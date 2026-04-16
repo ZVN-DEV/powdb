@@ -16,6 +16,17 @@ export const MSG_RESULT_OK = 0x09;
 export const MSG_ERROR = 0x0a;
 export const MSG_DISCONNECT = 0x10;
 
+// ───── Size limits (mirror crates/server/src/protocol.rs) ──────────────────
+
+/** Maximum payload size accepted from the wire (64 MB). */
+export const MAX_PAYLOAD_SIZE = 64 * 1024 * 1024;
+
+/** Maximum number of rows allowed in a single result message. */
+export const MAX_ROWS = 10_000_000;
+
+/** Maximum number of columns allowed in a result set. */
+export const MAX_COLUMNS = 4096;
+
 export type Message =
   | { type: "Connect"; dbName: string; password: string | null }
   | { type: "ConnectOk"; version: string }
@@ -105,6 +116,11 @@ export function tryDecode(
   const msgType = buf.readUInt8(0);
   // flags byte at offset 1 is currently unused
   const payloadLen = buf.readUInt32LE(2);
+  if (payloadLen > MAX_PAYLOAD_SIZE) {
+    throw new Error(
+      `payload too large: ${payloadLen} bytes (max ${MAX_PAYLOAD_SIZE})`,
+    );
+  }
   if (buf.length < 6 + payloadLen) return null;
   const payload = buf.subarray(6, 6 + payloadLen);
   const msg = decodePayload(msgType, payload);
@@ -130,12 +146,22 @@ function decodePayload(msgType: number, payload: Buffer): Message {
     case MSG_RESULT_ROWS: {
       const colCount = payload.readUInt16LE(cursor.pos);
       cursor.pos += 2;
+      if (colCount > MAX_COLUMNS) {
+        throw new Error(
+          `too many columns: ${colCount} (max ${MAX_COLUMNS})`,
+        );
+      }
       const columns: string[] = [];
       for (let i = 0; i < colCount; i++) {
         columns.push(decodeString(payload, cursor));
       }
       const rowCount = payload.readUInt32LE(cursor.pos);
       cursor.pos += 4;
+      if (rowCount > MAX_ROWS) {
+        throw new Error(
+          `too many rows: ${rowCount} (max ${MAX_ROWS})`,
+        );
+      }
       const rows: string[][] = [];
       for (let r = 0; r < rowCount; r++) {
         const row: string[] = [];
