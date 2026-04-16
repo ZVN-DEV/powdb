@@ -45,31 +45,37 @@ async function main() {
     assert.equal(escapeLiteral(""), `""`);
   });
 
-  await test("internal double quotes are doubled (SQL-style)", () => {
-    // input:  say "hi"
-    // output: "say ""hi"""
-    assert.equal(escapeLiteral('say "hi"'), `"say ""hi"""`);
+  await test("internal double quotes are backslash-escaped (C-style)", () => {
+    // input:  say "hi"        (9 chars)
+    // output: "say \"hi\""    (11 chars)
+    assert.equal(escapeLiteral('say "hi"'), `"say \\"hi\\""`);
   });
 
-  await test("multiple internal quotes are each doubled", () => {
-    // input:  hi "there"
-    // output: "hi ""there"""
-    assert.equal(escapeLiteral('hi "there"'), `"hi ""there"""`);
+  await test("multiple internal quotes are each escaped", () => {
+    assert.equal(escapeLiteral('hi "there"'), `"hi \\"there\\""`);
   });
 
   await test("only leading quote", () => {
-    assert.equal(escapeLiteral('"hello'), `"""hello"`);
+    assert.equal(escapeLiteral('"hello'), `"\\"hello"`);
   });
 
   await test("only trailing quote", () => {
-    assert.equal(escapeLiteral('hello"'), `"hello"""`);
+    assert.equal(escapeLiteral('hello"'), `"hello\\""`);
   });
 
-  await test("backslashes are not special — passed through unchanged", () => {
-    assert.equal(escapeLiteral("a\\b"), `"a\\b"`);
+  await test("backslashes are escaped (C-style) so they don't swallow next char", () => {
+    // input: a\b  (3 chars: a, backslash, b)
+    // output: "a\\b"  (6 chars: ", a, \, \, b, ")
+    assert.equal(escapeLiteral("a\\b"), `"a\\\\b"`);
   });
 
-  await test("newlines are passed through unchanged", () => {
+  await test("backslash immediately before quote — escapes are independent", () => {
+    // input:  a\"b  (4 chars: a, \, ", b)
+    // output: "a\\\"b"  (8 chars: ", a, \, \, \, ", b, ")
+    assert.equal(escapeLiteral('a\\"b'), `"a\\\\\\"b"`);
+  });
+
+  await test("newlines pass through raw (lexer reads them literally)", () => {
     assert.equal(escapeLiteral("a\nb"), `"a\nb"`);
   });
 
@@ -255,7 +261,7 @@ async function main() {
 
   await test("complete insert query with mixed types", () => {
     const q = powql`insert ${ident("User")} { name := ${'O"Brien'}, age := ${42} }`;
-    assert.equal(q, `insert User { name := "O""Brien", age := 42 }`);
+    assert.equal(q, `insert User { name := "O\\"Brien", age := 42 }`);
   });
 
   await test("multiple interpolations of same type", () => {
@@ -287,15 +293,15 @@ async function main() {
   console.log("\ninjection resistance");
   // ──────────────────────────────────────────────────────────
 
-  await test("injection attempt is neutralised by doubling quotes", () => {
-    // The classic SQL-injection payload: break out of the string, inject
-    // malicious statements, open a comment to swallow the trailing quote.
-    // Under SQL-style doubling, the embedded `"` is doubled, so the payload
-    // stays trapped inside a single literal.
+  await test("injection attempt is neutralised by backslash-escaping the quote", () => {
+    // Classic injection payload: try to break out of the string, inject
+    // malicious statements, and open a comment to swallow the trailing quote.
+    // With C-style escaping, the embedded `"` becomes `\"`, so the payload
+    // stays trapped inside a single string literal.
     const payload = '"); drop table users; --';
     const q = powql`${payload}`;
-    // doubled "" + rest + closing "
-    assert.equal(q, `"""); drop table users; --"`);
+    // Opening " + \" (escaped inner quote) + rest of payload + closing "
+    assert.equal(q, `"\\"); drop table users; --"`);
   });
 
   await test("identifier interpolation rejects injection attempts", () => {
@@ -306,8 +312,9 @@ async function main() {
   });
 
   await test("escapeLiteral on a value with nothing but quotes", () => {
-    // 3 internal quotes → 6 doubled quotes inside, plus 2 outer = 8 total.
-    assert.equal(escapeLiteral('"""'), `""""""""`);
+    // 3 internal quotes → each becomes \" (2 chars) → 6 chars inside,
+    // plus 2 outer quotes = 8 total.
+    assert.equal(escapeLiteral('"""'), `"\\"\\"\\""`);
   });
 
   // ──────────────────────────────────────────────────────────

@@ -111,20 +111,23 @@ export class Client {
     // pending-queue machinery, so we do a one-shot handshake here.
     const handshake = new Promise<Message>((resolve, reject) => {
       let scratch = Buffer.alloc(0);
+      const cleanup = () => {
+        socket.removeListener("data", onData);
+        socket.removeListener("error", onError);
+        socket.removeListener("close", onClose);
+      };
       const onData = (chunk: Buffer) => {
         scratch = Buffer.concat([scratch, chunk]);
         let decoded: { msg: Message; consumed: number } | null;
         try {
           decoded = tryDecode(scratch);
         } catch (err) {
-          socket.removeListener("data", onData);
-          socket.removeListener("error", onError);
+          cleanup();
           reject(err as Error);
           return;
         }
         if (decoded !== null) {
-          socket.removeListener("data", onData);
-          socket.removeListener("error", onError);
+          cleanup();
           // Any bytes past the handshake frame belong to later responses.
           // This should not happen in practice, but handle it defensively.
           const leftover = scratch.subarray(decoded.consumed);
@@ -135,11 +138,18 @@ export class Client {
         }
       };
       const onError = (err: Error) => {
-        socket.removeListener("data", onData);
+        cleanup();
         reject(err);
+      };
+      // Without this, a peer that FINs the connection mid-handshake (no
+      // explicit error event) would leave this promise pending forever.
+      const onClose = () => {
+        cleanup();
+        reject(new Error("connection closed during handshake"));
       };
       socket.on("data", onData);
       socket.on("error", onError);
+      socket.on("close", onClose);
     });
 
     socket.write(encode({ type: "Connect", dbName, password }));
@@ -200,7 +210,11 @@ export class Client {
     }
   }
 
-  /** Send Disconnect and tear down the socket. */
+  /**
+   * Send Disconnect and tear down the socket. Waits for the remote FIN-ack
+   * (`socket.end` callback) but falls back to `destroy()` after a bounded
+   * timeout so an unresponsive peer cannot make `close()` hang forever.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
     try {
@@ -210,7 +224,20 @@ export class Client {
     }
     this.closed = true;
     await new Promise<void>((resolve) => {
-      this.socket.end(() => resolve());
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        // Peer didn't ack FIN in time — force-close so we don't hang.
+        this.socket.destroy();
+        finish();
+      }, 5_000);
+      if (typeof timer.unref === "function") timer.unref();
+      this.socket.end(finish);
     });
   }
 
@@ -277,6 +304,11 @@ export class Client {
           if (entry.settled) return;
           // Writer error — the promise will also be rejected by onClose,
           // but rejecting here gives a faster, more specific failure.
+          //
+          // Splicing an entry from the middle of `pending` is only safe
+          // because a write-callback error implies the bytes never reached
+          // the server — no reply will ever come for this slot, so FIFO
+          // alignment with subsequent entries is preserved.
           const idx = this.pending.indexOf(entry);
           if (idx !== -1) this.pending.splice(idx, 1);
           entry.reject(err);
@@ -444,3 +476,14 @@ export {
   MAX_ROWS,
   MAX_COLUMNS,
 } from "./protocol.js";
+
+export {
+  escapeLiteral,
+  escapeIdent,
+  ident,
+  powql,
+  PowqlIdent,
+} from "./escape.js";
+
+export { Pool } from "./pool.js";
+export type { PoolOptions } from "./pool.js";

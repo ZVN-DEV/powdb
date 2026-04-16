@@ -11,10 +11,12 @@
  *   - Identifiers are validated against `^[A-Za-z_][A-Za-z0-9_]*$` and passed
  *     through unchanged. Anything else throws a `TypeError`.
  *
- * PowQL string-escape rules (as documented in the sprint plan):
+ * PowQL string-escape rules (verified against `crates/query/src/lexer.rs`):
  *   - Strings are delimited by `"`.
- *   - A literal `"` inside a string is represented as `""` (doubled, SQL-style).
- *   - Backslashes have no special meaning and are passed through unchanged.
+ *   - `\\` → `\`, `\"` → `"`, `\n` → newline, `\t` → tab.
+ *   - For any other `\X`, the backslash is dropped and `X` is kept literally.
+ *   - A bare `"` terminates the string, so `"` inside must be `\"` and any
+ *     literal backslash must be `\\` (otherwise it would swallow the next char).
  */
 
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -56,7 +58,8 @@ export function escapeIdent(name: string): string {
  * `boolean`, and `null`. Rejects `NaN`/`±Infinity`, `undefined`, symbols,
  * objects, and arrays with `TypeError`.
  *
- * - string → `"..."` with internal `"` doubled (SQL-style)
+ * - string → `"..."` with `\` and `"` backslash-escaped (C-style, per the
+ *   PowQL lexer). Backslash must be escaped first to avoid double-processing.
  * - number → decimal; rejects non-finite
  * - bigint → decimal digits
  * - boolean → `true` / `false`
@@ -70,7 +73,10 @@ export function escapeLiteral(
   const t = typeof value;
 
   if (t === "string") {
-    return `"${(value as string).replace(/"/g, '""')}"`;
+    const escaped = (value as string)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"');
+    return `"${escaped}"`;
   }
 
   if (t === "number") {

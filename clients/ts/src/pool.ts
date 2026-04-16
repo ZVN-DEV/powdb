@@ -59,6 +59,9 @@ export class Pool {
 
   private readonly idleClients: Client[] = [];
   private readonly waiters: Waiter[] = [];
+  /** Clients owned by this pool (idle + checked-out). Used to reject
+   *  foreign/double-destroyed clients from corrupting the slot accounting. */
+  private readonly owned: Set<Client> = new Set();
   private live = 0;
   private _closed = false;
 
@@ -113,6 +116,7 @@ export class Pool {
       this.live++;
       try {
         const c = await Client.connect(this.opts);
+        this.owned.add(c);
         return c;
       } catch (err) {
         // Creation failed — we never had a live client, so give the slot
@@ -153,8 +157,15 @@ export class Pool {
    * {@link destroy} for that case.
    */
   release(c: Client): void {
+    if (!this.owned.has(c)) {
+      // Foreign client or already-destroyed — refuse to touch accounting.
+      return;
+    }
+
     if (this._closed) {
       // Pool is gone — just close the client, fire-and-forget.
+      this.owned.delete(c);
+      if (this.live > 0) this.live--;
       void c.close().catch(() => {});
       return;
     }
@@ -175,6 +186,11 @@ export class Pool {
    * known-bad.
    */
   destroy(c: Client): void {
+    if (!this.owned.has(c)) {
+      // Foreign client or already destroyed — don't touch slot accounting.
+      return;
+    }
+    this.owned.delete(c);
     // Decrement first so any waiter we hand off to can create a fresh one.
     if (this.live > 0) this.live--;
     void c.close().catch(() => {});
@@ -224,6 +240,7 @@ export class Pool {
 
     // Close every idle client.
     const idle = this.idleClients.splice(0, this.idleClients.length);
+    for (const c of idle) this.owned.delete(c);
     this.live -= idle.length;
     await Promise.all(idle.map((c) => c.close().catch(() => {})));
   }
@@ -242,7 +259,18 @@ export class Pool {
       if (waiter.timer !== null) clearTimeout(waiter.timer);
       this.live++;
       Client.connect(this.opts).then(
-        (c) => waiter.resolve(c),
+        (c) => {
+          // Pool may have been closed while the connect was in flight.
+          // If so, close the freshly-opened client instead of handing it
+          // to a waiter that's already been rejected.
+          if (this._closed) {
+            if (this.live > 0) this.live--;
+            void c.close().catch(() => {});
+            return;
+          }
+          this.owned.add(c);
+          waiter.resolve(c);
+        },
         (err) => {
           this.live--;
           waiter.reject(err as Error);
