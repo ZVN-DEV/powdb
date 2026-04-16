@@ -9,7 +9,7 @@
  *     POWDB_HOST=127.0.0.1 POWDB_PORT=5433 tsx demo/demo.ts
  */
 
-import { Client, type QueryResult } from "../src/index.js";
+import { Client, ident, powql, type QueryResult } from "../src/index.js";
 
 const HOST = process.env.POWDB_HOST ?? "213.188.194.202";
 const PORT = Number(process.env.POWDB_PORT ?? "5433");
@@ -29,11 +29,12 @@ async function main() {
   try {
     // Use a unique table name per run so reruns don't collide on a
     // persistent server. PowQL doesn't have DROP TABLE (yet).
-    const table = `Demo${Date.now().toString(36)}`;
-    console.log(`→ creating type ${table}`);
+    const tableName = `Demo${Date.now().toString(36)}`;
+    const table = ident(tableName);
+    console.log(`→ creating type ${tableName}`);
     await run(
       client,
-      `type ${table} { required name: string, required age: int, city: string }`,
+      powql`type ${table} { required name: string, required age: int, city: string }`,
     );
 
     console.log(`→ inserting rows`);
@@ -47,29 +48,31 @@ async function main() {
     for (const p of people) {
       await run(
         client,
-        `insert ${table} { name := "${p.name}", age := ${p.age}, city := "${p.city}" }`,
+        powql`insert ${table} { name := ${p.name}, age := ${p.age}, city := ${p.city} }`,
       );
     }
 
-    console.log(`\n→ ${table} count`);
-    printResult(await client.query(`count(${table})`));
+    console.log(`\n→ ${tableName} count`);
+    printResult(await client.query(powql`count(${table})`));
 
     console.log(`\n→ everyone, name + age, oldest first`);
     printResult(
-      await client.query(`${table} order .age desc { .name, .age, .city }`),
+      await client.query(
+        powql`${table} order .age desc { .name, .age, .city }`,
+      ),
     );
 
     console.log(`\n→ people over 27, youngest of those first, limit 3`);
     printResult(
       await client.query(
-        `${table} filter .age > 27 order .age limit 3 { .name, .age, .city }`,
+        powql`${table} filter .age > ${27} order .age limit 3 { .name, .age, .city }`,
       ),
     );
 
     console.log(`\n→ only NYC residents`);
     printResult(
       await client.query(
-        `${table} filter .city = "NYC" { .name, .age }`,
+        powql`${table} filter .city = ${"NYC"} { .name, .age }`,
       ),
     );
   } finally {

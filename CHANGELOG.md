@@ -5,6 +5,41 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [TS client 0.2.0] - 2026-04-16
+
+TypeScript client (`@zvndev/powdb-client`) hardening release. Server is
+unaffected — this is a client-only version bump.
+
+### Added
+
+- **Safe query composition**: new `powql` tagged template plus `escapeLiteral`,
+  `escapeIdent`, and `ident()` helpers. The tagged template escapes literals
+  and validates identifiers, neutralising PowQL-injection attacks (the same
+  class of issue as SQL injection).
+- **Connection pool**: new `Pool` class with `acquire`/`release`/`withClient`,
+  FIFO waiter queue, and `acquireTimeoutMs`.
+- **TLS support**: `tls` option on `Client.connect` accepts `true` or a
+  `tls.ConnectionOptions` object.
+- **Cancellation**: `client.query(q, { signal })` accepts an `AbortSignal`;
+  cancelling does not tear down the socket — the reply is discarded so other
+  in-flight queries keep working.
+- **Frame size limits**: decoder enforces `MAX_PAYLOAD_SIZE` (64 MiB),
+  `MAX_ROWS` (10M), and `MAX_COLUMNS` (4096) matching the server.
+- **Version check**: on connect, warns once per `host:port` if the server's
+  major version differs from the client's.
+- **TCP keepalive**: `setKeepAlive(true, 30_000)` enabled on every connection
+  so dead peers are detected on idle sockets.
+
+### Fixed
+
+- **O(n²) receive buffer**: the previous `Buffer.concat` on every chunk caused
+  quadratic CPU on large result sets. Replaced with a lazy chunk queue that
+  only coalesces when needed to decode a frame.
+
+### Changed
+
+- Minimum Node.js version is now explicitly `>=18` (was previously implicit).
+
 ## [0.1.2] - 2026-04-16
 
 Hardening release: all known fuzz-reachable panics in the query layer are now

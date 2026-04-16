@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-client",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "main": "dist/index.js",
@@ -19,9 +19,15 @@
     "directory": "clients/ts"
   },
   "keywords": ["powdb", "database", "client", "powql"],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx test/client.test.ts",
+    "test:escape": "tsx test/escape.test.ts",
+    "test:protocol": "tsx test/protocol.test.ts",
+    "test:pool": "tsx test/pool.test.ts",
     "demo": "tsx demo/demo.ts",
     "clean": "rm -rf dist"
   },
