@@ -21,12 +21,73 @@
  */
 
 import { Client, type ClientOptions } from "./index.js";
+import { PowDBError, isPowDBError } from "./errors.js";
 
 export interface PoolOptions extends ClientOptions {
   /** Maximum concurrent clients. Default 10. */
   max?: number;
   /** Acquire timeout in ms. Default 30_000. */
   acquireTimeoutMs?: number;
+  /**
+   * How many times to retry `Client.connect` on transient errors
+   * (connect_failed / timeout). Auth failures and other non-transient
+   * errors are never retried. Default 3. Set to 0 to disable.
+   */
+  connectRetries?: number;
+  /**
+   * Initial backoff (ms) between connect retries. Each subsequent retry
+   * doubles the delay up to `connectMaxBackoffMs`. Default 100.
+   */
+  connectBackoffMs?: number;
+  /** Maximum backoff (ms) between connect retries. Default 2_000. */
+  connectMaxBackoffMs?: number;
+}
+
+/**
+ * Is this error worth retrying? Only the transient connect-phase errors
+ * are retryable. Auth failures, size violations, aborts, and protocol
+ * errors are not — retrying would just fail the same way.
+ */
+function isRetryable(err: unknown): boolean {
+  if (!isPowDBError(err)) {
+    // Raw socket errors surface as generic Error before we wrap them in
+    // connect_failed. In practice connect() wraps them, but be defensive.
+    return err instanceof Error;
+  }
+  return err.code === "connect_failed" || err.code === "timeout";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === "function") t.unref();
+  });
+}
+
+/**
+ * Connect to the server with bounded retry + exponential backoff. Throws
+ * the last error if every attempt fails, or the first error unchanged if
+ * it was not retryable.
+ */
+async function connectWithRetry(
+  opts: ClientOptions,
+  retries: number,
+  initialBackoffMs: number,
+  maxBackoffMs: number,
+): Promise<Client> {
+  let lastErr: unknown;
+  let delay = initialBackoffMs;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await Client.connect(opts);
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryable(err) || attempt === retries) break;
+      await sleep(delay);
+      delay = Math.min(delay * 2, maxBackoffMs);
+    }
+  }
+  throw lastErr;
 }
 
 type Waiter = {
@@ -56,6 +117,9 @@ export class Pool {
   private readonly opts: ClientOptions;
   private readonly max: number;
   private readonly acquireTimeoutMs: number;
+  private readonly connectRetries: number;
+  private readonly connectBackoffMs: number;
+  private readonly connectMaxBackoffMs: number;
 
   private readonly idleClients: Client[] = [];
   private readonly waiters: Waiter[] = [];
@@ -66,7 +130,14 @@ export class Pool {
   private _closed = false;
 
   constructor(opts: PoolOptions) {
-    const { max = 10, acquireTimeoutMs = 30_000, ...clientOpts } = opts;
+    const {
+      max = 10,
+      acquireTimeoutMs = 30_000,
+      connectRetries = 3,
+      connectBackoffMs = 100,
+      connectMaxBackoffMs = 2_000,
+      ...clientOpts
+    } = opts;
     if (!Number.isFinite(max) || max < 1) {
       throw new TypeError(`Pool: max must be a positive integer, got ${max}`);
     }
@@ -75,9 +146,30 @@ export class Pool {
         `Pool: acquireTimeoutMs must be a non-negative number, got ${acquireTimeoutMs}`
       );
     }
+    if (!Number.isFinite(connectRetries) || connectRetries < 0) {
+      throw new TypeError(
+        `Pool: connectRetries must be a non-negative integer, got ${connectRetries}`
+      );
+    }
     this.opts = clientOpts;
     this.max = max;
     this.acquireTimeoutMs = acquireTimeoutMs;
+    this.connectRetries = connectRetries;
+    this.connectBackoffMs = connectBackoffMs;
+    this.connectMaxBackoffMs = connectMaxBackoffMs;
+  }
+
+  /**
+   * Wraps Client.connect with the pool's configured retry policy. Used by
+   * `acquire` and `drainWaiters`.
+   */
+  private connect(): Promise<Client> {
+    return connectWithRetry(
+      this.opts,
+      this.connectRetries,
+      this.connectBackoffMs,
+      this.connectMaxBackoffMs,
+    );
   }
 
   /** Live client count (idle + checked out). */
@@ -115,7 +207,7 @@ export class Pool {
     if (this.live < this.max) {
       this.live++;
       try {
-        const c = await Client.connect(this.opts);
+        const c = await this.connect();
         this.owned.add(c);
         return c;
       } catch (err) {
@@ -258,7 +350,7 @@ export class Pool {
       const waiter = this.waiters.shift()!;
       if (waiter.timer !== null) clearTimeout(waiter.timer);
       this.live++;
-      Client.connect(this.opts).then(
+      this.connect().then(
         (c) => {
           // Pool may have been closed while the connect was in flight.
           // If so, close the freshly-opened client instead of handing it

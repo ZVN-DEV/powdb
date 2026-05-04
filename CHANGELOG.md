@@ -5,6 +5,49 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [TS client 0.3.0] - 2026-04-16
+
+TypeScript client (`@zvndev/powdb-client`) production-readiness release.
+Server is unaffected — this is a client-only version bump. No breaking
+changes to the 0.2.x API surface; all additions are additive.
+
+### Added
+
+- **Structured errors**: every error thrown by the client is now a
+  `PowDBError` with a stable `.code` (`connect_failed`, `auth_failed`,
+  `query_failed`, `aborted`, `size_exceeded`, `protocol_error`, `closed`,
+  `timeout`, `type_coercion_failed`). Callers can branch on `.code` without
+  string-matching messages. `isPowDBError(err)` narrows `unknown` for use
+  in catch blocks.
+- **Typed rows**: `client.queryTyped(query, schema, opts?)` coerces the
+  server's string wire format into JS values using a caller-supplied
+  schema (`int`, `float`, `bool`, `str`, `datetime`, `uuid`). Int values
+  that exceed `Number.MAX_SAFE_INTEGER` are promoted to `bigint`;
+  datetime microseconds are converted via `BigInt` division to avoid
+  float precision loss at year-2262 boundaries. Bytes columns are
+  intentionally unsupported until the wire protocol grows a binary type.
+- **Polling watch**: `client.watch(query, { intervalMs, onRows, onError?,
+  stopOnError? })` re-runs a query on an interval and delivers rows to a
+  callback. Guards against pile-up when a query is slower than the
+  interval; returns `{ stop() }` to cancel. Uses `handle.unref()` so the
+  watcher doesn't keep the event loop alive on its own.
+- **Observability hooks**: `Client` now extends `EventEmitter`. Emits
+  `"query"` (with `{ query, durationMs, ok, kind?, error? }`) after every
+  query and `"close"` (with `{ error }`) exactly once per socket. Designed
+  to be dropped into OpenTelemetry, pino, or a Prometheus exporter.
+- **Pool connect retries**: `Pool` now retries transient connect-phase
+  failures (`connect_failed`, `timeout`) with exponential backoff. New
+  options: `connectRetries` (default 3), `connectBackoffMs` (default
+  100), `connectMaxBackoffMs` (default 2_000). Auth failures, size
+  violations, and other non-transient errors are never retried — they'd
+  just fail the same way.
+
+### Changed
+
+- All raw `Error` throws in the client have been replaced with
+  `PowDBError`. Existing `instanceof Error` checks still work; new code
+  should prefer `instanceof PowDBError` + `.code` branching.
+
 ## [TS client 0.2.0] - 2026-04-16
 
 TypeScript client (`@zvndev/powdb-client`) hardening release. Server is

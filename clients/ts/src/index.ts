@@ -17,10 +17,17 @@
 
 import * as net from "node:net";
 import * as tls from "node:tls";
+import { EventEmitter } from "node:events";
 import { encode, tryDecode, type Message } from "./protocol.js";
+import { PowDBError } from "./errors.js";
+import {
+  coerceRows,
+  type TypedRow,
+  type TypedSchema,
+} from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.2.0";
+export const CLIENT_VERSION = "0.3.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -58,22 +65,45 @@ function majorOf(version: string): string {
   return dot === -1 ? version : version.slice(0, dot);
 }
 
-/** Build an AbortError matching the DOM's `signal.reason` default. */
+/**
+ * Build an AbortError. Prefers the caller-supplied `signal.reason` if it is
+ * itself an `Error` (matches DOM semantics); otherwise wraps it in a
+ * `PowDBError` with code `"aborted"` so catch-blocks can branch uniformly.
+ */
 function abortError(signal?: AbortSignal): Error {
   if (signal && signal.reason !== undefined) {
     const r = signal.reason;
-    return r instanceof Error ? r : new Error(String(r));
+    if (r instanceof Error) return r;
+    return new PowDBError(String(r), "aborted");
   }
-  // Match the runtime's built-in AbortError when a reason wasn't set.
-  if (typeof DOMException !== "undefined") {
-    return new DOMException("The operation was aborted.", "AbortError");
-  }
-  const err = new Error("The operation was aborted.");
-  err.name = "AbortError";
-  return err;
+  return new PowDBError("query was aborted", "aborted");
 }
 
-export class Client {
+/**
+ * Event map for {@link Client}. Typed so `client.on("query", ...)` gets
+ * inference for the payload.
+ *
+ *   - `"query"`: one emission per completed (or failed) query attempt,
+ *     whether via `query` or `queryTyped`. `durationMs` is the client-side
+ *     round-trip including abort handling. `ok=false` means the server
+ *     returned an Error frame or the client rejected locally.
+ *   - `"close"`: the underlying socket has been fully torn down. Emitted
+ *     once per client.
+ */
+export interface ClientEvents {
+  query: [
+    {
+      query: string;
+      durationMs: number;
+      ok: boolean;
+      kind?: "rows" | "scalar" | "ok";
+      error?: Error;
+    },
+  ];
+  close: [{ error: Error | null }];
+}
+
+export class Client extends EventEmitter<ClientEvents> {
   private readonly socket: net.Socket;
   /** FIFO of raw chunks; concatenated lazily when we try to decode. */
   private readonly chunks: Buffer[] = [];
@@ -86,6 +116,7 @@ export class Client {
   readonly serverVersion: string;
 
   private constructor(socket: net.Socket, serverVersion: string) {
+    super();
     this.socket = socket;
     this.serverVersion = serverVersion;
 
@@ -145,7 +176,7 @@ export class Client {
       // explicit error event) would leave this promise pending forever.
       const onClose = () => {
         cleanup();
-        reject(new Error("connection closed during handshake"));
+        reject(new PowDBError("connection closed during handshake", "connect_failed"));
       };
       socket.on("data", onData);
       socket.on("error", onError);
@@ -157,11 +188,11 @@ export class Client {
 
     if (reply.type === "Error") {
       socket.destroy();
-      throw new Error(`connect failed: ${reply.message}`);
+      throw new PowDBError(`connect failed: ${reply.message}`, "auth_failed");
     }
     if (reply.type !== "ConnectOk") {
       socket.destroy();
-      throw new Error(`expected ConnectOk, got ${reply.type}`);
+      throw new PowDBError(`expected ConnectOk, got ${reply.type}`, "protocol_error");
     }
 
     // Advisory: warn once per host:port if the server's major differs
@@ -195,19 +226,126 @@ export class Client {
     query: string,
     opts?: { signal?: AbortSignal },
   ): Promise<QueryResult> {
-    const reply = await this.send({ type: "Query", query }, opts);
-    switch (reply.type) {
-      case "ResultRows":
-        return { kind: "rows", columns: reply.columns, rows: reply.rows };
-      case "ResultScalar":
-        return { kind: "scalar", value: reply.value };
-      case "ResultOk":
-        return { kind: "ok", affected: reply.affected };
-      case "Error":
-        throw new Error(`query failed: ${reply.message}`);
-      default:
-        throw new Error(`unexpected reply: ${reply.type}`);
+    const start = Date.now();
+    try {
+      const reply = await this.send({ type: "Query", query }, opts);
+      let result: QueryResult;
+      switch (reply.type) {
+        case "ResultRows":
+          result = { kind: "rows", columns: reply.columns, rows: reply.rows };
+          break;
+        case "ResultScalar":
+          result = { kind: "scalar", value: reply.value };
+          break;
+        case "ResultOk":
+          result = { kind: "ok", affected: reply.affected };
+          break;
+        case "Error":
+          throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+        default:
+          throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
+      }
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
     }
+  }
+
+  /**
+   * Like {@link query}, but coerces string result columns to typed JS values
+   * using the caller-supplied schema. See `./typed.ts` for the coercion
+   * rules and supported column types.
+   *
+   * Returns a `TypedRow[]` — an array of objects keyed by column name.
+   * Throws `PowDBError(code="query_failed")` if the query is not a
+   * rows-returning query.
+   */
+  async queryTyped(
+    query: string,
+    schema: TypedSchema,
+    opts?: { signal?: AbortSignal },
+  ): Promise<TypedRow[]> {
+    const result = await this.query(query, opts);
+    if (result.kind !== "rows") {
+      throw new PowDBError(
+        `queryTyped: expected rows result, got ${result.kind}`,
+        "query_failed",
+      );
+    }
+    return coerceRows(result.columns, result.rows, schema);
+  }
+
+  /**
+   * Poll a query on an interval and invoke `onRows` for every successful
+   * run. Returns an unsubscribe function. Does NOT deduplicate results —
+   * `onRows` fires every interval, even if the rows are unchanged.
+   *
+   * Pragmatic first-cut live-data. If a query takes longer than
+   * `intervalMs`, the next tick waits for the in-flight one to finish
+   * (no pile-up). Errors fire `onError` (if provided) without stopping
+   * the watcher unless `stopOnError: true`.
+   */
+  watch(
+    query: string,
+    opts: {
+      intervalMs: number;
+      onRows: (rows: QueryResult) => void;
+      onError?: (err: Error) => void;
+      stopOnError?: boolean;
+    },
+  ): { stop: () => void } {
+    if (!(opts.intervalMs > 0)) {
+      throw new PowDBError(
+        `watch: intervalMs must be > 0, got ${opts.intervalMs}`,
+        "protocol_error",
+      );
+    }
+    let stopped = false;
+    let inFlight = false;
+
+    const tick = async () => {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        const r = await this.query(query);
+        if (!stopped) opts.onRows(r);
+      } catch (err) {
+        if (stopped) return;
+        if (opts.onError) opts.onError(err as Error);
+        if (opts.stopOnError) {
+          stopped = true;
+          clearInterval(handle);
+          return;
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    // Run immediately so callers don't wait a full interval for the first
+    // emission, then every `intervalMs`.
+    void tick();
+    const handle: NodeJS.Timeout = setInterval(tick, opts.intervalMs);
+    if (typeof handle.unref === "function") handle.unref();
+
+    return {
+      stop: () => {
+        stopped = true;
+        clearInterval(handle);
+      },
+    };
   }
 
   /**
@@ -249,7 +387,7 @@ export class Client {
   ): Promise<Message> {
     if (this.closed) {
       return Promise.reject(
-        this.closeError ?? new Error("client is closed"),
+        this.closeError ?? new PowDBError("client is closed", "closed"),
       );
     }
 
@@ -378,7 +516,9 @@ export class Client {
       if (!entry) {
         // Server sent an unsolicited frame (or we got extra after aborts
         // with no replacement). Treat as protocol error.
-        this.onClose(new Error("received unexpected frame from server"));
+        this.onClose(
+          new PowDBError("received unexpected frame from server", "protocol_error"),
+        );
         return;
       }
       entry.resolve(decoded.msg);
@@ -411,15 +551,21 @@ export class Client {
   }
 
   private onClose(err: Error | null): void {
+    const firstClose = !this.closed;
     if (this.closed && err === null) return;
     this.closed = true;
     this.closeError = err;
-    const error = err ?? new Error("connection closed");
+    const error = err ?? new PowDBError("connection closed", "closed");
     while (this.pending.length > 0) {
       const entry = this.pending.shift()!;
       if (!entry.settled) {
         entry.reject(error);
       }
+    }
+    if (firstClose) {
+      // Best-effort: surface the close event once. Late listeners on a
+      // closed client miss it, which matches Node socket semantics.
+      this.emit("close", { error: err });
     }
   }
 }
@@ -434,7 +580,7 @@ function openSocket(
     let socket: net.Socket;
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new Error(`connect timeout after ${timeoutMs}ms`));
+      reject(new PowDBError(`connect timeout after ${timeoutMs}ms`, "timeout"));
     }, timeoutMs);
 
     const onConnect = () => {
@@ -447,7 +593,9 @@ function openSocket(
     };
     const onError = (err: Error) => {
       clearTimeout(timer);
-      reject(err);
+      // Wrap raw socket errors in the PowDBError taxonomy — callers can
+      // branch on `.code === "connect_failed"` rather than string-matching.
+      reject(new PowDBError(`connect failed: ${err.message}`, "connect_failed", { cause: err }));
     };
 
     if (tlsOpt) {
@@ -487,3 +635,18 @@ export {
 
 export { Pool } from "./pool.js";
 export type { PoolOptions } from "./pool.js";
+
+export { PowDBError, isPowDBError } from "./errors.js";
+export type { PowDBErrorCode } from "./errors.js";
+
+export {
+  coerceValue,
+  coerceRow,
+  coerceRows,
+} from "./typed.js";
+export type {
+  ColumnType,
+  TypedSchema,
+  TypedRow,
+  Coerced,
+} from "./typed.js";

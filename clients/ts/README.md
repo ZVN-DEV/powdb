@@ -93,6 +93,116 @@ const client = await Client.connect({
 });
 ```
 
+## Typed rows
+
+The wire protocol serialises every value as a string. If you want JS types
+back (numbers, `Date`, booleans), call `queryTyped` with a schema:
+
+```typescript
+import { Client } from "@zvndev/powdb-client";
+
+const client = await Client.connect({ host: "localhost", port: 5433 });
+
+const rows = await client.queryTyped(
+  "User { .id, .name, .age, .active, .created_at }",
+  {
+    id: "int",        // number — or bigint if > Number.MAX_SAFE_INTEGER
+    age: "int",
+    active: "bool",
+    created_at: "datetime",
+    // columns not in the schema (like `name`) pass through as strings
+  },
+);
+
+rows[0].age;         // typeof number
+rows[0].created_at;  // instanceof Date
+```
+
+Supported column types: `int` | `float` | `bool` | `str` | `datetime` | `uuid`.
+Bytes columns are intentionally unsupported (the wire format is lossy —
+it renders `<N bytes>`) and throw on coercion. Declare `str` if you just
+want the placeholder.
+
+## Structured errors
+
+Every error thrown by the client is a `PowDBError` with a stable `.code`:
+
+```typescript
+import { Client, PowDBError, isPowDBError } from "@zvndev/powdb-client";
+
+try {
+  await client.query("bogus");
+} catch (err) {
+  if (isPowDBError(err)) {
+    switch (err.code) {
+      case "connect_failed":
+      case "timeout":
+        // transient — safe to retry
+        break;
+      case "auth_failed":
+      case "query_failed":
+      case "protocol_error":
+        // not transient — surface to the caller
+        break;
+      case "aborted":
+        // caller asked to stop — never retry
+        break;
+    }
+  }
+}
+```
+
+The full taxonomy: `connect_failed`, `auth_failed`, `query_failed`,
+`aborted`, `size_exceeded`, `protocol_error`, `closed`, `timeout`,
+`type_coercion_failed`.
+
+## Polling watch
+
+For simple change-polling (the server doesn't ship a subscription
+protocol yet), `watch` re-runs a query on an interval and invokes a
+callback with the latest rows:
+
+```typescript
+const handle = client.watch("User filter .active = true { .id, .name }", {
+  intervalMs: 1000,
+  onRows: (rows, columns) => {
+    console.log(`${rows.length} active users`);
+  },
+  onError: (err) => {
+    console.error("watch error:", err);
+  },
+});
+
+// ...later
+handle.stop();
+```
+
+If a query takes longer than `intervalMs` the next tick is skipped rather
+than piling up. The watcher does not keep the event loop alive on its own
+(it uses `timer.unref()`).
+
+## Observability
+
+`Client` is an `EventEmitter`. Wire it into your logger or metrics
+pipeline:
+
+```typescript
+client.on("query", ({ query, durationMs, ok, kind, error }) => {
+  metrics.histogram("powdb_query_ms", durationMs, { ok: String(ok) });
+});
+
+client.on("close", ({ error }) => {
+  if (error) logger.warn({ err: error }, "powdb connection lost");
+});
+```
+
+Events:
+
+| Event | Payload | Fires when |
+|---|---|---|
+| `query` | `{ query, durationMs, ok, kind?, error? }` | After every query completes (success or failure) |
+| `close` | `{ error: Error \| null }` | Exactly once per socket, on normal or error close |
+
 ## Cancellation
 
 Pass an `AbortSignal` to cancel a query:
@@ -135,7 +245,21 @@ Sends a PowQL query and returns a `Promise<QueryResult>`:
 
 `opts.signal?: AbortSignal` — aborts the returned promise (see Cancellation above).
 
-Throws on server errors.
+Throws a `PowDBError` (see Structured errors above) on any failure.
+
+### `client.queryTyped(query, schema, opts?)`
+
+Like `query()`, but coerces each row's string values to JS types using the
+supplied schema and returns `Promise<TypedRow[]>`. See Typed rows above.
+
+### `client.watch(query, options)`
+
+Re-runs `query` every `intervalMs` and pushes rows to `onRows`. Returns
+`{ stop(): void }`. See Polling watch above.
+
+### `client.on("query", handler)` / `client.on("close", handler)`
+
+`Client` extends `EventEmitter`. See Observability above.
 
 ### `client.close()`
 
@@ -153,6 +277,9 @@ Constructor options extend `ClientOptions` with:
 |---|---|---|---|
 | `max` | `number` | `10` | Maximum concurrent connections |
 | `acquireTimeoutMs` | `number` | `30000` | How long `acquire()` waits before rejecting (pass `0` to disable) |
+| `connectRetries` | `number` | `3` | How many times to retry transient connect failures before giving up (set `0` to disable) |
+| `connectBackoffMs` | `number` | `100` | Initial delay between connect retries; doubles each attempt |
+| `connectMaxBackoffMs` | `number` | `2000` | Cap on the exponential backoff |
 
 Methods: `acquire()`, `release(client)`, `destroy(client)`, `withClient(fn)`, `close()`.
 Getters: `size`, `idle`, `closed`.
