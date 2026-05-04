@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-powdb-storage = { path = "../storage" }
-powdb-query = { path = "../query" }
+powdb-storage = { version = "0.1.2", path = "../storage" }
+powdb-query = { version = "0.1.2", path = "../query" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 thiserror.workspace = true
 bytes.workspace = true

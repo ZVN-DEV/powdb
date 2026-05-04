@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-powdb-storage = { path = "../storage" }
-powdb-query = { path = "../query" }
-powdb-server = { path = "../server" }
+powdb-storage = { version = "0.1.2", path = "../storage" }
+powdb-query = { version = "0.1.2", path = "../query" }
+powdb-server = { version = "0.1.2", path = "../server" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tracing.workspace = true
