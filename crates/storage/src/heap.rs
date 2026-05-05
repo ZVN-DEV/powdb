@@ -629,25 +629,17 @@ impl HeapFile {
                     // checker is happy because each borrow ends inside the
                     // same iteration.
                     let should_delete = match hot.page.get(slot) {
-                        Some(bytes) => {
-                            if pred(bytes) {
-                                // Mission B2: hook receives the rid so the
-                                // catalog's WAL-logged wrapper can emit one
-                                // Delete record per matched row in the same
-                                // single-pass scan.
-                                hook(
-                                    RowId {
-                                        page_id,
-                                        slot_index: slot,
-                                    },
-                                    bytes,
-                                );
-                                true
-                            } else {
-                                false
-                            }
+                        Some(bytes) if pred(bytes) => {
+                            hook(
+                                RowId {
+                                    page_id,
+                                    slot_index: slot,
+                                },
+                                bytes,
+                            );
+                            true
                         }
-                        None => false,
+                        _ => false,
                     };
                     if should_delete {
                         hot.page.delete(slot);
