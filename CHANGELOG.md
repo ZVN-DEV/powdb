@@ -5,6 +5,43 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Fixed path traversal vulnerability via table names
+- Added TLS support for encrypted connections
+- Added authentication rate limiting
+- Added row size validation to prevent u16 overflow corruption
+- Replaced unsafe UTF-8 decoding with safe alternative
+
+### Added
+
+- CLI meta-commands: `.tables`, `.schema`, `.timing`, `.help`, `.quit`
+- Tab completion for PowQL keywords
+- Persistent command history
+- Query timing display
+- Health check (Ping/Pong) protocol message
+- Cross join and sort row count safety limits
+- String literal size limit (16 MB)
+- `--version` flag for CLI and server binaries
+- `cargo install powdb-cli` / `cargo install powdb-server` install path
+
+### Fixed
+
+- Version strings now use Cargo.toml version instead of hardcoded "0.1.0"
+- NULL values display as "NULL" instead of "{}"
+- UUID values display in full standard format
+- B-tree load validates file size to prevent OOM
+- mmap slot access validates bounds
+
+### Changed
+
+- README repositioned around compiled predicates and PowQL ergonomics
+- Server `--password` flag removed (use `POWDB_PASSWORD` env var)
+- Human-readable error messages in parser
+- PowQL docs updated with math, date/time, window functions, CAST, EXPLAIN, UPSERT
+
 ## [TS client 0.3.0] - 2026-04-16
 
 TypeScript client (`@zvndev/powdb-client`) production-readiness release.
