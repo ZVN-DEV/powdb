@@ -275,10 +275,13 @@ impl HeapFile {
             return;
         }
         // Flush every dirty page (hot + buffered) so the mmap sees the
-        // same bytes the reader would expect. Silently swallow errors —
-        // we never want `enable_mmap` to fail the bench harness, and the
-        // fall-back is per-call mmap which is still correct (if slower).
-        let _ = self.flush_all_dirty();
+        // same bytes the reader would expect. We log a warning on failure
+        // rather than propagating the error, because `enable_mmap` does
+        // not return `Result` and we don't want to fail the bench harness.
+        // The fallback is per-call mmap which is still correct (if slower).
+        if let Err(e) = self.flush_all_dirty() {
+            tracing::warn!(error = %e, "flush failed before mmap enable");
+        }
 
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
@@ -413,6 +416,15 @@ impl HeapFile {
             let offset = rid.page_id as usize * PAGE_SIZE;
             if offset + PAGE_SIZE <= len {
                 let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
+                // Bounds check: validate slot_index against the page's
+                // actual slot count to prevent OOB reads from stale/invalid
+                // RowIds.
+                let slot_count = u16::from_le_bytes(
+                    page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap(),
+                );
+                if rid.slot_index >= slot_count {
+                    return None;
+                }
                 let entry_off = PAGE_SIZE - 2 - ((rid.slot_index as usize + 1) * 4);
                 let slot_offset =
                     u16::from_le_bytes(page_bytes[entry_off..entry_off + 2].try_into().unwrap());

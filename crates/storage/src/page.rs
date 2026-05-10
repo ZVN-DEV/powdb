@@ -68,14 +68,18 @@ impl Page {
     }
 
     pub fn page_id(&self) -> u32 {
+        // SAFETY: slice is exactly 4 bytes, try_into is infallible.
         u32::from_le_bytes(self.data[0..4].try_into().unwrap())
     }
 
-    pub fn page_type(&self) -> PageType {
-        PageType::from_u8(self.data[4]).unwrap()
+    /// Returns the page type, or `None` if the type byte is invalid
+    /// (e.g. from a corrupted or uninitialized page).
+    pub fn page_type(&self) -> Option<PageType> {
+        PageType::from_u8(self.data[4])
     }
 
     fn free_start(&self) -> u16 {
+        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
         u16::from_le_bytes(self.data[6..8].try_into().unwrap())
     }
 
@@ -84,6 +88,7 @@ impl Page {
     }
 
     pub fn slot_count(&self) -> u16 {
+        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
         u16::from_le_bytes(self.data[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap())
     }
 
@@ -99,6 +104,7 @@ impl Page {
 
     fn read_slot_entry(&self, i: u16) -> (u16, u16) {
         let off = self.slot_entry_offset(i);
+        // SAFETY: slices are exactly 2 bytes each, try_into is infallible.
         let offset = u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap());
         let length = u16::from_le_bytes(self.data[off + 2..off + 4].try_into().unwrap());
         (offset, length)
@@ -283,7 +289,7 @@ mod tests {
     fn test_new_page() {
         let page = Page::new(0, PageType::Data);
         assert_eq!(page.page_id(), 0);
-        assert_eq!(page.page_type(), PageType::Data);
+        assert_eq!(page.page_type(), Some(PageType::Data));
         assert_eq!(page.slot_count(), 0);
         assert_eq!(
             page.free_space(),
