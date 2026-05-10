@@ -2,11 +2,118 @@ use powdb_query::executor::Engine;
 use powdb_query::result::QueryResult;
 use powdb_server::protocol::Message;
 use powdb_storage::types::Value;
-use rustyline::DefaultEditor;
-use std::path::Path;
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Editor, Helper};
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::io::{BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
+
+// ─── Tab completion helper ─────────────────────────────────────────────────
+
+const POWQL_KEYWORDS: &[&str] = &[
+    "abs", "alter", "and", "as", "asc", "avg", "between", "bool", "bytes", "case", "cast",
+    "ceil", "coalesce", "concat", "count", "cross", "datetime", "delete", "desc", "distinct",
+    "drop", "else", "end", "exec", "explain", "extract", "false", "filter", "float", "floor",
+    "group", "having", "in", "index", "inner", "insert", "int", "is", "join", "left", "length",
+    "like", "limit", "lower", "max", "min", "not", "now", "null", "offset", "on", "or", "order",
+    "pow", "prepare", "refresh", "required", "round", "sqrt", "str", "substring", "sum", "then",
+    "trim", "true", "type", "union", "update", "upper", "upsert", "uuid", "view", "when", "where",
+];
+
+const META_COMMANDS: &[&str] = &[
+    ".exit", ".help", ".quit", ".schema", ".tables", ".timing",
+];
+
+struct PowqlHelper;
+
+impl Helper for PowqlHelper {}
+
+impl Completer for PowqlHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let (start, word) = find_word_start(line, pos);
+        let lower = word.to_lowercase();
+
+        let mut matches: Vec<Pair> = Vec::new();
+
+        if word.starts_with('.') {
+            // Complete meta-commands
+            for cmd in META_COMMANDS {
+                if cmd.starts_with(&lower) {
+                    matches.push(Pair {
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
+                    });
+                }
+            }
+        } else if !word.is_empty() {
+            // Complete PowQL keywords
+            for kw in POWQL_KEYWORDS {
+                if kw.starts_with(&lower) {
+                    // Preserve the case style of what the user typed
+                    let replacement = if word.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        let mut s = kw.to_string();
+                        s[..1].make_ascii_uppercase();
+                        s
+                    } else {
+                        kw.to_string()
+                    };
+                    matches.push(Pair {
+                        display: kw.to_string(),
+                        replacement,
+                    });
+                }
+            }
+        }
+
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for PowqlHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for PowqlHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Borrowed(hint)
+    }
+}
+
+impl Validator for PowqlHelper {}
+
+fn find_word_start(line: &str, pos: usize) -> (usize, &str) {
+    let bytes = &line.as_bytes()[..pos];
+    let start = bytes
+        .iter()
+        .rposition(|&b| b == b' ' || b == b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    (start, &line[start..pos])
+}
+
+fn history_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".powdb_history")
+}
 
 struct CliArgs {
     data_dir: String,
@@ -60,6 +167,10 @@ fn parse_args() -> CliArgs {
                 }
                 data_dir = argv[i].clone();
             }
+            "--version" | "-V" => {
+                println!("powdb-cli {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("powdb-cli — PowQL interactive shell");
                 println!();
@@ -74,6 +185,7 @@ fn parse_args() -> CliArgs {
                     "    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)"
                 );
                 println!("    -h, --help                 Print this message");
+                println!("    -V, --version              Print version and exit");
                 println!();
                 println!("MODES:");
                 println!("    Embedded (default):  powdb-cli ./mydata");
@@ -132,13 +244,22 @@ fn main() {
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
 fn run_embedded(data_dir: &str) {
-    eprintln!("PowDB v0.1.0 — embedded mode");
+    eprintln!(
+        "PowDB v{} — embedded mode",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("Data directory: {data_dir}");
-    eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
+    eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
 
     let mut engine = Engine::new(Path::new(data_dir)).expect("failed to initialize engine");
 
-    let mut rl = DefaultEditor::new().expect("failed to init readline");
+    let mut rl = Editor::new().expect("failed to init readline");
+    rl.set_helper(Some(PowqlHelper));
+
+    let hist = history_path();
+    rl.load_history(&hist).ok();
+
+    let mut timing_enabled = false;
 
     loop {
         let line = match rl.readline("powql> ") {
@@ -158,19 +279,100 @@ fn run_embedded(data_dir: &str) {
 
         rl.add_history_entry(trimmed).ok();
 
+        // ── Meta-commands ──────────────────────────────────────────────
+        if trimmed.starts_with('.') {
+            match trimmed {
+                ".quit" | ".exit" => break,
+                ".help" => {
+                    println!("Meta-commands:");
+                    println!("  .tables          List all tables");
+                    println!("  .schema <TABLE>  Show columns and types for a table");
+                    println!("  .timing          Toggle query timing on/off");
+                    println!("  .help            Show this help");
+                    println!("  .quit / .exit    Exit the REPL");
+                }
+                ".tables" => {
+                    let tables = engine.catalog().list_tables();
+                    if tables.is_empty() {
+                        println!("(no tables)");
+                    } else {
+                        for t in &tables {
+                            println!("  {t}");
+                        }
+                        println!(
+                            "({} table{})",
+                            tables.len(),
+                            if tables.len() == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                ".timing" => {
+                    timing_enabled = !timing_enabled;
+                    println!(
+                        "Timing is {}.",
+                        if timing_enabled { "on" } else { "off" }
+                    );
+                }
+                cmd if cmd.starts_with(".schema") => {
+                    let table_name = cmd.strip_prefix(".schema").unwrap().trim();
+                    if table_name.is_empty() {
+                        eprintln!("Usage: .schema <TABLE_NAME>");
+                    } else if let Some(schema) = engine.catalog().schema(table_name) {
+                        println!("Table: {}", schema.table_name);
+                        println!(
+                            "  {:<20} {:<12} Required",
+                            "Column", "Type"
+                        );
+                        println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
+                        for col in &schema.columns {
+                            println!(
+                                "  {:<20} {:<12} {}",
+                                col.name,
+                                format!("{:?}", col.type_id),
+                                if col.required { "yes" } else { "no" }
+                            );
+                        }
+                    } else {
+                        eprintln!("Error: table '{table_name}' not found");
+                    }
+                }
+                other => {
+                    eprintln!("Unknown meta-command: {other}");
+                    eprintln!("Type .help for available commands.");
+                }
+            }
+            continue;
+        }
+
+        // ── Execute PowQL query ────────────────────────────────────────
+        let start = Instant::now();
         match engine.execute_powql(trimmed) {
-            Ok(result) => print_local_result(&result),
+            Ok(result) => {
+                print_local_result(&result);
+                if timing_enabled {
+                    let elapsed = start.elapsed();
+                    if elapsed.as_secs() >= 1 {
+                        println!("Time: {:.2}s", elapsed.as_secs_f64());
+                    } else {
+                        println!("Time: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+                    }
+                }
+            }
             Err(e) => eprintln!("Error: {e}"),
         }
     }
 
+    rl.save_history(&hist).ok();
     eprintln!("\nBye!");
 }
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
 
 async fn run_remote(addr: String, db: String, password: Option<String>) {
-    eprintln!("PowDB v0.1.0 — remote mode");
+    eprintln!(
+        "PowDB v{} — remote mode",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("Connecting to {addr} ...");
 
     let stream = match TcpStream::connect(&addr).await {
@@ -223,7 +425,13 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
         }
     }
 
-    let mut rl = DefaultEditor::new().expect("failed to init readline");
+    let mut rl = Editor::new().expect("failed to init readline");
+    rl.set_helper(Some(PowqlHelper));
+
+    let hist = history_path();
+    rl.load_history(&hist).ok();
+
+    let mut timing_enabled = false;
 
     loop {
         let line = match rl.readline("powql> ") {
@@ -243,6 +451,33 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
 
         rl.add_history_entry(trimmed).ok();
 
+        // Handle local-only meta-commands in remote mode
+        if trimmed.starts_with('.') {
+            match trimmed {
+                ".quit" | ".exit" => break,
+                ".timing" => {
+                    timing_enabled = !timing_enabled;
+                    println!(
+                        "Timing is {}.",
+                        if timing_enabled { "on" } else { "off" }
+                    );
+                }
+                ".help" => {
+                    println!("Meta-commands (remote mode):");
+                    println!("  .timing          Toggle query timing on/off");
+                    println!("  .help            Show this help");
+                    println!("  .quit / .exit    Exit the REPL");
+                    println!();
+                    println!("Note: .tables and .schema are only available in embedded mode.");
+                }
+                _ => {
+                    eprintln!("Meta-commands (.tables, .schema) are not supported in remote mode.");
+                    eprintln!("Type .help for available commands.");
+                }
+            }
+            continue;
+        }
+
         let q = Message::Query {
             query: trimmed.to_string(),
         };
@@ -255,8 +490,19 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
             break;
         }
 
+        let start = Instant::now();
         match Message::read_from(&mut reader).await {
-            Ok(Some(msg)) => print_remote_result(&msg),
+            Ok(Some(msg)) => {
+                print_remote_result(&msg);
+                if timing_enabled {
+                    let elapsed = start.elapsed();
+                    if elapsed.as_secs() >= 1 {
+                        println!("Time: {:.2}s", elapsed.as_secs_f64());
+                    } else {
+                        println!("Time: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+                    }
+                }
+            }
             Ok(None) => {
                 eprintln!("server closed connection");
                 break;
@@ -272,6 +518,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     let _ = Message::Disconnect.write_to(&mut writer).await;
     let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
 
+    rl.save_history(&hist).ok();
     eprintln!("\nBye!");
 }
 
@@ -374,8 +621,12 @@ fn format_value(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Str(s) => s.clone(),
         Value::DateTime(t) => format!("{t}"),
-        Value::Uuid(u) => format!("{:02x}{:02x}{:02x}{:02x}-...", u[0], u[1], u[2], u[3]),
+        Value::Uuid(u) => format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+            u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+        ),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
-        Value::Empty => "{}".into(),
+        Value::Empty => "NULL".into(),
     }
 }
