@@ -419,9 +419,8 @@ impl HeapFile {
                 // Bounds check: validate slot_index against the page's
                 // actual slot count to prevent OOB reads from stale/invalid
                 // RowIds.
-                let slot_count = u16::from_le_bytes(
-                    page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap(),
-                );
+                let slot_count =
+                    u16::from_le_bytes(page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap());
                 if rid.slot_index >= slot_count {
                     return None;
                 }

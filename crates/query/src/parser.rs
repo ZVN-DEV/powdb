@@ -93,7 +93,10 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     // they wrote isn't recognized.
     if !matches!(parser.peek(), Token::Eof) {
         return Err(ParseError::Syntax {
-            message: format!("unexpected trailing token: {}", parser.peek().display_name()),
+            message: format!(
+                "unexpected trailing token: {}",
+                parser.peek().display_name()
+            ),
         });
     }
     Ok(stmt)
@@ -1674,7 +1677,10 @@ impl Parser {
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
             _ => Err(ParseError::Syntax {
-                message: format!("expected query after UNION, got {}", self.peek().display_name()),
+                message: format!(
+                    "expected query after UNION, got {}",
+                    self.peek().display_name()
+                ),
             }),
         }
     }

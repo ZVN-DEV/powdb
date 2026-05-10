@@ -17,18 +17,83 @@ use tracing_subscriber::EnvFilter;
 // ─── Tab completion helper ─────────────────────────────────────────────────
 
 const POWQL_KEYWORDS: &[&str] = &[
-    "abs", "alter", "and", "as", "asc", "avg", "between", "bool", "bytes", "case", "cast",
-    "ceil", "coalesce", "concat", "count", "cross", "datetime", "delete", "desc", "distinct",
-    "drop", "else", "end", "exec", "explain", "extract", "false", "filter", "float", "floor",
-    "group", "having", "in", "index", "inner", "insert", "int", "is", "join", "left", "length",
-    "like", "limit", "lower", "max", "min", "not", "now", "null", "offset", "on", "or", "order",
-    "pow", "prepare", "refresh", "required", "round", "sqrt", "str", "substring", "sum", "then",
-    "trim", "true", "type", "union", "update", "upper", "upsert", "uuid", "view", "when", "where",
+    "abs",
+    "alter",
+    "and",
+    "as",
+    "asc",
+    "avg",
+    "between",
+    "bool",
+    "bytes",
+    "case",
+    "cast",
+    "ceil",
+    "coalesce",
+    "concat",
+    "count",
+    "cross",
+    "datetime",
+    "delete",
+    "desc",
+    "distinct",
+    "drop",
+    "else",
+    "end",
+    "exec",
+    "explain",
+    "extract",
+    "false",
+    "filter",
+    "float",
+    "floor",
+    "group",
+    "having",
+    "in",
+    "index",
+    "inner",
+    "insert",
+    "int",
+    "is",
+    "join",
+    "left",
+    "length",
+    "like",
+    "limit",
+    "lower",
+    "max",
+    "min",
+    "not",
+    "now",
+    "null",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "pow",
+    "prepare",
+    "refresh",
+    "required",
+    "round",
+    "sqrt",
+    "str",
+    "substring",
+    "sum",
+    "then",
+    "trim",
+    "true",
+    "type",
+    "union",
+    "update",
+    "upper",
+    "upsert",
+    "uuid",
+    "view",
+    "when",
+    "where",
 ];
 
-const META_COMMANDS: &[&str] = &[
-    ".exit", ".help", ".quit", ".schema", ".tables", ".timing",
-];
+const META_COMMANDS: &[&str] = &[".exit", ".help", ".quit", ".schema", ".tables", ".timing"];
 
 struct PowqlHelper;
 
@@ -244,10 +309,7 @@ fn main() {
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
 fn run_embedded(data_dir: &str) {
-    eprintln!(
-        "PowDB v{} — embedded mode",
-        env!("CARGO_PKG_VERSION")
-    );
+    eprintln!("PowDB v{} — embedded mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Data directory: {data_dir}");
     eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
 
@@ -308,10 +370,7 @@ fn run_embedded(data_dir: &str) {
                 }
                 ".timing" => {
                     timing_enabled = !timing_enabled;
-                    println!(
-                        "Timing is {}.",
-                        if timing_enabled { "on" } else { "off" }
-                    );
+                    println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
                 }
                 cmd if cmd.starts_with(".schema") => {
                     let table_name = cmd.strip_prefix(".schema").unwrap().trim();
@@ -319,10 +378,7 @@ fn run_embedded(data_dir: &str) {
                         eprintln!("Usage: .schema <TABLE_NAME>");
                     } else if let Some(schema) = engine.catalog().schema(table_name) {
                         println!("Table: {}", schema.table_name);
-                        println!(
-                            "  {:<20} {:<12} Required",
-                            "Column", "Type"
-                        );
+                        println!("  {:<20} {:<12} Required", "Column", "Type");
                         println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
                         for col in &schema.columns {
                             println!(
@@ -378,10 +434,7 @@ fn run_embedded(data_dir: &str) {
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
 
 async fn run_remote(addr: String, db: String, password: Option<String>) {
-    eprintln!(
-        "PowDB v{} — remote mode",
-        env!("CARGO_PKG_VERSION")
-    );
+    eprintln!("PowDB v{} — remote mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Connecting to {addr} ...");
 
     let stream = match TcpStream::connect(&addr).await {
@@ -466,10 +519,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
                 ".quit" | ".exit" => break,
                 ".timing" => {
                     timing_enabled = !timing_enabled;
-                    println!(
-                        "Timing is {}.",
-                        if timing_enabled { "on" } else { "off" }
-                    );
+                    println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
                 }
                 ".help" => {
                     println!("Meta-commands (remote mode):");

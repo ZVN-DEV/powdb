@@ -221,15 +221,13 @@ async fn main() {
 
     // Build TLS acceptor if both cert and key are provided.
     let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
-        (Some(cert), Some(key)) => {
-            match build_tls_acceptor(cert, key) {
-                Ok(acceptor) => Some(acceptor),
-                Err(e) => {
-                    error!(error = %e, "failed to configure TLS");
-                    std::process::exit(1);
-                }
+        (Some(cert), Some(key)) => match build_tls_acceptor(cert, key) {
+            Ok(acceptor) => Some(acceptor),
+            Err(e) => {
+                error!(error = %e, "failed to configure TLS");
+                std::process::exit(1);
             }
-        }
+        },
         (Some(_), None) => {
             error!("--tls-cert provided without --tls-key");
             std::process::exit(2);

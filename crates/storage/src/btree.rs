@@ -900,10 +900,7 @@ impl BTree {
         if file_size > 512 * 1024 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "btree file too large: {} bytes (limit 512MB)",
-                    file_size
-                ),
+                format!("btree file too large: {} bytes (limit 512MB)", file_size),
             ));
         }
         let mut buf = Vec::new();
@@ -930,9 +927,7 @@ impl BTree {
         if n_nodes > 10_000_000 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "btree file corrupt: unreasonable node count {n_nodes} (limit 10M)"
-                ),
+                format!("btree file corrupt: unreasonable node count {n_nodes} (limit 10M)"),
             ));
         }
 

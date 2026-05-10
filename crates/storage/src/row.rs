@@ -274,17 +274,13 @@ pub fn try_encode_row_into_with_layout(
     if total_size > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "row too large: {total_size} bytes exceeds 64KB limit"
-            ),
+            format!("row too large: {total_size} bytes exceeds 64KB limit"),
         ));
     }
     if var_data_size > u16::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "row too large: variable data is {var_data_size} bytes, exceeds 64KB limit"
-            ),
+            format!("row too large: variable data is {var_data_size} bytes, exceeds 64KB limit"),
         ));
     }
 

@@ -27,7 +27,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.3.0";
+export const CLIENT_VERSION = "0.3.1";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -505,6 +505,12 @@ export class Client extends EventEmitter<ClientEvents> {
 
       // Advance past the consumed bytes without copying the trailing data.
       this.consume(decoded.consumed);
+
+      // Handle Ping frames: auto-reply with Pong and continue decoding.
+      if (decoded.msg.type === "Ping") {
+        this.socket.write(encode({ type: "Pong" }));
+        continue;
+      }
 
       // Find the next non-settled pending entry and hand it the reply.
       // Settled entries at the head were aborted by the caller but their

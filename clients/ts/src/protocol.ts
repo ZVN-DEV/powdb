@@ -15,6 +15,8 @@ export const MSG_RESULT_SCALAR = 0x08;
 export const MSG_RESULT_OK = 0x09;
 export const MSG_ERROR = 0x0a;
 export const MSG_DISCONNECT = 0x10;
+export const MSG_PING = 0x11;
+export const MSG_PONG = 0x12;
 
 // ───── Size limits (mirror crates/server/src/protocol.rs) ──────────────────
 
@@ -35,7 +37,9 @@ export type Message =
   | { type: "ResultScalar"; value: string }
   | { type: "ResultOk"; affected: bigint }
   | { type: "Error"; message: string }
-  | { type: "Disconnect" };
+  | { type: "Disconnect" }
+  | { type: "Ping" }
+  | { type: "Pong" };
 
 // ───── Encoding ────────────────────────────────────────────────────────────
 
@@ -91,6 +95,14 @@ export function encode(msg: Message): Buffer {
     case "Disconnect":
       payload = Buffer.alloc(0);
       msgType = MSG_DISCONNECT;
+      break;
+    case "Ping":
+      payload = Buffer.alloc(0);
+      msgType = MSG_PING;
+      break;
+    case "Pong":
+      payload = Buffer.alloc(0);
+      msgType = MSG_PONG;
       break;
   }
 
@@ -182,6 +194,10 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       return { type: "Error", message: decodeString(payload, cursor) };
     case MSG_DISCONNECT:
       return { type: "Disconnect" };
+    case MSG_PING:
+      return { type: "Ping" };
+    case MSG_PONG:
+      return { type: "Pong" };
     default:
       throw new Error(`unknown message type: 0x${msgType.toString(16)}`);
   }

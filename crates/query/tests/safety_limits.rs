@@ -88,8 +88,14 @@ fn display_name_covers_common_tokens() {
 
     assert_eq!(Token::IntLit(42).display_name(), "number 42");
     assert_eq!(Token::FloatLit(3.14).display_name(), "decimal number 3.14");
-    assert_eq!(Token::StringLit("hi".into()).display_name(), "string \"hi\"");
-    assert_eq!(Token::Ident("User".into()).display_name(), "identifier 'User'");
+    assert_eq!(
+        Token::StringLit("hi".into()).display_name(),
+        "string \"hi\""
+    );
+    assert_eq!(
+        Token::Ident("User".into()).display_name(),
+        "identifier 'User'"
+    );
     assert_eq!(Token::Filter.display_name(), "'filter'");
     assert_eq!(Token::Comma.display_name(), "','");
     assert_eq!(Token::Eof.display_name(), "end of input");

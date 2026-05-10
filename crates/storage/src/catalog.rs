@@ -23,9 +23,7 @@ fn validate_identifier(kind: &str, name: &str) -> io::Result<()> {
     if !first.is_ascii_alphabetic() && first != '_' {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "invalid {kind} name '{name}': must start with a letter or underscore"
-            ),
+            format!("invalid {kind} name '{name}': must start with a letter or underscore"),
         ));
     }
     for ch in chars {
