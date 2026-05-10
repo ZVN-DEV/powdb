@@ -30,6 +30,16 @@ pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
 /// `plan_cache::PlanCache::insert`).
 const PLAN_CACHE_CAPACITY: usize = 256;
 
+/// Maximum number of rows a join may produce before the executor aborts.
+/// Prevents Cartesian-product blowups (e.g. `T cross join T` on 10K rows
+/// would produce 100M rows in memory without this cap).
+const MAX_JOIN_ROWS: usize = 1_000_000;
+
+/// Maximum number of rows that may be materialized for sorting.
+/// Queries that exceed this should add a LIMIT clause to narrow the input
+/// before sorting.
+const MAX_SORT_ROWS: usize = 10_000_000;
+
 // ─── Mission D11 Phase 1: scalar hot-loop helpers ─────────────────────────
 //
 // These macros expand into the scan body of `agg_single_col_fast` and sit
@@ -989,6 +999,12 @@ impl Engine {
                 let result = self.execute_plan_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
+                        if rows.len() > MAX_SORT_ROWS {
+                            return Err(format!(
+                                "sort input exceeds {} row limit — add a LIMIT clause",
+                                MAX_SORT_ROWS
+                            ));
+                        }
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
@@ -1348,7 +1364,7 @@ impl Engine {
                         if let Some((l_idx, r_idx)) =
                             try_extract_equi_join_keys(pred, &left_columns, &right_columns)
                         {
-                            return Ok(hash_join(
+                            let result = hash_join(
                                 left_columns,
                                 left_rows,
                                 right_columns,
@@ -1356,7 +1372,16 @@ impl Engine {
                                 l_idx,
                                 r_idx,
                                 *kind,
-                            ));
+                            );
+                            if let QueryResult::Rows { ref rows, .. } = result {
+                                if rows.len() > MAX_JOIN_ROWS {
+                                    return Err(format!(
+                                        "join result exceeds {} row limit",
+                                        MAX_JOIN_ROWS
+                                    ));
+                                }
+                            }
+                            return Ok(result);
                         }
                     }
                 }
@@ -1388,6 +1413,12 @@ impl Engine {
                         };
                         if keep {
                             rows.push(combined.clone());
+                            if rows.len() > MAX_JOIN_ROWS {
+                                return Err(format!(
+                                    "join result exceeds {} row limit",
+                                    MAX_JOIN_ROWS
+                                ));
+                            }
                             matched = true;
                         }
                     }
@@ -1396,6 +1427,12 @@ impl Engine {
                         row.extend_from_slice(left_row);
                         row.resize(n_left + n_right, Value::Empty);
                         rows.push(row);
+                        if rows.len() > MAX_JOIN_ROWS {
+                            return Err(format!(
+                                "join result exceeds {} row limit",
+                                MAX_JOIN_ROWS
+                            ));
+                        }
                     }
                 }
 
@@ -2551,6 +2588,12 @@ impl Engine {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
+                        if rows.len() > MAX_SORT_ROWS {
+                            return Err(format!(
+                                "sort input exceeds {} row limit — add a LIMIT clause",
+                                MAX_SORT_ROWS
+                            ));
+                        }
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
@@ -3330,7 +3373,7 @@ impl Engine {
                         if let Some((l_idx, r_idx)) =
                             try_extract_equi_join_keys(pred, &left_columns, &right_columns)
                         {
-                            return Ok(hash_join(
+                            let result = hash_join(
                                 left_columns,
                                 left_rows,
                                 right_columns,
@@ -3338,7 +3381,16 @@ impl Engine {
                                 l_idx,
                                 r_idx,
                                 *kind,
-                            ));
+                            );
+                            if let QueryResult::Rows { ref rows, .. } = result {
+                                if rows.len() > MAX_JOIN_ROWS {
+                                    return Err(format!(
+                                        "join result exceeds {} row limit",
+                                        MAX_JOIN_ROWS
+                                    ));
+                                }
+                            }
+                            return Ok(result);
                         }
                     }
                 }
@@ -3376,6 +3428,12 @@ impl Engine {
                         };
                         if keep {
                             rows.push(combined.clone());
+                            if rows.len() > MAX_JOIN_ROWS {
+                                return Err(format!(
+                                    "join result exceeds {} row limit",
+                                    MAX_JOIN_ROWS
+                                ));
+                            }
                             matched = true;
                         }
                     }
@@ -3384,6 +3442,12 @@ impl Engine {
                         row.extend_from_slice(left_row);
                         row.resize(n_left + n_right, Value::Empty);
                         rows.push(row);
+                        if rows.len() > MAX_JOIN_ROWS {
+                            return Err(format!(
+                                "join result exceeds {} row limit",
+                                MAX_JOIN_ROWS
+                            ));
+                        }
                     }
                 }
 

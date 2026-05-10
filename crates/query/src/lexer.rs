@@ -1,5 +1,9 @@
 use crate::token::Token;
 
+/// Maximum allowed length for a string literal (16 MB).
+/// Prevents unbounded memory consumption from queries with multi-gigabyte strings.
+const MAX_STRING_LITERAL: usize = 16 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct LexError {
     pub message: String,
@@ -101,6 +105,15 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 });
             }
             pos += 1; // closing quote
+            if s.len() > MAX_STRING_LITERAL {
+                return Err(LexError {
+                    message: format!(
+                        "string literal exceeds maximum size of {}MB",
+                        MAX_STRING_LITERAL / (1024 * 1024)
+                    ),
+                    position: pos,
+                });
+            }
             tokens.push(Token::StringLit(s));
             continue;
         }

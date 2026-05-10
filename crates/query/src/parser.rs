@@ -93,7 +93,7 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     // they wrote isn't recognized.
     if !matches!(parser.peek(), Token::Eof) {
         return Err(ParseError::Syntax {
-            message: format!("unexpected trailing token: {:?}", parser.peek()),
+            message: format!("unexpected trailing token: {}", parser.peek().display_name()),
         });
     }
     Ok(stmt)
@@ -164,8 +164,8 @@ impl Parser {
             Ok(())
         } else {
             Err(ParseError::UnexpectedToken {
-                expected: format!("{expected:?}"),
-                got: format!("{t:?}"),
+                expected: expected.display_name(),
+                got: t.display_name(),
             })
         }
     }
@@ -174,7 +174,7 @@ impl Parser {
     fn unexpected(&self, expected: &str, got: &Token) -> ParseError {
         ParseError::UnexpectedToken {
             expected: expected.into(),
-            got: format!("{got:?}"),
+            got: got.display_name(),
         }
     }
 
@@ -218,7 +218,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -473,7 +473,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "type name after join".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     });
                 }
             };
@@ -506,7 +506,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -525,7 +525,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -535,7 +535,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: ".key_column".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -564,7 +564,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "field name".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     })
                 }
             };
@@ -763,7 +763,7 @@ impl Parser {
                     _ => {
                         return Err(ParseError::UnexpectedToken {
                             expected: "field".into(),
-                            got: format!("{first:?}"),
+                            got: first.display_name(),
                         })
                     }
                 };
@@ -847,7 +847,7 @@ impl Parser {
             },
             t => Err(ParseError::UnexpectedToken {
                 expected: "string literal for cast type".into(),
-                got: format!("{t:?}"),
+                got: t.display_name(),
             }),
         }
     }
@@ -860,7 +860,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: ".field after order".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     })
                 }
             };
@@ -895,7 +895,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "aggregate function".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -910,7 +910,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1465,7 +1465,7 @@ impl Parser {
                 Ok(Expr::Case { whens, else_expr })
             }
             t => Err(ParseError::Syntax {
-                message: format!("unexpected token in expression: {t:?}"),
+                message: format!("unexpected token in expression: {}", t.display_name()),
             }),
         }
     }
@@ -1479,7 +1479,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "table name after alter".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1494,7 +1494,7 @@ impl Parser {
                         t => {
                             return Err(ParseError::UnexpectedToken {
                                 expected: ".<column> after add index".into(),
-                                got: format!("{t:?}"),
+                                got: t.display_name(),
                             })
                         }
                     };
@@ -1518,7 +1518,7 @@ impl Parser {
                     t => {
                         return Err(ParseError::UnexpectedToken {
                             expected: "column name".into(),
-                            got: format!("{t:?}"),
+                            got: t.display_name(),
                         })
                     }
                 };
@@ -1528,7 +1528,7 @@ impl Parser {
                     t => {
                         return Err(ParseError::UnexpectedToken {
                             expected: "type name".into(),
-                            got: format!("{t:?}"),
+                            got: t.display_name(),
                         })
                     }
                 };
@@ -1552,7 +1552,7 @@ impl Parser {
                     t => {
                         return Err(ParseError::UnexpectedToken {
                             expected: "column name".into(),
-                            got: format!("{t:?}"),
+                            got: t.display_name(),
                         })
                     }
                 };
@@ -1563,7 +1563,7 @@ impl Parser {
             }
             t => Err(ParseError::UnexpectedToken {
                 expected: "add or drop after alter <table>".into(),
-                got: format!("{t:?}"),
+                got: t.display_name(),
             }),
         }
     }
@@ -1578,7 +1578,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "view name after drop view".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     })
                 }
             };
@@ -1589,7 +1589,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "table name after drop".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1607,7 +1607,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "view name after materialize".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1619,7 +1619,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "source table name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1674,7 +1674,7 @@ impl Parser {
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
             _ => Err(ParseError::Syntax {
-                message: format!("expected query after UNION, got {:?}", self.peek()),
+                message: format!("expected query after UNION, got {}", self.peek().display_name()),
             }),
         }
     }
@@ -1687,7 +1687,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "view name after refresh".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1701,7 +1701,7 @@ impl Parser {
             t => {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
-                    got: format!("{t:?}"),
+                    got: t.display_name(),
                 })
             }
         };
@@ -1719,7 +1719,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "field name".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     })
                 }
             };
@@ -1729,7 +1729,7 @@ impl Parser {
                 t => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "type name".into(),
-                        got: format!("{t:?}"),
+                        got: t.display_name(),
                     })
                 }
             };
