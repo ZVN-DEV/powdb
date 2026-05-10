@@ -40,6 +40,14 @@ const MAX_JOIN_ROWS: usize = 1_000_000;
 /// before sorting.
 const MAX_SORT_ROWS: usize = 10_000_000;
 
+#[inline]
+fn check_join_limit(row_count: usize) -> Result<(), String> {
+    if row_count > MAX_JOIN_ROWS {
+        return Err(format!("join result exceeds {} row limit", MAX_JOIN_ROWS));
+    }
+    Ok(())
+}
+
 // ─── Mission D11 Phase 1: scalar hot-loop helpers ─────────────────────────
 //
 // These macros expand into the scan body of `agg_single_col_fast` and sit
@@ -1374,12 +1382,7 @@ impl Engine {
                                 *kind,
                             );
                             if let QueryResult::Rows { ref rows, .. } = result {
-                                if rows.len() > MAX_JOIN_ROWS {
-                                    return Err(format!(
-                                        "join result exceeds {} row limit",
-                                        MAX_JOIN_ROWS
-                                    ));
-                                }
+                                check_join_limit(rows.len())?;
                             }
                             return Ok(result);
                         }
@@ -1413,12 +1416,7 @@ impl Engine {
                         };
                         if keep {
                             rows.push(combined.clone());
-                            if rows.len() > MAX_JOIN_ROWS {
-                                return Err(format!(
-                                    "join result exceeds {} row limit",
-                                    MAX_JOIN_ROWS
-                                ));
-                            }
+                            check_join_limit(rows.len())?;
                             matched = true;
                         }
                     }
@@ -1427,12 +1425,7 @@ impl Engine {
                         row.extend_from_slice(left_row);
                         row.resize(n_left + n_right, Value::Empty);
                         rows.push(row);
-                        if rows.len() > MAX_JOIN_ROWS {
-                            return Err(format!(
-                                "join result exceeds {} row limit",
-                                MAX_JOIN_ROWS
-                            ));
-                        }
+                        check_join_limit(rows.len())?;
                     }
                 }
 
@@ -3383,12 +3376,7 @@ impl Engine {
                                 *kind,
                             );
                             if let QueryResult::Rows { ref rows, .. } = result {
-                                if rows.len() > MAX_JOIN_ROWS {
-                                    return Err(format!(
-                                        "join result exceeds {} row limit",
-                                        MAX_JOIN_ROWS
-                                    ));
-                                }
+                                check_join_limit(rows.len())?;
                             }
                             return Ok(result);
                         }
@@ -3428,12 +3416,7 @@ impl Engine {
                         };
                         if keep {
                             rows.push(combined.clone());
-                            if rows.len() > MAX_JOIN_ROWS {
-                                return Err(format!(
-                                    "join result exceeds {} row limit",
-                                    MAX_JOIN_ROWS
-                                ));
-                            }
+                            check_join_limit(rows.len())?;
                             matched = true;
                         }
                     }
@@ -3442,12 +3425,7 @@ impl Engine {
                         row.extend_from_slice(left_row);
                         row.resize(n_left + n_right, Value::Empty);
                         rows.push(row);
-                        if rows.len() > MAX_JOIN_ROWS {
-                            return Err(format!(
-                                "join result exceeds {} row limit",
-                                MAX_JOIN_ROWS
-                            ));
-                        }
+                        check_join_limit(rows.len())?;
                     }
                 }
 

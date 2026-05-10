@@ -328,7 +328,16 @@ fn run_embedded(data_dir: &str) {
                             println!(
                                 "  {:<20} {:<12} {}",
                                 col.name,
-                                format!("{:?}", col.type_id),
+                                match col.type_id {
+                                    powdb_storage::types::TypeId::Int => "int",
+                                    powdb_storage::types::TypeId::Float => "float",
+                                    powdb_storage::types::TypeId::Bool => "bool",
+                                    powdb_storage::types::TypeId::Str => "str",
+                                    powdb_storage::types::TypeId::DateTime => "datetime",
+                                    powdb_storage::types::TypeId::Uuid => "uuid",
+                                    powdb_storage::types::TypeId::Bytes => "bytes",
+                                    powdb_storage::types::TypeId::Empty => "empty",
+                                },
                                 if col.required { "yes" } else { "no" }
                             );
                         }
