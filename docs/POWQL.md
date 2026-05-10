@@ -1,8 +1,6 @@
 # PowQL Language Reference
 
-PowQL is the query language for PowDB, a high-performance embedded database written in Rust. PowQL is designed to be modern, concise, and pipeline-oriented while remaining immediately familiar to anyone who knows SQL.
-
-PowDB beats SQLite on all 15 benchmark workloads (1.2x--10x faster). PowQL is at SQL parity for core operations.
+PowQL is the query language for PowDB, a Rust-native embedded database with compiled query execution. PowQL is designed to be modern, concise, and pipeline-oriented while remaining immediately familiar to anyone who knows SQL.
 
 ---
 
@@ -21,9 +19,12 @@ PowDB beats SQLite on all 15 benchmark workloads (1.2x--10x faster). PowQL is at
 11. [Mutations](#mutations)
 12. [DDL](#ddl)
 13. [Materialized Views](#materialized-views)
-14. [Prepared Queries](#prepared-queries)
-15. [Type System](#type-system)
-16. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+14. [Window Functions](#window-functions)
+15. [UPSERT](#upsert)
+16. [EXPLAIN](#explain)
+17. [Prepared Queries](#prepared-queries)
+18. [Type System](#type-system)
+19. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -716,6 +717,95 @@ User { info: concat(.name, " age=", .age) }
 -- "Alice age=30"
 ```
 
+### Math Functions
+
+#### abs
+
+Return the absolute value of a number:
+
+```
+User { .name, abs_score: abs(.score) }
+```
+
+#### round
+
+Round a float to the nearest integer (or to N decimal places with a second argument):
+
+```
+User { .name, rounded: round(.score) }
+User { .name, rounded: round(.score, 2) }
+```
+
+#### ceil / floor
+
+Round up or down to the nearest integer:
+
+```
+User { .name, up: ceil(.score), down: floor(.score) }
+```
+
+#### sqrt
+
+Return the square root:
+
+```
+User { .name, root: sqrt(.score) }
+```
+
+#### pow
+
+Raise a value to a power:
+
+```
+User { .name, squared: pow(.score, 2) }
+```
+
+### Date/Time Functions
+
+#### now
+
+Return the current timestamp as a datetime value:
+
+```
+insert Event { name := "login", ts := now() }
+```
+
+#### extract
+
+Extract a component from a datetime value. Supported components: `year`, `month`, `day`, `hour`, `minute`, `second`:
+
+```
+Event { .name, yr: extract("year", .ts) }
+Event filter extract("month", .created_at) = 6
+```
+
+#### date_add
+
+Add a duration to a datetime value. Units: `years`, `months`, `days`, `hours`, `minutes`, `seconds`:
+
+```
+Event { .name, next_week: date_add(.ts, 7, "days") }
+```
+
+#### date_diff
+
+Return the difference between two datetime values in the specified unit:
+
+```
+Event { .name, age_days: date_diff(.created_at, now(), "days") }
+```
+
+### CAST
+
+Convert a value to a different type:
+
+```
+User { .name, age_str: cast(.age as str) }
+User filter cast(.score as int) > 50
+```
+
+Supported target types: `int`, `float`, `str`, `bool`.
+
 ### CASE WHEN
 
 Conditional expression with multiple branches:
@@ -894,6 +984,77 @@ drop view OldUsers
 ```
 
 Note: `drop view` removes the view. Plain `drop` (without `view`) drops a table.
+
+---
+
+## Window Functions
+
+Window functions compute a value for each row based on a window of rows. They do not reduce the number of rows.
+
+### Syntax
+
+```
+<Table> { .field, <func> over (partition .key order .sort_key) }
+```
+
+### ROW_NUMBER
+
+Assign a sequential number to each row within its partition:
+
+```
+User { .name, .dept, rn: row_number() over (partition .dept order .age) }
+```
+
+### RANK / DENSE_RANK
+
+Assign a rank based on the ORDER BY expression. `RANK` leaves gaps for ties; `DENSE_RANK` does not:
+
+```
+User { .name, r: rank() over (order .score desc) }
+User { .name, dr: dense_rank() over (partition .dept order .score desc) }
+```
+
+### Aggregate Windows
+
+SUM, AVG, MIN, MAX can be used as window functions:
+
+```
+User { .name, .salary, dept_avg: avg(.salary) over (partition .dept) }
+User { .name, running_total: sum(.amount) over (order .date) }
+```
+
+---
+
+## UPSERT
+
+Insert a row or update it if a conflict occurs on a specified column.
+
+### Syntax
+
+```
+upsert <Table> { <assignments> } on conflict .<column> update { <assignments> }
+```
+
+### Examples
+
+```
+upsert User { name := "Alice", email := "alice@example.com", age := 30 }
+  on conflict .email update { age := 30 }
+```
+
+If a row with `email = "alice@example.com"` already exists, the `age` field is updated instead of inserting a duplicate.
+
+---
+
+## EXPLAIN
+
+Inspect the query plan without executing it:
+
+```
+explain User filter .age > 25 order .age desc limit 10 { .name, .age }
+```
+
+Returns the plan tree that the executor would run. Useful for understanding whether indexes are being used and how the engine structures a query.
 
 ---
 

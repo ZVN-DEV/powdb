@@ -4,9 +4,16 @@ PowDB is a high-performance database engine with its own query language called P
 
 ---
 
-## 1. Install from Source
+## 1. Install
 
-PowDB is written in Rust. You need Rust 1.80 or newer. If you don't have it, install it from [rustup.rs](https://rustup.rs/).
+The easiest way to install PowDB is from crates.io:
+
+```bash
+cargo install powdb-cli
+cargo install powdb-server
+```
+
+Or build from source (requires Rust 1.80+; install from [rustup.rs](https://rustup.rs/) if needed):
 
 ```bash
 git clone https://github.com/zvndev/powdb.git
@@ -16,6 +23,12 @@ cargo build --release
 
 This builds the CLI, server, query engine, and storage engine.
 
+Check that installation worked:
+
+```bash
+powdb-cli --version
+```
+
 ---
 
 ## 2. Start the REPL
@@ -23,13 +36,15 @@ This builds the CLI, server, query engine, and storage engine.
 Launch the interactive PowQL shell:
 
 ```bash
+powdb-cli
+# or from source:
 cargo run --release -p powdb-cli
 ```
 
 You should see:
 
 ```
-PowDB v0.1.0 — embedded mode
+PowDB v0.1.2 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit.
 
@@ -127,11 +142,11 @@ Output:
  Diana   | diana@example.com    | 28
  Eve     | eve@example.com      | 22
  Frank   | frank@example.com    | 40
- Grace   | grace@example.com    | {}
+ Grace   | grace@example.com    | NULL
 (7 rows)
 ```
 
-The `{}` for Grace's age means null (she was inserted without an age).
+The `NULL` for Grace's age means null (she was inserted without an age).
 
 ### Filter rows
 
@@ -172,7 +187,7 @@ Output:
  Diana   | 28
  Eve     | 22
  Frank   | 40
- Grace   | {}
+ Grace   | NULL
 (7 rows)
 ```
 
@@ -381,7 +396,7 @@ Output:
  Charlie | 35
  Diana   | 28
  Frank   | 40
- Grace   | {}
+ Grace   | NULL
 (6 rows)
 ```
 
@@ -402,6 +417,8 @@ So far we've been running PowDB in embedded mode -- the CLI talks directly to th
 In one terminal:
 
 ```bash
+powdb-server --port 5433 --data-dir ./powdb_data
+# or from source:
 cargo run --release -p powdb-server -- --port 5433 --data-dir ./powdb_data
 ```
 
@@ -416,15 +433,17 @@ powdb server listening addr=127.0.0.1:5433 data_dir=./powdb_data auth=false ...
 In another terminal, connect with the CLI in remote mode:
 
 ```bash
+powdb-cli --remote localhost:5433
+# or from source:
 cargo run --release -p powdb-cli -- --remote localhost:5433
 ```
 
 Output:
 
 ```
-PowDB v0.1.0 — remote mode
+PowDB v0.1.2 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `main` (server v0.1.0)
+Connected to db `main` (server v0.1.2)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>
@@ -434,17 +453,15 @@ From here, everything works exactly the same as embedded mode. The server handle
 
 ### Password authentication
 
-To require a password:
+To require a password, set the `POWDB_PASSWORD` environment variable:
 
 ```bash
 # Start the server with a password
-cargo run --release -p powdb-server -- --password mysecret
+POWDB_PASSWORD=mysecret powdb-server
 
 # Connect with the password
-cargo run --release -p powdb-cli -- --remote localhost:5433 --password mysecret
+powdb-cli --remote localhost:5433 --password mysecret
 ```
-
-You can also set the password via the `POWDB_PASSWORD` environment variable.
 
 ---
 

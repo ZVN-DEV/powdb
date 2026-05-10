@@ -1,24 +1,58 @@
 # PowDB
 
-A database engine that removes the SQL translation tier. **3--9x faster than SQLite** on every workload we measure.
+A Rust-native embedded database with compiled query execution and PowQL -- a query language designed for how developers actually think.
 
-Most databases spend 22--42x more work *translating your query* than actually doing it. PowDB eliminates that overhead with PowQL -- a query language designed so the parser's AST **is already a plan tree**. No rewriting, no cost-based planning, no bytecode interpreter. A point lookup parses in ~200ns, plans in ~100ns, and executes in ~1,200ns.
+PowDB compiles filter expressions into byte-level operations that skip full row decoding, producing 3-10x speedups over SQLite on aggregate and scan workloads. Its pipeline query language (PowQL) reads left to right -- no `SELECT ... FROM ... WHERE` juggling -- and the engine is pure Rust end-to-end, no C FFI required.
 
-## Benchmark: PowDB vs SQLite (50K rows, M1)
+## Why PowQL?
 
-| Workload | PowDB | SQLite | Speedup |
+PowQL replaces SQL's inside-out clause structure with a left-to-right pipeline. You name the table, chain operations, and project fields -- all in reading order.
+
+| Task | SQL | PowQL |
+|---|---|---|
+| Filter + project | `SELECT name, age FROM User WHERE age > 25` | `User filter .age > 25 { .name, .age }` |
+| Sort + limit | `SELECT * FROM User ORDER BY age DESC LIMIT 10` | `User order .age desc limit 10` |
+| Aggregate with filter | `SELECT AVG(age) FROM User WHERE city = 'NYC'` | `avg(User filter .city = "NYC" { .age })` |
+| Group + having | `SELECT status, COUNT(*) FROM User GROUP BY status HAVING COUNT(*) > 5` | `User group .status having count(*) > 5 { .status, count(*) }` |
+
+PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
+
+Full language reference: [docs/POWQL.md](docs/POWQL.md) | Getting started: [docs/getting-started.md](docs/getting-started.md)
+
+## Install
+
+```bash
+# Install from crates.io
+cargo install powdb-cli
+cargo install powdb-server
+
+# Or build from source
+git clone https://github.com/zvndev/powdb
+cd powdb
+cargo build --release
+```
+
+Requires Rust stable (1.80+). This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks.
+
+## Benchmark: PowDB vs SQLite (100K rows, M1)
+
+PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. Write performance is an active area of improvement.
+
+| Workload | PowDB | SQLite | Result |
 |---|---|---|---|
-| Indexed point lookup | 90 ns | 293 ns | **3.2x** |
-| Scan + filter + count | 311 us | 1,964 us | **6.3x** |
-| Scan + filter + sort + limit 10 | 2.5 ms | 9.9 ms | **4.0x** |
-| Aggregate SUM | 218 us | 1,884 us | **8.6x** |
-| Aggregate MIN | 250 us | 2,352 us | **9.4x** |
-| Multi-column AND filter | 1.8 ms | 4.7 ms | **2.5x** |
-| Single-row insert | 346 ns | 901 ns | **2.6x** |
-| Update by primary key | 50 ns | 416 ns | **8.3x** |
-| Update by filter (10K rows) | 2.4 ms | 7.1 ms | **3.0x** |
+| Scan + filter + count | 311 us | 1,964 us | **6.3x faster** |
+| Aggregate SUM | 218 us | 1,884 us | **8.6x faster** |
+| Aggregate MIN | 250 us | 2,352 us | **9.4x faster** |
+| Scan + filter + sort + limit 10 | 2.5 ms | 9.9 ms | **4.0x faster** |
+| Multi-column AND filter | 1.8 ms | 4.7 ms | **2.5x faster** |
+| Indexed point lookup | 90 ns | 293 ns | **3.2x faster** |
+| Update by primary key | 50 ns | 416 ns | **8.3x faster** |
+| Update by filter (10K rows) | 2.4 ms | 7.1 ms | **3.0x faster** |
+| Single-row insert | 346 ns | 901 ns | **2.6x faster** |
 
-Both engines use in-memory mode (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`). Full results in `crates/compare/results.csv`.
+PowDB is fastest where it matters most: the compiled predicate engine avoids full row decoding during scans and aggregates, delivering 3-10x gains on analytical queries. Point lookups benefit from a minimal parse-plan-execute pipeline (~1.5us total). Write-heavy workloads (batch inserts, deletes) are where SQLite's decades of optimization still lead -- this is an active focus area.
+
+Both engines use in-memory mode (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`). Full results in `crates/compare/`.
 
 ## PowQL
 
@@ -66,37 +100,30 @@ alter User add index .email
 drop User
 ```
 
-Full reference: [docs/POWQL.md](docs/POWQL.md) | Getting started: [docs/getting-started.md](docs/getting-started.md)
-
-## Build from source
-
-```bash
-# Requires Rust stable (1.80+)
-cargo build --release
-```
-
-This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks.
-
 ## Run
 
 ### Embedded (CLI / REPL)
 
 ```bash
+powdb-cli
+# or from source:
 cargo run --release -p powdb-cli
 ```
 
-Opens an interactive REPL. Data is stored in `./powdb_data/` by default.
+Opens an interactive REPL with tab completion, command history, and meta-commands (`.tables`, `.schema`, `.timing`, `.help`). Data is stored in `./powdb_data/` by default.
 
 ### Server mode
 
 ```bash
+powdb-server --port 5433 --data-dir ./powdb_data
+# or from source:
 cargo run --release -p powdb-server -- --port 5433 --data-dir ./powdb_data
 ```
 
 Listens on TCP with a binary wire protocol. Connect via the CLI:
 
 ```bash
-cargo run --release -p powdb-cli --release -- --remote localhost:5433
+powdb-cli --remote localhost:5433
 ```
 
 Or the TypeScript client:
@@ -115,7 +142,7 @@ console.table(result.rows);
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
 | `POWDB_DATA` | `./powdb_data` | Data directory (heap files, WAL, catalog, indexes) |
-| `POWDB_PASSWORD` | *(none)* | Require this password on connect |
+| `POWDB_PASSWORD` | *(none)* | Require this password on connect (set as env var) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
 ## Features
@@ -130,16 +157,21 @@ console.table(result.rows);
 - Thread-safe concurrent reads via pread(2)/pwrite(2)
 
 **Query engine**
-- PowQL parser + planner + executor with plan cache
+- PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
 - Joins (nested-loop + hash join for equi-joins)
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
-- Expressions in SELECT and WHERE (arithmetic, string ops, BETWEEN, LIKE, IN-list)
+- Expressions in projections and filters (arithmetic, string ops, BETWEEN, LIKE, IN-list)
 - COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT
 - ORDER BY (multi-column), LIMIT, OFFSET
+- Window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/MIN/MAX OVER)
+- CAST, CASE/WHEN, COALESCE (`??`)
+- Scalar functions: UPPER, LOWER, LENGTH, TRIM, SUBSTRING, CONCAT, ABS, ROUND, CEIL, FLOOR, SQRT, POW, NOW, EXTRACT, DATE_ADD, DATE_DIFF
 - Materialized views with automatic dirty tracking
+- UPSERT with ON CONFLICT
 - Prepared queries with literal substitution
+- EXPLAIN for query plan inspection
 
 **DDL**
 - `type` (create table), `drop` (drop table)
@@ -149,7 +181,13 @@ console.table(result.rows);
 **Server**
 - Tokio async TCP with `Arc<RwLock<Engine>>` for parallel readers
 - Binary wire protocol (length-prefixed framing)
-- Optional password auth
+- TLS support for encrypted connections
+- Password authentication via `POWDB_PASSWORD` env var
+
+**Pure Rust**
+- Zero C FFI -- no C compiler, no `libsqlite3-sys`, no bindgen
+- Single `cargo install` on any platform Rust supports
+- Small dependency tree compared to full-featured alternatives
 
 ## Architecture
 
@@ -185,8 +223,6 @@ cargo run --release -p powdb-compare    # prints table + writes results.csv
 ```bash
 cargo test --workspace
 ```
-
-444 tests across storage, query, server, bench, and compare crates.
 
 ## License
 
