@@ -62,17 +62,22 @@ async fn test_full_lifecycle() {
         let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
         loop {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
             let eng = engine.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
+            let peer_addr = Some(peer);
             tokio::spawn(async move {
                 powdb_server::handler::handle_connection(
                     stream,
-                    eng,
-                    None,
-                    &mut rx,
-                    Duration::from_secs(300),
-                    Duration::from_secs(30),
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        expected_password: None,
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr,
+                    },
                 )
                 .await;
             });

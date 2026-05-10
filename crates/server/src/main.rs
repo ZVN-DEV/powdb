@@ -16,6 +16,8 @@ struct Args {
     password: Option<String>,
     idle_timeout_secs: u64,
     query_timeout_secs: u64,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -27,7 +29,8 @@ fn parse_args() -> Args {
     let mut bind: String = std::env::var("POWDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let mut data_dir: String =
         std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
-    let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
+    // Password is set exclusively via environment variable.
+    let password: Option<String> = std::env::var("POWDB_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty());
     let mut idle_timeout_secs: u64 = std::env::var("POWDB_IDLE_TIMEOUT")
@@ -38,6 +41,12 @@ fn parse_args() -> Args {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30); // 30s default
+    let mut tls_cert: Option<String> = std::env::var("POWDB_TLS_CERT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let mut tls_key: Option<String> = std::env::var("POWDB_TLS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -70,14 +79,6 @@ fn parse_args() -> Args {
                 }
                 bind = argv[i].clone();
             }
-            "--password" => {
-                i += 1;
-                if i >= argv.len() {
-                    eprintln!("--password requires a value");
-                    std::process::exit(2);
-                }
-                password = Some(argv[i].clone());
-            }
             "--idle-timeout" => {
                 i += 1;
                 if i >= argv.len() {
@@ -100,6 +101,22 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 });
             }
+            "--tls-cert" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--tls-cert requires a value");
+                    std::process::exit(2);
+                }
+                tls_cert = Some(argv[i].clone());
+            }
+            "--tls-key" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--tls-key requires a value");
+                    std::process::exit(2);
+                }
+                tls_key = Some(argv[i].clone());
+            }
             "--help" | "-h" => {
                 println!("powdb-server — PowDB wire-protocol server");
                 println!();
@@ -110,7 +127,8 @@ fn parse_args() -> Args {
                 println!("    -p, --port <PORT>          TCP port to listen on (default: 5433)");
                 println!("    -b, --bind <ADDR>          Bind address (default: 127.0.0.1)");
                 println!("    -d, --data-dir <PATH>      Data directory (default: ./powdb_data)");
-                println!("        --password <PW>        Require this password on CONNECT");
+                println!("        --tls-cert <PATH>      TLS certificate file (PEM)");
+                println!("        --tls-key <PATH>       TLS private key file (PEM)");
                 println!("        --idle-timeout <SECS>  Idle connection timeout (default: 300)");
                 println!(
                     "        --query-timeout <SECS> Per-query execution timeout (default: 30)"
@@ -118,7 +136,9 @@ fn parse_args() -> Args {
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("ENVIRONMENT:");
-                println!("    POWDB_PORT, POWDB_BIND, POWDB_DATA, POWDB_PASSWORD");
+                println!("    POWDB_PORT, POWDB_BIND, POWDB_DATA");
+                println!("    POWDB_PASSWORD             Set password for client authentication");
+                println!("    POWDB_TLS_CERT, POWDB_TLS_KEY");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
@@ -139,7 +159,38 @@ fn parse_args() -> Args {
         password,
         idle_timeout_secs,
         query_timeout_secs,
+        tls_cert,
+        tls_key,
     }
+}
+
+/// Load TLS certificate and key files, returning a configured `TlsAcceptor`.
+fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<tokio_rustls::TlsAcceptor, Box<dyn std::error::Error>> {
+    use std::io::BufReader;
+    use tokio_rustls::rustls;
+
+    let cert_file = std::fs::File::open(cert_path)
+        .map_err(|e| format!("failed to open TLS cert {cert_path}: {e}"))?;
+    let key_file = std::fs::File::open(key_path)
+        .map_err(|e| format!("failed to open TLS key {key_path}: {e}"))?;
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse TLS certs: {e}"))?;
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| format!("failed to parse TLS key: {e}"))?
+        .ok_or("no private key found in TLS key file")?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("TLS config error: {e}"))?;
+
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 #[tokio::main]
@@ -154,6 +205,11 @@ async fn main() {
 
     let args = parse_args();
 
+    // TASK-09: Warn when no password is configured.
+    if args.password.is_none() {
+        warn!("no password configured — all connections will be accepted without authentication");
+    }
+
     let engine = match Engine::new(std::path::Path::new(&args.data_dir)) {
         Ok(e) => e,
         Err(e) => {
@@ -162,6 +218,30 @@ async fn main() {
         }
     };
     let engine = Arc::new(RwLock::new(engine));
+
+    // Build TLS acceptor if both cert and key are provided.
+    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            match build_tls_acceptor(cert, key) {
+                Ok(acceptor) => Some(acceptor),
+                Err(e) => {
+                    error!(error = %e, "failed to configure TLS");
+                    std::process::exit(1);
+                }
+            }
+        }
+        (Some(_), None) => {
+            error!("--tls-cert provided without --tls-key");
+            std::process::exit(2);
+        }
+        (None, Some(_)) => {
+            error!("--tls-key provided without --tls-cert");
+            std::process::exit(2);
+        }
+        (None, None) => None,
+    };
+
+    let tls_enabled = tls_acceptor.is_some();
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = match TcpListener::bind(&addr).await {
@@ -174,6 +254,7 @@ async fn main() {
 
     info!(
         addr = %addr, data_dir = %args.data_dir, auth = %args.password.is_some(),
+        tls = tls_enabled,
         idle_timeout = args.idle_timeout_secs, query_timeout = args.query_timeout_secs,
         "powdb server listening"
     );
@@ -185,6 +266,9 @@ async fn main() {
 
     let idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     let query_timeout = std::time::Duration::from_secs(args.query_timeout_secs);
+
+    // Shared auth rate limiter.
+    let rate_limiter = handler::new_rate_limiter();
 
     loop {
         tokio::select! {
@@ -202,8 +286,38 @@ async fn main() {
                         let mut rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
+                        let rl = rate_limiter.clone();
+                        let tls = tls_acceptor.clone();
                         tokio::spawn(async move {
-                            handler::handle_connection(stream, eng, pw, &mut rx, idle, qtimeout).await;
+                            let peer_addr = Some(peer);
+                            if let Some(acceptor) = tls {
+                                match acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        handler::handle_connection(
+                                            tls_stream,
+                                            handler::ConnOpts {
+                                                engine: eng, expected_password: pw,
+                                                shutdown_rx: &mut rx, idle_timeout: idle,
+                                                query_timeout: qtimeout, rate_limiter: Some(&rl),
+                                                peer_addr,
+                                            },
+                                        ).await;
+                                    }
+                                    Err(e) => {
+                                        warn!(peer = %peer, error = %e, "TLS handshake failed");
+                                    }
+                                }
+                            } else {
+                                handler::handle_connection(
+                                    stream,
+                                    handler::ConnOpts {
+                                        engine: eng, expected_password: pw,
+                                        shutdown_rx: &mut rx, idle_timeout: idle,
+                                        query_timeout: qtimeout, rate_limiter: Some(&rl),
+                                        peer_addr,
+                                    },
+                                ).await;
+                            }
                             drop(permit);
                         });
                     }
