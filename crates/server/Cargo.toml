@@ -10,6 +10,8 @@ repository.workspace = true
 powdb-storage = { version = "0.1.2", path = "../storage" }
 powdb-query = { version = "0.1.2", path = "../query" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true

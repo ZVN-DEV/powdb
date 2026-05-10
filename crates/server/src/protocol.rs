@@ -8,6 +8,8 @@ const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
 const MSG_ERROR: u8 = 0x0A;
 const MSG_DISCONNECT: u8 = 0x10;
+const MSG_PING: u8 = 0x11;
+const MSG_PONG: u8 = 0x12;
 
 /// Maximum payload size accepted from the wire (64 MB).
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
@@ -44,6 +46,8 @@ pub enum Message {
         message: String,
     },
     Disconnect,
+    Ping,
+    Pong,
 }
 
 impl Message {
@@ -79,6 +83,8 @@ impl Message {
             Message::ResultOk { affected } => (MSG_RESULT_OK, affected.to_le_bytes().to_vec()),
             Message::Error { message } => (MSG_ERROR, encode_string(message)),
             Message::Disconnect => (MSG_DISCONNECT, Vec::new()),
+            Message::Ping => (MSG_PING, Vec::new()),
+            Message::Pong => (MSG_PONG, Vec::new()),
         };
 
         let mut frame = Vec::with_capacity(6 + payload.len());
@@ -188,6 +194,8 @@ impl Message {
                 Ok(Message::Error { message })
             }
             MSG_DISCONNECT => Ok(Message::Disconnect),
+            MSG_PING => Ok(Message::Ping),
+            MSG_PONG => Ok(Message::Pong),
             _ => Err(format!("unknown message type: {msg_type:#x}")),
         }
     }
