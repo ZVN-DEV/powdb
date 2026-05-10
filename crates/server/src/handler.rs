@@ -14,6 +14,9 @@ use tracing::{debug, error, info, warn};
 /// Tracks per-IP authentication failure counts for rate limiting.
 pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
 
+/// Maximum query text length accepted from the wire (1 MB).
+const MAX_QUERY_LENGTH: usize = 1024 * 1024;
+
 /// Maximum number of auth failures per IP within the rate-limit window.
 const MAX_AUTH_FAILURES: u32 = 5;
 
@@ -59,14 +62,14 @@ fn clear_auth_failures(limiter: &AuthRateLimiter, ip: IpAddr) {
     map.remove(&ip);
 }
 
-/// Constant-time byte comparison to prevent timing side-channel attacks
-/// on password verification. Returns `true` iff `a` and `b` are identical.
+/// Constant-time password comparison. Hashes both inputs to fixed-size
+/// SHA-256 digests so neither length nor content leaks through timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    use sha2::{Digest, Sha256};
+    let ha = Sha256::digest(a);
+    let hb = Sha256::digest(b);
     let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (x, y) in ha.iter().zip(hb.iter()) {
         diff |= x ^ y;
     }
     diff == 0
@@ -296,25 +299,34 @@ where
                 Message::Pong
             }
             Message::Query { query } => {
-                debug!(peer = %peer, query = %query, "received query");
-                // Run query with timeout.
-                let result = tokio::task::spawn_blocking({
-                    let engine = engine.clone();
-                    let query = query.clone();
-                    move || dispatch_query(&engine, &query)
-                });
-                match tokio::time::timeout(query_timeout, result).await {
-                    Ok(Ok(Ok(result))) => query_result_to_message(result),
-                    Ok(Ok(Err(e))) => Message::Error {
-                        message: sanitize_error(&e),
-                    },
-                    Ok(Err(e)) => Message::Error {
-                        message: format!("internal error: {e}"),
-                    },
-                    Err(_) => {
-                        warn!(peer = %peer, query = %query, "query timeout exceeded");
-                        Message::Error {
-                            message: "query timeout exceeded".into(),
+                if query.len() > MAX_QUERY_LENGTH {
+                    Message::Error {
+                        message: format!(
+                            "query too large: {} bytes (max {})",
+                            query.len(),
+                            MAX_QUERY_LENGTH
+                        ),
+                    }
+                } else {
+                    debug!(peer = %peer, query = %query, "received query");
+                    let result = tokio::task::spawn_blocking({
+                        let engine = engine.clone();
+                        let query = query.clone();
+                        move || dispatch_query(&engine, &query)
+                    });
+                    match tokio::time::timeout(query_timeout, result).await {
+                        Ok(Ok(Ok(result))) => query_result_to_message(result),
+                        Ok(Ok(Err(e))) => Message::Error {
+                            message: sanitize_error(&e),
+                        },
+                        Ok(Err(e)) => Message::Error {
+                            message: format!("internal error: {e}"),
+                        },
+                        Err(_) => {
+                            warn!(peer = %peer, query = %query, "query timeout exceeded");
+                            Message::Error {
+                                message: "query timeout exceeded".into(),
+                            }
                         }
                     }
                 }

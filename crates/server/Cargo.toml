@@ -12,6 +12,7 @@ powdb-query = { version = "0.2.0", path = "../query" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+sha2 = "0.10"
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true
