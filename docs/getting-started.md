@@ -449,7 +449,7 @@ Type PowQL queries. Use Ctrl-D to exit.
 powql>
 ```
 
-From here, everything works exactly the same as embedded mode. The server handles concurrent readers and uses a write-ahead log for durability.
+From here, the same PowQL statements work as embedded mode. Some status messages are normalized by the wire protocol -- for example, DDL statements return an affected-row status such as `0 rows affected` in remote mode instead of the embedded REPL's `type User created` message. The server handles concurrent readers and uses a write-ahead log for durability.
 
 ### Password authentication
 

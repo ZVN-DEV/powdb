@@ -25,9 +25,12 @@ use powdb_query::ast::Literal;
 use powdb_query::executor::Engine;
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, RwLock};
 use std::thread;
 use std::time::Instant;
+
+static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
 fn fresh_engine() -> Arc<RwLock<Engine>> {
     let test_id = std::process::id();
@@ -35,7 +38,8 @@ fn fresh_engine() -> Arc<RwLock<Engine>> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let data_dir = std::env::temp_dir().join(format!("powdb_conc_read_{test_id}_{ts}"));
+    let unique = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+    let data_dir = std::env::temp_dir().join(format!("powdb_conc_read_{test_id}_{ts}_{unique}"));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).unwrap();
     let engine = Engine::new(&data_dir).unwrap();

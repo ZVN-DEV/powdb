@@ -3,87 +3,87 @@
   "runner": "ubuntu-24.04",
   "rustc": "1.89.0",
   "updated": "2026-05-10",
-  "commit": "7a08425",
+  "commit": "ecfcbf6",
   "workloads": {
     "insert_10k": {
-      "ns_per_iter": 2672291.75,
-      "ops_per_sec": 374
+      "ns_per_iter": 1948582.25,
+      "ops_per_sec": 513
     },
     "btree_lookup": {
-      "ns_per_iter": 269.8491811672668,
-      "ops_per_sec": 3705774
+      "ns_per_iter": 265.2374972221193,
+      "ops_per_sec": 3770206
     },
     "seq_scan_filter": {
-      "ns_per_iter": 8406029.785714285,
-      "ops_per_sec": 119
+      "ns_per_iter": 7728687.642857143,
+      "ops_per_sec": 129
     },
     "powql_point": {
-      "ns_per_iter": 1544.145633187773,
-      "ops_per_sec": 647607
+      "ns_per_iter": 1568.0293191441942,
+      "ops_per_sec": 637743
     },
     "powql_filter_only": {
-      "ns_per_iter": 14298958.375,
-      "ops_per_sec": 70
+      "ns_per_iter": 19208481.666666668,
+      "ops_per_sec": 52
     },
     "powql_filter_projection": {
-      "ns_per_iter": 6653947.9375,
-      "ops_per_sec": 150
+      "ns_per_iter": 10410444.5,
+      "ops_per_sec": 96
     },
     "powql_aggregation": {
-      "ns_per_iter": 757101.8537912088,
-      "ops_per_sec": 1321
+      "ns_per_iter": 551748.4717278457,
+      "ops_per_sec": 1812
     },
     "point_lookup_nonindexed": {
-      "ns_per_iter": 577372.7890410959,
-      "ops_per_sec": 1732
+      "ns_per_iter": 530616.4755813954,
+      "ops_per_sec": 1885
     },
     "scan_filter_project_top100": {
-      "ns_per_iter": 25037.7375,
-      "ops_per_sec": 39940
+      "ns_per_iter": 22741.731148429863,
+      "ops_per_sec": 43972
     },
     "scan_filter_sort_limit10": {
-      "ns_per_iter": 4194945.8,
-      "ops_per_sec": 238
+      "ns_per_iter": 3735281.6428571427,
+      "ops_per_sec": 268
     },
     "agg_sum": {
-      "ns_per_iter": 469434.7843642612,
-      "ops_per_sec": 2130
+      "ns_per_iter": 298293.09270833334,
+      "ops_per_sec": 3352
     },
     "agg_avg": {
-      "ns_per_iter": 638211.0042735043,
-      "ops_per_sec": 1567
+      "ns_per_iter": 592182.4846855653,
+      "ops_per_sec": 1689
     },
     "agg_min": {
-      "ns_per_iter": 452269.4422222222,
-      "ops_per_sec": 2211
+      "ns_per_iter": 275772.6500959079,
+      "ops_per_sec": 3626
     },
     "agg_max": {
-      "ns_per_iter": 459646.8095238095,
-      "ops_per_sec": 2176
+      "ns_per_iter": 293833.13180272107,
+      "ops_per_sec": 3403
     },
     "multi_col_and_filter": {
-      "ns_per_iter": 4470246.227272727,
-      "ops_per_sec": 224
+      "ns_per_iter": 3287321.125,
+      "ops_per_sec": 304
     },
     "insert_single": {
-      "ns_per_iter": 2788.007004310345,
-      "ops_per_sec": 358679
+      "ns_per_iter": 3087.662491592129,
+      "ops_per_sec": 323870
     },
     "insert_batch_1k": {
-      "ns_per_iter": 3241905.5746478876,
-      "ops_per_sec": 308
+      "ns_per_iter": 3549018.9669540226,
+      "ops_per_sec": 282
     },
     "update_by_pk": {
-      "ns_per_iter": 1792.20337850119,
-      "ops_per_sec": 557972
+      "ns_per_iter": 1819.6643752267332,
+      "ops_per_sec": 549552
     },
     "update_by_filter": {
-      "ns_per_iter": 1876450.8800813009,
-      "ops_per_sec": 533
+      "ns_per_iter": 1693165.5607723577,
+      "ops_per_sec": 591
     },
     "delete_by_filter": {
-      "ns_per_iter": 251419.61349206348,
-      "ops_per_sec": 3977
+      "ns_per_iter": 168238.9476190476,
+      "ops_per_sec": 5944
     }
   }
 }
