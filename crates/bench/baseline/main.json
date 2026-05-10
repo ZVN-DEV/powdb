@@ -3,15 +3,15 @@
   "runner": "ubuntu-24.04",
   "rustc": "1.89.0",
   "updated": "2026-05-10",
-  "commit": "92b103b",
+  "commit": "d44e69b",
   "workloads": {
     "insert_10k": {
       "ns_per_iter": 1948582.25,
       "ops_per_sec": 513
     },
     "btree_lookup": {
-      "ns_per_iter": 265.2374972221193,
-      "ops_per_sec": 3770206
+      "ns_per_iter": 289.53555305732203,
+      "ops_per_sec": 3453807
     },
     "seq_scan_filter": {
       "ns_per_iter": 7728687.642857143,
@@ -26,8 +26,8 @@
       "ops_per_sec": 52
     },
     "powql_filter_projection": {
-      "ns_per_iter": 10766865.9,
-      "ops_per_sec": 93
+      "ns_per_iter": 10858598.8,
+      "ops_per_sec": 92
     },
     "powql_aggregation": {
       "ns_per_iter": 634509.9475308642,
@@ -38,12 +38,12 @@
       "ops_per_sec": 1717
     },
     "scan_filter_project_top100": {
-      "ns_per_iter": 22741.731148429863,
-      "ops_per_sec": 43972
+      "ns_per_iter": 22911.649803760498,
+      "ops_per_sec": 43646
     },
     "scan_filter_sort_limit10": {
-      "ns_per_iter": 3735281.6428571427,
-      "ops_per_sec": 268
+      "ns_per_iter": 4178327.6923076925,
+      "ops_per_sec": 239
     },
     "agg_sum": {
       "ns_per_iter": 436259.19680611783,
@@ -66,12 +66,12 @@
       "ops_per_sec": 304
     },
     "insert_single": {
-      "ns_per_iter": 3240.1346405787194,
-      "ops_per_sec": 308629
+      "ns_per_iter": 3610.6090956887488,
+      "ops_per_sec": 276962
     },
     "insert_batch_1k": {
-      "ns_per_iter": 3549018.9669540226,
-      "ops_per_sec": 282
+      "ns_per_iter": 3759254.3427450983,
+      "ops_per_sec": 266
     },
     "update_by_pk": {
       "ns_per_iter": 1819.6643752267332,
