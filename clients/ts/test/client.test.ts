@@ -1,7 +1,10 @@
 /**
  * Comprehensive end-to-end tests for the PowDB TypeScript client.
  *
- * Requires a running PowDB server:
+ * Run through package.json to start a disposable PowDB server automatically:
+ *   npm test
+ *
+ * Or point at an existing server:
  *   POWDB_HOST=127.0.0.1 POWDB_PORT=15433 npx tsx test/client.test.ts
  */
 

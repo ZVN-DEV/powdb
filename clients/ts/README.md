@@ -304,6 +304,10 @@ The client enforces the same frame limits as the server and throws on violation:
 - Node.js 18+ (uses `node:net`, `node:tls`)
 - A running PowDB server (`cargo run --release -p powdb-server`)
 
+For local development, `npm test` and `npm run test:pool` start a disposable
+PowDB server automatically when `POWDB_PORT` is not set. Set `POWDB_HOST` and
+`POWDB_PORT` to run those tests against an existing server.
+
 ## License
 
 MIT

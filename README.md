@@ -133,7 +133,7 @@ import { Client } from "@zvndev/powdb-client";
 
 const client = await Client.connect({ host: "localhost", port: 5433 });
 const result = await client.query("User filter .age > 25 { .name, .age }");
-console.table(result.rows);
+if (result.kind === "rows") console.table(result.rows);
 ```
 
 ### Environment variables

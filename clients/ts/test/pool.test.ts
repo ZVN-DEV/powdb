@@ -1,11 +1,12 @@
 /**
  * Tests for the PowDB connection pool (clients/ts/src/pool.ts).
  *
- * These are LIVE tests — they require a running PowDB server. If no server
- * is reachable at `$POWDB_HOST:$POWDB_PORT` the suite exits 0 with a
- * "SKIPPED" message (we don't want CI to fail just because nobody started
- * the server).
+ * These are LIVE tests. Run through package.json to start a disposable PowDB
+ * server automatically:
  *
+ *     npm run test:pool
+ *
+ * Or point at an existing server:
  *     POWDB_HOST=127.0.0.1 POWDB_PORT=15433 npx tsx test/pool.test.ts
  */
 
