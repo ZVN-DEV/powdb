@@ -8,6 +8,49 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Validate that a name (table or column) is safe for use in file paths and
+/// follows the identifier convention: starts with a letter or underscore,
+/// followed by letters, digits, or underscores.
+fn validate_identifier(kind: &str, name: &str) -> io::Result<()> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {kind} name: must not be empty"),
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid {kind} name '{name}': must start with a letter or underscore"
+            ),
+        ));
+    }
+    for ch in chars {
+        if !ch.is_ascii_alphanumeric() && ch != '_' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid {kind} name '{name}': must contain only letters, digits, and underscores"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a table name for path safety.
+fn validate_table_name(name: &str) -> io::Result<()> {
+    validate_identifier("table", name)
+}
+
+/// Validate a column name for path safety.
+fn validate_column_name(name: &str) -> io::Result<()> {
+    validate_identifier("column", name)
+}
+
 /// On-disk catalog file: lists every table's schema so we can reopen them
 /// after a restart. Format is a small custom binary blob (no serde dep).
 ///
@@ -331,6 +374,10 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
+        validate_table_name(&schema.table_name)?;
+        for col in &schema.columns {
+            validate_column_name(&col.name)?;
+        }
         let name = schema.table_name.clone();
         if self.name_to_slot.contains_key(&name) {
             return Err(io::Error::new(
@@ -872,6 +919,7 @@ impl Catalog {
     /// Returns `Err` if the table doesn't exist.
     // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        validate_table_name(name)?;
         let slot = *self.name_to_slot.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
         })?;
@@ -1588,5 +1636,78 @@ mod tests {
         let mut tables = cat.list_tables();
         tables.sort();
         assert_eq!(tables, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_path_traversal_table_name_rejected() {
+        let mut cat = temp_catalog("path_trav");
+        // Names with path separators must be rejected.
+        let bad_names = vec![
+            "../etc/passwd",
+            "foo/bar",
+            "table\0name",
+            "",
+            "123starts_with_digit",
+            "has-dashes",
+            "has spaces",
+            "has.dots",
+        ];
+        for name in bad_names {
+            let schema = Schema {
+                table_name: name.into(),
+                columns: vec![ColumnDef {
+                    name: "x".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            };
+            let result = cat.create_table(schema);
+            assert!(result.is_err(), "expected error for table name '{name}'");
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        // Valid names must still work.
+        let good_names = vec!["users", "_private", "Table_123", "_"];
+        for name in good_names {
+            let schema = Schema {
+                table_name: name.into(),
+                columns: vec![ColumnDef {
+                    name: "x".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            };
+            assert!(
+                cat.create_table(schema).is_ok(),
+                "expected ok for table name '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_traversal_column_name_rejected() {
+        let mut cat = temp_catalog("col_path_trav");
+        let schema = Schema {
+            table_name: "valid_table".into(),
+            columns: vec![ColumnDef {
+                name: "../bad".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
+        };
+        let result = cat.create_table(schema);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_drop_table_validates_name() {
+        let mut cat = temp_catalog("drop_trav");
+        let result = cat.drop_table("../etc/passwd");
+        assert!(result.is_err());
+        // Should fail with InvalidInput (validation), not NotFound.
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }

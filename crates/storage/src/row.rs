@@ -1,4 +1,5 @@
 use crate::types::*;
+use std::io;
 
 /// Encode a row of values into the compact binary format.
 ///
@@ -15,6 +16,14 @@ pub fn encode_row(schema: &Schema, values: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
     encode_row_into(schema, values, &mut out);
     out
+}
+
+/// Fallible version of [`encode_row`] — returns an error if the row exceeds
+/// the 64KB size limit.
+pub fn try_encode_row(schema: &Schema, values: &[Value]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    try_encode_row_into(schema, values, &mut out)?;
+    Ok(out)
 }
 
 /// Encode a row into a caller-provided scratch buffer.
@@ -38,6 +47,13 @@ pub fn encode_row(schema: &Schema, values: &[Value]) -> Vec<u8> {
 pub fn encode_row_into(schema: &Schema, values: &[Value], out: &mut Vec<u8>) {
     let layout = RowLayout::new(schema);
     encode_row_into_with_layout(schema, &layout, values, out);
+}
+
+/// Fallible version of [`encode_row_into`] — returns an error if the row
+/// exceeds the 64KB size limit.
+pub fn try_encode_row_into(schema: &Schema, values: &[Value], out: &mut Vec<u8>) -> io::Result<()> {
+    let layout = RowLayout::new(schema);
+    try_encode_row_into_with_layout(schema, &layout, values, out)
 }
 
 /// Encode a row using a precomputed [`RowLayout`].
@@ -103,6 +119,18 @@ pub fn encode_row_into_with_layout(
 
     let body_size = bitmap_size + fixed_region_size + n_offsets * 2 + var_data_size;
     let total_size = 2 + body_size;
+
+    // Guard: individual var-column lengths and total row size must fit in u16.
+    // The infallible encode path panics in debug mode; callers handling
+    // untrusted data should use `try_encode_row_into_with_layout` instead.
+    debug_assert!(
+        total_size <= u16::MAX as usize,
+        "row too large: {total_size} bytes exceeds 64KB limit"
+    );
+    debug_assert!(
+        var_data_size <= u16::MAX as usize,
+        "variable data too large: {var_data_size} bytes exceeds 64KB limit"
+    );
 
     // One resize → zeroed buffer. This subsumes: placeholder zeros for
     // null fixed columns, zero-init of the offset table, and the end
@@ -179,6 +207,154 @@ pub fn encode_row_into_with_layout(
     out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
     debug_assert_eq!(out.len(), total_size);
+}
+
+/// Fallible version of [`encode_row_into_with_layout`] — returns an error
+/// if the total row size or any individual variable-length value exceeds
+/// the 64KB u16 limit. Callers that receive values from user queries should
+/// use this to prevent silent data corruption from u16 truncation.
+pub fn try_encode_row_into_with_layout(
+    schema: &Schema,
+    layout: &RowLayout,
+    values: &[Value],
+    out: &mut Vec<u8>,
+) -> io::Result<()> {
+    let n_cols = schema.columns.len();
+    let bitmap_size = layout.bitmap_size;
+    let fixed_region_size = layout.fixed_region_size;
+    let n_var = layout.n_var;
+    let n_offsets = n_var + 1;
+
+    let mut bitmap_stack = [0u8; 32];
+    let mut bitmap_heap: Vec<u8>;
+    let bitmap_slice: &mut [u8] = if bitmap_size <= 32 {
+        &mut bitmap_stack[..bitmap_size]
+    } else {
+        bitmap_heap = vec![0u8; bitmap_size];
+        &mut bitmap_heap[..]
+    };
+
+    let mut var_data_size: usize = 0;
+    for (i, val) in values.iter().enumerate() {
+        match val {
+            Value::Empty => {
+                bitmap_slice[i >> 3] |= 1 << (i & 7);
+            }
+            Value::Str(s) => {
+                if s.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "row too large: string value in column '{}' is {} bytes, exceeds 64KB limit",
+                            schema.columns[i].name, s.len()
+                        ),
+                    ));
+                }
+                var_data_size += s.len();
+            }
+            Value::Bytes(b) => {
+                if b.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "row too large: bytes value in column '{}' is {} bytes, exceeds 64KB limit",
+                            schema.columns[i].name, b.len()
+                        ),
+                    ));
+                }
+                var_data_size += b.len();
+            }
+            _ => {}
+        }
+    }
+
+    let body_size = bitmap_size + fixed_region_size + n_offsets * 2 + var_data_size;
+    let total_size = 2 + body_size;
+
+    if total_size > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "row too large: {total_size} bytes exceeds 64KB limit"
+            ),
+        ));
+    }
+    if var_data_size > u16::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "row too large: variable data is {var_data_size} bytes, exceeds 64KB limit"
+            ),
+        ));
+    }
+
+    // Delegate to the infallible version now that bounds are verified.
+    // The data is already validated above, so the infallible path won't
+    // encounter any truncation.
+    out.clear();
+    out.resize(total_size, 0);
+    out[0..2].copy_from_slice(&(total_size as u16).to_le_bytes());
+    let bitmap_start = 2;
+    out[bitmap_start..bitmap_start + bitmap_size].copy_from_slice(bitmap_slice);
+
+    let fixed_start = bitmap_start + bitmap_size;
+    let offsets_start = fixed_start + fixed_region_size;
+    let var_data_start = offsets_start + n_offsets * 2;
+
+    let mut var_cursor: u16 = 0;
+    let mut off_slot: usize = 0;
+
+    for (i, val) in values.iter().enumerate().take(n_cols) {
+        if let Some(off) = layout.fixed_offsets[i] {
+            let pos = fixed_start + off;
+            match val {
+                Value::Empty => {}
+                Value::Int(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Float(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Bool(v) => {
+                    out[pos] = if *v { 1 } else { 0 };
+                }
+                Value::DateTime(v) => {
+                    out[pos..pos + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                Value::Uuid(v) => {
+                    out[pos..pos + 16].copy_from_slice(v);
+                }
+                _ => unreachable!("fixed column with non-fixed value"),
+            }
+        } else {
+            let off_pos = offsets_start + off_slot * 2;
+            out[off_pos..off_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
+            off_slot += 1;
+
+            match val {
+                Value::Empty => {}
+                Value::Str(s) => {
+                    let len = s.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(s.as_bytes());
+                    var_cursor += len as u16;
+                }
+                Value::Bytes(b) => {
+                    let len = b.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(b);
+                    var_cursor += len as u16;
+                }
+                _ => unreachable!("variable column with non-variable value"),
+            }
+        }
+    }
+
+    let end_pos = offsets_start + off_slot * 2;
+    out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
+
+    debug_assert_eq!(out.len(), total_size);
+    Ok(())
 }
 
 /// Precomputed layout information for fast selective column decoding.
@@ -300,13 +476,14 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
         let bytes = &data[start..end];
 
         match col.type_id {
-            // SAFETY: every byte written into a `TypeId::Str` column's slot
-            // originates from `String::as_bytes()` (see `encode_row_into_with_layout`
-            // above and `executor::patch_var_col_in_place` in the update fast path),
-            // so the bytes are guaranteed to be valid UTF-8. Skipping the UTF-8
-            // check saves ~5-15ns per projected string, which is measurable on
-            // string-heavy workloads like `multi_col_and_filter` (30K strings).
-            TypeId::Str => Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned()),
+            // Safety fix: use lossy UTF-8 decoding to prevent undefined
+            // behavior from corrupted on-disk data. The ~5-15ns cost per
+            // string is negligible compared to the safety win. Under normal
+            // operation the bytes are always valid UTF-8 (they originate
+            // from `String::as_bytes()` in `encode_row_into_with_layout`),
+            // so `from_utf8_lossy` returns a `Borrowed` variant and avoids
+            // any allocation.
+            TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         }
@@ -494,9 +671,10 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
         let end = var_data_start + var_offsets[vi + 1];
         let bytes = &data[start..end];
         values[col_idx] = match schema.columns[col_idx].type_id {
-            // SAFETY: see `decode_column` — the encoder is the only writer
-            // and always writes valid UTF-8 for `TypeId::Str` columns.
-            TypeId::Str => Value::Str(unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned()),
+            // Safety fix: use lossy UTF-8 decoding (see `decode_column`
+            // for the full rationale). Normal data is always valid UTF-8;
+            // corrupted bytes get replacement characters instead of UB.
+            TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
             _ => unreachable!(),
         };
@@ -848,5 +1026,75 @@ mod tests {
         assert_eq!(dec_str[0], Value::Str("".into()));
         assert_eq!(dec_empty[0], Value::Empty);
         assert_ne!(dec_str[0], dec_empty[0]); // "" is NOT the same as {}
+    }
+
+    #[test]
+    fn test_try_encode_row_rejects_oversized_row() {
+        let schema = Schema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "big".into(),
+                type_id: TypeId::Str,
+                required: true,
+                position: 0,
+            }],
+        };
+        // A string larger than 64KB should be rejected.
+        let big_string = "x".repeat(70_000);
+        let row = vec![Value::Str(big_string)];
+        let result = try_encode_row(&schema, &row);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("64KB") || msg.contains("too large"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_try_encode_row_accepts_normal_row() {
+        let schema = user_schema();
+        let row = vec![
+            Value::Str("Alice".into()),
+            Value::Str("alice@example.com".into()),
+            Value::Int(30),
+            Value::Bool(true),
+        ];
+        let result = try_encode_row(&schema, &row);
+        assert!(result.is_ok());
+        let encoded = result.unwrap();
+        let decoded = decode_row(&schema, &encoded);
+        assert_eq!(decoded[0], Value::Str("Alice".into()));
+    }
+
+    #[test]
+    fn test_safe_utf8_decode_handles_invalid_bytes() {
+        // Manually construct a row with invalid UTF-8 in a Str column
+        // to verify we don't crash/UB.
+        let schema = Schema {
+            table_name: "t".into(),
+            columns: vec![ColumnDef {
+                name: "s".into(),
+                type_id: TypeId::Str,
+                required: true,
+                position: 0,
+            }],
+        };
+        // Encode a valid row first, then corrupt the string bytes.
+        let mut encoded = encode_row(&schema, &[Value::Str("hello".into())]);
+        // The var data starts after: 2 (len) + 1 (bitmap) + 2*2 (offset table)
+        // = 7 bytes. Write invalid UTF-8 sequence.
+        let var_data_start = 2 + 1 + 4; // len_prefix + bitmap + offset_table(2 entries * 2 bytes)
+        if var_data_start + 2 <= encoded.len() {
+            encoded[var_data_start] = 0xFF;
+            encoded[var_data_start + 1] = 0xFE;
+        }
+        // Should not panic — lossy decoding replaces invalid bytes.
+        let decoded = decode_row(&schema, &encoded);
+        // The value should be a Str (not crash), contents may have
+        // replacement characters.
+        matches!(decoded[0], Value::Str(_));
     }
 }

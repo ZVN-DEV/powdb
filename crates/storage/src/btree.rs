@@ -891,8 +891,21 @@ impl BTree {
 
     /// Reload a tree from disk. The returned tree's `path` is set to the
     /// supplied path so subsequent `save()` calls hit the same file.
+    ///
+    /// Guards against corrupted or maliciously large files: rejects files
+    /// larger than 512MB and node counts above 10 million.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut f = fs::File::open(path)?;
+        let file_size = f.metadata()?.len();
+        if file_size > 512 * 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "btree file too large: {} bytes (limit 512MB)",
+                    file_size
+                ),
+            ));
+        }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
 
@@ -913,6 +926,15 @@ impl BTree {
         }
         let root = read_u32(&buf, &mut pos)? as usize;
         let n_nodes = read_u32(&buf, &mut pos)? as usize;
+
+        if n_nodes > 10_000_000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "btree file corrupt: unreasonable node count {n_nodes} (limit 10M)"
+                ),
+            ));
+        }
 
         let mut nodes: Vec<Node> = Vec::with_capacity(n_nodes);
         for _ in 0..n_nodes {
