@@ -87,7 +87,7 @@ fn display_name_covers_common_tokens() {
     use powdb_query::token::Token;
 
     assert_eq!(Token::IntLit(42).display_name(), "number 42");
-    assert_eq!(Token::FloatLit(3.14).display_name(), "decimal number 3.14");
+    assert_eq!(Token::FloatLit(2.72).display_name(), "decimal number 2.72");
     assert_eq!(
         Token::StringLit("hi".into()).display_name(),
         "string \"hi\""

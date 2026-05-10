@@ -5,6 +5,13 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [TS client 0.3.1] - 2026-05-09
+
+### Fixed
+
+- Added Ping/Pong protocol support — client auto-replies Pong on server
+  health check Ping frames instead of throwing "unknown message type"
+
 ## [0.2.0] - 2026-05-09
 
 ### Security
