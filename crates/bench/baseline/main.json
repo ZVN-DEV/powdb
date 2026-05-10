@@ -3,7 +3,7 @@
   "runner": "ubuntu-24.04",
   "rustc": "1.89.0",
   "updated": "2026-05-10",
-  "commit": "ecfcbf6",
+  "commit": "92b103b",
   "workloads": {
     "insert_10k": {
       "ns_per_iter": 1948582.25,
@@ -26,16 +26,16 @@
       "ops_per_sec": 52
     },
     "powql_filter_projection": {
-      "ns_per_iter": 10410444.5,
-      "ops_per_sec": 96
+      "ns_per_iter": 10766865.9,
+      "ops_per_sec": 93
     },
     "powql_aggregation": {
-      "ns_per_iter": 551748.4717278457,
-      "ops_per_sec": 1812
+      "ns_per_iter": 634509.9475308642,
+      "ops_per_sec": 1576
     },
     "point_lookup_nonindexed": {
-      "ns_per_iter": 530616.4755813954,
-      "ops_per_sec": 1885
+      "ns_per_iter": 582495.3601865672,
+      "ops_per_sec": 1717
     },
     "scan_filter_project_top100": {
       "ns_per_iter": 22741.731148429863,
@@ -46,28 +46,28 @@
       "ops_per_sec": 268
     },
     "agg_sum": {
-      "ns_per_iter": 298293.09270833334,
-      "ops_per_sec": 3352
+      "ns_per_iter": 436259.19680611783,
+      "ops_per_sec": 2292
     },
     "agg_avg": {
-      "ns_per_iter": 592182.4846855653,
-      "ops_per_sec": 1689
+      "ns_per_iter": 700610.2244598765,
+      "ops_per_sec": 1427
     },
     "agg_min": {
-      "ns_per_iter": 275772.6500959079,
-      "ops_per_sec": 3626
+      "ns_per_iter": 405419.24201680673,
+      "ops_per_sec": 2467
     },
     "agg_max": {
-      "ns_per_iter": 293833.13180272107,
-      "ops_per_sec": 3403
+      "ns_per_iter": 407247.6041324576,
+      "ops_per_sec": 2456
     },
     "multi_col_and_filter": {
       "ns_per_iter": 3287321.125,
       "ops_per_sec": 304
     },
     "insert_single": {
-      "ns_per_iter": 3087.662491592129,
-      "ops_per_sec": 323870
+      "ns_per_iter": 3240.1346405787194,
+      "ops_per_sec": 308629
     },
     "insert_batch_1k": {
       "ns_per_iter": 3549018.9669540226,
@@ -82,8 +82,8 @@
       "ops_per_sec": 591
     },
     "delete_by_filter": {
-      "ns_per_iter": 168238.9476190476,
-      "ops_per_sec": 5944
+      "ns_per_iter": 175589.4890625,
+      "ops_per_sec": 5695
     }
   }
 }
