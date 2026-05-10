@@ -5,7 +5,7 @@
  * protocol.
  *
  *     const client = await Client.connect({
- *       host: "213.188.194.202",
+ *       host: "127.0.0.1",
  *       port: 5433,
  *       dbName: "default",
  *       password: process.env.POWDB_PASSWORD,

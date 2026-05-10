@@ -117,6 +117,10 @@ fn parse_args() -> Args {
                 }
                 tls_key = Some(argv[i].clone());
             }
+            "--version" | "-V" => {
+                println!("powdb-server {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("powdb-server — PowDB wire-protocol server");
                 println!();
@@ -133,6 +137,7 @@ fn parse_args() -> Args {
                 println!(
                     "        --query-timeout <SECS> Per-query execution timeout (default: 30)"
                 );
+                println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
                 println!();
                 println!("ENVIRONMENT:");

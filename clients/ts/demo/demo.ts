@@ -1,7 +1,7 @@
 /**
  * PowDB client demo.
  *
- * Connects to the PowDB server (defaults to the Fly deployment), creates a
+ * Connects to the PowDB server (defaults to localhost), creates a
  * table, inserts a handful of rows, and runs a few PowQL queries against it.
  *
  * Usage:
@@ -11,7 +11,7 @@
 
 import { Client, ident, powql, type QueryResult } from "../src/index.js";
 
-const HOST = process.env.POWDB_HOST ?? "213.188.194.202";
+const HOST = process.env.POWDB_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.POWDB_PORT ?? "5433");
 const DB = process.env.POWDB_DB ?? "default";
 const PASSWORD = process.env.POWDB_PASSWORD ?? null;

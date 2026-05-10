@@ -19,3 +19,11 @@ crates/compare/results.csv
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+
+# Secrets and credentials
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
