@@ -90,6 +90,35 @@ async function main() {
     assert.throws(() => tryDecode(frame), /too many rows/);
   });
 
+  await test("tryDecode throws intentional error on truncated ResultRows column count", () => {
+    const frame = Buffer.alloc(6);
+    frame.writeUInt8(0x07, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(0, 2);
+    assert.throws(() => tryDecode(frame), /truncated column count/);
+  });
+
+  await test("tryDecode throws intentional error on truncated ResultRows row count", () => {
+    const payload = Buffer.alloc(2);
+    payload.writeUInt16LE(0, 0);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x07, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /truncated row count/);
+  });
+
+  await test("tryDecode throws intentional error on truncated ResultOk payload", () => {
+    const payload = Buffer.alloc(7);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x09, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /truncated affected count/);
+  });
+
   console.log("\nCancellation — abort during in-flight query");
 
   await test("AbortSignal rejects the pending query without destroying the socket", async () => {

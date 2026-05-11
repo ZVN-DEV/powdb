@@ -156,8 +156,7 @@ function decodePayload(msgType: number, payload: Buffer): Message {
     case MSG_QUERY:
       return { type: "Query", query: decodeString(payload, cursor) };
     case MSG_RESULT_ROWS: {
-      const colCount = payload.readUInt16LE(cursor.pos);
-      cursor.pos += 2;
+      const colCount = readU16(payload, cursor, "column count");
       if (colCount > MAX_COLUMNS) {
         throw new Error(
           `too many columns: ${colCount} (max ${MAX_COLUMNS})`,
@@ -167,8 +166,7 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       for (let i = 0; i < colCount; i++) {
         columns.push(decodeString(payload, cursor));
       }
-      const rowCount = payload.readUInt32LE(cursor.pos);
-      cursor.pos += 4;
+      const rowCount = readU32(payload, cursor, "row count");
       if (rowCount > MAX_ROWS) {
         throw new Error(
           `too many rows: ${rowCount} (max ${MAX_ROWS})`,
@@ -187,7 +185,7 @@ function decodePayload(msgType: number, payload: Buffer): Message {
     case MSG_RESULT_SCALAR:
       return { type: "ResultScalar", value: decodeString(payload, cursor) };
     case MSG_RESULT_OK: {
-      const affected = payload.readBigUInt64LE(0);
+      const affected = readU64(payload, cursor, "affected count");
       return { type: "ResultOk", affected };
     }
     case MSG_ERROR:
@@ -217,14 +215,40 @@ function decodeString(buf: Buffer, cursor: { pos: number }): string {
   if (cursor.pos + 4 > buf.length) {
     throw new Error("truncated string length");
   }
-  const len = buf.readUInt32LE(cursor.pos);
-  cursor.pos += 4;
+  const len = readU32(buf, cursor, "string length");
   if (cursor.pos + len > buf.length) {
     throw new Error("truncated string data");
   }
   const s = buf.toString("utf8", cursor.pos, cursor.pos + len);
   cursor.pos += len;
   return s;
+}
+
+function readU16(buf: Buffer, cursor: { pos: number }, label: string): number {
+  if (cursor.pos + 2 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readUInt16LE(cursor.pos);
+  cursor.pos += 2;
+  return value;
+}
+
+function readU32(buf: Buffer, cursor: { pos: number }, label: string): number {
+  if (cursor.pos + 4 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readUInt32LE(cursor.pos);
+  cursor.pos += 4;
+  return value;
+}
+
+function readU64(buf: Buffer, cursor: { pos: number }, label: string): bigint {
+  if (cursor.pos + 8 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readBigUInt64LE(cursor.pos);
+  cursor.pos += 8;
+  return value;
 }
 
 function u32LE(n: number): Buffer {

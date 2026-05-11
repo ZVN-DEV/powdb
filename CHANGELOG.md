@@ -5,6 +5,19 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [TS client 0.3.3] - 2026-05-10
+
+### Fixed
+
+- Report intentional protocol truncation errors for malformed short
+  `ResultRows` and `ResultOk` frames instead of surfacing raw Node buffer
+  range errors.
+
+### Changed
+
+- Pin local package-manager metadata to `pnpm@10.29.3` so audit and install
+  tooling match the v9 lockfile used by the TypeScript client workspace.
+
 ## [TS client 0.3.1] - 2026-05-09
 
 ### Fixed
