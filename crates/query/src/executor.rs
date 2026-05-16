@@ -446,7 +446,10 @@ impl Engine {
 
     /// Plan cache stats — useful for benches and debugging.
     pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
-        let cache = self.plan_cache.lock().unwrap();
+        let cache = self
+            .plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         (cache.hits, cache.misses, cache.len())
     }
 

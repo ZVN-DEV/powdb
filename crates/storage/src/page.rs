@@ -99,6 +99,11 @@ impl Page {
     /// Byte offset where slot entry `i` starts in the page.
     /// Slot directory grows upward from the bottom (before slot_count).
     fn slot_entry_offset(&self, i: u16) -> usize {
+        let required = (i as usize + 1) * SLOT_ENTRY_SIZE + SLOT_COUNT_SIZE;
+        assert!(
+            required <= PAGE_SIZE,
+            "slot index {i} exceeds page capacity (need {required} bytes, page is {PAGE_SIZE})"
+        );
         PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE)
     }
 
