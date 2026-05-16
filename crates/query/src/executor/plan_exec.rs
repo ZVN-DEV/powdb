@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::plan::*;
-use crate::result::QueryResult;
+use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
 use powdb_storage::types::*;
@@ -15,7 +15,7 @@ use super::{check_join_limit, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::ViewDef;
 
 impl Engine {
-    pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, String> {
+    pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
         match plan {
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
@@ -25,13 +25,13 @@ impl Engine {
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let rows: Vec<Vec<Value>> = self
                     .catalog
                     .scan(table)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?
                     .map(|(_, row)| row)
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
@@ -83,7 +83,7 @@ impl Engine {
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                         .clone();
                     let columns: Vec<String> =
                         schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -103,7 +103,7 @@ impl Engine {
                                     rows.push(decode_row(&schema, data));
                                 }
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     } else {
                         let pred_cols = predicate_column_indices(predicate, &columns);
                         self.catalog
@@ -114,7 +114,7 @@ impl Engine {
                                     rows.push(decode_row(&schema, data));
                                 }
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
 
                     return Ok(QueryResult::Rows { columns, rows });
@@ -144,7 +144,7 @@ impl Engine {
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                         .clone();
                     let all_columns: Vec<String> =
                         schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -152,7 +152,7 @@ impl Engine {
                     let tbl = self
                         .catalog
                         .get_table(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
 
                     let proj_columns: Vec<String> = fields
                         .iter()
@@ -366,10 +366,7 @@ impl Engine {
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
                         if rows.len() > MAX_SORT_ROWS {
-                            return Err(format!(
-                                "sort input exceeds {} row limit — add a LIMIT clause",
-                                MAX_SORT_ROWS
-                            ));
+                            return Err(QueryError::SortLimitExceeded);
                         }
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
@@ -378,9 +375,9 @@ impl Engine {
                                     .iter()
                                     .position(|c| c == &k.field)
                                     .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| format!("column '{}' not found", k.field))
+                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.field.clone() })
                             })
-                            .collect::<Result<_, String>>()?;
+                            .collect::<Result<_, QueryError>>()?;
                         rows.sort_by(|a, b| {
                             for &(col_idx, descending) in &key_indices {
                                 let cmp = a[col_idx].cmp(&b[col_idx]);
@@ -440,7 +437,7 @@ impl Engine {
                             .for_each_row_raw(table, |_rid, _data| {
                                 count += 1;
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(QueryResult::Scalar(Value::Int(count)));
                     }
                     // Fast path: count() over Filter(SeqScan) — try compiled
@@ -454,7 +451,7 @@ impl Engine {
                             let schema = self
                                 .catalog
                                 .schema(table)
-                                .ok_or_else(|| format!("table '{table}' not found"))?
+                                .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                                 .clone();
                             let columns: Vec<String> =
                                 schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -473,7 +470,7 @@ impl Engine {
                                             count += 1;
                                         }
                                     })
-                                    .map_err(|e| e.to_string())?;
+                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
 
@@ -488,7 +485,7 @@ impl Engine {
                                         count += 1;
                                     }
                                 })
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
@@ -638,19 +635,19 @@ impl Engine {
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let mut values = vec![Value::Empty; schema.columns.len()];
                     for a in assignments {
                         let idx = schema
                             .column_index(&a.field)
-                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                            .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
                         values[idx] = literal_to_value(&a.value)?;
                     }
                     values
                 };
                 self.catalog
                     .insert(table, &values)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 self.view_registry.mark_dependents_dirty(table);
                 Ok(QueryResult::Modified(1))
             }
@@ -666,12 +663,12 @@ impl Engine {
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let mut values = vec![Value::Empty; schema.columns.len()];
                     for a in assignments {
                         let idx = schema
                             .column_index(&a.field)
-                            .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                            .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
                         values[idx] = literal_to_value(&a.value)?;
                     }
                     let key_idx = schema
@@ -687,7 +684,7 @@ impl Engine {
                     let tbl = self
                         .catalog
                         .get_table(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     if let Some(btree) = tbl.index(key_column) {
                         let hit = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
@@ -722,12 +719,12 @@ impl Engine {
                         let schema = self
                             .catalog
                             .schema(table)
-                            .ok_or_else(|| format!("table '{table}' not found"))?;
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let mut indices = Vec::new();
                         for a in update_assignments {
                             let idx = schema
                                 .column_index(&a.field)
-                                .ok_or_else(|| format!("column '{}' not found", a.field))?;
+                                .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
                             if idx != key_idx {
                                 existing_row[idx] = literal_to_value(&a.value)?;
                                 indices.push(idx);
@@ -737,14 +734,14 @@ impl Engine {
                     };
                     self.catalog
                         .update_hinted(table, rid, &existing_row, Some(&changed_cols))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     self.view_registry.mark_dependents_dirty(table);
                     Ok(QueryResult::Modified(1))
                 } else {
                     // No conflict: insert.
                     self.catalog
                         .insert(table, &values)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     self.view_registry.mark_dependents_dirty(table);
                     Ok(QueryResult::Modified(1))
                 }
@@ -764,13 +761,13 @@ impl Engine {
                     let schema_ref = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let indices: Vec<usize> = assignments
                         .iter()
                         .map(|a| {
                             schema_ref
                                 .column_index(&a.field)
-                                .ok_or_else(|| format!("column '{}' not found", a.field))
+                                .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })
                         })
                         .collect::<Result<_, _>>()?;
                     let vals: Result<Vec<Value>, _> = assignments
@@ -828,7 +825,7 @@ impl Engine {
                         let tbl = self
                             .catalog
                             .get_table(table)
-                            .ok_or_else(|| format!("table '{table}' not found"))?;
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let schema = &tbl.schema;
                         let all_fixed_nonnull = resolved_assignments.iter().all(|(idx, val)| {
                             is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
@@ -886,7 +883,7 @@ impl Engine {
                                             .copy_from_slice(field_bytes);
                                     }
                                 })
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             if ok {
                                 count += 1;
                             }
@@ -900,7 +897,7 @@ impl Engine {
                         let tbl = self
                             .catalog
                             .get_table(table)
-                            .ok_or_else(|| format!("table '{table}' not found"))?;
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let schema = &tbl.schema;
                         let is_single = resolved_assignments.len() == 1;
                         let is_var_col = is_single
@@ -916,10 +913,10 @@ impl Engine {
                                 Value::Bytes(b) => Some(b.clone()),
                                 Value::Empty => None,
                                 _ => {
-                                    return Err(format!(
-                                "type mismatch: cannot assign non-var value to var column '{}'",
+                                    return Err(QueryError::TypeError(format!(
+                                "cannot assign non-var value to var column '{}'",
                                 schema.columns[*idx].name
-                            ))
+                            )))
                                 }
                             };
                             Some((*idx, bytes_opt))
@@ -941,7 +938,7 @@ impl Engine {
                             let ok = self
                                 .catalog
                                 .patch_var_col_logged(table, *rid, col_idx, new_bytes_ref)
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             if ok {
                                 count += 1;
                             } else {
@@ -958,7 +955,7 @@ impl Engine {
                             }
                             self.catalog
                                 .update_hinted(table, rid, &row, Some(&changed_cols))
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             count += 1;
                         }
                         self.view_registry.mark_dependents_dirty(table);
@@ -977,7 +974,7 @@ impl Engine {
                         }
                         self.catalog
                             .update_hinted(table, rid, &row, Some(&changed_cols))
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         count += 1;
                     }
                     self.view_registry.mark_dependents_dirty(table);
@@ -991,7 +988,7 @@ impl Engine {
                     let schema_ref = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     schema_ref.columns.iter().map(|c| c.name.clone()).collect()
                 };
                 let mut count = 0u64;
@@ -1006,7 +1003,7 @@ impl Engine {
                     }
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     count += 1;
                 }
                 self.view_registry.mark_dependents_dirty(table);
@@ -1044,7 +1041,7 @@ impl Engine {
                             let schema = self
                                 .catalog
                                 .schema(table)
-                                .ok_or_else(|| format!("table '{table}' not found"))?;
+                                .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                             let columns: Vec<String> =
                                 schema.columns.iter().map(|c| c.name.clone()).collect();
                             let fast = FastLayout::new(schema);
@@ -1059,7 +1056,7 @@ impl Engine {
                                 let count = self
                                     .catalog
                                     .scan_delete_matching_logged(table, |data| compiled(data))
-                                    .map_err(|e| e.to_string())?;
+                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                                 self.view_registry.mark_dependents_dirty(table);
                                 return Ok(QueryResult::Modified(count));
                             }
@@ -1073,7 +1070,7 @@ impl Engine {
                         let count = self
                             .catalog
                             .scan_delete_matching_logged(table, |_| true)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         self.view_registry.mark_dependents_dirty(table);
                         return Ok(QueryResult::Modified(count));
                     }
@@ -1083,7 +1080,7 @@ impl Engine {
                 let count = self
                     .catalog
                     .delete_many(table, &matching_rids)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 self.view_registry.mark_dependents_dirty(table);
                 Ok(QueryResult::Modified(count))
             }
@@ -1101,7 +1098,7 @@ impl Engine {
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                     .clone();
                 let columns: Vec<String> = schema
                     .columns
@@ -1111,7 +1108,7 @@ impl Engine {
                 let rows: Vec<Vec<Value>> = self
                     .catalog
                     .scan(table)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?
                     .map(|(_, row)| row)
                     .collect();
                 Ok(QueryResult::Rows { columns, rows })
@@ -1343,7 +1340,7 @@ impl Engine {
                 };
                 self.catalog
                     .create_table(schema)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 Ok(QueryResult::Created(name.clone()))
             }
 
@@ -1356,7 +1353,7 @@ impl Engine {
                     let position = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                         .columns
                         .len() as u16;
                     let col = ColumnDef {
@@ -1367,7 +1364,7 @@ impl Engine {
                     };
                     self.catalog
                         .alter_table_add_column(table, col)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("column '{name}' added to '{table}'"),
                     })
@@ -1375,7 +1372,7 @@ impl Engine {
                 AlterAction::DropColumn { name } => {
                     self.catalog
                         .alter_table_drop_column(table, name)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("column '{name}' dropped from '{table}'"),
                     })
@@ -1383,7 +1380,7 @@ impl Engine {
                 AlterAction::AddIndex { column } => {
                     self.catalog
                         .create_index(table, column)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("index on '{table}.{column}' created"),
                     })
@@ -1391,7 +1388,7 @@ impl Engine {
             },
 
             PlanNode::DropTable { name } => {
-                self.catalog.drop_table(name).map_err(|e| e.to_string())?;
+                self.catalog.drop_table(name).map_err(|e| QueryError::StorageError(e.to_string()))?;
                 Ok(QueryResult::Executed {
                     message: format!("table '{name}' dropped"),
                 })
@@ -1473,7 +1470,7 @@ impl Engine {
                 let tbl = self
                     .catalog
                     .get_table(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                 let columns: Vec<String> =
                     tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -1524,14 +1521,14 @@ impl Engine {
                                 rows.push(decode_row(schema, data));
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
                 // Last resort: slow eq-check on materialised rows.
                 let col_idx = schema
                     .column_index(column)
-                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter_map(|(_, row)| {
@@ -1554,7 +1551,7 @@ impl Engine {
                 let tbl = self
                     .catalog
                     .get_table(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                 let columns: Vec<String> =
                     tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
                 let schema = &tbl.schema;
@@ -1614,13 +1611,13 @@ impl Engine {
                                 rows.push(decode_row(schema, data));
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
                 let col_idx = schema
                     .column_index(column)
-                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter(|(_, row)| {
@@ -1643,9 +1640,9 @@ impl Engine {
 
     /// Create a materialized view: execute the source query, store results
     /// in a new backing table, and register the view.
-    fn create_view(&mut self, name: &str, query_text: &str) -> Result<(), String> {
+    fn create_view(&mut self, name: &str, query_text: &str) -> Result<(), QueryError> {
         if self.view_registry.is_view(name) {
-            return Err(format!("materialized view '{name}' already exists"));
+            return Err(QueryError::ViewError(format!("materialized view '{name}' already exists")));
         }
         // Execute the source query to get the result set.
         let result = self.execute_powql(query_text)?;
@@ -1658,9 +1655,9 @@ impl Engine {
         // Create the backing table and insert the result rows.
         self.catalog
             .create_table(schema)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
         for row in &rows {
-            self.catalog.insert(name, row).map_err(|e| e.to_string())?;
+            self.catalog.insert(name, row).map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         // Determine which base tables this view depends on by parsing the query.
         let depends_on = self.extract_view_deps(query_text);
@@ -1671,13 +1668,13 @@ impl Engine {
                 depends_on,
                 dirty: false,
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
     /// Refresh a materialized view: re-execute its source query and replace
     /// the backing table's contents.
-    fn refresh_view(&mut self, name: &str) -> Result<(), String> {
+    fn refresh_view(&mut self, name: &str) -> Result<(), QueryError> {
         let def = self
             .view_registry
             .get(name)
@@ -1694,23 +1691,23 @@ impl Engine {
         // must see them.
         self.catalog
             .scan_delete_matching_logged(name, |_| true)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
         for row in &rows {
-            self.catalog.insert(name, row).map_err(|e| e.to_string())?;
+            self.catalog.insert(name, row).map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         self.view_registry.mark_clean(name);
         Ok(())
     }
 
     /// Drop a materialized view: remove the backing table and unregister.
-    fn drop_view(&mut self, name: &str) -> Result<(), String> {
+    fn drop_view(&mut self, name: &str) -> Result<(), QueryError> {
         if !self.view_registry.is_view(name) {
-            return Err(format!("materialized view '{name}' not found"));
+            return Err(QueryError::ViewError(format!("materialized view '{name}' not found")));
         }
         self.view_registry
             .unregister(name)
-            .map_err(|e| e.to_string())?;
-        self.catalog.drop_table(name).map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        self.catalog.drop_table(name).map_err(|e| QueryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -1772,11 +1769,11 @@ impl Engine {
         col: &str,
         function: AggFunc,
         predicate: Option<&Expr>,
-    ) -> Result<Option<QueryResult>, String> {
+    ) -> Result<Option<QueryResult>, QueryError> {
         let schema = self
             .catalog
             .schema(table)
-            .ok_or_else(|| format!("table '{table}' not found"))?
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
             .clone();
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let col_idx = match schema.column_index(col) {
@@ -2077,11 +2074,11 @@ impl Engine {
         fields: &[ProjectField],
         limit: usize,
         predicate: Option<&Expr>,
-    ) -> Result<Option<QueryResult>, String> {
+    ) -> Result<Option<QueryResult>, QueryError> {
         let schema = self
             .catalog
             .schema(table)
-            .ok_or_else(|| format!("table '{table}' not found"))?
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
             .clone();
         let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -2137,7 +2134,7 @@ impl Engine {
                     ControlFlow::Continue(())
                 }
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
         Ok(Some(QueryResult::Rows {
             columns: proj_columns,
@@ -2157,7 +2154,7 @@ impl Engine {
         descending: bool,
         limit: usize,
         predicate: Option<&Expr>,
-    ) -> Result<Option<QueryResult>, String> {
+    ) -> Result<Option<QueryResult>, QueryError> {
         if limit == 0 {
             // Degenerate case — empty result. Let the generic path handle it
             // for proper column naming.
@@ -2166,7 +2163,7 @@ impl Engine {
         let schema = self
             .catalog
             .schema(table)
-            .ok_or_else(|| format!("table '{table}' not found"))?
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
             .clone();
         let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
 
@@ -2274,7 +2271,7 @@ impl Engine {
                             }
                         }
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
                 let mut drained: Vec<(i64, u64, Vec<u8>)> = if descending {
                     heap_desc.into_iter().map(|Reverse(t)| t).collect()
@@ -2341,7 +2338,7 @@ impl Engine {
                             }
                         }
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
                 let mut drained: Vec<(u64, u64, Vec<u8>)> = if descending {
                     heap_desc.into_iter().map(|Reverse(t)| t).collect()
@@ -2396,7 +2393,7 @@ impl Engine {
         predicate: &Expr,
         resolved: &[(usize, Value)],
         changed_cols: &[usize],
-    ) -> Option<Result<QueryResult, String>> {
+    ) -> Option<Result<QueryResult, QueryError>> {
         // Build compiled predicate. Requires a schema borrow that must be
         // dropped before we call scan_patch_matching_logged.
         let compiled = {
@@ -2464,7 +2461,7 @@ impl Engine {
                     self.view_registry.mark_dependents_dirty(table);
                     return Some(Ok(QueryResult::Modified(count)));
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(QueryError::Execution(e))),
             }
         }
 
@@ -2521,7 +2518,7 @@ impl Engine {
                     self.view_registry.mark_dependents_dirty(table);
                     return Some(Ok(QueryResult::Modified(count)));
                 }
-                Err(e) => return Some(Err(e)),
+                Err(e) => return Some(Err(QueryError::Execution(e))),
             }
         }
 
@@ -2537,14 +2534,14 @@ impl Engine {
         &mut self,
         input: &PlanNode,
         table: &str,
-    ) -> Result<Vec<RowId>, String> {
+    ) -> Result<Vec<RowId>, QueryError> {
         match input {
             PlanNode::SeqScan { table: t } if t == table => {
                 // "Update/delete everything" — rare but legal.
                 let rids: Vec<RowId> = self
                     .catalog
                     .scan(table)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?
                     .map(|(rid, _)| rid)
                     .collect();
                 Ok(rids)
@@ -2568,7 +2565,7 @@ impl Engine {
                     let tbl = self
                         .catalog
                         .get_table(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     if let Some(btree) = tbl.index(column) {
                         let hit = match &key_value {
                             Value::Int(k) => btree.lookup_int(*k),
@@ -2588,7 +2585,7 @@ impl Engine {
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let fast = FastLayout::new(schema);
                 let synth = Expr::BinaryOp(
@@ -2605,18 +2602,18 @@ impl Engine {
                                 rids.push(rid);
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(rids);
                 }
 
                 // Fallback: decode each row, compare values.
                 let col_idx = schema
                     .column_index(column)
-                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
                 let rids: Vec<RowId> = self
                     .catalog
                     .scan(table)
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?
                     .filter_map(|(rid, row)| {
                         if row[col_idx] == key_value {
                             Some(rid)
@@ -2638,7 +2635,7 @@ impl Engine {
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let columns: Vec<String> =
                         schema.columns.iter().map(|c| c.name.clone()).collect();
                     let fast = FastLayout::new(schema);
@@ -2654,7 +2651,7 @@ impl Engine {
                                     rids.push(rid);
                                 }
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(rids);
                     }
 
@@ -2668,7 +2665,7 @@ impl Engine {
                                 rids.push(rid);
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(rids);
                 }
                 self.generic_rid_match(input, table)
@@ -2680,7 +2677,7 @@ impl Engine {
     /// Last-ditch generic match: execute the plan, collect matching rows,
     /// then find corresponding RowIds by value equality. This is the old
     /// O(N*M) code path; only used when the plan shape is something exotic.
-    fn generic_rid_match(&mut self, input: &PlanNode, table: &str) -> Result<Vec<RowId>, String> {
+    fn generic_rid_match(&mut self, input: &PlanNode, table: &str) -> Result<Vec<RowId>, QueryError> {
         let result = self.execute_plan(input)?;
         let rows = match result {
             QueryResult::Rows { rows, .. } => rows,
@@ -2689,7 +2686,7 @@ impl Engine {
         let matching: Vec<RowId> = self
             .catalog
             .scan(table)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| QueryError::StorageError(e.to_string()))?
             .filter(|(_, row)| rows.iter().any(|r| r == row))
             .map(|(rid, _)| rid)
             .collect();
@@ -2697,7 +2694,7 @@ impl Engine {
     }
 }
 
-pub(super) fn execute_window(result: QueryResult, windows: &[WindowDef]) -> Result<QueryResult, String> {
+pub(super) fn execute_window(result: QueryResult, windows: &[WindowDef]) -> Result<QueryResult, QueryError> {
     let (mut columns, mut rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => return Err("window function requires row input".into()),

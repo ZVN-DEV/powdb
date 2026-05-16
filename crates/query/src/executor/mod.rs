@@ -9,7 +9,7 @@ use crate::canonicalize::canonicalize;
 use crate::plan::*;
 use crate::plan_cache::PlanCache;
 use crate::planner;
-use crate::result::QueryResult;
+use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{decode_column, decode_row, RowLayout};
 use powdb_storage::types::*;
@@ -24,13 +24,9 @@ use tracing::{error, info, Level};
 use self::compiled::*;
 use self::eval::*;
 
-/// Sentinel error returned by `Engine::execute_powql_readonly` when the
-/// query touches a materialized view whose backing table is dirty. The
-/// read path holds only `&self`, so it can't refresh the view — the caller
-/// is expected to recognise this prefix and retry with the write lock.
-///
-/// Mission infra-1: this is the escalation hook between the RwLock reader
-/// fast path and the generic write path. Handlers match on it verbatim.
+/// Legacy sentinel string constant — kept for backward compatibility with
+/// any external code matching on the string representation. New code should
+/// match on `QueryError::ReadonlyNeedsWrite` directly.
 pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
 
 /// Plan cache capacity. Bench workloads fill ~15 slots; real apps will sit
@@ -49,9 +45,9 @@ pub(super) const MAX_JOIN_ROWS: usize = 1_000_000;
 pub(super) const MAX_SORT_ROWS: usize = 10_000_000;
 
 #[inline]
-pub(super) fn check_join_limit(row_count: usize) -> Result<(), String> {
+pub(super) fn check_join_limit(row_count: usize) -> Result<(), QueryError> {
     if row_count > MAX_JOIN_ROWS {
-        return Err(format!("join result exceeds {} row limit", MAX_JOIN_ROWS));
+        return Err(QueryError::JoinLimitExceeded);
     }
     Ok(())
 }
@@ -107,7 +103,7 @@ macro_rules! agg_int_loop {
                         unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         } else {
             $self
                 .catalog
@@ -121,7 +117,7 @@ macro_rules! agg_int_loop {
                         unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
     }};
 }
@@ -151,7 +147,7 @@ macro_rules! agg_float_loop {
                         unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         } else {
             $self
                 .catalog
@@ -165,7 +161,7 @@ macro_rules! agg_float_loop {
                         unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
                 })
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
     }};
 }
@@ -275,7 +271,7 @@ impl Engine {
     /// cached plan. This skips re-lexing, re-parsing, and re-planning —
     /// around 3μs per call on bench workloads. On a miss we plan as before
     /// and insert the plan under its canonical hash.
-    pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, String> {
+    pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
         // Hot path: tracing disabled. Zero syscalls, zero formatting.
         if !tracing::enabled!(Level::INFO) {
             // D9: try the plan cache first. Canonicalisation lexes the
@@ -284,7 +280,7 @@ impl Engine {
                 let cached = self
                     .plan_cache
                     .lock()
-                    .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
                     let plan = lower_unindexed_range_scans(&self.catalog, &plan);
@@ -294,7 +290,7 @@ impl Engine {
                     // the fsync happens here exactly once per statement.
                     // `sync_wal` is a no-op when nothing was buffered
                     // (pure reads pay zero fsync).
-                    self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                    self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -302,14 +298,14 @@ impl Engine {
                     Ok(plan) => {
                         self.plan_cache
                             .lock()
-                            .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                            .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                             .insert(hash, plan.clone());
                         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
-                        self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                        self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
                         result
                     }
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(QueryError::Parse(e.to_string())),
                 };
             }
             // Lex error — fall through to the planner so the caller gets a
@@ -318,10 +314,10 @@ impl Engine {
                 Ok(plan) => {
                     let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
-                    self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                    self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
                     result
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(QueryError::Parse(e.to_string())),
             };
         }
 
@@ -329,8 +325,9 @@ impl Engine {
         let total_start = Instant::now();
         let plan_start = Instant::now();
         let plan = planner::plan(input).map_err(|e| {
-            error!(query = %input, error = %e.to_string(), "query plan failed");
-            e.to_string()
+            let msg = e.to_string();
+            error!(query = %input, error = %msg, "query plan failed");
+            QueryError::Parse(msg)
         })?;
         let plan_us = plan_start.elapsed().as_micros();
 
@@ -390,13 +387,13 @@ impl Engine {
     /// This method is the concurrent-read fast path behind
     /// `Arc<RwLock<Engine>>`: multiple threads can call it simultaneously
     /// under a shared `.read()` lock and each will scan independently.
-    pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, String> {
+    pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
         // Parse the statement first so we can classify read vs. write
         // without touching the catalog. This is the same lex+parse cost
         // the hot path would pay anyway.
-        let stmt = crate::parser::parse(input).map_err(|e| e.to_string())?;
+        let stmt = crate::parser::parse(input).map_err(|e| QueryError::Parse(e.to_string()))?;
         if !is_read_only_statement(&stmt) {
-            return Err(READONLY_NEEDS_WRITE.to_string());
+            return Err(QueryError::ReadonlyNeedsWrite);
         }
 
         // Try the plan cache first — identical hash scheme to
@@ -406,7 +403,7 @@ impl Engine {
             let cached = self
                 .plan_cache
                 .lock()
-                .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
                 let plan = lower_unindexed_range_scans(&self.catalog, &plan);
@@ -414,17 +411,17 @@ impl Engine {
             }
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
-            let plan = crate::planner::plan_statement(stmt).map_err(|e| e.to_string())?;
+            let plan = crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
             self.plan_cache
                 .lock()
-                .map_err(|e| format!("plan cache lock poisoned: {e}"))?
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .insert(hash, plan.clone());
             let plan = lower_unindexed_range_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
-        let plan = crate::planner::plan_statement(stmt).map_err(|e| e.to_string())?;
+        let plan = crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
     }
@@ -439,18 +436,18 @@ impl Engine {
     /// cache mutation on inner subqueries is handled via the shared mutex
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
-    fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, String> {
+    fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
         match plan {
             PlanNode::SeqScan { table } => {
                 // Dirty view means we'd need to refresh it — can't do that
                 // under `&self`. Escalate to the write path.
                 if self.view_registry.is_dirty(table) {
-                    return Err(READONLY_NEEDS_WRITE.to_string());
+                    return Err(QueryError::ReadonlyNeedsWrite);
                 }
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let rows: Vec<Vec<Value>> = self
@@ -466,7 +463,7 @@ impl Engine {
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                     .clone();
                 let columns: Vec<String> = schema
                     .columns
@@ -486,14 +483,14 @@ impl Engine {
                 let schema = self
                     .catalog
                     .schema(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 let key_value = literal_to_value(key)?;
                 let tbl = self
                     .catalog
                     .get_table(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
 
                 if let Some(btree) = tbl.index(column) {
                     let hit = match &key_value {
@@ -525,14 +522,14 @@ impl Engine {
                                 rows.push(decode_row(&schema, data));
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
                 // Last resort: slow eq-check.
                 let col_idx = schema
                     .column_index(column)
-                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter_map(|(_, row)| {
@@ -555,7 +552,7 @@ impl Engine {
                 let tbl = self
                     .catalog
                     .get_table(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
                 let columns: Vec<String> =
                     tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
                 let schema = tbl.schema.clone();
@@ -617,14 +614,14 @@ impl Engine {
                                 rows.push(decode_row(&schema, data));
                             }
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
                 // Last resort: decoded row eval.
                 let col_idx = schema
                     .column_index(column)
-                    .ok_or_else(|| format!("column '{column}' not found"))?;
+                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter(|(_, row)| {
@@ -680,12 +677,12 @@ impl Engine {
                 // Fused Filter+SeqScan fast path.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
                     if self.view_registry.is_dirty(table) {
-                        return Err(READONLY_NEEDS_WRITE.to_string());
+                        return Err(QueryError::ReadonlyNeedsWrite);
                     }
                     let schema = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?
+                        .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                         .clone();
                     let columns: Vec<String> =
                         schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -700,7 +697,7 @@ impl Engine {
                                     rows.push(decode_row(&schema, data));
                                 }
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     } else {
                         let pred_cols = predicate_column_indices(predicate, &columns);
                         self.catalog
@@ -711,7 +708,7 @@ impl Engine {
                                     rows.push(decode_row(&schema, data));
                                 }
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
 
                     return Ok(QueryResult::Rows { columns, rows });
@@ -742,7 +739,7 @@ impl Engine {
                     let tbl = self
                         .catalog
                         .get_table(table)
-                        .ok_or_else(|| format!("table '{table}' not found"))?;
+                        .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
                     let schema = &tbl.schema;
                     let layout = tbl.row_layout();
 
@@ -933,10 +930,7 @@ impl Engine {
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
                         if rows.len() > MAX_SORT_ROWS {
-                            return Err(format!(
-                                "sort input exceeds {} row limit — add a LIMIT clause",
-                                MAX_SORT_ROWS
-                            ));
+                            return Err(QueryError::SortLimitExceeded);
                         }
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
@@ -945,9 +939,9 @@ impl Engine {
                                     .iter()
                                     .position(|c| c == &k.field)
                                     .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| format!("column '{}' not found", k.field))
+                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.field.clone() })
                             })
-                            .collect::<Result<_, String>>()?;
+                            .collect::<Result<_, QueryError>>()?;
                         rows.sort_by(|a, b| {
                             for &(col_idx, descending) in &key_indices {
                                 let cmp = a[col_idx].cmp(&b[col_idx]);
@@ -1007,7 +1001,7 @@ impl Engine {
                             .for_each_row_raw(table, |_rid, _data| {
                                 count += 1;
                             })
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(QueryResult::Scalar(Value::Int(count)));
                     }
                     if let PlanNode::Filter {
@@ -1019,7 +1013,7 @@ impl Engine {
                             let schema = self
                                 .catalog
                                 .schema(table)
-                                .ok_or_else(|| format!("table '{table}' not found"))?
+                                .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                                 .clone();
                             let columns: Vec<String> =
                                 schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -1036,7 +1030,7 @@ impl Engine {
                                             count += 1;
                                         }
                                     })
-                                    .map_err(|e| e.to_string())?;
+                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
 
@@ -1050,7 +1044,7 @@ impl Engine {
                                         count += 1;
                                     }
                                 })
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
                     }
@@ -1208,7 +1202,7 @@ impl Engine {
                                 columns
                                     .iter()
                                     .position(|c| c == k)
-                                    .ok_or_else(|| format!("group-by column '{k}' not found"))
+                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.clone() })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1219,7 +1213,7 @@ impl Engine {
                                     Ok(usize::MAX)
                                 } else {
                                     columns.iter().position(|c| c == &a.field).ok_or_else(|| {
-                                        format!("aggregate column '{}' not found", a.field)
+                                        QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() }
                                     })
                                 }
                             })
@@ -1414,7 +1408,7 @@ impl Engine {
             | PlanNode::DropTable { .. }
             | PlanNode::CreateView { .. }
             | PlanNode::RefreshView { .. }
-            | PlanNode::DropView { .. } => Err(READONLY_NEEDS_WRITE.to_string()),
+            | PlanNode::DropView { .. } => Err(QueryError::ReadonlyNeedsWrite),
         }
     }
 
@@ -1424,7 +1418,7 @@ impl Engine {
     /// lock. Inner queries that would themselves need a write (e.g. dirty
     /// view) escalate via [`READONLY_NEEDS_WRITE`] just like the top-level
     /// read path does.
-    fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, String> {
+    fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
@@ -1443,7 +1437,7 @@ impl Engine {
                 }
                 let inner = self.materialize_subqueries_readonly(inner)?;
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -1469,7 +1463,7 @@ impl Engine {
                     return Ok(expr.clone());
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -1495,7 +1489,7 @@ impl Engine {
                         let r = self.materialize_subqueries_readonly(r)?;
                         Ok((Box::new(c), Box::new(r)))
                     })
-                    .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<Result<Vec<_>, QueryError>>()?;
                 let else_expr = match else_expr {
                     Some(e) => Some(Box::new(self.materialize_subqueries_readonly(e)?)),
                     None => None,
@@ -1515,7 +1509,7 @@ impl Engine {
         expr: &Expr,
         outer_row: &[Value],
         outer_columns: &[String],
-    ) -> Result<Expr, String> {
+    ) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
@@ -1535,7 +1529,7 @@ impl Engine {
                     ));
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -1568,7 +1562,7 @@ impl Engine {
                     ));
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),

@@ -1,7 +1,7 @@
 use crate::protocol::Message;
-use powdb_query::executor::{is_read_only_statement, Engine, READONLY_NEEDS_WRITE};
+use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
-use powdb_query::result::QueryResult;
+use powdb_query::result::{QueryError, QueryResult};
 use powdb_storage::types::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -123,25 +123,25 @@ pub struct ConnOpts<'a> {
 /// Execute a query against the engine under the RwLock. Read-only
 /// statements acquire `.read()` so concurrent SELECTs can scan in
 /// parallel; mutations acquire `.write()`.
-fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, String> {
+fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, QueryError> {
     let stmt_result = parser::parse(query).map_err(|e| e.to_string());
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine.read().map_err(|e| format!("lock poisoned: {e}"))?;
+            let eng = engine.read().map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
             eng.execute_powql_readonly(query)
         };
         match res {
             Ok(r) => return Ok(r),
-            Err(e) if e == READONLY_NEEDS_WRITE => {
+            Err(QueryError::ReadonlyNeedsWrite) => {
                 // Escalate: fall through to the write path below.
             }
             Err(e) => return Err(e),
         }
     }
 
-    let mut eng = engine.write().map_err(|e| format!("lock poisoned: {e}"))?;
+    let mut eng = engine.write().map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     eng.execute_powql(query)
 }
 
@@ -317,7 +317,7 @@ where
                     match tokio::time::timeout(query_timeout, result).await {
                         Ok(Ok(Ok(result))) => query_result_to_message(result),
                         Ok(Ok(Err(e))) => Message::Error {
-                            message: sanitize_error(&e),
+                            message: sanitize_error(&e.to_string()),
                         },
                         Ok(Err(e)) => Message::Error {
                             message: format!("internal error: {e}"),

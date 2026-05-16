@@ -379,7 +379,7 @@ fn write_lock_excludes_readers_correctness() {
 
 #[test]
 fn readonly_rejects_mutations_with_escalation_sentinel() {
-    use powdb_query::executor::READONLY_NEEDS_WRITE;
+    use powdb_query::result::QueryError;
     let engine = fresh_engine();
     {
         let mut eng = engine.write().unwrap();
@@ -389,5 +389,5 @@ fn readonly_rejects_mutations_with_escalation_sentinel() {
     let err = eng
         .execute_powql_readonly(r#"insert T { id := 1 }"#)
         .unwrap_err();
-    assert_eq!(err, READONLY_NEEDS_WRITE);
+    assert_eq!(err, QueryError::ReadonlyNeedsWrite);
 }

@@ -130,7 +130,7 @@ fn test_order_by_missing_column_errors() {
         .execute_powql("User order .nonexistent desc")
         .expect_err("sort on missing column must error, not panic");
     assert!(
-        err.contains("nonexistent"),
+        err.to_string().contains("nonexistent"),
         "error should name the missing column, got: {err}"
     );
 }
@@ -685,7 +685,7 @@ fn test_prepared_wrong_arity_errors() {
         .expect("prepare");
     assert_eq!(prep.param_count, 1);
     let err = engine.execute_prepared(&prep, &[]).unwrap_err();
-    assert!(err.contains("expects 1 literal"));
+    assert!(err.to_string().contains("expects 1 literal"));
 }
 
 // ─── Mission E1.2 join executor tests ───────────────────────────────────
@@ -2418,7 +2418,7 @@ fn test_drop_view() {
     }
     // Querying the dropped view should fail.
     let err = engine.execute_powql("OldUsers").unwrap_err();
-    assert!(err.contains("not found"));
+    assert!(err.to_string().contains("not found"));
 }
 
 #[test]
@@ -2471,14 +2471,14 @@ fn test_duplicate_view_creation_fails() {
     let err = engine
         .execute_powql(r#"materialize V as User"#)
         .unwrap_err();
-    assert!(err.contains("already exists"));
+    assert!(err.to_string().contains("already exists"));
 }
 
 #[test]
 fn test_drop_nonexistent_view_fails() {
     let mut engine = test_engine();
     let err = engine.execute_powql("drop view NoSuchView").unwrap_err();
-    assert!(err.contains("not found"));
+    assert!(err.to_string().contains("not found"));
 }
 
 // ── UNION / UNION ALL tests ────────────────────────────────

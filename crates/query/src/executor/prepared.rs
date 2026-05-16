@@ -3,7 +3,7 @@
 use crate::ast::*;
 use crate::plan::*;
 use crate::planner;
-use crate::result::QueryResult;
+use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::types::*;
 
@@ -95,8 +95,8 @@ struct UpdatePkFast {
 }
 
 impl Engine {
-    pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, String> {
-        let plan = planner::plan(query).map_err(|e| e.to_string())?;
+    pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, QueryError> {
+        let plan = planner::plan(query).map_err(|e| QueryError::Parse(e.to_string()))?;
         let param_count = crate::plan_cache::count_literal_slots(&plan);
 
         // Insert fast path: if the template is Insert and every assignment
@@ -117,15 +117,15 @@ impl Engine {
                 let table_slot = self
                     .catalog
                     .table_slot(table)
-                    .ok_or_else(|| format!("table '{table}' not found"))?;
+                    .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
                 let schema = &self.catalog.table_by_slot(table_slot).schema;
                 let n_cols = schema.columns.len();
-                let indices: Result<Vec<usize>, String> = assignments
+                let indices: Result<Vec<usize>, QueryError> = assignments
                     .iter()
                     .map(|a| {
                         schema
                             .column_index(&a.field)
-                            .ok_or_else(|| format!("column '{}' not found", a.field))
+                            .ok_or_else(|| QueryError::ColumnNotFound { table: table.clone(), column: a.field.clone() })
                     })
                     .collect();
                 Some(InsertFast {
@@ -255,13 +255,13 @@ impl Engine {
         &mut self,
         prep: &PreparedQuery,
         literals: &[Literal],
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, QueryError> {
         if literals.len() != prep.param_count {
-            return Err(format!(
+            return Err(QueryError::Execution(format!(
                 "prepared query expects {} literal(s), got {}",
                 prep.param_count,
                 literals.len(),
-            ));
+            )));
         }
 
         // Mission C Phase 14: update-by-pk fast path. Skip plan clone,
@@ -280,7 +280,7 @@ impl Engine {
                 // commit. The fast path appended an Update record but did
                 // not flush — flush it now so the executor's contract is
                 // "WAL is on disk before this returns".
-                self.catalog.sync_wal().map_err(|e| e.to_string())?;
+                self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
                 return Ok(result);
             }
         }
@@ -323,7 +323,7 @@ impl Engine {
                 self.view_registry.mark_dependents_dirty(table);
             }
             // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog.sync_wal().map_err(|e| e.to_string())?;
+            self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -334,7 +334,7 @@ impl Engine {
         let result = self.execute_plan(&plan);
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).
-        self.catalog.sync_wal().map_err(|e| e.to_string())?;
+        self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
         result
     }
 
@@ -356,7 +356,7 @@ impl Engine {
         &mut self,
         fast: &UpdatePkFast,
         literals: &[Literal],
-    ) -> Result<Option<QueryResult>, String> {
+    ) -> Result<Option<QueryResult>, QueryError> {
         // 1) Extract the key literal. The fast path is only built for
         //    int key columns; any other literal type means the caller
         //    is violating the prepared-query contract or the schema
@@ -410,7 +410,7 @@ impl Engine {
                 let field_bytes = bytes.as_slice();
                 row[field_off..field_off + field_bytes.len()].copy_from_slice(field_bytes);
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
 
         Ok(Some(QueryResult::Modified(if ok { 1 } else { 0 })))
     }
@@ -432,13 +432,13 @@ impl Engine {
         &mut self,
         prep: &PreparedQuery,
         literals: &mut [Literal],
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, QueryError> {
         if literals.len() != prep.param_count {
-            return Err(format!(
+            return Err(QueryError::Execution(format!(
                 "prepared query expects {} literal(s), got {}",
                 prep.param_count,
                 literals.len(),
-            ));
+            )));
         }
 
         if let Some(fast) = &prep.insert_fast {
@@ -457,7 +457,7 @@ impl Engine {
             self.insert_values_scratch = values;
             res?;
             // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog.sync_wal().map_err(|e| e.to_string())?;
+            self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -473,7 +473,7 @@ impl Engine {
     /// column as literal values. This must be called before entering
     /// the row-by-row scan loop because the scan closure can't call back
     /// into the engine.
-    pub(super) fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, String> {
+    pub(super) fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
@@ -491,7 +491,7 @@ impl Engine {
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -519,7 +519,7 @@ impl Engine {
                 // Uncorrelated EXISTS: run the subquery once and collapse
                 // into a Bool literal.
                 let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -545,7 +545,7 @@ impl Engine {
                         let r = self.materialize_subqueries(r)?;
                         Ok((Box::new(c), Box::new(r)))
                     })
-                    .collect::<Result<Vec<_>, String>>()?;
+                    .collect::<Result<Vec<_>, QueryError>>()?;
                 let else_expr = match else_expr {
                     Some(e) => Some(Box::new(self.materialize_subqueries(e)?)),
                     None => None,
@@ -563,7 +563,7 @@ impl Engine {
         expr: &Expr,
         outer_row: &[Value],
         outer_columns: &[String],
-    ) -> Result<Expr, String> {
+    ) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
@@ -582,7 +582,7 @@ impl Engine {
                     ));
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => rows
@@ -615,7 +615,7 @@ impl Engine {
                     ));
                 }
                 let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
