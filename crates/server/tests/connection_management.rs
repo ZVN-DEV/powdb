@@ -64,10 +64,8 @@ async fn read_message(stream: &mut TcpStream) -> Option<Message> {
     }
     let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
     let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        if stream.read_exact(&mut payload).await.is_err() {
-            return None;
-        }
+    if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
+        return None;
     }
     let mut full = Vec::with_capacity(6 + payload_len);
     full.extend_from_slice(&header);
