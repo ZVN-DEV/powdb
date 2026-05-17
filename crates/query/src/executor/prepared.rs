@@ -125,7 +125,10 @@ impl Engine {
                     .map(|a| {
                         schema
                             .column_index(&a.field)
-                            .ok_or_else(|| QueryError::ColumnNotFound { table: table.clone(), column: a.field.clone() })
+                            .ok_or_else(|| QueryError::ColumnNotFound {
+                                table: table.clone(),
+                                column: a.field.clone(),
+                            })
                     })
                     .collect();
                 Some(InsertFast {
@@ -280,7 +283,9 @@ impl Engine {
                 // commit. The fast path appended an Update record but did
                 // not flush — flush it now so the executor's contract is
                 // "WAL is on disk before this returns".
-                self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+                self.catalog
+                    .sync_wal()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 return Ok(result);
             }
         }
@@ -323,7 +328,9 @@ impl Engine {
                 self.view_registry.mark_dependents_dirty(table);
             }
             // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+            self.catalog
+                .sync_wal()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -334,7 +341,9 @@ impl Engine {
         let result = self.execute_plan(&plan);
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).
-        self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+        self.catalog
+            .sync_wal()
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
         result
     }
 
@@ -457,7 +466,9 @@ impl Engine {
             self.insert_values_scratch = values;
             res?;
             // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+            self.catalog
+                .sync_wal()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
 

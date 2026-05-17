@@ -375,7 +375,10 @@ impl Engine {
                                     .iter()
                                     .position(|c| c == &k.field)
                                     .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.field.clone() })
+                                    .ok_or_else(|| QueryError::ColumnNotFound {
+                                        table: String::new(),
+                                        column: k.field.clone(),
+                                    })
                             })
                             .collect::<Result<_, QueryError>>()?;
                         rows.sort_by(|a, b| {
@@ -638,9 +641,12 @@ impl Engine {
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let mut values = vec![Value::Empty; schema.columns.len()];
                     for a in assignments {
-                        let idx = schema
-                            .column_index(&a.field)
-                            .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
+                        let idx = schema.column_index(&a.field).ok_or_else(|| {
+                            QueryError::ColumnNotFound {
+                                table: String::new(),
+                                column: a.field.clone(),
+                            }
+                        })?;
                         values[idx] = literal_to_value(&a.value)?;
                     }
                     values
@@ -666,9 +672,12 @@ impl Engine {
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     let mut values = vec![Value::Empty; schema.columns.len()];
                     for a in assignments {
-                        let idx = schema
-                            .column_index(&a.field)
-                            .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
+                        let idx = schema.column_index(&a.field).ok_or_else(|| {
+                            QueryError::ColumnNotFound {
+                                table: String::new(),
+                                column: a.field.clone(),
+                            }
+                        })?;
                         values[idx] = literal_to_value(&a.value)?;
                     }
                     let key_idx = schema
@@ -722,9 +731,12 @@ impl Engine {
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let mut indices = Vec::new();
                         for a in update_assignments {
-                            let idx = schema
-                                .column_index(&a.field)
-                                .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })?;
+                            let idx = schema.column_index(&a.field).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: a.field.clone(),
+                                }
+                            })?;
                             if idx != key_idx {
                                 existing_row[idx] = literal_to_value(&a.value)?;
                                 indices.push(idx);
@@ -765,9 +777,12 @@ impl Engine {
                     let indices: Vec<usize> = assignments
                         .iter()
                         .map(|a| {
-                            schema_ref
-                                .column_index(&a.field)
-                                .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() })
+                            schema_ref.column_index(&a.field).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: a.field.clone(),
+                                }
+                            })
                         })
                         .collect::<Result<_, _>>()?;
                     let vals: Result<Vec<Value>, _> = assignments
@@ -914,9 +929,9 @@ impl Engine {
                                 Value::Empty => None,
                                 _ => {
                                     return Err(QueryError::TypeError(format!(
-                                "cannot assign non-var value to var column '{}'",
-                                schema.columns[*idx].name
-                            )))
+                                        "cannot assign non-var value to var column '{}'",
+                                        schema.columns[*idx].name
+                                    )))
                                 }
                             };
                             Some((*idx, bytes_opt))
@@ -1388,7 +1403,9 @@ impl Engine {
             },
 
             PlanNode::DropTable { name } => {
-                self.catalog.drop_table(name).map_err(|e| QueryError::StorageError(e.to_string()))?;
+                self.catalog
+                    .drop_table(name)
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 Ok(QueryResult::Executed {
                     message: format!("table '{name}' dropped"),
                 })
@@ -1526,9 +1543,13 @@ impl Engine {
                 }
 
                 // Last resort: slow eq-check on materialised rows.
-                let col_idx = schema
-                    .column_index(column)
-                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
+                let col_idx =
+                    schema
+                        .column_index(column)
+                        .ok_or_else(|| QueryError::ColumnNotFound {
+                            table: String::new(),
+                            column: column.clone(),
+                        })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter_map(|(_, row)| {
@@ -1615,9 +1636,13 @@ impl Engine {
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
-                let col_idx = schema
-                    .column_index(column)
-                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
+                let col_idx =
+                    schema
+                        .column_index(column)
+                        .ok_or_else(|| QueryError::ColumnNotFound {
+                            table: String::new(),
+                            column: column.clone(),
+                        })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter(|(_, row)| {
@@ -1642,7 +1667,9 @@ impl Engine {
     /// in a new backing table, and register the view.
     fn create_view(&mut self, name: &str, query_text: &str) -> Result<(), QueryError> {
         if self.view_registry.is_view(name) {
-            return Err(QueryError::ViewError(format!("materialized view '{name}' already exists")));
+            return Err(QueryError::ViewError(format!(
+                "materialized view '{name}' already exists"
+            )));
         }
         // Execute the source query to get the result set.
         let result = self.execute_powql(query_text)?;
@@ -1657,7 +1684,9 @@ impl Engine {
             .create_table(schema)
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
         for row in &rows {
-            self.catalog.insert(name, row).map_err(|e| QueryError::StorageError(e.to_string()))?;
+            self.catalog
+                .insert(name, row)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         // Determine which base tables this view depends on by parsing the query.
         let depends_on = self.extract_view_deps(query_text);
@@ -1693,7 +1722,9 @@ impl Engine {
             .scan_delete_matching_logged(name, |_| true)
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
         for row in &rows {
-            self.catalog.insert(name, row).map_err(|e| QueryError::StorageError(e.to_string()))?;
+            self.catalog
+                .insert(name, row)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         self.view_registry.mark_clean(name);
         Ok(())
@@ -1702,12 +1733,16 @@ impl Engine {
     /// Drop a materialized view: remove the backing table and unregister.
     fn drop_view(&mut self, name: &str) -> Result<(), QueryError> {
         if !self.view_registry.is_view(name) {
-            return Err(QueryError::ViewError(format!("materialized view '{name}' not found")));
+            return Err(QueryError::ViewError(format!(
+                "materialized view '{name}' not found"
+            )));
         }
         self.view_registry
             .unregister(name)
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
-        self.catalog.drop_table(name).map_err(|e| QueryError::StorageError(e.to_string()))?;
+        self.catalog
+            .drop_table(name)
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -2613,9 +2648,13 @@ impl Engine {
                 }
 
                 // Fallback: decode each row, compare values.
-                let col_idx = schema
-                    .column_index(column)
-                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
+                let col_idx =
+                    schema
+                        .column_index(column)
+                        .ok_or_else(|| QueryError::ColumnNotFound {
+                            table: String::new(),
+                            column: column.clone(),
+                        })?;
                 let rids: Vec<RowId> = self
                     .catalog
                     .scan(table)
@@ -2683,7 +2722,11 @@ impl Engine {
     /// Last-ditch generic match: execute the plan, collect matching rows,
     /// then find corresponding RowIds by value equality. This is the old
     /// O(N*M) code path; only used when the plan shape is something exotic.
-    fn generic_rid_match(&mut self, input: &PlanNode, table: &str) -> Result<Vec<RowId>, QueryError> {
+    fn generic_rid_match(
+        &mut self,
+        input: &PlanNode,
+        table: &str,
+    ) -> Result<Vec<RowId>, QueryError> {
         let result = self.execute_plan(input)?;
         let rows = match result {
             QueryResult::Rows { rows, .. } => rows,
@@ -2700,7 +2743,10 @@ impl Engine {
     }
 }
 
-pub(super) fn execute_window(result: QueryResult, windows: &[WindowDef]) -> Result<QueryResult, QueryError> {
+pub(super) fn execute_window(
+    result: QueryResult,
+    windows: &[WindowDef],
+) -> Result<QueryResult, QueryError> {
     let (mut columns, mut rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => return Err("window function requires row input".into()),

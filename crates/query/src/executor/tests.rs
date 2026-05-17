@@ -1,8 +1,8 @@
+use super::compiled::f64_bits_to_sortable_u64;
 use super::Engine;
 use crate::ast::Literal;
 use crate::result::QueryResult;
 use powdb_storage::types::*;
-use super::compiled::f64_bits_to_sortable_u64;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -21,9 +21,7 @@ fn test_engine() -> Engine {
         .execute_powql(r#"insert User { name := "Bob", email := "bob@ex.com", age := 25 }"#)
         .unwrap();
     engine
-        .execute_powql(
-            r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#,
-        )
+        .execute_powql(r#"insert User { name := "Charlie", email := "charlie@ex.com", age := 35 }"#)
         .unwrap();
     engine
 }
@@ -254,8 +252,7 @@ fn test_offset_then_limit_keyword_order() {
 ///   created_at= 1_700_000_000 + i
 fn mission_a_engine(n: i64) -> Engine {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("powdb_mission_a_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_mission_a_{}_{}", std::process::id(), id));
     let mut engine = Engine::new(&dir).unwrap();
     engine
         .execute_powql(
@@ -325,9 +322,7 @@ fn test_fastpath_scan_filter_sort_limit10_desc() {
     // Project(Limit(Sort(Filter(SeqScan)))) — bounded top-N heap desc.
     let mut engine = mission_a_engine(500);
     let result = engine
-        .execute_powql(
-            "User filter .age > 20 order .created_at desc limit 10 { .id, .created_at }",
-        )
+        .execute_powql("User filter .age > 20 order .created_at desc limit 10 { .id, .created_at }")
         .unwrap();
     match result {
         QueryResult::Rows { rows, .. } => {
@@ -1010,9 +1005,7 @@ fn test_distinct_deduplicates_rows() {
     let mut engine = test_engine();
     // Insert a second Alice to create a duplicate name.
     engine
-        .execute_powql(
-            r#"insert User { name := "Alice", email := "alice2@ex.com", age := 25 }"#,
-        )
+        .execute_powql(r#"insert User { name := "Alice", email := "alice2@ex.com", age := 25 }"#)
         .unwrap();
     let result = engine.execute_powql("User distinct { .name }").unwrap();
     match result {
@@ -1290,9 +1283,7 @@ fn test_group_by_having() {
     // 30 rows: statuses cycle active/inactive/pending → 10 each.
     // Group by status, HAVING count > 5.
     let result = engine
-        .execute_powql(
-            "User group .status having count(.name) > 5 { .status, n: count(.name) }",
-        )
+        .execute_powql("User group .status having count(.name) > 5 { .status, n: count(.name) }")
         .unwrap();
     match result {
         QueryResult::Rows { columns, rows } => {
@@ -1364,8 +1355,7 @@ fn test_group_by_having_post_projection() {
     // referencing projection aliases) was silently dropped. This reproduces
     // the exact form the TS client used.
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("powdb_having_post_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_having_post_{}_{}", std::process::id(), id));
     let mut engine = Engine::new(&dir).unwrap();
     engine
         .execute_powql("type Person { required name: str, required age: int, city: str }")
@@ -1411,8 +1401,7 @@ fn test_group_by_having_reproduces_ts_client_case() {
     // Exact reproduction of the TS client test that surfaced the bug:
     // 5 people across 4 cities, HAVING count >= 2 should keep only NYC.
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("powdb_having_ts_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_having_ts_{}_{}", std::process::id(), id));
     let mut engine = Engine::new(&dir).unwrap();
     engine
         .execute_powql("type Person { required name: str, required age: int, city: str }")
@@ -1431,9 +1420,7 @@ fn test_group_by_having_reproduces_ts_client_case() {
             .unwrap();
     }
     let result = engine
-        .execute_powql(
-            "Person group .city having count(.name) >= 2 { .city, cnt: count(.name) }",
-        )
+        .execute_powql("Person group .city having count(.name) >= 2 { .city, cnt: count(.name) }")
         .unwrap();
     match result {
         QueryResult::Rows { rows, .. } => {
@@ -1500,9 +1487,7 @@ fn test_group_by_avg() {
     // inactive (i=1,4): ages 19,22 → avg=20.5
     // pending (i=2,5): ages 20,23 → avg=21.5
     let result = engine
-        .execute_powql(
-            r#"User filter .status = "active" group .status { .status, a: avg(.age) }"#,
-        )
+        .execute_powql(r#"User filter .status = "active" group .status { .status, a: avg(.age) }"#)
         .unwrap();
     match result {
         QueryResult::Rows { rows, .. } => {
@@ -2801,8 +2786,7 @@ fn test_group_by_count_star_with_having() {
 /// Exercises mixed numeric promotion in `eval_binop`.
 fn product_mix_engine() -> Engine {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("powdb_product_mix_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_product_mix_{}_{}", std::process::id(), id));
     let mut engine = Engine::new(&dir).unwrap();
     engine
         .execute_powql(
@@ -3025,8 +3009,7 @@ fn test_sum_float_group_by() {
 /// the `total_cmp` invariant.
 fn float_fast_engine() -> Engine {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("powdb_float_fast_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_float_fast_{}_{}", std::process::id(), id));
     let mut engine = Engine::new(&dir).unwrap();
     engine
         .execute_powql("type Price { required name: str, price: float, required qty: int }")
@@ -3358,9 +3341,11 @@ fn test_correlated_in_subquery() {
 
     // Correlated: for each User row, find orders where user_name = outer .name
     // The subquery references .name which is a User column, not a UserOrder column.
-    let result = engine.execute_powql(
-        "User filter .name in (UserOrder filter .user_name = .name { .user_name }) { .name }"
-    ).unwrap();
+    let result = engine
+        .execute_powql(
+            "User filter .name in (UserOrder filter .user_name = .name { .user_name }) { .name }",
+        )
+        .unwrap();
     match result {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 2, "Alice and Bob have orders");

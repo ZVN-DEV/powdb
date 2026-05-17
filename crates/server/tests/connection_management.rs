@@ -524,10 +524,7 @@ async fn test_malformed_protocol() {
     match result {
         Ok(Some(Message::Error { message })) => {
             // Server responded with an error - good
-            assert!(
-                !message.is_empty(),
-                "error message should not be empty"
-            );
+            assert!(!message.is_empty(), "error message should not be empty");
         }
         Ok(None) => {
             // Server closed the connection - also acceptable
@@ -641,7 +638,10 @@ async fn test_connection_reuse_after_error() {
     assert!(matches!(msg, Message::Error { .. }));
 
     // Still alive
-    stream.write_all(&encode_query("count(User)")).await.unwrap();
+    stream
+        .write_all(&encode_query("count(User)"))
+        .await
+        .unwrap();
     let msg = read_message(&mut stream).await.unwrap();
     match msg {
         Message::ResultScalar { value } => {

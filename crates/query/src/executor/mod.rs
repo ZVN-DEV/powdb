@@ -322,7 +322,9 @@ impl Engine {
                     // the fsync happens here exactly once per statement.
                     // `sync_wal` is a no-op when nothing was buffered
                     // (pure reads pay zero fsync).
-                    self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    self.catalog
+                        .sync_wal()
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -330,11 +332,15 @@ impl Engine {
                     Ok(plan) => {
                         self.plan_cache
                             .lock()
-                            .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                            .map_err(|e| {
+                                QueryError::Execution(format!("plan cache lock poisoned: {e}"))
+                            })?
                             .insert(hash, plan.clone());
                         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
-                        self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        self.catalog
+                            .sync_wal()
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         result
                     }
                     Err(e) => Err(QueryError::Parse(e.to_string())),
@@ -346,7 +352,9 @@ impl Engine {
                 Ok(plan) => {
                     let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
-                    self.catalog.sync_wal().map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    self.catalog
+                        .sync_wal()
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     result
                 }
                 Err(e) => Err(QueryError::Parse(e.to_string())),
@@ -397,10 +405,7 @@ impl Engine {
 
     /// Plan cache stats — useful for benches and debugging.
     pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
-        let cache = self
-            .plan_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
         (cache.hits, cache.misses, cache.len())
     }
 
@@ -443,7 +448,8 @@ impl Engine {
             }
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
-            let plan = crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
+            let plan = crate::planner::plan_statement(stmt)
+                .map_err(|e| QueryError::Parse(e.to_string()))?;
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
@@ -453,7 +459,8 @@ impl Engine {
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
-        let plan = crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan =
+            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
     }
@@ -559,9 +566,13 @@ impl Engine {
                 }
 
                 // Last resort: slow eq-check.
-                let col_idx = schema
-                    .column_index(column)
-                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
+                let col_idx =
+                    schema
+                        .column_index(column)
+                        .ok_or_else(|| QueryError::ColumnNotFound {
+                            table: String::new(),
+                            column: column.clone(),
+                        })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter_map(|(_, row)| {
@@ -651,9 +662,13 @@ impl Engine {
                 }
 
                 // Last resort: decoded row eval.
-                let col_idx = schema
-                    .column_index(column)
-                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: column.clone() })?;
+                let col_idx =
+                    schema
+                        .column_index(column)
+                        .ok_or_else(|| QueryError::ColumnNotFound {
+                            table: String::new(),
+                            column: column.clone(),
+                        })?;
                 let rows: Vec<Vec<Value>> = tbl
                     .scan()
                     .filter(|(_, row)| {
@@ -971,7 +986,10 @@ impl Engine {
                                     .iter()
                                     .position(|c| c == &k.field)
                                     .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.field.clone() })
+                                    .ok_or_else(|| QueryError::ColumnNotFound {
+                                        table: String::new(),
+                                        column: k.field.clone(),
+                                    })
                             })
                             .collect::<Result<_, QueryError>>()?;
                         rows.sort_by(|a, b| {
@@ -1231,10 +1249,12 @@ impl Engine {
                         let key_indices: Vec<usize> = keys
                             .iter()
                             .map(|k| {
-                                columns
-                                    .iter()
-                                    .position(|c| c == k)
-                                    .ok_or_else(|| QueryError::ColumnNotFound { table: String::new(), column: k.clone() })
+                                columns.iter().position(|c| c == k).ok_or_else(|| {
+                                    QueryError::ColumnNotFound {
+                                        table: String::new(),
+                                        column: k.clone(),
+                                    }
+                                })
                             })
                             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1245,7 +1265,10 @@ impl Engine {
                                     Ok(usize::MAX)
                                 } else {
                                     columns.iter().position(|c| c == &a.field).ok_or_else(|| {
-                                        QueryError::ColumnNotFound { table: String::new(), column: a.field.clone() }
+                                        QueryError::ColumnNotFound {
+                                            table: String::new(),
+                                            column: a.field.clone(),
+                                        }
                                     })
                                 }
                             })

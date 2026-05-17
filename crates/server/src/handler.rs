@@ -114,10 +114,7 @@ fn sanitize_error(e: &str) -> String {
 
 /// Write a message to the client with a timeout. Returns false if the
 /// write failed or timed out (caller should close the connection).
-async fn write_msg<W: AsyncWrite + Unpin>(
-    writer: &mut BufWriter<W>,
-    msg: &Message,
-) -> bool {
+async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Message) -> bool {
     let write_fut = async {
         if msg.write_to(writer).await.is_err() {
             return false;
@@ -150,7 +147,9 @@ fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResu
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine.read().map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+            let eng = engine
+                .read()
+                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
             eng.execute_powql_readonly(query)
         };
         match res {
@@ -162,7 +161,9 @@ fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResu
         }
     }
 
-    let mut eng = engine.write().map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+    let mut eng = engine
+        .write()
+        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     eng.execute_powql(query)
 }
 

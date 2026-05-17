@@ -287,7 +287,8 @@ impl Catalog {
                                 let _ = fs::remove_file(&heap_path);
                             }
                             for col_name in self.tables[slot].indexed_column_names() {
-                                let idx_path = self.data_dir.join(format!("{table_name}_{col_name}.idx"));
+                                let idx_path =
+                                    self.data_dir.join(format!("{table_name}_{col_name}.idx"));
                                 if idx_path.exists() {
                                     let _ = fs::remove_file(&idx_path);
                                 }
@@ -315,7 +316,11 @@ impl Catalog {
                                 if has_rows {
                                     let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                     let data_dir = self.data_dir.clone();
-                                    let _ = tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir);
+                                    let _ = tbl.rewrite_rows_for_schema_change(
+                                        &old_schema,
+                                        &fill,
+                                        &data_dir,
+                                    );
                                 }
                             }
                         }
@@ -325,7 +330,9 @@ impl Catalog {
                     if let Some((table_name, col_name)) = decode_ddl_alter_drop_column(&rec.data) {
                         if let Some(&slot) = self.name_to_slot.get(&table_name) {
                             let tbl = &mut self.tables[slot];
-                            if let Some(idx) = tbl.schema.columns.iter().position(|c| c.name == col_name) {
+                            if let Some(idx) =
+                                tbl.schema.columns.iter().position(|c| c.name == col_name)
+                            {
                                 let old_schema = tbl.schema.clone();
                                 let has_rows = tbl.heap.scan().next().is_some();
                                 tbl.schema.columns.remove(idx);
@@ -336,7 +343,11 @@ impl Catalog {
                                 if has_rows {
                                     let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                     let data_dir = self.data_dir.clone();
-                                    let _ = tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir);
+                                    let _ = tbl.rewrite_rows_for_schema_change(
+                                        &old_schema,
+                                        &fill,
+                                        &data_dir,
+                                    );
                                 }
                             }
                         }
@@ -479,7 +490,8 @@ impl Catalog {
         }
         if !self.wal.is_off() {
             let payload = encode_ddl_create_table(&schema);
-            self.wal.append(0, WalRecordType::DdlCreateTable, &payload)?;
+            self.wal
+                .append(0, WalRecordType::DdlCreateTable, &payload)?;
             self.wal.flush()?;
         }
         let table = Table::create(schema, &self.data_dir)?;
@@ -1324,7 +1336,9 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
     if pos + name_len > data.len() {
         return None;
     }
-    let table_name = std::str::from_utf8(&data[pos..pos + name_len]).ok()?.to_string();
+    let table_name = std::str::from_utf8(&data[pos..pos + name_len])
+        .ok()?
+        .to_string();
     pos += name_len;
     if pos + 2 > data.len() {
         return None;
@@ -1341,7 +1355,9 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
         if pos + cn_len + 4 > data.len() {
             return None;
         }
-        let col_name = std::str::from_utf8(&data[pos..pos + cn_len]).ok()?.to_string();
+        let col_name = std::str::from_utf8(&data[pos..pos + cn_len])
+            .ok()?
+            .to_string();
         pos += cn_len;
         let type_id = TypeId::from_u8(data[pos])?;
         pos += 1;
@@ -1352,9 +1368,17 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
         }
         let position = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
         pos += 2;
-        columns.push(ColumnDef { name: col_name, type_id, required, position });
+        columns.push(ColumnDef {
+            name: col_name,
+            type_id,
+            required,
+            position,
+        });
     }
-    Some(Schema { table_name, columns })
+    Some(Schema {
+        table_name,
+        columns,
+    })
 }
 
 fn encode_ddl_drop_table(table_name: &str) -> Vec<u8> {
@@ -1398,7 +1422,9 @@ fn decode_ddl_table_name(data: &[u8]) -> Option<(String, usize)> {
     if 4 + name_len > data.len() {
         return None;
     }
-    let name = std::str::from_utf8(&data[4..4 + name_len]).ok()?.to_string();
+    let name = std::str::from_utf8(&data[4..4 + name_len])
+        .ok()?
+        .to_string();
     Some((name, 4 + name_len))
 }
 
@@ -1412,7 +1438,9 @@ fn decode_ddl_alter_add_column(data: &[u8]) -> Option<(String, ColumnDef)> {
     if pos + cn_len + 4 > data.len() {
         return None;
     }
-    let col_name = std::str::from_utf8(&data[pos..pos + cn_len]).ok()?.to_string();
+    let col_name = std::str::from_utf8(&data[pos..pos + cn_len])
+        .ok()?
+        .to_string();
     pos += cn_len;
     let type_id = TypeId::from_u8(data[pos])?;
     pos += 1;
@@ -1422,7 +1450,15 @@ fn decode_ddl_alter_add_column(data: &[u8]) -> Option<(String, ColumnDef)> {
         return None;
     }
     let position = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
-    Some((table_name, ColumnDef { name: col_name, type_id, required, position }))
+    Some((
+        table_name,
+        ColumnDef {
+            name: col_name,
+            type_id,
+            required,
+            position,
+        },
+    ))
 }
 
 fn decode_ddl_alter_drop_column(data: &[u8]) -> Option<(String, String)> {
@@ -1434,10 +1470,11 @@ fn decode_ddl_alter_drop_column(data: &[u8]) -> Option<(String, String)> {
     if pos + 4 + cn_len > data.len() {
         return None;
     }
-    let col_name = std::str::from_utf8(&data[pos + 4..pos + 4 + cn_len]).ok()?.to_string();
+    let col_name = std::str::from_utf8(&data[pos + 4..pos + 4 + cn_len])
+        .ok()?
+        .to_string();
     Some((table_name, col_name))
 }
-
 
 // ─── Catalog file format ────────────────────────────────────────────────────
 //
