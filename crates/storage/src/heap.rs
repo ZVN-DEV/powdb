@@ -419,16 +419,27 @@ impl HeapFile {
                 // Bounds check: validate slot_index against the page's
                 // actual slot count to prevent OOB reads from stale/invalid
                 // RowIds.
-                let slot_count =
-                    u16::from_le_bytes(page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap());
+                let slot_count = u16::from_le_bytes(
+                    page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                );
                 if rid.slot_index >= slot_count {
                     return None;
                 }
                 let entry_off = PAGE_SIZE - 2 - ((rid.slot_index as usize + 1) * 4);
-                let slot_offset =
-                    u16::from_le_bytes(page_bytes[entry_off..entry_off + 2].try_into().unwrap());
+                if entry_off + 4 > PAGE_SIZE {
+                    return None;
+                }
+                let slot_offset = u16::from_le_bytes(
+                    page_bytes[entry_off..entry_off + 2]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                );
                 let slot_length = u16::from_le_bytes(
-                    page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap(),
+                    page_bytes[entry_off + 2..entry_off + 4]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
                 );
                 if slot_length == 0xFFFF {
                     return None; // deleted

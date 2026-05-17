@@ -18,6 +18,19 @@ impl std::fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
+/// Tokenize a PowQL input string into a stream of tokens.
+///
+/// # Examples
+///
+/// ```
+/// use powdb_query::lexer::lex;
+/// use powdb_query::token::Token;
+///
+/// let tokens = lex("User filter .age > 30").unwrap();
+/// assert_eq!(tokens[0], Token::Ident("User".to_string()));
+/// assert_eq!(tokens[1], Token::Filter);
+/// assert_eq!(tokens[2], Token::DotIdent("age".to_string()));
+/// ```
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();

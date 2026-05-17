@@ -229,6 +229,20 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Open or create a PowDB engine rooted at `data_dir`.
+    ///
+    /// If the directory already contains a catalog, it is reopened.
+    /// Otherwise a fresh empty database is created.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use powdb_query::executor::Engine;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let engine = Engine::new(dir.path()).unwrap();
+    /// // Engine is ready — the directory now contains a catalog.
+    /// ```
     pub fn new(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         // Try to reopen an existing database first; only create a fresh
@@ -255,6 +269,24 @@ impl Engine {
     }
 
     /// Parse + plan + execute a PowQL query.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use powdb_query::executor::Engine;
+    /// use powdb_query::result::QueryResult;
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let mut engine = Engine::new(dir.path()).unwrap();
+    ///
+    /// // Create a table and insert a row.
+    /// engine.execute_powql("type User { required name: str, age: int }").unwrap();
+    /// engine.execute_powql(r#"insert User { name := "Alice", age := 30 }"#).unwrap();
+    ///
+    /// // Query rows back.
+    /// let result = engine.execute_powql("User").unwrap();
+    /// assert_eq!(result.row_count(), 1);
+    /// ```
     ///
     /// Mission D6 — tracing collapse: the previous implementation ran 4
     /// `Instant::now()` + 3 `elapsed().as_micros()` calls + formatted an

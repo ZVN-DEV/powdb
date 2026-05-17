@@ -1717,6 +1717,7 @@ version = "0.2.1"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -1746,6 +1747,7 @@ dependencies = [
  "libc",
  "proptest",
  "rustc-hash",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

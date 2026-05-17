@@ -2241,6 +2241,9 @@ impl Engine {
                             }
                         }
                         // Inlined int-column reader: null check + i64 decode.
+                        if data.len() < sort_data_offset + 8 {
+                            return;
+                        }
                         let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
@@ -2248,7 +2251,7 @@ impl Engine {
                         let key = i64::from_le_bytes(
                             data[sort_data_offset..sort_data_offset + 8]
                                 .try_into()
-                                .unwrap(),
+                                .unwrap_or_else(|_| unreachable!()),
                         );
                         let id = seq;
                         seq += 1;
@@ -2307,6 +2310,9 @@ impl Engine {
                                 return;
                             }
                         }
+                        if data.len() < sort_data_offset + 8 {
+                            return;
+                        }
                         let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
@@ -2314,7 +2320,7 @@ impl Engine {
                         let bits = u64::from_le_bytes(
                             data[sort_data_offset..sort_data_offset + 8]
                                 .try_into()
-                                .unwrap(),
+                                .unwrap_or_else(|_| unreachable!()),
                         );
                         let key = f64_bits_to_sortable_u64(bits);
                         let id = seq;

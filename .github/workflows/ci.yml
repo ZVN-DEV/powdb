@@ -63,6 +63,72 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc
 
+  miri:
+    name: miri (powdb-storage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+      # miri cannot handle mmap syscalls; tests using mmap will be skipped or
+      # will cause miri to abort gracefully thanks to continue-on-error.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust nightly with miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            miri-${{ runner.os }}-
+
+      - name: Run miri on powdb-storage
+        run: cargo +nightly miri test -p powdb-storage
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-Zsanitizer=address"
+      RUSTDOCFLAGS: "-Zsanitizer=address"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: asan-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            asan-${{ runner.os }}-
+
+      - name: Run tests with AddressSanitizer
+        run: cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
+
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-24.04

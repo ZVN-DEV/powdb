@@ -194,12 +194,19 @@ impl CompiledLeaf {
                 op,
                 literal,
             } => {
+                if data.len() < *data_offset + 8 || data.len() < 3 + bitmap_byte {
+                    return false;
+                }
                 let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
                 if is_null {
                     return false;
                 }
-                let val =
-                    i64::from_le_bytes(data[*data_offset..*data_offset + 8].try_into().unwrap());
+                let val = i64::from_le_bytes(
+                    // SAFETY: bounds checked above
+                    data[*data_offset..*data_offset + 8]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                );
                 match op {
                     BinOp::Eq => val == *literal,
                     BinOp::Neq => val != *literal,
@@ -217,12 +224,18 @@ impl CompiledLeaf {
                 op,
                 literal,
             } => {
+                if data.len() < *data_offset + 8 || data.len() < 3 + bitmap_byte {
+                    return false;
+                }
                 let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
                 if is_null {
                     return false;
                 }
-                let val =
-                    f64::from_le_bytes(data[*data_offset..*data_offset + 8].try_into().unwrap());
+                let val = f64::from_le_bytes(
+                    data[*data_offset..*data_offset + 8]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                );
                 // `total_cmp` matches Value::Ord: NaN > everything,
                 // -0.0 < +0.0, finite order as expected. Keeps compiled
                 // WHERE identical in semantics to the generic row-decode
@@ -259,17 +272,34 @@ impl CompiledLeaf {
                 negate,
                 needle,
             } => {
+                if data.len() < 3 + bitmap_byte {
+                    return false;
+                }
                 let is_null = (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1;
                 if is_null {
                     return false;
                 }
                 let off_pos = var_offset_table_start + var_idx * 2;
                 let next_pos = var_offset_table_start + (var_idx + 1) * 2;
-                let start =
-                    u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
-                let end =
-                    u16::from_le_bytes(data[next_pos..next_pos + 2].try_into().unwrap()) as usize;
-                let slice = &data[var_data_start + start..var_data_start + end];
+                if data.len() < next_pos + 2 {
+                    return false;
+                }
+                let start = u16::from_le_bytes(
+                    data[off_pos..off_pos + 2]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                ) as usize;
+                let end = u16::from_le_bytes(
+                    data[next_pos..next_pos + 2]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                ) as usize;
+                let abs_start = var_data_start + start;
+                let abs_end = var_data_start + end;
+                if abs_end > data.len() || abs_start > abs_end {
+                    return false;
+                }
+                let slice = &data[abs_start..abs_end];
                 let eq = slice == needle.as_slice();
                 if *negate {
                     !eq

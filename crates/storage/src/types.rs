@@ -15,6 +15,23 @@ pub enum TypeId {
     Bytes = 7,
 }
 
+impl TypeId {
+    /// Decode a `u8` discriminant into a `TypeId`, returning `None` for unknown values.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(TypeId::Empty),
+            1 => Some(TypeId::Int),
+            2 => Some(TypeId::Float),
+            3 => Some(TypeId::Bool),
+            4 => Some(TypeId::Str),
+            5 => Some(TypeId::DateTime),
+            6 => Some(TypeId::Uuid),
+            7 => Some(TypeId::Bytes),
+            _ => None,
+        }
+    }
+}
+
 /// A single scalar value. Optional fields use `Empty` (set-based nullability).
 #[derive(Debug, Clone)]
 pub enum Value {
