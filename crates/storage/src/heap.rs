@@ -230,6 +230,11 @@ impl HeapFile {
         if let Some((ptr, len)) = self.mmap_ptr {
             let offset = page_id as usize * PAGE_SIZE;
             if offset + PAGE_SIZE <= len {
+                // SAFETY: `ptr` is a valid read-only mmap pointer covering
+                // `len` bytes (set by `enable_mmap`). We verified
+                // `offset + PAGE_SIZE <= len` above, so `ptr.add(offset)`
+                // is within the mapped region and the resulting slice does
+                // not exceed it.
                 let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
                 if let Some(page) = Page::from_bytes(page_bytes) {
                     self.hot_page = Some(HotPage {
@@ -290,6 +295,13 @@ impl HeapFile {
         let file_len = num_pages as usize * PAGE_SIZE;
         use std::os::unix::io::AsRawFd;
         let fd = self.disk.file_ref().as_raw_fd();
+        // SAFETY: `fd` is a valid open file descriptor obtained from
+        // `self.disk.file_ref()`. `file_len` is computed from
+        // `num_pages * PAGE_SIZE` which matches the actual file size
+        // (we flushed all dirty pages above). The mapping is read-only
+        // (`PROT_READ`) and private (`MAP_PRIVATE`), so no writes can
+        // occur through this pointer. The returned pointer is only
+        // stored if mmap succeeded (not `MAP_FAILED`).
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -310,6 +322,10 @@ impl HeapFile {
     /// `insert` so the mapping is invalidated before the file can grow.
     pub fn disable_mmap(&mut self) {
         if let Some((ptr, len)) = self.mmap_ptr.take() {
+            // SAFETY: `ptr` and `len` were returned by a successful
+            // `libc::mmap` call in `enable_mmap`. We only call `munmap`
+            // once (the `take()` ensures the slot is cleared), so no
+            // double-free is possible.
             unsafe {
                 libc::munmap(ptr as *mut libc::c_void, len);
             }
@@ -356,7 +372,7 @@ impl HeapFile {
         for idx in 0..self.pages_with_space.len() {
             let page_id = self.pages_with_space[idx];
             self.ensure_hot(page_id)?;
-            let hot = self.hot_page.as_mut().unwrap();
+            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
                 if hot.page.free_space() < 64 {
@@ -415,6 +431,12 @@ impl HeapFile {
         if let Some((ptr, len)) = self.mmap_ptr {
             let offset = rid.page_id as usize * PAGE_SIZE;
             if offset + PAGE_SIZE <= len {
+                // SAFETY: `ptr` points to a valid read-only mmap of `len`
+                // bytes. We checked `offset + PAGE_SIZE <= len`, so the
+                // slice is within bounds. The mmap is `MAP_PRIVATE` and
+                // `PROT_READ`, and no concurrent writer can mutate the
+                // underlying file region while the RwLock read guard is
+                // held.
                 let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
                 // Bounds check: validate slot_index against the page's
                 // actual slot count to prevent OOB reads from stale/invalid
@@ -422,7 +444,7 @@ impl HeapFile {
                 let slot_count = u16::from_le_bytes(
                     page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
                         .try_into()
-                        .unwrap_or_else(|_| unreachable!()),
+                        .expect("2-byte slice"),
                 );
                 if rid.slot_index >= slot_count {
                     return None;
@@ -434,12 +456,12 @@ impl HeapFile {
                 let slot_offset = u16::from_le_bytes(
                     page_bytes[entry_off..entry_off + 2]
                         .try_into()
-                        .unwrap_or_else(|_| unreachable!()),
+                        .expect("2-byte slice"),
                 );
                 let slot_length = u16::from_le_bytes(
                     page_bytes[entry_off + 2..entry_off + 4]
                         .try_into()
-                        .unwrap_or_else(|_| unreachable!()),
+                        .expect("2-byte slice"),
                 );
                 if slot_length == 0xFFFF {
                     return None; // deleted
@@ -461,7 +483,7 @@ impl HeapFile {
     /// deletes targeting the same page coalesce into one disk write.
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
         self.ensure_hot(rid.page_id)?;
-        let hot = self.hot_page.as_mut().unwrap();
+        let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
         hot.page.delete(rid.slot_index);
         hot.dirty = true;
         // Mission C Phase 8: O(1) membership check via sidecar bitmap.
@@ -495,7 +517,7 @@ impl HeapFile {
     {
         self.ensure_hot(rid.page_id)?;
         let found = {
-            let hot = self.hot_page.as_mut().unwrap();
+            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             // Run the hook under a scoped immutable borrow of the page,
             // then drop that borrow before re-borrowing mutably for
             // `delete`.
@@ -535,7 +557,7 @@ impl HeapFile {
         F: FnOnce(&mut [u8]),
     {
         self.ensure_hot(rid.page_id)?;
-        let hot = self.hot_page.as_mut().unwrap();
+        let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
         if let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) {
             f(bytes);
             hot.dirty = true;
@@ -565,7 +587,7 @@ impl HeapFile {
         F: FnOnce(&mut [u8]) -> Option<u16>,
     {
         self.ensure_hot(rid.page_id)?;
-        let hot = self.hot_page.as_mut().unwrap();
+        let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
         let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) else {
             return Ok(false);
         };
@@ -603,7 +625,7 @@ impl HeapFile {
         F: FnOnce(&[u8]) -> R,
     {
         self.ensure_hot(rid.page_id)?;
-        let hot = self.hot_page.as_ref().unwrap();
+        let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
         if let Some(bytes) = hot.page.get(rid.slot_index) {
             return Ok(Some(f(bytes)));
         }
@@ -643,7 +665,7 @@ impl HeapFile {
             self.ensure_hot(page_id)?;
             let mut any_deleted = false;
             {
-                let hot = self.hot_page.as_mut().unwrap();
+                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
                 let slot_count = hot.page.slot_count();
                 for slot in 0..slot_count {
                     // Scoped immutable borrow for the pred/hook invocation,
@@ -718,7 +740,7 @@ impl HeapFile {
         let mut fallback: Vec<RowId> = Vec::new();
         for page_id in 0..num_pages {
             self.ensure_hot(page_id)?;
-            let hot = self.hot_page.as_mut().unwrap();
+            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             let slot_count = hot.page.slot_count();
             let mut any_mutated = false;
             for slot in 0..slot_count {
@@ -763,7 +785,7 @@ impl HeapFile {
     pub fn update(&mut self, rid: RowId, row_data: &[u8]) -> io::Result<RowId> {
         self.ensure_hot(rid.page_id)?;
         {
-            let hot = self.hot_page.as_mut().unwrap();
+            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             if hot.page.update(rid.slot_index, row_data) {
                 hot.dirty = true;
                 return Ok(rid);
@@ -877,6 +899,11 @@ impl HeapFile {
         // Fast path: persistent mmap activated by `enable_mmap()`. Zero
         // syscalls per query — we just slice the existing mapping.
         if let Some((ptr, len)) = self.mmap_ptr {
+            // SAFETY: `ptr` is a valid read-only mmap pointer of `len`
+            // bytes, established by `enable_mmap`. All dirty pages were
+            // flushed before the mmap was created, and mutations
+            // invalidate it via `disable_mmap`. The slice lifetime is
+            // bounded by this method call.
             let mapped = unsafe { std::slice::from_raw_parts(ptr, len) };
             let pages_in_map = len / PAGE_SIZE;
             let limit = num_pages.min(pages_in_map as u32);
@@ -958,6 +985,9 @@ impl HeapFile {
         use std::os::unix::io::AsRawFd;
         let fd = self.disk.file_ref().as_raw_fd();
         let file_len = (num_pages as usize) * PAGE_SIZE;
+        // SAFETY: `fd` is a valid file descriptor from `self.disk`.
+        // `file_len` matches the file's actual size (`num_pages *
+        // PAGE_SIZE`). The mapping is read-only and private.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -970,6 +1000,8 @@ impl HeapFile {
         };
 
         if ptr != libc::MAP_FAILED {
+            // SAFETY: mmap succeeded — `ptr` is valid for `file_len`
+            // bytes. The mapping is read-only (`PROT_READ`) and private.
             let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
             'outer: for page_id in 0..num_pages {
                 // Mission C Phase 9: dirty buffer has priority.
@@ -1006,6 +1038,8 @@ impl HeapFile {
                     }
                 }
             }
+            // SAFETY: `ptr` and `file_len` came from the successful
+            // `libc::mmap` call above. We unmap exactly once.
             unsafe {
                 libc::munmap(ptr, file_len);
             }
@@ -1090,6 +1124,9 @@ impl HeapFile {
 
         // Fast path: persistent mmap.
         if let Some((ptr, len)) = self.mmap_ptr {
+            // SAFETY: `ptr` is a valid read-only mmap pointer of `len`
+            // bytes, established by `enable_mmap`. See the SAFETY note
+            // in `try_for_each_row` for the full argument.
             let mapped = unsafe { std::slice::from_raw_parts(ptr, len) };
             let pages_in_map = len / PAGE_SIZE;
             let limit = num_pages.min(pages_in_map as u32);
@@ -1157,6 +1194,8 @@ impl HeapFile {
         use std::os::unix::io::AsRawFd;
         let fd = self.disk.file_ref().as_raw_fd();
         let file_len = (num_pages as usize) * PAGE_SIZE;
+        // SAFETY: `fd` is a valid file descriptor. `file_len` matches
+        // the actual file size. Mapping is read-only and private.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1169,6 +1208,7 @@ impl HeapFile {
         };
 
         if ptr != libc::MAP_FAILED {
+            // SAFETY: mmap succeeded — `ptr` is valid for `file_len` bytes.
             let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
             for page_id in 0..num_pages {
                 if let Some(page) = self.dirty_buffer.get(&page_id) {
@@ -1200,6 +1240,7 @@ impl HeapFile {
                     );
                 }
             }
+            // SAFETY: `ptr` and `file_len` from the successful mmap above.
             unsafe {
                 libc::munmap(ptr, file_len);
             }
@@ -1249,6 +1290,54 @@ impl HeapFile {
                 }
             }
         }
+    }
+
+    /// Return the maximum LSN across all pages in this heap file.
+    /// Scans every page header (hot page, dirty buffer, and disk) to
+    /// find the highest LSN. Used by WAL replay to determine which
+    /// records have already been applied.
+    pub fn max_page_lsn(&self) -> u64 {
+        use crate::page::page_lsn;
+        let mut max_lsn = 0u64;
+
+        // Check hot page.
+        if let Some(hot) = &self.hot_page {
+            max_lsn = max_lsn.max(hot.page.lsn());
+        }
+
+        // Check dirty buffer.
+        for page in self.dirty_buffer.values() {
+            max_lsn = max_lsn.max(page.lsn());
+        }
+
+        // Check disk pages.
+        for page_id in 0..self.disk.num_pages() {
+            // Skip pages we already have in memory.
+            if self.hot_page.as_ref().is_some_and(|h| h.page_id == page_id) {
+                continue;
+            }
+            if self.dirty_buffer.contains_key(&page_id) {
+                continue;
+            }
+            if let Ok(buf) = self.disk.read_page(page_id) {
+                max_lsn = max_lsn.max(page_lsn(&buf));
+            }
+        }
+
+        max_lsn
+    }
+
+    /// Set the LSN on a specific page. Loads the page into the hot
+    /// slot if needed, stamps the LSN, and marks it dirty.
+    pub fn set_page_lsn(&mut self, page_id: u32, lsn: u64) -> io::Result<()> {
+        self.ensure_hot(page_id)?;
+        if let Some(hot) = self.hot_page.as_mut() {
+            if hot.page.lsn() < lsn {
+                hot.page.set_lsn(lsn);
+                hot.dirty = true;
+            }
+        }
+        Ok(())
     }
 
     /// Mission C Phase 1: flush the hot page (if dirty) before syncing the

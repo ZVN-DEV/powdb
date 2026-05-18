@@ -19,7 +19,8 @@ fn validate_identifier(kind: &str, name: &str) -> io::Result<()> {
         ));
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    // Infallible: we returned early if `name.is_empty()` above.
+    let first = chars.next().expect("non-empty name");
     if !first.is_ascii_alphabetic() && first != '_' {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -220,43 +221,80 @@ impl Catalog {
             return Ok(());
         }
         info!(count = records.len(), "replaying WAL records");
+
+        // Build a per-table max-LSN map by scanning every heap page's
+        // header. Records whose LSN <= the table's max page LSN have
+        // already been flushed to disk and can be skipped, making
+        // Insert replay idempotent even after partial-flush crashes.
+        let mut table_max_lsn: FxHashMap<String, u64> = FxHashMap::default();
+        for tbl in &self.tables {
+            let max = tbl.heap.max_page_lsn();
+            if max > 0 {
+                table_max_lsn.insert(tbl.schema.table_name.clone(), max);
+            }
+        }
+
         let mut replayed_inserts = 0usize;
         let mut replayed_updates = 0usize;
         let mut replayed_deletes = 0usize;
+        let mut skipped = 0usize;
         for rec in records {
             match rec.record_type {
                 WalRecordType::Insert => {
                     if let Some((table_name, _rid, row_bytes)) = decode_wal_payload(&rec.data) {
-                        // Route around `Catalog::insert` so we don't
-                        // re-log during replay.
+                        // LSN-based idempotent replay: if this record's
+                        // LSN is <= the max LSN already persisted on any
+                        // page of the target table, the record was
+                        // already applied before the crash. Skip it to
+                        // avoid inserting a duplicate row.
+                        if rec.lsn > 0 {
+                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
+                            if rec.lsn <= max {
+                                skipped += 1;
+                                continue;
+                            }
+                        }
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
-                            // Write the raw encoded bytes directly to the
-                            // heap. We bypass Table::insert because that
-                            // would re-encode (we already have bytes) and
-                            // touch secondary indexes (which we rebuild
-                            // post-replay anyway — this mission doesn't
-                            // persist indexes).
                             let tbl = &mut self.tables[slot];
-                            let _ = tbl.heap.insert(&row_bytes)?;
+                            let new_rid = tbl.heap.insert(&row_bytes)?;
+                            // Stamp the page with this record's LSN so
+                            // subsequent replays (or the max-LSN scan on
+                            // the next open) know it's already applied.
+                            tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_inserts += 1;
                         }
                     }
                 }
                 WalRecordType::Update => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
+                        if rec.lsn > 0 {
+                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
+                            if rec.lsn <= max {
+                                skipped += 1;
+                                continue;
+                            }
+                        }
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
                             let tbl = &mut self.tables[slot];
-                            let _ = tbl.heap.update(rid, &row_bytes)?;
+                            let new_rid = tbl.heap.update(rid, &row_bytes)?;
+                            tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_updates += 1;
                         }
                     }
                 }
                 WalRecordType::Delete => {
                     if let Some((table_name, rid, _)) = decode_wal_payload(&rec.data) {
+                        if rec.lsn > 0 {
+                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
+                            if rec.lsn <= max {
+                                skipped += 1;
+                                continue;
+                            }
+                        }
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
                             let tbl = &mut self.tables[slot];
-                            // Delete is idempotent on a missing/deleted slot.
                             let _ = tbl.heap.delete(rid);
+                            tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_deletes += 1;
                         }
                     }
@@ -359,7 +397,8 @@ impl Catalog {
             inserts = replayed_inserts,
             updates = replayed_updates,
             deletes = replayed_deletes,
-            "WAL replay complete"
+            skipped = skipped,
+            "WAL replay complete (LSN-based idempotent)"
         );
         // Persist the replayed changes to disk before truncating the WAL,
         // otherwise a crash between here and the next checkpoint would lose
@@ -1544,6 +1583,12 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
         }
     }
 
+    // Append a CRC32 checksum of the entire payload so the reader can
+    // detect corruption (the WAL and btree .idx files already do this;
+    // catalog.bin was the one file missing a checksum).
+    let crc = crc32fast::hash(&buf);
+    buf.extend_from_slice(&crc.to_le_bytes());
+
     let mut f = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -1560,12 +1605,32 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     f.read_to_end(&mut buf)?;
 
     let mut pos = 0usize;
-    if buf.len() < 10 || &buf[0..4] != CATALOG_MAGIC {
+    // Minimum: 4 (magic) + 2 (version) + 4 (n_tables) + 4 (crc) = 14
+    if buf.len() < 14 || &buf[0..4] != CATALOG_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad catalog magic",
         ));
     }
+
+    // Verify the trailing CRC32 checksum.
+    let payload = &buf[..buf.len() - 4];
+    let stored_crc = u32::from_le_bytes(
+        buf[buf.len() - 4..]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog CRC"))?,
+    );
+    let computed_crc = crc32fast::hash(payload);
+    if stored_crc != computed_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "catalog CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"
+            ),
+        ));
+    }
+    // Strip the CRC suffix so the parsing loop below doesn't walk into it.
+    let buf = &buf[..buf.len() - 4];
     pos += 4;
     let version = u16::from_le_bytes(
         buf[pos..pos + 2]
@@ -1593,18 +1658,18 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
 
     let mut entries = Vec::with_capacity(n_tables);
     for _ in 0..n_tables {
-        let name_len = read_u32(&buf, &mut pos)? as usize;
-        let table_name = read_string(&buf, &mut pos, name_len)?;
-        let n_cols = read_u16(&buf, &mut pos)? as usize;
+        let name_len = read_u32(buf, &mut pos)? as usize;
+        let table_name = read_string(buf, &mut pos, name_len)?;
+        let n_cols = read_u16(buf, &mut pos)? as usize;
 
         let mut columns = Vec::with_capacity(n_cols);
         for _ in 0..n_cols {
-            let cname_len = read_u32(&buf, &mut pos)? as usize;
-            let name = read_string(&buf, &mut pos, cname_len)?;
-            let type_id_raw = read_u8(&buf, &mut pos)?;
+            let cname_len = read_u32(buf, &mut pos)? as usize;
+            let name = read_string(buf, &mut pos, cname_len)?;
+            let type_id_raw = read_u8(buf, &mut pos)?;
             let type_id = type_id_from_u8(type_id_raw)?;
-            let required = read_u8(&buf, &mut pos)? != 0;
-            let position = read_u16(&buf, &mut pos)?;
+            let required = read_u8(buf, &mut pos)? != 0;
+            let position = read_u16(buf, &mut pos)?;
             columns.push(ColumnDef {
                 name,
                 type_id,
@@ -1616,11 +1681,11 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
         // Version 2 appends the indexed column list. Version 1 stops
         // after the column block — default to an empty list.
         let indexed_cols = if version >= 2 {
-            let n = read_u16(&buf, &mut pos)? as usize;
+            let n = read_u16(buf, &mut pos)? as usize;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
-                let l = read_u32(&buf, &mut pos)? as usize;
-                v.push(read_string(&buf, &mut pos, l)?);
+                let l = read_u32(buf, &mut pos)? as usize;
+                v.push(read_string(buf, &mut pos, l)?);
             }
             v
         } else {
@@ -1660,7 +1725,7 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
     let v = u16::from_le_bytes(
         buf[*pos..*pos + 2]
             .try_into()
-            .unwrap_or_else(|_| unreachable!()),
+            .expect("bounds checked above"),
     );
     *pos += 2;
     Ok(v)
@@ -1675,7 +1740,7 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
     let v = u32::from_le_bytes(
         buf[*pos..*pos + 4]
             .try_into()
-            .unwrap_or_else(|_| unreachable!()),
+            .expect("bounds checked above"),
     );
     *pos += 4;
     Ok(v)

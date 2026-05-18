@@ -34,8 +34,8 @@ impl WalRecordType {
     }
 }
 
-/// WAL record header: len(4) + crc32(4) + tx_id(8) + type(1) = 17 bytes
-const WAL_HEADER_SIZE: usize = 17;
+/// WAL record header: len(4) + crc32(4) + tx_id(8) + type(1) + lsn(8) = 25 bytes
+const WAL_HEADER_SIZE: usize = 25;
 
 /// Maximum allowed size for a single WAL record's data payload.
 /// Records claiming more than 256 MB are treated as corruption and
@@ -47,6 +47,11 @@ const MAX_WAL_RECORD_SIZE: usize = 256 * 1024 * 1024;
 pub struct WalRecord {
     pub tx_id: u64,
     pub record_type: WalRecordType,
+    /// Monotonic log sequence number assigned at append time. Used by
+    /// the page-level idempotent replay: if a page's on-disk LSN is
+    /// `>=` this record's LSN, the record has already been applied and
+    /// replay skips it.
+    pub lsn: u64,
     pub data: Vec<u8>,
 }
 
@@ -76,6 +81,9 @@ pub struct Wal {
     batch_size: usize,
     pending: usize,
     sync_mode: WalSyncMode,
+    /// Monotonic LSN counter. Starts at 1 (0 means "no WAL record has
+    /// ever touched this page") and increments by 1 on every `append`.
+    next_lsn: u64,
 }
 
 impl Wal {
@@ -92,6 +100,7 @@ impl Wal {
             batch_size,
             pending: 0,
             sync_mode: WalSyncMode::default(),
+            next_lsn: 1,
         })
     }
 
@@ -107,6 +116,7 @@ impl Wal {
             batch_size,
             pending: 0,
             sync_mode: WalSyncMode::default(),
+            next_lsn: 1,
         })
     }
 
@@ -147,20 +157,24 @@ impl Wal {
         if matches!(self.sync_mode, WalSyncMode::Off) {
             return Ok(());
         }
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
         let total_len = (WAL_HEADER_SIZE + data.len()) as u32;
 
-        // Compute CRC over tx_id + type + data
-        let mut crc_input = Vec::with_capacity(9 + data.len());
+        // Compute CRC over tx_id + type + lsn + data
+        let mut crc_input = Vec::with_capacity(17 + data.len());
         crc_input.extend_from_slice(&tx_id.to_le_bytes());
         crc_input.push(record_type as u8);
+        crc_input.extend_from_slice(&lsn.to_le_bytes());
         crc_input.extend_from_slice(data);
         let crc = crc32fast::hash(&crc_input);
 
-        // Write: len + crc + tx_id + type + data
+        // Write: len + crc + tx_id + type + lsn + data
         self.writer.write_all(&total_len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&tx_id.to_le_bytes())?;
         self.writer.write_all(&[record_type as u8])?;
+        self.writer.write_all(&lsn.to_le_bytes())?;
         self.writer.write_all(data)?;
 
         self.pending += 1;
@@ -229,6 +243,11 @@ impl Wal {
                 Some(rt) => rt,
                 None => break,
             };
+            let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let lsn = u64::from_le_bytes(lsn_bytes);
 
             // TASK-11: Verify the record fits within the file before
             // allocating. Catches truncated writes without any allocation.
@@ -255,10 +274,11 @@ impl Wal {
                 file.read_exact(&mut data)?;
             }
 
-            // Verify CRC
-            let mut crc_input = Vec::new();
+            // Verify CRC (includes lsn in the hash input)
+            let mut crc_input = Vec::with_capacity(17 + data.len());
             crc_input.extend_from_slice(&tx_id.to_le_bytes());
             crc_input.push(record_type as u8);
+            crc_input.extend_from_slice(&lsn.to_le_bytes());
             crc_input.extend_from_slice(&data);
             let computed_crc = crc32fast::hash(&crc_input);
 
@@ -269,6 +289,7 @@ impl Wal {
             records.push(WalRecord {
                 tx_id,
                 record_type,
+                lsn,
                 data,
             });
             pos += total_len as u64;

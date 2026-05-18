@@ -1,4 +1,5 @@
 pub mod btree;
+pub mod error;
 pub mod buffer;
 pub mod catalog;
 pub mod disk;

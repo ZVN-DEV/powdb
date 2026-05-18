@@ -1,5 +1,14 @@
 pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_HEADER_SIZE: usize = 8;
+/// Page header layout (16 bytes):
+///   [0..4]   page_id (u32)
+///   [4]      page_type (u8)
+///   [5]      flags (u8)
+///   [6..8]   free_start (u16)
+///   [8..16]  lsn (u64) — log sequence number of the last WAL record
+///                         applied to this page. Used for idempotent
+///                         WAL replay: records with LSN <= page LSN
+///                         are skipped.
+pub const PAGE_HEADER_SIZE: usize = 16;
 const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
 const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
 const DELETED_MARKER: u16 = 0xFFFF;
@@ -30,8 +39,12 @@ impl PageType {
 /// A 4KB page with header, row data growing down, slot directory growing up.
 ///
 /// Layout:
-///   [0..8]        Header: page_id(u32) + page_type(u8) + flags(u8) + free_start(u16)
-///   [8..free_start] Row data (grows downward from header)
+///   [0..4]         page_id (u32)
+///   [4]            page_type (u8)
+///   [5]            flags (u8)
+///   [6..8]         free_start (u16)
+///   [8..16]        lsn (u64)
+///   [16..free_start] Row data (grows downward from header)
 ///   [free_start..dir_bottom] Free space
 ///   [dir_bottom..4094] Slot directory (grows upward): each entry is offset(u16) + length(u16)
 ///   [4094..4096]  slot_count(u16)
@@ -68,8 +81,8 @@ impl Page {
     }
 
     pub fn page_id(&self) -> u32 {
-        // SAFETY: slice is exactly 4 bytes, try_into is infallible.
-        u32::from_le_bytes(self.data[0..4].try_into().unwrap())
+        // Infallible: slice is exactly 4 bytes from a fixed-size array.
+        u32::from_le_bytes(self.data[0..4].try_into().expect("page_id: 4-byte slice"))
     }
 
     /// Returns the page type, or `None` if the type byte is invalid
@@ -78,9 +91,23 @@ impl Page {
         PageType::from_u8(self.data[4])
     }
 
+    /// Log sequence number of the most recent WAL record applied to this
+    /// page. Zero on a freshly allocated page. Used by idempotent WAL
+    /// replay to skip records that have already been applied.
+    pub fn lsn(&self) -> u64 {
+        // SAFETY: slice is exactly 8 bytes, try_into is infallible.
+        u64::from_le_bytes(self.data[8..16].try_into().expect("8-byte slice"))
+    }
+
+    /// Update the page's LSN. Should be called after applying a WAL
+    /// record so replay can skip it next time.
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.data[8..16].copy_from_slice(&lsn.to_le_bytes());
+    }
+
     fn free_start(&self) -> u16 {
-        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
-        u16::from_le_bytes(self.data[6..8].try_into().unwrap())
+        // Infallible: slice is exactly 2 bytes from a fixed-size array.
+        u16::from_le_bytes(self.data[6..8].try_into().expect("free_start: 2-byte slice"))
     }
 
     fn set_free_start(&mut self, v: u16) {
@@ -88,8 +115,12 @@ impl Page {
     }
 
     pub fn slot_count(&self) -> u16 {
-        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
-        u16::from_le_bytes(self.data[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap())
+        // Infallible: slice is exactly 2 bytes from a fixed-size array.
+        u16::from_le_bytes(
+            self.data[PAGE_SIZE - 2..PAGE_SIZE]
+                .try_into()
+                .expect("slot_count: 2-byte slice"),
+        )
     }
 
     fn set_slot_count(&mut self, v: u16) {
@@ -109,9 +140,17 @@ impl Page {
 
     fn read_slot_entry(&self, i: u16) -> (u16, u16) {
         let off = self.slot_entry_offset(i);
-        // SAFETY: slices are exactly 2 bytes each, try_into is infallible.
-        let offset = u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap());
-        let length = u16::from_le_bytes(self.data[off + 2..off + 4].try_into().unwrap());
+        // Infallible: slices are exactly 2 bytes each from a fixed-size array.
+        let offset = u16::from_le_bytes(
+            self.data[off..off + 2]
+                .try_into()
+                .expect("slot offset: 2-byte slice"),
+        );
+        let length = u16::from_le_bytes(
+            self.data[off + 2..off + 4]
+                .try_into()
+                .expect("slot length: 2-byte slice"),
+        );
         (offset, length)
     }
 
@@ -269,19 +308,49 @@ impl Page {
 /// Mission F: `#[inline]` so the slot-walking closure can fold into the
 /// `for_each_row` mmap loop in heap.rs. With LTO this becomes a tight loop
 /// over `entry_off` with no function call per slot.
+/// Read the LSN from a page-sized byte slice without constructing a `Page`.
+/// Used by WAL replay to check whether a record has already been applied.
+#[inline]
+pub fn page_lsn(page_bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(
+        page_bytes[8..16]
+            .try_into()
+            .expect("page_lsn: 8-byte slice"),
+    )
+}
+
 #[inline]
 pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
-    let slot_count = u16::from_le_bytes(page_bytes[PAGE_SIZE - 2..PAGE_SIZE].try_into().unwrap());
+    // SAFETY: slice is exactly 2 bytes, try_into is infallible.
+    let slot_count = u16::from_le_bytes(
+        page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
+            .try_into()
+            .expect("slot_count: 2-byte slice"),
+    );
     (0..slot_count).filter_map(move |i| {
         let entry_off = PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE);
-        let offset = u16::from_le_bytes(page_bytes[entry_off..entry_off + 2].try_into().unwrap());
-        let length =
-            u16::from_le_bytes(page_bytes[entry_off + 2..entry_off + 4].try_into().unwrap());
+        // SAFETY: slices are exactly 2 bytes each, try_into is infallible.
+        let offset = u16::from_le_bytes(
+            page_bytes[entry_off..entry_off + 2]
+                .try_into()
+                .expect("slot offset: 2-byte slice"),
+        );
+        let length = u16::from_le_bytes(
+            page_bytes[entry_off + 2..entry_off + 4]
+                .try_into()
+                .expect("slot length: 2-byte slice"),
+        );
         if length == DELETED_MARKER {
             return None;
         }
         let start = offset as usize;
         let end = start + length as usize;
+        // Task 3: bounds validation — a corrupt page could have slot
+        // offset/length that point outside the data region. Return None
+        // instead of panicking on an out-of-bounds slice.
+        if end > PAGE_SIZE || start < PAGE_HEADER_SIZE {
+            return None;
+        }
         Some((i, &page_bytes[start..end]))
     })
 }
@@ -296,6 +365,7 @@ mod tests {
         assert_eq!(page.page_id(), 0);
         assert_eq!(page.page_type(), Some(PageType::Data));
         assert_eq!(page.slot_count(), 0);
+        assert_eq!(page.lsn(), 0);
         assert_eq!(
             page.free_space(),
             PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE
@@ -411,9 +481,9 @@ mod tests {
         while page.insert(&[0u8; 10]).is_some() {
             count += 1;
         }
-        // 4096 - 8 (header) - 2 (slot_count) = 4086 usable
+        // 4096 - 16 (header) - 2 (slot_count) = 4078 usable
         // Each row: 10 data + 4 slot entry = 14 bytes
-        // 4086 / 14 = 291 rows
+        // 4078 / 14 = 291 rows
         assert!(
             count > 280 && count <= 292,
             "expected ~291 rows, got {count}"
