@@ -4,13 +4,15 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.3.x   | :white_check_mark: |
+| 0.2.x   | :white_check_mark: |
+| 0.1.x   | :x:                |
 
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in PowDB, please report it responsibly.
 
-**Do not open a public issue.** Instead, email security concerns to:
+**Do not open a public issue.** Instead, email:
 
 **78920650+zvndev@users.noreply.github.com**
 
@@ -31,8 +33,26 @@ PowDB is a storage engine and query executor. Security-relevant areas include:
 - **Storage engine** (`crates/storage/`) — WAL integrity, mmap safety, file I/O bounds
 - **Network binding** — server binds to `127.0.0.1` by default (not `0.0.0.0`)
 
+## Transport Security (TLS)
+
+PowDB supports native TLS for encrypted client-server connections. To enable TLS, set the following environment variables when starting the server:
+
+- `POWDB_TLS_CERT` — path to the PEM-encoded TLS certificate
+- `POWDB_TLS_KEY` — path to the PEM-encoded TLS private key
+
+When both are set, the server requires TLS for all connections. When unset, the server accepts plaintext TCP connections. For production deployments, always enable TLS or use a reverse proxy / SSH tunnel.
+
+## Authentication
+
+PowDB uses single-password authentication via the `POWDB_PASSWORD` environment variable. When set, clients must authenticate before executing queries.
+
+- **Rate limiting**: authentication attempts are rate-limited to prevent brute-force attacks.
+- **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
+- **Connection limits**: the server enforces a maximum number of concurrent connections.
+
+There is no per-user auth or RBAC. The password should be treated as a shared secret for all clients connecting to a given server instance.
+
 ## Known Limitations
 
-- Authentication is single-password (`POWDB_PASSWORD` env var). There is no per-user auth or RBAC.
-- TLS is not implemented. Use a reverse proxy or SSH tunnel for encrypted connections.
+- Authentication is single-password. There is no per-user auth or RBAC.
 - The query parser has a nesting depth limit but no query timeout mechanism yet.

@@ -5,6 +5,41 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-18
+
+### Added
+
+- **DDL WAL replay**: schema mutations (CREATE TABLE, DROP TABLE, ADD COLUMN,
+  DROP COLUMN) are now logged to the WAL with record types 6-9. Crash recovery
+  replays DDL operations idempotently — if the table/column already exists or
+  was already dropped, replay skips gracefully. WAL records are flushed
+  immediately before filesystem mutations for durability.
+- **CRC32 checksums on B+ tree nodes**: every serialized B+ tree node now
+  includes a CRC32 checksum (last 4 bytes), verified on load. Returns
+  `io::Error(InvalidData)` on mismatch, protecting against silent corruption of
+  index data on disk.
+- `TypeId::from_u8()` convenience method on storage types.
+- Doc-tests added across lexer, parser, executor, and storage modules.
+
+### Fixed
+
+- **Compiled predicates**: bounds-checked `CompiledLeaf::eval()` — no panics on
+  corrupt row data.
+- Bounds checks in sort+limit fast path and mmap heap scan slot directory reads.
+- UTF-8 slicing bug found by fuzzer: `&s[..20]` replaced with
+  `&s[..s.floor_char_boundary(20)]` in token display.
+- Clippy `collapsible_if` lint in connection management tests.
+
+### CI
+
+- Added Miri job (scoped to non-mmap modules: btree, page, row, types, tx,
+  view).
+- Added AddressSanitizer job (hard gate, leak detection disabled for mmap
+  regions).
+- Fixed fuzz workflow `cargo-fuzz` install (removed `--locked` to avoid stale
+  transitive deps).
+- Updated required status check names in branch protection.
+
 ## [TS client 0.3.3] - 2026-05-10
 
 ### Fixed
