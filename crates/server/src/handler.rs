@@ -1,7 +1,7 @@
 use crate::protocol::Message;
-use powdb_query::executor::{is_read_only_statement, Engine, READONLY_NEEDS_WRITE};
+use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
-use powdb_query::result::QueryResult;
+use powdb_query::result::{QueryError, QueryResult};
 use powdb_storage::types::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -16,6 +16,10 @@ pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
 
 /// Maximum query text length accepted from the wire (1 MB).
 const MAX_QUERY_LENGTH: usize = 1024 * 1024;
+
+/// Timeout for writing a response to the client. Prevents slow-drain
+/// clients from blocking the handler indefinitely.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of auth failures per IP within the rate-limit window.
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -108,6 +112,20 @@ fn sanitize_error(e: &str) -> String {
     "query execution error".into()
 }
 
+/// Write a message to the client with a timeout. Returns false if the
+/// write failed or timed out (caller should close the connection).
+async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Message) -> bool {
+    let write_fut = async {
+        if msg.write_to(writer).await.is_err() {
+            return false;
+        }
+        writer.flush().await.is_ok()
+    };
+    tokio::time::timeout(WRITE_TIMEOUT, write_fut)
+        .await
+        .unwrap_or_default()
+}
+
 /// Options for a single connection, bundled to keep `handle_connection`'s
 /// argument list short.
 pub struct ConnOpts<'a> {
@@ -123,25 +141,29 @@ pub struct ConnOpts<'a> {
 /// Execute a query against the engine under the RwLock. Read-only
 /// statements acquire `.read()` so concurrent SELECTs can scan in
 /// parallel; mutations acquire `.write()`.
-fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, String> {
+fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, QueryError> {
     let stmt_result = parser::parse(query).map_err(|e| e.to_string());
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine.read().map_err(|e| format!("lock poisoned: {e}"))?;
+            let eng = engine
+                .read()
+                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
             eng.execute_powql_readonly(query)
         };
         match res {
             Ok(r) => return Ok(r),
-            Err(e) if e == READONLY_NEEDS_WRITE => {
+            Err(QueryError::ReadonlyNeedsWrite) => {
                 // Escalate: fall through to the write path below.
             }
             Err(e) => return Err(e),
         }
     }
 
-    let mut eng = engine.write().map_err(|e| format!("lock poisoned: {e}"))?;
+    let mut eng = engine
+        .write()
+        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     eng.execute_powql(query)
 }
 
@@ -175,11 +197,7 @@ where
         match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
             Ok(Ok(Some(Message::Ping))) => {
                 debug!(peer = %peer, "pre-auth ping");
-                let pong = Message::Pong;
-                if pong.write_to(&mut writer).await.is_err() {
-                    return;
-                }
-                if writer.flush().await.is_err() {
+                if !write_msg(&mut writer, &Message::Pong).await {
                     return;
                 }
                 continue;
@@ -209,8 +227,7 @@ where
                     let err = Message::Error {
                         message: "too many auth failures, try again later".into(),
                     };
-                    err.write_to(&mut writer).await.ok();
-                    writer.flush().await.ok();
+                    write_msg(&mut writer, &err).await;
                     return;
                 }
             }
@@ -228,8 +245,7 @@ where
                     let err = Message::Error {
                         message: "authentication failed".into(),
                     };
-                    err.write_to(&mut writer).await.ok();
-                    writer.flush().await.ok();
+                    write_msg(&mut writer, &err).await;
                     return;
                 }
             }
@@ -241,10 +257,7 @@ where
             let ok = Message::ConnectOk {
                 version: env!("CARGO_PKG_VERSION").into(),
             };
-            if ok.write_to(&mut writer).await.is_err() {
-                return;
-            }
-            if writer.flush().await.is_err() {
+            if !write_msg(&mut writer, &ok).await {
                 return;
             }
         }
@@ -253,8 +266,7 @@ where
             let err = Message::Error {
                 message: "expected CONNECT".into(),
             };
-            err.write_to(&mut writer).await.ok();
-            writer.flush().await.ok();
+            write_msg(&mut writer, &err).await;
             return;
         }
     }
@@ -274,8 +286,7 @@ where
                     Err(_) => {
                         info!(peer = %peer, "idle timeout, closing connection");
                         let err = Message::Error { message: "idle timeout".into() };
-                        err.write_to(&mut writer).await.ok();
-                        writer.flush().await.ok();
+                        write_msg(&mut writer, &err).await;
                         break;
                     }
                 }
@@ -285,8 +296,7 @@ where
                 if *shutdown_rx.borrow() {
                     info!(peer = %peer, "server shutting down, closing connection");
                     let err = Message::Error { message: "server shutting down".into() };
-                    err.write_to(&mut writer).await.ok();
-                    writer.flush().await.ok();
+                    write_msg(&mut writer, &err).await;
                     break;
                 }
                 continue;
@@ -309,20 +319,22 @@ where
                     }
                 } else {
                     debug!(peer = %peer, query = %query, "received query");
-                    let result = tokio::task::spawn_blocking({
+                    let handle = tokio::task::spawn_blocking({
                         let engine = engine.clone();
                         let query = query.clone();
                         move || dispatch_query(&engine, &query)
                     });
-                    match tokio::time::timeout(query_timeout, result).await {
+                    let abort_handle = handle.abort_handle();
+                    match tokio::time::timeout(query_timeout, handle).await {
                         Ok(Ok(Ok(result))) => query_result_to_message(result),
                         Ok(Ok(Err(e))) => Message::Error {
-                            message: sanitize_error(&e),
+                            message: sanitize_error(&e.to_string()),
                         },
                         Ok(Err(e)) => Message::Error {
                             message: format!("internal error: {e}"),
                         },
                         Err(_) => {
+                            abort_handle.abort();
                             warn!(peer = %peer, query = %query, "query timeout exceeded");
                             Message::Error {
                                 message: "query timeout exceeded".into(),
@@ -340,10 +352,7 @@ where
             },
         };
 
-        if response.write_to(&mut writer).await.is_err() {
-            break;
-        }
-        if writer.flush().await.is_err() {
+        if !write_msg(&mut writer, &response).await {
             break;
         }
     }

@@ -1,4 +1,5 @@
 use crate::types::{RowId, TypeId, Value};
+use crc32fast::Hasher as Crc32Hasher;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -852,6 +853,12 @@ impl BTree {
             }
         }
 
+        // Append CRC32 checksum as the last 4 bytes of the serialized data.
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&buf);
+        let checksum = hasher.finalize();
+        buf.extend_from_slice(&checksum.to_le_bytes());
+
         // Atomic write: sibling .tmp then rename. Mirrors the catalog's
         // persist strategy so a crash between write and rename leaves
         // the old file intact.
@@ -905,6 +912,35 @@ impl BTree {
         }
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
+
+        // Verify CRC32 checksum (last 4 bytes of file).
+        if buf.len() < 18 {
+            // Minimum: 4 magic + 2 version + 4 root + 4 n_nodes + 4 crc = 18
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "btree file too short to contain header + checksum",
+            ));
+        }
+        let data_len = buf.len() - 4;
+        let stored_crc = u32::from_le_bytes([
+            buf[data_len],
+            buf[data_len + 1],
+            buf[data_len + 2],
+            buf[data_len + 3],
+        ]);
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&buf[..data_len]);
+        let computed_crc = hasher.finalize();
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "btree CRC32 checksum mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"
+                ),
+            ));
+        }
+        // Trim the checksum bytes so the rest of deserialization works unchanged.
+        buf.truncate(data_len);
 
         let mut pos = 0usize;
         if buf.len() < 14 || &buf[0..4] != BTREE_MAGIC {
@@ -1121,7 +1157,11 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
             "truncated btree",
         ));
     }
-    let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
+    let v = u16::from_le_bytes(
+        buf[*pos..*pos + 2]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     *pos += 2;
     Ok(v)
 }
@@ -1132,7 +1172,11 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
             "truncated btree",
         ));
     }
-    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+    let v = u32::from_le_bytes(
+        buf[*pos..*pos + 4]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     *pos += 4;
     Ok(v)
 }
@@ -1143,7 +1187,11 @@ fn read_u64(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
             "truncated btree",
         ));
     }
-    let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+    let v = u64::from_le_bytes(
+        buf[*pos..*pos + 8]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     *pos += 8;
     Ok(v)
 }

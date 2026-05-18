@@ -499,6 +499,18 @@ SELECT name, COUNT(name) AS n FROM User WHERE age >= 30 GROUP BY name
 
 PowQL supports inner, left outer, right outer, and cross joins. Aliases are used to disambiguate fields from different tables.
 
+### Example Schemas
+
+The join examples below assume these table definitions:
+
+```
+type User { required id: int, required name: str, required email: str, age: int }
+type Order { required id: int, required user_id: int, required total: float, product_id: int }
+type Product { required id: int, required name: str, price: float }
+```
+
+PowDB does not generate implicit IDs -- every column must be explicitly defined.
+
 ### Syntax
 
 ```
@@ -1027,22 +1039,32 @@ User { .name, running_total: sum(.amount) over (order .date) }
 
 ## UPSERT
 
-Insert a row or update it if a conflict occurs on a specified column.
+Insert a row or update it if a conflict occurs on a specified key column.
 
 ### Syntax
 
 ```
-upsert <Table> { <assignments> } on conflict .<column> update { <assignments> }
+upsert <Table> on .<key_column> { <assignments> } [on conflict { <conflict_assignments> }]
 ```
+
+The key column (specified after `on`) is used to detect conflicts. If a row with a matching key already exists, the row is updated with the provided assignments (or the conflict-specific assignments if `on conflict` is given). If no match exists, a new row is inserted.
 
 ### Examples
 
+Basic upsert (insert or replace all fields on conflict):
+
 ```
-upsert User { name := "Alice", email := "alice@example.com", age := 30 }
-  on conflict .email update { age := 30 }
+upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
 ```
 
-If a row with `email = "alice@example.com"` already exists, the `age` field is updated instead of inserting a duplicate.
+Upsert with explicit conflict handling (only update specific fields on conflict):
+
+```
+upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
+  on conflict { age := 30 }
+```
+
+If a row with `email = "alice@example.com"` already exists, only the `age` field is updated instead of replacing the entire row.
 
 ---
 

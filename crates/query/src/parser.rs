@@ -75,6 +75,27 @@ struct Parser {
     depth: usize,
 }
 
+/// Parse a PowQL query string into an AST [`Statement`].
+///
+/// # Examples
+///
+/// ```
+/// use powdb_query::parser::parse;
+/// use powdb_query::ast::Statement;
+///
+/// // A bare type name is a query (select all rows).
+/// let stmt = parse("User").unwrap();
+/// assert!(matches!(stmt, Statement::Query(_)));
+/// ```
+///
+/// ```
+/// use powdb_query::parser::parse;
+/// use powdb_query::ast::Statement;
+///
+/// // DDL: define a new type (table).
+/// let stmt = parse("type User { required name: str, age: int }").unwrap();
+/// assert!(matches!(stmt, Statement::CreateType(_)));
+/// ```
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
     let tokens = lex(input).map_err(|e| ParseError::Lex {
         message: e.message,

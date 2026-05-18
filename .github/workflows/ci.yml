@@ -63,6 +63,78 @@ jobs:
       - name: Run doc tests
         run: cargo test --workspace --doc
 
+  miri:
+    name: miri (powdb-storage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      # miri cannot interpret libc::mmap, so we skip modules that touch the
+      # mmap-based heap (heap, catalog, buffer, disk, wal, and integration
+      # tests). The remaining modules (btree, page, row, types, tx, view)
+      # still give strong UB coverage of the core data-structures.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust nightly with miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            miri-${{ runner.os }}-
+
+      - name: Run miri on powdb-storage (non-mmap modules)
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: |
+          cargo +nightly miri test -p powdb-storage -- \
+            btree::tests page::tests row::tests types::tests tx::tests view::tests
+
+  asan:
+    name: AddressSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-Zsanitizer=address"
+      RUSTDOCFLAGS: "-Zsanitizer=address"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: asan-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            asan-${{ runner.os }}-
+
+      - name: Run tests with AddressSanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+        run: cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
+
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-24.04

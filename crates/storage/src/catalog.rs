@@ -108,6 +108,25 @@ pub struct Catalog {
 
 impl Catalog {
     /// Create a brand-new catalog. Wipes any existing catalog file in this directory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use powdb_storage::catalog::Catalog;
+    /// use powdb_storage::types::{Schema, ColumnDef, TypeId};
+    ///
+    /// let dir = tempfile::tempdir().unwrap();
+    /// let mut catalog = Catalog::create(dir.path()).unwrap();
+    ///
+    /// let schema = Schema {
+    ///     table_name: "User".to_string(),
+    ///     columns: vec![
+    ///         ColumnDef { name: "name".to_string(), type_id: TypeId::Str, required: true, position: 0 },
+    ///         ColumnDef { name: "age".to_string(), type_id: TypeId::Int, required: false, position: 1 },
+    ///     ],
+    /// };
+    /// catalog.create_table(schema).unwrap();
+    /// ```
     pub fn create(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let wal_path = data_dir.join(WAL_FILE);
@@ -248,6 +267,92 @@ impl Catalog {
                     // mission that adds multi-op transactions can extend
                     // replay without a WAL format break.
                 }
+                WalRecordType::DdlCreateTable => {
+                    if let Some(schema) = decode_ddl_create_table(&rec.data) {
+                        if !self.name_to_slot.contains_key(&schema.table_name) {
+                            if let Ok(table) = Table::create(schema, &self.data_dir) {
+                                let slot = self.tables.len();
+                                let name = table.schema.table_name.clone();
+                                self.tables.push(table);
+                                self.name_to_slot.insert(name, slot);
+                            }
+                        }
+                    }
+                }
+                WalRecordType::DdlDropTable => {
+                    if let Some((table_name, _)) = decode_ddl_table_name(&rec.data) {
+                        if let Some(&slot) = self.name_to_slot.get(&table_name) {
+                            let heap_path = self.data_dir.join(format!("{table_name}.heap"));
+                            if heap_path.exists() {
+                                let _ = fs::remove_file(&heap_path);
+                            }
+                            for col_name in self.tables[slot].indexed_column_names() {
+                                let idx_path =
+                                    self.data_dir.join(format!("{table_name}_{col_name}.idx"));
+                                if idx_path.exists() {
+                                    let _ = fs::remove_file(&idx_path);
+                                }
+                            }
+                            self.name_to_slot.remove(&table_name);
+                            let last = self.tables.len() - 1;
+                            if slot != last {
+                                let moved_name = self.tables[last].schema.table_name.clone();
+                                self.tables.swap(slot, last);
+                                self.name_to_slot.insert(moved_name, slot);
+                            }
+                            self.tables.pop();
+                        }
+                    }
+                }
+                WalRecordType::DdlAddColumn => {
+                    if let Some((table_name, col)) = decode_ddl_alter_add_column(&rec.data) {
+                        if let Some(&slot) = self.name_to_slot.get(&table_name) {
+                            let tbl = &mut self.tables[slot];
+                            if !tbl.schema.columns.iter().any(|c| c.name == col.name) {
+                                let old_schema = tbl.schema.clone();
+                                let has_rows = tbl.heap.scan().next().is_some();
+                                tbl.schema.columns.push(col);
+                                tbl.refresh_layout();
+                                if has_rows {
+                                    let fill = vec![Value::Empty; tbl.schema.columns.len()];
+                                    let data_dir = self.data_dir.clone();
+                                    let _ = tbl.rewrite_rows_for_schema_change(
+                                        &old_schema,
+                                        &fill,
+                                        &data_dir,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                WalRecordType::DdlDropColumn => {
+                    if let Some((table_name, col_name)) = decode_ddl_alter_drop_column(&rec.data) {
+                        if let Some(&slot) = self.name_to_slot.get(&table_name) {
+                            let tbl = &mut self.tables[slot];
+                            if let Some(idx) =
+                                tbl.schema.columns.iter().position(|c| c.name == col_name)
+                            {
+                                let old_schema = tbl.schema.clone();
+                                let has_rows = tbl.heap.scan().next().is_some();
+                                tbl.schema.columns.remove(idx);
+                                for (i, c) in tbl.schema.columns.iter_mut().enumerate() {
+                                    c.position = i as u16;
+                                }
+                                tbl.refresh_layout();
+                                if has_rows {
+                                    let fill = vec![Value::Empty; tbl.schema.columns.len()];
+                                    let data_dir = self.data_dir.clone();
+                                    let _ = tbl.rewrite_rows_for_schema_change(
+                                        &old_schema,
+                                        &fill,
+                                        &data_dir,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         info!(
@@ -383,11 +488,16 @@ impl Catalog {
                 format!("table '{name}' already exists"),
             ));
         }
+        if !self.wal.is_off() {
+            let payload = encode_ddl_create_table(&schema);
+            self.wal
+                .append(0, WalRecordType::DdlCreateTable, &payload)?;
+            self.wal.flush()?;
+        }
         let table = Table::create(schema, &self.data_dir)?;
         let slot = self.tables.len();
         self.tables.push(table);
         self.name_to_slot.insert(name, slot);
-        // Persist the updated catalog so the new schema survives a crash/restart.
         self.persist()?;
         Ok(())
     }
@@ -915,12 +1025,16 @@ impl Catalog {
 
     /// Drop a table: remove from the catalog and delete its data files.
     /// Returns `Err` if the table doesn't exist.
-    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
         validate_table_name(name)?;
         let slot = *self.name_to_slot.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
         })?;
+        if !self.wal.is_off() {
+            let payload = encode_ddl_drop_table(name);
+            self.wal.append(0, WalRecordType::DdlDropTable, &payload)?;
+            self.wal.flush()?;
+        }
         // Remove the data file.
         let table = &self.tables[slot];
         let heap_path = self
@@ -975,20 +1089,24 @@ impl Catalog {
     /// non-empty table — there is no default value to backfill with,
     /// and silently storing `Empty` in a required slot would just
     /// shift the invariant violation to the next query.
-    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
-        let tbl = self.by_name_mut(table)?;
-        // Check for duplicate column name.
-        if tbl.schema.columns.iter().any(|c| c.name == col.name) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("column '{}' already exists in table '{table}'", col.name),
-            ));
+        {
+            let tbl = self.by_name_mut(table)?;
+            if tbl.schema.columns.iter().any(|c| c.name == col.name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("column '{}' already exists in table '{table}'", col.name),
+                ));
+            }
         }
+        if !self.wal.is_off() {
+            let payload = encode_ddl_alter_add_column(table, &col);
+            self.wal.append(0, WalRecordType::DdlAddColumn, &payload)?;
+            self.wal.flush()?;
+        }
+        let tbl = self.by_name_mut(table)?;
 
-        // Snapshot the old schema so we can decode existing rows with
-        // the original layout before we mutate anything.
         let old_schema = tbl.schema.clone();
 
         // Peek at the heap to learn whether there are any existing
@@ -1048,9 +1166,26 @@ impl Catalog {
     /// schema, mutate to the new schema, then rewrite every row
     /// through [`Table::rewrite_rows_for_schema_change`]. Dropping a
     /// column from an empty table skips the rewrite.
-    // TODO(WAL): DDL is not replayed — track in follow-up
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
+        {
+            let tbl = self.by_name_mut(table)?;
+            tbl.schema
+                .columns
+                .iter()
+                .position(|c| c.name == col_name)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("column '{col_name}' not found in table '{table}'"),
+                    )
+                })?;
+        }
+        if !self.wal.is_off() {
+            let payload = encode_ddl_alter_drop_column(table, col_name);
+            self.wal.append(0, WalRecordType::DdlDropColumn, &payload)?;
+            self.wal.flush()?;
+        }
         let tbl = self.by_name_mut(table)?;
         let idx = tbl
             .schema
@@ -1172,6 +1307,175 @@ fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
     ))
 }
 
+// ─── DDL WAL payload codecs ─────────────────────────────────────────────────
+
+fn encode_ddl_create_table(schema: &Schema) -> Vec<u8> {
+    let name = schema.table_name.as_bytes();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
+    for col in &schema.columns {
+        let cn = col.name.as_bytes();
+        out.extend_from_slice(&(cn.len() as u32).to_le_bytes());
+        out.extend_from_slice(cn);
+        out.push(col.type_id as u8);
+        out.push(col.required as u8);
+        out.extend_from_slice(&col.position.to_le_bytes());
+    }
+    out
+}
+
+fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
+    let mut pos = 0usize;
+    if data.len() < 4 {
+        return None;
+    }
+    let name_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + name_len > data.len() {
+        return None;
+    }
+    let table_name = std::str::from_utf8(&data[pos..pos + name_len])
+        .ok()?
+        .to_string();
+    pos += name_len;
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let n_cols = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    let mut columns = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let cn_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + cn_len + 4 > data.len() {
+            return None;
+        }
+        let col_name = std::str::from_utf8(&data[pos..pos + cn_len])
+            .ok()?
+            .to_string();
+        pos += cn_len;
+        let type_id = TypeId::from_u8(data[pos])?;
+        pos += 1;
+        let required = data[pos] != 0;
+        pos += 1;
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let position = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
+        pos += 2;
+        columns.push(ColumnDef {
+            name: col_name,
+            type_id,
+            required,
+            position,
+        });
+    }
+    Some(Schema {
+        table_name,
+        columns,
+    })
+}
+
+fn encode_ddl_drop_table(table_name: &str) -> Vec<u8> {
+    let name = table_name.as_bytes();
+    let mut out = Vec::with_capacity(4 + name.len());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out
+}
+
+fn encode_ddl_alter_add_column(table_name: &str, col: &ColumnDef) -> Vec<u8> {
+    let name = table_name.as_bytes();
+    let cn = col.name.as_bytes();
+    let mut out = Vec::with_capacity(4 + name.len() + 4 + cn.len() + 4);
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(cn.len() as u32).to_le_bytes());
+    out.extend_from_slice(cn);
+    out.push(col.type_id as u8);
+    out.push(col.required as u8);
+    out.extend_from_slice(&col.position.to_le_bytes());
+    out
+}
+
+fn encode_ddl_alter_drop_column(table_name: &str, col_name: &str) -> Vec<u8> {
+    let name = table_name.as_bytes();
+    let cn = col_name.as_bytes();
+    let mut out = Vec::with_capacity(4 + name.len() + 4 + cn.len());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(cn.len() as u32).to_le_bytes());
+    out.extend_from_slice(cn);
+    out
+}
+
+fn decode_ddl_table_name(data: &[u8]) -> Option<(String, usize)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let name_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    if 4 + name_len > data.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(&data[4..4 + name_len])
+        .ok()?
+        .to_string();
+    Some((name, 4 + name_len))
+}
+
+fn decode_ddl_alter_add_column(data: &[u8]) -> Option<(String, ColumnDef)> {
+    let (table_name, mut pos) = decode_ddl_table_name(data)?;
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let cn_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + cn_len + 4 > data.len() {
+        return None;
+    }
+    let col_name = std::str::from_utf8(&data[pos..pos + cn_len])
+        .ok()?
+        .to_string();
+    pos += cn_len;
+    let type_id = TypeId::from_u8(data[pos])?;
+    pos += 1;
+    let required = data[pos] != 0;
+    pos += 1;
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let position = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
+    Some((
+        table_name,
+        ColumnDef {
+            name: col_name,
+            type_id,
+            required,
+            position,
+        },
+    ))
+}
+
+fn decode_ddl_alter_drop_column(data: &[u8]) -> Option<(String, String)> {
+    let (table_name, pos) = decode_ddl_table_name(data)?;
+    if pos + 4 > data.len() {
+        return None;
+    }
+    let cn_len = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    if pos + 4 + cn_len > data.len() {
+        return None;
+    }
+    let col_name = std::str::from_utf8(&data[pos + 4..pos + 4 + cn_len])
+        .ok()?
+        .to_string();
+    Some((table_name, col_name))
+}
+
 // ─── Catalog file format ────────────────────────────────────────────────────
 //
 // Layout (version 2):
@@ -1263,7 +1567,11 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
         ));
     }
     pos += 4;
-    let version = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+    let version = u16::from_le_bytes(
+        buf[pos..pos + 2]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog header"))?,
+    );
     pos += 2;
     // Mission 3: accept version 1 files for forward compatibility.
     // `create_index` was the only mutator that added indexes before, and
@@ -1276,7 +1584,11 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             format!("unsupported catalog version: {version}"),
         ));
     }
-    let n_tables = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    let n_tables = u32::from_le_bytes(
+        buf[pos..pos + 4]
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog header"))?,
+    ) as usize;
     pos += 4;
 
     let mut entries = Vec::with_capacity(n_tables);
@@ -1345,7 +1657,11 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
             "truncated catalog",
         ));
     }
-    let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
+    let v = u16::from_le_bytes(
+        buf[*pos..*pos + 2]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     *pos += 2;
     Ok(v)
 }
@@ -1356,7 +1672,11 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
             "truncated catalog",
         ));
     }
-    let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+    let v = u32::from_le_bytes(
+        buf[*pos..*pos + 4]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!()),
+    );
     *pos += 4;
     Ok(v)
 }

@@ -59,7 +59,7 @@ jobs:
             fuzz-${{ runner.os }}-
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz
 
       # `cargo fuzz` expects `<crate>/fuzz/Cargo.toml` relative to its cwd,
       # so we run from `crates/query` (the crate under test), not from

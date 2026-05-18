@@ -11,6 +11,10 @@ pub enum WalRecordType {
     Delete = 3,
     Commit = 4,
     Rollback = 5,
+    DdlCreateTable = 6,
+    DdlDropTable = 7,
+    DdlAddColumn = 8,
+    DdlDropColumn = 9,
 }
 
 impl WalRecordType {
@@ -21,6 +25,10 @@ impl WalRecordType {
             3 => Some(WalRecordType::Delete),
             4 => Some(WalRecordType::Commit),
             5 => Some(WalRecordType::Rollback),
+            6 => Some(WalRecordType::DdlCreateTable),
+            7 => Some(WalRecordType::DdlDropTable),
+            8 => Some(WalRecordType::DdlAddColumn),
+            9 => Some(WalRecordType::DdlDropColumn),
             _ => None,
         }
     }
