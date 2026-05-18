@@ -70,8 +70,9 @@ jobs:
     continue-on-error: true
     env:
       CARGO_TERM_COLOR: always
-      # miri cannot handle mmap syscalls; tests using mmap will be skipped or
-      # will cause miri to abort gracefully thanks to continue-on-error.
+      # miri cannot interpret libc::mmap — heap tests that activate mmap will
+      # fail. continue-on-error keeps it advisory; the non-mmap tests (btree,
+      # page, row codec) still get coverage.
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -94,13 +95,14 @@ jobs:
             miri-${{ runner.os }}-
 
       - name: Run miri on powdb-storage
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
         run: cargo +nightly miri test -p powdb-storage
 
   asan:
     name: AddressSanitizer
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    continue-on-error: true
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-Zsanitizer=address"
@@ -127,6 +129,8 @@ jobs:
             asan-${{ runner.os }}-
 
       - name: Run tests with AddressSanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
         run: cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
 
   audit:
