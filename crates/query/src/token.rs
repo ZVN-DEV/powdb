@@ -147,7 +147,8 @@ impl Token {
             Token::FloatLit(v) => format!("decimal number {v}"),
             Token::StringLit(s) => {
                 let preview = if s.len() > 20 {
-                    format!("{}...", &s[..20])
+                    let end = s.floor_char_boundary(20);
+                    format!("{}...", &s[..end])
                 } else {
                     s.clone()
                 };
