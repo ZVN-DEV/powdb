@@ -94,11 +94,25 @@ macro_rules! agg_int_loop {
                     if !pred(data) {
                         return;
                     }
-                    // SAFETY: see module-level comment on agg_int_loop!.
+                    // Bounds guard: skip corrupt/truncated rows that are too
+                    // short to contain the bitmap byte or the 8-byte value.
+                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                        return;
+                    }
+                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // The bitmap byte lives at offset 2..2+bitmap_size in the
+                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // Corrupt rows are rejected by the bounds guard.
                     let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
+                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
+                    // to an 8-byte i64 in the fixed-size region of the row.
+                    // The pointer cast is valid because we read exactly 8
+                    // bytes via from_le_bytes. Corrupt rows are rejected by
+                    // the bounds guard.
                     let $v: i64 =
                         unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
@@ -108,11 +122,18 @@ macro_rules! agg_int_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
-                    // SAFETY: see module-level comment on agg_int_loop!.
+                    // Bounds guard: skip corrupt/truncated rows.
+                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                        return;
+                    }
+                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // See the predicate branch for the full invariant.
                     let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
+                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // See the predicate branch for the full invariant.
                     let $v: i64 =
                         unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
@@ -138,11 +159,25 @@ macro_rules! agg_float_loop {
                     if !pred(data) {
                         return;
                     }
-                    // SAFETY: see module-level comment on agg_float_loop!.
+                    // Bounds guard: skip corrupt/truncated rows that are too
+                    // short to contain the bitmap byte or the 8-byte value.
+                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                        return;
+                    }
+                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // The bitmap byte lives at offset 2..2+bitmap_size in the
+                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // Corrupt rows are rejected by the bounds guard.
                     let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
+                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
+                    // to an 8-byte f64 in the fixed-size region of the row.
+                    // The pointer cast is valid because we read exactly 8
+                    // bytes via from_le_bytes. Corrupt rows are rejected by
+                    // the bounds guard.
                     let $v: f64 =
                         unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body
@@ -152,11 +187,18 @@ macro_rules! agg_float_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
-                    // SAFETY: see module-level comment on agg_float_loop!.
+                    // Bounds guard: skip corrupt/truncated rows.
+                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                        return;
+                    }
+                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // See the predicate branch for the full invariant.
                     let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
+                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // See the predicate branch for the full invariant.
                     let $v: f64 =
                         unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
                     $body

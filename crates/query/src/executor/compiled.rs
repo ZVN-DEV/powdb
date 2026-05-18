@@ -82,7 +82,8 @@ impl FastLayout {
         for (i, col) in schema.columns.iter().enumerate() {
             if is_fixed_size(col.type_id) {
                 fixed_offsets[i] = Some(fixed_pos);
-                fixed_pos += fixed_size(col.type_id).unwrap();
+                fixed_pos += fixed_size(col.type_id)
+                    .expect("is_fixed_size guard ensures fixed_size returns Some");
             } else {
                 var_indices[i] = Some(var_count);
                 var_count += 1;
@@ -337,7 +338,10 @@ pub(super) fn compile_predicate(
     }
     if leaves.len() == 1 {
         // Single-leaf fast path: skip the Vec iteration entirely.
-        let leaf = leaves.into_iter().next().unwrap();
+        let leaf = leaves
+            .into_iter()
+            .next()
+            .expect("leaves.len() == 1 checked above");
         return Some(Box::new(move |data: &[u8]| leaf.eval(data)));
     }
     Some(Box::new(move |data: &[u8]| {
