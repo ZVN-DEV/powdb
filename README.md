@@ -40,17 +40,22 @@ PowDB's compiled predicate engine excels at read-heavy aggregate and scan worklo
 
 | Workload | PowDB | SQLite | Result |
 |---|---|---|---|
-| Scan + filter + count | 311 us | 1,964 us | **6.3x faster** |
-| Aggregate SUM | 218 us | 1,884 us | **8.6x faster** |
-| Aggregate MIN | 250 us | 2,352 us | **9.4x faster** |
-| Scan + filter + sort + limit 10 | 2.5 ms | 9.9 ms | **4.0x faster** |
-| Multi-column AND filter | 1.8 ms | 4.7 ms | **2.5x faster** |
-| Indexed point lookup | 90 ns | 293 ns | **3.2x faster** |
-| Update by primary key | 50 ns | 416 ns | **8.3x faster** |
-| Update by filter (10K rows) | 2.4 ms | 7.1 ms | **3.0x faster** |
-| Single-row insert | 346 ns | 901 ns | **2.6x faster** |
+| Aggregate MIN | 236 us | 2,340 us | **9.9x faster** |
+| Aggregate MAX | 236 us | 2,100 us | **8.9x faster** |
+| Aggregate SUM | 231 us | 1,870 us | **8.1x faster** |
+| Update by primary key | 55 ns | 412 ns | **7.5x faster** |
+| Aggregate AVG | 401 us | 2,300 us | **5.7x faster** |
+| Scan + filter + count | 381 us | 1,950 us | **5.1x faster** |
+| Scan + filter + sort + limit 10 | 2.66 ms | 9.77 ms | **3.7x faster** |
+| Update by filter (10K rows) | 2.16 ms | 6.77 ms | **3.1x faster** |
+| Indexed point lookup | 93 ns | 282 ns | **3.0x faster** |
+| Multi-column AND filter | 2.22 ms | 4.70 ms | **2.1x faster** |
+| Insert batch (1K rows) | 238 ns | 320 ns | **1.3x faster** |
+| Delete by filter (10K rows) | 1.76 ms | 2.35 ms | **1.3x faster** |
+| Scan + filter + project top 100 | 9.6 us | 12.7 us | **1.3x faster** |
+| Non-indexed point lookup | 350 us | 432 us | **1.2x faster** |
 
-PowDB is fastest where it matters most: the compiled predicate engine avoids full row decoding during scans and aggregates, delivering 3-10x gains on analytical queries. Point lookups benefit from a minimal parse-plan-execute pipeline (~1.5us total). Write-heavy workloads (batch inserts, deletes) are where SQLite's decades of optimization still lead -- this is an active focus area.
+PowDB is fastest where it matters most: the compiled predicate engine avoids full row decoding during scans and aggregates, delivering 3-10x gains on analytical queries. Point lookups benefit from a minimal parse-plan-execute pipeline. Write performance is competitive with SQLite across the board.
 
 Both engines use in-memory mode (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`). Full results in `crates/compare/`.
 

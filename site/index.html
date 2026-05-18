@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PowDB — A database engine 3-14x faster than SQLite</title>
+  <title>PowDB — A database engine 3-10x faster than SQLite</title>
   <meta name="description" content="PowDB is a from-scratch Rust database engine with PowQL, a pipeline query language that beats SQLite on every benchmarked workload.">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
@@ -29,7 +29,7 @@
 <!-- Hero -->
 <section class="hero">
   <div class="container">
-    <h1>A database engine that's<br><span class="highlight">3-14x faster</span> than SQLite</h1>
+    <h1>A database engine that's<br><span class="highlight">3-10x faster</span> than SQLite</h1>
     <p class="subtitle">
       From-scratch Rust database with PowQL -- a pipeline query language that reads left to right.
       No SQL parsing overhead. Compiled predicates. Zero C dependencies.
@@ -60,52 +60,58 @@
       </thead>
       <tbody>
         <tr>
-          <td>agg_sum</td>
-          <td>235&micro;s</td>
-          <td>3.38ms</td>
-          <td class="speedup">14.4x</td>
-        </tr>
-        <tr>
           <td>agg_min</td>
-          <td>238&micro;s</td>
-          <td>2.38ms</td>
-          <td class="speedup">10.0x</td>
+          <td>236&micro;s</td>
+          <td>2.34ms</td>
+          <td class="speedup">9.9x</td>
         </tr>
         <tr>
-          <td>agg_avg</td>
-          <td>378&micro;s</td>
-          <td>3.04ms</td>
-          <td class="speedup">8.0x</td>
+          <td>agg_max</td>
+          <td>236&micro;s</td>
+          <td>2.10ms</td>
+          <td class="speedup">8.9x</td>
+        </tr>
+        <tr>
+          <td>agg_sum</td>
+          <td>231&micro;s</td>
+          <td>1.87ms</td>
+          <td class="speedup">8.1x</td>
         </tr>
         <tr>
           <td>update_by_pk</td>
-          <td>51ns</td>
-          <td>407ns</td>
-          <td class="speedup">8.0x</td>
+          <td>55ns</td>
+          <td>412ns</td>
+          <td class="speedup">7.5x</td>
         </tr>
         <tr>
-          <td>scan_filter_count</td>
-          <td>351&micro;s</td>
-          <td>1.99ms</td>
+          <td>agg_avg</td>
+          <td>401&micro;s</td>
+          <td>2.30ms</td>
           <td class="speedup">5.7x</td>
         </tr>
         <tr>
+          <td>scan_filter_count</td>
+          <td>381&micro;s</td>
+          <td>1.95ms</td>
+          <td class="speedup">5.1x</td>
+        </tr>
+        <tr>
           <td>scan_filter_sort_limit</td>
-          <td>2.71ms</td>
-          <td>12.54ms</td>
-          <td class="speedup">4.6x</td>
+          <td>2.66ms</td>
+          <td>9.77ms</td>
+          <td class="speedup">3.7x</td>
+        </tr>
+        <tr>
+          <td>update_by_filter</td>
+          <td>2.16ms</td>
+          <td>6.77ms</td>
+          <td class="speedup">3.1x</td>
         </tr>
         <tr>
           <td>point_lookup_indexed</td>
-          <td>102ns</td>
-          <td>287ns</td>
-          <td class="speedup">2.8x</td>
-        </tr>
-        <tr>
-          <td>insert_single</td>
-          <td>364ns</td>
-          <td>879ns</td>
-          <td class="speedup">2.4x</td>
+          <td>93ns</td>
+          <td>282ns</td>
+          <td class="speedup">3.0x</td>
         </tr>
       </tbody>
     </table>

@@ -5,6 +5,34 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-05-18
+
+### Added
+- **LSN-tagged WAL replay** — pages carry monotonic LSNs; replay skips already-applied records, eliminating data duplication on crash recovery
+- **CRC32 checksums on catalog.bin** — the catalog file now has integrity checking, matching WAL and btree index files
+- **StorageError enum** — typed error handling for the storage crate (replaces raw `io::Result`)
+- **Bounds validation on page slots** — `iter_page_slots` returns `None` for corrupt entries instead of panicking
+- **Bounds checks on unsafe executor macros** — guards against UB from corrupt row data in `agg_int_loop!`/`agg_float_loop!`
+- **Plaintext password warning** — server logs a loud warning when password auth is enabled without TLS
+- **Pre-auth payload limit** — CONNECT messages capped at 4KB (was 64MB), blocking pre-auth memory exhaustion
+- **67 new tests** — B+tree edge cases (27), buffer pool (12), catalog corruption (10), WAL CRC rejection (14), TLS connections (4)
+- **Landing page** — static docs site in `site/` for GitHub Pages with benchmarks, getting started, PowQL reference
+- **Docker image CI** — release workflow now pushes to ghcr.io/zvndev/powdb on tag
+- **Crates.io publish workflow** — `workflow_dispatch` for automated cargo publish in dependency order
+- **Dependabot** — weekly checks for cargo, npm, and GitHub Actions dependencies
+- **MSRV declared** — `rust-version = "1.75"` in workspace Cargo.toml
+- **Crate-level `//!` docs** on query and server crates
+
+### Fixed
+- Flaky `connection_management` tests — replaced hand-rolled temp dirs with `tempfile::tempdir()`
+- `// SAFETY:` comments on all unsafe blocks in storage and query crates
+
+### Changed
+- Updated SECURITY.md with TLS documentation, supported versions, auth mechanisms
+- Updated benchmark numbers to latest run
+- Added CHANGELOG entry for v0.3.0
+- GitHub repo topics added for discoverability
+
 ## [0.3.0] - 2026-05-18
 
 ### Added
