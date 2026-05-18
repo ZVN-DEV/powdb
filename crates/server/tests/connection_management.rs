@@ -20,16 +20,10 @@ use powdb_server::protocol::Message;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn fresh_engine() -> Arc<RwLock<Engine>> {
-    let test_id = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let data_dir = std::env::temp_dir().join(format!("powdb_conn_mgmt_{test_id}_{ts}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    std::fs::create_dir_all(&data_dir).unwrap();
-    Arc::new(RwLock::new(Engine::new(&data_dir).unwrap()))
+fn fresh_engine() -> (Arc<RwLock<Engine>>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = Arc::new(RwLock::new(Engine::new(tmp.path()).unwrap()));
+    (engine, tmp)
 }
 
 fn encode_connect(db: &str) -> Vec<u8> {
@@ -158,7 +152,7 @@ async fn start_multi_conn_server(
 /// Test 1: Idle timeout closes the connection after inactivity.
 #[tokio::test]
 async fn test_idle_timeout() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let addr = start_single_conn_server(
@@ -201,7 +195,7 @@ async fn test_idle_timeout() {
 /// Test 2: Query timeout returns an error for slow queries.
 #[tokio::test]
 async fn test_query_timeout() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
 
     // Set up a table so the query actually does work
     {
@@ -253,7 +247,7 @@ async fn test_query_timeout() {
 /// Test 3: Rate limiting after too many auth failures.
 #[tokio::test]
 async fn test_rate_limiting() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let rate_limiter = new_rate_limiter();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -313,7 +307,7 @@ async fn test_rate_limiting() {
 /// verifying the pattern works.
 #[tokio::test]
 async fn test_max_connections_backpressure() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let max_conns: usize = 3;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_conns));
@@ -402,7 +396,7 @@ async fn test_max_connections_backpressure() {
 /// that normal message delivery works correctly (write_msg is functional).
 #[tokio::test]
 async fn test_write_msg_delivers_messages() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let addr = start_single_conn_server(
@@ -444,7 +438,7 @@ async fn test_write_msg_delivers_messages() {
 /// Test 6: Graceful shutdown notifies connected clients.
 #[tokio::test]
 async fn test_graceful_shutdown() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let addr = start_single_conn_server(
@@ -488,7 +482,7 @@ async fn test_graceful_shutdown() {
 /// Test 7: Malformed protocol data results in error, not a crash.
 #[tokio::test]
 async fn test_malformed_protocol() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let addr = start_single_conn_server(
@@ -539,7 +533,7 @@ async fn test_malformed_protocol() {
 /// Test 7b: Send completely random bytes (not even a valid header length).
 #[tokio::test]
 async fn test_malformed_protocol_truncated() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let addr = start_single_conn_server(
@@ -570,7 +564,7 @@ async fn test_malformed_protocol_truncated() {
 /// Test 8: Connection reuse after a query error.
 #[tokio::test]
 async fn test_connection_reuse_after_error() {
-    let engine = fresh_engine();
+    let (engine, _tmp) = fresh_engine();
 
     // Create a table so we have something valid to query
     {
