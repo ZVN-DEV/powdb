@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PowQL Reference - PowDB</title>
+  <meta name="description" content="PowQL language reference: data types, CRUD operations, filtering, aggregation, joins, indexes, and more.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="nav-brand">Pow<span>DB</span></a>
+    <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Toggle menu">&#9776;</button>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="powql.html" class="active">PowQL Reference</a>
+      <a href="https://github.com/zvndev/powdb" class="nav-github" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- Content -->
+<div class="container">
+  <div class="content">
+    <h1>PowQL Reference</h1>
+    <p class="lead">PowQL is a pipeline-oriented query language. You name the table, chain operations left to right, and project fields -- all in reading order.</p>
+
+    <!-- Table of Contents -->
+    <div style="background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin: 32px 0;">
+      <p style="font-weight: 600; margin-bottom: 12px; color: var(--text);">On this page</p>
+      <ul style="columns: 2; column-gap: 32px; list-style: none; padding: 0;">
+        <li style="margin-bottom: 6px;"><a href="#data-types">Data Types</a></li>
+        <li style="margin-bottom: 6px;"><a href="#schema">Schema Definition</a></li>
+        <li style="margin-bottom: 6px;"><a href="#queries">Queries</a></li>
+        <li style="margin-bottom: 6px;"><a href="#expressions">Expressions</a></li>
+        <li style="margin-bottom: 6px;"><a href="#aggregates">Aggregates</a></li>
+        <li style="margin-bottom: 6px;"><a href="#group-by">GROUP BY + HAVING</a></li>
+        <li style="margin-bottom: 6px;"><a href="#joins">Joins</a></li>
+        <li style="margin-bottom: 6px;"><a href="#mutations">Mutations</a></li>
+        <li style="margin-bottom: 6px;"><a href="#ddl">DDL</a></li>
+        <li style="margin-bottom: 6px;"><a href="#views">Materialized Views</a></li>
+        <li style="margin-bottom: 6px;"><a href="#window">Window Functions</a></li>
+        <li style="margin-bottom: 6px;"><a href="#cheat-sheet">PowQL vs SQL Cheat Sheet</a></li>
+      </ul>
+    </div>
+
+    <!-- Data Types -->
+    <h2 id="data-types">Data Types</h2>
+    <p>PowQL has seven data types plus a null representation.</p>
+    <table>
+      <thead>
+        <tr><th>Type</th><th>PowQL Name</th><th>Size</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Integer</td><td><code>int</code></td><td>8 bytes</td><td>64-bit signed integer</td></tr>
+        <tr><td>Float</td><td><code>float</code></td><td>8 bytes</td><td>IEEE 754 double precision</td></tr>
+        <tr><td>Boolean</td><td><code>bool</code></td><td>1 byte</td><td><code>true</code> or <code>false</code></td></tr>
+        <tr><td>String</td><td><code>str</code></td><td>Variable</td><td>UTF-8 text</td></tr>
+        <tr><td>DateTime</td><td><code>datetime</code></td><td>8 bytes</td><td>Unix timestamp</td></tr>
+        <tr><td>UUID</td><td><code>uuid</code></td><td>16 bytes</td><td>128-bit identifier</td></tr>
+        <tr><td>Bytes</td><td><code>bytes</code></td><td>Variable</td><td>Raw binary data</td></tr>
+        <tr><td>Null</td><td><em>(empty)</em></td><td>0 bytes</td><td>Absence of a value</td></tr>
+      </tbody>
+    </table>
+    <p>Fields marked <code>required</code> cannot be null. All other fields are nullable by default. Use <code>is null</code> / <code>is not null</code> to check, and <code>??</code> to coalesce.</p>
+
+    <!-- Schema Definition -->
+    <h2 id="schema">Schema Definition</h2>
+    <p>Tables are defined using the <code>type</code> keyword:</p>
+    <pre><code>type User {
+  required name: str,
+  required email: str,
+  age: int
+}
+
+type Record {
+  required id: int,
+  required title: str,
+  score: float,
+  active: bool,
+  created_at: datetime,
+  ref_id: uuid,
+  payload: bytes
+}</code></pre>
+
+    <!-- Queries -->
+    <h2 id="queries">Queries</h2>
+    <p>Queries are pipeline-oriented: start with a table name, then chain operations left to right.</p>
+
+    <h3>Full Scan</h3>
+    <pre><code>User</code></pre>
+
+    <h3>Filter</h3>
+    <pre><code>User filter .age > 30
+User filter .name = "Alice"
+User filter .age > 25 and .status = "active"
+User filter .age < 20 or .age > 60</code></pre>
+
+    <h3>Projection</h3>
+    <p>Select specific fields using <code>{ }</code> braces. Reference fields with <code>.field</code> dot syntax:</p>
+    <pre><code>User { .name, .email }
+User filter .age > 30 { .name, .age }
+
+-- Aliases
+User { full_name: .name, years: .age }
+
+-- Computed expressions
+User { .name, double_age: .age * 2 }</code></pre>
+
+    <h3>Ordering</h3>
+    <pre><code>User order .age
+User order .age desc
+User order .age asc, .name desc</code></pre>
+
+    <h3>Limit and Offset</h3>
+    <pre><code>User limit 10
+User order .age desc limit 5
+User order .age offset 20 limit 10</code></pre>
+
+    <h3>Distinct</h3>
+    <pre><code>User distinct { .name }
+User filter .age > 20 distinct { .status }</code></pre>
+
+    <h3>Full Pipeline</h3>
+    <p>The full pipeline order:</p>
+    <pre><code>Table [distinct] [filter expr] [group keys [having expr]] [order keys] [limit n] [offset n] { projection }</code></pre>
+    <p>Example:</p>
+    <pre><code>User filter .age > 18 order .name asc limit 100 offset 20 { .name, .email, .age }</code></pre>
+
+    <!-- Expressions -->
+    <h2 id="expressions">Expressions</h2>
+
+    <h3>Comparison Operators</h3>
+    <table>
+      <thead><tr><th>Operator</th><th>Meaning</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>=</code></td><td>Equal</td><td><code>User filter .name = "Alice"</code></td></tr>
+        <tr><td><code>!=</code></td><td>Not equal</td><td><code>User filter .score != 0</code></td></tr>
+        <tr><td><code>&lt;</code> <code>&gt;</code></td><td>Less/greater than</td><td><code>User filter .age > 30</code></td></tr>
+        <tr><td><code>&lt;=</code> <code>&gt;=</code></td><td>Less/greater or equal</td><td><code>User filter .age >= 18</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Logical Operators</h3>
+    <pre><code>User filter .age > 25 and .status = "active"
+User filter .age < 20 or .age > 60
+User filter not .active</code></pre>
+
+    <h3>IN, BETWEEN, LIKE</h3>
+    <pre><code>-- IN list
+User filter .name in ("Alice", "Bob")
+User filter .name not in ("Alice")
+
+-- BETWEEN (inclusive)
+User filter .age between 25 and 35
+
+-- LIKE pattern matching
+User filter .name like "Ali%"
+User filter .name not like "A%"</code></pre>
+
+    <h3>NULL Checks and Coalesce</h3>
+    <pre><code>User filter .age is null
+User filter .age is not null
+
+-- Coalesce: return left if non-null, else right
+User { .name, display_age: .age ?? 0 }</code></pre>
+
+    <h3>CASE WHEN</h3>
+    <pre><code>User {
+  .name,
+  label: case
+    when .age > 30 then "senior"
+    when .age >= 20 then "adult"
+    else "young"
+  end
+}</code></pre>
+
+    <h3>Functions</h3>
+    <table>
+      <thead><tr><th>Category</th><th>Functions</th></tr></thead>
+      <tbody>
+        <tr><td>String</td><td><code>upper</code>, <code>lower</code>, <code>length</code>, <code>trim</code>, <code>substring</code>, <code>concat</code></td></tr>
+        <tr><td>Math</td><td><code>abs</code>, <code>round</code>, <code>ceil</code>, <code>floor</code>, <code>sqrt</code>, <code>pow</code></td></tr>
+        <tr><td>Date/Time</td><td><code>now</code>, <code>extract</code>, <code>date_add</code>, <code>date_diff</code></td></tr>
+        <tr><td>Type</td><td><code>cast(expr as type)</code></td></tr>
+      </tbody>
+    </table>
+    <pre><code>-- String functions
+User filter upper(.name) = "ALICE"
+User { full: concat(.name, " - ", .email) }
+User { sub: substring(.name, 1, 3) }
+
+-- Math functions
+User { .name, rounded: round(.score, 2) }
+
+-- Date/time functions
+insert Event { name := "login", ts := now() }
+Event { .name, yr: extract("year", .ts) }
+
+-- Cast
+User { .name, age_str: cast(.age as str) }</code></pre>
+
+    <!-- Aggregates -->
+    <h2 id="aggregates">Aggregates</h2>
+    <p>Aggregate functions wrap a query in function-call syntax:</p>
+    <pre><code>count(User)                              -- count all rows
+count(User filter .age > 30)             -- count with filter
+sum(User { .age })                       -- sum a column
+avg(User { .age })                       -- average
+min(User { .age })                       -- minimum
+max(User { .age })                       -- maximum
+count(distinct User { .name })           -- count unique values</code></pre>
+
+    <!-- GROUP BY -->
+    <h2 id="group-by">GROUP BY and HAVING</h2>
+    <pre><code>-- Count users per name
+User group .name { .name, n: count(.name) }
+
+-- Multiple aggregates per group
+User group .status {
+  .status,
+  total: count(.name),
+  avg_age: avg(.age),
+  youngest: min(.age),
+  oldest: max(.age)
+}
+
+-- HAVING: filter groups after aggregation
+User group .status having count(.name) > 5 { .status, n: count(.name) }
+
+-- Filter before grouping
+User filter .age >= 30 group .name { .name, n: count(.name) }
+
+-- count(*) and count(distinct) in groups
+User group .age { .age, count(*) }
+Sale group .dept { .dept, count(distinct .item) }</code></pre>
+
+    <!-- Joins -->
+    <h2 id="joins">Joins</h2>
+    <p>PowQL supports inner, left outer, right outer, and cross joins. Aliases disambiguate fields.</p>
+
+    <pre><code>-- Inner join (default)
+User as u join Order as o on u.id = o.user_id
+
+-- Left outer join
+User as u left join Order as o on u.id = o.user_id
+
+-- Right outer join
+User as u right join Order as o on u.id = o.user_id
+
+-- Cross join (no ON clause)
+User as u cross join Product as p
+
+-- With filter and projection
+User as u join Order as o on u.id = o.user_id
+  filter o.total > 75 { u.name, o.total }
+
+-- Multi-table join
+User as u join Order as o on u.id = o.user_id
+  join Product as p on o.product_id = p.id</code></pre>
+
+    <p>The engine automatically selects hash join (O(L+R)) for equi-joins and nested loop for non-equi predicates.</p>
+
+    <!-- Mutations -->
+    <h2 id="mutations">Mutations</h2>
+
+    <h3>INSERT</h3>
+    <pre><code>insert User { name := "Alice", email := "alice@example.com", age := 30 }
+
+-- Omitted fields default to null
+insert User { name := "Bob", email := "bob@example.com" }</code></pre>
+
+    <h3>UPDATE</h3>
+    <pre><code>-- Set a literal value
+User filter .name = "Alice" update { age := 31 }
+
+-- Expression referencing current row
+User filter .name = "Alice" update { age := .age + 5 }
+
+-- Update all rows
+User update { age := .age * 2 }</code></pre>
+
+    <h3>DELETE</h3>
+    <pre><code>User filter .name = "Bob" delete
+User filter .age < 18 delete
+
+-- Delete all rows
+User delete</code></pre>
+
+    <h3>UPSERT</h3>
+    <pre><code>-- Insert or update on conflict
+upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
+
+-- Explicit conflict handling
+upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
+  on conflict { age := 30 }</code></pre>
+
+    <!-- DDL -->
+    <h2 id="ddl">DDL</h2>
+
+    <h3>Create Table</h3>
+    <pre><code>type User { required name: str, required email: str, age: int }</code></pre>
+
+    <h3>Alter Table</h3>
+    <pre><code>-- Add a column
+alter User add column status: str
+alter User add required active: bool
+
+-- Drop a column
+alter User drop column email
+
+-- Create an index
+alter User add index .email
+alter User add index .age</code></pre>
+
+    <h3>Drop Table</h3>
+    <pre><code>drop User</code></pre>
+
+    <!-- Materialized Views -->
+    <h2 id="views">Materialized Views</h2>
+    <pre><code>-- Create a view
+materialize OldUsers as User filter .age > 28
+materialize UserNames as User { .name }
+
+-- Query it like a table
+OldUsers
+OldUsers filter .name = "Alice"
+count(OldUsers)
+
+-- Manual refresh
+refresh OldUsers
+
+-- Drop
+drop view OldUsers</code></pre>
+    <p>Views auto-refresh when underlying data changes. No stale reads.</p>
+
+    <!-- Window Functions -->
+    <h2 id="window">Window Functions</h2>
+    <pre><code>-- ROW_NUMBER
+User { .name, .dept, rn: row_number() over (partition .dept order .age) }
+
+-- RANK / DENSE_RANK
+User { .name, r: rank() over (order .score desc) }
+User { .name, dr: dense_rank() over (partition .dept order .score desc) }
+
+-- Aggregate windows
+User { .name, .salary, dept_avg: avg(.salary) over (partition .dept) }
+User { .name, running_total: sum(.amount) over (order .date) }</code></pre>
+
+    <!-- Cheat Sheet -->
+    <h2 id="cheat-sheet">PowQL vs SQL Cheat Sheet</h2>
+    <table class="cheat-table">
+      <thead>
+        <tr><th>Operation</th><th>PowQL</th><th>SQL</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Select all</td>
+          <td><code>User</code></td>
+          <td><code>SELECT * FROM User</code></td>
+        </tr>
+        <tr>
+          <td>Select columns</td>
+          <td><code>User { .name, .age }</code></td>
+          <td><code>SELECT name, age FROM User</code></td>
+        </tr>
+        <tr>
+          <td>Where</td>
+          <td><code>User filter .age > 30</code></td>
+          <td><code>SELECT * FROM User WHERE age > 30</code></td>
+        </tr>
+        <tr>
+          <td>Order + Limit</td>
+          <td><code>User order .age desc limit 5</code></td>
+          <td><code>... ORDER BY age DESC LIMIT 5</code></td>
+        </tr>
+        <tr>
+          <td>Count</td>
+          <td><code>count(User filter .age > 30)</code></td>
+          <td><code>SELECT COUNT(*) FROM User WHERE age > 30</code></td>
+        </tr>
+        <tr>
+          <td>Sum</td>
+          <td><code>sum(User { .age })</code></td>
+          <td><code>SELECT SUM(age) FROM User</code></td>
+        </tr>
+        <tr>
+          <td>Group By</td>
+          <td><code>User group .status { .status, count(.name) }</code></td>
+          <td><code>SELECT status, COUNT(name) FROM User GROUP BY status</code></td>
+        </tr>
+        <tr>
+          <td>Inner Join</td>
+          <td><code>User as u join Order as o on u.id = o.user_id</code></td>
+          <td><code>... JOIN Order o ON u.id = o.user_id</code></td>
+        </tr>
+        <tr>
+          <td>Insert</td>
+          <td><code>insert User { name := "Alice", age := 30 }</code></td>
+          <td><code>INSERT INTO User (name, age) VALUES ('Alice', 30)</code></td>
+        </tr>
+        <tr>
+          <td>Update</td>
+          <td><code>User filter .id = 1 update { age := 31 }</code></td>
+          <td><code>UPDATE User SET age = 31 WHERE id = 1</code></td>
+        </tr>
+        <tr>
+          <td>Delete</td>
+          <td><code>User filter .id = 1 delete</code></td>
+          <td><code>DELETE FROM User WHERE id = 1</code></td>
+        </tr>
+        <tr>
+          <td>Create table</td>
+          <td><code>type User { required name: str }</code></td>
+          <td><code>CREATE TABLE User (name TEXT NOT NULL)</code></td>
+        </tr>
+        <tr>
+          <td>Create index</td>
+          <td><code>alter User add index .email</code></td>
+          <td><code>CREATE INDEX ON User (email)</code></td>
+        </tr>
+        <tr>
+          <td>Alias</td>
+          <td><code>User { full_name: .name }</code></td>
+          <td><code>SELECT name AS full_name FROM User</code></td>
+        </tr>
+        <tr>
+          <td>NULL check</td>
+          <td><code>User filter .age is null</code></td>
+          <td><code>... WHERE age IS NULL</code></td>
+        </tr>
+        <tr>
+          <td>Coalesce</td>
+          <td><code>.age ?? 0</code></td>
+          <td><code>COALESCE(age, 0)</code></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Key Syntactic Differences</h3>
+    <table>
+      <thead><tr><th>Concept</th><th>PowQL</th><th>SQL</th></tr></thead>
+      <tbody>
+        <tr><td>Field reference</td><td><code>.field</code> (dot prefix)</td><td><code>field</code> (bare identifier)</td></tr>
+        <tr><td>Assignment</td><td><code>:=</code></td><td><code>=</code> or <code>SET col = val</code></td></tr>
+        <tr><td>Table definition</td><td><code>type Name { ... }</code></td><td><code>CREATE TABLE Name (...)</code></td></tr>
+        <tr><td>Required / NOT NULL</td><td><code>required field: type</code></td><td><code>field TYPE NOT NULL</code></td></tr>
+        <tr><td>String literals</td><td><code>"double quotes"</code></td><td><code>'single quotes'</code></td></tr>
+        <tr><td>Query shape</td><td>Pipeline: <code>Table verb verb { proj }</code></td><td>Clausal: <code>SELECT proj FROM Table WHERE ...</code></td></tr>
+        <tr><td>Aggregates</td><td>Wrapping: <code>count(Table filter ...)</code></td><td>Inline: <code>SELECT COUNT(*) FROM ...</code></td></tr>
+      </tbody>
+    </table>
+
+  </div>
+</div>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>PowDB is MIT licensed. Built by <a href="https://github.com/zvndev" target="_blank" rel="noopener">ZVN</a>.</p>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+</body>
+</html>

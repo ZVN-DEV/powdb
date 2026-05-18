@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PowDB — A database engine 3-14x faster than SQLite</title>
+  <meta name="description" content="PowDB is a from-scratch Rust database engine with PowQL, a pipeline query language that beats SQLite on every benchmarked workload.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="nav-brand">Pow<span>DB</span></a>
+    <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Toggle menu">&#9776;</button>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="powql.html">PowQL Reference</a>
+      <a href="https://github.com/zvndev/powdb" class="nav-github" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <h1>A database engine that's<br><span class="highlight">3-14x faster</span> than SQLite</h1>
+    <p class="subtitle">
+      From-scratch Rust database with PowQL -- a pipeline query language that reads left to right.
+      No SQL parsing overhead. Compiled predicates. Zero C dependencies.
+    </p>
+    <div class="hero-actions">
+      <a href="getting-started.html" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/zvndev/powdb" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+    <div class="install-block">
+      <span class="prompt">$</span> cargo install powdb-cli
+    </div>
+  </div>
+</section>
+
+<!-- Benchmarks -->
+<section class="bench-section">
+  <div class="container">
+    <h2>Benchmarks</h2>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows. Both engines in memory-mode. Real numbers, no cherry-picking.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Workload</th>
+          <th>PowDB</th>
+          <th>SQLite</th>
+          <th>Speedup</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>agg_sum</td>
+          <td>235&micro;s</td>
+          <td>3.38ms</td>
+          <td class="speedup">14.4x</td>
+        </tr>
+        <tr>
+          <td>agg_min</td>
+          <td>238&micro;s</td>
+          <td>2.38ms</td>
+          <td class="speedup">10.0x</td>
+        </tr>
+        <tr>
+          <td>agg_avg</td>
+          <td>378&micro;s</td>
+          <td>3.04ms</td>
+          <td class="speedup">8.0x</td>
+        </tr>
+        <tr>
+          <td>update_by_pk</td>
+          <td>51ns</td>
+          <td>407ns</td>
+          <td class="speedup">8.0x</td>
+        </tr>
+        <tr>
+          <td>scan_filter_count</td>
+          <td>351&micro;s</td>
+          <td>1.99ms</td>
+          <td class="speedup">5.7x</td>
+        </tr>
+        <tr>
+          <td>scan_filter_sort_limit</td>
+          <td>2.71ms</td>
+          <td>12.54ms</td>
+          <td class="speedup">4.6x</td>
+        </tr>
+        <tr>
+          <td>point_lookup_indexed</td>
+          <td>102ns</td>
+          <td>287ns</td>
+          <td class="speedup">2.8x</td>
+        </tr>
+        <tr>
+          <td>insert_single</td>
+          <td>364ns</td>
+          <td>879ns</td>
+          <td class="speedup">2.4x</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- PowQL vs SQL -->
+<section class="compare-section">
+  <div class="container">
+    <h2>PowQL vs SQL</h2>
+    <p class="section-subtitle">PowQL reads left to right like a pipeline. No <code>SELECT ... FROM ... WHERE</code> juggling.</p>
+
+    <!-- Example 1: Filter + Project -->
+    <div class="compare-example">
+      <p class="compare-label">Filter and project</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">SELECT name, price
+FROM Product
+WHERE price > 10
+ORDER BY name;</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>Product filter .price > 10
+order .name
+{ .name, .price }</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Example 2: Aggregate -->
+    <div class="compare-example">
+      <p class="compare-label">Aggregate with filter</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">SELECT AVG(age)
+FROM User
+WHERE city = 'NYC';</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>avg(User filter .city = "NYC"
+{ .age })</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Example 3: Group By + Having -->
+    <div class="compare-example">
+      <p class="compare-label">Group by with having</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">SELECT status, COUNT(*)
+FROM User
+GROUP BY status
+HAVING COUNT(*) > 5;</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>User group .status
+having count(*) > 5
+{ .status, count(*) }</code></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Example 4: Insert -->
+    <div class="compare-example">
+      <p class="compare-label">Insert a row</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">INSERT INTO User (name, email, age)
+VALUES ('Alice', 'alice@example.com', 30);</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>insert User {
+  name := "Alice",
+  email := "alice@example.com",
+  age := 30
+}</code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="features-section">
+  <div class="container">
+    <h2>Built for Performance</h2>
+    <p class="section-subtitle">Every layer of PowDB is written in Rust, from the storage engine to the query executor.</p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <h3>Compiled Predicates</h3>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads run 8-14x faster than SQLite.</p>
+      </div>
+      <div class="feature-card">
+        <h3>B+ Tree Indexes</h3>
+        <p>Disk-persisted B+ tree indexes in a custom BIDX binary format. Point lookups resolve in under 150ns. Indexes survive restarts and are used automatically.</p>
+      </div>
+      <div class="feature-card">
+        <h3>WAL + Crash Recovery</h3>
+        <p>Write-ahead log with statement-boundary group commit. Full crash recovery via WAL replay, page-zero recovery, and automatic index rebuild.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Plan Cache</h3>
+        <p>FNV-1a hashed plan cache with literal substitution. Parse and plan once, execute thousands of times. Prepared queries skip the entire front-end pipeline.</p>
+      </div>
+      <div class="feature-card">
+        <h3>TypeScript Client</h3>
+        <p>First-class TypeScript client (<code>@zvndev/powdb-client</code>) with a clean async API. Connect to PowDB server over TCP with full type safety.</p>
+      </div>
+      <div class="feature-card">
+        <h3>TLS + Authentication</h3>
+        <p>Production-ready security with TLS encryption and password authentication. Set <code>POWDB_PASSWORD</code> to lock down your server.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Zero C Dependencies</h3>
+        <p>Pure Rust, end to end. No C FFI, no <code>libsqlite3-sys</code>, no bindgen. Single <code>cargo install</code> on any platform Rust supports.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Pipeline Query Language</h3>
+        <p>PowQL reads left to right: table, filter, order, limit, project. No inside-out clause structure. Queries read like sentences.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>PowDB is MIT licensed. Built by <a href="https://github.com/zvndev" target="_blank" rel="noopener">ZVN</a>.</p>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+</body>
+</html>

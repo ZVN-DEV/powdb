@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Getting Started - PowDB</title>
+  <meta name="description" content="Install PowDB, create a table, insert data, query it, and run in server mode. Takes about 10 minutes.">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="nav-brand">Pow<span>DB</span></a>
+    <button class="nav-toggle" onclick="document.querySelector('.nav-links').classList.toggle('open')" aria-label="Toggle menu">&#9776;</button>
+    <div class="nav-links">
+      <a href="getting-started.html" class="active">Getting Started</a>
+      <a href="powql.html">PowQL Reference</a>
+      <a href="https://github.com/zvndev/powdb" class="nav-github" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- Content -->
+<div class="container">
+  <div class="content">
+    <h1>Getting Started</h1>
+    <p class="lead">Install PowDB, create a table, insert data, query it, and run in server mode. Takes about 10 minutes.</p>
+
+    <!-- Step 1: Install -->
+    <h2><span class="step-number">1</span>Install</h2>
+    <p>The easiest way to install PowDB is from crates.io:</p>
+    <pre><code class="language-bash">cargo install powdb-cli
+cargo install powdb-server</code></pre>
+
+    <p>Or build from source (requires Rust 1.80+; install from <a href="https://rustup.rs/" target="_blank" rel="noopener">rustup.rs</a> if needed):</p>
+    <pre><code class="language-bash">git clone https://github.com/zvndev/powdb.git
+cd powdb
+cargo build --release</code></pre>
+
+    <p>Check that installation worked:</p>
+    <pre><code class="language-bash">powdb-cli --version</code></pre>
+
+    <!-- Step 2: Start the REPL -->
+    <h2><span class="step-number">2</span>Start the REPL</h2>
+    <p>Launch the interactive PowQL shell:</p>
+    <pre><code class="language-bash">powdb-cli
+# or from source:
+cargo run --release -p powdb-cli</code></pre>
+
+    <p>You should see:</p>
+    <div class="output">PowDB v0.2.0 -- embedded mode
+Data directory: ./powdb_data
+Type PowQL queries. Use Ctrl-D to exit.
+
+powql></div>
+
+    <p>Data is stored in <code>./powdb_data/</code> by default. Change it with <code>--data-dir</code>:</p>
+    <pre><code class="language-bash">powdb-cli --data-dir ./my_project_data</code></pre>
+
+    <!-- Step 3: Create a Table -->
+    <h2><span class="step-number">3</span>Create a Table</h2>
+    <p>PowDB uses the <code>type</code> keyword to define tables. Fields prefixed with <code>required</code> cannot be null.</p>
+    <pre><code>powql> type User { required name: str, required email: str, age: int }</code></pre>
+    <div class="output">type User created</div>
+
+    <p>No <code>CREATE TABLE</code>, no column types in parentheses. Fields have a name and a type, separated by a colon.</p>
+    <p>Supported types: <code>str</code>, <code>int</code>, <code>float</code>, <code>bool</code>, <code>datetime</code>, <code>uuid</code>, <code>bytes</code>.</p>
+
+    <!-- Step 4: Insert Data -->
+    <h2><span class="step-number">4</span>Insert Data</h2>
+    <p>Insert rows with the <code>insert</code> keyword. Fields are assigned with <code>:=</code>.</p>
+    <pre><code>powql> insert User { name := "Alice", email := "alice@example.com", age := 30 }</code></pre>
+    <div class="output">1 row affected</div>
+
+    <p>Add a few more people:</p>
+    <pre><code>powql> insert User { name := "Bob", email := "bob@example.com", age := 25 }
+powql> insert User { name := "Charlie", email := "charlie@example.com", age := 35 }
+powql> insert User { name := "Diana", email := "diana@example.com", age := 28 }
+powql> insert User { name := "Eve", email := "eve@example.com", age := 22 }
+powql> insert User { name := "Frank", email := "frank@example.com", age := 40 }</code></pre>
+
+    <p>Fields without <code>required</code> can be omitted -- they default to null:</p>
+    <pre><code>powql> insert User { name := "Grace", email := "grace@example.com" }</code></pre>
+    <div class="output">1 row affected</div>
+
+    <!-- Step 5: Query Basics -->
+    <h2><span class="step-number">5</span>Query Basics</h2>
+
+    <h3>Select all rows</h3>
+    <p>Just type the table name:</p>
+    <pre><code>powql> User</code></pre>
+    <div class="output"> name    | email                | age
+---------+----------------------+----
+ Alice   | alice@example.com    | 30
+ Bob     | bob@example.com      | 25
+ Charlie | charlie@example.com  | 35
+ Diana   | diana@example.com    | 28
+ Eve     | eve@example.com      | 22
+ Frank   | frank@example.com    | 40
+ Grace   | grace@example.com    | NULL
+(7 rows)</div>
+
+    <h3>Filter rows</h3>
+    <p>Use <code>filter</code> with a condition. Fields are referenced with a dot prefix:</p>
+    <pre><code>powql> User filter .age > 25</code></pre>
+    <div class="output"> name    | email                | age
+---------+----------------------+----
+ Alice   | alice@example.com    | 30
+ Charlie | charlie@example.com  | 35
+ Diana   | diana@example.com    | 28
+ Frank   | frank@example.com    | 40
+(4 rows)</div>
+
+    <h3>Project specific fields</h3>
+    <p>Use <code>{ }</code> braces to select which fields to return:</p>
+    <pre><code>powql> User filter .age > 25 { .name, .age }</code></pre>
+    <div class="output"> name    | age
+---------+----
+ Alice   | 30
+ Charlie | 35
+ Diana   | 28
+ Frank   | 40
+(4 rows)</div>
+
+    <!-- Step 6: Sorting and Limiting -->
+    <h2><span class="step-number">6</span>Sorting and Limiting</h2>
+    <p>PowQL operations chain left to right in a pipeline. Add <code>order</code> and <code>limit</code>:</p>
+    <pre><code>powql> User order .age desc limit 3 { .name, .age }</code></pre>
+    <div class="output"> name    | age
+---------+----
+ Frank   | 40
+ Charlie | 35
+ Alice   | 30
+(3 rows)</div>
+
+    <!-- Step 7: Aggregations -->
+    <h2><span class="step-number">7</span>Aggregations</h2>
+    <p>PowQL wraps aggregate functions around the query pipeline.</p>
+    <pre><code>powql> count(User)
+7
+
+powql> count(User filter .age > 25)
+4
+
+powql> avg(User { .age })
+30
+
+powql> sum(User filter .age > 25 { .age })
+133</code></pre>
+
+    <p>Other aggregate functions: <code>min()</code>, <code>max()</code>.</p>
+
+    <!-- Step 8: Updates -->
+    <h2><span class="step-number">8</span>Updates</h2>
+    <p>Use <code>update</code> after an optional <code>filter</code> to modify rows:</p>
+    <pre><code>powql> User filter .name = "Alice" update { age := 31 }</code></pre>
+    <div class="output">1 row affected</div>
+
+    <p>Verify it worked:</p>
+    <pre><code>powql> User filter .name = "Alice" { .name, .age }</code></pre>
+    <div class="output"> name  | age
+-------+----
+ Alice | 31
+(1 row)</div>
+
+    <p>You can use expressions that reference the current row value:</p>
+    <pre><code>powql> User filter .name = "Bob" update { age := .age + 1 }</code></pre>
+
+    <!-- Step 9: Create an Index -->
+    <h2><span class="step-number">9</span>Create an Index</h2>
+    <p>Indexes speed up lookups on frequently queried columns:</p>
+    <pre><code>powql> alter User add index .email</code></pre>
+    <div class="output">index on 'User.email' created</div>
+    <p>Indexed columns are used automatically for point lookups and range scans -- no query hints needed.</p>
+
+    <!-- Step 10: Delete -->
+    <h2><span class="step-number">10</span>Delete</h2>
+    <p>Use <code>delete</code> after a <code>filter</code> to remove matching rows:</p>
+    <pre><code>powql> User filter .age < 25 delete</code></pre>
+    <div class="output">1 row affected</div>
+
+    <p>To delete all rows in a table: <code>User delete</code></p>
+
+    <!-- Step 11: Server Mode -->
+    <h2><span class="step-number">11</span>Server Mode</h2>
+    <p>For multi-client access, run PowDB as a server.</p>
+
+    <h3>Start the server</h3>
+    <pre><code class="language-bash">powdb-server --port 5433 --data-dir ./powdb_data</code></pre>
+    <div class="output">powdb server listening addr=127.0.0.1:5433 data_dir=./powdb_data auth=false ...</div>
+
+    <h3>Connect from a client</h3>
+    <pre><code class="language-bash">powdb-cli --remote localhost:5433</code></pre>
+    <div class="output">PowDB v0.2.0 -- remote mode
+Connecting to localhost:5433 ...
+Connected to db `main` (server v0.2.0)
+Type PowQL queries. Use Ctrl-D to exit.
+
+powql></div>
+
+    <p>From here, the same PowQL statements work as embedded mode.</p>
+
+    <h3>TypeScript client</h3>
+    <pre><code class="language-typescript">import { Client } from "@zvndev/powdb-client";
+
+const client = await Client.connect({ host: "localhost", port: 5433 });
+const result = await client.query("User filter .age > 25 { .name, .age }");
+if (result.kind === "rows") console.table(result.rows);</code></pre>
+
+    <h3>Password authentication</h3>
+    <pre><code class="language-bash"># Start the server with a password
+POWDB_PASSWORD=mysecret powdb-server
+
+# Connect with the password
+powdb-cli --remote localhost:5433 --password mysecret</code></pre>
+
+    <!-- What's Next -->
+    <h2>What's Next</h2>
+    <p>This tutorial covered tables, inserts, queries, aggregates, updates, indexes, deletes, and server mode. PowDB supports much more, including joins, group by, subqueries, materialized views, window functions, and set operations.</p>
+    <p>See the full language reference: <a href="powql.html">PowQL Reference</a></p>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>PowDB is MIT licensed. Built by <a href="https://github.com/zvndev" target="_blank" rel="noopener">ZVN</a>.</p>
+  </div>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+</body>
+</html>
