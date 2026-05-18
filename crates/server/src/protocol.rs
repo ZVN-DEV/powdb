@@ -14,6 +14,10 @@ const MSG_PONG: u8 = 0x12;
 /// Maximum payload size accepted from the wire (64 MB).
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 
+/// Maximum payload size for pre-auth CONNECT messages (4 KB).
+/// Only a database name and password are needed before authentication.
+const MAX_CONNECT_PAYLOAD_SIZE: usize = 4096;
+
 /// Maximum number of columns allowed in a result set.
 const MAX_COLUMNS: usize = 4096;
 
@@ -210,6 +214,23 @@ impl Message {
     pub async fn read_from<R: AsyncReadExt + Unpin>(
         reader: &mut R,
     ) -> std::io::Result<Option<Message>> {
+        Self::read_from_with_limit(reader, MAX_PAYLOAD_SIZE).await
+    }
+
+    /// Read a pre-auth message with a smaller payload limit (4 KB).
+    /// Use this before authentication is complete to prevent oversized
+    /// CONNECT payloads from consuming server memory.
+    pub async fn read_from_preauth<R: AsyncReadExt + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<Option<Message>> {
+        Self::read_from_with_limit(reader, MAX_CONNECT_PAYLOAD_SIZE).await
+    }
+
+    /// Read a message from an async reader with a configurable payload limit.
+    async fn read_from_with_limit<R: AsyncReadExt + Unpin>(
+        reader: &mut R,
+        max_payload: usize,
+    ) -> std::io::Result<Option<Message>> {
         let mut header = [0u8; 6];
         match reader.read_exact(&mut header).await {
             Ok(_) => {}
@@ -223,10 +244,10 @@ impl Message {
             )
         })?;
         let payload_len = u32::from_le_bytes(len_bytes) as usize;
-        if payload_len > MAX_PAYLOAD_SIZE {
+        if payload_len > max_payload {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("payload too large: {payload_len} bytes (max {MAX_PAYLOAD_SIZE})"),
+                format!("payload too large: {payload_len} bytes (max {max_payload})"),
             ));
         }
         let mut payload = vec![0u8; payload_len];

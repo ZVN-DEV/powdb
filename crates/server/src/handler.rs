@@ -193,8 +193,9 @@ where
     // Wait for Connect message (with idle timeout).
     // Accept Ping messages before authentication so load balancers can
     // health-check without completing a full CONNECT handshake.
+    // Uses the smaller pre-auth payload limit (4 KB) to prevent memory abuse.
     let connect_msg = loop {
-        match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
+        match tokio::time::timeout(idle_timeout, Message::read_from_preauth(&mut reader)).await {
             Ok(Ok(Some(Message::Ping))) => {
                 debug!(peer = %peer, "pre-auth ping");
                 if !write_msg(&mut writer, &Message::Pong).await {

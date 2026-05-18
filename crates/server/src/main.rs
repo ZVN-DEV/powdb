@@ -246,6 +246,12 @@ async fn main() {
 
     let tls_enabled = tls_acceptor.is_some();
 
+    // CRITICAL: warn when password auth is enabled without TLS encryption.
+    if args.password.is_some() && tls_acceptor.is_none() {
+        warn!("WARNING: Password authentication enabled without TLS. Credentials will be sent in plaintext.");
+        eprintln!("!!! CRITICAL: Password authentication enabled without TLS. Credentials will be sent in plaintext. !!!");
+    }
+
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
