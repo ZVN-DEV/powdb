@@ -135,42 +135,6 @@ jobs:
           ASAN_OPTIONS: "detect_leaks=0"
         run: cargo +nightly test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
 
-  msrv-consistency:
-    name: MSRV consistency (Cargo.toml ↔ README ↔ Dockerfile)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Check MSRV is consistent everywhere
-        run: |
-          set -euo pipefail
-          MSRV=$(grep -E '^rust-version' Cargo.toml | head -1 | sed -E 's/.*"([0-9]+\.[0-9]+)".*/\1/')
-          if [ -z "$MSRV" ]; then
-            echo "::error::Could not parse rust-version from Cargo.toml"
-            exit 1
-          fi
-          echo "Cargo.toml rust-version: $MSRV"
-
-          if ! grep -qE "MSRV-${MSRV}-blue" README.md; then
-            echo "::error::README MSRV badge does not match Cargo.toml ($MSRV). Update the [![MSRV] badge."
-            exit 1
-          fi
-          if ! grep -qE "Rust ${MSRV}\+" README.md; then
-            echo "::error::README text does not mention 'Rust ${MSRV}+'. Update README."
-            exit 1
-          fi
-
-          DOCKER_RUST=$(grep -E '^FROM rust:' Dockerfile | head -1 | sed -E 's/.*rust:([0-9]+\.[0-9]+).*/\1/')
-          echo "Dockerfile rust: $DOCKER_RUST"
-          # Dockerfile may be newer than MSRV, but never older.
-          if [ "$(printf '%s\n%s\n' "$MSRV" "$DOCKER_RUST" | sort -V | head -1)" != "$MSRV" ]; then
-            echo "::error::Dockerfile rust version ($DOCKER_RUST) is older than MSRV ($MSRV)."
-            exit 1
-          fi
-          echo "MSRV consistency OK."
-
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-24.04

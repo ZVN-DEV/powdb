@@ -107,11 +107,7 @@ impl Page {
 
     fn free_start(&self) -> u16 {
         // Infallible: slice is exactly 2 bytes from a fixed-size array.
-        u16::from_le_bytes(
-            self.data[6..8]
-                .try_into()
-                .expect("free_start: 2-byte slice"),
-        )
+        u16::from_le_bytes(self.data[6..8].try_into().expect("free_start: 2-byte slice"))
     }
 
     fn set_free_start(&mut self, v: u16) {

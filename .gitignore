@@ -15,13 +15,6 @@ clients/ts/dist/
 # Bench artifacts
 crates/compare/results.csv
 
-# Smoke-audit screenshots (regenerated on demand)
-/landing-desktop.png
-/landing-mobile.png
-/getting-started.png
-/powql.png
-/screenshots/
-
 # Fuzz build artifacts + corpus
 **/fuzz/target/
 **/fuzz/corpus/

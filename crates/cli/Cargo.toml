@@ -1,15 +1,10 @@
 [package]
 name = "powdb-cli"
-description = "Interactive REPL and CLI for PowDB — 3-10x faster than SQLite on aggregates"
+description = "Interactive REPL and CLI for PowDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
-readme = "../../README.md"
-keywords = ["database", "powdb", "powql", "cli", "embedded-database"]
-categories = ["database", "command-line-utilities"]
-documentation = "https://docs.rs/powdb-cli"
 
 [dependencies]
 powdb-storage = { version = "0.3.1", path = "../storage" }

@@ -266,8 +266,14 @@ fn test_large_string_keys() {
     bt.insert(Value::Str(key_a.clone()), rid(0, 0));
     bt.insert(Value::Str(key_b.clone()), rid(0, 1));
     assert_eq!(bt.len(), 2);
-    assert_eq!(bt.lookup(&Value::Str(key_a)).unwrap().slot_index, 0);
-    assert_eq!(bt.lookup(&Value::Str(key_b)).unwrap().slot_index, 1);
+    assert_eq!(
+        bt.lookup(&Value::Str(key_a)).unwrap().slot_index,
+        0
+    );
+    assert_eq!(
+        bt.lookup(&Value::Str(key_b)).unwrap().slot_index,
+        1
+    );
 }
 
 // ── Empty tree operations ─────────────────────────────────────────────
@@ -372,8 +378,10 @@ fn test_load_corrupted_file() {
 /// Loading a truncated btree file should return an error.
 #[test]
 fn test_load_truncated_file() {
-    let path =
-        std::env::temp_dir().join(format!("powdb_btree_edge_trunc_{}.idx", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "powdb_btree_edge_trunc_{}.idx",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
 
     let mut bt = BTree::create(&path).unwrap();
@@ -443,8 +451,10 @@ fn test_interleaved_insert_delete() {
 
 #[test]
 fn test_dirty_flag_lifecycle() {
-    let path =
-        std::env::temp_dir().join(format!("powdb_btree_edge_dirty_{}.idx", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "powdb_btree_edge_dirty_{}.idx",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
 
     let mut bt = BTree::create(&path).unwrap();

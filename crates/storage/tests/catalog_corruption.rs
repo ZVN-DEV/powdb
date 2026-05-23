@@ -127,9 +127,10 @@ fn test_corrupted_middle_bytes() {
     // (wrong column names, bad type IDs, etc.). We accept either an
     // error or a successful open with garbled data — the key invariant
     // is that it must NOT panic.
-    // Either Err (corruption detected) or Ok (garbled data landed in a valid
-    // byte range) is acceptable — the key invariant is that it must NOT panic.
-    let _ = result;
+    match result {
+        Err(_) => {} // Expected: corruption detected.
+        Ok(_) => {}  // Acceptable: corruption landed in a "valid" byte range.
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -166,7 +167,10 @@ fn test_bad_magic() {
     std::fs::write(&cat_path, &data).unwrap();
 
     let result = Catalog::open(&dir);
-    assert!(result.is_err(), "bad magic should be rejected");
+    assert!(
+        result.is_err(),
+        "bad magic should be rejected"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
