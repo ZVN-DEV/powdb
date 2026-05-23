@@ -38,11 +38,33 @@ clients/ts       # TypeScript client + demo
 
 ## Development Workflow
 
-1. Create a branch from `main`
+**Never push directly to `main`.** Every change — docs, CI tweaks, version bumps, "trivial" fixes, all of it — goes through a pull request.
+
+1. Create a branch from `main` (kebab-case)
 2. Make changes, run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`
 3. Run `cargo test --workspace` — all tests must pass
 4. Run `cargo run --release -p powdb-compare` to check for performance regressions
-5. Open a PR against `main`
+5. Push the branch and open a PR against `main` using the template in `.github/pull_request_template.md`
+
+### Branch protection on `main`
+
+- PRs are required (no direct pushes)
+- 4 status checks must pass (clippy + fmt + test, miri, asan, audit, plus MSRV consistency and the bench gate)
+- Force-push is rejected by branch protection
+
+Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work** — routine work goes through PRs even when bypass is technically available.
+
+### If you push to main by accident
+
+1. Revert the commit on `main` with a forward `git revert` (not force-push — force-push to `main` is blocked anyway).
+2. Push the revert directly. The revert restores the invariant; that's why bypass exists.
+3. Re-introduce the work on a branch and open a PR.
+
+### For AI assistants working in this repo
+
+- The branch + PR rule is not a default you can override. The user does not need to repeat it per session.
+- "Implement X" never includes "push to main." Implementation always lands on a branch with a PR.
+- Treat the branch-protection bypass capability as if it doesn't exist for your account.
 
 ## CI Checks
 
