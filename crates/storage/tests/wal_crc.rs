@@ -209,7 +209,11 @@ fn test_truncated_between_records() {
 
     let wal = Wal::open(&path, 128).unwrap();
     let records = wal.read_all().unwrap();
-    assert_eq!(records.len(), 1, "only the first complete record should survive");
+    assert_eq!(
+        records.len(),
+        1,
+        "only the first complete record should survive"
+    );
     assert_eq!(records[0].tx_id, 1);
     std::fs::remove_file(&path).ok();
 }
@@ -236,7 +240,10 @@ fn test_partial_write_valid_header_no_data() {
     // Append a partial record: write the header claiming 100 bytes total
     // but only write a few data bytes.
     {
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         let total_len: u32 = 100;
         f.write_all(&total_len.to_le_bytes()).unwrap();
         f.write_all(&[0u8; 4]).unwrap(); // fake CRC
@@ -286,11 +293,7 @@ fn test_zero_length_field() {
 
     let wal = Wal::open(&path, 128).unwrap();
     let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        0,
-        "zero-length record should stop replay"
-    );
+    assert_eq!(records.len(), 0, "zero-length record should stop replay");
     std::fs::remove_file(&path).ok();
 }
 
@@ -330,11 +333,7 @@ fn test_huge_length_field() {
 
     let wal = Wal::open(&path, 128).unwrap();
     let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        0,
-        "huge length field should stop replay"
-    );
+    assert_eq!(records.len(), 0, "huge length field should stop replay");
     std::fs::remove_file(&path).ok();
 }
 

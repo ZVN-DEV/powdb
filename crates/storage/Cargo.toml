@@ -1,10 +1,15 @@
 [package]
 name = "powdb-storage"
-description = "Slotted-page heap, B+tree indexes, and WAL for PowDB"
+description = "Slotted-page heap, B+tree indexes, and WAL — pure-Rust storage engine for PowDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["database", "powdb", "btree", "wal", "storage-engine"]
+categories = ["database", "database-implementations", "data-structures"]
+documentation = "https://docs.rs/powdb-storage"
 
 [dependencies]
 thiserror.workspace = true

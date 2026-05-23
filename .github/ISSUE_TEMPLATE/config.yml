@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/zvndev/powdb/blob/main/SECURITY.md
+    about: Please report security issues privately via the process in SECURITY.md.
+  - name: PowQL reference
+    url: https://github.com/zvndev/powdb/blob/main/docs/POWQL.md
+    about: Language docs — please check before filing a syntax question as a bug.
