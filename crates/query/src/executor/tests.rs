@@ -3677,3 +3677,105 @@ fn test_date_diff() {
         _ => panic!("expected rows"),
     }
 }
+
+// ── Transaction tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_begin_commit() {
+    let mut engine = test_engine();
+    let count_before = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count_before, QueryResult::Scalar(Value::Int(3))));
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Diane", email := "diane@ex.com", age := 28 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Eve", email := "eve@ex.com", age := 22 }"#)
+        .unwrap();
+    engine.execute_powql("commit").unwrap();
+
+    let count_after = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count_after, QueryResult::Scalar(Value::Int(5))));
+}
+
+#[test]
+fn test_begin_transaction_keyword() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin transaction").unwrap();
+    engine.execute_powql("commit").unwrap();
+}
+
+#[test]
+fn test_rollback_undoes_inserts() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Zack", email := "zack@ex.com", age := 40 }"#)
+        .unwrap();
+    let mid = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(mid, QueryResult::Scalar(Value::Int(4))));
+
+    engine.execute_powql("rollback").unwrap();
+
+    let after = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(3))));
+}
+
+#[test]
+fn test_nested_begin_errors() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    let err = engine.execute_powql("begin").unwrap_err();
+    assert!(
+        err.to_string().contains("already in a transaction"),
+        "expected nested-begin error, got: {err}"
+    );
+    engine.execute_powql("rollback").unwrap();
+}
+
+#[test]
+fn test_commit_without_begin_errors() {
+    let mut engine = test_engine();
+    let err = engine.execute_powql("commit").unwrap_err();
+    assert!(
+        err.to_string().contains("no active transaction"),
+        "expected no-tx error, got: {err}"
+    );
+}
+
+#[test]
+fn test_rollback_without_begin_errors() {
+    let mut engine = test_engine();
+    let err = engine.execute_powql("rollback").unwrap_err();
+    assert!(
+        err.to_string().contains("no active transaction"),
+        "expected no-tx error, got: {err}"
+    );
+}
+
+#[test]
+fn test_commit_persists_across_reopen() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_tx_persist_{}_{}", std::process::id(), id));
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Item { required name: str }")
+            .unwrap();
+        engine.execute_powql("begin").unwrap();
+        engine
+            .execute_powql(r#"insert Item { name := "A" }"#)
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Item { name := "B" }"#)
+            .unwrap();
+        engine.execute_powql("commit").unwrap();
+    }
+    {
+        let engine = Engine::new(&dir).unwrap();
+        let result = engine.execute_powql_readonly("count(Item)").unwrap();
+        assert!(matches!(result, QueryResult::Scalar(Value::Int(2))));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

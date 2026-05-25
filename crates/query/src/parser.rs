@@ -224,6 +224,22 @@ impl Parser {
             Token::Drop => self.parse_drop_or_drop_view(),
             Token::Materialized => self.parse_create_view(),
             Token::Refresh => self.parse_refresh_view(),
+            Token::Begin => {
+                self.advance();
+                // Optional `transaction` keyword after `begin`.
+                if *self.peek() == Token::Transaction {
+                    self.advance();
+                }
+                return Ok(Statement::Begin);
+            }
+            Token::Commit => {
+                self.advance();
+                return Ok(Statement::Commit);
+            }
+            Token::Rollback => {
+                self.advance();
+                return Ok(Statement::Rollback);
+            }
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 self.parse_aggregate_query()
             }
@@ -1834,6 +1850,9 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Outer => out.push_str("outer"),
             Token::Cross => out.push_str("cross"),
             Token::Transaction => out.push_str("transaction"),
+            Token::Begin => out.push_str("begin"),
+            Token::Commit => out.push_str("commit"),
+            Token::Rollback => out.push_str("rollback"),
             Token::View => out.push_str("view"),
             Token::Materialized => out.push_str("materialized"),
             Token::Refresh => out.push_str("refresh"),

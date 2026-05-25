@@ -1482,6 +1482,48 @@ impl Engine {
                 })
             }
 
+            PlanNode::Begin => {
+                if self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "already in a transaction (nested transactions not supported)".into(),
+                    ));
+                }
+                self.in_transaction = true;
+                Ok(QueryResult::Executed {
+                    message: "transaction started".to_string(),
+                })
+            }
+
+            PlanNode::Commit => {
+                if !self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "no active transaction to commit".into(),
+                    ));
+                }
+                self.in_transaction = false;
+                self.catalog
+                    .sync_wal()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                Ok(QueryResult::Executed {
+                    message: "transaction committed".to_string(),
+                })
+            }
+
+            PlanNode::Rollback => {
+                if !self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "no active transaction to roll back".into(),
+                    ));
+                }
+                self.in_transaction = false;
+                self.catalog
+                    .rollback_to_last_sync()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                Ok(QueryResult::Executed {
+                    message: "transaction rolled back".to_string(),
+                })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let key_value = literal_to_value(key)?;
                 let tbl = self
@@ -3598,5 +3640,8 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             let child = format_plan_tree(input, depth + 1);
             format!("{indent}Explain\n{child}")
         }
+        PlanNode::Begin => format!("{indent}Begin"),
+        PlanNode::Commit => format!("{indent}Commit"),
+        PlanNode::Rollback => format!("{indent}Rollback"),
     }
 }

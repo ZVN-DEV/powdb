@@ -515,6 +515,27 @@ impl Catalog {
         self.wal.set_sync_mode(mode);
     }
 
+    /// Discard in-memory mutations made since the last `sync_wal()` and
+    /// restore the catalog to its on-disk state. Used by ROLLBACK to
+    /// undo an in-progress transaction's changes.
+    ///
+    /// This re-opens the catalog from the checkpoint file and replays
+    /// only the durable (already flushed) WAL records. Any WAL records
+    /// that were appended but not yet flushed are lost.
+    pub fn rollback_to_last_sync(&mut self) -> io::Result<()> {
+        let data_dir = self.data_dir.clone();
+        let sync_mode = self.wal.sync_mode();
+        let restored = Self::open(&data_dir)?;
+        *self = restored;
+        self.wal.set_sync_mode(sync_mode);
+        Ok(())
+    }
+
+    /// Returns a reference to the data directory.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {

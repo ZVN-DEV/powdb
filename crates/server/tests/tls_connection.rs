@@ -19,7 +19,7 @@ fn encode_connect(db: &str) -> Vec<u8> {
     payload.extend_from_slice(&0u32.to_le_bytes()); // no password
     let mut frame = Vec::new();
     frame.push(0x01); // CONNECT
-    frame.push(0);    // flags
+    frame.push(0); // flags
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload);
     frame
@@ -74,13 +74,13 @@ fn generate_test_certs() -> TestCerts {
 }
 
 fn build_tls_acceptor(certs: &TestCerts) -> tokio_rustls::TlsAcceptor {
-    let cert_chain = vec![rustls::pki_types::CertificateDer::from(certs.cert_der.clone())];
+    let cert_chain = vec![rustls::pki_types::CertificateDer::from(
+        certs.cert_der.clone(),
+    )];
     // Parse the PEM key via rustls-pemfile so we get a PrivateKeyDer.
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        certs.key_pem.as_bytes(),
-    ))
-    .unwrap()
-    .expect("no private key found in PEM");
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(certs.key_pem.as_bytes()))
+        .unwrap()
+        .expect("no private key found in PEM");
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
@@ -113,8 +113,7 @@ async fn start_tls_server(
     let acceptor = acceptor.clone();
 
     tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir)).unwrap();
+        let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir)).unwrap();
         let engine = Arc::new(std::sync::RwLock::new(engine));
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
@@ -128,23 +127,20 @@ async fn start_tls_server(
             let (_, mut rx) = tokio::sync::watch::channel(false);
 
             tokio::spawn(async move {
-                match acc.accept(stream).await {
-                    Ok(tls_stream) => {
-                        powdb_server::handler::handle_connection(
-                            tls_stream,
-                            powdb_server::handler::ConnOpts {
-                                engine: eng,
-                                expected_password: None,
-                                shutdown_rx: &mut rx,
-                                idle_timeout: Duration::from_secs(300),
-                                query_timeout: Duration::from_secs(30),
-                                rate_limiter: None,
-                                peer_addr: Some(peer),
-                            },
-                        )
-                        .await;
-                    }
-                    Err(_) => {} // TLS handshake failed — expected in some tests
+                if let Ok(tls_stream) = acc.accept(stream).await {
+                    powdb_server::handler::handle_connection(
+                        tls_stream,
+                        powdb_server::handler::ConnOpts {
+                            engine: eng,
+                            expected_password: None,
+                            shutdown_rx: &mut rx,
+                            idle_timeout: Duration::from_secs(300),
+                            query_timeout: Duration::from_secs(30),
+                            rate_limiter: None,
+                            peer_addr: Some(peer),
+                        },
+                    )
+                    .await;
                 }
             });
         }
@@ -266,10 +262,7 @@ async fn test_plaintext_client_to_tls_server() {
 async fn test_tls_config_missing_cert() {
     let cert_path = "/nonexistent/cert.pem";
     let result = std::fs::File::open(cert_path);
-    assert!(
-        result.is_err(),
-        "opening a nonexistent cert should fail"
-    );
+    assert!(result.is_err(), "opening a nonexistent cert should fail");
 }
 
 /// TLS config with an invalid (non-PEM) cert file should fail.
@@ -285,8 +278,5 @@ async fn test_tls_config_invalid_cert() {
     let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_default();
-    assert!(
-        certs.is_empty(),
-        "garbage PEM should yield no certs"
-    );
+    assert!(certs.is_empty(), "garbage PEM should yield no certs");
 }

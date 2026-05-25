@@ -254,10 +254,7 @@ fn test_mark_dirty_missing_page_no_panic() {
 
 #[test]
 fn test_reopen_existing_file() {
-    let path = std::env::temp_dir().join(format!(
-        "powdb_bp_reopen_{}",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir().join(format!("powdb_bp_reopen_{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
     let pid;

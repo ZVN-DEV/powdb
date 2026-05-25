@@ -243,6 +243,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::CreateView(_)
         | Statement::RefreshView(_)
         | Statement::DropView(_) => false,
+        Statement::Begin | Statement::Commit | Statement::Rollback => false,
         Statement::Explain(inner) => is_read_only_statement(inner),
     }
 }
@@ -268,6 +269,7 @@ pub struct Engine {
     /// and dirty state. Views are backed by regular catalog tables; this
     /// registry adds the lifecycle metadata.
     view_registry: ViewRegistry,
+    in_transaction: bool,
 }
 
 impl Engine {
@@ -307,6 +309,7 @@ impl Engine {
             plan_cache: Mutex::new(PlanCache::new(PLAN_CACHE_CAPACITY)),
             insert_values_scratch: Vec::new(),
             view_registry,
+            in_transaction: false,
         })
     }
 
@@ -364,9 +367,11 @@ impl Engine {
                     // the fsync happens here exactly once per statement.
                     // `sync_wal` is a no-op when nothing was buffered
                     // (pure reads pay zero fsync).
-                    self.catalog
-                        .sync_wal()
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    if !self.in_transaction {
+                        self.catalog
+                            .sync_wal()
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    }
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -380,9 +385,11 @@ impl Engine {
                             .insert(hash, plan.clone());
                         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
-                        self.catalog
-                            .sync_wal()
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        if !self.in_transaction {
+                            self.catalog
+                                .sync_wal()
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        }
                         result
                     }
                     Err(e) => Err(QueryError::Parse(e.to_string())),
@@ -394,9 +401,11 @@ impl Engine {
                 Ok(plan) => {
                     let plan = lower_unindexed_range_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
-                    self.catalog
-                        .sync_wal()
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    if !self.in_transaction {
+                        self.catalog
+                            .sync_wal()
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    }
                     result
                 }
                 Err(e) => Err(QueryError::Parse(e.to_string())),
@@ -416,8 +425,9 @@ impl Engine {
         let exec_start = Instant::now();
         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         let result = self.execute_plan(&plan);
-        // Mission B (post-review): statement-boundary WAL flush.
-        let _ = self.catalog.sync_wal();
+        if !self.in_transaction {
+            let _ = self.catalog.sync_wal();
+        }
         let exec_us = exec_start.elapsed().as_micros();
 
         let total_us = total_start.elapsed().as_micros();
@@ -1505,7 +1515,10 @@ impl Engine {
             | PlanNode::DropTable { .. }
             | PlanNode::CreateView { .. }
             | PlanNode::RefreshView { .. }
-            | PlanNode::DropView { .. } => Err(QueryError::ReadonlyNeedsWrite),
+            | PlanNode::DropView { .. }
+            | PlanNode::Begin
+            | PlanNode::Commit
+            | PlanNode::Rollback => Err(QueryError::ReadonlyNeedsWrite),
         }
     }
 
