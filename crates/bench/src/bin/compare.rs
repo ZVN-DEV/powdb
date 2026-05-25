@@ -128,7 +128,12 @@ fn threshold_for(workload: &str) -> f64 {
         // after +10.14% variance on identical code (four same-code runs
         // showed 2.89%–10.14% spread). seq_scan_filter promoted in PR #21
         // after +7.58% on identical code (other runs: +2.40%).
-        "insert_single" | "insert_batch_1k" | "multi_col_and_filter" | "seq_scan_filter" => {
+        // Full-table filter scans: runtime dominated by disk I/O and cache
+        // effects on shared GHA runners. PR #56 back-to-back runs showed
+        // powql_filter_only +10.76%, powql_filter_projection +7.18% on
+        // identical code. Promoted from DEFAULT (7%) to NOISY (10%).
+        "insert_single" | "insert_batch_1k" | "multi_col_and_filter" | "seq_scan_filter"
+        | "powql_filter_only" | "powql_filter_projection" => {
             NOISY_ABSOLUTE_THRESHOLD
         }
         _ => DEFAULT_ABSOLUTE_THRESHOLD,
