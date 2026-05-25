@@ -27,6 +27,10 @@ crates/compare/results.csv
 **/fuzz/corpus/
 **/fuzz/artifacts/
 
+# Local orchestration logs
+ITERATION-LOG.md
+PRODUCT-REVIEW.md
+
 # Secrets and credentials
 .env*
 *.pem

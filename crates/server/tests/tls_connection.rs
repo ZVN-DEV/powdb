@@ -61,10 +61,10 @@ struct TestCerts {
 }
 
 fn generate_test_certs() -> TestCerts {
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+    let key_pem = signing_key.serialize_pem();
     let cert_der = cert.der().to_vec();
     TestCerts {
         cert_pem,
