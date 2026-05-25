@@ -185,6 +185,7 @@ struct CliArgs {
     remote: Option<String>,
     db: String,
     password: Option<String>,
+    exec: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -194,12 +195,21 @@ fn parse_args() -> CliArgs {
     let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty());
+    let mut exec: Option<String> = None;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
     let mut saw_positional = false;
     while i < argv.len() {
         match argv[i].as_str() {
+            "--exec" | "-c" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--exec requires a PowQL query");
+                    std::process::exit(2);
+                }
+                exec = Some(argv[i].clone());
+            }
             "--remote" | "-r" => {
                 i += 1;
                 if i >= argv.len() {
@@ -243,6 +253,7 @@ fn parse_args() -> CliArgs {
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
                 println!();
                 println!("OPTIONS:");
+                println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: main)");
                 println!("        --password <PW>        Password for remote auth");
@@ -253,10 +264,12 @@ fn parse_args() -> CliArgs {
                 println!("    -V, --version              Print version and exit");
                 println!();
                 println!("MODES:");
-                println!("    Embedded (default):  powdb-cli ./mydata");
+                println!("    Embedded REPL:       powdb-cli ./mydata");
                 println!(
-                    "    Remote:              powdb-cli --remote 127.0.0.1:5433 --password secret"
+                    "    Remote REPL:         powdb-cli --remote 127.0.0.1:5433 --password secret"
                 );
+                println!("    One-shot:            powdb-cli --exec 'count(User)'");
+                println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 | limit 5'");
                 std::process::exit(0);
             }
             other if !other.starts_with('-') && !saw_positional => {
@@ -277,6 +290,7 @@ fn parse_args() -> CliArgs {
         remote,
         db,
         password,
+        exec,
     }
 }
 
@@ -296,14 +310,118 @@ fn main() {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime");
+        if let Some(query) = args.exec.clone() {
+            let code = rt.block_on(exec_remote(
+                remote_addr.clone(),
+                args.db.clone(),
+                args.password.clone(),
+                query,
+            ));
+            std::process::exit(code);
+        }
         rt.block_on(run_remote(
             remote_addr.clone(),
             args.db.clone(),
             args.password.clone(),
         ));
+    } else if let Some(query) = args.exec {
+        std::process::exit(exec_embedded(&args.data_dir, &query));
     } else {
         run_embedded(&args.data_dir);
     }
+}
+
+// ─── One-shot execution (embedded) ──────────────────────────────────────────
+
+fn exec_embedded(data_dir: &str, query: &str) -> i32 {
+    let mut engine = match Engine::new(Path::new(data_dir)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: failed to initialize engine: {e}");
+            return 1;
+        }
+    };
+    match engine.execute_powql(query.trim()) {
+        Ok(result) => {
+            print_local_result(&result);
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            1
+        }
+    }
+}
+
+// ─── One-shot execution (remote) ────────────────────────────────────────────
+
+async fn exec_remote(addr: String, db: String, password: Option<String>, query: String) -> i32 {
+    let stream = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("connection failed: {e}");
+            return 1;
+        }
+    };
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+
+    let connect = Message::Connect {
+        db_name: db,
+        password,
+    };
+    if connect.write_to(&mut writer).await.is_err()
+        || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
+    {
+        eprintln!("failed to send CONNECT");
+        return 1;
+    }
+    match Message::read_from(&mut reader).await {
+        Ok(Some(Message::ConnectOk { .. })) => {}
+        Ok(Some(Message::Error { message })) => {
+            eprintln!("server rejected connection: {message}");
+            return 1;
+        }
+        _ => {
+            eprintln!("handshake failed");
+            return 1;
+        }
+    }
+
+    let q = Message::Query {
+        query: query.trim().to_string(),
+    };
+    if q.write_to(&mut writer).await.is_err()
+        || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
+    {
+        eprintln!("write error");
+        return 1;
+    }
+
+    let code = match Message::read_from(&mut reader).await {
+        Ok(Some(msg)) => {
+            let is_error = matches!(msg, Message::Error { .. });
+            print_remote_result(&msg);
+            if is_error {
+                1
+            } else {
+                0
+            }
+        }
+        Ok(None) => {
+            eprintln!("server closed connection");
+            1
+        }
+        Err(e) => {
+            eprintln!("read error: {e}");
+            1
+        }
+    };
+
+    let _ = Message::Disconnect.write_to(&mut writer).await;
+    let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
+    code
 }
 
 // ─── Embedded mode ──────────────────────────────────────────────────────────

@@ -1,8 +1,15 @@
 # PowDB
 
+[![CI](https://github.com/zvndev/powdb/actions/workflows/ci.yml/badge.svg)](https://github.com/zvndev/powdb/actions/workflows/ci.yml)
+[![bench](https://github.com/zvndev/powdb/actions/workflows/bench.yml/badge.svg)](https://github.com/zvndev/powdb/actions/workflows/bench.yml)
+[![crates.io](https://img.shields.io/crates/v/powdb-cli.svg)](https://crates.io/crates/powdb-cli)
+[![docs.rs](https://img.shields.io/docsrs/powdb-query)](https://docs.rs/powdb-query)
+[![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)](https://github.com/zvndev/powdb/blob/main/Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A Rust-native embedded database with compiled query execution and PowQL -- a query language designed for how developers actually think.
 
-PowDB compiles filter expressions into byte-level operations that skip full row decoding, producing 3-10x speedups over SQLite on aggregate and scan workloads. Its pipeline query language (PowQL) reads left to right -- no `SELECT ... FROM ... WHERE` juggling -- and the engine is pure Rust end-to-end, no C FFI required.
+PowDB compiles filter expressions into byte-level operations that skip full row decoding, producing 3-10x speedups over SQLite on aggregate and scan workloads. Its pipeline query language (PowQL) reads left to right -- no `SELECT ... FROM ... WHERE` juggling -- and the storage and query engines are pure Rust with no SQL parsing layer.
 
 ## Why PowQL?
 
@@ -17,14 +24,23 @@ PowQL replaces SQL's inside-out clause structure with a left-to-right pipeline. 
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
 
-Full language reference: [docs/POWQL.md](docs/POWQL.md) | Getting started: [docs/getting-started.md](docs/getting-started.md)
+Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md)
 
 ## Install
 
 ```bash
-# Install from crates.io
+# From crates.io (Rust 1.93+)
 cargo install powdb-cli
 cargo install powdb-server
+
+# TypeScript client (Node 18+)
+npm install @zvndev/powdb-client
+
+# Prebuilt binaries (linux x86_64, macos aarch64)
+# https://github.com/zvndev/powdb/releases/latest
+
+# Docker
+docker pull ghcr.io/zvndev/powdb:latest
 
 # Or build from source
 git clone https://github.com/zvndev/powdb
@@ -32,7 +48,7 @@ cd powdb
 cargo build --release
 ```
 
-Requires Rust stable (1.80+). This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks.
+Requires Rust 1.93+. This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks. TLS support in `powdb-server` pulls `aws-lc-sys`, which requires a C toolchain (`cmake`); disable the default `tls` feature for a fully-Rust build.
 
 ## Benchmark: PowDB vs SQLite (100K rows, M1)
 
@@ -150,6 +166,18 @@ if (result.kind === "rows") console.table(result.rows);
 | `POWDB_PASSWORD` | *(none)* | Require this password on connect (set as env var) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
+### Production checklist
+
+Before exposing `powdb-server` beyond `127.0.0.1`:
+
+- [ ] Set `POWDB_PASSWORD` to a strong secret. The server logs a `WARN` on startup when unset and will accept any connection.
+- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy).
+- [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
+- [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
+- [ ] Pin the version (`cargo install powdb-server --version 0.3.1 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+
+For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://github.com/zvndev/powdb/blob/main/examples/deploy/fly.toml).
+
 ## Features
 
 **Storage engine**
@@ -189,10 +217,11 @@ if (result.kind === "rows") console.table(result.rows);
 - TLS support for encrypted connections
 - Password authentication via `POWDB_PASSWORD` env var
 
-**Pure Rust**
-- Zero C FFI -- no C compiler, no `libsqlite3-sys`, no bindgen
+**Pure Rust core**
+- No SQL parsing layer, no `libsqlite3-sys`, no bindgen
+- Storage, query, and CLI are 100% Rust
+- TLS (`powdb-server` only) pulls `aws-lc-sys`; disable the `tls` feature for a C-free build
 - Single `cargo install` on any platform Rust supports
-- Small dependency tree compared to full-featured alternatives
 
 ## Architecture
 

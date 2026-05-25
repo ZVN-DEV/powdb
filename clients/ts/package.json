@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-client",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
@@ -12,16 +12,36 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src", "README.md"],
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/zvndev/powdb.git",
     "directory": "clients/ts"
   },
-  "keywords": ["powdb", "database", "client", "powql"],
+  "homepage": "https://zvndev.github.io/powdb/",
+  "bugs": {
+    "url": "https://github.com/zvndev/powdb/issues"
+  },
+  "keywords": [
+    "powdb",
+    "powql",
+    "database",
+    "client",
+    "embedded-database",
+    "query-engine",
+    "typescript",
+    "tcp",
+    "sql-alternative"
+  ],
   "engines": {
     "node": ">=18"
+  },
+  "peerDependencies": {
+    "@types/node": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@types/node": { "optional": true }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
