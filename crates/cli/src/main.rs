@@ -344,16 +344,23 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
             return 1;
         }
     };
-    match engine.execute_powql(query.trim()) {
-        Ok(result) => {
-            print_local_result(&result);
-            0
-        }
-        Err(e) => {
-            eprintln!("Error: {e}");
-            1
+    let statements: Vec<&str> = query
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for stmt in &statements {
+        match engine.execute_powql(stmt) {
+            Ok(result) => {
+                print_local_result(&result);
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
         }
     }
+    0
 }
 
 // ─── One-shot execution (remote) ────────────────────────────────────────────

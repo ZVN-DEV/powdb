@@ -214,6 +214,7 @@ pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
         Expr::Literal(Literal::Float(v)) => Ok(Value::Float(*v)),
         Expr::Literal(Literal::String(v)) => Ok(Value::Str(v.clone())),
         Expr::Literal(Literal::Bool(v)) => Ok(Value::Bool(*v)),
+        Expr::Null => Ok(Value::Empty),
         _ => Err("expected literal value".into()),
     }
 }
@@ -344,7 +345,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             let val = eval_expr(inner, row, columns);
             eval_cast(val, *cast_type)
         }
-        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } => Value::Empty,
+        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => {
+            Value::Empty
+        }
     }
 }
 

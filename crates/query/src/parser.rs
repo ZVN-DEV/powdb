@@ -1304,6 +1304,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Param(name))
             }
+            Token::Null => {
+                self.advance();
+                Ok(Expr::Null)
+            }
             Token::Not => {
                 self.advance();
                 if *self.peek() == Token::Exists {
@@ -2577,10 +2581,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ordering_null_still_errors() {
-        // `< null`, `>= null` etc. are nonsensical — leave them as errors.
-        assert!(parse("User filter .age < null").is_err());
-        assert!(parse("User filter .age >= null").is_err());
+    fn test_parse_null_comparisons_parse_ok() {
+        // `< null`, `>= null` etc. parse successfully now that `null` is a
+        // valid expression. At runtime they evaluate to Empty (no match),
+        // which is correct null-propagation semantics.
+        assert!(parse("User filter .age < null").is_ok());
+        assert!(parse("User filter .age >= null").is_ok());
     }
 
     #[test]

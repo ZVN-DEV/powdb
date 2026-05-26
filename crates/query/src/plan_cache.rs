@@ -432,6 +432,7 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        Expr::Null => {}
     }
 }
 
@@ -492,6 +493,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        Expr::Null => {}
     }
 }
 
@@ -769,6 +771,7 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            Expr::Null => {}
         }
     }
 }

@@ -312,6 +312,8 @@ pub enum Expr {
     },
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
     Cast(Box<Expr>, CastType),
+    /// The `null` literal — produces `Value::Empty`.
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq)]
