@@ -102,7 +102,7 @@ avg(User filter .city = "NYC" { .age })
 User as u inner join Team as t on u.team_id = t.id { u.name, team_name: t.name }
 
 -- GROUP BY + HAVING
-User group .city { .city, avg_age: avg(.age) } having avg_age > 30
+User group .city having avg(.age) > 30 { .city, avg_age: avg(.age) }
 
 -- Subqueries
 User filter .id in (Order filter .total > 100 { .user_id })
@@ -174,7 +174,7 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy).
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.3.1 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+- [ ] Pin the version (`cargo install powdb-server --version 0.4.0 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
 
 For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://github.com/zvndev/powdb/blob/main/examples/deploy/fly.toml).
 

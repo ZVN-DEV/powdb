@@ -49,7 +49,7 @@ clients/ts       # TypeScript client + demo
 ### Branch protection on `main`
 
 - PRs are required (no direct pushes)
-- 4 status checks must pass (clippy + fmt + test, miri, asan, audit, plus MSRV consistency and the bench gate)
+- 7 status checks must pass: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, and the bench regression gate
 - Force-push is rejected by branch protection
 
 Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work** — routine work goes through PRs even when bypass is technically available.

@@ -17,14 +17,15 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 9. [Subqueries](#subqueries)
 10. [Functions](#functions)
 11. [Mutations](#mutations)
-12. [DDL](#ddl)
-13. [Materialized Views](#materialized-views)
-14. [Window Functions](#window-functions)
-15. [UPSERT](#upsert)
-16. [EXPLAIN](#explain)
-17. [Prepared Queries](#prepared-queries)
-18. [Type System](#type-system)
-19. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+12. [Transactions](#transactions)
+13. [DDL](#ddl)
+14. [Materialized Views](#materialized-views)
+15. [Window Functions](#window-functions)
+16. [UPSERT](#upsert)
+17. [EXPLAIN](#explain)
+18. [Prepared Queries](#prepared-queries)
+19. [Type System](#type-system)
+20. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -894,6 +895,65 @@ Delete all rows (use with care):
 ```
 User delete
 ```
+
+---
+
+## Transactions
+
+PowDB supports explicit transactions with `begin`, `commit`, and `rollback`. Statements executed between `begin` and `commit` are applied atomically -- either all succeed or none do. Use `rollback` to discard uncommitted changes.
+
+### Syntax
+
+```
+begin
+<statement1>
+<statement2>
+...
+commit    -- apply all changes
+```
+
+```
+begin
+<statement1>
+<statement2>
+...
+rollback  -- discard all changes
+```
+
+### Examples
+
+Insert multiple rows atomically:
+
+```
+begin
+insert User { name := "Alice", email := "alice@example.com", age := 30 }
+insert User { name := "Bob", email := "bob@example.com", age := 25 }
+commit
+```
+
+Roll back a change before it takes effect:
+
+```
+begin
+insert User { name := "Charlie", email := "charlie@example.com", age := 40 }
+rollback
+-- Charlie is not inserted
+```
+
+Mix reads and writes inside a transaction:
+
+```
+begin
+insert Order { user_id := 1, total := 99.95 }
+User filter .id = 1 update { order_count := .order_count + 1 }
+commit
+```
+
+### Notes
+
+- If a connection closes before `commit`, uncommitted changes are discarded (implicit rollback).
+- Transactions are per-connection. Other connections do not see uncommitted rows.
+- Nesting transactions is not supported -- calling `begin` inside an open transaction is an error.
 
 ---
 
