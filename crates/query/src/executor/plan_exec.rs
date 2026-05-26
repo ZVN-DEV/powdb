@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 use super::compiled::*;
 use super::eval::*;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
-use powdb_storage::view::ViewDef;
+use powdb_storage::view::{ViewDef, ViewRegistry};
 
 impl Engine {
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
@@ -628,12 +628,6 @@ impl Engine {
             }
 
             PlanNode::Insert { table, assignments } => {
-                // Mission C Phase 3: resolve column indices + literals under
-                // a short-lived shared borrow on the catalog, then release
-                // it before calling insert(). The previous code cloned the
-                // full Schema (6+ String allocations on User) just to dodge
-                // the borrow checker — a measurable 200-400ns on every
-                // insert_single call in the bench.
                 let values = {
                     let schema = self
                         .catalog
@@ -647,7 +641,16 @@ impl Engine {
                                 column: a.field.clone(),
                             }
                         })?;
-                        values[idx] = literal_to_value(&a.value)?;
+                        let raw = literal_to_value(&a.value)?;
+                        values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                    }
+                    for col in &schema.columns {
+                        if col.required && matches!(values[col.position as usize], Value::Empty) {
+                            return Err(QueryError::Execution(format!(
+                                "column '{}' is required but no value was provided",
+                                col.name
+                            )));
+                        }
                     }
                     values
                 };
@@ -664,7 +667,6 @@ impl Engine {
                 assignments,
                 on_conflict,
             } => {
-                // Build the insert values from assignments.
                 let (values, key_idx) = {
                     let schema = self
                         .catalog
@@ -678,7 +680,16 @@ impl Engine {
                                 column: a.field.clone(),
                             }
                         })?;
-                        values[idx] = literal_to_value(&a.value)?;
+                        let raw = literal_to_value(&a.value)?;
+                        values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                    }
+                    for col in &schema.columns {
+                        if col.required && matches!(values[col.position as usize], Value::Empty) {
+                            return Err(QueryError::Execution(format!(
+                                "column '{}' is required but no value was provided",
+                                col.name
+                            )));
+                        }
                     }
                     let key_idx = schema
                         .column_index(key_column)
@@ -1519,6 +1530,11 @@ impl Engine {
                 self.catalog
                     .rollback_to_last_sync()
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.clear();
+                }
+                self.view_registry = ViewRegistry::open(self.catalog.data_dir())
+                    .unwrap_or_else(|_| ViewRegistry::new(self.catalog.data_dir()));
                 Ok(QueryResult::Executed {
                     message: "transaction rolled back".to_string(),
                 })

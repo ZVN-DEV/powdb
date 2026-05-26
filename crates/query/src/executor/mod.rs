@@ -426,7 +426,9 @@ impl Engine {
         let plan = lower_unindexed_range_scans(&self.catalog, &plan);
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
-            let _ = self.catalog.sync_wal();
+            self.catalog
+                .sync_wal()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         let exec_us = exec_start.elapsed().as_micros();
 

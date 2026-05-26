@@ -104,6 +104,10 @@ impl PlanCache {
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
 }
 
 /// Walk a plan tree depth-first, replacing every `Expr::Literal` with the
