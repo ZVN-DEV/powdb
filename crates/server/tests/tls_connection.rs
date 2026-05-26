@@ -127,7 +127,6 @@ async fn start_tls_server(
             let (_, mut rx) = tokio::sync::watch::channel(false);
 
             tokio::spawn(async move {
-                // TLS handshake errors are expected in some tests — ignore them.
                 if let Ok(tls_stream) = acc.accept(stream).await {
                     powdb_server::handler::handle_connection(
                         tls_stream,

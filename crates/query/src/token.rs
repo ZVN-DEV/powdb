@@ -43,6 +43,9 @@ pub enum Token {
     Outer,        // outer
     Cross,        // cross
     Transaction,  // transaction
+    Begin,        // begin
+    Commit,       // commit
+    Rollback,     // rollback
     View,         // view
     Materialized, // materialized
     Refresh,      // refresh
@@ -191,6 +194,9 @@ impl Token {
             Token::Outer => "'outer'".into(),
             Token::Cross => "'cross'".into(),
             Token::Transaction => "'transaction'".into(),
+            Token::Begin => "'begin'".into(),
+            Token::Commit => "'commit'".into(),
+            Token::Rollback => "'rollback'".into(),
             Token::View => "'view'".into(),
             Token::Materialized => "'materialized'".into(),
             Token::Refresh => "'refresh'".into(),

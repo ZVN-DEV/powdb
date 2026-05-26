@@ -144,6 +144,9 @@ pub enum PlanNode {
     Explain {
         input: Box<PlanNode>,
     },
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone)]

@@ -14,6 +14,9 @@ pub enum Statement {
     Union(UnionExpr),
     Upsert(UpsertExpr),
     Explain(Box<Statement>),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
