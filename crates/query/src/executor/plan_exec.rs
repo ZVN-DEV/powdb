@@ -1353,13 +1353,16 @@ impl Engine {
                 let columns: Vec<ColumnDef> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, (fname, tname, req))| ColumnDef {
-                        name: fname.clone(),
-                        type_id: type_name_to_id(tname),
-                        required: *req,
-                        position: i as u16,
+                    .map(|(i, (fname, tname, req))| -> Result<ColumnDef, QueryError> {
+                        Ok(ColumnDef {
+                            name: fname.clone(),
+                            type_id: type_name_to_id(tname)
+                                .map_err(|e| QueryError::TypeError(e))?,
+                            required: *req,
+                            position: i as u16,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
                 let schema = Schema {
                     table_name: name.clone(),
                     columns,
@@ -1384,7 +1387,8 @@ impl Engine {
                         .len() as u16;
                     let col = ColumnDef {
                         name: name.clone(),
-                        type_id: type_name_to_id(type_name),
+                        type_id: type_name_to_id(type_name)
+                            .map_err(|e| QueryError::TypeError(e))?,
                         required: *required,
                         position,
                     };

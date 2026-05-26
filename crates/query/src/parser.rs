@@ -244,6 +244,16 @@ impl Parser {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
+            Token::Update => Err(ParseError::Syntax {
+                message: "'update' cannot start a statement — in PowQL, use pipeline syntax: \
+                    TableName filter ... update { ... }"
+                    .into(),
+            }),
+            Token::Delete => Err(ParseError::Syntax {
+                message: "'delete' cannot start a statement — in PowQL, use pipeline syntax: \
+                    TableName filter ... delete"
+                    .into(),
+            }),
             _ => Err(self.unexpected("statement", self.peek())),
         }?;
         // Check for UNION chaining after any query-producing statement.
@@ -3297,5 +3307,34 @@ mod tests {
     fn test_parse_fuzz_repro_short_projection_eof() {
         let err = parse("z{").expect_err("unterminated projection must error, not panic");
         let _ = err.message();
+    }
+
+    #[test]
+    fn test_update_at_statement_start_gives_helpful_error() {
+        let err =
+            parse(r#"update User filter .name = "Alice" { age := 31 }"#).expect_err("should fail");
+        let msg = err.message();
+        assert!(
+            msg.contains("pipeline syntax"),
+            "error should mention pipeline syntax, got: {msg}"
+        );
+        assert!(
+            msg.contains("update"),
+            "error should mention 'update', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_delete_at_statement_start_gives_helpful_error() {
+        let err = parse("delete User filter .age < 18").expect_err("should fail");
+        let msg = err.message();
+        assert!(
+            msg.contains("pipeline syntax"),
+            "error should mention pipeline syntax, got: {msg}"
+        );
+        assert!(
+            msg.contains("delete"),
+            "error should mention 'delete', got: {msg}"
+        );
     }
 }
