@@ -350,6 +350,14 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
         .filter(|s| !s.is_empty())
         .collect();
     for stmt in &statements {
+        if stmt.starts_with('.') {
+            let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
+            eprintln!(
+                "error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
+                cmd
+            );
+            return 1;
+        }
         match engine.execute_powql(stmt) {
             Ok(result) => {
                 print_local_result(&result);
@@ -399,8 +407,20 @@ async fn exec_remote(addr: String, db: String, password: Option<String>, query: 
         }
     }
 
+    let trimmed_query = query.trim();
+    if trimmed_query.starts_with('.') {
+        let cmd = trimmed_query.split_whitespace().next().unwrap_or(trimmed_query);
+        eprintln!(
+            "error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
+            cmd
+        );
+        let _ = Message::Disconnect.write_to(&mut writer).await;
+        let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
+        return 1;
+    }
+
     let q = Message::Query {
-        query: query.trim().to_string(),
+        query: trimmed_query.to_string(),
     };
     if q.write_to(&mut writer).await.is_err()
         || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
@@ -756,6 +776,9 @@ fn print_remote_result(msg: &Message) {
                 "{affected} row{} affected",
                 if *affected == 1 { "" } else { "s" }
             );
+        }
+        Message::ResultMessage { message } => {
+            println!("{message}");
         }
         Message::Error { message } => {
             eprintln!("Error: {message}");
