@@ -765,7 +765,11 @@ impl BTree {
             }
             Value::Float(f) => {
                 let bits = f.to_bits();
-                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                let ordered = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1u64 << 63)
+                };
                 buf.extend_from_slice(&ordered.to_be_bytes());
             }
             Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
@@ -803,7 +807,11 @@ impl BTree {
             }
             Value::Float(f) => {
                 let bits = f.to_bits();
-                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                let ordered = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1u64 << 63)
+                };
                 buf.extend_from_slice(&ordered.to_be_bytes());
             }
             Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
@@ -839,7 +847,11 @@ impl BTree {
             }
             Value::Float(f) => {
                 let bits = f.to_bits();
-                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                let ordered = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1u64 << 63)
+                };
                 buf.extend_from_slice(&ordered.to_be_bytes());
             }
             Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
@@ -1896,11 +1908,26 @@ mod tests {
         let mut bt = temp_btree("nonunique_basic");
         // Insert 5 rows with 3 distinct values.
         let rids = [
-            RowId { page_id: 0, slot_index: 0 },
-            RowId { page_id: 0, slot_index: 1 },
-            RowId { page_id: 0, slot_index: 2 },
-            RowId { page_id: 0, slot_index: 3 },
-            RowId { page_id: 0, slot_index: 4 },
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 1,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 2,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 3,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 4,
+            },
         ];
         bt.insert_non_unique(Value::Str("Eng".into()), rids[0]);
         bt.insert_non_unique(Value::Str("Eng".into()), rids[1]);
@@ -1973,9 +2000,18 @@ mod tests {
     fn test_non_unique_delete() {
         let mut bt = temp_btree("nonunique_delete");
         let rids = [
-            RowId { page_id: 1, slot_index: 0 },
-            RowId { page_id: 1, slot_index: 1 },
-            RowId { page_id: 1, slot_index: 2 },
+            RowId {
+                page_id: 1,
+                slot_index: 0,
+            },
+            RowId {
+                page_id: 1,
+                slot_index: 1,
+            },
+            RowId {
+                page_id: 1,
+                slot_index: 2,
+            },
         ];
         bt.insert_non_unique(Value::Str("Eng".into()), rids[0]);
         bt.insert_non_unique(Value::Str("Eng".into()), rids[1]);
@@ -2000,9 +2036,18 @@ mod tests {
     fn test_non_unique_delete_int() {
         let mut bt = temp_btree("nonunique_delete_int");
         let rids = [
-            RowId { page_id: 2, slot_index: 0 },
-            RowId { page_id: 2, slot_index: 1 },
-            RowId { page_id: 2, slot_index: 2 },
+            RowId {
+                page_id: 2,
+                slot_index: 0,
+            },
+            RowId {
+                page_id: 2,
+                slot_index: 1,
+            },
+            RowId {
+                page_id: 2,
+                slot_index: 2,
+            },
         ];
         bt.insert_non_unique_int(42, rids[0]);
         bt.insert_non_unique_int(42, rids[1]);
@@ -2025,9 +2070,18 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
 
         let rids = [
-            RowId { page_id: 0, slot_index: 0 },
-            RowId { page_id: 0, slot_index: 1 },
-            RowId { page_id: 0, slot_index: 2 },
+            RowId {
+                page_id: 0,
+                slot_index: 0,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 1,
+            },
+            RowId {
+                page_id: 0,
+                slot_index: 2,
+            },
         ];
 
         {
