@@ -22,8 +22,8 @@
       "ops_per_sec": 676729
     },
     "powql_filter_only": {
-      "ns_per_iter": 17140000.0,
-      "ops_per_sec": 58
+      "ns_per_iter": 18924318.0,
+      "ops_per_sec": 53
     },
     "powql_filter_projection": {
       "ns_per_iter": 10381000.0,
