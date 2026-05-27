@@ -60,7 +60,7 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
-const CATALOG_VERSION: u16 = 2;
+const CATALOG_VERSION: u16 = 3;
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
@@ -589,7 +589,7 @@ impl Catalog {
             .iter()
             .map(|t| CatalogEntryRef {
                 schema: &t.schema,
-                indexed_cols: t.indexed_column_names(),
+                indexed_cols: t.indexed_column_metas(),
             })
             .collect();
         write_catalog_file(&tmp_path, &entries)?;
@@ -1068,8 +1068,22 @@ impl Catalog {
     }
 
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
+        self.create_index_unique(table, column, false)
+    }
+
+    /// Create an index with an explicit uniqueness flag. `unique = true`
+    /// for primary-key-like columns where duplicate values should
+    /// overwrite. `unique = false` for secondary indexes that allow
+    /// duplicate column values (the default via `create_index`).
+    pub fn create_index_unique(
+        &mut self,
+        table: &str,
+        column: &str,
+        unique: bool,
+    ) -> io::Result<()> {
         let data_dir = self.data_dir.clone();
-        self.by_name_mut(table)?.create_index(column, &data_dir)?;
+        self.by_name_mut(table)?
+            .create_index_with_unique(column, &data_dir, unique)?;
         // Mission 3: persist the updated catalog so the indexed column
         // list survives a restart. `Table::create_index` already saved
         // the btree file itself.
@@ -1577,17 +1591,23 @@ fn decode_ddl_alter_drop_column(data: &[u8]) -> Option<(String, String)> {
 // trailing indexed-column block) and treated as having zero indexed
 // columns. Writers always emit version 2 from Mission 3 onwards.
 
+/// Per-indexed-column metadata persisted in the catalog file.
+pub(crate) struct IndexedColMeta {
+    pub name: String,
+    pub unique: bool,
+}
+
 /// In-memory catalog entry pairing a schema with its indexed column list.
 /// Produced by the reader; the writer takes the borrowed counterpart below.
 pub(crate) struct CatalogEntry {
     pub schema: Schema,
-    pub indexed_cols: Vec<String>,
+    pub indexed_cols: Vec<IndexedColMeta>,
 }
 
 /// Borrowed view passed to the writer.
 pub(crate) struct CatalogEntryRef<'a> {
     pub schema: &'a Schema,
-    pub indexed_cols: Vec<String>,
+    pub indexed_cols: Vec<IndexedColMeta>,
 }
 
 fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Result<()> {
@@ -1610,12 +1630,13 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
             buf.push(if col.required { 1 } else { 0 });
             buf.extend_from_slice(&col.position.to_le_bytes());
         }
-        // Mission 3: per-table indexed column list (version 2 only).
+        // Per-table indexed column list with uniqueness flags (version 3).
         buf.extend_from_slice(&(entry.indexed_cols.len() as u16).to_le_bytes());
-        for col_name in &entry.indexed_cols {
-            let cn = col_name.as_bytes();
+        for meta in &entry.indexed_cols {
+            let cn = meta.name.as_bytes();
             buf.extend_from_slice(&(cn.len() as u32).to_le_bytes());
             buf.extend_from_slice(cn);
+            buf.push(if meta.unique { 1 } else { 0 });
         }
     }
 
@@ -1679,7 +1700,7 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     // those indexes were in-memory only, so on open we simply treat them
     // as absent and let the first `create_index` call repopulate the
     // metadata (and mint a version 2 file).
-    if version != CATALOG_VERSION && version != 1 {
+    if version != CATALOG_VERSION && version != 1 && version != 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported catalog version: {version}"),
@@ -1714,14 +1735,29 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             });
         }
 
-        // Version 2 appends the indexed column list. Version 1 stops
-        // after the column block — default to an empty list.
-        let indexed_cols = if version >= 2 {
+        // Version 3 appends indexed column list with uniqueness flag.
+        // Version 2 has indexed column names without uniqueness (default
+        // to non-unique). Version 1 has no index info at all.
+        let indexed_cols: Vec<IndexedColMeta> = if version >= 3 {
             let n = read_u16(buf, &mut pos)? as usize;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 let l = read_u32(buf, &mut pos)? as usize;
-                v.push(read_string(buf, &mut pos, l)?);
+                let name = read_string(buf, &mut pos, l)?;
+                let unique = read_u8(buf, &mut pos)? != 0;
+                v.push(IndexedColMeta { name, unique });
+            }
+            v
+        } else if version >= 2 {
+            let n = read_u16(buf, &mut pos)? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                let l = read_u32(buf, &mut pos)? as usize;
+                let name = read_string(buf, &mut pos, l)?;
+                v.push(IndexedColMeta {
+                    name,
+                    unique: false,
+                });
             }
             v
         } else {

@@ -28,6 +28,11 @@ pub(crate) struct IndexedCol {
     /// `delete` take the `insert_int` / `delete_int` fast paths without
     /// re-matching the schema every call.
     pub is_int: bool,
+    /// `true` for primary key / explicitly unique indexes. `false` for
+    /// secondary indexes on non-unique columns. Non-unique indexes use
+    /// composite keys (column_value + RowId) so duplicate column values
+    /// don't overwrite each other.
+    pub unique: bool,
     /// The B+ tree. Lives inline alongside the metadata so the hot
     /// insert/delete/update loops can touch a single cache line per
     /// index entry instead of chasing a separate HashMap probe.
@@ -97,10 +102,10 @@ impl Table {
     ///     path: scan the heap and insert every non-empty value. After the
     ///     rebuild, `save` the freshly built tree so subsequent opens hit
     ///     the fast path.
-    pub fn open_with_indexes(
+    pub(crate) fn open_with_indexes(
         schema: Schema,
         data_dir: &Path,
-        indexed_col_names: &[String],
+        indexed_col_metas: &[crate::catalog::IndexedColMeta],
     ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
@@ -113,7 +118,9 @@ impl Table {
             row_layout,
         };
 
-        for col_name in indexed_col_names {
+        for meta in indexed_col_metas {
+            let col_name = &meta.name;
+            let unique = meta.unique;
             let col_idx = match table.schema.column_index(col_name) {
                 Some(i) => i,
                 // Schema drift: the catalog lists an index on a column that
@@ -134,7 +141,11 @@ impl Table {
                 for (rid, row) in table.heap.scan() {
                     let row = crate::row::decode_row(&table.schema, &row);
                     if !row[col_idx].is_empty() {
-                        bt.insert(row[col_idx].clone(), rid);
+                        if unique {
+                            bt.insert(row[col_idx].clone(), rid);
+                        } else {
+                            bt.insert_non_unique(row[col_idx].clone(), rid);
+                        }
                     }
                 }
                 bt.save()?;
@@ -145,6 +156,7 @@ impl Table {
                 col_idx,
                 col_name: col_name.clone(),
                 is_int,
+                unique,
                 btree,
             });
         }
@@ -158,6 +170,17 @@ impl Table {
         self.indexed_cols
             .iter()
             .map(|c| c.col_name.clone())
+            .collect()
+    }
+
+    /// Snapshot index metadata (name + uniqueness) for catalog persistence.
+    pub(crate) fn indexed_column_metas(&self) -> Vec<crate::catalog::IndexedColMeta> {
+        self.indexed_cols
+            .iter()
+            .map(|c| crate::catalog::IndexedColMeta {
+                name: c.col_name.clone(),
+                unique: c.unique,
+            })
             .collect()
     }
 
@@ -249,17 +272,17 @@ impl Table {
             // Preserve per-index metadata (col_idx, col_name, is_int)
             // via fresh BTree instances. The old btrees are dropped
             // when `indexed_cols` is reassigned.
-            let existing: Vec<(usize, String, bool)> = self
+            let existing: Vec<(usize, String, bool, bool)> = self
                 .indexed_cols
                 .iter()
-                .map(|c| (c.col_idx, c.col_name.clone(), c.is_int))
+                .map(|c| (c.col_idx, c.col_name.clone(), c.is_int, c.unique))
                 .collect();
 
             // Drain the old entries first so the borrow of
             // `self.indexed_cols` is clear before we start scanning.
             self.indexed_cols.clear();
 
-            for (col_idx, col_name, is_int) in existing {
+            for (col_idx, col_name, is_int, unique) in existing {
                 // Mission 3: write the freshly rebuilt index back to its
                 // canonical `{table}_{col}.idx` file so a subsequent
                 // restart loads the up-to-date tree instead of the stale
@@ -274,19 +297,24 @@ impl Table {
                     if v.is_empty() {
                         continue;
                     }
-                    if is_int {
-                        if let Value::Int(i) = v {
-                            btree.insert_int(*i, rid);
-                            continue;
+                    if unique {
+                        if is_int {
+                            if let Value::Int(i) = v {
+                                btree.insert_int(*i, rid);
+                                continue;
+                            }
                         }
+                        btree.insert(v.clone(), rid);
+                    } else {
+                        btree.insert_non_unique(v.clone(), rid);
                     }
-                    btree.insert(v.clone(), rid);
                 }
                 btree.save()?;
                 self.indexed_cols.push(IndexedCol {
                     col_idx,
                     col_name,
                     is_int,
+                    unique,
                     btree,
                 });
             }
@@ -374,13 +402,20 @@ impl Table {
             if val.is_empty() {
                 continue;
             }
-            if entry.is_int {
-                if let Value::Int(i) = val {
-                    entry.btree.insert_int(*i, rid);
-                    continue;
+            if entry.unique {
+                // Unique index: duplicate key overwrites (correct for PKs).
+                if entry.is_int {
+                    if let Value::Int(i) = val {
+                        entry.btree.insert_int(*i, rid);
+                        continue;
+                    }
                 }
+                entry.btree.insert(val.clone(), rid);
+            } else {
+                // Non-unique index: composite key (col_val, rid) so
+                // duplicate column values coexist.
+                entry.btree.insert_non_unique(val.clone(), rid);
             }
-            entry.btree.insert(val.clone(), rid);
         }
         Ok(rid)
     }
@@ -423,13 +458,17 @@ impl Table {
                 if v.is_empty() {
                     continue;
                 }
-                if entry.is_int {
-                    if let Value::Int(i) = v {
-                        fresh.insert_int(*i, rid);
-                        continue;
+                if entry.unique {
+                    if entry.is_int {
+                        if let Value::Int(i) = v {
+                            fresh.insert_int(*i, rid);
+                            continue;
+                        }
                     }
+                    fresh.insert(v.clone(), rid);
+                } else {
+                    fresh.insert_non_unique(v.clone(), rid);
                 }
-                fresh.insert(v.clone(), rid);
             }
             // Force-mark dirty so the next checkpoint flushes the
             // freshly rebuilt tree, even if no further mutations
@@ -480,16 +519,19 @@ impl Table {
                 if val.is_empty() {
                     continue;
                 }
-                // Mission C Phase 11: dispatch to delete_int when the
-                // indexed key is an integer — skips Value::Ord dispatch
-                // in the btree binary search and partition_point walk.
-                match &val {
-                    Value::Int(i) => {
-                        entry.btree.delete_int(*i);
+                if entry.unique {
+                    // Unique index: key is the column value directly.
+                    match &val {
+                        Value::Int(i) => {
+                            entry.btree.delete_int(*i);
+                        }
+                        _ => {
+                            entry.btree.delete(&val);
+                        }
                     }
-                    _ => {
-                        entry.btree.delete(&val);
-                    }
+                } else {
+                    // Non-unique index: key is composite (col_val, rid).
+                    entry.btree.delete_non_unique(&val, rid);
                 }
             }
         })?;
@@ -532,11 +574,12 @@ impl Table {
             return Ok(rids.len() as u64);
         }
 
-        // All indexed cols must be int for the batch btree path to apply.
-        // Phase 15: `is_int` is precomputed at create_index time, so this
-        // is now a straight bool AND across the slice.
-        let all_int = self.indexed_cols.iter().all(|c| c.is_int);
-        if !all_int {
+        // All indexed cols must be int AND unique for the batch btree
+        // path to apply. Non-unique indexes use composite keys, so the
+        // `delete_many_int` primitive (which searches by raw i64) won't
+        // find them.
+        let all_int_unique = self.indexed_cols.iter().all(|c| c.is_int && c.unique);
+        if !all_int_unique {
             // Mixed index types — defer to the generic per-row path.
             let mut count = 0u64;
             for &rid in rids {
@@ -652,9 +695,9 @@ impl Table {
         } = self;
 
         let n_indexed = indexed_cols.len();
-        let all_int = indexed_cols.iter().all(|c| c.is_int);
+        let all_int_unique = indexed_cols.iter().all(|c| c.is_int && c.unique);
 
-        if all_int {
+        if all_int_unique {
             let mut keys_per_index: Vec<Vec<i64>> =
                 (0..n_indexed).map(|_| Vec::with_capacity(1024)).collect();
 
@@ -680,24 +723,29 @@ impl Table {
             return Ok(count);
         }
 
-        // Mixed / non-int secondary indexes: still do the single heap
-        // pass, but fall back to per-key btree deletes at the end.
-        let mut values_per_index: Vec<Vec<Value>> =
+        // Mixed / non-int / non-unique secondary indexes: single heap
+        // pass, per-key btree deletes at the end. We collect (value, rid)
+        // pairs so non-unique indexes can delete the correct composite key.
+        let mut entries_per_index: Vec<Vec<(Value, RowId)>> =
             (0..n_indexed).map(|_| Vec::with_capacity(256)).collect();
 
         let count = heap.scan_delete_matching(pred, |rid, data| {
             for (slot_i, entry) in indexed_cols.iter().enumerate() {
                 let v = decode_column(schema, layout, data, entry.col_idx);
                 if !v.is_empty() {
-                    values_per_index[slot_i].push(v);
+                    entries_per_index[slot_i].push((v, rid));
                 }
             }
             user_hook(rid, data);
         })?;
 
         for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
-            for v in &values_per_index[slot_i] {
-                entry.btree.delete(v);
+            for (v, rid) in &entries_per_index[slot_i] {
+                if entry.unique {
+                    entry.btree.delete(v);
+                } else {
+                    entry.btree.delete_non_unique(v, *rid);
+                }
             }
         }
         // Blocker B3: btree dirty flags are set by `delete`; checkpoint
@@ -797,16 +845,31 @@ impl Table {
                 let new_val = &values[entry.col_idx];
                 let old_val_opt = old_row.as_ref().map(|r| &r[entry.col_idx]);
 
-                if let Some(old_val) = old_val_opt {
-                    if old_val == new_val && new_rid == rid {
-                        continue;
+                if entry.unique {
+                    if let Some(old_val) = old_val_opt {
+                        if old_val == new_val && new_rid == rid {
+                            continue;
+                        }
+                        if !old_val.is_empty() {
+                            entry.btree.delete(old_val);
+                        }
                     }
-                    if !old_val.is_empty() {
-                        entry.btree.delete(old_val);
+                    if !new_val.is_empty() {
+                        entry.btree.insert(new_val.clone(), new_rid);
                     }
-                }
-                if !new_val.is_empty() {
-                    entry.btree.insert(new_val.clone(), new_rid);
+                } else {
+                    // Non-unique: delete old composite, insert new composite.
+                    if let Some(old_val) = old_val_opt {
+                        if old_val == new_val && new_rid == rid {
+                            continue;
+                        }
+                        if !old_val.is_empty() {
+                            entry.btree.delete_non_unique(old_val, rid);
+                        }
+                    }
+                    if !new_val.is_empty() {
+                        entry.btree.insert_non_unique(new_val.clone(), new_rid);
+                    }
                 }
             }
         }
@@ -896,13 +959,62 @@ impl Table {
     }
 
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
-        let btree = self.index(col_name)?;
-        let rid = btree.lookup(key)?;
-        let row = self.get(rid)?;
-        Some((rid, row))
+        let entry = self.indexed_cols.iter().find(|c| c.col_name == col_name)?;
+        if entry.unique {
+            let rid = entry.btree.lookup(key)?;
+            let row = self.get(rid)?;
+            Some((rid, row))
+        } else {
+            // Non-unique: return the first match (for backwards compat).
+            let rids = entry.btree.lookup_prefix(key);
+            let rid = *rids.first()?;
+            let row = self.get(rid)?;
+            Some((rid, row))
+        }
     }
 
+    /// Look up ALL matching rows for a column value. For unique indexes
+    /// this returns 0 or 1 results. For non-unique indexes this returns
+    /// all rows whose indexed column equals `key`.
+    pub fn index_lookup_all(&self, col_name: &str, key: &Value) -> Vec<RowId> {
+        let entry = match self.indexed_cols.iter().find(|c| c.col_name == col_name) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        if entry.unique {
+            match entry.btree.lookup(key) {
+                Some(rid) => vec![rid],
+                None => Vec::new(),
+            }
+        } else {
+            entry.btree.lookup_prefix(key)
+        }
+    }
+
+    /// Check if an index on the given column is unique.
+    pub fn is_index_unique(&self, col_name: &str) -> Option<bool> {
+        self.indexed_cols
+            .iter()
+            .find(|c| c.col_name == col_name)
+            .map(|c| c.unique)
+    }
+
+    /// Create a non-unique secondary index on a column. Duplicate column
+    /// values are supported via composite keys (column_value, RowId).
     pub fn create_index(&mut self, col_name: &str, data_dir: &Path) -> io::Result<()> {
+        self.create_index_with_unique(col_name, data_dir, false)
+    }
+
+    /// Create an index on a column with an explicit uniqueness flag.
+    /// `unique = true` creates a traditional unique index where duplicate
+    /// key inserts overwrite (suitable for primary keys). `unique = false`
+    /// creates a non-unique secondary index using composite keys.
+    pub fn create_index_with_unique(
+        &mut self,
+        col_name: &str,
+        data_dir: &Path,
+        unique: bool,
+    ) -> io::Result<()> {
         let col_idx = self
             .schema
             .column_index(col_name)
@@ -918,10 +1030,14 @@ impl Table {
         let idx_path = data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
         let mut btree = BTree::create(&idx_path)?;
 
-        // Build index from existing data
+        // Build index from existing data.
         for (rid, row) in self.scan() {
             if !row[col_idx].is_empty() {
-                btree.insert(row[col_idx].clone(), rid);
+                if unique {
+                    btree.insert(row[col_idx].clone(), rid);
+                } else {
+                    btree.insert_non_unique(row[col_idx].clone(), rid);
+                }
             }
         }
 
@@ -939,6 +1055,7 @@ impl Table {
             col_idx,
             col_name: col_name.to_string(),
             is_int,
+            unique,
             btree,
         });
         Ok(())
