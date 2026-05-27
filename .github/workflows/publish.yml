@@ -55,15 +55,13 @@ jobs:
 
       - name: Verify version matches input
         run: |
-          for crate in powdb-storage powdb-query powdb-server powdb-cli; do
-            dir="crates/${crate#powdb-}"
-            version=$(grep '^version' "$dir/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
-            if [ "$version" != "${{ inputs.version }}" ]; then
-              echo "::error::$crate version ($version) does not match input (${{ inputs.version }})"
-              exit 1
-            fi
-          done
-          echo "All crate versions match ${{ inputs.version }}"
+          # Crates use version.workspace = true, so check the workspace root.
+          ws_version=$(sed -n '/\[workspace\.package\]/,/^\[/{ s/^version = "\(.*\)"/\1/p; }' Cargo.toml)
+          if [ "$ws_version" != "${{ inputs.version }}" ]; then
+            echo "::error::workspace version ($ws_version) does not match input (${{ inputs.version }})"
+            exit 1
+          fi
+          echo "Workspace version matches ${{ inputs.version }}"
 
       - name: Run tests
         run: cargo test --workspace
