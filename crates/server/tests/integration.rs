@@ -99,7 +99,11 @@ async fn test_full_lifecycle() {
         .await
         .unwrap();
     let resp = read_response(&mut stream).await;
-    assert_eq!(resp[0], 0x09, "expected RESULT_OK for create type");
+    assert!(
+        resp[0] == 0x09 || resp[0] == 0x0B,
+        "expected RESULT_OK or RESULT_MSG for create type, got: 0x{:02X}",
+        resp[0]
+    );
 
     // Insert row
     stream

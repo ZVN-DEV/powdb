@@ -522,7 +522,22 @@ impl Catalog {
     /// This re-opens the catalog from the checkpoint file and replays
     /// only the durable (already flushed) WAL records. Any WAL records
     /// that were appended but not yet flushed are lost.
+    ///
+    /// **Critical**: before replacing `*self` we must discard every
+    /// dirty in-memory page across all heaps. Otherwise the old
+    /// `Catalog`'s `Drop` impl calls `checkpoint()` which flushes those
+    /// dirty pages to disk — and the freshly-opened replacement catalog
+    /// would then read the flushed (uncommitted) rows back, defeating
+    /// the entire rollback.
     pub fn rollback_to_last_sync(&mut self) -> io::Result<()> {
+        // Step 1: throw away every uncommitted in-memory write so the
+        // upcoming Drop of `*self` has nothing dirty to flush.
+        for tbl in &mut self.tables {
+            tbl.heap.discard_dirty();
+        }
+        // Step 2: re-open the catalog from disk. The heap files on disk
+        // still reflect the last checkpoint (pre-transaction state)
+        // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
         let sync_mode = self.wal.sync_mode();
         let restored = Self::open(&data_dir)?;

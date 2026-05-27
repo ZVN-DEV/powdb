@@ -3779,3 +3779,154 @@ fn test_commit_persists_across_reopen() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn test_rollback_undoes_inserts_no_trace() {
+    // Verify the rolled-back row is completely gone, not just from count
+    // but also invisible to a filter query.
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "TxTest", email := "tx@ex.com", age := 99 }"#)
+        .unwrap();
+    // Row is visible during the transaction.
+    let mid = engine
+        .execute_powql(r#"User filter .name = "TxTest""#)
+        .unwrap();
+    match mid {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback the row must be completely gone.
+    let after = engine
+        .execute_powql(r#"User filter .name = "TxTest""#)
+        .unwrap();
+    match after {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 0, "rolled-back insert should leave no trace");
+        }
+        _ => panic!("expected rows"),
+    }
+    // Total count is back to the original.
+    let count = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count, QueryResult::Scalar(Value::Int(3))));
+}
+
+#[test]
+fn test_rollback_undoes_update() {
+    let mut engine = test_engine();
+    // Verify Alice's age is 30 before the transaction.
+    let before = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match &before {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(30)),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"User filter .name = "Alice" update { age := 999 }"#)
+        .unwrap();
+    // Verify the update took effect during the transaction.
+    let mid = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match &mid {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(999)),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback Alice's age is back to 30.
+    let after = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match after {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows[0][0],
+                Value::Int(30),
+                "rolled-back update should restore original value"
+            );
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_rollback_undoes_delete() {
+    let mut engine = test_engine();
+    let count_before = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(
+        count_before,
+        QueryResult::Scalar(Value::Int(3))
+    ));
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"User filter .name = "Bob" delete"#)
+        .unwrap();
+    // Bob is gone during the transaction.
+    let mid = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(mid, QueryResult::Scalar(Value::Int(2))));
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback Bob is back.
+    let after = engine.execute_powql("count(User)").unwrap();
+    assert!(
+        matches!(after, QueryResult::Scalar(Value::Int(3))),
+        "rolled-back delete should restore deleted row"
+    );
+    let bob = engine
+        .execute_powql(r#"User filter .name = "Bob""#)
+        .unwrap();
+    match bob {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "Bob should be restored after rollback");
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_rollback_then_new_transaction_works() {
+    // Ensure the engine is functional after a rollback — a new
+    // begin/commit cycle should work normally.
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Ghost", email := "g@ex.com", age := 1 }"#)
+        .unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // Start a fresh transaction and commit.
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Real", email := "r@ex.com", age := 50 }"#)
+        .unwrap();
+    engine.execute_powql("commit").unwrap();
+
+    let count = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count, QueryResult::Scalar(Value::Int(4))));
+    // Ghost should not be there, Real should.
+    let ghost = engine
+        .execute_powql(r#"User filter .name = "Ghost""#)
+        .unwrap();
+    match ghost {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+        _ => panic!("expected rows"),
+    }
+    let real = engine
+        .execute_powql(r#"User filter .name = "Real""#)
+        .unwrap();
+    match real {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        _ => panic!("expected rows"),
+    }
+}

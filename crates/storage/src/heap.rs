@@ -1347,6 +1347,21 @@ impl HeapFile {
         self.flush_hot_page()?;
         self.disk.flush()
     }
+
+    /// Discard all in-memory dirty state (hot page + dirty buffer) WITHOUT
+    /// writing anything to disk. Used by ROLLBACK to throw away uncommitted
+    /// mutations so the subsequent `Drop` doesn't accidentally persist them.
+    ///
+    /// After this call the HeapFile is in a "cold" state: all reads will go
+    /// through disk or mmap, and the next mutation will start fresh.
+    pub fn discard_dirty(&mut self) {
+        // Drop the hot page without parking it into the dirty buffer.
+        self.hot_page = None;
+        // Clear every buffered dirty page — they contain uncommitted writes.
+        self.dirty_buffer.clear();
+        // Tear down the mmap so stale mappings don't confuse the next reader.
+        self.disable_mmap();
+    }
 }
 
 impl Drop for HeapFile {

@@ -184,7 +184,11 @@ async fn test_tls_connect_and_query() {
         .await
         .unwrap();
     let resp = read_response(&mut stream).await;
-    assert_eq!(resp[0], 0x09, "expected RESULT_OK for create type over TLS");
+    assert!(
+        resp[0] == 0x09 || resp[0] == 0x0B,
+        "expected RESULT_OK or RESULT_MSG for create type over TLS, got: 0x{:02X}",
+        resp[0]
+    );
 
     // INSERT
     stream

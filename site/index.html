@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PowDB — A database engine 3-10x faster than SQLite</title>
   <meta name="description" content="PowDB is a from-scratch Rust database engine with PowQL, a pipeline query language that beats SQLite on every benchmarked workload.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
@@ -216,7 +217,7 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
     <div class="features-grid">
       <div class="feature-card">
         <h3>Compiled Predicates</h3>
-        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads run 8-14x faster than SQLite.</p>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads run up to 10x faster than SQLite.</p>
       </div>
       <div class="feature-card">
         <h3>B+ Tree Indexes</h3>

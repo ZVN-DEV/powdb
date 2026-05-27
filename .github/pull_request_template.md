@@ -12,6 +12,15 @@ Thanks for contributing to PowDB! A few quick checks before you submit:
 
 <!-- One or two sentences on what this changes and why. -->
 
+## Type of change
+
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Documentation
+- [ ] Refactor / cleanup
+- [ ] Performance improvement
+- [ ] CI / tooling
+
 ## Behavior change
 
 <!-- User-visible behavior, wire-protocol changes, on-disk format changes, or
@@ -23,6 +32,8 @@ PowQL syntax changes. Write "none" if internal-only. -->
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
 - [ ] `cargo fmt --all -- --check` clean
 - [ ] (if perf-sensitive) `cargo bench -p powdb-bench` shows no regression beyond gate thresholds
+- [ ] Docs updated (if applicable)
+- [ ] CHANGELOG.md updated (if user-facing)
 
 ## Related issues
 

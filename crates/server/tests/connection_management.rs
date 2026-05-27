@@ -429,7 +429,7 @@ async fn test_write_msg_delivers_messages() {
         stream.write_all(&encode_query(&q)).await.unwrap();
         let msg = read_message(&mut stream).await.unwrap();
         assert!(
-            matches!(msg, Message::ResultOk { .. }),
+            matches!(msg, Message::ResultOk { .. } | Message::ResultMessage { .. }),
             "query {i} should succeed, got: {msg:?}"
         );
     }

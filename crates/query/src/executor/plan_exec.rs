@@ -1357,7 +1357,7 @@ impl Engine {
                         Ok(ColumnDef {
                             name: fname.clone(),
                             type_id: type_name_to_id(tname)
-                                .map_err(|e| QueryError::TypeError(e))?,
+                                .map_err(QueryError::TypeError)?,
                             required: *req,
                             position: i as u16,
                         })
@@ -1388,7 +1388,7 @@ impl Engine {
                     let col = ColumnDef {
                         name: name.clone(),
                         type_id: type_name_to_id(type_name)
-                            .map_err(|e| QueryError::TypeError(e))?,
+                            .map_err(QueryError::TypeError)?,
                         required: *required,
                         position,
                     };
