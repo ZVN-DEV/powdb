@@ -260,7 +260,10 @@ fn mission_a_engine(n: i64) -> Engine {
          required status: str, required email: str, required created_at: int }",
         )
         .unwrap();
-    engine.catalog_mut().create_index("User", "id").unwrap();
+    engine
+        .catalog_mut()
+        .create_index_unique("User", "id", true)
+        .unwrap();
     let statuses = ["active", "inactive", "pending"];
     for i in 0..n {
         let age = 18 + (i % 60);
@@ -3673,6 +3676,434 @@ fn test_date_diff() {
     match result {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows[0][0], Value::Int(3));
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+// ── Transaction tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_begin_commit() {
+    let mut engine = test_engine();
+    let count_before = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count_before, QueryResult::Scalar(Value::Int(3))));
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Diane", email := "diane@ex.com", age := 28 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Eve", email := "eve@ex.com", age := 22 }"#)
+        .unwrap();
+    engine.execute_powql("commit").unwrap();
+
+    let count_after = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count_after, QueryResult::Scalar(Value::Int(5))));
+}
+
+#[test]
+fn test_begin_transaction_keyword() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin transaction").unwrap();
+    engine.execute_powql("commit").unwrap();
+}
+
+#[test]
+fn test_rollback_undoes_inserts() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Zack", email := "zack@ex.com", age := 40 }"#)
+        .unwrap();
+    let mid = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(mid, QueryResult::Scalar(Value::Int(4))));
+
+    engine.execute_powql("rollback").unwrap();
+
+    let after = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(3))));
+}
+
+#[test]
+fn test_nested_begin_errors() {
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    let err = engine.execute_powql("begin").unwrap_err();
+    assert!(
+        err.to_string().contains("already in a transaction"),
+        "expected nested-begin error, got: {err}"
+    );
+    engine.execute_powql("rollback").unwrap();
+}
+
+#[test]
+fn test_commit_without_begin_errors() {
+    let mut engine = test_engine();
+    let err = engine.execute_powql("commit").unwrap_err();
+    assert!(
+        err.to_string().contains("no active transaction"),
+        "expected no-tx error, got: {err}"
+    );
+}
+
+#[test]
+fn test_rollback_without_begin_errors() {
+    let mut engine = test_engine();
+    let err = engine.execute_powql("rollback").unwrap_err();
+    assert!(
+        err.to_string().contains("no active transaction"),
+        "expected no-tx error, got: {err}"
+    );
+}
+
+#[test]
+fn test_commit_persists_across_reopen() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_tx_persist_{}_{}", std::process::id(), id));
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Item { required name: str }")
+            .unwrap();
+        engine.execute_powql("begin").unwrap();
+        engine
+            .execute_powql(r#"insert Item { name := "A" }"#)
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Item { name := "B" }"#)
+            .unwrap();
+        engine.execute_powql("commit").unwrap();
+    }
+    {
+        let engine = Engine::new(&dir).unwrap();
+        let result = engine.execute_powql_readonly("count(Item)").unwrap();
+        assert!(matches!(result, QueryResult::Scalar(Value::Int(2))));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_rollback_undoes_inserts_no_trace() {
+    // Verify the rolled-back row is completely gone, not just from count
+    // but also invisible to a filter query.
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "TxTest", email := "tx@ex.com", age := 99 }"#)
+        .unwrap();
+    // Row is visible during the transaction.
+    let mid = engine
+        .execute_powql(r#"User filter .name = "TxTest""#)
+        .unwrap();
+    match mid {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback the row must be completely gone.
+    let after = engine
+        .execute_powql(r#"User filter .name = "TxTest""#)
+        .unwrap();
+    match after {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 0, "rolled-back insert should leave no trace");
+        }
+        _ => panic!("expected rows"),
+    }
+    // Total count is back to the original.
+    let count = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count, QueryResult::Scalar(Value::Int(3))));
+}
+
+#[test]
+fn test_rollback_undoes_update() {
+    let mut engine = test_engine();
+    // Verify Alice's age is 30 before the transaction.
+    let before = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match &before {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(30)),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"User filter .name = "Alice" update { age := 999 }"#)
+        .unwrap();
+    // Verify the update took effect during the transaction.
+    let mid = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match &mid {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(999)),
+        _ => panic!("expected rows"),
+    }
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback Alice's age is back to 30.
+    let after = engine
+        .execute_powql(r#"User filter .name = "Alice" { age: .age }"#)
+        .unwrap();
+    match after {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows[0][0],
+                Value::Int(30),
+                "rolled-back update should restore original value"
+            );
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+// ─── Non-unique secondary index tests ──────────────────────────────────
+
+#[test]
+fn test_non_unique_index_returns_all_matches() {
+    // Reproducer for the non-unique index bug: a secondary index on a
+    // non-unique column (dept) must return ALL matching rows, not just one.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_nonunique_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str, age: int }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng", age := 30 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng", age := 25 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Sales", age := 35 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Dave", dept := "Eng", age := 28 }"#)
+        .unwrap();
+
+    // Create a non-unique secondary index on dept.
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Filter by dept = "Eng" must return all 3 matching rows.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(
+                rows.len(),
+                3,
+                "Expected 3 Eng employees, got {}",
+                rows.len()
+            );
+            let name_idx = columns.iter().position(|c| c == "name").unwrap();
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[name_idx] {
+                    Value::Str(s) => s.clone(),
+                    _ => panic!("expected string name"),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Alice", "Bob", "Dave"]);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Sales should return 1 row.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Sales""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Missing dept should return 0 rows.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Legal""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 0);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_rollback_undoes_delete() {
+    let mut engine = test_engine();
+    let count_before = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count_before, QueryResult::Scalar(Value::Int(3))));
+
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"User filter .name = "Bob" delete"#)
+        .unwrap();
+    // Bob is gone during the transaction.
+    let mid = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(mid, QueryResult::Scalar(Value::Int(2))));
+
+    engine.execute_powql("rollback").unwrap();
+
+    // After rollback Bob is back.
+    let after = engine.execute_powql("count(User)").unwrap();
+    assert!(
+        matches!(after, QueryResult::Scalar(Value::Int(3))),
+        "rolled-back delete should restore deleted row"
+    );
+    let bob = engine
+        .execute_powql(r#"User filter .name = "Bob""#)
+        .unwrap();
+    match bob {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "Bob should be restored after rollback");
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_non_unique_index_delete_removes_correct_entry() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_nonunique_del_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Delete Bob.
+    engine
+        .execute_powql(r#"Employee filter .name = "Bob" delete"#)
+        .unwrap();
+
+    // Should have 2 Eng employees remaining.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 2, "Expected 2 Eng employees after delete");
+            let name_idx = columns.iter().position(|c| c == "name").unwrap();
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[name_idx] {
+                    Value::Str(s) => s.clone(),
+                    _ => panic!("expected string"),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Alice", "Carol"]);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_rollback_then_new_transaction_works() {
+    // Ensure the engine is functional after a rollback — a new
+    // begin/commit cycle should work normally.
+    let mut engine = test_engine();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Ghost", email := "g@ex.com", age := 1 }"#)
+        .unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // Start a fresh transaction and commit.
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert User { name := "Real", email := "r@ex.com", age := 50 }"#)
+        .unwrap();
+    engine.execute_powql("commit").unwrap();
+
+    let count = engine.execute_powql("count(User)").unwrap();
+    assert!(matches!(count, QueryResult::Scalar(Value::Int(4))));
+    // Ghost should not be there, Real should.
+    let ghost = engine
+        .execute_powql(r#"User filter .name = "Ghost""#)
+        .unwrap();
+    match ghost {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 0),
+        _ => panic!("expected rows"),
+    }
+    let real = engine
+        .execute_powql(r#"User filter .name = "Real""#)
+        .unwrap();
+    match real {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_non_unique_index_update_changes_correct_entry() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_nonunique_upd_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Sales" }"#)
+        .unwrap();
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Move Bob from Eng to Sales.
+    engine
+        .execute_powql(r#"Employee filter .name = "Bob" update { dept := "Sales" }"#)
+        .unwrap();
+
+    // Eng should now have 1 employee.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "Eng should have 1 employee after move");
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Sales should now have 2 employees.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Sales""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 2, "Sales should have 2 employees after move");
         }
         _ => panic!("expected rows"),
     }

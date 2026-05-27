@@ -177,12 +177,44 @@ pub(super) fn value_to_expr(val: Value) -> Expr {
     }
 }
 
+pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String> {
+    use TypeId::*;
+    match (&val, col.type_id) {
+        (Value::Empty, _) => Ok(val),
+        (Value::Int(_), Int) => Ok(val),
+        (Value::Float(_), Float) => Ok(val),
+        (Value::Bool(_), Bool) => Ok(val),
+        (Value::Str(_), Str) => Ok(val),
+        (Value::Int(v), Float) => Ok(Value::Float(*v as f64)),
+        (Value::Int(v), DateTime) => Ok(Value::Int(*v)),
+        (Value::Str(s), DateTime) => Err(format!(
+            "column '{}' is datetime — use an integer timestamp, not a string (\"{}\")",
+            col.name, s
+        )),
+        (Value::Float(v), Int) => Ok(Value::Int(*v as i64)),
+        _ => Err(format!(
+            "type mismatch for column '{}': expected {:?}, got {}",
+            col.name,
+            col.type_id,
+            match &val {
+                Value::Int(_) => "int",
+                Value::Float(_) => "float",
+                Value::Bool(_) => "bool",
+                Value::Str(_) => "str",
+                Value::Empty => "null",
+                _ => "other",
+            }
+        )),
+    }
+}
+
 pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
     match expr {
         Expr::Literal(Literal::Int(v)) => Ok(Value::Int(*v)),
         Expr::Literal(Literal::Float(v)) => Ok(Value::Float(*v)),
         Expr::Literal(Literal::String(v)) => Ok(Value::Str(v.clone())),
         Expr::Literal(Literal::Bool(v)) => Ok(Value::Bool(*v)),
+        Expr::Null => Ok(Value::Empty),
         _ => Err("expected literal value".into()),
     }
 }
@@ -313,7 +345,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             let val = eval_expr(inner, row, columns);
             eval_cast(val, *cast_type)
         }
-        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } => Value::Empty,
+        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => {
+            Value::Empty
+        }
     }
 }
 

@@ -14,6 +14,9 @@ pub enum Statement {
     Union(UnionExpr),
     Upsert(UpsertExpr),
     Explain(Box<Statement>),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
@@ -309,6 +312,8 @@ pub enum Expr {
     },
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
     Cast(Box<Expr>, CastType),
+    /// The `null` literal — produces `Value::Empty`.
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq)]

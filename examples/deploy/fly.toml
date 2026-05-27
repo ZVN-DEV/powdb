@@ -1,9 +1,18 @@
-# fly.toml — PowDB on Fly.io
+# fly.toml — example PowDB deployment on Fly.io
 #
-# This is a stateful TCP service (not HTTP). One machine, one persistent volume.
-# Scaling out would require sharding/replication which is out of scope for the MVP.
+# This is a template, not a live service. Copy it to your repo root, change
+# `app` to one you own, then:
+#
+#   fly launch --copy-config --name <your-app-name>
+#   fly volumes create powdb_data --region iad --size 1
+#   fly secrets set POWDB_PASSWORD=<strong-secret>
+#   fly deploy
+#
+# PowDB on Fly is a stateful TCP service (not HTTP). One machine, one
+# persistent volume. Scaling out requires sharding/replication, which is out
+# of scope for the current MVP.
 
-app = "zvndev-powdb"
+app = "your-powdb-app"
 primary_region = "iad"
 
 [build]

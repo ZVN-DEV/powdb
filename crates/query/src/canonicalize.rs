@@ -272,6 +272,9 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::DateAdd => hash_byte(h, 0x78),
         Token::DateDiff => hash_byte(h, 0x79),
         Token::Cast => hash_byte(h, 0x7A),
+        Token::Begin => hash_byte(h, 0x7B),
+        Token::Commit => hash_byte(h, 0x7C),
+        Token::Rollback => hash_byte(h, 0x7D),
 
         // Operators.
         Token::Eq => hash_byte(h, 0x40),

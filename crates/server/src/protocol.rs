@@ -7,6 +7,7 @@ const MSG_RESULT_ROWS: u8 = 0x07;
 const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
 const MSG_ERROR: u8 = 0x0A;
+const MSG_RESULT_MSG: u8 = 0x0B;
 const MSG_DISCONNECT: u8 = 0x10;
 const MSG_PING: u8 = 0x11;
 const MSG_PONG: u8 = 0x12;
@@ -45,6 +46,10 @@ pub enum Message {
     },
     ResultOk {
         affected: u64,
+    },
+    /// A descriptive status message (e.g. "type User created", "index dropped").
+    ResultMessage {
+        message: String,
     },
     Error {
         message: String,
@@ -85,6 +90,7 @@ impl Message {
             }
             Message::ResultScalar { value } => (MSG_RESULT_SCALAR, encode_string(value)),
             Message::ResultOk { affected } => (MSG_RESULT_OK, affected.to_le_bytes().to_vec()),
+            Message::ResultMessage { message } => (MSG_RESULT_MSG, encode_string(message)),
             Message::Error { message } => (MSG_ERROR, encode_string(message)),
             Message::Disconnect => (MSG_DISCONNECT, Vec::new()),
             Message::Ping => (MSG_PING, Vec::new()),
@@ -192,6 +198,10 @@ impl Message {
                     .map_err(|_| "invalid affected count bytes".to_string())?;
                 let affected = u64::from_le_bytes(aff_bytes);
                 Ok(Message::ResultOk { affected })
+            }
+            MSG_RESULT_MSG => {
+                let message = decode_string(payload, &mut 0)?;
+                Ok(Message::ResultMessage { message })
             }
             MSG_ERROR => {
                 let message = decode_string(payload, &mut 0)?;
@@ -323,6 +333,19 @@ mod tests {
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected ResultRows"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_result_message() {
+        let msg = Message::ResultMessage {
+            message: "type User created".into(),
+        };
+        let bytes = msg.encode();
+        let decoded = Message::decode(&bytes).unwrap();
+        match decoded {
+            Message::ResultMessage { message } => assert_eq!(message, "type User created"),
+            _ => panic!("expected ResultMessage"),
         }
     }
 

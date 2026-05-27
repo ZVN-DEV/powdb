@@ -12,7 +12,7 @@ use std::collections::BinaryHeap;
 use super::compiled::*;
 use super::eval::*;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
-use powdb_storage::view::ViewDef;
+use powdb_storage::view::{ViewDef, ViewRegistry};
 
 impl Engine {
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
@@ -176,28 +176,19 @@ impl Engine {
                         })
                         .collect();
 
-                    if let Some(btree) = tbl.index(column) {
+                    if tbl.has_index(column) {
                         let layout = RowLayout::new(&schema);
-                        // Mission D7: int-specialized lookup skips the
-                        // `<Value as Ord>::cmp` discriminant dispatch on
-                        // int-keyed indexes (the vast majority).
-                        let lookup_result = match &key_value {
-                            Value::Int(k) => btree.lookup_int(*k),
-                            other => btree.lookup(other),
-                        };
-                        let rows = match lookup_result {
-                            Some(rid) => match tbl.heap.get(rid) {
-                                Some(data) => {
-                                    let row: Vec<Value> = proj_indices
-                                        .iter()
-                                        .map(|&ci| decode_column(&schema, &layout, &data, ci))
-                                        .collect();
-                                    vec![row]
-                                }
-                                None => Vec::new(),
-                            },
-                            None => Vec::new(),
-                        };
+                        let rids = tbl.index_lookup_all(column, &key_value);
+                        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                        for rid in rids {
+                            if let Some(data) = tbl.heap.get(rid) {
+                                let row: Vec<Value> = proj_indices
+                                    .iter()
+                                    .map(|&ci| decode_column(&schema, &layout, &data, ci))
+                                    .collect();
+                                rows.push(row);
+                            }
+                        }
                         return Ok(QueryResult::Rows {
                             columns: proj_columns,
                             rows,
@@ -628,12 +619,6 @@ impl Engine {
             }
 
             PlanNode::Insert { table, assignments } => {
-                // Mission C Phase 3: resolve column indices + literals under
-                // a short-lived shared borrow on the catalog, then release
-                // it before calling insert(). The previous code cloned the
-                // full Schema (6+ String allocations on User) just to dodge
-                // the borrow checker — a measurable 200-400ns on every
-                // insert_single call in the bench.
                 let values = {
                     let schema = self
                         .catalog
@@ -647,7 +632,16 @@ impl Engine {
                                 column: a.field.clone(),
                             }
                         })?;
-                        values[idx] = literal_to_value(&a.value)?;
+                        let raw = literal_to_value(&a.value)?;
+                        values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                    }
+                    for col in &schema.columns {
+                        if col.required && matches!(values[col.position as usize], Value::Empty) {
+                            return Err(QueryError::Execution(format!(
+                                "column '{}' is required but no value was provided",
+                                col.name
+                            )));
+                        }
                     }
                     values
                 };
@@ -664,7 +658,6 @@ impl Engine {
                 assignments,
                 on_conflict,
             } => {
-                // Build the insert values from assignments.
                 let (values, key_idx) = {
                     let schema = self
                         .catalog
@@ -678,7 +671,16 @@ impl Engine {
                                 column: a.field.clone(),
                             }
                         })?;
-                        values[idx] = literal_to_value(&a.value)?;
+                        let raw = literal_to_value(&a.value)?;
+                        values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                    }
+                    for col in &schema.columns {
+                        if col.required && matches!(values[col.position as usize], Value::Empty) {
+                            return Err(QueryError::Execution(format!(
+                                "column '{}' is required but no value was provided",
+                                col.name
+                            )));
+                        }
                     }
                     let key_idx = schema
                         .column_index(key_column)
@@ -694,12 +696,13 @@ impl Engine {
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                    if let Some(btree) = tbl.index(key_column) {
-                        let hit = match &key_value {
-                            Value::Int(k) => btree.lookup_int(*k),
-                            other => btree.lookup(other),
-                        };
-                        hit.and_then(|rid| {
+                    if tbl.has_index(key_column) {
+                        // Upsert key lookup: return the first match.
+                        // For unique indexes this is the only match.
+                        // For non-unique indexes on a key column, also
+                        // just the first (upsert semantics).
+                        let rids = tbl.index_lookup_all(key_column, &key_value);
+                        rids.into_iter().next().and_then(|rid| {
                             tbl.heap
                                 .get(rid)
                                 .map(|data| (rid, decode_row(&tbl.schema, &data)))
@@ -1342,13 +1345,17 @@ impl Engine {
                 let columns: Vec<ColumnDef> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, (fname, tname, req))| ColumnDef {
-                        name: fname.clone(),
-                        type_id: type_name_to_id(tname),
-                        required: *req,
-                        position: i as u16,
-                    })
-                    .collect();
+                    .map(
+                        |(i, (fname, tname, req))| -> Result<ColumnDef, QueryError> {
+                            Ok(ColumnDef {
+                                name: fname.clone(),
+                                type_id: type_name_to_id(tname).map_err(QueryError::TypeError)?,
+                                required: *req,
+                                position: i as u16,
+                            })
+                        },
+                    )
+                    .collect::<Result<Vec<_>, _>>()?;
                 let schema = Schema {
                     table_name: name.clone(),
                     columns,
@@ -1373,7 +1380,7 @@ impl Engine {
                         .len() as u16;
                     let col = ColumnDef {
                         name: name.clone(),
-                        type_id: type_name_to_id(type_name),
+                        type_id: type_name_to_id(type_name).map_err(QueryError::TypeError)?,
                         required: *required,
                         position,
                     };
@@ -1482,6 +1489,53 @@ impl Engine {
                 })
             }
 
+            PlanNode::Begin => {
+                if self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "already in a transaction (nested transactions not supported)".into(),
+                    ));
+                }
+                self.in_transaction = true;
+                Ok(QueryResult::Executed {
+                    message: "transaction started".to_string(),
+                })
+            }
+
+            PlanNode::Commit => {
+                if !self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "no active transaction to commit".into(),
+                    ));
+                }
+                self.in_transaction = false;
+                self.catalog
+                    .sync_wal()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                Ok(QueryResult::Executed {
+                    message: "transaction committed".to_string(),
+                })
+            }
+
+            PlanNode::Rollback => {
+                if !self.in_transaction {
+                    return Err(QueryError::Execution(
+                        "no active transaction to roll back".into(),
+                    ));
+                }
+                self.in_transaction = false;
+                self.catalog
+                    .rollback_to_last_sync()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.clear();
+                }
+                self.view_registry = ViewRegistry::open(self.catalog.data_dir())
+                    .unwrap_or_else(|_| ViewRegistry::new(self.catalog.data_dir()));
+                Ok(QueryResult::Executed {
+                    message: "transaction rolled back".to_string(),
+                })
+            }
+
             PlanNode::IndexScan { table, column, key } => {
                 let key_value = literal_to_value(key)?;
                 let tbl = self
@@ -1491,27 +1545,17 @@ impl Engine {
                 let columns: Vec<String> =
                     tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
 
-                // Fast path: the table has a B-tree on this column. A single
-                // point lookup returns 0 or 1 rows — this is the whole reason
-                // the planner bothers emitting IndexScan.
-                //
-                // Mission D7: use `lookup_int` on int-keyed indexes to skip
-                // the Value enum dispatch in the inner binary search. The
-                // generic `tbl.index_lookup` helper can't do this without
-                // lying about the key type, so we inline the index+heap
-                // touch here.
-                if let Some(btree) = tbl.index(column) {
-                    let hit = match &key_value {
-                        Value::Int(k) => btree.lookup_int(*k),
-                        other => btree.lookup(other),
-                    };
-                    let rows = match hit {
-                        Some(rid) => match tbl.heap.get(rid) {
-                            Some(data) => vec![decode_row(&tbl.schema, &data)],
-                            None => Vec::new(),
-                        },
-                        None => Vec::new(),
-                    };
+                // Fast path: the table has a B-tree on this column.
+                // Uses index_lookup_all to return ALL matching rows for
+                // both unique and non-unique indexes.
+                if tbl.has_index(column) {
+                    let rids = tbl.index_lookup_all(column, &key_value);
+                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                    for rid in rids {
+                        if let Some(data) = tbl.heap.get(rid) {
+                            rows.push(decode_row(&tbl.schema, &data));
+                        }
+                    }
                     return Ok(QueryResult::Rows { columns, rows });
                 }
 
@@ -1588,37 +1632,43 @@ impl Engine {
                 let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
                 let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
 
-                if let Some(btree) = tbl.index(column) {
-                    let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
-                        (Some(s), Some(e)) => btree.range(s, e).collect(),
-                        (Some(s), None) => btree.range_from(s),
-                        (None, Some(e)) => btree.range_to(e),
-                        (None, None) => {
-                            let rows: Vec<Vec<Value>> = tbl.scan().map(|(_, row)| row).collect();
-                            return Ok(QueryResult::Rows { columns, rows });
-                        }
-                    };
-                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
-                    for (key, rid) in hits {
-                        if !start_inclusive {
-                            if let Some(ref s) = start_val {
-                                if &key == s {
-                                    continue;
+                // Range scans only use the btree fast path for unique indexes,
+                // because non-unique indexes store composite keys (column_value
+                // + RowId) that don't directly compare against raw column values.
+                if tbl.is_index_unique(column) == Some(true) {
+                    if let Some(btree) = tbl.index(column) {
+                        let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                            (Some(s), Some(e)) => btree.range(s, e).collect(),
+                            (Some(s), None) => btree.range_from(s),
+                            (None, Some(e)) => btree.range_to(e),
+                            (None, None) => {
+                                let rows: Vec<Vec<Value>> =
+                                    tbl.scan().map(|(_, row)| row).collect();
+                                return Ok(QueryResult::Rows { columns, rows });
+                            }
+                        };
+                        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                        for (key, rid) in hits {
+                            if !start_inclusive {
+                                if let Some(ref s) = start_val {
+                                    if &key == s {
+                                        continue;
+                                    }
                                 }
                             }
-                        }
-                        if !end_inclusive {
-                            if let Some(ref e) = end_val {
-                                if &key == e {
-                                    continue;
+                            if !end_inclusive {
+                                if let Some(ref e) = end_val {
+                                    if &key == e {
+                                        continue;
+                                    }
                                 }
                             }
+                            if let Some(data) = tbl.heap.get(rid) {
+                                rows.push(decode_row(schema, &data));
+                            }
                         }
-                        if let Some(data) = tbl.heap.get(rid) {
-                            rows.push(decode_row(schema, &data));
-                        }
+                        return Ok(QueryResult::Rows { columns, rows });
                     }
-                    return Ok(QueryResult::Rows { columns, rows });
                 }
 
                 // Fallback: no index — synthesize range predicate and scan.
@@ -2607,15 +2657,9 @@ impl Engine {
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                    if let Some(btree) = tbl.index(column) {
-                        let hit = match &key_value {
-                            Value::Int(k) => btree.lookup_int(*k),
-                            other => btree.lookup(other),
-                        };
-                        return Ok(match hit {
-                            Some(rid) => vec![rid],
-                            None => Vec::new(),
-                        });
+                    if tbl.has_index(column) {
+                        let rids = tbl.index_lookup_all(column, &key_value);
+                        return Ok(rids);
                     }
                 }
 
@@ -3245,7 +3289,11 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             end,
         } => {
             if let Some(tbl) = catalog.get_table(table) {
-                if tbl.index(column).is_some() {
+                // Keep RangeScan only for unique indexes — their btree
+                // stores raw column values. Non-unique indexes store
+                // composite keys that don't directly compare against
+                // column values, so lower them to Filter(SeqScan).
+                if tbl.is_index_unique(column) == Some(true) {
                     return plan.clone();
                 }
             }
@@ -3598,5 +3646,8 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             let child = format_plan_tree(input, depth + 1);
             format!("{indent}Explain\n{child}")
         }
+        PlanNode::Begin => format!("{indent}Begin"),
+        PlanNode::Commit => format!("{indent}Commit"),
+        PlanNode::Rollback => format!("{indent}Rollback"),
     }
 }

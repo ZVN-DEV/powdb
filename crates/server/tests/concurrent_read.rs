@@ -220,7 +220,8 @@ fn concurrent_readers_see_uncorrupted_rows() {
             .catalog_mut()
             .get_table_mut("Row")
             .expect("Row table exists");
-        tbl.create_index("id", &data_dir).expect("build id index");
+        tbl.create_index_with_unique("id", &data_dir, true)
+            .expect("build id index");
 
         // Force every dirty page out of `HeapFile`'s write-back buffer
         // and onto disk. Without this, `heap.get` short-circuits every

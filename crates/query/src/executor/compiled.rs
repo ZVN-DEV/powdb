@@ -42,16 +42,16 @@ impl FixedBytes {
     }
 }
 
-pub(super) fn type_name_to_id(name: &str) -> TypeId {
-    match name {
-        "str" => TypeId::Str,
-        "int" => TypeId::Int,
-        "float" => TypeId::Float,
-        "bool" => TypeId::Bool,
-        "datetime" => TypeId::DateTime,
-        "uuid" => TypeId::Uuid,
-        "bytes" => TypeId::Bytes,
-        _ => TypeId::Str,
+pub(super) fn type_name_to_id(name: &str) -> Result<TypeId, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "str" | "string" => Ok(TypeId::Str),
+        "int" => Ok(TypeId::Int),
+        "float" => Ok(TypeId::Float),
+        "bool" | "boolean" => Ok(TypeId::Bool),
+        "datetime" => Ok(TypeId::DateTime),
+        "uuid" => Ok(TypeId::Uuid),
+        "bytes" => Ok(TypeId::Bytes),
+        _ => Err(format!("unknown type name: '{name}'")),
     }
 }
 
@@ -640,4 +640,43 @@ pub(super) fn decode_selective(
         values[ci] = decode_column(schema, layout, data, ci);
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_name_to_id_lowercase() {
+        assert_eq!(type_name_to_id("int").unwrap(), TypeId::Int);
+        assert_eq!(type_name_to_id("str").unwrap(), TypeId::Str);
+        assert_eq!(type_name_to_id("float").unwrap(), TypeId::Float);
+        assert_eq!(type_name_to_id("bool").unwrap(), TypeId::Bool);
+        assert_eq!(type_name_to_id("datetime").unwrap(), TypeId::DateTime);
+        assert_eq!(type_name_to_id("uuid").unwrap(), TypeId::Uuid);
+        assert_eq!(type_name_to_id("bytes").unwrap(), TypeId::Bytes);
+    }
+
+    #[test]
+    fn type_name_to_id_case_insensitive() {
+        assert_eq!(type_name_to_id("Int").unwrap(), TypeId::Int);
+        assert_eq!(type_name_to_id("INT").unwrap(), TypeId::Int);
+        assert_eq!(type_name_to_id("Str").unwrap(), TypeId::Str);
+        assert_eq!(type_name_to_id("Float").unwrap(), TypeId::Float);
+        assert_eq!(type_name_to_id("Bool").unwrap(), TypeId::Bool);
+        assert_eq!(type_name_to_id("DateTime").unwrap(), TypeId::DateTime);
+        assert_eq!(type_name_to_id("DATETIME").unwrap(), TypeId::DateTime);
+        assert_eq!(type_name_to_id("Uuid").unwrap(), TypeId::Uuid);
+        assert_eq!(type_name_to_id("UUID").unwrap(), TypeId::Uuid);
+        assert_eq!(type_name_to_id("Bytes").unwrap(), TypeId::Bytes);
+        assert_eq!(type_name_to_id("String").unwrap(), TypeId::Str);
+        assert_eq!(type_name_to_id("Boolean").unwrap(), TypeId::Bool);
+    }
+
+    #[test]
+    fn type_name_to_id_unknown_returns_error() {
+        let err = type_name_to_id("Foo").unwrap_err();
+        assert!(err.contains("unknown type name"), "got: {err}");
+        assert!(err.contains("Foo"), "got: {err}");
+    }
 }

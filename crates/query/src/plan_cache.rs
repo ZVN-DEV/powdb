@@ -104,6 +104,10 @@ impl PlanCache {
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
 }
 
 /// Walk a plan tree depth-first, replacing every `Expr::Literal` with the
@@ -244,6 +248,7 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Explain { input } => {
             substitute_plan(input, literals, idx);
         }
+        PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
     }
 }
 
@@ -374,6 +379,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::Explain { input } => {
             count_plan(input, n);
         }
+        PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
     }
 }
 
@@ -426,6 +432,7 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        Expr::Null => {}
     }
 }
 
@@ -486,6 +493,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        Expr::Null => {}
     }
 }
 
@@ -715,6 +723,7 @@ mod tests {
             PlanNode::Explain { input } => {
                 collect_literals_for_test(input, out);
             }
+            PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
         }
     }
 
@@ -762,6 +771,7 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            Expr::Null => {}
         }
     }
 }

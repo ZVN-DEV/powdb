@@ -13,7 +13,7 @@ cargo install powdb-cli
 cargo install powdb-server
 ```
 
-Or build from source (requires Rust 1.80+; install from [rustup.rs](https://rustup.rs/) if needed):
+Or build from source (requires Rust 1.93+; install from [rustup.rs](https://rustup.rs/) if needed):
 
 ```bash
 git clone https://github.com/zvndev/powdb.git
@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.2.0 — embedded mode
+PowDB v0.4.0 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit.
 
@@ -441,9 +441,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.2.0 — remote mode
+PowDB v0.4.0 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `main` (server v0.2.0)
+Connected to db `main` (server v0.4.0)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>

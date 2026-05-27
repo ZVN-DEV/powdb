@@ -1,8 +1,8 @@
 pub mod btree;
-pub mod error;
 pub mod buffer;
 pub mod catalog;
 pub mod disk;
+pub mod error;
 pub mod heap;
 pub mod mvcc;
 pub mod page;

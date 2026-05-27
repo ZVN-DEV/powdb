@@ -3,11 +3,13 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.93"
 license = "MIT"
 repository = "https://github.com/zvndev/powdb"
+homepage = "https://zvndev.github.io/powdb/"
+readme = "README.md"
 
 [workspace.dependencies]
 thiserror = "2"

@@ -224,10 +224,36 @@ impl Parser {
             Token::Drop => self.parse_drop_or_drop_view(),
             Token::Materialized => self.parse_create_view(),
             Token::Refresh => self.parse_refresh_view(),
+            Token::Begin => {
+                self.advance();
+                // Optional `transaction` keyword after `begin`.
+                if *self.peek() == Token::Transaction {
+                    self.advance();
+                }
+                return Ok(Statement::Begin);
+            }
+            Token::Commit => {
+                self.advance();
+                return Ok(Statement::Commit);
+            }
+            Token::Rollback => {
+                self.advance();
+                return Ok(Statement::Rollback);
+            }
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 self.parse_aggregate_query()
             }
             Token::Ident(_) => self.parse_query_or_mutation(),
+            Token::Update => Err(ParseError::Syntax {
+                message: "'update' cannot start a statement — in PowQL, use pipeline syntax: \
+                    TableName filter ... update { ... }"
+                    .into(),
+            }),
+            Token::Delete => Err(ParseError::Syntax {
+                message: "'delete' cannot start a statement — in PowQL, use pipeline syntax: \
+                    TableName filter ... delete"
+                    .into(),
+            }),
             _ => Err(self.unexpected("statement", self.peek())),
         }?;
         // Check for UNION chaining after any query-producing statement.
@@ -1288,6 +1314,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Param(name))
             }
+            Token::Null => {
+                self.advance();
+                Ok(Expr::Null)
+            }
             Token::Not => {
                 self.advance();
                 if *self.peek() == Token::Exists {
@@ -1834,6 +1864,9 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Outer => out.push_str("outer"),
             Token::Cross => out.push_str("cross"),
             Token::Transaction => out.push_str("transaction"),
+            Token::Begin => out.push_str("begin"),
+            Token::Commit => out.push_str("commit"),
+            Token::Rollback => out.push_str("rollback"),
             Token::View => out.push_str("view"),
             Token::Materialized => out.push_str("materialized"),
             Token::Refresh => out.push_str("refresh"),
@@ -2558,10 +2591,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ordering_null_still_errors() {
-        // `< null`, `>= null` etc. are nonsensical — leave them as errors.
-        assert!(parse("User filter .age < null").is_err());
-        assert!(parse("User filter .age >= null").is_err());
+    fn test_parse_null_comparisons_parse_ok() {
+        // `< null`, `>= null` etc. parse successfully now that `null` is a
+        // valid expression. At runtime they evaluate to Empty (no match),
+        // which is correct null-propagation semantics.
+        assert!(parse("User filter .age < null").is_ok());
+        assert!(parse("User filter .age >= null").is_ok());
     }
 
     #[test]
@@ -3272,5 +3307,34 @@ mod tests {
     fn test_parse_fuzz_repro_short_projection_eof() {
         let err = parse("z{").expect_err("unterminated projection must error, not panic");
         let _ = err.message();
+    }
+
+    #[test]
+    fn test_update_at_statement_start_gives_helpful_error() {
+        let err =
+            parse(r#"update User filter .name = "Alice" { age := 31 }"#).expect_err("should fail");
+        let msg = err.message();
+        assert!(
+            msg.contains("pipeline syntax"),
+            "error should mention pipeline syntax, got: {msg}"
+        );
+        assert!(
+            msg.contains("update"),
+            "error should mention 'update', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_delete_at_statement_start_gives_helpful_error() {
+        let err = parse("delete User filter .age < 18").expect_err("should fail");
+        let msg = err.message();
+        assert!(
+            msg.contains("pipeline syntax"),
+            "error should mention pipeline syntax, got: {msg}"
+        );
+        assert!(
+            msg.contains("delete"),
+            "error should mention 'delete', got: {msg}"
+        );
     }
 }

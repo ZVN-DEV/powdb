@@ -377,8 +377,10 @@ fn query_result_to_message(result: QueryResult) -> Message {
             value: value_to_display(&val),
         },
         QueryResult::Modified(n) => Message::ResultOk { affected: n },
-        QueryResult::Created(_name) => Message::ResultOk { affected: 0 },
-        QueryResult::Executed { .. } => Message::ResultOk { affected: 0 },
+        QueryResult::Created(name) => Message::ResultMessage {
+            message: format!("type {name} created"),
+        },
+        QueryResult::Executed { message } => Message::ResultMessage { message },
     }
 }
 

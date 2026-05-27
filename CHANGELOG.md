@@ -5,6 +5,21 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-26
+
+### Added
+- **Explicit transactions** — `BEGIN`, `COMMIT`, and `ROLLBACK` statements for grouping multiple operations into atomic units. Uncommitted changes are discarded on `ROLLBACK` or connection close
+- **Benchmark tuning** — promoted `powql_filter_only` and `projection` workloads to NOISY (10%) threshold to reduce false-positive regressions
+
+### Fixed
+- Critical bugs and review findings from the 0.4.0 audit (executor, storage edge cases)
+- Upgraded `rcgen` 0.13 to 0.14 (drops transitive `ring` dependency)
+
+### Changed
+- Bumped all crate versions to 0.4.0
+- Rebaselined benchmarks after hardening; relaxed `insert_single` ratio threshold (16 to 300)
+- Documentation and packaging improvements from smoke-audit findings
+
 ## [0.3.1] - 2026-05-18
 
 ### Added

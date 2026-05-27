@@ -1,19 +1,46 @@
 version: 2
 updates:
+  # ───────────────────────── Cargo ─────────────────────────
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
+    # Group routine bumps so we don't get a wall of red. Dev-dep majors
+    # (criterion, rustyline, rusqlite) usually require code changes; keep
+    # those as individual PRs and ignore their breaking majors until we
+    # explicitly schedule the upgrade.
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor-dev:
+        dependency-type: "development"
+        update-types: ["minor"]
+    ignore:
+      # Breaking major bumps — opt in by removing the entry when ready.
+      - dependency-name: "criterion"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rustyline"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rusqlite"
+        update-types: ["version-update:semver-major"]
 
+  # ─────────────────────── GitHub Actions ──────────────────
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
 
+  # ──────────────────────────── npm ────────────────────────
   - package-ecosystem: npm
     directory: /clients/ts
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      dev:
+        dependency-type: "development"

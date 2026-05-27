@@ -1,13 +1,18 @@
 [package]
 name = "powdb-query"
-description = "PowQL lexer, parser, planner, and executor for PowDB"
+description = "PowQL lexer, parser, planner, and executor — compiled query engine for PowDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["database", "powdb", "powql", "query-engine", "parser"]
+categories = ["database", "database-implementations", "parser-implementations"]
+documentation = "https://docs.rs/powdb-query"
 
 [dependencies]
-powdb-storage = { version = "0.3.1", path = "../storage" }
+powdb-storage = { version = "0.4.0", path = "../storage" }
 thiserror.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true

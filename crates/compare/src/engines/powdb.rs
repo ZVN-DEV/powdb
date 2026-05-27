@@ -263,7 +263,9 @@ impl BenchEngine for PowdbEngine {
             // path into a linear scan and tanks the headline ratio.
             // `create_index` is safe to call again; the table rebuilds the
             // index from current row contents.
-            table.create_index("id", &data_dir).expect("build id index");
+            table
+                .create_index_with_unique("id", &data_dir, true)
+                .expect("build id index");
 
             self.layout = Some(RowLayout::new(&table.schema));
 

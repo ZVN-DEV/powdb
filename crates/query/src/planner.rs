@@ -74,6 +74,9 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
             })
         }
         Statement::Upsert(ups) => plan_upsert(ups),
+        Statement::Begin => Ok(PlanNode::Begin),
+        Statement::Commit => Ok(PlanNode::Commit),
+        Statement::Rollback => Ok(PlanNode::Rollback),
         Statement::Explain(inner) => {
             let inner_plan = plan_statement(*inner)?;
             Ok(PlanNode::Explain {
