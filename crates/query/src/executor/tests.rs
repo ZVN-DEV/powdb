@@ -260,7 +260,7 @@ fn mission_a_engine(n: i64) -> Engine {
          required status: str, required email: str, required created_at: int }",
         )
         .unwrap();
-    engine.catalog_mut().create_index("User", "id").unwrap();
+    engine.catalog_mut().create_index_unique("User", "id", true).unwrap();
     let statuses = ["active", "inactive", "pending"];
     for i in 0..n {
         let age = 18 + (i % 60);
@@ -3673,6 +3673,177 @@ fn test_date_diff() {
     match result {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows[0][0], Value::Int(3));
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+// ─── Non-unique secondary index tests ──────────────────────────────────
+
+#[test]
+fn test_non_unique_index_returns_all_matches() {
+    // Reproducer for the non-unique index bug: a secondary index on a
+    // non-unique column (dept) must return ALL matching rows, not just one.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_nonunique_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str, age: int }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng", age := 30 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng", age := 25 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Sales", age := 35 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Dave", dept := "Eng", age := 28 }"#)
+        .unwrap();
+
+    // Create a non-unique secondary index on dept.
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Filter by dept = "Eng" must return all 3 matching rows.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 3, "Expected 3 Eng employees, got {}", rows.len());
+            let name_idx = columns.iter().position(|c| c == "name").unwrap();
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[name_idx] {
+                    Value::Str(s) => s.clone(),
+                    _ => panic!("expected string name"),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Alice", "Bob", "Dave"]);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Sales should return 1 row.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Sales""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Missing dept should return 0 rows.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Legal""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 0);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_non_unique_index_delete_removes_correct_entry() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_nonunique_del_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Delete Bob.
+    engine
+        .execute_powql(r#"Employee filter .name = "Bob" delete"#)
+        .unwrap();
+
+    // Should have 2 Eng employees remaining.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 2, "Expected 2 Eng employees after delete");
+            let name_idx = columns.iter().position(|c| c == "name").unwrap();
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[name_idx] {
+                    Value::Str(s) => s.clone(),
+                    _ => panic!("expected string"),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Alice", "Carol"]);
+        }
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_non_unique_index_update_changes_correct_entry() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_nonunique_upd_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Employee { required name: str, required dept: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Alice", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Bob", dept := "Eng" }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Employee { name := "Carol", dept := "Sales" }"#)
+        .unwrap();
+    engine
+        .execute_powql("alter Employee add index .dept")
+        .unwrap();
+
+    // Move Bob from Eng to Sales.
+    engine
+        .execute_powql(r#"Employee filter .name = "Bob" update { dept := "Sales" }"#)
+        .unwrap();
+
+    // Eng should now have 1 employee.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Eng""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "Eng should have 1 employee after move");
+        }
+        _ => panic!("expected rows"),
+    }
+
+    // Sales should now have 2 employees.
+    let result = engine
+        .execute_powql(r#"Employee filter .dept = "Sales""#)
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 2, "Sales should have 2 employees after move");
         }
         _ => panic!("expected rows"),
     }

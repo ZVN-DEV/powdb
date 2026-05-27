@@ -49,7 +49,7 @@ fn test_index_survives_catalog_reopen() {
     {
         let mut cat = Catalog::create(&dir).expect("create catalog");
         cat.create_table(user_schema()).expect("create table");
-        cat.create_index("users", "id").expect("create index");
+        cat.create_index_unique("users", "id", true).expect("create index");
 
         for i in 0..100i64 {
             cat.insert("users", &row(i, &format!("user_{i}")))
@@ -141,7 +141,7 @@ fn test_index_rehydrates_via_rebuild_when_idx_file_missing() {
     {
         let mut cat = Catalog::create(&dir).expect("create catalog");
         cat.create_table(user_schema()).expect("create table");
-        cat.create_index("users", "id").expect("create index");
+        cat.create_index_unique("users", "id", true).expect("create index");
         for i in 0..50i64 {
             cat.insert("users", &row(i, &format!("user_{i}"))).unwrap();
         }
@@ -193,7 +193,7 @@ fn test_index_crash_before_save_rebuilds_from_heap() {
     {
         let mut cat = Catalog::create(&dir).expect("create catalog");
         cat.create_table(user_schema()).expect("create table");
-        cat.create_index("users", "id").expect("create index");
+        cat.create_index_unique("users", "id", true).expect("create index");
         // Force one clean checkpoint here so the catalog.bin and the
         // `.idx` file land on disk — otherwise `Catalog::open` has
         // nothing to rehydrate from besides the WAL.
@@ -247,7 +247,7 @@ fn test_index_persists_deletes_across_reopen() {
     {
         let mut cat = Catalog::create(&dir).expect("create catalog");
         cat.create_table(user_schema()).expect("create table");
-        cat.create_index("users", "id").expect("create index");
+        cat.create_index_unique("users", "id", true).expect("create index");
         let mut deleted_rid = None;
         for i in 0..20i64 {
             let r = cat.insert("users", &row(i, &format!("user_{i}"))).unwrap();

@@ -730,6 +730,202 @@ impl BTree {
         results
     }
 
+    // ─── Non-unique index support ─────────────────────────────────────────
+    //
+    // Secondary indexes on non-unique columns (e.g. `dept`) use the
+    // "composite key" pattern: the stored key is `(column_value, row_id)`
+    // so every entry is unique even when many rows share the same column
+    // value. This is how SQLite, InnoDB, and MongoDB handle non-unique
+    // indexes.
+    //
+    // The RowId is encoded as `Value::Int((page_id as i64) << 16 | slot_index as i64)`.
+    // This gives a total order that is compatible with Value::Ord and
+    // survives round-tripping through the on-disk format unchanged.
+
+    /// Build a composite key: `[column_value, rid_as_int]`. The B+ tree
+    /// treats this 2-element sequence as a single `Value::Bytes` blob
+    /// whose `Ord` implementation naturally sorts by column value first,
+    /// then by RowId.
+    ///
+    /// Encoding: type_tag(1) + column_value_bytes + rid_i64(8).
+    /// We use a `Value::Bytes` wrapper so the existing `Value::Ord` gives
+    /// us lexicographic byte comparison, which matches the intended
+    /// (column_value, rid) sort order for same-type keys.
+    fn make_composite_key(col_val: &Value, rid: RowId) -> Value {
+        // Encode column value into bytes, then append the rid as 8 LE bytes.
+        let mut buf = Vec::with_capacity(32);
+        // Type tag so we can reconstruct the column value on prefix scan.
+        buf.push(col_val.type_id() as u8);
+        match col_val {
+            Value::Int(i) => {
+                // Encode as big-endian with sign-flip so byte comparison
+                // matches i64 ordering.
+                let flipped = (*i as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Float(f) => {
+                let bits = f.to_bits();
+                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                buf.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
+            Value::Str(s) => {
+                buf.extend_from_slice(s.as_bytes());
+                // Null terminator so "abc" < "abcd" works correctly when
+                // followed by the rid suffix.
+                buf.push(0);
+            }
+            Value::DateTime(t) => {
+                let flipped = (*t as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Uuid(u) => buf.extend_from_slice(u),
+            Value::Bytes(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
+            Value::Empty => {}
+        }
+        // Append RowId as big-endian u64 so it sorts correctly.
+        let rid_bits = ((rid.page_id as u64) << 16) | rid.slot_index as u64;
+        buf.extend_from_slice(&rid_bits.to_be_bytes());
+        Value::Bytes(buf)
+    }
+
+    /// Build a prefix key for scanning: everything before the RowId suffix.
+    fn make_prefix_start(col_val: &Value) -> Value {
+        let mut buf = Vec::with_capacity(32);
+        buf.push(col_val.type_id() as u8);
+        match col_val {
+            Value::Int(i) => {
+                let flipped = (*i as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Float(f) => {
+                let bits = f.to_bits();
+                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                buf.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
+            Value::Str(s) => {
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(0);
+            }
+            Value::DateTime(t) => {
+                let flipped = (*t as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Uuid(u) => buf.extend_from_slice(u),
+            Value::Bytes(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
+            Value::Empty => {}
+        }
+        // Append the smallest possible RowId (all zeros).
+        buf.extend_from_slice(&0u64.to_be_bytes());
+        Value::Bytes(buf)
+    }
+
+    /// Build the upper bound prefix for scanning: same column value but
+    /// with the maximum possible RowId appended.
+    fn make_prefix_end(col_val: &Value) -> Value {
+        let mut buf = Vec::with_capacity(32);
+        buf.push(col_val.type_id() as u8);
+        match col_val {
+            Value::Int(i) => {
+                let flipped = (*i as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Float(f) => {
+                let bits = f.to_bits();
+                let ordered = if bits >> 63 == 1 { !bits } else { bits ^ (1u64 << 63) };
+                buf.extend_from_slice(&ordered.to_be_bytes());
+            }
+            Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
+            Value::Str(s) => {
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(0);
+            }
+            Value::DateTime(t) => {
+                let flipped = (*t as u64) ^ (1u64 << 63);
+                buf.extend_from_slice(&flipped.to_be_bytes());
+            }
+            Value::Uuid(u) => buf.extend_from_slice(u),
+            Value::Bytes(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
+            Value::Empty => {}
+        }
+        // Append the largest possible RowId.
+        buf.extend_from_slice(&u64::MAX.to_be_bytes());
+        Value::Bytes(buf)
+    }
+
+    /// Extract the RowId from a composite key (last 8 bytes of the
+    /// `Value::Bytes` blob).
+    fn rid_from_composite(key: &Value) -> Option<RowId> {
+        if let Value::Bytes(b) = key {
+            if b.len() >= 8 {
+                let rid_bytes = &b[b.len() - 8..];
+                let rid_bits = u64::from_be_bytes(rid_bytes.try_into().ok()?);
+                return Some(RowId {
+                    page_id: (rid_bits >> 16) as u32,
+                    slot_index: (rid_bits & 0xFFFF) as u16,
+                });
+            }
+        }
+        None
+    }
+
+    /// Insert into a non-unique secondary index. The key stored in the
+    /// tree is `make_composite_key(col_val, rid)`, which is unique even
+    /// when many rows share the same `col_val`.
+    pub fn insert_non_unique(&mut self, col_val: Value, rid: RowId) {
+        let composite = Self::make_composite_key(&col_val, rid);
+        // The composite key is always unique, so the normal insert path
+        // will never hit the "duplicate key — update in place" branch.
+        self.insert(composite, rid);
+    }
+
+    /// Int-specialized variant of `insert_non_unique`. Still builds a
+    /// composite key (as Bytes), so this routes through the generic
+    /// `insert` — the int fast path only applies to keys that are
+    /// literally `Value::Int`, not `Value::Bytes`.
+    pub fn insert_non_unique_int(&mut self, col_val: i64, rid: RowId) {
+        self.insert_non_unique(Value::Int(col_val), rid);
+    }
+
+    /// Look up all RowIds matching a column value in a non-unique
+    /// secondary index. Does a range scan from
+    /// `make_prefix_start(col_val)` to `make_prefix_end(col_val)` and
+    /// extracts the RowId from each composite key.
+    pub fn lookup_prefix(&self, col_val: &Value) -> Vec<RowId> {
+        let start = Self::make_prefix_start(col_val);
+        let end = Self::make_prefix_end(col_val);
+        self.range(&start, &end)
+            .filter_map(|(key, _rid_in_value)| Self::rid_from_composite(&key))
+            .collect()
+    }
+
+    /// Int-specialized variant of `lookup_prefix`.
+    pub fn lookup_prefix_int(&self, col_val: i64) -> Vec<RowId> {
+        self.lookup_prefix(&Value::Int(col_val))
+    }
+
+    /// Delete a specific (col_val, rid) entry from a non-unique
+    /// secondary index.
+    pub fn delete_non_unique(&mut self, col_val: &Value, rid: RowId) -> bool {
+        let composite = Self::make_composite_key(col_val, rid);
+        self.delete(&composite)
+    }
+
+    /// Int-specialized variant of `delete_non_unique`.
+    pub fn delete_non_unique_int(&mut self, col_val: i64, rid: RowId) -> bool {
+        self.delete_non_unique(&Value::Int(col_val), rid)
+    }
+
     /// Number of entries in the tree.
     pub fn len(&self) -> usize {
         let mut count = 0;
@@ -1691,5 +1887,204 @@ mod tests {
         for (j, (k, _)) in results.iter().enumerate() {
             assert_eq!(*k, Value::Int(j as i64));
         }
+    }
+
+    // ─── Non-unique index tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_non_unique_insert_and_lookup_prefix() {
+        let mut bt = temp_btree("nonunique_basic");
+        // Insert 5 rows with 3 distinct values.
+        let rids = [
+            RowId { page_id: 0, slot_index: 0 },
+            RowId { page_id: 0, slot_index: 1 },
+            RowId { page_id: 0, slot_index: 2 },
+            RowId { page_id: 0, slot_index: 3 },
+            RowId { page_id: 0, slot_index: 4 },
+        ];
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[0]);
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[1]);
+        bt.insert_non_unique(Value::Str("Sales".into()), rids[2]);
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[3]);
+        bt.insert_non_unique(Value::Str("HR".into()), rids[4]);
+
+        // All 5 entries should exist.
+        assert_eq!(bt.len(), 5);
+
+        // lookup_prefix for "Eng" should return 3 RowIds.
+        let eng_rids = bt.lookup_prefix(&Value::Str("Eng".into()));
+        assert_eq!(eng_rids.len(), 3, "Eng should have 3 rows");
+        assert!(eng_rids.contains(&rids[0]));
+        assert!(eng_rids.contains(&rids[1]));
+        assert!(eng_rids.contains(&rids[3]));
+
+        // lookup_prefix for "Sales" should return 1 RowId.
+        let sales_rids = bt.lookup_prefix(&Value::Str("Sales".into()));
+        assert_eq!(sales_rids.len(), 1);
+        assert_eq!(sales_rids[0], rids[2]);
+
+        // lookup_prefix for "HR" should return 1 RowId.
+        let hr_rids = bt.lookup_prefix(&Value::Str("HR".into()));
+        assert_eq!(hr_rids.len(), 1);
+        assert_eq!(hr_rids[0], rids[4]);
+
+        // lookup_prefix for missing value should return empty.
+        let missing = bt.lookup_prefix(&Value::Str("Legal".into()));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_non_unique_int_insert_and_lookup() {
+        let mut bt = temp_btree("nonunique_int");
+        let rids: Vec<RowId> = (0..10)
+            .map(|i| RowId {
+                page_id: 0,
+                slot_index: i,
+            })
+            .collect();
+
+        // Three distinct int keys: 100, 200, 300.
+        bt.insert_non_unique_int(100, rids[0]);
+        bt.insert_non_unique_int(200, rids[1]);
+        bt.insert_non_unique_int(100, rids[2]);
+        bt.insert_non_unique_int(300, rids[3]);
+        bt.insert_non_unique_int(100, rids[4]);
+        bt.insert_non_unique_int(200, rids[5]);
+
+        assert_eq!(bt.len(), 6);
+
+        let hits = bt.lookup_prefix_int(100);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.contains(&rids[0]));
+        assert!(hits.contains(&rids[2]));
+        assert!(hits.contains(&rids[4]));
+
+        let hits = bt.lookup_prefix_int(200);
+        assert_eq!(hits.len(), 2);
+
+        let hits = bt.lookup_prefix_int(300);
+        assert_eq!(hits.len(), 1);
+
+        let hits = bt.lookup_prefix_int(999);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_non_unique_delete() {
+        let mut bt = temp_btree("nonunique_delete");
+        let rids = [
+            RowId { page_id: 1, slot_index: 0 },
+            RowId { page_id: 1, slot_index: 1 },
+            RowId { page_id: 1, slot_index: 2 },
+        ];
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[0]);
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[1]);
+        bt.insert_non_unique(Value::Str("Eng".into()), rids[2]);
+
+        assert_eq!(bt.len(), 3);
+
+        // Delete one specific (value, rid) pair.
+        let deleted = bt.delete_non_unique(&Value::Str("Eng".into()), rids[1]);
+        assert!(deleted, "delete should succeed");
+        assert_eq!(bt.len(), 2);
+
+        // The remaining two should still be findable.
+        let remaining = bt.lookup_prefix(&Value::Str("Eng".into()));
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&rids[0]));
+        assert!(remaining.contains(&rids[2]));
+        assert!(!remaining.contains(&rids[1]));
+    }
+
+    #[test]
+    fn test_non_unique_delete_int() {
+        let mut bt = temp_btree("nonunique_delete_int");
+        let rids = [
+            RowId { page_id: 2, slot_index: 0 },
+            RowId { page_id: 2, slot_index: 1 },
+            RowId { page_id: 2, slot_index: 2 },
+        ];
+        bt.insert_non_unique_int(42, rids[0]);
+        bt.insert_non_unique_int(42, rids[1]);
+        bt.insert_non_unique_int(42, rids[2]);
+
+        assert_eq!(bt.len(), 3);
+
+        bt.delete_non_unique_int(42, rids[0]);
+        let remaining = bt.lookup_prefix_int(42);
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.contains(&rids[0]));
+    }
+
+    #[test]
+    fn test_non_unique_save_load_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!(
+            "powdb_btree_nonunique_roundtrip_{}.idx",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let rids = [
+            RowId { page_id: 0, slot_index: 0 },
+            RowId { page_id: 0, slot_index: 1 },
+            RowId { page_id: 0, slot_index: 2 },
+        ];
+
+        {
+            let mut bt = BTree::create(&tmp).unwrap();
+            bt.insert_non_unique(Value::Str("Eng".into()), rids[0]);
+            bt.insert_non_unique(Value::Str("Eng".into()), rids[1]);
+            bt.insert_non_unique(Value::Str("Sales".into()), rids[2]);
+            bt.save().unwrap();
+        }
+
+        let reloaded = BTree::load(&tmp).unwrap();
+        assert_eq!(reloaded.len(), 3);
+
+        let eng = reloaded.lookup_prefix(&Value::Str("Eng".into()));
+        assert_eq!(eng.len(), 2);
+        assert!(eng.contains(&rids[0]));
+        assert!(eng.contains(&rids[1]));
+
+        let sales = reloaded.lookup_prefix(&Value::Str("Sales".into()));
+        assert_eq!(sales.len(), 1);
+        assert_eq!(sales[0], rids[2]);
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn test_non_unique_many_duplicates() {
+        // Stress test: 1000 rows with only 5 distinct values.
+        let mut bt = temp_btree("nonunique_many");
+        let depts = ["Eng", "Sales", "HR", "Legal", "Support"];
+        for i in 0..1000u16 {
+            let dept = depts[i as usize % 5];
+            bt.insert_non_unique(
+                Value::Str(dept.into()),
+                RowId {
+                    page_id: (i / 256) as u32,
+                    slot_index: i,
+                },
+            );
+        }
+        assert_eq!(bt.len(), 1000);
+
+        for dept in &depts {
+            let hits = bt.lookup_prefix(&Value::Str((*dept).into()));
+            assert_eq!(hits.len(), 200, "each dept should have 200 rows");
+        }
+
+        // Delete all "HR" rows one by one.
+        for i in (2..1000u16).step_by(5) {
+            let rid = RowId {
+                page_id: (i / 256) as u32,
+                slot_index: i,
+            };
+            bt.delete_non_unique(&Value::Str("HR".into()), rid);
+        }
+        let hr = bt.lookup_prefix(&Value::Str("HR".into()));
+        assert!(hr.is_empty(), "all HR rows should be deleted");
+        assert_eq!(bt.len(), 800);
     }
 }
