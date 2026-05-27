@@ -627,6 +627,21 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
 
 /// Decode only the specified columns from raw row bytes, filling the rest
 /// with `Value::Empty`. This avoids heap allocations for String/Bytes
+/// columns that the predicate doesn't reference.
+pub(super) fn decode_selective(
+    schema: &Schema,
+    layout: &RowLayout,
+    data: &[u8],
+    col_indices: &[usize],
+) -> Vec<Value> {
+    let n_cols = schema.columns.len();
+    let mut values = vec![Value::Empty; n_cols];
+    for &ci in col_indices {
+        values[ci] = decode_column(schema, layout, data, ci);
+    }
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,19 +679,4 @@ mod tests {
         assert!(err.contains("unknown type name"), "got: {err}");
         assert!(err.contains("Foo"), "got: {err}");
     }
-}
-
-/// columns that the predicate doesn't reference.
-pub(super) fn decode_selective(
-    schema: &Schema,
-    layout: &RowLayout,
-    data: &[u8],
-    col_indices: &[usize],
-) -> Vec<Value> {
-    let n_cols = schema.columns.len();
-    let mut values = vec![Value::Empty; n_cols];
-    for &ci in col_indices {
-        values[ci] = decode_column(schema, layout, data, ci);
-    }
-    values
 }
