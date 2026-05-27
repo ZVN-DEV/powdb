@@ -139,7 +139,9 @@ fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
             ];
             table.insert(&row).expect("insert row");
         }
-        table.create_index_with_unique("id", &data_dir, true).expect("build id index");
+        table
+            .create_index_with_unique("id", &data_dir, true)
+            .expect("build id index");
     }
 
     (engine, tmp)

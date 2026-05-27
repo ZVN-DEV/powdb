@@ -70,7 +70,9 @@ fn bench_insert(engine: &mut Engine, data_dir: &Path) {
 
     // Build an index on .id so the next benchmark has something to use.
     let build_start = Instant::now();
-    table.create_index_with_unique("id", data_dir, true).unwrap();
+    table
+        .create_index_with_unique("id", data_dir, true)
+        .unwrap();
     println!(
         "    built B-tree index on .id in {:.2} ms",
         build_start.elapsed().as_secs_f64() * 1000.0,

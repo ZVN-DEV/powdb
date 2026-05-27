@@ -66,7 +66,10 @@ fn test_crash_recovery_update_by_pk() {
         // Index on `id` — this is what unlocks the prepared-update-by-pk
         // fast path in `try_execute_update_pk_fast`. PowQL has no
         // `create index` syntax, so we reach through to the catalog.
-        engine.catalog_mut().create_index_unique("users", "id", true).unwrap();
+        engine
+            .catalog_mut()
+            .create_index_unique("users", "id", true)
+            .unwrap();
         for i in 0..10i64 {
             exec(
                 &mut engine,

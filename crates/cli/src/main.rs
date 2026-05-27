@@ -409,7 +409,10 @@ async fn exec_remote(addr: String, db: String, password: Option<String>, query: 
 
     let trimmed_query = query.trim();
     if trimmed_query.starts_with('.') {
-        let cmd = trimmed_query.split_whitespace().next().unwrap_or(trimmed_query);
+        let cmd = trimmed_query
+            .split_whitespace()
+            .next()
+            .unwrap_or(trimmed_query);
         eprintln!(
             "error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
             cmd
