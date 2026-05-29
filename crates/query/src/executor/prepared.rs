@@ -517,6 +517,8 @@ impl Engine {
                         .collect(),
                     _ => Vec::new(),
                 };
+                // WS2: byte-budget guard on the materialized IN-list.
+                self.charge_in_list(&values)?;
                 Ok(Expr::InList {
                     expr: Box::new(inner),
                     list: values,
