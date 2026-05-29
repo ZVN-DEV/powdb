@@ -363,6 +363,55 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_garbage_never_panics() {
+        // Feed a wide range of malformed/truncated byte sequences to the
+        // wire-protocol decode path. Every one must return Err, never panic:
+        // a malformed client message must not crash the server.
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],                                   // empty
+            vec![0x03],                               // 1 byte, shorter than header
+            vec![0x03, 0x00, 0x00, 0x00, 0x00],       // 5 bytes, header truncated by one
+            vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x00], // unknown message type
+            // QUERY with payload_len far exceeding the frame.
+            vec![0x03, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // CONNECT claiming a string len of 0xFFFFFFFF but no data.
+            vec![0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // RESULT_ROWS claiming a huge column count with no data.
+            vec![0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF],
+            // RESULT_OK with a truncated 8-byte affected field.
+            vec![0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03],
+        ];
+        for bytes in cases {
+            let result = Message::decode(&bytes);
+            assert!(
+                result.is_err(),
+                "expected Err for malformed input {bytes:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_arbitrary_prefixes_never_panic() {
+        // Exhaustively walk every truncation of a well-formed frame plus a
+        // few byte mutations. None may panic.
+        let valid = Message::ResultRows {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "2".into()]],
+        }
+        .encode();
+        for end in 0..valid.len() {
+            // Every prefix that is not the full frame must be rejected, not panic.
+            let _ = Message::decode(&valid[..end]);
+        }
+        // Mutate each byte to a high value and confirm no panic.
+        for i in 0..valid.len() {
+            let mut m = valid.clone();
+            m[i] = 0xFF;
+            let _ = Message::decode(&m);
+        }
+    }
+
+    #[test]
     fn test_frame_length() {
         let msg = Message::Query {
             query: "User".into(),
