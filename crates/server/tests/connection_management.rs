@@ -88,7 +88,7 @@ async fn start_single_conn_server(
             stream,
             ConnOpts {
                 engine,
-                expected_password,
+                expected_password: expected_password.map(zeroize::Zeroizing::new),
                 shutdown_rx: &mut rx,
                 idle_timeout,
                 query_timeout,
@@ -129,7 +129,7 @@ async fn start_multi_conn_server(
                     stream,
                     ConnOpts {
                         engine: eng,
-                        expected_password: pw,
+                        expected_password: pw.map(zeroize::Zeroizing::new),
                         shutdown_rx: &mut rx,
                         idle_timeout,
                         query_timeout,

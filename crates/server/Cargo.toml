@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 sha2 = "0.10"
+zeroize = "1"
 thiserror.workspace = true
 bytes.workspace = true
 tracing.workspace = true

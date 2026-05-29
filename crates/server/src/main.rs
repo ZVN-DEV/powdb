@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 /// Maximum number of concurrent connections.
 const MAX_CONNECTIONS: usize = 1024;
@@ -13,7 +14,8 @@ struct Args {
     port: u16,
     bind: String,
     data_dir: String,
-    password: Option<String>,
+    /// Client password, wrapped so it is zeroized from memory on drop.
+    password: Option<Zeroizing<String>>,
     idle_timeout_secs: u64,
     query_timeout_secs: u64,
     tls_cert: Option<String>,
@@ -44,10 +46,12 @@ fn parse_args() -> Args {
     let mut bind: String = std::env::var("POWDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let mut data_dir: String =
         std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
-    // Password is set exclusively via environment variable.
-    let password: Option<String> = std::env::var("POWDB_PASSWORD")
+    // Password is set exclusively via environment variable. Wrapped in
+    // Zeroizing so the secret is wiped from memory on drop.
+    let password: Option<Zeroizing<String>> = std::env::var("POWDB_PASSWORD")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(Zeroizing::new);
     let mut idle_timeout_secs: u64 = std::env::var("POWDB_IDLE_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
