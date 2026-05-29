@@ -1,4 +1,5 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 const MSG_CONNECT: u8 = 0x01;
 const MSG_CONNECT_OK: u8 = 0x02;
@@ -29,7 +30,11 @@ const MAX_ROWS: usize = 10_000_000;
 pub enum Message {
     Connect {
         db_name: String,
-        password: Option<String>,
+        /// Client-supplied candidate password. Wrapped in `Zeroizing` so the
+        /// raw bytes from the wire are wiped from memory once the `Message`
+        /// (and thus this field) is dropped after the constant-time compare —
+        /// the candidate never lingers in a plain `String`.
+        password: Option<Zeroizing<String>>,
     },
     ConnectOk {
         version: String,
@@ -128,7 +133,9 @@ impl Message {
                 // Password is optional. If there are no more bytes, treat as None
                 // (backwards compatible with old clients that don't send a password).
                 let password = if pos < payload.len() {
-                    let p = decode_string(payload, &mut pos)?;
+                    // Wrap the candidate immediately so the only owned copy of
+                    // the secret lives inside `Zeroizing` and is wiped on drop.
+                    let p = Zeroizing::new(decode_string(payload, &mut pos)?);
                     if p.is_empty() {
                         None
                     } else {

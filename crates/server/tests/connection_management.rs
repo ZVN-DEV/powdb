@@ -37,7 +37,7 @@ fn encode_connect(db: &str) -> Vec<u8> {
 fn encode_connect_with_password(db: &str, password: &str) -> Vec<u8> {
     Message::Connect {
         db_name: db.to_string(),
-        password: Some(password.to_string()),
+        password: Some(zeroize::Zeroizing::new(password.to_string())),
     }
     .encode()
 }
