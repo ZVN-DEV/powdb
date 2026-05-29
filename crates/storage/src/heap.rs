@@ -1370,6 +1370,45 @@ impl HeapFile {
         Ok(())
     }
 
+    /// Scan every page on disk and verify its CRC32 checksum, returning the
+    /// first `PageCorrupt` error encountered (or `Ok(())` if all pages are
+    /// intact / legacy-unstamped).
+    ///
+    /// # Why this exists (the honest checksum contract)
+    ///
+    /// PowDB's hot read paths — `ensure_hot`'s mmap branch and the zero-copy
+    /// `try_for_each_row*` scan path — deliberately read page bytes through
+    /// the mmap **without** per-read CRC verification. Verifying every page on
+    /// every scan would re-hash 4KB per page on the critical path and erase
+    /// the 3-10x scan/agg wins that are PowDB's headline numbers. So the
+    /// checksum guarantee is scoped, not universal:
+    ///
+    /// * The **write path** stamps a CRC on every flushed page
+    ///   ([`Page::stamp_checksum`]).
+    /// * **Cold reads** (the `disk.read_page` fallback in [`Self::ensure_hot`])
+    ///   verify via [`Page::from_bytes_verified`].
+    /// * The **hot mmap read path** trades per-read verification for speed.
+    ///   On-disk bit-rot in a page that is only ever read through the mmap
+    ///   fast path is NOT caught implicitly.
+    ///
+    /// `verify_integrity()` closes that gap explicitly: call it at startup or
+    /// on demand (e.g. a `CHECK TABLE`-style operation, or a periodic scrub)
+    /// to detect silent corruption across the entire file regardless of which
+    /// read path serves a page. It reads each page directly off disk via
+    /// [`Page::from_bytes_verified`], so it is correct whether or not an mmap
+    /// is active — it does not consult the mmap snapshot, the hot page, or the
+    /// dirty buffer (those in-memory copies are trusted; corruption we care
+    /// about here is on-disk bit-rot).
+    pub fn verify_integrity(&self) -> crate::error::Result<()> {
+        for page_id in 0..self.disk.num_pages() {
+            let buf = self.disk.read_page(page_id)?;
+            // Returns PageCorrupt on a CRC mismatch for stamped pages;
+            // legacy unstamped pages (flag clear) pass without verification.
+            Page::from_bytes_verified(&buf)?;
+        }
+        Ok(())
+    }
+
     /// Mission C Phase 1: flush the hot page (if dirty) before syncing the
     /// underlying file. A bare `disk.flush()` would otherwise miss the
     /// in-memory dirty buffer.

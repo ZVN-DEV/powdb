@@ -16,6 +16,24 @@ struct Frame {
 /// Keeps up to `capacity` pages in memory. When full, clock-sweep finds
 /// an unpinned frame with a cleared ref bit to evict. Dirty pages are
 /// flushed to disk before eviction.
+///
+/// # WS3 checksum caveat (read before wiring this into the heap)
+///
+/// `BufferPool` is **not** currently on the heap's read/write path — the
+/// heap uses its own `hot_page` + `dirty_buffer` + mmap machinery in
+/// `heap.rs`. As a result, the `write_page` calls in this file
+/// (`new_page`, eviction in `find_or_evict_frame`, `flush_page`,
+/// `flush_all`) deliberately do NOT call [`Page::stamp_checksum`] before
+/// writing, and `ensure_loaded` reads via [`Page::from_bytes`] (no CRC
+/// verification). That is safe only because nothing reads these pages back
+/// through `from_bytes_verified` today.
+///
+/// If `BufferPool` is ever wired into the heap (or any path whose pages are
+/// later read with [`Page::from_bytes_verified`] or scrubbed by
+/// `HeapFile::verify_integrity`), every `write_page` here MUST stamp the
+/// checksum first, or the verified reads will reject these pages as corrupt
+/// (stamped flag + stale CRC). Do not silently flip the heap onto this pool
+/// without fixing the write paths below.
 pub struct BufferPool {
     disk: DiskManager,
     frames: Vec<Option<Frame>>,

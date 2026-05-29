@@ -83,6 +83,126 @@ fn test_disk_corruption_detected_on_read() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Flip one byte of page 0's data region directly on disk, bypassing the
+/// heap. Returns nothing; panics on I/O failure.
+fn corrupt_page_data_byte(path: &std::path::Path, page_id: u32) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let corrupt_at = (page_id as u64) * PAGE_SIZE as u64 + 40;
+    f.seek(SeekFrom::Start(corrupt_at)).unwrap();
+    let mut byte = [0u8; 1];
+    f.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0xFF;
+    f.seek(SeekFrom::Start(corrupt_at)).unwrap();
+    f.write_all(&byte).unwrap();
+    f.flush().unwrap();
+}
+
+/// Proves the *gap*: when the mmap fast path is active, the zero-copy scan
+/// reads the corrupted page bytes WITHOUT a CRC check, so on-disk bit-rot
+/// goes UNDETECTED. This documents the deliberate read-path tradeoff — the
+/// scan does not error, it just yields the garbled row.
+///
+/// NOTE: MAP_PRIVATE on macOS/Linux maps the on-disk contents at the time of
+/// first access; this test corrupts the file *before* `enable_mmap()` so the
+/// mapping observes the corrupted bytes deterministically.
+#[test]
+fn test_mmap_scan_does_not_detect_corruption_by_design() {
+    let path = tmp_path("mmap_gap");
+    let schema = one_col_schema();
+
+    let rid;
+    {
+        let mut heap = HeapFile::create(&path).unwrap();
+        rid = heap
+            .insert(&encode_row(&schema, &[Value::Str("important_data".into())]))
+            .unwrap();
+        heap.flush().unwrap();
+    }
+
+    // Corrupt on disk, then reopen and activate the mmap fast path.
+    corrupt_page_data_byte(&path, rid.page_id);
+
+    let mut heap = HeapFile::open(&path).unwrap();
+    heap.enable_mmap();
+
+    // The zero-copy scan reads through the mmap with no per-read CRC check.
+    // It must NOT error — it silently yields the (corrupted) row. This is
+    // the documented performance tradeoff, asserted here so the gap is
+    // explicit rather than hidden.
+    let mut rows_seen = 0usize;
+    heap.try_for_each_row(|_rid, _data| {
+        rows_seen += 1;
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(
+        rows_seen, 1,
+        "mmap scan yields the row without detecting corruption (by design)"
+    );
+
+    // ...but an explicit integrity scan DOES catch it, even with mmap active.
+    let err = heap
+        .verify_integrity()
+        .expect_err("verify_integrity must detect on-disk corruption");
+    assert!(
+        matches!(err, StorageError::PageCorrupt(_)),
+        "expected PageCorrupt, got: {err:?}"
+    );
+
+    drop(heap);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `verify_integrity()` detects a corrupted page whether or not an mmap is
+/// active, and returns `Ok(())` for a clean file.
+#[test]
+fn test_verify_integrity_detects_corruption() {
+    let path = tmp_path("verify");
+    let schema = one_col_schema();
+
+    let rid;
+    {
+        let mut heap = HeapFile::create(&path).unwrap();
+        rid = heap
+            .insert(&encode_row(&schema, &[Value::Str("important_data".into())]))
+            .unwrap();
+        heap.flush().unwrap();
+    }
+
+    // Clean file: no mmap.
+    {
+        let heap = HeapFile::open(&path).unwrap();
+        heap.verify_integrity()
+            .expect("clean file must pass integrity check");
+    }
+
+    // Corrupt and detect, mmap NOT active.
+    corrupt_page_data_byte(&path, rid.page_id);
+    {
+        let heap = HeapFile::open(&path).unwrap();
+        let err = heap
+            .verify_integrity()
+            .expect_err("corrupted page must fail integrity check (no mmap)");
+        assert!(matches!(err, StorageError::PageCorrupt(_)));
+    }
+
+    // Corrupt and detect, mmap ACTIVE — verify_integrity reads off disk, not
+    // the mmap snapshot, so it still catches it.
+    {
+        let mut heap = HeapFile::open(&path).unwrap();
+        heap.enable_mmap();
+        let err = heap
+            .verify_integrity()
+            .expect_err("corrupted page must fail integrity check (mmap active)");
+        assert!(matches!(err, StorageError::PageCorrupt(_)));
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn test_clean_page_reads_back_after_flush() {
     // Sanity: a stamped page round-trips through disk without false
