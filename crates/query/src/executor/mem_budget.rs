@@ -11,6 +11,18 @@
 //! total would exceed the configured limit we return
 //! [`QueryError::MemoryLimitExceeded`] cleanly — no panic, no partial state.
 //!
+//! ## Why a thread-local accumulator
+//!
+//! The read path runs concurrently behind `Arc<RwLock<Engine>>`: many threads
+//! call `execute_powql_readonly(&self)` at once. A single accumulator field on
+//! the `Engine` would (a) make `Engine` `!Sync` if it used `Cell`, and (b) be
+//! *wrong* even with an atomic, because concurrent queries would sum and reset
+//! each other's totals. Each query, however, runs to completion synchronously
+//! on a single thread (`spawn_blocking` → `dispatch_query` → `execute_powql*`),
+//! so a thread-local running total is both correct and contention-free. The
+//! per-query limit is passed explicitly (it lives on the `Engine` as a plain
+//! `usize`, which is `Copy`/`Sync`).
+//!
 //! Disk-spill (so over-budget queries still succeed) is explicitly deferred to
 //! Phase 3; for now over-budget is a clean error.
 
@@ -24,72 +36,50 @@ use crate::result::QueryError;
 /// `POWDB_QUERY_MEMORY_LIMIT` by the server.
 pub const DEFAULT_QUERY_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 
-/// A per-query byte-budget accumulator.
-///
-/// Cheap: a single `Cell<usize>` plus the immutable limit. Charged on the
-/// read path (`&self`) so the field uses interior mutability rather than
-/// requiring `&mut`. One budget is created per top-level query and is **not**
-/// shared across queries, so the `Cell` is never touched from two threads.
-#[derive(Debug)]
-pub struct MemoryBudget {
-    limit_bytes: usize,
-    used_bytes: Cell<usize>,
+thread_local! {
+    /// Bytes charged so far for the query currently executing on this thread.
+    /// Reset to zero at every top-level query entry via [`reset`].
+    static USED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
-impl MemoryBudget {
-    /// Create a budget with the given byte limit.
-    pub fn new(limit_bytes: usize) -> Self {
-        MemoryBudget {
-            limit_bytes,
-            used_bytes: Cell::new(0),
-        }
-    }
+/// Reset the per-query running total for the current thread. Called at every
+/// top-level `execute_powql` / `execute_powql_readonly` entry so each query
+/// starts with the full allowance.
+#[inline]
+pub fn reset() {
+    USED_BYTES.with(|u| u.set(0));
+}
 
-    /// Charge `bytes` against the budget. Returns
-    /// [`QueryError::MemoryLimitExceeded`] if this allocation would push the
-    /// running total over the limit. On error nothing is charged (the caller
-    /// has not yet performed the allocation).
-    #[inline]
-    pub fn charge(&self, bytes: usize) -> Result<(), QueryError> {
-        let requested = self.used_bytes.get().saturating_add(bytes);
-        if requested > self.limit_bytes {
+/// Charge `bytes` against the current thread's running total, checking it
+/// against `limit_bytes`. Returns [`QueryError::MemoryLimitExceeded`] if this
+/// allocation would push the total over the limit. On error nothing is charged.
+#[inline]
+pub fn charge(bytes: usize, limit_bytes: usize) -> Result<(), QueryError> {
+    USED_BYTES.with(|u| {
+        let requested = u.get().saturating_add(bytes);
+        if requested > limit_bytes {
             return Err(QueryError::MemoryLimitExceeded {
-                limit_bytes: self.limit_bytes,
+                limit_bytes,
                 requested_bytes: requested,
             });
         }
-        self.used_bytes.set(requested);
+        u.set(requested);
         Ok(())
-    }
+    })
+}
 
-    /// Charge the estimated heap+stack footprint of a fully materialized row.
-    #[inline]
-    pub fn charge_row(&self, row: &[Value]) -> Result<(), QueryError> {
-        self.charge(estimate_row_size(row))
-    }
-
-    /// Reset the running total to zero (reuse the same budget for a fresh
-    /// query). Works through `&self` so the read path (`&self`) can reset it.
-    #[inline]
-    pub fn reset(&self) {
-        self.used_bytes.set(0);
-    }
-
-    /// Bytes charged so far (test/diagnostic helper).
-    #[cfg(test)]
-    pub fn used(&self) -> usize {
-        self.used_bytes.get()
-    }
+/// Bytes charged so far on the current thread (test/diagnostic helper).
+#[cfg(test)]
+pub fn used() -> usize {
+    USED_BYTES.with(|u| u.get())
 }
 
 /// Estimate the in-memory footprint of a single `Value`, including the heap
 /// allocation behind `Str`/`Bytes`. The estimate counts the enum slot plus any
-/// owned heap bytes — it is intentionally an over-approximation (rounds the
-/// enum size up) so the guard trips slightly early rather than slightly late.
+/// owned heap bytes — it is intentionally an over-approximation so the guard
+/// trips slightly early rather than slightly late.
 #[inline]
 pub fn estimate_value_size(v: &Value) -> usize {
-    // `Value` is an enum whose largest inline variant is `Str(String)` /
-    // `Bytes(Vec<u8>)` (3 words) plus the discriminant. Use the actual size.
     let base = std::mem::size_of::<Value>();
     let heap = match v {
         Value::Str(s) => s.capacity(),
@@ -116,17 +106,17 @@ mod tests {
 
     #[test]
     fn charge_under_limit_succeeds() {
-        let b = MemoryBudget::new(1024);
-        assert!(b.charge(512).is_ok());
-        assert!(b.charge(512).is_ok());
-        assert_eq!(b.used(), 1024);
+        reset();
+        assert!(charge(512, 1024).is_ok());
+        assert!(charge(512, 1024).is_ok());
+        assert_eq!(used(), 1024);
     }
 
     #[test]
     fn charge_over_limit_errors_without_charging() {
-        let b = MemoryBudget::new(1024);
-        assert!(b.charge(512).is_ok());
-        let err = b.charge(1024).unwrap_err();
+        reset();
+        assert!(charge(512, 1024).is_ok());
+        let err = charge(1024, 1024).unwrap_err();
         match err {
             QueryError::MemoryLimitExceeded {
                 limit_bytes,
@@ -138,7 +128,7 @@ mod tests {
             other => panic!("expected MemoryLimitExceeded, got {other:?}"),
         }
         // The failed charge did not advance the counter.
-        assert_eq!(b.used(), 512);
+        assert_eq!(used(), 512);
     }
 
     #[test]

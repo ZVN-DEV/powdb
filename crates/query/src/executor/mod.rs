@@ -271,18 +271,14 @@ pub struct Engine {
     /// registry adds the lifecycle metadata.
     view_registry: ViewRegistry,
     in_transaction: bool,
-    /// WS2 — per-query memory budget ceiling (bytes). A fresh
-    /// [`mem_budget::MemoryBudget`] is created from this limit for each
-    /// top-level query so that sort/join/GROUP BY/IN-list materialization can
-    /// be capped without OOM-killing the process. Default
-    /// [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable via
-    /// `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
+    /// WS2 — per-query memory budget ceiling (bytes). The running total lives
+    /// in a thread-local (see [`mem_budget`]) and is reset at every top-level
+    /// query entry, so sort/join/GROUP BY/IN-list materialization can be capped
+    /// without OOM-killing the process. This field holds only the *limit* (a
+    /// plain `usize`, so `Engine` stays `Sync` for the concurrent read path).
+    /// Default [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable
+    /// via `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
     query_memory_limit: usize,
-    /// WS2 — the byte-budget accumulator for the query currently executing.
-    /// Reset at every top-level `execute_plan` / `execute_plan_readonly` entry
-    /// so that each query gets the full limit (budgets are not shared across
-    /// queries). Charged via `&self` through interior mutability.
-    current_budget: mem_budget::MemoryBudget,
 }
 
 impl Engine {
@@ -324,7 +320,6 @@ impl Engine {
             view_registry,
             in_transaction: false,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
-            current_budget: mem_budget::MemoryBudget::new(mem_budget::DEFAULT_QUERY_MEMORY_LIMIT),
         })
     }
 
@@ -345,14 +340,14 @@ impl Engine {
     /// Override the per-query memory limit in bytes (builder-style).
     pub fn set_query_memory_limit(&mut self, limit_bytes: usize) {
         self.query_memory_limit = limit_bytes;
-        self.current_budget = mem_budget::MemoryBudget::new(limit_bytes);
     }
 
-    /// Reset the per-query budget to a fresh full allowance. Called at every
-    /// top-level query entry so each statement gets the whole limit. Takes
-    /// `&self` (interior mutability) so the read path can reset it too.
+    /// Reset the per-query budget (this thread's running total) to a fresh full
+    /// allowance. Called at every top-level query entry so each statement gets
+    /// the whole limit. The accumulator is thread-local, so this never touches
+    /// another concurrent query's total.
     pub(super) fn reset_memory_budget(&self) {
-        self.current_budget.reset();
+        mem_budget::reset();
     }
 
     /// Charge the estimated footprint of a freshly materialized batch of rows
@@ -365,7 +360,7 @@ impl Engine {
         for row in rows {
             total = total.saturating_add(mem_budget::estimate_row_size(row));
         }
-        self.current_budget.charge(total)
+        mem_budget::charge(total, self.query_memory_limit)
     }
 
     /// Charge a materialized IN-list (the literal expressions pulled out of an
@@ -381,7 +376,7 @@ impl Engine {
                 total = total.saturating_add(s.capacity());
             }
         }
-        self.current_budget.charge(total)
+        mem_budget::charge(total, self.query_memory_limit)
     }
 
     /// Parse + plan + execute a PowQL query.
