@@ -21,6 +21,7 @@ struct Args {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     query_memory_limit: usize,
+    require_tls: bool,
 }
 
 /// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
@@ -35,6 +36,34 @@ fn parse_query_memory_limit(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
+/// Parse the `POWDB_REQUIRE_TLS` env value. Truthy on `1`/`true` (any case);
+/// default off (false) for backward compatibility.
+fn parse_require_tls(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Enforce the TLS requirement at startup. When `require_tls` is set, a server
+/// configured with a password but no TLS cert/key would transmit credentials
+/// in cleartext — refuse to start. Returns `Err` with a message describing the
+/// misconfiguration; `Ok(())` otherwise.
+fn check_tls_requirement(
+    require_tls: bool,
+    password_set: bool,
+    tls_configured: bool,
+) -> Result<(), String> {
+    if require_tls && password_set && !tls_configured {
+        return Err(
+            "POWDB_REQUIRE_TLS is set but a password is configured without TLS \
+             (provide --tls-cert and --tls-key, or unset POWDB_REQUIRE_TLS)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_args() -> Args {
@@ -69,6 +98,8 @@ fn parse_args() -> Args {
     // WS2: per-query memory budget. Env-only (no CLI flag) for now.
     let query_memory_limit =
         parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
+    // WS4: when set, refuse to start with a password but no TLS. Default off.
+    let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -166,6 +197,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_PORT, POWDB_BIND, POWDB_DATA");
                 println!("    POWDB_PASSWORD             Set password for client authentication");
                 println!("    POWDB_TLS_CERT, POWDB_TLS_KEY");
+                println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
@@ -190,6 +222,7 @@ fn parse_args() -> Args {
         tls_cert,
         tls_key,
         query_memory_limit,
+        require_tls,
     }
 }
 
@@ -276,6 +309,14 @@ async fn main() {
     };
 
     let tls_enabled = tls_acceptor.is_some();
+
+    // WS4: enforce TLS when required. Refuse to start (rather than silently
+    // transmitting credentials in cleartext) if a password is set without TLS.
+    if let Err(msg) = check_tls_requirement(args.require_tls, args.password.is_some(), tls_enabled)
+    {
+        error!("{msg}");
+        std::process::exit(2);
+    }
 
     // CRITICAL: warn when password auth is enabled without TLS encryption.
     if args.password.is_some() && tls_acceptor.is_none() {
@@ -396,6 +437,40 @@ async fn main() {
 mod tests {
     use super::*;
     use powdb_query::executor::Engine;
+
+    #[test]
+    fn require_tls_rejects_password_without_tls() {
+        // POWDB_REQUIRE_TLS=1 + password set + no TLS cert/key → hard error.
+        let err = check_tls_requirement(true, true, false);
+        assert!(err.is_err(), "expected startup refusal");
+    }
+
+    #[test]
+    fn require_tls_allows_password_with_tls() {
+        assert!(check_tls_requirement(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn require_tls_allows_no_password() {
+        // No password means nothing to leak; TLS not required.
+        assert!(check_tls_requirement(true, false, false).is_ok());
+    }
+
+    #[test]
+    fn require_tls_off_is_backward_compatible() {
+        // Default off: password without TLS is allowed (just warned).
+        assert!(check_tls_requirement(false, true, false).is_ok());
+    }
+
+    #[test]
+    fn parse_require_tls_env() {
+        assert!(parse_require_tls(Some("1")));
+        assert!(parse_require_tls(Some("true")));
+        assert!(parse_require_tls(Some("TRUE")));
+        assert!(!parse_require_tls(Some("0")));
+        assert!(!parse_require_tls(Some("")));
+        assert!(!parse_require_tls(None));
+    }
 
     #[test]
     fn memory_limit_defaults_when_unset() {

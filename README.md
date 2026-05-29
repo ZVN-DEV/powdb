@@ -164,6 +164,8 @@ if (result.kind === "rows") console.table(result.rows);
 | `POWDB_PORT` | `5433` | TCP port for the server |
 | `POWDB_DATA` | `./powdb_data` | Data directory (heap files, WAL, catalog, indexes) |
 | `POWDB_PASSWORD` | *(none)* | Require this password on connect (set as env var) |
+| `POWDB_REQUIRE_TLS` | *(off)* | When set (`1`/`true`), refuse to start if a password is configured without TLS |
+| `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
 ### Production checklist
@@ -171,7 +173,7 @@ if (result.kind === "rows") console.table(result.rows);
 Before exposing `powdb-server` beyond `127.0.0.1`:
 
 - [ ] Set `POWDB_PASSWORD` to a strong secret. The server logs a `WARN` on startup when unset and will accept any connection.
-- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy).
+- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
 - [ ] Pin the version (`cargo install powdb-server --version 0.4.0 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
