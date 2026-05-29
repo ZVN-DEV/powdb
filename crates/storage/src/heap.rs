@@ -1415,6 +1415,33 @@ unsafe impl Send for HeapFile {}
 // the RwLock write guard excludes them. Writers still take the write
 // guard for higher-level consistency (catalog/header mutation); this
 // SAFETY note is strictly about the read path not corrupting bytes.
+//
+// WS4-mmap: the mmap/write torn-read window is closed by THREE
+// independent mechanisms working together. A torn read would require all
+// three to fail simultaneously:
+//
+//   1. RwLock exclusion (caller contract). Reads take `&self` (a read
+//      guard); writes take `&mut self` (the exclusive write guard). A
+//      reader can therefore never hold a raw mmap-derived `&[u8]` slice
+//      while a writer is mid-`insert`/`munmap`. Every reader API
+//      (`get`, `scan`, `try_for_each_row`, `for_each_row`) confines its
+//      mmap-derived borrow to the body of the call — no slice escapes the
+//      guard (`get`/`scan` copy out owned `Vec<u8>`; the `*_each_row`
+//      variants pass `&[u8]` into a closure that runs synchronously).
+//   2. Read ordering: hot page + dirty buffer BEFORE mmap. In-place
+//      mutations (`update`, `with_row_bytes_mut`, `patch_row_shrink`)
+//      land on the in-memory hot page, never through the read-only mmap.
+//      Because `get`/`scan` consult the dirty hot page and dirty buffer
+//      first, a reader observing a page under mutation reads the live
+//      in-memory bytes, not the mmap's stale snapshot — so there is no
+//      half-written page to tear on.
+//   3. Munmap only on growth (WS1). `disable_mmap` (the only `munmap`)
+//      fires solely on the new-page allocation path, which holds the
+//      write guard. It never runs concurrently with a reader.
+//
+// The `heap_mmap_race` integration test exercises (1)+(2)+(3) under
+// concurrent reader/writer threads sharing an `Arc<RwLock<HeapFile>>`,
+// asserting every scanned row decodes to its expected invariant.
 unsafe impl Sync for HeapFile {}
 
 #[cfg(test)]
