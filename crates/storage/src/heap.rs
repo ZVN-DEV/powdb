@@ -97,7 +97,12 @@ impl HeapFile {
                 // takes `free_start = 0` as the write offset and stomps
                 // on the page header with row bytes.
                 if buf[4] == 0 {
-                    let fresh = Page::new(i, PageType::Data);
+                    let mut fresh = Page::new(i, PageType::Data);
+                    // WS3: this is a direct write that bypasses the flush
+                    // path, so stamp the CRC here — otherwise the page's
+                    // checksum flag would be set with a zero CRC and the
+                    // next verified read would (correctly) reject it.
+                    fresh.stamp_checksum();
                     let _ = disk.write_page(i, fresh.as_bytes());
                     pages_with_space.push(i);
                     in_free_list[i as usize] = true;
@@ -179,6 +184,10 @@ impl HeapFile {
     pub fn flush_all_dirty(&mut self) -> io::Result<()> {
         if let Some(hot) = self.hot_page.as_mut() {
             if hot.dirty {
+                // WS3: stamp the CRC32 on the flush path (once per dirty
+                // page), not per row, so the write-path regression stays
+                // negligible.
+                hot.page.stamp_checksum();
                 self.disk.write_page(hot.page_id, hot.page.as_bytes())?;
                 hot.dirty = false;
             }
@@ -186,7 +195,8 @@ impl HeapFile {
         if !self.dirty_buffer.is_empty() {
             // Drain via a swap to avoid borrowing `self` twice.
             let drained: Vec<(u32, Page)> = self.dirty_buffer.drain().collect();
-            for (page_id, page) in drained {
+            for (mut page, page_id) in drained.into_iter().map(|(id, p)| (p, id)) {
+                page.stamp_checksum();
                 self.disk.write_page(page_id, page.as_bytes())?;
             }
         }
@@ -248,8 +258,10 @@ impl HeapFile {
         }
 
         let buf = self.disk.read_page(page_id)?;
-        let page = Page::from_bytes(&buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt page"))?;
+        // WS3: verify the page CRC32 on read (validate-if-present). A
+        // checksum mismatch surfaces as `StorageError::PageCorrupt`, which
+        // converts to an `io::Error` for this `io::Result` boundary.
+        let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
         self.hot_page = Some(HotPage {
             page_id,
             page,

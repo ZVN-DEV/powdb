@@ -67,8 +67,7 @@ fn assert_row_invariant(schema: &Schema, data: &[u8]) {
 
 #[test]
 fn test_mmap_write_race_no_torn_reads() {
-    let path =
-        std::env::temp_dir().join(format!("powdb_heap_mmap_race_{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("powdb_heap_mmap_race_{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
 
     let schema = race_schema();
@@ -132,8 +131,7 @@ fn test_mmap_write_race_no_torn_reads() {
                     // Insert a batch — this allocates new pages and tears
                     // down the mmap on the growth path.
                     for _ in 0..200 {
-                        let row =
-                            vec![Value::Str(format!("row_{next_id}")), Value::Int(next_id)];
+                        let row = vec![Value::Str(format!("row_{next_id}")), Value::Int(next_id)];
                         guard.insert(&encode_row(&schema, &row)).unwrap();
                         next_id += 1;
                     }

@@ -1,17 +1,40 @@
 pub const PAGE_SIZE: usize = 4096;
-/// Page header layout (16 bytes):
+/// Page header layout (20 bytes):
 ///   [0..4]   page_id (u32)
 ///   [4]      page_type (u8)
-///   [5]      flags (u8)
+///   [5]      flags (u8) — bit 0 (`FLAG_HAS_CHECKSUM`) marks a page written
+///                         in the checksummed format. Pages written by older
+///                         builds have this bit clear and are read without
+///                         CRC verification (validate-if-present).
 ///   [6..8]   free_start (u16)
 ///   [8..16]  lsn (u64) — log sequence number of the last WAL record
 ///                         applied to this page. Used for idempotent
 ///                         WAL replay: records with LSN <= page LSN
 ///                         are skipped.
-pub const PAGE_HEADER_SIZE: usize = 16;
+///   [16..20] crc32 (u32) — CRC32 (crc32fast) of the entire 4KB page with
+///                          these 4 bytes treated as zero. Present only when
+///                          `FLAG_HAS_CHECKSUM` is set. WS3.
+pub const PAGE_HEADER_SIZE: usize = 20;
+/// The pre-WS3 header size. Pages written by older builds packed row data
+/// starting at byte 16 (no CRC field), so the lower bound for a valid slot
+/// offset is 16, not 20 — otherwise backward-compat reads of legacy pages
+/// would reject rows living in `[16..20]`. New pages reserve `[16..20]` for
+/// the CRC and start data at `PAGE_HEADER_SIZE` (20).
+const LEGACY_HEADER_SIZE: usize = 16;
 const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
 const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
 const DELETED_MARKER: u16 = 0xFFFF;
+
+/// Byte range holding the page CRC32 (WS3). Lives just after the legacy
+/// 16-byte header so the slot directory at the bottom of the page is
+/// untouched — old and new pages share the same slot/slot_count layout,
+/// which keeps the mmap fast paths in heap.rs format-agnostic.
+const CRC_OFFSET: usize = 16;
+const CRC_SIZE: usize = 4;
+
+/// `flags` bit 0: set when the page carries a CRC32 in `[CRC_OFFSET..]`.
+/// Pre-WS3 files have this clear; their pages are read without verification.
+const FLAG_HAS_CHECKSUM: u8 = 0b0000_0001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -54,19 +77,27 @@ pub struct Page {
 }
 
 impl Page {
-    /// Create a fresh empty page.
+    /// Create a fresh empty page in the checksummed (WS3) format.
     pub fn new(page_id: u32, page_type: PageType) -> Self {
         let mut data = [0u8; PAGE_SIZE];
         data[0..4].copy_from_slice(&page_id.to_le_bytes());
         data[4] = page_type as u8;
-        data[5] = 0; // flags
+        data[5] = FLAG_HAS_CHECKSUM; // flags: this page carries a CRC32
+                                     // Row data starts after the full header (which now includes the
+                                     // 4-byte CRC field). The CRC bytes [16..20] are reserved and never
+                                     // hold row data on a checksummed page.
         let free_start = PAGE_HEADER_SIZE as u16;
         data[6..8].copy_from_slice(&free_start.to_le_bytes());
-        // slot_count = 0
+        // slot_count = 0 (unchanged location: very bottom of page)
         data[PAGE_SIZE - 2..PAGE_SIZE].copy_from_slice(&0u16.to_le_bytes());
         Page { data }
     }
 
+    /// Construct a page from raw bytes without CRC verification. Retained
+    /// for callers on paths that have already validated (or intentionally
+    /// skip) the checksum — e.g. WAL replay reconstructing pages, or the
+    /// zero-copy mmap scan which slices `iter_page_slots` directly. Disk
+    /// reads on the heap go through [`from_bytes_verified`] instead.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() != PAGE_SIZE {
             return None;
@@ -74,6 +105,51 @@ impl Page {
         let mut data = [0u8; PAGE_SIZE];
         data.copy_from_slice(buf);
         Some(Page { data })
+    }
+
+    /// Construct a page from raw bytes, verifying the CRC32 if the page was
+    /// written in the checksummed format (validate-if-present). Pages from
+    /// pre-WS3 files (flag clear) are accepted without verification so old
+    /// data files still open. Returns `PageCorrupt` on a CRC mismatch.
+    pub fn from_bytes_verified(buf: &[u8]) -> crate::error::Result<Self> {
+        if buf.len() != PAGE_SIZE {
+            return Err(crate::error::StorageError::PageCorrupt(format!(
+                "page buffer is {} bytes, expected {PAGE_SIZE}",
+                buf.len()
+            )));
+        }
+        // Validate-if-present: only pages stamped with FLAG_HAS_CHECKSUM
+        // carry a CRC. Older pages are trusted (no checksum to check).
+        if buf[5] & FLAG_HAS_CHECKSUM != 0 {
+            let stored = u32::from_le_bytes(
+                buf[CRC_OFFSET..CRC_OFFSET + CRC_SIZE]
+                    .try_into()
+                    .expect("4-byte CRC slice"),
+            );
+            let actual = checksum_with_crc_zeroed(buf);
+            if stored != actual {
+                let page_id = u32::from_le_bytes(buf[0..4].try_into().expect("4-byte page_id"));
+                return Err(crate::error::StorageError::PageCorrupt(format!(
+                    "page {page_id} CRC32 mismatch: stored {stored:#010x}, computed {actual:#010x}"
+                )));
+            }
+        }
+        let mut data = [0u8; PAGE_SIZE];
+        data.copy_from_slice(buf);
+        Ok(Page { data })
+    }
+
+    /// Compute the page CRC32 and write it into the header. Must be called
+    /// immediately before the page is written back to disk so the stored
+    /// CRC matches the final byte image. Idempotent: zeroes the CRC field
+    /// before hashing so re-stamping a page yields a stable value.
+    ///
+    /// WS3: stamping happens on the *flush* path (once per dirty page),
+    /// not per row insert/update, to keep the write-path regression small.
+    pub fn stamp_checksum(&mut self) {
+        self.data[5] |= FLAG_HAS_CHECKSUM;
+        let crc = checksum_with_crc_zeroed(&self.data);
+        self.data[CRC_OFFSET..CRC_OFFSET + CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
     }
 
     pub fn as_bytes(&self) -> &[u8; PAGE_SIZE] {
@@ -314,6 +390,21 @@ impl Page {
 /// over `entry_off` with no function call per slot.
 /// Read the LSN from a page-sized byte slice without constructing a `Page`.
 /// Used by WAL replay to check whether a record has already been applied.
+/// CRC32 (crc32fast) over a full 4KB page image, treating the 4-byte CRC
+/// field as zero. Used both to stamp a page on write-back and to verify it
+/// on read — the "with CRC zeroed" convention means the same input bytes
+/// produce the same hash regardless of any stale CRC already present.
+#[inline]
+fn checksum_with_crc_zeroed(page_bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    // Hash everything before the CRC field, four zero bytes in its place,
+    // then everything after — no allocation, no full-page copy.
+    hasher.update(&page_bytes[..CRC_OFFSET]);
+    hasher.update(&[0u8; CRC_SIZE]);
+    hasher.update(&page_bytes[CRC_OFFSET + CRC_SIZE..]);
+    hasher.finalize()
+}
+
 #[inline]
 pub fn page_lsn(page_bytes: &[u8]) -> u64 {
     u64::from_le_bytes(
@@ -351,8 +442,10 @@ pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> 
         let end = start + length as usize;
         // Task 3: bounds validation — a corrupt page could have slot
         // offset/length that point outside the data region. Return None
-        // instead of panicking on an out-of-bounds slice.
-        if end > PAGE_SIZE || start < PAGE_HEADER_SIZE {
+        // instead of panicking on an out-of-bounds slice. Use the legacy
+        // header size as the lower bound so pre-WS3 pages (data from byte
+        // 16) still read.
+        if end > PAGE_SIZE || start < LEGACY_HEADER_SIZE {
             return None;
         }
         Some((i, &page_bytes[start..end]))
@@ -475,6 +568,70 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live[0], (0, &b"a"[..]));
         assert_eq!(live[1], (2, &b"c"[..]));
+    }
+
+    #[test]
+    fn test_checksum_roundtrip_and_corruption_detected() {
+        // WS3 Test 1: stamp a page, flip a byte in the data region, and
+        // assert verification fails with PageCorrupt.
+        let mut page = Page::new(7, PageType::Data);
+        page.insert(b"the quick brown fox").unwrap();
+        page.insert(b"jumps over the lazy dog").unwrap();
+        page.stamp_checksum();
+
+        // A clean round-trip verifies fine.
+        let bytes = *page.as_bytes();
+        assert!(
+            Page::from_bytes_verified(&bytes).is_ok(),
+            "freshly stamped page must verify"
+        );
+
+        // Flip a byte inside the row-data region (well clear of the CRC
+        // field and the slot directory) — verification must reject it.
+        let mut corrupted = bytes;
+        corrupted[PAGE_HEADER_SIZE + 3] ^= 0xFF;
+        match Page::from_bytes_verified(&corrupted) {
+            Err(crate::error::StorageError::PageCorrupt(_)) => {}
+            Err(other) => panic!("expected PageCorrupt on flipped data byte, got {other:?}"),
+            Ok(_) => panic!("expected PageCorrupt on flipped data byte, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_page_without_checksum_still_reads() {
+        // WS3 Test 2: a page in the pre-checksum format (flag clear, no
+        // CRC stored) must still open without error — validate-if-present.
+        let mut page = Page::new(9, PageType::Data);
+        page.insert(b"legacy row").unwrap();
+        // Simulate the old on-disk format: clear the checksum flag and zero
+        // the CRC field so it looks exactly like a page written by a
+        // pre-WS3 build.
+        let mut bytes = *page.as_bytes();
+        bytes[5] &= !FLAG_HAS_CHECKSUM;
+        bytes[CRC_OFFSET..CRC_OFFSET + CRC_SIZE].copy_from_slice(&[0u8; CRC_SIZE]);
+
+        let reopened =
+            Page::from_bytes_verified(&bytes).expect("legacy page must read without verification");
+        assert_eq!(reopened.page_id(), 9);
+        assert_eq!(reopened.get(0).unwrap(), b"legacy row");
+    }
+
+    #[test]
+    fn test_stamp_checksum_is_idempotent() {
+        // Re-stamping a page (e.g. flushed, mutated, flushed again) must
+        // produce a self-consistent CRC each time, since the field is
+        // zeroed before hashing.
+        let mut page = Page::new(3, PageType::Data);
+        page.insert(b"row").unwrap();
+        page.stamp_checksum();
+        let first = *page.as_bytes();
+        page.stamp_checksum();
+        let second = *page.as_bytes();
+        assert_eq!(
+            first, second,
+            "re-stamping an unchanged page must be stable"
+        );
+        assert!(Page::from_bytes_verified(&second).is_ok());
     }
 
     #[test]
