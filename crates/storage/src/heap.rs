@@ -318,8 +318,11 @@ impl HeapFile {
     }
 
     /// Tear down the persistent mmap, if active. Safe to call when no
-    /// mapping exists (it's a no-op). Called automatically at the start of
-    /// `insert` so the mapping is invalidated before the file can grow.
+    /// mapping exists (it's a no-op). Called on the file-growth path of
+    /// `insert` (new-page allocation) so the mapping is invalidated before
+    /// the file grows beyond the mapped length. WS1: it is deliberately
+    /// *not* called on the hot-page insert fast path, which never grows
+    /// the file.
     pub fn disable_mmap(&mut self) {
         if let Some((ptr, len)) = self.mmap_ptr.take() {
             // SAFETY: `ptr` and `len` were returned by a successful
@@ -339,14 +342,23 @@ impl HeapFile {
     /// disk syscalls; the page stays pinned until a different page is
     /// touched or an explicit flush runs.
     pub fn insert(&mut self, row_data: &[u8]) -> io::Result<RowId> {
-        // Invalidate the persistent mmap before any mutation that may
-        // extend the file. The mapping covers a snapshot of the file at
-        // enable_mmap() time; inserts that allocate new pages would grow
-        // the file beyond that snapshot.
-        self.disable_mmap();
+        // WS1 invariant: the persistent mmap covers a snapshot of the file
+        // taken at `enable_mmap()` time (length = num_pages * PAGE_SIZE).
+        // It only becomes unsafe — covering a stale/short region relative
+        // to the live file — when the file actually *grows*, i.e. when we
+        // allocate a brand-new page below. Writes into already-mapped pages
+        // are safe to leave the mapping in place because:
+        //   1. The mapping is `MAP_PRIVATE` + `PROT_READ` (never written
+        //      through), so it cannot tear from our writes here.
+        //   2. `get()` / `scan()` consult the dirty hot page and the
+        //      dirty buffer *before* the mmap, so unflushed writes to a
+        //      mapped page are always read from memory, not the snapshot.
+        // Therefore we defer `disable_mmap()` to the new-page path only,
+        // instead of paying a `munmap` syscall on every hot-page insert.
 
         // Hot-path: the pinned page already has room. This is the bench's
-        // insert_batch_1k / insert_single loop.
+        // insert_batch_1k / insert_single loop. No file growth happens here,
+        // so the mmap stays mapped.
         if let Some(hot) = self.hot_page.as_mut() {
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
@@ -387,7 +399,13 @@ impl HeapFile {
             // Page doesn't fit this row; try the next one on the list.
         }
 
-        // Allocate a new page.
+        // Allocate a new page. This *grows the file*, so the persistent
+        // mmap snapshot must be invalidated first: after `allocate_page`,
+        // `num_pages` increases and the mapping would cover a stale/short
+        // region relative to the new file length. This is the only place
+        // an `insert` extends the file, so it is the only place a `munmap`
+        // is required (WS1: not on every insert).
+        self.disable_mmap();
         let page_id = self.disk.allocate_page()?;
         let mut page = Page::new(page_id, PageType::Data);
         let slot = page.insert(row_data).expect("row too large for empty page");
@@ -1563,6 +1581,51 @@ mod tests {
         let c = heap.scan_delete_matching(|_| true, |_rid, _| {}).unwrap();
         assert_eq!(c, 50);
         assert_eq!(heap.scan().count(), 0);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_inserts_with_mmap_enabled_all_readable() {
+        // Regression test for WS1: `insert` previously called
+        // `disable_mmap()` unconditionally on every row, even on the
+        // hot-page fast path where the file never grows. The fix only
+        // tears down the mmap when a new page is actually allocated. This
+        // test guards the correctness invariant: with mmap enabled,
+        // interleaving reads and writes across page boundaries must never
+        // observe stale/short mappings.
+        let (mut heap, path) = temp_heap("mmap_inserts");
+        let schema = user_schema();
+
+        // Seed a few pages, then enable the persistent mmap so the file is
+        // mapped at a known length.
+        let mut rids = Vec::new();
+        for i in 0..200 {
+            let row = vec![Value::Str(format!("seed_{i:04}")), Value::Int(i)];
+            rids.push((i, heap.insert(&encode_row(&schema, &row)).unwrap()));
+        }
+        heap.enable_mmap();
+
+        // Now insert many more rows *with the mmap active*. These will grow
+        // the file past the mapped length, which must invalidate the mmap
+        // exactly when (and only when) a new page is allocated.
+        for i in 200..2000 {
+            let row = vec![Value::Str(format!("seed_{i:04}")), Value::Int(i)];
+            rids.push((i, heap.insert(&encode_row(&schema, &row)).unwrap()));
+        }
+
+        // Every row — both pre- and post-mmap — must be readable with the
+        // correct contents.
+        for (i, rid) in &rids {
+            let data = heap.get(*rid).unwrap_or_else(|| panic!("row {i} missing"));
+            let decoded = decode_row(&schema, &data);
+            assert_eq!(decoded[0], Value::Str(format!("seed_{i:04}")));
+            assert_eq!(decoded[1], Value::Int(*i));
+        }
+
+        // A full scan must also see exactly the rows we inserted.
+        assert_eq!(heap.scan().count(), 2000);
+
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
