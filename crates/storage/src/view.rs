@@ -226,7 +226,11 @@ fn read_view_file(path: &Path) -> io::Result<Vec<ViewDef>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad view magic"));
     }
     pos += 4;
-    let version = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+    let version = u16::from_le_bytes(
+        buf[pos..pos + 2]
+            .try_into()
+            .expect("invariant: buf.len() >= 10 checked above covers the 2-byte version field"),
+    );
     pos += 2;
     if version != VIEW_VERSION {
         return Err(io::Error::new(
@@ -234,7 +238,11 @@ fn read_view_file(path: &Path) -> io::Result<Vec<ViewDef>> {
             format!("unsupported view version: {version}"),
         ));
     }
-    let n_views = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    let n_views = u32::from_le_bytes(
+        buf[pos..pos + 4]
+            .try_into()
+            .expect("invariant: buf.len() >= 10 checked above covers the 4-byte n_views field"),
+    ) as usize;
     pos += 4;
 
     let mut defs = Vec::with_capacity(n_views);
@@ -278,7 +286,11 @@ fn read_u16(buf: &[u8], pos: &mut usize) -> io::Result<u16> {
             "truncated view file",
         ));
     }
-    let v = u16::from_le_bytes(buf[*pos..*pos + 2].try_into().unwrap());
+    let v = u16::from_le_bytes(
+        buf[*pos..*pos + 2]
+            .try_into()
+            .expect("invariant: bounds checked immediately above (*pos + 2 <= buf.len())"),
+    );
     *pos += 2;
     Ok(v)
 }
@@ -290,7 +302,11 @@ fn read_str(buf: &[u8], pos: &mut usize) -> io::Result<String> {
             "truncated view file",
         ));
     }
-    let len = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(
+        buf[*pos..*pos + 4]
+            .try_into()
+            .expect("invariant: bounds checked immediately above (*pos + 4 <= buf.len())"),
+    ) as usize;
     *pos += 4;
     if *pos + len > buf.len() {
         return Err(io::Error::new(
@@ -313,6 +329,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("powdb_view_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ViewRegistry::new(&dir)
+    }
+
+    #[test]
+    fn test_read_view_file_garbage_errors_not_panic() {
+        // A truncated or corrupt on-disk view file (read during DB open) must
+        // surface an io::Error, never panic the server.
+        let dir = std::env::temp_dir().join(format!("powdb_view_garbage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],                                   // empty
+            b"BVIW".to_vec(),                         // magic only, no version/count
+            b"XXXX\x01\x00\x00\x00\x00\x00".to_vec(), // wrong magic, full header len
+            // valid header claiming 1 view but no view bytes follow
+            {
+                let mut v = b"BVIW".to_vec();
+                v.extend_from_slice(&VIEW_VERSION.to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes());
+                v
+            },
+            // valid header, view name claims a 0xFFFFFFFF-byte string
+            {
+                let mut v = b"BVIW".to_vec();
+                v.extend_from_slice(&VIEW_VERSION.to_le_bytes());
+                v.extend_from_slice(&1u32.to_le_bytes());
+                v.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                v
+            },
+        ];
+
+        for (i, bytes) in cases.iter().enumerate() {
+            let p = dir.join(format!("v{i}.bin"));
+            std::fs::write(&p, bytes).unwrap();
+            let result = read_view_file(&p);
+            assert!(
+                result.is_err(),
+                "expected Err for garbage view file case {i} ({bytes:?}), got Ok"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
