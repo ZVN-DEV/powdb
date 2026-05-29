@@ -38,16 +38,53 @@ pub const DEFAULT_QUERY_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 
 thread_local! {
     /// Bytes charged so far for the query currently executing on this thread.
-    /// Reset to zero at every top-level query entry via [`reset`].
+    /// Reset to zero at every *outermost* query entry via [`enter`].
     static USED_BYTES: Cell<usize> = const { Cell::new(0) };
+
+    /// Reentrancy depth: how many budgeted statements are active on this
+    /// thread's call stack. `create_view` / `refresh_view` recursively call
+    /// `execute_powql` mid-statement, so the inner entry runs at depth > 0.
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Reset the per-query running total for the current thread. Called at every
-/// top-level `execute_powql` / `execute_powql_readonly` entry so each query
-/// starts with the full allowance.
+/// Enter a budgeted statement frame. Returns an [`EnterGuard`] that decrements
+/// the depth on drop so the count stays correct even if execution unwinds via
+/// `?`/panic. Only the *outermost* entry (depth 0 → 1) zeroes the accumulator;
+/// nested entries (e.g. the source query of a `create_view`/`refresh_view`
+/// recursively calling `execute_powql`) leave the outer frame's charged bytes
+/// intact. This is a reentrancy guard rather than a save/restore because it is
+/// simpler — there is exactly one running total to protect and the guard makes
+/// the "outermost statement owns the reset" rule self-evident at the call site.
 #[inline]
+#[must_use = "the guard must be held for the duration of the statement"]
+pub fn enter() -> EnterGuard {
+    DEPTH.with(|d| {
+        let depth = d.get();
+        if depth == 0 {
+            USED_BYTES.with(|u| u.set(0));
+        }
+        d.set(depth + 1);
+    });
+    EnterGuard
+}
+
+/// RAII guard returned by [`enter`]; decrements the reentrancy depth on drop.
+pub struct EnterGuard;
+
+impl Drop for EnterGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Reset the per-query running total for the current thread, unconditionally.
+/// Test-only escape hatch; production code goes through [`enter`] so nested
+/// statements never clobber an outer frame's accounting.
+#[cfg(test)]
 pub fn reset() {
     USED_BYTES.with(|u| u.set(0));
+    DEPTH.with(|d| d.set(0));
 }
 
 /// Charge `bytes` against the current thread's running total, checking it
@@ -129,6 +166,34 @@ mod tests {
         }
         // The failed charge did not advance the counter.
         assert_eq!(used(), 512);
+    }
+
+    #[test]
+    fn nested_enter_preserves_outer_accounting() {
+        // Simulates an outer statement that charges bytes, then recursively
+        // enters a nested statement (as create_view/refresh_view do when their
+        // source query calls execute_powql). The nested `enter` must NOT reset
+        // the running total, so the outer frame's accounting survives.
+        reset();
+        let outer = enter();
+        assert_eq!(used(), 0, "outermost enter zeroes the accumulator");
+        charge(1000, 1_000_000).unwrap();
+        assert_eq!(used(), 1000);
+
+        {
+            // Nested statement entry (depth 1 -> 2): must not reset.
+            let _inner = enter();
+            assert_eq!(used(), 1000, "nested enter must not discard outer bytes");
+            charge(500, 1_000_000).unwrap();
+            assert_eq!(used(), 1500);
+        } // inner guard drops, depth 2 -> 1, accumulator untouched
+
+        assert_eq!(used(), 1500, "outer accounting includes nested charges");
+        drop(outer); // depth 1 -> 0
+
+        // A fresh outermost statement starts clean again.
+        let _next = enter();
+        assert_eq!(used(), 0, "next outermost statement resets");
     }
 
     #[test]

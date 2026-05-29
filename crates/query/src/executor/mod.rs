@@ -342,12 +342,16 @@ impl Engine {
         self.query_memory_limit = limit_bytes;
     }
 
-    /// Reset the per-query budget (this thread's running total) to a fresh full
-    /// allowance. Called at every top-level query entry so each statement gets
-    /// the whole limit. The accumulator is thread-local, so this never touches
-    /// another concurrent query's total.
-    pub(super) fn reset_memory_budget(&self) {
-        mem_budget::reset();
+    /// Enter a budgeted-statement frame for the current query. The returned
+    /// guard must be held for the duration of the statement; on its drop the
+    /// reentrancy depth is decremented. Only the *outermost* statement entry
+    /// zeroes this thread's running total, so a nested `execute_powql` (the
+    /// source query of a `create_view`/`refresh_view`) does NOT discard the
+    /// outer frame's accounting. The accumulator is thread-local, so this never
+    /// touches another concurrent query's total.
+    #[must_use = "the budget guard must outlive the statement body"]
+    pub(super) fn enter_memory_budget(&self) -> mem_budget::EnterGuard {
+        mem_budget::enter()
     }
 
     /// Charge the estimated footprint of a freshly materialized batch of rows
@@ -415,8 +419,11 @@ impl Engine {
     /// around 3μs per call on bench workloads. On a miss we plan as before
     /// and insert the plan under its canonical hash.
     pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
-        // WS2: each statement starts with the full memory allowance.
-        self.reset_memory_budget();
+        // WS2: each *outermost* statement starts with the full memory
+        // allowance. The guard holds the reentrancy depth so a nested
+        // `execute_powql` (e.g. a view's source query) does not reset the
+        // outer frame's accounting mid-statement.
+        let _budget = self.enter_memory_budget();
         // Hot path: tracing disabled. Zero syscalls, zero formatting.
         if !tracing::enabled!(Level::INFO) {
             // D9: try the plan cache first. Canonicalisation lexes the
@@ -547,8 +554,10 @@ impl Engine {
     /// `Arc<RwLock<Engine>>`: multiple threads can call it simultaneously
     /// under a shared `.read()` lock and each will scan independently.
     pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
-        // WS2: each statement starts with the full memory allowance.
-        self.reset_memory_budget();
+        // WS2: each *outermost* statement starts with the full memory
+        // allowance. The guard holds the reentrancy depth so a nested
+        // `execute_powql*` does not reset the outer frame's accounting.
+        let _budget = self.enter_memory_budget();
         // Parse the statement first so we can classify read vs. write
         // without touching the catalog. This is the same lex+parse cost
         // the hot path would pay anyway.
