@@ -17,23 +17,17 @@ struct Frame {
 /// an unpinned frame with a cleared ref bit to evict. Dirty pages are
 /// flushed to disk before eviction.
 ///
-/// # WS3 checksum caveat (read before wiring this into the heap)
+/// # WS3 checksum integrity
 ///
-/// `BufferPool` is **not** currently on the heap's read/write path — the
-/// heap uses its own `hot_page` + `dirty_buffer` + mmap machinery in
-/// `heap.rs`. As a result, the `write_page` calls in this file
-/// (`new_page`, eviction in `find_or_evict_frame`, `flush_page`,
-/// `flush_all`) deliberately do NOT call [`Page::stamp_checksum`] before
-/// writing, and `ensure_loaded` reads via [`Page::from_bytes`] (no CRC
-/// verification). That is safe only because nothing reads these pages back
-/// through `from_bytes_verified` today.
-///
-/// If `BufferPool` is ever wired into the heap (or any path whose pages are
-/// later read with [`Page::from_bytes_verified`] or scrubbed by
-/// `HeapFile::verify_integrity`), every `write_page` here MUST stamp the
-/// checksum first, or the verified reads will reject these pages as corrupt
-/// (stamped flag + stale CRC). Do not silently flip the heap onto this pool
-/// without fixing the write paths below.
+/// Every `write_page` call in this file (`new_page`, eviction in
+/// `find_or_evict_frame`, `flush_page`, `flush_all`) calls
+/// [`Page::stamp_checksum`] immediately before writing, and `ensure_loaded`
+/// reads back through [`Page::from_bytes_verified`]. A page that is corrupt
+/// or truncated on disk therefore surfaces a `PageCorrupt` error on read
+/// rather than returning garbage or panicking the server. Keep this
+/// stamp-on-write / verify-on-read pairing intact: dropping the stamp on any
+/// write path would make the verified read reject the page as corrupt
+/// (stamped flag + stale CRC).
 pub struct BufferPool {
     disk: DiskManager,
     frames: Vec<Option<Frame>>,
@@ -64,7 +58,12 @@ impl BufferPool {
     /// Allocate a new page on disk and load it into the buffer pool.
     pub fn new_page(&mut self, page_type: PageType) -> io::Result<u32> {
         let page_id = self.disk.allocate_page()?;
-        let page = Page::new(page_id, page_type);
+        let mut page = Page::new(page_id, page_type);
+        // Stamp the CRC32 before writing so the page can be read back through
+        // the verifying constructor (see `ensure_loaded`). Without this the
+        // checksum flag would be set with a stale (zero) CRC and the verified
+        // read would reject the page as corrupt.
+        page.stamp_checksum();
         let frame_idx = self.find_or_evict_frame()?;
         self.page_table.insert(page_id, frame_idx);
         self.frames[frame_idx] = Some(Frame {
@@ -76,7 +75,11 @@ impl BufferPool {
         // Write to disk immediately so it exists for read-back
         self.disk.write_page(
             page_id,
-            self.frames[frame_idx].as_ref().unwrap().page.as_bytes(),
+            self.frames[frame_idx]
+                .as_ref()
+                .expect("invariant: frame just assigned Some on the line above")
+                .page
+                .as_bytes(),
         )?;
         Ok(page_id)
     }
@@ -85,7 +88,9 @@ impl BufferPool {
     pub fn get_page(&mut self, page_id: u32) -> io::Result<&Page> {
         self.ensure_loaded(page_id)?;
         let frame_idx = self.page_table[&page_id];
-        let frame = self.frames[frame_idx].as_mut().unwrap();
+        let frame = self.frames[frame_idx]
+            .as_mut()
+            .expect("invariant: ensure_loaded guarantees this frame slot is Some");
         frame.ref_bit = true;
         Ok(&frame.page)
     }
@@ -94,7 +99,9 @@ impl BufferPool {
     pub fn get_page_mut(&mut self, page_id: u32) -> io::Result<&mut Page> {
         self.ensure_loaded(page_id)?;
         let frame_idx = self.page_table[&page_id];
-        let frame = self.frames[frame_idx].as_mut().unwrap();
+        let frame = self.frames[frame_idx]
+            .as_mut()
+            .expect("invariant: ensure_loaded guarantees this frame slot is Some");
         frame.ref_bit = true;
         Ok(&mut frame.page)
     }
@@ -130,9 +137,11 @@ impl BufferPool {
         if self.page_table.contains_key(&page_id) {
             return Ok(());
         }
-        // Load from disk
+        // Load from disk. Use the checksum-verifying constructor so a corrupt
+        // or truncated page surfaces as PageCorrupt (mapped to an io error)
+        // instead of panicking the server on a malformed on-disk page.
         let buf = self.disk.read_page(page_id)?;
-        let page = Page::from_bytes(&buf).unwrap();
+        let page = Page::from_bytes_verified(&buf)?;
         let frame_idx = self.find_or_evict_frame()?;
         self.page_table.insert(page_id, frame_idx);
         self.frames[frame_idx] = Some(Frame {
@@ -171,6 +180,7 @@ impl BufferPool {
                 // Evict this frame
                 if frame.dirty {
                     let page_id = frame.page.page_id();
+                    frame.page.stamp_checksum();
                     self.disk.write_page(page_id, frame.page.as_bytes())?;
                 }
                 let old_page_id = frame.page.page_id();
@@ -190,6 +200,7 @@ impl BufferPool {
         if let Some(&frame_idx) = self.page_table.get(&page_id) {
             if let Some(frame) = &mut self.frames[frame_idx] {
                 if frame.dirty {
+                    frame.page.stamp_checksum();
                     self.disk.write_page(page_id, frame.page.as_bytes())?;
                     frame.dirty = false;
                 }
@@ -204,6 +215,7 @@ impl BufferPool {
             if let Some(frame) = &mut self.frames[i] {
                 if frame.dirty {
                     let page_id = frame.page.page_id();
+                    frame.page.stamp_checksum();
                     self.disk.write_page(page_id, frame.page.as_bytes())?;
                     frame.dirty = false;
                 }
@@ -247,6 +259,48 @@ mod tests {
 
         let page = pool.get_page(page_id).unwrap();
         assert_eq!(page.get(0).unwrap(), b"buffered");
+        drop(pool);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_corrupt_page_on_read_errors_not_panic() {
+        use crate::page::Page;
+        use std::os::unix::fs::FileExt;
+
+        let (pool, path) = temp_pool("corrupt_read", 4);
+
+        // Build a CRC-stamped page, corrupt one body byte after the CRC was
+        // finalized, and write it straight to disk under a fresh page id.
+        let mut page = Page::new(0, PageType::Data);
+        page.insert(b"trust me");
+        page.stamp_checksum();
+        let mut raw = page.as_bytes().to_vec();
+        // Flip a byte well past the header so the stored CRC no longer matches.
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+
+        // Append it as a new on-disk page beyond what the pool has allocated.
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let offset = pool.disk().num_pages() as u64 * crate::page::PAGE_SIZE as u64;
+            f.write_all_at(&raw, offset).unwrap();
+        }
+        // Re-open the pool so it picks up the new page count.
+        drop(pool);
+        let mut pool = BufferPool::new(&path, 4).unwrap();
+        let corrupt_id = pool.disk().num_pages() - 1;
+
+        // Reading the corrupt page must return Err, never panic the server.
+        let result = pool.get_page(corrupt_id);
+        assert!(
+            result.is_err(),
+            "expected an error reading a CRC-corrupt page, got Ok"
+        );
         drop(pool);
         std::fs::remove_file(&path).ok();
     }
