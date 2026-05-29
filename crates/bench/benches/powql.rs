@@ -41,6 +41,7 @@
 //! a rebaseline commit will overwrite the null entries with real numbers.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use powdb_query::ast::Literal;
 use powdb_query::executor::Engine;
 use powdb_storage::types::*;
 use powdb_storage::wal::WalSyncMode;
@@ -474,21 +475,52 @@ fn bench_multi_col_and_filter(c: &mut Criterion) {
 fn bench_insert_single(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture_n(N_ROWS_WRITE);
 
-    let mut next_id: i64 = N_ROWS_WRITE as i64;
+    // WS1' (stabilize insert bench): prepare the INSERT template once and
+    // reuse it, matching SQLite's `prepare_cached` reuse on the comparator
+    // side. The previous version ran full `execute_powql` (re-lex + plan-cache
+    // mutex + plan clone) plus a `format!()` allocation *inside* the timed
+    // loop — both measurement artifacts that produced large run-to-run swings.
+    let prep = engine
+        .prepare(
+            r#"insert User { id := 0, name := "", age := 0, status := "", email := "", created_at := 0 }"#,
+        )
+        .expect("prepare insert template");
 
+    // Build one literal set up front and reuse it; the timed loop only
+    // overwrites the id slot. This keeps both `format!()` and the `String`
+    // allocations (and even the `Vec<Literal>` clone) out of the measured
+    // region, so the bench measures pure insert dispatch + write cost.
+    let mut lits = insert_literals(0, "new");
+    let mut next_id: i64 = N_ROWS_WRITE as i64;
     c.bench_function("insert_single", |b| {
         b.iter(|| {
-            let id = next_id;
+            // Bump the id slot so each insert lands on a fresh primary key (the
+            // table grows, which is the honest "insert into a populated table"
+            // measurement).
+            lits[0] = Literal::Int(next_id);
             next_id += 1;
-            let q = format!(
-                "insert User {{ id := {id}, name := \"new_{id}\", \
-                 age := 30, status := \"active\", \
-                 email := \"new_{id}@example.com\", created_at := {} }}",
-                1_700_000_000 + id
-            );
-            black_box(engine.execute_powql(&q).expect("insert failed"))
+            black_box(
+                engine
+                    .execute_prepared(&prep, &lits)
+                    .expect("insert failed"),
+            )
         });
     });
+}
+
+/// Build the six-literal parameter set for the prepared `User` INSERT in the
+/// order the prepared template expects: id, name, age, status, email,
+/// created_at. The strings are built here (outside any timed loop) so the
+/// benchmark never allocates them under measurement.
+fn insert_literals(id: i64, prefix: &str) -> Vec<Literal> {
+    vec![
+        Literal::Int(id),
+        Literal::String(format!("{prefix}_{id}")),
+        Literal::Int(30),
+        Literal::String("active".to_string()),
+        Literal::String(format!("{prefix}_{id}@example.com")),
+        Literal::Int(1_700_000_000 + id),
+    ]
 }
 
 // ───── Workload 12. insert_batch_1k ────────────────────────────────────────
@@ -503,6 +535,20 @@ fn bench_insert_single(c: &mut Criterion) {
 fn bench_insert_batch_1k(c: &mut Criterion) {
     let (mut engine, _tmp) = setup_user_fixture_n(N_ROWS_WRITE);
 
+    // WS1' (stabilize insert bench): prepare once and reuse across all 1000
+    // rows, mirroring SQLite's transaction-wrapped `prepare_cached` loop. The
+    // previous loop ran full `execute_powql` per row with an in-loop
+    // `format!()` — the source of the documented ~13x run-to-run swing.
+    let prep = engine
+        .prepare(
+            r#"insert User { id := 0, name := "", age := 0, status := "", email := "", created_at := 0 }"#,
+        )
+        .expect("prepare insert template");
+
+    // Pre-build 1000 literal sets once; the timed loop only bumps the id slot
+    // so no string allocation happens under measurement.
+    let mut batch: Vec<Vec<Literal>> = (0..1000_i64).map(|i| insert_literals(i, "b")).collect();
+
     // Anchor the counter well above the fixture so ids never collide with
     // the seeded rows even across the entire sample run.
     let mut base_id: i64 = (N_ROWS_WRITE as i64) * 10;
@@ -511,15 +557,9 @@ fn bench_insert_batch_1k(c: &mut Criterion) {
         b.iter(|| {
             let start_id = base_id;
             base_id += 1000;
-            for offset in 0..1000_i64 {
-                let id = start_id + offset;
-                let q = format!(
-                    "insert User {{ id := {id}, name := \"b_{id}\", \
-                     age := 30, status := \"active\", \
-                     email := \"b_{id}@example.com\", created_at := {} }}",
-                    1_700_000_000 + id
-                );
-                let _ = engine.execute_powql(&q).expect("insert failed");
+            for (offset, lits) in batch.iter_mut().enumerate() {
+                lits[0] = Literal::Int(start_id + offset as i64);
+                let _ = engine.execute_prepared(&prep, lits).expect("insert failed");
             }
             black_box(base_id)
         });
