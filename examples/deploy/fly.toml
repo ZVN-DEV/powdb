@@ -22,6 +22,12 @@ primary_region = "iad"
   RUST_LOG = "info"
   POWDB_DATA = "/data"
   POWDB_PORT = "5433"
+  # Phase 1 hardening: refuse to start when a password is set without TLS.
+  # Leave OFF until you've mounted certs via secrets (POWDB_TLS_CERT /
+  # POWDB_TLS_KEY) or fronted the service with a TLS-terminating proxy.
+  POWDB_REQUIRE_TLS = "0"
+  # Per-query memory budget (bytes). 256 MiB suits the default shared-cpu-1x VM.
+  POWDB_QUERY_MEMORY_LIMIT = "268435456"
 
 # Mount the persistent volume at /data so the database survives machine recycles.
 [mounts]
