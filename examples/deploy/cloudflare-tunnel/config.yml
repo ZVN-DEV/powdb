@@ -11,7 +11,7 @@ credentials-file: /etc/cloudflared/creds.json
 # tcp --hostname powdb.example.com --url localhost:5433` from their side,
 # or use a Cloudflare Access service token for programmatic clients.
 ingress:
-  - hostname: powdb.example.com
+  - hostname: powdb.example.com  # REPLACE THIS with the hostname you control or cloudflared returns 404
     service: tcp://powdb-server:5433
   # Catch-all required by cloudflared — refuses anything else.
   - service: http_status:404
