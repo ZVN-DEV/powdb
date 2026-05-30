@@ -171,6 +171,54 @@ jobs:
           fi
           echo "MSRV consistency OK."
 
+  examples-smoke:
+    name: examples smoke (terraform validate + compose config + dev.sh)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: examples-smoke-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            examples-smoke-${{ runner.os }}-
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: "1.9.5"
+          terraform_wrapper: false
+
+      - name: terraform validate (examples/deploy/aws-ecs)
+        working-directory: examples/deploy/aws-ecs
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: docker compose config (examples/deploy/cloudflare-tunnel)
+        working-directory: examples/deploy/cloudflare-tunnel
+        env:
+          POWDB_PASSWORD: ci-smoke-not-a-real-secret
+        run: docker compose -f docker-compose.yml config -q
+
+      - name: dev.sh up/down cycle
+        run: |
+          bash scripts/dev.sh up
+          sleep 1
+          bash scripts/dev.sh down
+
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-24.04
