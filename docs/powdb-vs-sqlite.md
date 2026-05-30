@@ -65,7 +65,7 @@ between the two.
 | Joins                     | Nested-loop + hash (equi-join)                       | Nested-loop + merge + hash                            |
 | Window functions          | ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/MIN/MAX OVER   | Full set                                              |
 | Server mode               | Yes (binary wire protocol, TLS, auth)                | Not in core (extensions exist)                        |
-| Fuzz testing              | 3 cargo-fuzz targets (lexer, parser, planner)        | OSS-Fuzz, decades of corpora                          |
+| Fuzz testing              | 3 cargo-fuzz targets (lexer, parser, roundtrip)      | OSS-Fuzz, decades of corpora                          |
 | Crash recovery            | WAL replay + page-zero recovery + index rebuild      | WAL/rollback journal                                  |
 | On-disk format stability  | Pre-1.0, may shift                                   | Stable for decades                                    |
 | Production deployments    | Pre-1.0                                              | Billions                                              |
