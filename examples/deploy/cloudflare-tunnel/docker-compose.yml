@@ -1,0 +1,64 @@
+# PowDB behind a Cloudflare Tunnel.
+#
+# Pattern: powdb-server listens on the internal docker network only (no
+# host port published), and cloudflared exposes it through a named tunnel
+# to a hostname you own. Zero ingress ports on the host.
+#
+# Setup (one-time):
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create powdb
+#      -> writes ~/.cloudflared/<TUNNEL_UUID>.json (the tunnel credentials)
+#   3. cp ~/.cloudflared/<TUNNEL_UUID>.json ./tunnel-creds.json
+#   4. edit config.yml: set `tunnel:` to <TUNNEL_UUID> and `hostname:` to
+#      the DNS name you want.
+#   5. cloudflared tunnel route dns powdb powdb.example.com
+#   6. set POWDB_PASSWORD in .env (see .env.example)
+#   7. docker compose up -d
+#
+# Smoke check (no auth needed, validates YAML + compose schema):
+#   docker compose -f docker-compose.yml config -q
+
+services:
+  powdb-server:
+    image: ghcr.io/zvndev/powdb:latest
+    container_name: powdb-server
+    restart: unless-stopped
+    environment:
+      POWDB_PORT: "5433"
+      POWDB_BIND: "0.0.0.0"
+      POWDB_DATA: "/data"
+      # Phase 1 hardening: refuse to start if a password is set without TLS.
+      # Cloudflare Tunnel terminates TLS at the edge, so the origin link is
+      # already private; leave this OFF unless you also enable PowDB's own
+      # TLS with mounted certs.
+      POWDB_REQUIRE_TLS: "0"
+      POWDB_QUERY_MEMORY_LIMIT: "268435456" # 256 MiB
+      POWDB_PASSWORD: ${POWDB_PASSWORD:?set POWDB_PASSWORD in .env}
+      RUST_LOG: "info"
+    volumes:
+      - powdb_data:/data
+    networks:
+      - powdb-net
+    # IMPORTANT: no `ports:` block. The TCP wire protocol is only reachable
+    # via the cloudflared sidecar, not from the host or LAN.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: powdb-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./config.yml:/etc/cloudflared/config.yml:ro
+      - ./tunnel-creds.json:/etc/cloudflared/creds.json:ro
+    networks:
+      - powdb-net
+    depends_on:
+      - powdb-server
+
+volumes:
+  powdb_data:
+    driver: local
+
+networks:
+  powdb-net:
+    driver: bridge
