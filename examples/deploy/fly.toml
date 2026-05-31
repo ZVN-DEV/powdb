@@ -26,8 +26,16 @@ primary_region = "iad"
   # Leave OFF until you've mounted certs via secrets (POWDB_TLS_CERT /
   # POWDB_TLS_KEY) or fronted the service with a TLS-terminating proxy.
   POWDB_REQUIRE_TLS = "0"
-  # Per-query memory budget (bytes). 256 MiB suits the default shared-cpu-1x VM.
-  POWDB_QUERY_MEMORY_LIMIT = "268435456"
+  # Per-query memory budget (bytes) — 64 MiB.
+  #
+  # IMPORTANT: this is the cap for a SINGLE query's sort/join/group/IN-list
+  # materialization, NOT a global process budget. With the 256 MB VM below
+  # and hard_limit = 32 connections, worst-case = 32 × 64 MiB = 2 GiB, which
+  # would OOM-kill the machine. In practice the VM survives because most
+  # queries use far less than the cap, but it MUST be sized for your real
+  # workload. Bump the VM to 512 MB / 1 GB if you raise this. See the
+  # "Production checklist" in README.md for the per-query × concurrency math.
+  POWDB_QUERY_MEMORY_LIMIT = "67108864"
 
 # Mount the persistent volume at /data so the database survives machine recycles.
 [mounts]
@@ -47,10 +55,12 @@ primary_region = "iad"
   [[services.ports]]
     port = 5433
 
+  # Concurrency cap aligned with POWDB_QUERY_MEMORY_LIMIT × VM memory:
+  # 32 conns × 64 MiB/query = 2 GiB worst case (rare). Tune for your workload.
   [services.concurrency]
     type = "connections"
-    hard_limit = 200
-    soft_limit = 100
+    hard_limit = 32
+    soft_limit = 16
 
   [[services.tcp_checks]]
     interval = "15s"
