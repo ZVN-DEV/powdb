@@ -97,7 +97,12 @@ impl HeapFile {
                 // takes `free_start = 0` as the write offset and stomps
                 // on the page header with row bytes.
                 if buf[4] == 0 {
-                    let fresh = Page::new(i, PageType::Data);
+                    let mut fresh = Page::new(i, PageType::Data);
+                    // WS3: this is a direct write that bypasses the flush
+                    // path, so stamp the CRC here — otherwise the page's
+                    // checksum flag would be set with a zero CRC and the
+                    // next verified read would (correctly) reject it.
+                    fresh.stamp_checksum();
                     let _ = disk.write_page(i, fresh.as_bytes());
                     pages_with_space.push(i);
                     in_free_list[i as usize] = true;
@@ -179,6 +184,10 @@ impl HeapFile {
     pub fn flush_all_dirty(&mut self) -> io::Result<()> {
         if let Some(hot) = self.hot_page.as_mut() {
             if hot.dirty {
+                // WS3: stamp the CRC32 on the flush path (once per dirty
+                // page), not per row, so the write-path regression stays
+                // negligible.
+                hot.page.stamp_checksum();
                 self.disk.write_page(hot.page_id, hot.page.as_bytes())?;
                 hot.dirty = false;
             }
@@ -186,7 +195,8 @@ impl HeapFile {
         if !self.dirty_buffer.is_empty() {
             // Drain via a swap to avoid borrowing `self` twice.
             let drained: Vec<(u32, Page)> = self.dirty_buffer.drain().collect();
-            for (page_id, page) in drained {
+            for (mut page, page_id) in drained.into_iter().map(|(id, p)| (p, id)) {
+                page.stamp_checksum();
                 self.disk.write_page(page_id, page.as_bytes())?;
             }
         }
@@ -248,8 +258,10 @@ impl HeapFile {
         }
 
         let buf = self.disk.read_page(page_id)?;
-        let page = Page::from_bytes(&buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt page"))?;
+        // WS3: verify the page CRC32 on read (validate-if-present). A
+        // checksum mismatch surfaces as `StorageError::PageCorrupt`, which
+        // converts to an `io::Error` for this `io::Result` boundary.
+        let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
         self.hot_page = Some(HotPage {
             page_id,
             page,
@@ -318,8 +330,11 @@ impl HeapFile {
     }
 
     /// Tear down the persistent mmap, if active. Safe to call when no
-    /// mapping exists (it's a no-op). Called automatically at the start of
-    /// `insert` so the mapping is invalidated before the file can grow.
+    /// mapping exists (it's a no-op). Called on the file-growth path of
+    /// `insert` (new-page allocation) so the mapping is invalidated before
+    /// the file grows beyond the mapped length. WS1: it is deliberately
+    /// *not* called on the hot-page insert fast path, which never grows
+    /// the file.
     pub fn disable_mmap(&mut self) {
         if let Some((ptr, len)) = self.mmap_ptr.take() {
             // SAFETY: `ptr` and `len` were returned by a successful
@@ -339,14 +354,23 @@ impl HeapFile {
     /// disk syscalls; the page stays pinned until a different page is
     /// touched or an explicit flush runs.
     pub fn insert(&mut self, row_data: &[u8]) -> io::Result<RowId> {
-        // Invalidate the persistent mmap before any mutation that may
-        // extend the file. The mapping covers a snapshot of the file at
-        // enable_mmap() time; inserts that allocate new pages would grow
-        // the file beyond that snapshot.
-        self.disable_mmap();
+        // WS1 invariant: the persistent mmap covers a snapshot of the file
+        // taken at `enable_mmap()` time (length = num_pages * PAGE_SIZE).
+        // It only becomes unsafe — covering a stale/short region relative
+        // to the live file — when the file actually *grows*, i.e. when we
+        // allocate a brand-new page below. Writes into already-mapped pages
+        // are safe to leave the mapping in place because:
+        //   1. The mapping is `MAP_PRIVATE` + `PROT_READ` (never written
+        //      through), so it cannot tear from our writes here.
+        //   2. `get()` / `scan()` consult the dirty hot page and the
+        //      dirty buffer *before* the mmap, so unflushed writes to a
+        //      mapped page are always read from memory, not the snapshot.
+        // Therefore we defer `disable_mmap()` to the new-page path only,
+        // instead of paying a `munmap` syscall on every hot-page insert.
 
         // Hot-path: the pinned page already has room. This is the bench's
-        // insert_batch_1k / insert_single loop.
+        // insert_batch_1k / insert_single loop. No file growth happens here,
+        // so the mmap stays mapped.
         if let Some(hot) = self.hot_page.as_mut() {
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
@@ -387,7 +411,13 @@ impl HeapFile {
             // Page doesn't fit this row; try the next one on the list.
         }
 
-        // Allocate a new page.
+        // Allocate a new page. This *grows the file*, so the persistent
+        // mmap snapshot must be invalidated first: after `allocate_page`,
+        // `num_pages` increases and the mapping would cover a stale/short
+        // region relative to the new file length. This is the only place
+        // an `insert` extends the file, so it is the only place a `munmap`
+        // is required (WS1: not on every insert).
+        self.disable_mmap();
         let page_id = self.disk.allocate_page()?;
         let mut page = Page::new(page_id, PageType::Data);
         let slot = page.insert(row_data).expect("row too large for empty page");
@@ -1340,6 +1370,45 @@ impl HeapFile {
         Ok(())
     }
 
+    /// Scan every page on disk and verify its CRC32 checksum, returning the
+    /// first `PageCorrupt` error encountered (or `Ok(())` if all pages are
+    /// intact / legacy-unstamped).
+    ///
+    /// # Why this exists (the honest checksum contract)
+    ///
+    /// PowDB's hot read paths — `ensure_hot`'s mmap branch and the zero-copy
+    /// `try_for_each_row*` scan path — deliberately read page bytes through
+    /// the mmap **without** per-read CRC verification. Verifying every page on
+    /// every scan would re-hash 4KB per page on the critical path and erase
+    /// the 3-10x scan/agg wins that are PowDB's headline numbers. So the
+    /// checksum guarantee is scoped, not universal:
+    ///
+    /// * The **write path** stamps a CRC on every flushed page
+    ///   ([`Page::stamp_checksum`]).
+    /// * **Cold reads** (the `disk.read_page` fallback in [`Self::ensure_hot`])
+    ///   verify via [`Page::from_bytes_verified`].
+    /// * The **hot mmap read path** trades per-read verification for speed.
+    ///   On-disk bit-rot in a page that is only ever read through the mmap
+    ///   fast path is NOT caught implicitly.
+    ///
+    /// `verify_integrity()` closes that gap explicitly: call it at startup or
+    /// on demand (e.g. a `CHECK TABLE`-style operation, or a periodic scrub)
+    /// to detect silent corruption across the entire file regardless of which
+    /// read path serves a page. It reads each page directly off disk via
+    /// [`Page::from_bytes_verified`], so it is correct whether or not an mmap
+    /// is active — it does not consult the mmap snapshot, the hot page, or the
+    /// dirty buffer (those in-memory copies are trusted; corruption we care
+    /// about here is on-disk bit-rot).
+    pub fn verify_integrity(&self) -> crate::error::Result<()> {
+        for page_id in 0..self.disk.num_pages() {
+            let buf = self.disk.read_page(page_id)?;
+            // Returns PageCorrupt on a CRC mismatch for stamped pages;
+            // legacy unstamped pages (flag clear) pass without verification.
+            Page::from_bytes_verified(&buf)?;
+        }
+        Ok(())
+    }
+
     /// Mission C Phase 1: flush the hot page (if dirty) before syncing the
     /// underlying file. A bare `disk.flush()` would otherwise miss the
     /// in-memory dirty buffer.
@@ -1397,6 +1466,33 @@ unsafe impl Send for HeapFile {}
 // the RwLock write guard excludes them. Writers still take the write
 // guard for higher-level consistency (catalog/header mutation); this
 // SAFETY note is strictly about the read path not corrupting bytes.
+//
+// WS4-mmap: the mmap/write torn-read window is closed by THREE
+// independent mechanisms working together. A torn read would require all
+// three to fail simultaneously:
+//
+//   1. RwLock exclusion (caller contract). Reads take `&self` (a read
+//      guard); writes take `&mut self` (the exclusive write guard). A
+//      reader can therefore never hold a raw mmap-derived `&[u8]` slice
+//      while a writer is mid-`insert`/`munmap`. Every reader API
+//      (`get`, `scan`, `try_for_each_row`, `for_each_row`) confines its
+//      mmap-derived borrow to the body of the call — no slice escapes the
+//      guard (`get`/`scan` copy out owned `Vec<u8>`; the `*_each_row`
+//      variants pass `&[u8]` into a closure that runs synchronously).
+//   2. Read ordering: hot page + dirty buffer BEFORE mmap. In-place
+//      mutations (`update`, `with_row_bytes_mut`, `patch_row_shrink`)
+//      land on the in-memory hot page, never through the read-only mmap.
+//      Because `get`/`scan` consult the dirty hot page and dirty buffer
+//      first, a reader observing a page under mutation reads the live
+//      in-memory bytes, not the mmap's stale snapshot — so there is no
+//      half-written page to tear on.
+//   3. Munmap only on growth (WS1). `disable_mmap` (the only `munmap`)
+//      fires solely on the new-page allocation path, which holds the
+//      write guard. It never runs concurrently with a reader.
+//
+// The `heap_mmap_race` integration test exercises (1)+(2)+(3) under
+// concurrent reader/writer threads sharing an `Arc<RwLock<HeapFile>>`,
+// asserting every scanned row decodes to its expected invariant.
 unsafe impl Sync for HeapFile {}
 
 #[cfg(test)]
@@ -1563,6 +1659,51 @@ mod tests {
         let c = heap.scan_delete_matching(|_| true, |_rid, _| {}).unwrap();
         assert_eq!(c, 50);
         assert_eq!(heap.scan().count(), 0);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_inserts_with_mmap_enabled_all_readable() {
+        // Regression test for WS1: `insert` previously called
+        // `disable_mmap()` unconditionally on every row, even on the
+        // hot-page fast path where the file never grows. The fix only
+        // tears down the mmap when a new page is actually allocated. This
+        // test guards the correctness invariant: with mmap enabled,
+        // interleaving reads and writes across page boundaries must never
+        // observe stale/short mappings.
+        let (mut heap, path) = temp_heap("mmap_inserts");
+        let schema = user_schema();
+
+        // Seed a few pages, then enable the persistent mmap so the file is
+        // mapped at a known length.
+        let mut rids = Vec::new();
+        for i in 0..200 {
+            let row = vec![Value::Str(format!("seed_{i:04}")), Value::Int(i)];
+            rids.push((i, heap.insert(&encode_row(&schema, &row)).unwrap()));
+        }
+        heap.enable_mmap();
+
+        // Now insert many more rows *with the mmap active*. These will grow
+        // the file past the mapped length, which must invalidate the mmap
+        // exactly when (and only when) a new page is allocated.
+        for i in 200..2000 {
+            let row = vec![Value::Str(format!("seed_{i:04}")), Value::Int(i)];
+            rids.push((i, heap.insert(&encode_row(&schema, &row)).unwrap()));
+        }
+
+        // Every row — both pre- and post-mmap — must be readable with the
+        // correct contents.
+        for (i, rid) in &rids {
+            let data = heap.get(*rid).unwrap_or_else(|| panic!("row {i} missing"));
+            let decoded = decode_row(&schema, &data);
+            assert_eq!(decoded[0], Value::Str(format!("seed_{i:04}")));
+            assert_eq!(decoded[1], Value::Int(*i));
+        }
+
+        // A full scan must also see exactly the rows we inserted.
+        assert_eq!(heap.scan().count(), 2000);
+
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

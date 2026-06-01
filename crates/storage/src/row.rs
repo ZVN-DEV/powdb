@@ -401,7 +401,8 @@ impl RowLayout {
         for (i, col) in schema.columns.iter().enumerate() {
             if is_fixed_size(col.type_id) {
                 fixed_offsets[i] = Some(fixed_pos);
-                fixed_pos += fixed_size(col.type_id).unwrap();
+                fixed_pos += fixed_size(col.type_id)
+                    .expect("invariant: is_fixed_size(type_id) is true in this branch");
             } else {
                 var_index[i] = Some(var_count);
                 var_count += 1;
@@ -441,14 +442,22 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
     if let Some(offset) = layout.fixed_offsets[col_idx] {
         let pos = fixed_start + offset;
         match col.type_id {
-            TypeId::Int => Value::Int(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap())),
-            TypeId::Float => {
-                Value::Float(f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
-            }
+            TypeId::Int => Value::Int(i64::from_le_bytes(
+                data[pos..pos + 8]
+                    .try_into()
+                    .expect("invariant: 8-byte slice"),
+            )),
+            TypeId::Float => Value::Float(f64::from_le_bytes(
+                data[pos..pos + 8]
+                    .try_into()
+                    .expect("invariant: 8-byte slice"),
+            )),
             TypeId::Bool => Value::Bool(data[pos] != 0),
-            TypeId::DateTime => {
-                Value::DateTime(i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
-            }
+            TypeId::DateTime => Value::DateTime(i64::from_le_bytes(
+                data[pos..pos + 8]
+                    .try_into()
+                    .expect("invariant: 8-byte slice"),
+            )),
             TypeId::Uuid => {
                 let mut v = [0u8; 16];
                 v.copy_from_slice(&data[pos..pos + 16]);
@@ -457,14 +466,21 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
             _ => unreachable!(),
         }
     } else {
-        let vi = layout.var_index[col_idx].unwrap();
+        let vi = layout.var_index[col_idx]
+            .expect("invariant: column is variable-length (not in fixed_offsets)");
         let offset_table_start = fixed_start + layout.fixed_region_size;
         let off_pos = offset_table_start + vi * 2;
         let next_off_pos = offset_table_start + (vi + 1) * 2;
-        let var_offset =
-            u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().unwrap()) as usize;
-        let var_next =
-            u16::from_le_bytes(data[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
+        let var_offset = u16::from_le_bytes(
+            data[off_pos..off_pos + 2]
+                .try_into()
+                .expect("invariant: 2-byte slice"),
+        ) as usize;
+        let var_next = u16::from_le_bytes(
+            data[next_off_pos..next_off_pos + 2]
+                .try_into()
+                .expect("invariant: 2-byte slice"),
+        ) as usize;
 
         let var_data_start = offset_table_start + (layout.n_var + 1) * 2;
         let start = var_data_start + var_offset;
@@ -525,10 +541,16 @@ pub fn patch_var_column_in_place(
     // Read old offsets for this var column from the offset table.
     let off_pos = offset_table_start + var_idx * 2;
     let next_off_pos = offset_table_start + (var_idx + 1) * 2;
-    let old_var_offset =
-        u16::from_le_bytes(bytes[off_pos..off_pos + 2].try_into().unwrap()) as usize;
-    let old_var_next =
-        u16::from_le_bytes(bytes[next_off_pos..next_off_pos + 2].try_into().unwrap()) as usize;
+    let old_var_offset = u16::from_le_bytes(
+        bytes[off_pos..off_pos + 2]
+            .try_into()
+            .expect("invariant: 2-byte slice"),
+    ) as usize;
+    let old_var_next = u16::from_le_bytes(
+        bytes[next_off_pos..next_off_pos + 2]
+            .try_into()
+            .expect("invariant: 2-byte slice"),
+    ) as usize;
     let old_var_len = old_var_next - old_var_offset;
 
     let new_var_len = new_value.map(|v| v.len()).unwrap_or(0);
@@ -559,7 +581,11 @@ pub fn patch_var_column_in_place(
         // entries var_idx+1..=n_var slide back by `delta`.
         for vi in (var_idx + 1)..=n_var {
             let pos = offset_table_start + vi * 2;
-            let old_off = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            let old_off = u16::from_le_bytes(
+                bytes[pos..pos + 2]
+                    .try_into()
+                    .expect("invariant: 2-byte slice"),
+            );
             let new_off = old_off - delta as u16;
             bytes[pos..pos + 2].copy_from_slice(&new_off.to_le_bytes());
         }
@@ -605,7 +631,8 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
             continue;
         }
         let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-        let sz = fixed_size(col.type_id).unwrap();
+        let sz = fixed_size(col.type_id)
+            .expect("invariant: is_fixed_size(type_id) is true (non-fixed columns skipped above)");
 
         if is_null {
             pos += sz; // skip placeholder
@@ -613,16 +640,28 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
         } else {
             values[i] = match col.type_id {
                 TypeId::Int => {
-                    let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let v = i64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: 8-byte slice"),
+                    );
                     Value::Int(v)
                 }
                 TypeId::Float => {
-                    let v = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let v = f64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: 8-byte slice"),
+                    );
                     Value::Float(v)
                 }
                 TypeId::Bool => Value::Bool(data[pos] != 0),
                 TypeId::DateTime => {
-                    let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                    let v = i64::from_le_bytes(
+                        data[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: 8-byte slice"),
+                    );
                     Value::DateTime(v)
                 }
                 TypeId::Uuid => {
@@ -650,7 +689,11 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
 
     let mut var_offsets = Vec::with_capacity(n_offsets);
     for _ in 0..n_offsets {
-        let off = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+        let off = u16::from_le_bytes(
+            data[pos..pos + 2]
+                .try_into()
+                .expect("invariant: 2-byte slice"),
+        );
         var_offsets.push(off as usize);
         pos += 2;
     }

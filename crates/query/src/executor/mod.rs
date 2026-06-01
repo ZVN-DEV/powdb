@@ -3,6 +3,7 @@
 // Submodules that don't use macros defined in this file.
 mod compiled;
 mod eval;
+pub mod mem_budget;
 
 use crate::ast::*;
 use crate::canonicalize::canonicalize;
@@ -270,6 +271,14 @@ pub struct Engine {
     /// registry adds the lifecycle metadata.
     view_registry: ViewRegistry,
     in_transaction: bool,
+    /// WS2 — per-query memory budget ceiling (bytes). The running total lives
+    /// in a thread-local (see [`mem_budget`]) and is reset at every top-level
+    /// query entry, so sort/join/GROUP BY/IN-list materialization can be capped
+    /// without OOM-killing the process. This field holds only the *limit* (a
+    /// plain `usize`, so `Engine` stays `Sync` for the concurrent read path).
+    /// Default [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable
+    /// via `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
+    query_memory_limit: usize,
 }
 
 impl Engine {
@@ -310,7 +319,68 @@ impl Engine {
             insert_values_scratch: Vec::new(),
             view_registry,
             in_transaction: false,
+            query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
         })
+    }
+
+    /// Open or create an engine with an explicit per-query memory limit
+    /// (bytes). Used by the server to apply `POWDB_QUERY_MEMORY_LIMIT`, and by
+    /// tests that need a tiny limit to exercise the budget guard.
+    pub fn with_memory_limit(data_dir: &Path, limit_bytes: usize) -> io::Result<Self> {
+        let mut engine = Engine::new(data_dir)?;
+        engine.set_query_memory_limit(limit_bytes);
+        Ok(engine)
+    }
+
+    /// Current per-query memory limit in bytes.
+    pub fn query_memory_limit(&self) -> usize {
+        self.query_memory_limit
+    }
+
+    /// Override the per-query memory limit in bytes (builder-style).
+    pub fn set_query_memory_limit(&mut self, limit_bytes: usize) {
+        self.query_memory_limit = limit_bytes;
+    }
+
+    /// Enter a budgeted-statement frame for the current query. The returned
+    /// guard must be held for the duration of the statement; on its drop the
+    /// reentrancy depth is decremented. Only the *outermost* statement entry
+    /// zeroes this thread's running total, so a nested `execute_powql` (the
+    /// source query of a `create_view`/`refresh_view`) does NOT discard the
+    /// outer frame's accounting. The accumulator is thread-local, so this never
+    /// touches another concurrent query's total.
+    #[must_use = "the budget guard must outlive the statement body"]
+    pub(super) fn enter_memory_budget(&self) -> mem_budget::EnterGuard {
+        mem_budget::enter()
+    }
+
+    /// Charge the estimated footprint of a freshly materialized batch of rows
+    /// against the current per-query budget. Returns
+    /// [`QueryError::MemoryLimitExceeded`] cleanly if the batch would push the
+    /// query over its limit. Used at every full-materialization point (sort
+    /// buffer, join build side, GROUP BY hash table, IN-list).
+    pub(super) fn charge_rows(&self, rows: &[Vec<Value>]) -> Result<(), QueryError> {
+        let mut total = 0usize;
+        for row in rows {
+            total = total.saturating_add(mem_budget::estimate_row_size(row));
+        }
+        mem_budget::charge(total, self.query_memory_limit)
+    }
+
+    /// Charge a materialized IN-list (the literal expressions pulled out of an
+    /// uncorrelated `IN (subquery)`) against the current per-query budget.
+    /// Each item is conservatively sized at the `Expr` slot plus, for string
+    /// literals, the owned heap bytes.
+    pub(super) fn charge_in_list(&self, list: &[crate::ast::Expr]) -> Result<(), QueryError> {
+        let base = std::mem::size_of::<crate::ast::Expr>();
+        let mut total = std::mem::size_of::<Vec<crate::ast::Expr>>();
+        for item in list {
+            total = total.saturating_add(base);
+            if let crate::ast::Expr::Literal(crate::ast::Literal::String(s)) = item {
+                total = total.saturating_add(s.capacity());
+            }
+        }
+        mem_budget::charge(total, self.query_memory_limit)
     }
 
     /// Parse + plan + execute a PowQL query.
@@ -349,6 +419,11 @@ impl Engine {
     /// around 3μs per call on bench workloads. On a miss we plan as before
     /// and insert the plan under its canonical hash.
     pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        // WS2: each *outermost* statement starts with the full memory
+        // allowance. The guard holds the reentrancy depth so a nested
+        // `execute_powql` (e.g. a view's source query) does not reset the
+        // outer frame's accounting mid-statement.
+        let _budget = self.enter_memory_budget();
         // Hot path: tracing disabled. Zero syscalls, zero formatting.
         if !tracing::enabled!(Level::INFO) {
             // D9: try the plan cache first. Canonicalisation lexes the
@@ -479,6 +554,10 @@ impl Engine {
     /// `Arc<RwLock<Engine>>`: multiple threads can call it simultaneously
     /// under a shared `.read()` lock and each will scan independently.
     pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
+        // WS2: each *outermost* statement starts with the full memory
+        // allowance. The guard holds the reentrancy depth so a nested
+        // `execute_powql*` does not reset the outer frame's accounting.
+        let _budget = self.enter_memory_budget();
         // Parse the statement first so we can classify read vs. write
         // without touching the catalog. This is the same lex+parse cost
         // the hot path would pay anyway.
@@ -1031,6 +1110,8 @@ impl Engine {
                         if rows.len() > MAX_SORT_ROWS {
                             return Err(QueryError::SortLimitExceeded);
                         }
+                        // WS2: byte-budget guard on the sort buffer.
+                        self.charge_rows(&rows)?;
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
@@ -1298,6 +1379,9 @@ impl Engine {
                 let result = self.execute_plan_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
+                        // WS2: byte-budget guard on the GROUP BY input buffer
+                        // (the hash table is bounded by the input it groups).
+                        self.charge_rows(&rows)?;
                         let key_indices: Vec<usize> = keys
                             .iter()
                             .map(|k| {
@@ -1392,6 +1476,10 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("join right side must produce rows".into()),
                 };
+
+                // WS2: byte-budget guard on the join build side.
+                self.charge_rows(&left_rows)?;
+                self.charge_rows(&right_rows)?;
 
                 if !matches!(kind, JoinKind::Cross) {
                     if let Some(pred) = on {
@@ -1562,6 +1650,8 @@ impl Engine {
                         .collect(),
                     _ => Vec::new(),
                 };
+                // WS2: byte-budget guard on the materialized IN-list.
+                self.charge_in_list(&values)?;
                 Ok(Expr::InList {
                     expr: Box::new(inner),
                     list: values,
@@ -1654,6 +1744,8 @@ impl Engine {
                         .collect(),
                     _ => Vec::new(),
                 };
+                // WS2: byte-budget guard on the per-row materialized IN-list.
+                self.charge_in_list(&values)?;
                 Ok(Expr::InList {
                     expr: Box::new(inner),
                     list: values,

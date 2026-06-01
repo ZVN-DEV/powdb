@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 /// Maximum number of concurrent connections.
 const MAX_CONNECTIONS: usize = 1024;
@@ -13,11 +14,56 @@ struct Args {
     port: u16,
     bind: String,
     data_dir: String,
-    password: Option<String>,
+    /// Client password, wrapped so it is zeroized from memory on drop.
+    password: Option<Zeroizing<String>>,
     idle_timeout_secs: u64,
     query_timeout_secs: u64,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    query_memory_limit: usize,
+    require_tls: bool,
+}
+
+/// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
+/// unset or unparseable. Mirrors the query crate's default (256 MB).
+const DEFAULT_QUERY_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
+/// Parse the per-query memory limit from the `POWDB_QUERY_MEMORY_LIMIT`
+/// environment value. Accepts a plain byte count; falls back to the default
+/// when unset, empty, or unparseable. Pulled out as a free function so it can
+/// be unit-tested without spawning the server.
+fn parse_query_memory_limit(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
+/// Parse the `POWDB_REQUIRE_TLS` env value. Truthy on `1`/`true` (any case);
+/// default off (false) for backward compatibility.
+fn parse_require_tls(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+/// Enforce the TLS requirement at startup. When `require_tls` is set, a server
+/// configured with a password but no TLS cert/key would transmit credentials
+/// in cleartext — refuse to start. Returns `Err` with a message describing the
+/// misconfiguration; `Ok(())` otherwise.
+fn check_tls_requirement(
+    require_tls: bool,
+    password_set: bool,
+    tls_configured: bool,
+) -> Result<(), String> {
+    if require_tls && password_set && !tls_configured {
+        return Err(
+            "POWDB_REQUIRE_TLS is set but a password is configured without TLS \
+             (provide --tls-cert and --tls-key, or unset POWDB_REQUIRE_TLS)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_args() -> Args {
@@ -29,10 +75,12 @@ fn parse_args() -> Args {
     let mut bind: String = std::env::var("POWDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let mut data_dir: String =
         std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
-    // Password is set exclusively via environment variable.
-    let password: Option<String> = std::env::var("POWDB_PASSWORD")
+    // Password is set exclusively via environment variable. Wrapped in
+    // Zeroizing so the secret is wiped from memory on drop.
+    let password: Option<Zeroizing<String>> = std::env::var("POWDB_PASSWORD")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(Zeroizing::new);
     let mut idle_timeout_secs: u64 = std::env::var("POWDB_IDLE_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -47,6 +95,11 @@ fn parse_args() -> Args {
     let mut tls_key: Option<String> = std::env::var("POWDB_TLS_KEY")
         .ok()
         .filter(|s| !s.is_empty());
+    // WS2: per-query memory budget. Env-only (no CLI flag) for now.
+    let query_memory_limit =
+        parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
+    // WS4: when set, refuse to start with a password but no TLS. Default off.
+    let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -144,7 +197,9 @@ fn parse_args() -> Args {
                 println!("    POWDB_PORT, POWDB_BIND, POWDB_DATA");
                 println!("    POWDB_PASSWORD             Set password for client authentication");
                 println!("    POWDB_TLS_CERT, POWDB_TLS_KEY");
+                println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
+                println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
             }
@@ -166,6 +221,8 @@ fn parse_args() -> Args {
         query_timeout_secs,
         tls_cert,
         tls_key,
+        query_memory_limit,
+        require_tls,
     }
 }
 
@@ -215,13 +272,20 @@ async fn main() {
         warn!("no password configured — all connections will be accepted without authentication");
     }
 
-    let engine = match Engine::new(std::path::Path::new(&args.data_dir)) {
+    let engine = match Engine::with_memory_limit(
+        std::path::Path::new(&args.data_dir),
+        args.query_memory_limit,
+    ) {
         Ok(e) => e,
         Err(e) => {
             error!(data_dir = %args.data_dir, error = %e, "failed to initialize storage engine");
             std::process::exit(1);
         }
     };
+    info!(
+        query_memory_limit = args.query_memory_limit,
+        "per-query memory budget"
+    );
     let engine = Arc::new(RwLock::new(engine));
 
     // Build TLS acceptor if both cert and key are provided.
@@ -245,6 +309,14 @@ async fn main() {
     };
 
     let tls_enabled = tls_acceptor.is_some();
+
+    // WS4: enforce TLS when required. Refuse to start (rather than silently
+    // transmitting credentials in cleartext) if a password is set without TLS.
+    if let Err(msg) = check_tls_requirement(args.require_tls, args.password.is_some(), tls_enabled)
+    {
+        error!("{msg}");
+        std::process::exit(2);
+    }
 
     // CRITICAL: warn when password auth is enabled without TLS encryption.
     if args.password.is_some() && tls_acceptor.is_none() {
@@ -359,4 +431,80 @@ async fn main() {
     // and truncates the WAL.
     drop(engine);
     info!("clean shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use powdb_query::executor::Engine;
+
+    #[test]
+    fn require_tls_rejects_password_without_tls() {
+        // POWDB_REQUIRE_TLS=1 + password set + no TLS cert/key → hard error.
+        let err = check_tls_requirement(true, true, false);
+        assert!(err.is_err(), "expected startup refusal");
+    }
+
+    #[test]
+    fn require_tls_allows_password_with_tls() {
+        assert!(check_tls_requirement(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn require_tls_allows_no_password() {
+        // No password means nothing to leak; TLS not required.
+        assert!(check_tls_requirement(true, false, false).is_ok());
+    }
+
+    #[test]
+    fn require_tls_off_is_backward_compatible() {
+        // Default off: password without TLS is allowed (just warned).
+        assert!(check_tls_requirement(false, true, false).is_ok());
+    }
+
+    #[test]
+    fn parse_require_tls_env() {
+        assert!(parse_require_tls(Some("1")));
+        assert!(parse_require_tls(Some("true")));
+        assert!(parse_require_tls(Some("TRUE")));
+        assert!(!parse_require_tls(Some("0")));
+        assert!(!parse_require_tls(Some("")));
+        assert!(!parse_require_tls(None));
+    }
+
+    #[test]
+    fn memory_limit_defaults_when_unset() {
+        assert_eq!(parse_query_memory_limit(None), DEFAULT_QUERY_MEMORY_LIMIT);
+    }
+
+    #[test]
+    fn memory_limit_defaults_on_garbage() {
+        assert_eq!(
+            parse_query_memory_limit(Some("not-a-number")),
+            DEFAULT_QUERY_MEMORY_LIMIT
+        );
+        assert_eq!(
+            parse_query_memory_limit(Some("")),
+            DEFAULT_QUERY_MEMORY_LIMIT
+        );
+        assert_eq!(
+            parse_query_memory_limit(Some("0")),
+            DEFAULT_QUERY_MEMORY_LIMIT
+        );
+    }
+
+    #[test]
+    fn memory_limit_parses_explicit_value() {
+        assert_eq!(parse_query_memory_limit(Some("1048576")), 1_048_576);
+        assert_eq!(parse_query_memory_limit(Some("  4096  ")), 4096);
+    }
+
+    /// The parsed env limit is actually applied to the constructed Engine.
+    #[test]
+    fn env_limit_is_applied_to_engine() {
+        let limit = parse_query_memory_limit(Some("2048"));
+        let dir = std::env::temp_dir().join(format!("powdb_srv_memlimit_{}", std::process::id()));
+        let engine = Engine::with_memory_limit(&dir, limit).unwrap();
+        assert_eq!(engine.query_memory_limit(), 2048);
+    }
 }

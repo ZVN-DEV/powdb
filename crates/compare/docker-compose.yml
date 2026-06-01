@@ -1,0 +1,35 @@
+# Local Postgres for the PowDB comparison benchmark (WS6).
+#
+# Credentials and database name match the default URL the comparison harness
+# tries when POWDB_BENCH_PG_URL is unset:
+#
+#     postgresql://postgres:powdb@localhost:5432/powdb_bench
+#
+# One-command flow:
+#
+#     docker compose -f crates/compare/docker-compose.yml up -d
+#     cargo run --release -p powdb-compare
+#     docker compose -f crates/compare/docker-compose.yml down
+#
+# The image tag is pinned so benchmark numbers are reproducible across runs.
+
+services:
+  postgres:
+    image: postgres:16.4-bookworm
+    container_name: powdb-bench-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: powdb
+      POSTGRES_DB: powdb_bench
+    ports:
+      - "5432:5432"
+    # tmpfs-backed data dir: the comparison reloads the fixture on every run,
+    # so durable storage is unnecessary and an in-memory volume avoids slow
+    # fsyncs skewing the write benchmarks.
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d powdb_bench"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

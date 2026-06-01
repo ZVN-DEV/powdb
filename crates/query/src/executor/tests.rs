@@ -4108,3 +4108,67 @@ fn test_non_unique_index_update_changes_correct_entry() {
         _ => panic!("expected rows"),
     }
 }
+
+// ─── WS2: per-query memory budget ─────────────────────────────────────────
+
+/// A sort over real rows with a 1 KB budget must return MemoryLimitExceeded —
+/// not OOM, not panic. The default limit is large so normal queries are
+/// unaffected; this exercises the budget at a tiny configured limit.
+#[test]
+fn test_memory_limit_sort_exceeded() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_memlimit_{}_{}", std::process::id(), id));
+    let mut engine = Engine::with_memory_limit(&dir, 1024).unwrap();
+    engine
+        .execute_powql("type Item { required name: str, n: int }")
+        .unwrap();
+    for i in 0..200 {
+        engine
+            .execute_powql(&format!(r#"insert Item {{ name := "row-{i}", n := {i} }}"#))
+            .unwrap();
+    }
+    // Sorting 200 rows materializes well over 1 KB of Value buffers.
+    let err = engine
+        .execute_powql("Item order .n")
+        .expect_err("expected memory limit error");
+    match err {
+        crate::result::QueryError::MemoryLimitExceeded { limit_bytes, .. } => {
+            assert_eq!(limit_bytes, 1024);
+        }
+        other => panic!("expected MemoryLimitExceeded, got {other:?}"),
+    }
+}
+
+/// GROUP BY hash-table materialization is also capped.
+#[test]
+fn test_memory_limit_group_by_exceeded() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_memlimit_g_{}_{}", std::process::id(), id));
+    let mut engine = Engine::with_memory_limit(&dir, 1024).unwrap();
+    engine
+        .execute_powql("type Item { required cat: str, n: int }")
+        .unwrap();
+    for i in 0..200 {
+        engine
+            .execute_powql(&format!(r#"insert Item {{ cat := "cat-{i}", n := {i} }}"#))
+            .unwrap();
+    }
+    let err = engine
+        .execute_powql("Item group .cat { .cat, n: count(.cat) }")
+        .expect_err("expected memory limit error on group by");
+    assert!(matches!(
+        err,
+        crate::result::QueryError::MemoryLimitExceeded { .. }
+    ));
+}
+
+/// Normal queries under the (default) budget are unaffected.
+#[test]
+fn test_memory_limit_default_allows_normal_query() {
+    let mut engine = test_engine();
+    let result = engine.execute_powql("User order .age").unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3),
+        _ => panic!("expected rows"),
+    }
+}

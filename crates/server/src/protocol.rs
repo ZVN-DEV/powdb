@@ -1,4 +1,5 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 const MSG_CONNECT: u8 = 0x01;
 const MSG_CONNECT_OK: u8 = 0x02;
@@ -29,7 +30,11 @@ const MAX_ROWS: usize = 10_000_000;
 pub enum Message {
     Connect {
         db_name: String,
-        password: Option<String>,
+        /// Client-supplied candidate password. Wrapped in `Zeroizing` so the
+        /// raw bytes from the wire are wiped from memory once the `Message`
+        /// (and thus this field) is dropped after the constant-time compare —
+        /// the candidate never lingers in a plain `String`.
+        password: Option<Zeroizing<String>>,
     },
     ConnectOk {
         version: String,
@@ -128,7 +133,9 @@ impl Message {
                 // Password is optional. If there are no more bytes, treat as None
                 // (backwards compatible with old clients that don't send a password).
                 let password = if pos < payload.len() {
-                    let p = decode_string(payload, &mut pos)?;
+                    // Wrap the candidate immediately so the only owned copy of
+                    // the secret lives inside `Zeroizing` and is wiped on drop.
+                    let p = Zeroizing::new(decode_string(payload, &mut pos)?);
                     if p.is_empty() {
                         None
                     } else {
@@ -359,6 +366,55 @@ mod tests {
         match decoded {
             Message::Error { message } => assert_eq!(message, "table not found"),
             _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_decode_garbage_never_panics() {
+        // Feed a wide range of malformed/truncated byte sequences to the
+        // wire-protocol decode path. Every one must return Err, never panic:
+        // a malformed client message must not crash the server.
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],                                   // empty
+            vec![0x03],                               // 1 byte, shorter than header
+            vec![0x03, 0x00, 0x00, 0x00, 0x00],       // 5 bytes, header truncated by one
+            vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x00], // unknown message type
+            // QUERY with payload_len far exceeding the frame.
+            vec![0x03, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // CONNECT claiming a string len of 0xFFFFFFFF but no data.
+            vec![0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // RESULT_ROWS claiming a huge column count with no data.
+            vec![0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF],
+            // RESULT_OK with a truncated 8-byte affected field.
+            vec![0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03],
+        ];
+        for bytes in cases {
+            let result = Message::decode(&bytes);
+            assert!(
+                result.is_err(),
+                "expected Err for malformed input {bytes:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_arbitrary_prefixes_never_panic() {
+        // Exhaustively walk every truncation of a well-formed frame plus a
+        // few byte mutations. None may panic.
+        let valid = Message::ResultRows {
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec!["1".into(), "2".into()]],
+        }
+        .encode();
+        for end in 0..valid.len() {
+            // Every prefix that is not the full frame must be rejected, not panic.
+            let _ = Message::decode(&valid[..end]);
+        }
+        // Mutate each byte to a high value and confirm no panic.
+        for i in 0..valid.len() {
+            let mut m = valid.clone();
+            m[i] = 0xFF;
+            let _ = Message::decode(&m);
         }
     }
 

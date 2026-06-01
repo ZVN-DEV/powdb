@@ -217,7 +217,9 @@ impl BenchEngine for PostgresEngine {
     }
 
     fn agg_sum(&self) -> i64 {
-        let stmt = prep!(self, agg_sum, "SELECT SUM(age) FROM bench_users");
+        // Postgres SUM(BIGINT) returns NUMERIC, not BIGINT — cast back so the
+        // `i64` deserialization matches (the other engines return an integer).
+        let stmt = prep!(self, agg_sum, "SELECT SUM(age)::bigint FROM bench_users");
         let row = self
             .client
             .borrow_mut()

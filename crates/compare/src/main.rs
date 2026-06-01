@@ -466,7 +466,7 @@ fn main() {
             results.push(bench_engine(&mut engine, n_rows, &selected));
         }
         None => {
-            println!("  [postgres] skipped — no server reachable (set POWDB_BENCH_PG_URL or start docker compose up -d)");
+            println!("  [postgres] skipped — no server reachable (set POWDB_BENCH_PG_URL, or run `docker compose -f crates/compare/docker-compose.yml up -d`)");
         }
     }
 

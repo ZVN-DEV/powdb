@@ -356,9 +356,13 @@ impl Engine {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
+                        // WS2: row-count cap is a cheap secondary guard; the
+                        // byte budget is the real OOM defense for the sort
+                        // buffer (a few very large rows pass the row cap).
                         if rows.len() > MAX_SORT_ROWS {
                             return Err(QueryError::SortLimitExceeded);
                         }
+                        self.charge_rows(&rows)?;
                         let key_indices: Vec<(usize, bool)> = keys
                             .iter()
                             .map(|k| {
@@ -1159,6 +1163,12 @@ impl Engine {
                     _ => return Err("join right side must produce rows".into()),
                 };
 
+                // WS2: byte-budget guard on the join build side. Charge both
+                // materialized inputs before we build the hash table / probe;
+                // the output is row-capped by check_join_limit below.
+                self.charge_rows(&left_rows)?;
+                self.charge_rows(&right_rows)?;
+
                 // Hash-join fast path.
                 if !matches!(kind, JoinKind::Cross) {
                     if let Some(pred) = on {
@@ -1260,6 +1270,9 @@ impl Engine {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
+                        // WS2: byte-budget guard on the GROUP BY input buffer
+                        // (the hash table is bounded by the input it groups).
+                        self.charge_rows(&rows)?;
                         // Resolve key column indices.
                         let key_indices: Vec<usize> = keys
                             .iter()

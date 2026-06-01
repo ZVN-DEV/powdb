@@ -47,6 +47,13 @@ pub enum QueryError {
     JoinLimitExceeded,
     /// Sort exceeded MAX_SORT_ROWS.
     SortLimitExceeded,
+    /// Per-query memory budget exceeded during materialization (sort buffer,
+    /// join build side, GROUP BY hash table, or IN-list). Returned cleanly so
+    /// the server process is never OOM-killed by a crafted query.
+    MemoryLimitExceeded {
+        limit_bytes: usize,
+        requested_bytes: usize,
+    },
     /// Parse error (wraps parser error).
     Parse(String),
     /// Index-related error.
@@ -77,6 +84,13 @@ impl fmt::Display for QueryError {
             QueryError::SortLimitExceeded => {
                 write!(f, "sort input exceeds row limit — add a LIMIT clause")
             }
+            QueryError::MemoryLimitExceeded {
+                limit_bytes,
+                requested_bytes,
+            } => write!(
+                f,
+                "query exceeded memory budget: requested {requested_bytes} bytes, limit {limit_bytes} bytes"
+            ),
             QueryError::Parse(msg) => write!(f, "{msg}"),
             QueryError::IndexError(msg) => write!(f, "{msg}"),
             QueryError::ViewError(msg) => write!(f, "{msg}"),

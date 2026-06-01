@@ -37,7 +37,7 @@ fn encode_connect(db: &str) -> Vec<u8> {
 fn encode_connect_with_password(db: &str, password: &str) -> Vec<u8> {
     Message::Connect {
         db_name: db.to_string(),
-        password: Some(password.to_string()),
+        password: Some(zeroize::Zeroizing::new(password.to_string())),
     }
     .encode()
 }
@@ -88,7 +88,7 @@ async fn start_single_conn_server(
             stream,
             ConnOpts {
                 engine,
-                expected_password,
+                expected_password: expected_password.map(zeroize::Zeroizing::new),
                 shutdown_rx: &mut rx,
                 idle_timeout,
                 query_timeout,
@@ -129,7 +129,7 @@ async fn start_multi_conn_server(
                     stream,
                     ConnOpts {
                         engine: eng,
-                        expected_password: pw,
+                        expected_password: pw.map(zeroize::Zeroizing::new),
                         shutdown_rx: &mut rx,
                         idle_timeout,
                         query_timeout,

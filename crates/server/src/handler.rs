@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 /// Tracks per-IP authentication failure counts for rate limiting.
 pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
@@ -130,7 +131,9 @@ async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Messa
 /// argument list short.
 pub struct ConnOpts<'a> {
     pub engine: Arc<RwLock<Engine>>,
-    pub expected_password: Option<String>,
+    /// Expected client password. Wrapped in `Zeroizing` so the secret is wiped
+    /// from memory on drop (defends against leaking via a core dump).
+    pub expected_password: Option<Zeroizing<String>>,
     pub shutdown_rx: &'a mut watch::Receiver<bool>,
     pub idle_timeout: Duration,
     pub query_timeout: Duration,
