@@ -7,13 +7,23 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)](https://github.com/zvndev/powdb/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Rust-native embedded database with compiled query execution and PowQL -- a query language designed for how developers actually think.
+**PowDB is a pure-Rust embedded database with a compiled query execution engine that delivers 3-10x SQLite on aggregate and scan workloads.**
 
-PowDB compiles filter expressions into byte-level operations that skip full row decoding, producing 3-10x speedups over SQLite on aggregate and scan workloads. Its pipeline query language (PowQL) reads left to right -- no `SELECT ... FROM ... WHERE` juggling -- and the storage and query engines are pure Rust with no SQL parsing layer.
+- **Performance** -- compiled byte-level predicates, zero-copy mmap scans, and a plan cache with literal substitution. Filter and aggregate paths skip full row decoding.
+- **Platform** -- 100% pure-Rust core, no C dependencies, embeddable and server modes, single `cargo install` on every platform Rust supports.
+- **DX** -- PowQL is the front door: a left-to-right pipeline syntax that reads like an iterator chain.
 
-## Why PowQL?
+Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to use which](docs/powdb-vs-sqlite.md).
 
-PowQL replaces SQL's inside-out clause structure with a left-to-right pipeline. You name the table, chain operations, and project fields -- all in reading order.
+## How it works
+
+**Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. On scan + filter + aggregate workloads, this is where the 3-10x SQLite wins come from.
+
+**Plan cache + tight planner-executor contract.** The planner is pure (no catalog access) and produces a canonical `PlanNode` tree; the cache hashes the canonical shape with FNV-1a and substitutes literals at lookup time, so repeat queries skip lex/parse/plan entirely. Range scans without a matching index are lowered to `Filter(SeqScan)` at execution time, keeping the planner stateless and the executor's fast paths fireable.
+
+**Zero-copy mmap scans.** Heap files are memory-mapped and scanned via `try_for_each_row_raw`, a zero-syscall, zero-allocation iterator over raw row bytes. Combined with the compiled predicates, a full scan + filter + count never copies a row.
+
+**PowQL -- the front door.** PowQL replaces SQL's inside-out clause structure with a left-to-right pipeline. You name the table, chain operations, and project fields, all in reading order.
 
 | Task | SQL | PowQL |
 |---|---|---|

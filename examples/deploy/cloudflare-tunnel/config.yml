@@ -1,0 +1,17 @@
+# cloudflared tunnel config — PowDB origin
+#
+# Fill in <TUNNEL_UUID> and the hostname you control before running.
+# The UUID matches the file you copied to ./tunnel-creds.json.
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/creds.json
+
+# Route public traffic to the PowDB origin. PowDB speaks raw TCP, so we
+# expose it as a tcp:// ingress — clients connect with `cloudflared access
+# tcp --hostname powdb.example.com --url localhost:5433` from their side,
+# or use a Cloudflare Access service token for programmatic clients.
+ingress:
+  - hostname: powdb.example.com  # REPLACE THIS with the hostname you control or cloudflared returns 404
+    service: tcp://powdb-server:5433
+  # Catch-all required by cloudflared — refuses anything else.
+  - service: http_status:404

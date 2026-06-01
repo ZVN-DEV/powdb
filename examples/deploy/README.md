@@ -33,9 +33,30 @@ Notes:
 See [`docker-compose.yml`](https://github.com/zvndev/powdb/blob/main/docker-compose.yml)
 in the repo root for a local-only quick-start.
 
+## AWS ECS Fargate + EFS
+
+[`aws-ecs/`](./aws-ecs/) is a Terraform module that provisions an ECS
+cluster, a single Fargate task running `ghcr.io/zvndev/powdb:latest`, and
+an EFS file system backing `POWDB_DATA`. Read
+[`aws-ecs/README.md`](./aws-ecs/README.md) for trade-offs (single-writer,
+EFS fsync latency) before applying.
+
+## Cloudflare Tunnel
+
+[`cloudflare-tunnel/`](./cloudflare-tunnel/) runs `powdb-server` +
+`cloudflared` together. Zero host ingress ports — the wire protocol is
+only reachable through the tunnel. Good fit for laptop / homelab /
+single-VPS deploys that need a stable hostname without a public IP.
+
+## Railway
+
+[`railway/`](./railway/) wires PowDB to Railway's persistent volumes via
+the repo Dockerfile. Best for developer-friendly hosted deploys; see the
+[`railway/README.md`](./railway/README.md) for the gotchas at scale.
+
 ## Other platforms
 
 PowDB ships a multi-arch container image at `ghcr.io/zvndev/powdb`. Any
 platform that can run a long-lived TCP container with a persistent volume
-(Railway, Hetzner, EC2, k8s with a PVC) will work — the Fly config is just a
-worked example.
+(Hetzner, EC2 direct, k8s with a PVC) will work — the above are just
+worked examples.

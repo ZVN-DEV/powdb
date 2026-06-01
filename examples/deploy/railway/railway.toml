@@ -1,0 +1,29 @@
+# Railway service config for PowDB.
+#
+# Railway builds from the repo Dockerfile, attaches a named volume at the
+# mount path, and injects env vars (set via the Railway dashboard or the
+# `railway` CLI). PowDB is a stateful TCP service — see the README in
+# this directory for the per-platform gotchas before you ship this.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# PowDB is single-writer — never set numReplicas > 1.
+numReplicas = 1
+# Restart on crash but don't loop infinitely on broken config.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+# Railway's TCP healthcheck runs against the same port the app exposes;
+# PowDB accepts TCP connects long before the catalog is ready, so this is
+# a coarse liveness signal only.
+healthcheckTimeout = 10
+
+# Volume mount for POWDB_DATA. Configure the volume in the Railway dashboard
+# (or `railway volume create`) and attach it at /data on this service.
+# Railway volumes are network-attached block storage backed by the host;
+# they survive deploys but not project deletions.
+[[deploy.volumeMounts]]
+mountPath = "/data"
+name = "powdb-data"
