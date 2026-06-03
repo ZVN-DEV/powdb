@@ -144,6 +144,22 @@ impl Wal {
         matches!(self.sync_mode, WalSyncMode::Off)
     }
 
+    /// LSN of the most recently appended record, or 0 if nothing has
+    /// been appended yet (or the WAL is off).
+    ///
+    /// Used by schema-change paths to capture a "barrier LSN" that
+    /// reflects the DDL record's position in the log; the heap can then
+    /// stamp its pages with that LSN so replay skips every
+    /// Insert/Update/Delete that pre-dates the schema change (those rows
+    /// have already been migrated to the new layout in place).
+    #[inline]
+    pub fn last_appended_lsn(&self) -> u64 {
+        if matches!(self.sync_mode, WalSyncMode::Off) {
+            return 0;
+        }
+        self.next_lsn.saturating_sub(1)
+    }
+
     /// Append a record to the WAL buffer. Auto-flushes when batch is full.
     ///
     /// In [`WalSyncMode::Off`] this is a zero-work no-op — see the enum's

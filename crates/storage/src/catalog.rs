@@ -361,6 +361,18 @@ impl Catalog {
                                     );
                                 }
                             }
+                            // Stamp pages with the DDL's LSN so a
+                            // subsequent restart skips pre-DDL
+                            // Insert/Update/Delete records (they have
+                            // already been folded into the new layout).
+                            // See `stamp_all_pages_min_lsn` doc.
+                            if rec.lsn > 0 {
+                                let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                table_max_lsn
+                                    .entry(table_name)
+                                    .and_modify(|m| *m = (*m).max(rec.lsn))
+                                    .or_insert(rec.lsn);
+                            }
                         }
                     }
                 }
@@ -387,6 +399,13 @@ impl Catalog {
                                         &data_dir,
                                     );
                                 }
+                            }
+                            if rec.lsn > 0 {
+                                let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                table_max_lsn
+                                    .entry(table_name)
+                                    .and_modify(|m| *m = (*m).max(rec.lsn))
+                                    .or_insert(rec.lsn);
                             }
                         }
                     }
@@ -1189,11 +1208,14 @@ impl Catalog {
                 ));
             }
         }
-        if !self.wal.is_off() {
+        let barrier_lsn = if !self.wal.is_off() {
             let payload = encode_ddl_alter_add_column(table, &col);
             self.wal.append(0, WalRecordType::DdlAddColumn, &payload)?;
             self.wal.flush()?;
-        }
+            self.wal.last_appended_lsn()
+        } else {
+            0
+        };
         let tbl = self.by_name_mut(table)?;
 
         let old_schema = tbl.schema.clone();
@@ -1227,6 +1249,17 @@ impl Catalog {
             // the new slot as Empty.
             let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
             tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)?;
+        }
+        // P0 fix (v0.4.3): stamp every heap page with the DDL record's
+        // LSN so any pre-DDL Insert/Update/Delete WAL record gets
+        // skipped on replay. Without this barrier, a restart after
+        // `alter add column` would replay pre-alter inserts (encoded in
+        // the OLD layout) onto a heap that's already in the NEW layout,
+        // producing a mixed-version heap that panics on the next
+        // projection. Regression: see `restart_after_alter_add_column_then_index`.
+        if barrier_lsn > 0 {
+            tbl.heap.stamp_all_pages_min_lsn(barrier_lsn)?;
+            tbl.heap.flush()?;
         }
 
         self.persist()?;
@@ -1270,11 +1303,14 @@ impl Catalog {
                     )
                 })?;
         }
-        if !self.wal.is_off() {
+        let barrier_lsn = if !self.wal.is_off() {
             let payload = encode_ddl_alter_drop_column(table, col_name);
             self.wal.append(0, WalRecordType::DdlDropColumn, &payload)?;
             self.wal.flush()?;
-        }
+            self.wal.last_appended_lsn()
+        } else {
+            0
+        };
         let tbl = self.by_name_mut(table)?;
         let idx = tbl
             .schema
@@ -1307,6 +1343,11 @@ impl Catalog {
             // `Empty` is a safe placeholder that never gets read.
             let fill: Vec<Value> = vec![Value::Empty; tbl.schema.columns.len()];
             tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)?;
+        }
+        // P0 fix: see matching comment in alter_table_add_column.
+        if barrier_lsn > 0 {
+            tbl.heap.stamp_all_pages_min_lsn(barrier_lsn)?;
+            tbl.heap.flush()?;
         }
 
         self.persist()?;

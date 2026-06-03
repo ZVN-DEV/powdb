@@ -217,3 +217,79 @@ fn test_crash_recovery_delete_by_filter() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Regression for the v0.4.1 / v0.4.2 P0 (issue surfaced by the
+/// post-release smoke test): on a process crash after
+/// `alter add column` + `update` of the new column + `alter add index`,
+/// WAL replay re-applied the pre-alter Insert records to a heap whose
+/// rows had already been rewritten into the post-alter layout. The
+/// resulting mixed-layout heap panicked on the next projection with
+/// `range start index N out of range for slice of length M` in
+/// `powdb-storage/src/row.rs`.
+///
+/// Fix (v0.4.3): the alter paths now stamp every heap page with the
+/// DDL record's LSN before persist, and the WAL replay paths for
+/// `DdlAddColumn` / `DdlDropColumn` do the same. Replay's LSN-based
+/// idempotency then correctly recognises every pre-DDL row record as
+/// already-applied (folded into the rewrite) and skips it.
+///
+/// This test runs the exact sequence that the live smoke test against
+/// crates.io v0.4.2 hit, simulates a crash via `mem::forget`, reopens,
+/// and asserts that a full projection (the operation that panicked
+/// under the bug) returns the correct two rows.
+#[test]
+fn test_alter_add_column_then_index_survives_crash() {
+    let dir = temp_dir("alter_add_col_then_index");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        exec(&mut engine, "type T { required name: str, age: int }");
+        exec(&mut engine, r#"insert T { name := "A", age := 1 }"#);
+        exec(&mut engine, r#"insert T { name := "B", age := 2 }"#);
+        exec(&mut engine, "alter T add column email: str");
+        exec(
+            &mut engine,
+            r#"T filter .name = "A" update { email := "a@x" }"#,
+        );
+        exec(&mut engine, "alter T add index .email");
+        // Crash without checkpoint: forces the next open to replay the
+        // WAL, which is where the bug manifests.
+        std::mem::forget(engine);
+    }
+
+    let mut engine = Engine::new(&dir).unwrap();
+    let res = exec(&mut engine, "T { .name, .age, .email }");
+    match res {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 2, "both rows must survive replay");
+            let name_i = columns.iter().position(|c| c == "name").unwrap();
+            let age_i = columns.iter().position(|c| c == "age").unwrap();
+            let email_i = columns.iter().position(|c| c == "email").unwrap();
+            let mut by_name: Vec<&Vec<Value>> = rows.iter().collect();
+            by_name.sort_by_key(|r| match &r[name_i] {
+                Value::Str(s) => s.clone(),
+                _ => String::new(),
+            });
+            assert_eq!(by_name[0][name_i], Value::Str("A".into()));
+            assert_eq!(by_name[0][age_i], Value::Int(1));
+            assert_eq!(by_name[0][email_i], Value::Str("a@x".into()));
+            assert_eq!(by_name[1][name_i], Value::Str("B".into()));
+            assert_eq!(by_name[1][age_i], Value::Int(2));
+            assert_eq!(by_name[1][email_i], Value::Empty);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // Indexed lookup on the just-added column must also work.
+    let res = exec(&mut engine, r#"T filter .email = "a@x" { .name }"#);
+    match res {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Str("A".into()));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

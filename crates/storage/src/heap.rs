@@ -1357,6 +1357,28 @@ impl HeapFile {
         max_lsn
     }
 
+    /// Stamp every page (hot, dirty, on-disk) with at least `barrier_lsn`.
+    /// Pages already at a higher LSN are left untouched (the inner
+    /// [`Self::set_page_lsn`] enforces monotonicity).
+    ///
+    /// Used by schema-change paths: after `rewrite_rows_for_schema_change`
+    /// converts every row to the new layout, the heap pages must
+    /// advertise an LSN >= the DDL record's LSN so WAL replay knows the
+    /// pre-DDL Insert/Update/Delete records have already been folded into
+    /// the new on-disk layout and must be skipped (otherwise replay would
+    /// re-inject rows in the OLD layout next to the rewritten rows and
+    /// corrupt the heap).
+    pub fn stamp_all_pages_min_lsn(&mut self, barrier_lsn: u64) -> io::Result<()> {
+        if barrier_lsn == 0 {
+            return Ok(());
+        }
+        let n = self.disk.num_pages();
+        for page_id in 0..n {
+            self.set_page_lsn(page_id, barrier_lsn)?;
+        }
+        Ok(())
+    }
+
     /// Set the LSN on a specific page. Loads the page into the hot
     /// slot if needed, stamps the LSN, and marks it dirty.
     pub fn set_page_lsn(&mut self, page_id: u32, lsn: u64) -> io::Result<()> {
