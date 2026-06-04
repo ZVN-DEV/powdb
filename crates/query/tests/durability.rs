@@ -339,3 +339,61 @@ fn test_prepared_insert_survives_crash() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Var-length update that grows a row enough to relocate it (the in-place
+/// patch can't fit, so the row moves to a new slot), followed by a crash.
+/// The relocated value must survive recovery, and the row count must be
+/// exact — a relocation that isn't replayed faithfully would duplicate or
+/// drop the row.
+#[test]
+fn test_var_length_update_relocation_survives_crash() {
+    let dir = temp_dir("var_relocation");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        exec(&mut engine, "type D { required id: int, blob: str }");
+        for i in 1..=120i64 {
+            exec(
+                &mut engine,
+                &format!("insert D {{ id := {i}, blob := \"x\" }}"),
+            );
+        }
+        // Grow several rows' strings far beyond their original 1 byte,
+        // forcing relocations within/across pages.
+        let big = "y".repeat(400);
+        for i in 1..=120i64 {
+            exec(
+                &mut engine,
+                &format!("D filter .id = {i} update {{ blob := \"{big}\" }}"),
+            );
+        }
+        std::mem::forget(engine); // crash
+    }
+
+    let mut engine = Engine::new(&dir).unwrap();
+    assert_eq!(
+        count(&mut engine, "count(D)"),
+        120,
+        "row count wrong after crash recovery of relocating updates"
+    );
+    // Every row must carry the grown value, exactly once.
+    let big = "y".repeat(400);
+    match exec(&mut engine, "D filter .id = 60 { .blob }") {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "id=60 must exist exactly once");
+            assert_eq!(rows[0][0], Value::Str(big.clone()), "grown value lost");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    assert_eq!(
+        count(
+            &mut engine,
+            &format!("count(D filter .blob = \"{big}\" {{ .id }})")
+        ),
+        120,
+        "every row's update must survive",
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
