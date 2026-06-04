@@ -275,6 +275,16 @@ impl Page {
         Some(slot_idx)
     }
 
+    /// True if this page's header is uninitialised — a zero page produced by
+    /// `DiskManager::allocate_page`'s file extension that was never written
+    /// with a valid layout (its `free_start` reads 0 instead of
+    /// `PAGE_HEADER_SIZE`). WAL replay uses this to detect and re-initialise
+    /// such a page before placing a row on it. A valid page — empty or with a
+    /// persisted prefix — always has `free_start >= PAGE_HEADER_SIZE`.
+    pub fn is_blank(&self) -> bool {
+        (self.free_start() as usize) < PAGE_HEADER_SIZE
+    }
+
     /// Place `row_data` so it occupies exactly slot index `slot`. Used only
     /// by WAL replay to reconstruct the original RowId layout deterministically
     /// (the normal `insert` self-assigns the next slot, which can diverge from

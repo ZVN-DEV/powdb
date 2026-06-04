@@ -419,19 +419,12 @@ impl HeapFile {
         // is required (WS1: not on every insert).
         self.disable_mmap();
         let page_id = self.disk.allocate_page()?;
-        // `allocate_page` zero-extends the file. A zero page is NOT a valid
-        // empty page — its header reads `free_start = 0` instead of
-        // `PAGE_HEADER_SIZE`. That malformed layout is invisible during
-        // normal operation (the page is immediately the dirty hot page and
-        // its real bytes overwrite the zeros on the next flush), but after a
-        // crash that never flushed it, WAL replay reads the zero page and
-        // packs re-inserted rows differently than the original run — the
-        // RowIds diverge and later Update/Delete records miss. Persist a
-        // properly-initialised empty page now so the on-disk state is always
-        // a valid page, making replay's row placement deterministic.
-        let mut empty = Page::new(page_id, PageType::Data);
-        empty.stamp_checksum();
-        self.disk.write_page(page_id, empty.as_bytes())?;
+        // `allocate_page` zero-extends the file (no synchronous page write on
+        // the insert hot path). The on-disk zeros are immediately shadowed by
+        // this dirty hot page and overwritten on the next flush. The only
+        // reader that can ever see an unflushed zero page is WAL replay after
+        // a crash, and that path (`insert_at`) re-initialises a malformed
+        // page before use — so the hot path pays nothing here.
         let mut page = Page::new(page_id, PageType::Data);
         let slot = page.insert(row_data).expect("row too large for empty page");
         if page.free_space() >= 64 {
@@ -470,6 +463,15 @@ impl HeapFile {
         }
         self.ensure_hot(rid.page_id)?;
         let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+        // A page that was allocated (file grown) but never flushed with real
+        // data before the crash reads back as a zero page — a malformed
+        // header with `free_start = 0`. Re-initialise it as a fresh empty
+        // page so the row lands in a valid layout. (Valid pages, including a
+        // persisted prefix on this page, have `free_start >= PAGE_HEADER_SIZE`
+        // and are left untouched.)
+        if hot.page.is_blank() {
+            hot.page = Page::new(rid.page_id, PageType::Data);
+        }
         if !hot.page.insert_at_slot(rid.slot_index, row_data) {
             return Err(io::Error::other(format!(
                 "replay: row does not fit at {rid:?} (page {} slot {})",
