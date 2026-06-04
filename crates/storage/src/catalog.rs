@@ -187,6 +187,22 @@ impl Catalog {
             checkpointed: false,
         };
         cat.replay_wal()?;
+        // Restore WAL LSN monotonicity across the restart. Heap pages carry
+        // LSNs stamped by replay (catalog.rs set_page_lsn) and by DDL
+        // rewrites (stamp_all_pages_min_lsn), but `Wal::open` reset the
+        // counter to 1. If the next write reused an LSN <= a stamped page
+        // LSN, the following crash's replay would skip it as already-applied
+        // — the data-loss bug behind the v0.4.x yanks. This runs on every
+        // open (including the empty-WAL clean-shutdown path, where pages may
+        // still carry LSNs from an earlier recovery). LSNs must be monotonic
+        // across restarts.
+        let max_page_lsn = cat
+            .tables
+            .iter()
+            .map(|t| t.heap.max_page_lsn())
+            .max()
+            .unwrap_or(0);
+        cat.wal.set_next_lsn_at_least(max_page_lsn + 1);
         Ok(cat)
     }
 
@@ -222,18 +238,14 @@ impl Catalog {
         }
         info!(count = records.len(), "replaying WAL records");
 
-        // Build a per-table max-LSN map by scanning every heap page's
-        // header. Records whose LSN <= the table's max page LSN have
-        // already been flushed to disk and can be skipped, making
-        // Insert replay idempotent even after partial-flush crashes.
-        let mut table_max_lsn: FxHashMap<String, u64> = FxHashMap::default();
-        for tbl in &self.tables {
-            let max = tbl.heap.max_page_lsn();
-            if max > 0 {
-                table_max_lsn.insert(tbl.schema.table_name.clone(), max);
-            }
-        }
-
+        // Per-page LSN redo (ARIES-style). A record is already durable iff
+        // its *target page* carries an LSN >= the record's LSN. The previous
+        // implementation used a single per-table max LSN, which is unsafe:
+        // a low-LSN record on an unflushed page would be wrongly skipped
+        // because some other, flushed page of the same table advertised a
+        // higher LSN — silently dropping the record (one of the v0.4.x
+        // data-loss bugs). Every record now carries its real RowId (inserts
+        // included), so the target page is always known.
         let mut replayed_inserts = 0usize;
         let mut replayed_updates = 0usize;
         let mut replayed_deletes = 0usize;
@@ -241,41 +253,36 @@ impl Catalog {
         for rec in records {
             match rec.record_type {
                 WalRecordType::Insert => {
-                    if let Some((table_name, _rid, row_bytes)) = decode_wal_payload(&rec.data) {
-                        // LSN-based idempotent replay: if this record's
-                        // LSN is <= the max LSN already persisted on any
-                        // page of the target table, the record was
-                        // already applied before the crash. Skip it to
-                        // avoid inserting a duplicate row.
-                        if rec.lsn > 0 {
-                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
-                            if rec.lsn <= max {
+                    if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            // Already persisted on its page? Skip — re-running
+                            // the insert would allocate a fresh slot and
+                            // duplicate the row.
+                            if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
                                 continue;
                             }
-                        }
-                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
-                            let tbl = &mut self.tables[slot];
-                            let new_rid = tbl.heap.insert(&row_bytes)?;
-                            // Stamp the page with this record's LSN so
-                            // subsequent replays (or the max-LSN scan on
-                            // the next open) know it's already applied.
-                            tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
+                            // Not yet durable: place the row at its exact
+                            // logged RowId so later Update/Delete records
+                            // (which carry that RowId) stay correctly
+                            // targeted. A plain re-`insert` would self-assign
+                            // a fresh slot whose position can diverge from the
+                            // original after a partial-flush crash.
+                            tbl.heap.insert_at(rid, &row_bytes)?;
+                            tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_inserts += 1;
                         }
                     }
                 }
                 WalRecordType::Update => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
-                        if rec.lsn > 0 {
-                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
-                            if rec.lsn <= max {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
                                 continue;
                             }
-                        }
-                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
-                            let tbl = &mut self.tables[slot];
                             let new_rid = tbl.heap.update(rid, &row_bytes)?;
                             tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_updates += 1;
@@ -284,15 +291,12 @@ impl Catalog {
                 }
                 WalRecordType::Delete => {
                     if let Some((table_name, rid, _)) = decode_wal_payload(&rec.data) {
-                        if rec.lsn > 0 {
-                            let max = table_max_lsn.get(&table_name).copied().unwrap_or(0);
-                            if rec.lsn <= max {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
                                 continue;
                             }
-                        }
-                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
-                            let tbl = &mut self.tables[slot];
                             let _ = tbl.heap.delete(rid);
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_deletes += 1;
@@ -361,17 +365,14 @@ impl Catalog {
                                     );
                                 }
                             }
-                            // Stamp pages with the DDL's LSN so a
-                            // subsequent restart skips pre-DDL
-                            // Insert/Update/Delete records (they have
-                            // already been folded into the new layout).
-                            // See `stamp_all_pages_min_lsn` doc.
+                            // Stamp every page with the DDL's LSN so a
+                            // subsequent restart's per-page check skips the
+                            // pre-DDL Insert/Update/Delete records — they
+                            // have already been folded into the new layout
+                            // by the rewrite above. See
+                            // `stamp_all_pages_min_lsn` doc.
                             if rec.lsn > 0 {
                                 let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
-                                table_max_lsn
-                                    .entry(table_name)
-                                    .and_modify(|m| *m = (*m).max(rec.lsn))
-                                    .or_insert(rec.lsn);
                             }
                         }
                     }
@@ -402,10 +403,6 @@ impl Catalog {
                             }
                             if rec.lsn > 0 {
                                 let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
-                                table_max_lsn
-                                    .entry(table_name)
-                                    .and_modify(|m| *m = (*m).max(rec.lsn))
-                                    .or_insert(rec.lsn);
                             }
                         }
                     }
@@ -689,20 +686,67 @@ impl Catalog {
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        // Insert into the heap FIRST so we can log the record with the real
+        // RowId. Replay needs the true (page, slot) to (a) know which page
+        // an Insert targets — for the per-page LSN durability check in
+        // `replay_wal` — and (b) reproduce the exact slot assignment, which
+        // makes Insert replay idempotent (no duplicate rows after a
+        // partial-flush crash, the v0.4.x data-loss bug).
+        //
+        // Ordering note: mutating the heap before appending+fsyncing the WAL
+        // is safe. A crash between the heap insert and the WAL append leaves
+        // the row only in an un-fsynced hot page (not durable) and the
+        // statement has not returned `Ok` (the executor's end-of-statement
+        // `sync_wal` hasn't run), so the write was never acknowledged.
+        // Durability is still gated on the WAL fsync at statement end.
+        let new_rid = tbl.insert(values)?;
         let tx_id = self.next_tx();
-        // Placeholder RowId — the real one is assigned by the heap below.
-        // Replay of an Insert record ignores the RowId field anyway.
-        self.wal_log(
-            tx_id,
-            WalRecordType::Insert,
-            table,
-            RowId {
-                page_id: 0,
-                slot_index: 0,
-            },
-            &wal_bytes,
-        )?;
-        self.by_name_mut(table)?.insert(values)
+        self.wal_log(tx_id, WalRecordType::Insert, table, new_rid, &wal_bytes)?;
+        // Stamp the landing page with this record's LSN so a future replay
+        // recognises the row as already persisted (per-page idempotency).
+        // The page is hot (just inserted into), so this is an in-memory
+        // header write — no extra I/O on the insert hot path.
+        let lsn = self.wal.last_appended_lsn();
+        if lsn > 0 {
+            self.by_name_mut(table)?
+                .heap
+                .set_page_lsn(new_rid.page_id, lsn)?;
+        }
+        Ok(new_rid)
+    }
+
+    /// WAL-logged insert addressed by table slot index instead of name.
+    /// Backs the executor's prepared-insert fast path, which resolves the
+    /// slot at prepare time to skip the name→slot hash probe. Behaves exactly
+    /// like [`Self::insert`] (logs the record with the real RowId, stamps the
+    /// landing page's LSN) — the prepared path previously called the raw
+    /// `Table::insert` and bypassed the WAL entirely, silently losing every
+    /// prepared insert on a crash.
+    pub fn insert_by_slot(&mut self, slot: usize, values: &Row) -> io::Result<RowId> {
+        if self.wal.is_off() {
+            return self.tables[slot].insert(values);
+        }
+        let Catalog {
+            tables,
+            wal,
+            next_tx_id,
+            ..
+        } = self;
+        let tbl = &mut tables[slot];
+        let mut wal_bytes: Vec<u8> = Vec::new();
+        encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        // Insert first so the WAL record carries the real RowId (see
+        // `insert` for the ordering/durability argument).
+        let new_rid = tbl.insert(values)?;
+        let tx_id = *next_tx_id;
+        *next_tx_id = next_tx_id.wrapping_add(1);
+        let payload = encode_wal_payload(&tbl.schema.table_name, new_rid, &wal_bytes);
+        wal.append(tx_id, WalRecordType::Insert, &payload)?;
+        let lsn = wal.last_appended_lsn();
+        if lsn > 0 {
+            tbl.heap.set_page_lsn(new_rid.page_id, lsn)?;
+        }
+        Ok(new_rid)
     }
 
     pub fn get(&self, table: &str, rid: RowId) -> Option<Row> {

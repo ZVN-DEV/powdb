@@ -419,6 +419,19 @@ impl HeapFile {
         // is required (WS1: not on every insert).
         self.disable_mmap();
         let page_id = self.disk.allocate_page()?;
+        // `allocate_page` zero-extends the file. A zero page is NOT a valid
+        // empty page — its header reads `free_start = 0` instead of
+        // `PAGE_HEADER_SIZE`. That malformed layout is invisible during
+        // normal operation (the page is immediately the dirty hot page and
+        // its real bytes overwrite the zeros on the next flush), but after a
+        // crash that never flushed it, WAL replay reads the zero page and
+        // packs re-inserted rows differently than the original run — the
+        // RowIds diverge and later Update/Delete records miss. Persist a
+        // properly-initialised empty page now so the on-disk state is always
+        // a valid page, making replay's row placement deterministic.
+        let mut empty = Page::new(page_id, PageType::Data);
+        empty.stamp_checksum();
+        self.disk.write_page(page_id, empty.as_bytes())?;
         let mut page = Page::new(page_id, PageType::Data);
         let slot = page.insert(row_data).expect("row too large for empty page");
         if page.free_space() >= 64 {
@@ -430,6 +443,41 @@ impl HeapFile {
             page_id,
             slot_index: slot,
         })
+    }
+
+    /// Place a row at an exact RowId. Used only by WAL replay so that a
+    /// re-applied Insert lands at the *same* (page, slot) it occupied before
+    /// the crash — keeping every later Update/Delete record (which carry that
+    /// RowId) correctly targeted. The normal `insert` self-assigns the next
+    /// free slot, which can diverge from the logged RowId after a
+    /// partial-flush crash (different page packing) and silently orphan those
+    /// later records — one of the v0.4.x data-loss bugs.
+    ///
+    /// Grows the file with valid empty pages (never zero pages) up to the
+    /// target page, then delegates to [`Page::insert_at_slot`]. Idempotent:
+    /// re-placing an already-present slot is a no-op.
+    pub fn insert_at(&mut self, rid: RowId, row_data: &[u8]) -> io::Result<()> {
+        // Grow the file so the target page exists. Initialise each new page
+        // as a proper empty page so a later read sees a valid layout.
+        if rid.page_id >= self.disk.num_pages() {
+            self.disable_mmap();
+            while self.disk.num_pages() <= rid.page_id {
+                let pid = self.disk.allocate_page()?;
+                let mut empty = Page::new(pid, PageType::Data);
+                empty.stamp_checksum();
+                self.disk.write_page(pid, empty.as_bytes())?;
+            }
+        }
+        self.ensure_hot(rid.page_id)?;
+        let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+        if !hot.page.insert_at_slot(rid.slot_index, row_data) {
+            return Err(io::Error::other(format!(
+                "replay: row does not fit at {rid:?} (page {} slot {})",
+                rid.page_id, rid.slot_index
+            )));
+        }
+        hot.dirty = true;
+        Ok(())
     }
 
     /// Read row data by RowId.
@@ -1355,6 +1403,33 @@ impl HeapFile {
         }
 
         max_lsn
+    }
+
+    /// Read the LSN currently stamped on a single page, consulting the
+    /// in-memory hot page and dirty buffer before falling back to the
+    /// on-disk copy (mirrors [`Self::max_page_lsn`]'s precedence). Returns
+    /// 0 for a page id past the end of the file or any page that has never
+    /// been stamped. This is the per-page granularity WAL replay needs:
+    /// a record is already durable iff its target page's LSN is >= the
+    /// record's LSN. The table-wide max is too coarse — a low-LSN record on
+    /// an unflushed page would be wrongly skipped because some *other*
+    /// flushed page carries a higher LSN.
+    pub fn page_lsn(&self, page_id: u32) -> u64 {
+        use crate::page::page_lsn;
+        if let Some(hot) = &self.hot_page {
+            if hot.page_id == page_id {
+                return hot.page.lsn();
+            }
+        }
+        if let Some(page) = self.dirty_buffer.get(&page_id) {
+            return page.lsn();
+        }
+        if page_id < self.disk.num_pages() {
+            if let Ok(buf) = self.disk.read_page(page_id) {
+                return page_lsn(&buf);
+            }
+        }
+        0
     }
 
     /// Stamp every page (hot, dirty, on-disk) with at least `barrier_lsn`.

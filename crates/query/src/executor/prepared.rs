@@ -315,8 +315,13 @@ impl Engine {
             }
             // Mission C Phase 18: direct O(1) slot index — no
             // catalog hash probe. Slot was resolved at prepare time.
-            let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
-            let res = tbl.insert(&values).map_err(|e| e.to_string());
+            // Durability fix: route through the WAL-logging `insert_by_slot`
+            // (was the raw `Table::insert`, which bypassed the WAL and lost
+            // every prepared insert on a crash).
+            let res = self
+                .catalog
+                .insert_by_slot(fast.table_slot, &values)
+                .map_err(|e| e.to_string());
             // Clear strings before returning the scratch — don't keep
             // dangling allocations from the previous row alive across
             // calls. `clear()` drops the Value::Str entries.
@@ -459,9 +464,12 @@ impl Engine {
             }
             // Mission C Phase 18: direct O(1) slot index — see
             // `execute_prepared` for rationale. This is the hot path
-            // for `insert_batch_1k`.
-            let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
-            let res = tbl.insert(&values).map_err(|e| e.to_string());
+            // for `insert_batch_1k`. Durability fix: WAL-logging
+            // `insert_by_slot` (was the raw `Table::insert`).
+            let res = self
+                .catalog
+                .insert_by_slot(fast.table_slot, &values)
+                .map_err(|e| e.to_string());
             values.clear();
             self.insert_values_scratch = values;
             res?;

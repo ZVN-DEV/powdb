@@ -810,14 +810,15 @@ Event { .name, age_days: date_diff(.created_at, now(), "days") }
 
 ### CAST
 
-Convert a value to a different type:
+Convert a value to a different type. The target type is given as a quoted
+string after a comma: `cast(<expr>, "<type>")`.
 
 ```
-User { .name, age_str: cast(.age as str) }
-User filter cast(.score as int) > 50
+User { .name, age_str: cast(.age, "str") }
+User filter cast(.score, "int") > 50
 ```
 
-Supported target types: `int`, `float`, `str`, `bool`.
+Supported target types: `"int"`, `"float"`, `"str"`, `"bool"`.
 
 ### CASE WHEN
 
