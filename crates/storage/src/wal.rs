@@ -160,6 +160,19 @@ impl Wal {
         self.next_lsn.saturating_sub(1)
     }
 
+    /// Ensure the next LSN this WAL hands out is at least `lsn`. Called on
+    /// open, after recovery, to restore monotonicity: heap pages carry the
+    /// LSNs stamped during replay (and by DDL rewrites), but `Wal::open`
+    /// always resets `next_lsn` to 1. Without this, writes taken after a
+    /// crash-recovery would reuse LSNs at or below those stamped page LSNs,
+    /// and the next crash's replay would skip them as already-applied —
+    /// silent data loss. Never lowers the counter.
+    pub fn set_next_lsn_at_least(&mut self, lsn: u64) {
+        if lsn > self.next_lsn {
+            self.next_lsn = lsn;
+        }
+    }
+
     /// Append a record to the WAL buffer. Auto-flushes when batch is full.
     ///
     /// In [`WalSyncMode::Off`] this is a zero-work no-op — see the enum's

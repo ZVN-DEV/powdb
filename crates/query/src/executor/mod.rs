@@ -1179,6 +1179,12 @@ impl Engine {
                 // Fast path: count() over SeqScan.
                 if *function == AggFunc::Count {
                     if let PlanNode::SeqScan { table } = input.as_ref() {
+                        // A dirty materialized view must be refreshed before
+                        // it can be counted, which needs `&mut self`. Escalate
+                        // to the write path (F3: count(View) returned stale).
+                        if self.view_registry.is_dirty(table) {
+                            return Err(QueryError::ReadonlyNeedsWrite);
+                        }
                         let mut count: i64 = 0;
                         self.catalog
                             .for_each_row_raw(table, |_rid, _data| {
@@ -1192,7 +1198,22 @@ impl Engine {
                         predicate,
                     } = input.as_ref()
                     {
+                        // Only take the fast path for a plain Filter(SeqScan)
+                        // with no subquery in the predicate. A subquery
+                        // predicate (`count(T filter .x in (...))`) must be
+                        // resolved first; the fast path evaluates the raw
+                        // predicate with no subquery materialisation, which
+                        // silently yields 0 (F1). Falling through routes it to
+                        // the generic path that runs the subquery correctly.
                         if let PlanNode::SeqScan { table } = inner.as_ref() {
+                            if self.view_registry.is_dirty(table) {
+                                // F3: count(View filter ...) over a dirty view.
+                                return Err(QueryError::ReadonlyNeedsWrite);
+                            }
+                        }
+                        if let (PlanNode::SeqScan { table }, false) =
+                            (inner.as_ref(), contains_subquery(predicate))
+                        {
                             let schema = self
                                 .catalog
                                 .schema(table)

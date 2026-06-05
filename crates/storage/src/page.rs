@@ -275,6 +275,61 @@ impl Page {
         Some(slot_idx)
     }
 
+    /// True if this page's header is uninitialised — a zero page produced by
+    /// `DiskManager::allocate_page`'s file extension that was never written
+    /// with a valid layout (its `free_start` reads 0 instead of
+    /// `PAGE_HEADER_SIZE`). WAL replay uses this to detect and re-initialise
+    /// such a page before placing a row on it. A valid page — empty or with a
+    /// persisted prefix — always has `free_start >= PAGE_HEADER_SIZE`.
+    pub fn is_blank(&self) -> bool {
+        (self.free_start() as usize) < PAGE_HEADER_SIZE
+    }
+
+    /// Place `row_data` so it occupies exactly slot index `slot`. Used only
+    /// by WAL replay to reconstruct the original RowId layout deterministically
+    /// (the normal `insert` self-assigns the next slot, which can diverge from
+    /// the logged RowId after a partial-flush crash and orphan later
+    /// Update/Delete records).
+    ///
+    /// - `slot < slot_count`: the slot already exists (it was part of a
+    ///   persisted prefix). Idempotent no-op — returns `true`.
+    /// - `slot == slot_count`: append, identical to `insert`.
+    /// - `slot > slot_count`: bridge the gap with tombstone (deleted) slot
+    ///   entries so the directory indices line up, then append the row. Gaps
+    ///   are not expected under prefix-persistence but are handled so a
+    ///   surprising log can never silently shift RowIds.
+    ///
+    /// Returns `false` if the row plus any required slot entries don't fit.
+    pub fn insert_at_slot(&mut self, slot: u16, row_data: &[u8]) -> bool {
+        let sc = self.slot_count();
+        if slot < sc {
+            return true; // already present (persisted prefix) — idempotent
+        }
+        // Slot entries needed: one tombstone per gap slot in [sc, slot), plus
+        // the row's own entry at `slot`.
+        let new_entries = (slot - sc) as usize + 1;
+        let needed = row_data.len() + SLOT_ENTRY_SIZE * new_entries;
+        if needed > self.free_space() {
+            return false;
+        }
+        // Bridge the gap with tombstones (offset 0, length = DELETED_MARKER).
+        while self.slot_count() < slot {
+            let idx = self.slot_count();
+            self.write_slot_entry(idx, 0, DELETED_MARKER);
+            self.set_slot_count(idx + 1);
+        }
+        // Append the row at `slot` (== current slot_count).
+        let idx = self.slot_count();
+        let offset = self.free_start();
+        let start = offset as usize;
+        let end = start + row_data.len();
+        self.data[start..end].copy_from_slice(row_data);
+        self.write_slot_entry(idx, offset, row_data.len() as u16);
+        self.set_free_start(end as u16);
+        self.set_slot_count(idx + 1);
+        true
+    }
+
     /// Read data at slot index. Returns None if slot is deleted or out of range.
     pub fn get(&self, slot: u16) -> Option<&[u8]> {
         if slot >= self.slot_count() {
