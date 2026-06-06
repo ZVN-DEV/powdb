@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.4.0 — embedded mode
+PowDB v0.4.4 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit.
 
@@ -118,6 +118,8 @@ Fields without `required` can be omitted -- they default to null:
 powql> insert User { name := "Grace", email := "grace@example.com" }
 1 row affected
 ```
+
+> **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- they share a single fsync at commit and run dozens of times faster, still fully durable. See [Transactions](POWQL.md#transactions).
 
 ---
 
@@ -441,9 +443,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.4.0 — remote mode
+PowDB v0.4.4 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `main` (server v0.4.0)
+Connected to db `main` (server v0.4.4)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>

@@ -36,7 +36,7 @@ in the repo root for a local-only quick-start.
 ## AWS ECS Fargate + EFS
 
 [`aws-ecs/`](./aws-ecs/) is a Terraform module that provisions an ECS
-cluster, a single Fargate task running `ghcr.io/zvndev/powdb:latest`, and
+cluster, a single Fargate task running `ghcr.io/zvndev/powdb:v0.4.4`, and
 an EFS file system backing `POWDB_DATA`. Read
 [`aws-ecs/README.md`](./aws-ecs/README.md) for trade-offs (single-writer,
 EFS fsync latency) before applying.

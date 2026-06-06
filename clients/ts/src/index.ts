@@ -27,12 +27,13 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.3.3";
+export const CLIENT_VERSION = "0.3.5";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
   | { kind: "scalar"; value: string }
-  | { kind: "ok"; affected: bigint };
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string };
 
 export interface ClientOptions {
   host: string;
@@ -96,7 +97,7 @@ export interface ClientEvents {
       query: string;
       durationMs: number;
       ok: boolean;
-      kind?: "rows" | "scalar" | "ok";
+      kind?: "rows" | "scalar" | "ok" | "message";
       error?: Error;
     },
   ];
@@ -239,6 +240,9 @@ export class Client extends EventEmitter<ClientEvents> {
           break;
         case "ResultOk":
           result = { kind: "ok", affected: reply.affected };
+          break;
+        case "ResultMessage":
+          result = { kind: "message", message: reply.message };
           break;
         case "Error":
           throw new PowDBError(`query failed: ${reply.message}`, "query_failed");

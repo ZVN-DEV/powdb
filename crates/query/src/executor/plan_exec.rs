@@ -640,38 +640,56 @@ impl Engine {
                 }
             }
 
-            PlanNode::Insert { table, assignments } => {
-                let values = {
+            PlanNode::Insert { table, rows } => {
+                // Build + validate EVERY row before inserting any, so a bad
+                // row (unknown/missing/uncoercible field) aborts the whole
+                // statement without a partial write. The WAL fsync happens
+                // once at statement end, so N rows = N appends + 1 fsync.
+                let all_values: Vec<Vec<Value>> = {
                     let schema = self
                         .catalog
                         .schema(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                    let mut values = vec![Value::Empty; schema.columns.len()];
-                    for a in assignments {
-                        let idx = schema.column_index(&a.field).ok_or_else(|| {
-                            QueryError::ColumnNotFound {
-                                table: String::new(),
-                                column: a.field.clone(),
-                            }
-                        })?;
-                        let raw = literal_to_value(&a.value)?;
-                        values[idx] = coerce_value(raw, &schema.columns[idx])?;
-                    }
-                    for col in &schema.columns {
-                        if col.required && matches!(values[col.position as usize], Value::Empty) {
-                            return Err(QueryError::Execution(format!(
-                                "column '{}' is required but no value was provided",
-                                col.name
-                            )));
+                    let mut all = Vec::with_capacity(rows.len());
+                    for assignments in rows {
+                        let mut values = vec![Value::Empty; schema.columns.len()];
+                        for a in assignments {
+                            let idx = schema.column_index(&a.field).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: a.field.clone(),
+                                }
+                            })?;
+                            let raw = literal_to_value(&a.value)?;
+                            values[idx] = coerce_value(raw, &schema.columns[idx])?;
                         }
+                        for col in &schema.columns {
+                            if col.required && matches!(values[col.position as usize], Value::Empty)
+                            {
+                                return Err(QueryError::Execution(format!(
+                                    "column '{}' is required but no value was provided",
+                                    col.name
+                                )));
+                            }
+                        }
+                        all.push(values);
                     }
-                    values
+                    all
                 };
-                self.catalog
-                    .insert(table, &values)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                // Charge the materialized batch against the per-query memory
+                // budget before inserting — keeps multi-row insert consistent
+                // with every other full-materialization point (sort/join/group)
+                // and bounds embedded callers (the server also caps the query
+                // string at 1 MB, but embedded callers have no such limit).
+                self.charge_rows(&all_values)?;
+                let n = all_values.len() as u64;
+                for values in &all_values {
+                    self.catalog
+                        .insert(table, values)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
                 self.view_registry.mark_dependents_dirty(table);
-                Ok(QueryResult::Modified(1))
+                Ok(QueryResult::Modified(n))
             }
 
             PlanNode::Upsert {
@@ -3598,9 +3616,16 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                 agg_strs.join(", "),
             )
         }
-        PlanNode::Insert { table, assignments } => {
-            let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
-            format!("{indent}Insert table={table} cols=[{}]", cols.join(", "))
+        PlanNode::Insert { table, rows } => {
+            let cols: Vec<&str> = rows
+                .first()
+                .map(|r| r.iter().map(|a| a.field.as_str()).collect())
+                .unwrap_or_default();
+            format!(
+                "{indent}Insert table={table} rows={} cols=[{}]",
+                rows.len(),
+                cols.join(", ")
+            )
         }
         PlanNode::Upsert {
             table,

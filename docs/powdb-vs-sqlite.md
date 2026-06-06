@@ -109,6 +109,20 @@ mature. On `delete_by_filter` and the smallest projection workloads the
 two are effectively tied; an honest comparison should not pretend
 otherwise.
 
+### A note on durable writes
+
+The table above runs both engines in RAM (`WalSyncMode::Off`,
+`:memory:`), which isolates query-engine cost from disk cost. In
+production, PowDB defaults to `WalSyncMode::Full`: every autocommit
+statement fsyncs the write-ahead log, so a single-row insert is
+fsync-bound -- on a real SSD that's roughly a few hundred autocommit
+inserts per second, comparable to SQLite in its default durable mode.
+The fix is the same on both engines: batch writes in a transaction.
+Wrapping inserts in `begin` / `commit` shares one fsync across the whole
+batch and runs ~50x faster on PowDB while staying fully durable. Bulk
+loads should always use a transaction -- see
+[Transactions](POWQL.md#transactions).
+
 Run it yourself:
 
 ```bash
@@ -120,7 +134,7 @@ Results land in `crates/compare/results.csv`.
 ## Caveats and roadmap
 
 - **PowDB is pre-1.0.** The on-disk format may shift across minor versions.
-  Pin a version (`cargo install powdb-cli --version 0.4.2 --locked`) and
+  Pin a version (`cargo install powdb-cli --version 0.4.4 --locked`) and
   expect to re-bench / re-import on upgrades until 1.0.
 - **SQLite is the safe default.** Decades of production exposure, an
   enormous test suite, and tools everywhere. If you're not sure, you

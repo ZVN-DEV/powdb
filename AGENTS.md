@@ -12,7 +12,7 @@ PowDB is an embeddable database engine written from scratch in Rust. It speaks i
 
 > Most of what a SQL engine does is *translate your query* into something executable. We remove that tier. PowQL is designed so the parser's AST **is already a plan tree** — no rewriting, no cost-based planning, no bytecode VM.
 
-The measurable result: 3–9× faster than SQLite on every workload we benchmark, with a 200ns parse + 100ns plan + 1200ns execute budget for a point lookup.
+The measurable result: 3–10× faster than SQLite on aggregate and scan workloads (competitive-to-modestly-faster on point writes and lookups), with a 200ns parse + 100ns plan + 1200ns execute budget for a point lookup.
 
 ### When PowDB is the right choice
 
@@ -201,9 +201,9 @@ Return shapes:
 
 ## What's shipped vs. what's planned
 
-Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE, materialized views with auto-refresh, upsert, prepared queries with literal substitution, password auth, WAL + crash recovery, persistent indexes.
+Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE, materialized views with auto-refresh, upsert, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth, TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes.
 
-Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, default operator (`??`), UDFs, TLS, per-row permissions, replication.
+Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, default operator (`??`), UDFs, per-row permissions, replication.
 
 ---
 

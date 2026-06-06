@@ -209,8 +209,10 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 substitute_expr(pred, literals, idx);
             }
         }
-        PlanNode::Insert { assignments, .. } => {
-            substitute_assignments(assignments, literals, idx);
+        PlanNode::Insert { rows, .. } => {
+            for assignments in rows {
+                substitute_assignments(assignments, literals, idx);
+            }
         }
         PlanNode::Upsert {
             assignments,
@@ -332,9 +334,11 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(pred, n);
             }
         }
-        PlanNode::Insert { assignments, .. } => {
-            for a in assignments {
-                count_expr(&a.value, n);
+        PlanNode::Insert { rows, .. } => {
+            for assignments in rows {
+                for a in assignments {
+                    count_expr(&a.value, n);
+                }
             }
         }
         PlanNode::Upsert {
@@ -669,9 +673,11 @@ mod tests {
                     collect_expr_literals(pred, out);
                 }
             }
-            PlanNode::Insert { assignments, .. } => {
-                for a in assignments {
-                    collect_expr_literals(&a.value, out);
+            PlanNode::Insert { rows, .. } => {
+                for assignments in rows {
+                    for a in assignments {
+                        collect_expr_literals(&a.value, out);
+                    }
                 }
             }
             PlanNode::Upsert {

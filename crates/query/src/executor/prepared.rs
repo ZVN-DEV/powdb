@@ -108,12 +108,15 @@ impl Engine {
         // name so execute_prepared doesn't need a second HashMap lookup
         // on `self.catalog.schema(table)` just to size the scratch Vec.
         let insert_fast = match &plan {
-            PlanNode::Insert { table, assignments }
-                if assignments
-                    .iter()
-                    .all(|a| matches!(a.value, Expr::Literal(_)))
-                    && param_count == assignments.len() =>
+            // Single-row inserts only: the byte-level fast path patches one
+            // row's worth of scratch. Multi-row `insert T {..},{..}` falls
+            // through to the generic plan path (always correct).
+            PlanNode::Insert { table, rows }
+                if rows.len() == 1
+                    && rows[0].iter().all(|a| matches!(a.value, Expr::Literal(_)))
+                    && param_count == rows[0].len() =>
             {
+                let assignments = &rows[0];
                 let table_slot = self
                     .catalog
                     .table_slot(table)

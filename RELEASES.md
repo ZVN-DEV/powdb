@@ -3,6 +3,11 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Current release: v0.4.4** (all four crates live on crates.io).
+> **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
+> 0.4.4 fixes them and adds a standing durability regression suite. See
+> `CHANGELOG.md`.
+
 ## Registries
 
 | Target | Package | Registry URL |
@@ -51,4 +56,8 @@ Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `pow
 [ ] cd clients/ts && npm publish --access public
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
 [ ] Verify GitHub Release workflow creates binaries
+[ ] Smoke-test the installed crates.io binary: run the README's documented
+    PowQL flow, then kill -9 the server and restart to confirm WAL replay
+    recovers the data (v0.4.1–v0.4.3 shipped data-loss P0s that the
+    pre-publish gates missed because none exercised a real crash + restart)
 ```

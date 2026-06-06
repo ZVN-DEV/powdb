@@ -62,7 +62,7 @@ Requires Rust 1.93+. This builds all crates: the storage engine, query engine, T
 
 ## Benchmark: PowDB vs SQLite (100K rows, M1)
 
-PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. Write performance is an active area of improvement.
+PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. For durable write throughput, batch writes in a transaction — see [Write throughput & durability](#write-throughput--durability).
 
 | Workload | PowDB | SQLite | Result |
 |---|---|---|---|
@@ -83,7 +83,31 @@ PowDB's compiled predicate engine excels at read-heavy aggregate and scan worklo
 
 PowDB is fastest where it matters most: the compiled predicate engine avoids full row decoding during scans and aggregates, delivering 3-10x gains on analytical queries. Point lookups benefit from a minimal parse-plan-execute pipeline. Write performance is competitive with SQLite across the board.
 
-Both engines use in-memory mode (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`). Full results in `crates/compare/`.
+Both engines use in-memory mode (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`). Full results in `crates/compare/`. These are *in-memory* numbers; for the durable (fsync) write story, see [Write throughput & durability](#write-throughput--durability) below.
+
+### Write throughput & durability
+
+PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: every mutating statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
+
+The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD) — not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
+
+```
+-- ~hundreds of rows/sec: one fsync per row
+insert User { id := 1, name := "a" }
+insert User { id := 2, name := "b" }
+...
+
+-- ~50x faster, still fully durable: one fsync for the whole batch
+begin
+insert User { id := 1, name := "a" }
+insert User { id := 2, name := "b" }
+... thousands of rows ...
+commit
+```
+
+On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction) — a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
+
+`WalSyncMode::Off` (used by the benchmark harness to compare against SQLite `:memory:`) disables the WAL entirely and is **not durable** — never use it in production.
 
 ## PowQL
 
@@ -97,8 +121,13 @@ type User {
   age: int
 }
 
--- Insert
+-- Insert (single row)
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
+
+-- Insert many rows in one statement (one fsync, one round trip, all-or-nothing)
+insert User
+  { name := "Bob",   email := "bob@example.com",   age := 22 },
+  { name := "Carol", email := "carol@example.com", age := 41 }
 
 -- Query pipeline: source -> filter -> order -> limit -> projection
 User filter .age > 25 order .age desc limit 10 { .name, .age }
@@ -186,7 +215,8 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.4.2 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+- [ ] Pin the version (`cargo install powdb-server --version 0.4.4 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 
 For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://github.com/zvndev/powdb/blob/main/examples/deploy/fly.toml).

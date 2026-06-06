@@ -560,11 +560,15 @@ impl Parser {
                 })
             }
         };
-        let assignments = self.parse_assignments()?;
-        Ok(Statement::Insert(InsertExpr {
-            target,
-            assignments,
-        }))
+        // One or more comma-separated assignment blocks:
+        //   insert T { a := 1 }
+        //   insert T { a := 1 }, { a := 2 }, { a := 3 }
+        let mut rows = vec![self.parse_assignments()?];
+        while *self.peek() == Token::Comma {
+            self.advance(); // consume the comma between row blocks
+            rows.push(self.parse_assignments()?);
+        }
+        Ok(Statement::Insert(InsertExpr { target, rows }))
     }
 
     /// Parse: `upsert Table on .key_col { assignments } [on conflict { update_assignments }]`
@@ -2004,9 +2008,28 @@ mod tests {
         match stmt {
             Statement::Insert(ins) => {
                 assert_eq!(ins.target, "User");
-                assert_eq!(ins.assignments.len(), 2);
-                assert_eq!(ins.assignments[0].field, "name");
-                assert_eq!(ins.assignments[1].field, "age");
+                assert_eq!(ins.rows.len(), 1);
+                assert_eq!(ins.rows[0].len(), 2);
+                assert_eq!(ins.rows[0][0].field, "name");
+                assert_eq!(ins.rows[0][1].field, "age");
+            }
+            _ => panic!("expected insert"),
+        }
+    }
+
+    #[test]
+    fn test_parse_insert_multi_row() {
+        let stmt =
+            parse(r#"insert User { name := "Alice", age := 30 }, { name := "Bob", age := 25 }, { name := "Cy" }"#)
+                .unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.target, "User");
+                assert_eq!(ins.rows.len(), 3);
+                assert_eq!(ins.rows[0].len(), 2);
+                assert_eq!(ins.rows[1][0].field, "name");
+                assert_eq!(ins.rows[2].len(), 1);
+                assert_eq!(ins.rows[2][0].field, "name");
             }
             _ => panic!("expected insert"),
         }

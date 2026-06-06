@@ -5,6 +5,24 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-06-05
+
+### Added
+- **Multi-row INSERT.** `insert T { a := 1 }, { a := 2 }, { a := 3 }` inserts
+  many rows in a single statement. This is the fastest durable way to bulk-load:
+  one statement = N WAL appends + **one fsync** (vs one fsync per single-row
+  autocommit statement), and over a network connection it's **one round trip**
+  instead of N — the right tool for remote bulk writes. Semantics:
+  - **All-or-nothing on validation** — if any row is missing a required field,
+    names an unknown column, or has an uncoercible value, the whole statement
+    fails and no rows are written (rows are validated before any insert).
+  - The whole batch is charged against `POWDB_QUERY_MEMORY_LIMIT`, so an
+    over-large batch errors cleanly instead of exhausting memory.
+  - Single-row `insert T { … }` is unchanged (still hits the prepared
+    byte-patch fast path). Covered by a new `crates/query/tests/multi_row_insert.rs`
+    suite (correctness, atomicity, transaction batching, plan-cache literal
+    substitution across rows, 1000-row batches, memory budget, crash recovery).
+
 ## [0.4.4] - 2026-06-04
 
 Critical durability release. Three distinct data-loss bugs found by a full

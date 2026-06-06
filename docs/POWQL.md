@@ -863,6 +863,29 @@ insert User { name := "Bob", email := "bob@example.com" }
 
 Omitted fields default to null. Required fields must be provided.
 
+**Multi-row insert.** Separate row blocks with commas to insert many rows in a
+single statement. Each block is independent and may set a different subset of
+columns:
+
+```
+insert User
+  { name := "Alice", email := "alice@example.com", age := 30 },
+  { name := "Bob",   email := "bob@example.com" },
+  { name := "Carol", email := "carol@example.com", age := 41 }
+```
+
+A multi-row insert is **one statement = one WAL fsync** (vs one fsync per
+single-row autocommit statement), so it's the fastest durable way to bulk-load
+— and over a network connection it's **one round trip** instead of N. It's also
+**all-or-nothing on validation**: if any row is invalid (missing a required
+field, unknown column, bad type), the whole statement fails and *no* rows are
+inserted. The result reports the number of rows inserted. (A mid-write *storage*
+failure — e.g. the disk filling between rows — is the one exception and can
+leave earlier rows written; wrap the insert in a transaction if you need a hard
+rollback boundary.) The whole batch is also charged against
+`POWDB_QUERY_MEMORY_LIMIT`, so an over-large batch errors rather than exhausting
+memory.
+
 ### UPDATE
 
 Update rows matching an optional filter. Supports both literal values and expressions:
@@ -955,6 +978,22 @@ commit
 - If a connection closes before `commit`, uncommitted changes are discarded (implicit rollback).
 - Transactions are per-connection. Other connections do not see uncommitted rows.
 - Nesting transactions is not supported -- calling `begin` inside an open transaction is an error.
+
+### Transactions and write throughput
+
+By default PowDB runs in `WalSyncMode::Full`: every autocommit statement fsyncs the write-ahead log before returning, so each write is durable on its own. That fsync is the bottleneck for single-row writes -- on real disks, autocommit inserts top out around a few hundred rows per second.
+
+Inside a transaction, the fsync is deferred to `commit`. All statements between `begin` and `commit` share one fsync, so wrapping a bulk load in a transaction is dramatically faster while staying fully durable:
+
+```
+begin
+insert User { name := "u1", email := "u1@ex.com", age := 20 }
+insert User { name := "u2", email := "u2@ex.com", age := 21 }
+-- ... thousands more ...
+commit
+```
+
+In internal benchmarks, batching inserts this way ran roughly 50x faster than the same inserts in autocommit, with identical durability guarantees. Always wrap bulk loads in a transaction.
 
 ---
 
