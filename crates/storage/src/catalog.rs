@@ -567,6 +567,18 @@ impl Catalog {
         &self.data_dir
     }
 
+    /// Highest page LSN across all tables (0 if nothing has been written).
+    /// This is the durability high-water mark — the LSN a backup taken now
+    /// corresponds to, and the value `Catalog::open` uses to restore
+    /// `next_lsn` after a reopen/restore.
+    pub fn max_lsn(&self) -> u64 {
+        self.tables
+            .iter()
+            .map(|t| t.heap.max_page_lsn())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {
@@ -1938,6 +1950,37 @@ mod tests {
     fn temp_catalog(name: &str) -> Catalog {
         let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
+    }
+
+    #[test]
+    fn data_dir_and_max_lsn_accessors() {
+        let dir = std::env::temp_dir().join(format!("powdb_cat_maxlsn_{}", std::process::id()));
+        let mut cat = Catalog::create(&dir).unwrap();
+
+        // data_dir() reflects the directory the catalog was created in.
+        assert_eq!(cat.data_dir(), dir.as_path());
+
+        // A fresh catalog has stamped no page LSNs yet.
+        assert_eq!(cat.max_lsn(), 0);
+
+        let schema = Schema {
+            table_name: "users".into(),
+            columns: vec![ColumnDef {
+                name: "name".into(),
+                type_id: TypeId::Str,
+                required: true,
+                position: 0,
+            }],
+        };
+        cat.create_table(schema).unwrap();
+
+        cat.insert("users", &vec![Value::Str("Alice".into())])
+            .unwrap();
+        cat.sync_wal().unwrap();
+
+        // An inserted (and synced) row stamps a page LSN, raising the
+        // durability high-water mark above zero.
+        assert!(cat.max_lsn() > 0);
     }
 
     #[test]
