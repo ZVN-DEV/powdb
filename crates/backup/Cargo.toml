@@ -1,0 +1,18 @@
+[package]
+name = "powdb-backup"
+description = "Backup, restore, and point-in-time recovery for PowDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["database", "powdb", "backup", "restore", "pitr"]
+categories = ["database", "database-implementations"]
+documentation = "https://docs.rs/powdb-backup"
+
+[dependencies]
+powdb-storage = { version = "0.4.5", path = "../storage" }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
