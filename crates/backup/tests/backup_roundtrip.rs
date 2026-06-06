@@ -56,3 +56,48 @@ fn full_backup_copies_files_and_records_lsn() {
         assert_eq!(blake3::hash(&bytes).to_hex().to_string(), f.blake3_hex);
     }
 }
+
+#[test]
+fn restore_rebuilds_a_usable_database() {
+    let src = tmp("rsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..50 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let backup = tmp("bkp");
+    powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+
+    let restored = tmp("restored");
+    powdb_backup::restore(&backup, &restored).unwrap();
+
+    // Reopen the restored dir and confirm every row is present.
+    let cat2 = Catalog::open(&restored).unwrap();
+    assert_eq!(cat2.scan("T").unwrap().count(), 50);
+}
+
+#[test]
+fn restore_rejects_a_tampered_backup() {
+    let src = tmp("tsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let backup = tmp("tbkp");
+    powdb_backup::full_backup(&mut cat, &backup).unwrap();
+
+    // Corrupt a backed-up data file (blake3 in the manifest will no longer match).
+    std::fs::write(backup.join("T.heap"), b"corrupted").unwrap();
+
+    let restored = tmp("trestored");
+    let err = powdb_backup::restore(&backup, &restored).unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("integrity") || msg.contains("hash") || msg.contains("corrupt"),
+        "tampered backup must be rejected with an integrity error, got: {err}"
+    );
+}
