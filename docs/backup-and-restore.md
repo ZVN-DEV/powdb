@@ -24,7 +24,7 @@ Output:
 backed up 3 files (49152 bytes) at lsn 128 -> ./backups/2026-06-06
 ```
 
-The server does not need to be stopped, but backup briefly quiesces writes for the duration of the checkpoint (see [Guarantees](#guarantees)). Point it at the same `--data-dir` your CLI or server uses.
+> **Back up offline.** `backup` opens the data directory with its own catalog handle and checkpoints it (which truncates the shared `wal.log`). It does **not** coordinate with any other process holding the same directory. Do **not** run `backup` against a `--data-dir` that a live `powdb-server` (or another CLI) currently has open — concurrent access can corrupt **both** the snapshot and the live database. Stop the server first (or snapshot a directory nothing else is using). Online, serve-while-backing-up snapshots are a planned later phase (see [Limitations](#limitations)).
 
 ### Restore
 
@@ -104,6 +104,7 @@ powdb-cli --data-dir ./powdb_data_restored
 
 This is the first phase of backup support. The following limits are real today:
 
+- **Offline / single-writer only.** Backup has no cross-process locking. The target directory must not be open in a live `powdb-server` or another CLI while you back it up. Online (serve-while-backing-up) snapshots are a future phase.
 - **Whole-database only.** Backup snapshots every table. There is no per-table backup.
 - **Restore is offline and needs a fresh destination.** Restore writes into a fresh or empty directory; it does not merge into a running database. If a restore fails partway, the destination may be left partial — discard it and restore again into a clean directory.
 - **Same engine version.** A backup is restorable by the same PowDB engine version that wrote it. There is no cross-version on-disk format guarantee yet. (The manifest carries a format version and refuses an unrecognized one.)
