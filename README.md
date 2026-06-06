@@ -34,7 +34,7 @@ Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to 
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
 
-Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md)
+Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/zvndev/powdb/blob/main/docs/backup-and-restore.md)
 
 ## Install
 
