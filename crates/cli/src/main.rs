@@ -183,12 +183,22 @@ fn history_path() -> PathBuf {
         .join(".powdb_history")
 }
 
+enum Action {
+    /// Default behaviour: REPL or one-shot `--exec`.
+    Default,
+    /// Snapshot the embedded DB at `--data-dir` into `dest`.
+    Backup { dest: String },
+    /// Rebuild a data dir from a backup.
+    Restore { backup_dir: String, dest: String },
+}
+
 struct CliArgs {
     data_dir: String,
     remote: Option<String>,
     db: String,
     password: Option<String>,
     exec: Option<String>,
+    action: Action,
 }
 
 fn parse_args() -> CliArgs {
@@ -199,6 +209,7 @@ fn parse_args() -> CliArgs {
         .ok()
         .filter(|s| !s.is_empty());
     let mut exec: Option<String> = None;
+    let mut action = Action::Default;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -254,6 +265,8 @@ fn parse_args() -> CliArgs {
                 println!();
                 println!("USAGE:");
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
+                println!("    powdb-cli --data-dir <DIR> backup <DEST_DIR>");
+                println!("    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR>");
                 println!();
                 println!("OPTIONS:");
                 println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
@@ -273,7 +286,38 @@ fn parse_args() -> CliArgs {
                 );
                 println!("    One-shot:            powdb-cli --exec 'count(User)'");
                 println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 | limit 5'");
+                println!();
+                println!("SUBCOMMANDS:");
+                println!("    backup <DEST_DIR>          Snapshot --data-dir into DEST_DIR");
+                println!("    restore <BKP> <DEST_DIR>   Rebuild a data dir from a backup");
                 std::process::exit(0);
+            }
+            "backup" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("backup requires a destination dir");
+                    std::process::exit(2);
+                }
+                action = Action::Backup {
+                    dest: argv[i].clone(),
+                };
+            }
+            "restore" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("restore requires a backup dir and a destination data dir");
+                    std::process::exit(2);
+                }
+                let backup_dir = argv[i].clone();
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("restore requires a destination data dir");
+                    std::process::exit(2);
+                }
+                action = Action::Restore {
+                    backup_dir,
+                    dest: argv[i].clone(),
+                };
             }
             other if !other.starts_with('-') && !saw_positional => {
                 data_dir = other.to_string();
@@ -294,6 +338,7 @@ fn parse_args() -> CliArgs {
         db,
         password,
         exec,
+        action,
     }
 }
 
@@ -307,6 +352,16 @@ fn main() {
         .init();
 
     let args = parse_args();
+
+    match &args.action {
+        Action::Backup { dest } => {
+            std::process::exit(run_backup(&args.data_dir, dest));
+        }
+        Action::Restore { backup_dir, dest } => {
+            std::process::exit(run_restore(backup_dir, dest));
+        }
+        Action::Default => {}
+    }
 
     if let Some(remote_addr) = &args.remote {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -331,6 +386,46 @@ fn main() {
         std::process::exit(exec_embedded(&args.data_dir, &query));
     } else {
         run_embedded(&args.data_dir);
+    }
+}
+
+// ─── Backup / restore ───────────────────────────────────────────────────────
+
+fn run_backup(data_dir: &str, dest: &str) -> i32 {
+    let mut catalog = match powdb_storage::catalog::Catalog::open(Path::new(data_dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to open data dir {data_dir}: {e}");
+            return 1;
+        }
+    };
+    match powdb_backup::full_backup(&mut catalog, Path::new(dest)) {
+        Ok(m) => {
+            let total_bytes: u64 = m.files.iter().map(|f| f.len).sum();
+            println!(
+                "backed up {} files ({total_bytes} bytes) at lsn {} -> {dest}",
+                m.files.len(),
+                m.source_lsn
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: backup failed: {e}");
+            1
+        }
+    }
+}
+
+fn run_restore(backup_dir: &str, dest: &str) -> i32 {
+    match powdb_backup::restore(Path::new(backup_dir), Path::new(dest)) {
+        Ok(()) => {
+            println!("restored backup {backup_dir} -> {dest}");
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: restore failed: {e}");
+            1
+        }
     }
 }
 
