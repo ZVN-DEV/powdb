@@ -41,8 +41,8 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
         format_version: BackupManifest::FORMAT_VERSION,
         created_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
         source_lsn,
         files,
     };

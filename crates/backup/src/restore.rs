@@ -9,6 +9,15 @@ use std::path::Path;
 /// LSN-reset fix) to validate that the restored database actually opens.
 pub fn restore(backup_dir: &Path, dest_data_dir: &Path) -> io::Result<()> {
     let manifest = BackupManifest::read(backup_dir)?;
+    // Refuse a non-empty destination: a stale wal.log left there would replay
+    // onto the restored data on Catalog::open and corrupt it. Restore requires
+    // a fresh or empty directory. A nonexistent or empty dest is fine.
+    if dest_data_dir.exists() && dest_data_dir.read_dir()?.next().is_some() {
+        return Err(io::Error::other(format!(
+            "restore destination {} is not empty; restore requires a fresh or empty directory",
+            dest_data_dir.display()
+        )));
+    }
     std::fs::create_dir_all(dest_data_dir)?;
     for f in &manifest.files {
         let bytes = std::fs::read(backup_dir.join(&f.name))?;
