@@ -57,6 +57,15 @@ function assertOk(r: QueryResult, affected?: number) {
   }
 }
 
+// DDL, transaction-control, and view-refresh statements resolve to a
+// `{ kind: "message", message }` result on powdb-server 0.4.x (wire type 0x0b).
+function assertMessage(r: QueryResult) {
+  assert.equal(r.kind, "message", `expected message, got ${r.kind}`);
+  if (r.kind !== "message") return;
+  assert.equal(typeof r.message, "string", "message should be a string");
+  assert.ok(r.message.length > 0, "message should be non-empty");
+}
+
 async function main() {
   console.log(`\nConnecting to ${HOST}:${PORT}...`);
   client = await Client.connect({ host: HOST, port: PORT });
@@ -71,7 +80,7 @@ async function main() {
     const r = await client.query(
       `type ${t} { required name: str, age: int, score: float, active: bool }`
     );
-    assertOk(r, 0);
+    assertMessage(r);
   });
 
   await test("create table with required fields", async () => {
@@ -79,7 +88,7 @@ async function main() {
     const r = await client.query(
       `type ${t} { required name: str, required email: str, age: int, city: str }`
     );
-    assertOk(r, 0);
+    assertMessage(r);
   });
 
   // ──────────────────────────────────────────────────────────
@@ -402,7 +411,7 @@ async function main() {
 
   await test("create index", async () => {
     const r = await client.query(`alter ${users} add index .email`);
-    assertOk(r);
+    assertMessage(r);
   });
 
   await test("query still works with index (point lookup)", async () => {
@@ -418,7 +427,7 @@ async function main() {
 
   await test("create index on age for range scans", async () => {
     const r = await client.query(`alter ${users} add index .age`);
-    assertOk(r);
+    assertMessage(r);
   });
 
   await test("range scan with index", async () => {
@@ -463,7 +472,7 @@ async function main() {
 
   await test("add column", async () => {
     const r = await client.query(`alter ${users} add column score: int`);
-    assertOk(r);
+    assertMessage(r);
 
     // Verify column exists by selecting it
     const check = await client.query(`${users} limit 1 { .name, .score }`);
@@ -475,7 +484,7 @@ async function main() {
 
   await test("drop column", async () => {
     const r = await client.query(`alter ${users} drop column score`);
-    assertOk(r);
+    assertMessage(r);
 
     // Verify column is gone
     const check = await client.query(`${users} limit 1`);
@@ -495,7 +504,7 @@ async function main() {
     const r = await client.query(
       `type ${teams} { required team_name: str, required team_city: str }`
     );
-    assertOk(r, 0);
+    assertMessage(r);
 
     await client.query(`insert ${teams} { team_name := "Engineering", team_city := "NYC" }`);
     await client.query(`insert ${teams} { team_name := "Design", team_city := "SF" }`);
@@ -675,7 +684,7 @@ async function main() {
 
   await test("drop table", async () => {
     const r = await client.query(`drop ${orders}`);
-    assertOk(r);
+    assertMessage(r);
 
     // Verify it's gone
     try {

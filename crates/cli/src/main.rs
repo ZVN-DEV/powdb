@@ -183,12 +183,29 @@ fn history_path() -> PathBuf {
         .join(".powdb_history")
 }
 
+enum Action {
+    /// Default behaviour: REPL or one-shot `--exec`.
+    Default,
+    /// Snapshot the embedded DB at `--data-dir` into `dest`.
+    /// When `base` is set, write an incremental (differential) backup
+    /// diffed against the full backup at that directory.
+    Backup { dest: String, base: Option<String> },
+    /// Rebuild a data dir from a backup. When `apply` is non-empty, treat
+    /// `backup_dir` as a full base and apply the ordered increments on top.
+    Restore {
+        backup_dir: String,
+        dest: String,
+        apply: Vec<String>,
+    },
+}
+
 struct CliArgs {
     data_dir: String,
     remote: Option<String>,
     db: String,
     password: Option<String>,
     exec: Option<String>,
+    action: Action,
 }
 
 fn parse_args() -> CliArgs {
@@ -199,6 +216,11 @@ fn parse_args() -> CliArgs {
         .ok()
         .filter(|s| !s.is_empty());
     let mut exec: Option<String> = None;
+    let mut action = Action::Default;
+    // Accumulators for backup/restore modifier flags, which may appear after
+    // the subcommand and its positionals.
+    let mut backup_base: Option<String> = None;
+    let mut restore_apply: Vec<String> = Vec::new();
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -254,6 +276,10 @@ fn parse_args() -> CliArgs {
                 println!();
                 println!("USAGE:");
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
+                println!("    powdb-cli --data-dir <DIR> backup <DEST_DIR> [--base <FULL_DIR>]");
+                println!(
+                    "    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR> [--apply <INC_DIR>]..."
+                );
                 println!();
                 println!("OPTIONS:");
                 println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
@@ -273,7 +299,62 @@ fn parse_args() -> CliArgs {
                 );
                 println!("    One-shot:            powdb-cli --exec 'count(User)'");
                 println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 | limit 5'");
+                println!();
+                println!("SUBCOMMANDS:");
+                println!("    backup <DEST_DIR> [--base <FULL_DIR>]");
+                println!("        Snapshot --data-dir into DEST_DIR. With --base, write an");
+                println!("        incremental (differential) backup of only the 4 KB pages that");
+                println!("        changed since the full backup at FULL_DIR.");
+                println!("    restore <BKP> <DEST_DIR> [--apply <INC_DIR>]...");
+                println!("        Rebuild a data dir from a backup. Pass --apply once per");
+                println!("        increment (in order) to chain-restore a full base plus");
+                println!("        incrementals for coarse point-in-time restore.");
                 std::process::exit(0);
+            }
+            "backup" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("backup requires a destination dir");
+                    std::process::exit(2);
+                }
+                action = Action::Backup {
+                    dest: argv[i].clone(),
+                    base: None,
+                };
+            }
+            "--base" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--base requires a full backup dir");
+                    std::process::exit(2);
+                }
+                backup_base = Some(argv[i].clone());
+            }
+            "--apply" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--apply requires an increment dir");
+                    std::process::exit(2);
+                }
+                restore_apply.push(argv[i].clone());
+            }
+            "restore" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("restore requires a backup dir and a destination data dir");
+                    std::process::exit(2);
+                }
+                let backup_dir = argv[i].clone();
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("restore requires a destination data dir");
+                    std::process::exit(2);
+                }
+                action = Action::Restore {
+                    backup_dir,
+                    dest: argv[i].clone(),
+                    apply: Vec::new(),
+                };
             }
             other if !other.starts_with('-') && !saw_positional => {
                 data_dir = other.to_string();
@@ -288,12 +369,33 @@ fn parse_args() -> CliArgs {
         i += 1;
     }
 
+    // Fold the modifier flags into their subcommand actions.
+    match &mut action {
+        Action::Backup { base, .. } => {
+            *base = backup_base;
+        }
+        Action::Restore { apply, .. } => {
+            *apply = restore_apply;
+        }
+        Action::Default => {
+            if backup_base.is_some() {
+                eprintln!("--base is only valid with the `backup` subcommand");
+                std::process::exit(2);
+            }
+            if !restore_apply.is_empty() {
+                eprintln!("--apply is only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
+        }
+    }
+
     CliArgs {
         data_dir,
         remote,
         db,
         password,
         exec,
+        action,
     }
 }
 
@@ -307,6 +409,20 @@ fn main() {
         .init();
 
     let args = parse_args();
+
+    match &args.action {
+        Action::Backup { dest, base } => {
+            std::process::exit(run_backup(&args.data_dir, dest, base.as_deref()));
+        }
+        Action::Restore {
+            backup_dir,
+            dest,
+            apply,
+        } => {
+            std::process::exit(run_restore(backup_dir, dest, apply));
+        }
+        Action::Default => {}
+    }
 
     if let Some(remote_addr) = &args.remote {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -331,6 +447,112 @@ fn main() {
         std::process::exit(exec_embedded(&args.data_dir, &query));
     } else {
         run_embedded(&args.data_dir);
+    }
+}
+
+// ─── Backup / restore ───────────────────────────────────────────────────────
+
+fn run_backup(data_dir: &str, dest: &str, base: Option<&str>) -> i32 {
+    let mut catalog = match powdb_storage::catalog::Catalog::open(Path::new(data_dir)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to open data dir {data_dir}: {e}");
+            return 1;
+        }
+    };
+
+    match base {
+        // ── Incremental (differential) backup against a full base ──────────
+        Some(full_dir) => {
+            let base_manifest = match powdb_backup::BackupManifest::read(Path::new(full_dir)) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error: failed to read base backup {full_dir}: {e}");
+                    return 1;
+                }
+            };
+            let base_lsn = base_manifest.source_lsn;
+            match powdb_backup::incremental_backup(&mut catalog, &base_manifest, Path::new(dest)) {
+                Ok(m) => {
+                    use powdb_backup::ChangedFile;
+                    let mut delta_pages: usize = 0;
+                    let mut whole_files: usize = 0;
+                    for cf in &m.changed {
+                        match cf {
+                            ChangedFile::Pages { page_indices, .. } => {
+                                delta_pages += page_indices.len();
+                            }
+                            ChangedFile::Whole { .. } => {
+                                whole_files += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "incremental backup: {} changed files ({whole_files} whole, {} paged), \
+                         {delta_pages} delta pages, base lsn {base_lsn} -> lsn {} -> {dest}",
+                        m.changed.len(),
+                        m.changed.len() - whole_files,
+                        m.source_lsn
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("Error: incremental backup failed: {e}");
+                    1
+                }
+            }
+        }
+        // ── Full backup ────────────────────────────────────────────────────
+        None => match powdb_backup::full_backup(&mut catalog, Path::new(dest)) {
+            Ok(m) => {
+                let total_bytes: u64 = m.files.iter().map(|f| f.len).sum();
+                println!(
+                    "backed up {} files ({total_bytes} bytes) at lsn {} -> {dest}",
+                    m.files.len(),
+                    m.source_lsn
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: backup failed: {e}");
+                1
+            }
+        },
+    }
+}
+
+fn run_restore(backup_dir: &str, dest: &str, apply: &[String]) -> i32 {
+    if apply.is_empty() {
+        // Full restore.
+        return match powdb_backup::restore(Path::new(backup_dir), Path::new(dest)) {
+            Ok(()) => {
+                println!("restored backup {backup_dir} -> {dest}");
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: restore failed: {e}");
+                1
+            }
+        };
+    }
+
+    // Chain restore: full base + ordered increments.
+    let increments: Vec<&Path> = apply.iter().map(|s| Path::new(s.as_str())).collect();
+    match powdb_backup::restore_chain(Path::new(backup_dir), &increments, Path::new(dest)) {
+        Ok(()) => {
+            println!(
+                "restored backup {backup_dir} + {} increment(s) -> {dest}",
+                apply.len()
+            );
+            for inc in apply {
+                println!("  applied {inc}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: chain restore failed: {e}");
+            1
+        }
     }
 }
 

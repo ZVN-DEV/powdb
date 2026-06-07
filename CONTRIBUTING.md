@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust stable (latest)
+- Rust 1.93 or newer (MSRV is `1.93`, edition 2021; enforced by the `msrv-consistency` CI check)
 - Docker + Docker Compose (optional, for running wide benchmarks against Postgres/MySQL)
 
 ## Quick Start
@@ -21,7 +21,7 @@ cargo build --workspace           # debug build
 cargo build --release --workspace # release build
 cargo test --workspace            # run all tests
 cargo bench -p powdb-bench        # criterion benchmarks (~60s)
-cargo run --release -p powdb-compare  # wide bench vs SQLite/PG/MySQL
+cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --features mysql for MySQL)
 ```
 
 ## Project Structure
@@ -68,9 +68,13 @@ Admin bypass exists for break-glass scenarios (security patches, recovering from
 
 ## CI Checks
 
-PRs must pass:
-- **clippy + fmt + test** — lints, formatting, and all workspace tests
-- **criterion + regression gate** — benchmark must not regress beyond thresholds
+PRs must pass these gates (see `.github/workflows/`):
+- **clippy + fmt + test** — lints, formatting, and all workspace tests, run on a two-OS matrix (`ubuntu-24.04`, `macos-latest`)
+- **miri** — undefined-behavior check on the non-mmap modules
+- **asan** — AddressSanitizer run
+- **audit** — `cargo audit` against the advisory database
+- **msrv-consistency** — verifies the declared MSRV (`1.93`) builds
+- **criterion + regression gate** — benchmark must not regress beyond thresholds (`.github/workflows/bench.yml`)
 
 ## Benchmark Regression Gate
 

@@ -65,6 +65,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -232,6 +238,20 @@ dependencies = [
  "radium",
  "tap",
  "wyz",
+]
+
+[[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -473,6 +493,12 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "cpufeatures"
@@ -1754,8 +1780,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "powdb-backup"
+version = "0.4.5"
+dependencies = [
+ "blake3",
+ "powdb-query",
+ "powdb-storage",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "powdb-bench"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "criterion",
  "powdb-query",
@@ -1766,8 +1803,9 @@ dependencies = [
 
 [[package]]
 name = "powdb-cli"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
+ "powdb-backup",
  "powdb-query",
  "powdb-server",
  "powdb-storage",
@@ -1779,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-compare"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "mysql",
  "postgres",
@@ -1791,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
@@ -1802,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bytes",
  "powdb-query",
@@ -1821,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "bytes",
  "crc32fast",

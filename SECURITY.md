@@ -2,12 +2,19 @@
 
 ## Supported Versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.4.x   | :white_check_mark: |
-| 0.3.x   | :white_check_mark: |
-| 0.2.x   | :white_check_mark: |
-| 0.1.x   | :x:                |
+| Version         | Supported          |
+| --------------- | ------------------ |
+| 0.4.4           | :white_check_mark: |
+| 0.4.1 – 0.4.3   | :x: (yanked)       |
+| 0.4.0           | :white_check_mark: |
+| 0.3.x           | :white_check_mark: |
+| 0.2.x           | :white_check_mark: |
+| 0.1.x           | :x:                |
+
+> **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
+> recovery and have been replaced by **v0.4.4**, which adds a permanent
+> durability regression suite. If you are on any of those three versions,
+> upgrade to 0.4.4. See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability
 

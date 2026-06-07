@@ -165,8 +165,10 @@ callback with the latest rows:
 ```typescript
 const handle = client.watch("User filter .active = true { .id, .name }", {
   intervalMs: 1000,
-  onRows: (rows, columns) => {
-    console.log(`${rows.length} active users`);
+  onRows: (result) => {
+    if (result.kind === "rows") {
+      console.log(`${result.rows.length} active users`);
+    }
   },
   onError: (err) => {
     console.error("watch error:", err);
@@ -208,15 +210,21 @@ Events:
 Pass an `AbortSignal` to cancel a query:
 
 ```typescript
+import { isPowDBError } from "@zvndev/powdb-client";
+
 const ctrl = new AbortController();
 setTimeout(() => ctrl.abort(), 1000);
 
 try {
   await client.query("slow_query(...)", { signal: ctrl.signal });
 } catch (err) {
-  if (err.name === "AbortError") { /* cancelled */ }
+  if (isPowDBError(err) && err.code === "aborted") { /* cancelled */ }
 }
 ```
+
+If you abort with a custom reason (`ctrl.abort(myError)`) and that reason is
+an `Error`, it is thrown as-is instead. Otherwise the client throws a
+`PowDBError` with `code === "aborted"`.
 
 The socket stays open — the server's reply is silently discarded so other in-flight queries keep working.
 
@@ -254,8 +262,8 @@ supplied schema and returns `Promise<TypedRow[]>`. See Typed rows above.
 
 ### `client.watch(query, options)`
 
-Re-runs `query` every `intervalMs` and pushes rows to `onRows`. Returns
-`{ stop(): void }`. See Polling watch above.
+Re-runs `query` every `intervalMs` and passes each `QueryResult` to
+`onRows`. Returns `{ stop(): void }`. See Polling watch above.
 
 ### `client.on("query", handler)` / `client.on("close", handler)`
 
@@ -267,7 +275,7 @@ Sends a disconnect message and closes the TCP socket.
 
 ### `client.serverVersion`
 
-The PowDB server version string (e.g., `"0.2.0"`). On connect, the client warns once per `host:port` if the server's major version differs from the client's.
+The PowDB server version string (e.g., `"0.4.4"`). On connect, the client warns once per `host:port` if the server's major version differs from the client's.
 
 ### `Pool` (class)
 

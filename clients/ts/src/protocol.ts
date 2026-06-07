@@ -14,6 +14,7 @@ export const MSG_RESULT_ROWS = 0x07;
 export const MSG_RESULT_SCALAR = 0x08;
 export const MSG_RESULT_OK = 0x09;
 export const MSG_ERROR = 0x0a;
+export const MSG_RESULT_MSG = 0x0b;
 export const MSG_DISCONNECT = 0x10;
 export const MSG_PING = 0x11;
 export const MSG_PONG = 0x12;
@@ -36,6 +37,7 @@ export type Message =
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
   | { type: "ResultScalar"; value: string }
   | { type: "ResultOk"; affected: bigint }
+  | { type: "ResultMessage"; message: string }
   | { type: "Error"; message: string }
   | { type: "Disconnect" }
   | { type: "Ping" }
@@ -88,6 +90,10 @@ export function encode(msg: Message): Buffer {
       msgType = MSG_RESULT_OK;
       break;
     }
+    case "ResultMessage":
+      payload = encodeString(msg.message);
+      msgType = MSG_RESULT_MSG;
+      break;
     case "Error":
       payload = encodeString(msg.message);
       msgType = MSG_ERROR;
@@ -188,6 +194,8 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       const affected = readU64(payload, cursor, "affected count");
       return { type: "ResultOk", affected };
     }
+    case MSG_RESULT_MSG:
+      return { type: "ResultMessage", message: decodeString(payload, cursor) };
     case MSG_ERROR:
       return { type: "Error", message: decodeString(payload, cursor) };
     case MSG_DISCONNECT:

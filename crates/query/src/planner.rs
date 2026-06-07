@@ -439,7 +439,7 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
 fn plan_insert(ins: InsertExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::Insert {
         table: ins.target,
-        assignments: ins.assignments,
+        rows: ins.rows,
     })
 }
 
