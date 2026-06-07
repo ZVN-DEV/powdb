@@ -1,5 +1,14 @@
 # PowDB Smoke Audit — 2026-05-26
 
+> **HISTORICAL — superseded as of v0.4.4 (2026-06-05).** This is a point-in-time
+> smoke audit of the pre-release 0.4.0 build. Nearly every finding has since been
+> resolved: ROLLBACK now undoes heap writes (verified by transaction tests in
+> `crates/query/src/executor/tests.rs`), the CHANGELOG has entries through 0.4.4,
+> all four crates are published on crates.io at 0.4.4, version pins and the MSRV
+> are current, and issue/PR templates exist. The three later durability P0s that
+> 0.4.4 fixed are not in this audit — see `CHANGELOG.md`. Kept unaltered for
+> provenance; do not treat its grades or status claims as current.
+
 ## Executive Summary
 
 | Surface | Grade | Verdict |

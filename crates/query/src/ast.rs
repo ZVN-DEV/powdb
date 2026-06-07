@@ -150,7 +150,9 @@ pub struct OrderKey {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertExpr {
     pub target: String,
-    pub assignments: Vec<Assignment>,
+    /// One assignment-block per row. Always contains at least one row;
+    /// `insert T { .. }` yields one, `insert T { .. }, { .. }` yields many.
+    pub rows: Vec<Vec<Assignment>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -22,7 +22,7 @@ database name match the URL the harness tries by default, so no env var is
 needed:
 
 ```bash
-# 1. bring up Postgres (pinned postgres:16.4)
+# 1. bring up Postgres (pinned postgres:16.4-bookworm)
 docker compose -f crates/compare/docker-compose.yml up -d
 
 # 2. run the comparison — Postgres now appears as a column
