@@ -267,11 +267,6 @@ async fn main() {
 
     let args = parse_args();
 
-    // TASK-09: Warn when no password is configured.
-    if args.password.is_none() {
-        warn!("no password configured — all connections will be accepted without authentication");
-    }
-
     let engine = match Engine::with_memory_limit(
         std::path::Path::new(&args.data_dir),
         args.query_memory_limit,
@@ -287,6 +282,24 @@ async fn main() {
         "per-query memory budget"
     );
     let engine = Arc::new(RwLock::new(engine));
+
+    // Load the multi-user store from the same data dir. When it has users, the
+    // handshake authenticates (username, password) against it; when empty the
+    // server falls back to the shared-password behavior.
+    let users = match powdb_auth::UserStore::load(std::path::Path::new(&args.data_dir)) {
+        Ok(u) => u,
+        Err(e) => {
+            error!(data_dir = %args.data_dir, error = %e, "failed to load user store (auth.json)");
+            std::process::exit(1);
+        }
+    };
+    if !users.is_empty() {
+        info!(users = users.len(), "multi-user authentication enabled");
+    } else if args.password.is_none() {
+        // TASK-09: Warn when neither a shared password nor users are configured.
+        warn!("no password configured — all connections will be accepted without authentication");
+    }
+    let users = Arc::new(users);
 
     // Build TLS acceptor if both cert and key are provided.
     let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
@@ -364,6 +377,7 @@ async fn main() {
                         info!(peer = %peer, "accepted connection");
                         let eng = engine.clone();
                         let pw = args.password.clone();
+                        let users = users.clone();
                         let mut rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
@@ -378,6 +392,7 @@ async fn main() {
                                             tls_stream,
                                             handler::ConnOpts {
                                                 engine: eng, expected_password: pw,
+                                                users,
                                                 shutdown_rx: &mut rx, idle_timeout: idle,
                                                 query_timeout: qtimeout, rate_limiter: Some(&rl),
                                                 peer_addr,
@@ -393,6 +408,7 @@ async fn main() {
                                     stream,
                                     handler::ConnOpts {
                                         engine: eng, expected_password: pw,
+                                        users,
                                         shutdown_rx: &mut rx, idle_timeout: idle,
                                         query_timeout: qtimeout, rate_limiter: Some(&rl),
                                         peer_addr,

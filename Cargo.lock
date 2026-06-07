@@ -1894,6 +1894,7 @@ name = "powdb-server"
 version = "0.4.5"
 dependencies = [
  "bytes",
+ "powdb-auth",
  "powdb-query",
  "powdb-storage",
  "rcgen",

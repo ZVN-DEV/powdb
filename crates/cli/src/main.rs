@@ -610,6 +610,7 @@ async fn exec_remote(addr: String, db: String, password: Option<String>, query: 
     let connect = Message::Connect {
         db_name: db,
         password: password.map(Into::into),
+        username: None,
     };
     if connect.write_to(&mut writer).await.is_err()
         || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
@@ -826,6 +827,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     let connect = Message::Connect {
         db_name: db.clone(),
         password: password.map(Into::into),
+        username: None,
     };
     if let Err(e) = connect.write_to(&mut writer).await {
         eprintln!("failed to send CONNECT: {e}");

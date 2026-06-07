@@ -105,6 +105,17 @@ impl UserStore {
             .ok_or_else(|| AuthError::UnknownUser(name.to_string()))
     }
 
+    /// Number of users in the store.
+    pub fn len(&self) -> usize {
+        self.users.len()
+    }
+
+    /// Whether the store has no users. When empty, the server falls back to
+    /// the legacy shared-password authentication path.
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+    }
+
     /// List users as `(name, role)` pairs. Never exposes password hashes.
     pub fn list_users(&self) -> Vec<(String, String)> {
         self.users
@@ -165,6 +176,23 @@ mod tests {
             s.create_user("a", "pw2", "readonly"),
             Err(AuthError::UserExists(_))
         ));
+    }
+
+    #[test]
+    fn empty_and_len_track_users() {
+        let mut s = UserStore::new();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        s.create_user("alice", "pw", "readwrite").unwrap();
+        assert!(!s.is_empty());
+        assert_eq!(s.len(), 1);
+        s.create_user("bob", "pw", "readonly").unwrap();
+        assert_eq!(s.len(), 2);
+        s.delete_user("alice").unwrap();
+        assert_eq!(s.len(), 1);
+        assert!(!s.is_empty());
+        s.delete_user("bob").unwrap();
+        assert!(s.is_empty());
     }
 
     #[test]

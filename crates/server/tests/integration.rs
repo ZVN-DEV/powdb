@@ -16,6 +16,17 @@ fn encode_connect(db: &str) -> Vec<u8> {
     frame
 }
 
+/// Encode a CONNECT frame carrying db_name + password + username, exercising
+/// the real wire encoder so the test depends on the actual protocol.
+fn encode_connect_user(db: &str, password: &str, username: &str) -> Vec<u8> {
+    powdb_server::protocol::Message::Connect {
+        db_name: db.to_string(),
+        password: Some(zeroize::Zeroizing::new(password.to_string())),
+        username: Some(username.to_string()),
+    }
+    .encode()
+}
+
 fn encode_query(q: &str) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
@@ -72,6 +83,7 @@ async fn test_full_lifecycle() {
                     powdb_server::handler::ConnOpts {
                         engine: eng,
                         expected_password: None,
+                        users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(300),
                         query_timeout: Duration::from_secs(30),
@@ -155,6 +167,190 @@ async fn test_full_lifecycle() {
     }
 
     // Cleanup
+    handle.abort();
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// Drive the REAL handshake with a populated UserStore: a valid (user,password)
+/// connects; wrong password, unknown user, and a missing username all reject.
+#[tokio::test]
+async fn test_user_auth_handshake() {
+    use powdb_auth::UserStore;
+    use std::sync::{Arc, RwLock};
+
+    let test_id = std::process::id();
+    let port = 16500 + (test_id % 1000) as u16;
+    let data_dir = std::env::temp_dir().join(format!("powdb_userauth_{test_id}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Seed a user store with one user.
+    let mut store = UserStore::new();
+    store.create_user("alice", "pw", "readwrite").unwrap();
+    let users = Arc::new(store);
+
+    let data_dir_str = data_dir.to_str().unwrap().to_string();
+    let addr = format!("127.0.0.1:{port}");
+    let bind_addr = addr.clone();
+
+    let handle = tokio::spawn(async move {
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let eng = engine.clone();
+            let users = users.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                powdb_server::handler::handle_connection(
+                    stream,
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        expected_password: None,
+                        users,
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr: Some(peer),
+                    },
+                )
+                .await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Valid user → CONNECT_OK.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "pw", "alice"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "valid user should get CONNECT_OK");
+    }
+
+    // Wrong password → ERROR.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "wrong", "alice"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x0A, "wrong password should get ERROR");
+    }
+
+    // Unknown user → ERROR.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "pw", "mallory"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x0A, "unknown user should get ERROR");
+    }
+
+    // Missing username (old-style connect with password only) → ERROR because
+    // the store has users.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let frame = powdb_server::protocol::Message::Connect {
+            db_name: "testdb".into(),
+            password: Some(zeroize::Zeroizing::new("pw".into())),
+            username: None,
+        }
+        .encode();
+        stream.write_all(&frame).await.unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x0A, "missing username should get ERROR");
+    }
+
+    handle.abort();
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// Empty UserStore → legacy shared-password path is byte-identical: right
+/// password connects, wrong password is rejected.
+#[tokio::test]
+async fn test_empty_store_shared_password_fallback() {
+    use powdb_auth::UserStore;
+    use std::sync::{Arc, RwLock};
+
+    let test_id = std::process::id();
+    let port = 17500 + (test_id % 1000) as u16;
+    let data_dir = std::env::temp_dir().join(format!("powdb_sharedpw_{test_id}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let users = Arc::new(UserStore::new()); // empty → fallback
+    let data_dir_str = data_dir.to_str().unwrap().to_string();
+    let addr = format!("127.0.0.1:{port}");
+    let bind_addr = addr.clone();
+
+    let handle = tokio::spawn(async move {
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let eng = engine.clone();
+            let users = users.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                powdb_server::handler::handle_connection(
+                    stream,
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        expected_password: Some(zeroize::Zeroizing::new("sekret".into())),
+                        users,
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr: Some(peer),
+                    },
+                )
+                .await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Right shared password, no username → CONNECT_OK.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let frame = powdb_server::protocol::Message::Connect {
+            db_name: "testdb".into(),
+            password: Some(zeroize::Zeroizing::new("sekret".into())),
+            username: None,
+        }
+        .encode();
+        stream.write_all(&frame).await.unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "correct shared password should connect");
+    }
+
+    // Wrong shared password → ERROR.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let frame = powdb_server::protocol::Message::Connect {
+            db_name: "testdb".into(),
+            password: Some(zeroize::Zeroizing::new("nope".into())),
+            username: None,
+        }
+        .encode();
+        stream.write_all(&frame).await.unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x0A, "wrong shared password should be rejected");
+    }
+
     handle.abort();
     std::fs::remove_dir_all(&data_dir).ok();
 }

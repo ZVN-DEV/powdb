@@ -35,6 +35,10 @@ pub enum Message {
         /// (and thus this field) is dropped after the constant-time compare —
         /// the candidate never lingers in a plain `String`.
         password: Option<Zeroizing<String>>,
+        /// Optional user name for multi-user authentication. Appended after the
+        /// password on the wire so the format is a pure, backward-compatible
+        /// extension: old clients that omit it decode as `None`.
+        username: Option<String>,
     },
     ConnectOk {
         version: String,
@@ -68,11 +72,21 @@ impl Message {
     /// Encode message into wire format: [type(1)][flags(1)][len(4)][payload]
     pub fn encode(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
-            Message::Connect { db_name, password } => {
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            } => {
                 let mut buf = encode_string(db_name);
                 // Password is encoded as a length-prefixed string. Empty (len=0) means None.
                 match password {
                     Some(p) => buf.extend_from_slice(&encode_string(p)),
+                    None => buf.extend_from_slice(&0u32.to_le_bytes()),
+                }
+                // Username is appended after the password (append-only extension).
+                // Length-prefixed string; empty (len=0) means None.
+                match username {
+                    Some(u) => buf.extend_from_slice(&encode_string(u)),
                     None => buf.extend_from_slice(&0u32.to_le_bytes()),
                 }
                 (MSG_CONNECT, buf)
@@ -144,7 +158,23 @@ impl Message {
                 } else {
                     None
                 };
-                Ok(Message::Connect { db_name, password })
+                // Username is optional and appended after the password. Old
+                // clients omit it entirely → no more bytes → None.
+                let username = if pos < payload.len() {
+                    let u = decode_string(payload, &mut pos)?;
+                    if u.is_empty() {
+                        None
+                    } else {
+                        Some(u)
+                    }
+                } else {
+                    None
+                };
+                Ok(Message::Connect {
+                    db_name,
+                    password,
+                    username,
+                })
             }
             MSG_CONNECT_OK => {
                 let version = decode_string(payload, &mut 0)?;
@@ -320,6 +350,95 @@ mod tests {
         match decoded {
             Message::Query { query } => assert_eq!(query, "User filter .age > 30"),
             _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_connect_with_username() {
+        let msg = Message::Connect {
+            db_name: "mydb".into(),
+            password: Some(Zeroizing::new("secret".into())),
+            username: Some("alice".into()),
+        };
+        let bytes = msg.encode();
+        match Message::decode(&bytes).unwrap() {
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            } => {
+                assert_eq!(db_name, "mydb");
+                assert_eq!(password.as_deref().map(|s| s.as_str()), Some("secret"));
+                assert_eq!(username.as_deref(), Some("alice"));
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_connect_without_username() {
+        // New-format Connect that explicitly carries no username.
+        let msg = Message::Connect {
+            db_name: "mydb".into(),
+            password: Some(Zeroizing::new("secret".into())),
+            username: None,
+        };
+        let bytes = msg.encode();
+        match Message::decode(&bytes).unwrap() {
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            } => {
+                assert_eq!(db_name, "mydb");
+                assert_eq!(password.as_deref().map(|s| s.as_str()), Some("secret"));
+                assert_eq!(username, None);
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_old_client_connect_db_and_password_only() {
+        // Simulate an OLD client frame: db_name + password, with NO username
+        // bytes at all. Must decode with username: None (backward compat).
+        let mut payload = encode_string("mydb");
+        payload.extend_from_slice(&encode_string("pw"));
+        let mut frame = vec![MSG_CONNECT, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        match Message::decode(&frame).unwrap() {
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            } => {
+                assert_eq!(db_name, "mydb");
+                assert_eq!(password.as_deref().map(|s| s.as_str()), Some("pw"));
+                assert_eq!(username, None, "old-client frame must yield username=None");
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_old_client_connect_db_only() {
+        // Oldest client: db_name only, no password and no username bytes.
+        let payload = encode_string("mydb");
+        let mut frame = vec![MSG_CONNECT, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        match Message::decode(&frame).unwrap() {
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            } => {
+                assert_eq!(db_name, "mydb");
+                assert_eq!(password, None);
+                assert_eq!(username, None);
+            }
+            other => panic!("expected Connect, got {other:?}"),
         }
     }
 
