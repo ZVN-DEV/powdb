@@ -5,6 +5,22 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Multi-user authentication (operator surface).** The server now authenticates
+  per-connection `(username, password)` against a persisted user store
+  (`auth.json`, argon2id hashes only) when any users are defined. New CLI flag
+  `powdb-cli --user <NAME>` carries the username on remote connect, and new
+  offline user-admin subcommands edit the data dir's user store without a running
+  server: `useradd <NAME> [--role <ROLE>] [--password <PW>]` (role defaults to
+  `readwrite`; password may come from `POWDB_NEW_PASSWORD`), `userdel <NAME>`,
+  `passwd <NAME> [--password <PW>]`, and `users` (lists name + role, never
+  hashes). The server can bootstrap an initial admin from `POWDB_ADMIN_USER` /
+  `POWDB_ADMIN_PASSWORD` on startup when that user does not yet exist. Added
+  `UserStore::set_password`. **Backward compatible:** with no users defined, the
+  single shared-password model (`POWDB_PASSWORD` / `--password`) still applies.
+
 ## [0.4.5] - 2026-06-06
 
 ### Added

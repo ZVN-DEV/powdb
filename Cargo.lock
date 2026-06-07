@@ -1856,6 +1856,7 @@ dependencies = [
 name = "powdb-cli"
 version = "0.4.5"
 dependencies = [
+ "powdb-auth",
  "powdb-backup",
  "powdb-query",
  "powdb-server",

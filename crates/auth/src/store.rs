@@ -97,6 +97,21 @@ impl UserStore {
         Ok(())
     }
 
+    /// Replace a user's password with a new argon2id hash, preserving role.
+    ///
+    /// Errors if the user is unknown. The new plaintext is held in a buffer
+    /// that is zeroed on drop.
+    pub fn set_password(&mut self, name: &str, new_password: &str) -> Result<(), AuthError> {
+        let secret = Zeroizing::new(new_password.to_string());
+        let password_hash = hash_password(&secret)?;
+        let user = self
+            .users
+            .get_mut(name)
+            .ok_or_else(|| AuthError::UnknownUser(name.to_string()))?;
+        user.password_hash = password_hash;
+        Ok(())
+    }
+
     /// Remove a user. Errors if the user is unknown.
     pub fn delete_user(&mut self, name: &str) -> Result<(), AuthError> {
         self.users
@@ -193,6 +208,27 @@ mod tests {
         assert!(!s.is_empty());
         s.delete_user("bob").unwrap();
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn set_password_changes_credential() {
+        let mut s = UserStore::new();
+        s.create_user("alice", "old", "readwrite").unwrap();
+        assert!(s.authenticate("alice", "old").is_some());
+        s.set_password("alice", "new").unwrap();
+        // Old password no longer works; new one does; role is preserved.
+        assert!(s.authenticate("alice", "old").is_none());
+        assert!(s.authenticate("alice", "new").is_some());
+        assert_eq!(s.authenticate("alice", "new").unwrap().role, "readwrite");
+    }
+
+    #[test]
+    fn set_password_unknown_user_rejected() {
+        let mut s = UserStore::new();
+        assert!(matches!(
+            s.set_password("ghost", "pw"),
+            Err(AuthError::UnknownUser(_))
+        ));
     }
 
     #[test]

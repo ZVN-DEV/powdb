@@ -255,6 +255,35 @@ fn build_tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Bootstrap an admin user from `POWDB_ADMIN_USER` / `POWDB_ADMIN_PASSWORD`.
+///
+/// Creates the user with role "admin" only when both values are present AND the
+/// user does not already exist. Returns `true` when a user was created (so the
+/// caller can persist + log). The password is never returned or logged.
+fn ensure_bootstrap_admin(
+    store: &mut powdb_auth::UserStore,
+    user: Option<String>,
+    pass: Option<String>,
+) -> bool {
+    let (Some(user), Some(pass)) = (user, pass) else {
+        return false;
+    };
+    if user.is_empty() || pass.is_empty() {
+        return false;
+    }
+    // Already present? Don't clobber an existing credential.
+    if store.list_users().iter().any(|(n, _)| n == &user) {
+        return false;
+    }
+    match store.create_user(&user, &pass, "admin") {
+        Ok(()) => true,
+        Err(e) => {
+            error!(error = %e, user = %user, "failed to bootstrap admin user");
+            false
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing. RUST_LOG overrides; default is info.
@@ -286,13 +315,32 @@ async fn main() {
     // Load the multi-user store from the same data dir. When it has users, the
     // handshake authenticates (username, password) against it; when empty the
     // server falls back to the shared-password behavior.
-    let users = match powdb_auth::UserStore::load(std::path::Path::new(&args.data_dir)) {
+    let mut users = match powdb_auth::UserStore::load(std::path::Path::new(&args.data_dir)) {
         Ok(u) => u,
         Err(e) => {
             error!(data_dir = %args.data_dir, error = %e, "failed to load user store (auth.json)");
             std::process::exit(1);
         }
     };
+    // Zero-CLI bootstrap: create an admin from POWDB_ADMIN_USER/PASSWORD when it
+    // doesn't already exist, then persist it. The password is never logged.
+    let admin_user = std::env::var("POWDB_ADMIN_USER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let admin_pass = std::env::var("POWDB_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if ensure_bootstrap_admin(&mut users, admin_user.clone(), admin_pass) {
+        match users.save(std::path::Path::new(&args.data_dir)) {
+            Ok(()) => {
+                info!(user = ?admin_user, "bootstrapped admin user from environment");
+            }
+            Err(e) => {
+                error!(error = %e, "failed to persist bootstrapped admin user");
+                std::process::exit(1);
+            }
+        }
+    }
     if !users.is_empty() {
         info!(users = users.len(), "multi-user authentication enabled");
     } else if args.password.is_none() {
@@ -513,6 +561,45 @@ mod tests {
     fn memory_limit_parses_explicit_value() {
         assert_eq!(parse_query_memory_limit(Some("1048576")), 1_048_576);
         assert_eq!(parse_query_memory_limit(Some("  4096  ")), 4096);
+    }
+
+    #[test]
+    fn bootstrap_admin_creates_when_both_set_and_absent() {
+        let mut store = powdb_auth::UserStore::new();
+        let created =
+            ensure_bootstrap_admin(&mut store, Some("root".into()), Some("secret".into()));
+        assert!(created);
+        assert!(store.authenticate("root", "secret").is_some());
+        assert_eq!(store.authenticate("root", "secret").unwrap().role, "admin");
+    }
+
+    #[test]
+    fn bootstrap_admin_noop_when_missing_inputs() {
+        let mut store = powdb_auth::UserStore::new();
+        assert!(!ensure_bootstrap_admin(&mut store, None, Some("p".into())));
+        assert!(!ensure_bootstrap_admin(&mut store, Some("u".into()), None));
+        assert!(!ensure_bootstrap_admin(&mut store, None, None));
+        assert!(!ensure_bootstrap_admin(
+            &mut store,
+            Some("".into()),
+            Some("p".into())
+        ));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_admin_does_not_clobber_existing() {
+        let mut store = powdb_auth::UserStore::new();
+        store.create_user("root", "original", "readonly").unwrap();
+        let created =
+            ensure_bootstrap_admin(&mut store, Some("root".into()), Some("different".into()));
+        assert!(!created);
+        // Existing credential + role preserved.
+        assert!(store.authenticate("root", "original").is_some());
+        assert_eq!(
+            store.authenticate("root", "original").unwrap().role,
+            "readonly"
+        );
     }
 
     /// The parsed env limit is actually applied to the constructed Engine.
