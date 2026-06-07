@@ -5,14 +5,21 @@ All notable changes to PowDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.5] - 2026-06-06
 
 ### Added
-- Full snapshot backup and restore (`powdb-cli backup` / `powdb-cli restore`), blake3-verified, crash-consistent via checkpoint. New `powdb-backup` crate.
-
-## [0.4.5] - 2026-06-05
-
-### Added
+- **Full snapshot backup & restore.** `powdb-cli backup <dest>` takes a
+  crash-consistent, blake3-verified full snapshot (checkpoint-then-copy of
+  `catalog.bin` + every heap + every index, plus an integrity `manifest.json`
+  recording each file's hash/size and the page-LSN the snapshot is consistent
+  at); `powdb-cli restore <backup> <dest>` re-verifies every file against the
+  manifest before writing and rebuilds a fresh data dir, validating by
+  reopening (which preserves the post-restore LSN invariant so writes made
+  after a restore survive a later crash). Offline / single-writer in this
+  release — do not back up a directory a live server has open. Incremental
+  backup, point-in-time restore, and cloud sync are planned (see
+  `docs/design/2026-06-05-backup-pitr-sync-migrations-plan.md`). New
+  `powdb-backup` crate; guide at `docs/backup-and-restore.md`.
 - **Multi-row INSERT.** `insert T { a := 1 }, { a := 2 }, { a := 3 }` inserts
   many rows in a single statement. This is the fastest durable way to bulk-load:
   one statement = N WAL appends + **one fsync** (vs one fsync per single-row
