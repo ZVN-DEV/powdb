@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     byte-patch fast path). Covered by a new `crates/query/tests/multi_row_insert.rs`
     suite (correctness, atomicity, transaction batching, plan-cache literal
     substitution across rows, 1000-row batches, memory budget, crash recovery).
+- **Incremental backup & chain / point-in-time restore.** `powdb-cli backup
+  <dest> --base <full_dir>` writes a **differential** backup against a full
+  base — only the 4 KB heap/index pages whose `page_lsn` is newer than the
+  base's high-water mark are stored (in `<name>.delta` sidecars), with the
+  catalog copied whole when it changed. `powdb-cli restore <full> <dest>
+  --apply <inc>...` chain-restores a full base plus one or more increments in
+  the order given, enabling **coarse point-in-time restore** (recover to the
+  state captured by the increment you stop at). The chain is verified before it
+  writes a usable database: **page-LSN continuity** (each increment's recorded
+  base LSN must match the running LSN) plus **blake3** on every delta /
+  whole-file copy, then a reopen-to-validate. Fine-grained (sub-increment) PITR
+  via WAL archiving and cloud sync remain future work. See
+  `docs/backup-and-restore.md`.
 
 ## [0.4.4] - 2026-06-04
 
