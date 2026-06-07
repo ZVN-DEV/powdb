@@ -11,13 +11,19 @@ use powdb_storage::types::Value;
 /// A fresh, non-existent temp path. `Engine::new` / `Catalog::open` create the
 /// directory on demand; `restore` creates its dest dir itself.
 fn tmp(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    // pid + atomic counter => unique even when the clock is too coarse to
+    // distinguish two parallel calls (macOS CI collided on nanos alone).
+    let uniq = CTR.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "powdb_rd_{tag}_{}_{}",
+        "powdb_rd_{tag}_{}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        uniq
     ));
     let _ = std::fs::remove_dir_all(&p);
     p

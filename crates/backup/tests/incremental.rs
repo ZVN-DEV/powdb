@@ -3,13 +3,20 @@ use powdb_storage::catalog::Catalog;
 use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    // pid + an atomic counter guarantee uniqueness across parallel test
+    // threads even when the system clock resolution is too coarse to
+    // distinguish two calls (macOS CI collided on nanos alone).
+    let uniq = CTR.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "powdb_inc_{tag}_{}_{}",
+        "powdb_inc_{tag}_{}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        uniq
     ));
     let _ = std::fs::remove_dir_all(&p);
     p
