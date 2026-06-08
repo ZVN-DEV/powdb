@@ -70,12 +70,19 @@ jobs:
     # whichever workload landed next to a noisy neighbour, tripping the
     # absolute thresholds at random (runs 27080564701, 27080616086,
     # 27081630605 each failed a *different* workload with no code change).
-    runs-on: depot-ubuntu-24.04
-    # Generous: a *cold* Depot cache rebuilds the whole release+bench tree
-    # (~10 min) before the ~8-min suite even starts. The previous 15-min cap
-    # killed the first run mid-suite, so it never saved the cache or uploaded
-    # estimates — leaving the next run cold too. With headroom the first run
-    # completes once, warms the Depot cache, and subsequent runs land in ~10.
+    #
+    # 4-CPU/16GB (not the 2-CPU default): the suite pins a core for ~minutes
+    # and the heavy workloads churn 100K-row fixtures; on the 2-CPU/8GB box
+    # that starved the Depot runner agent of CPU/memory and it lost contact
+    # with the server mid-suite (run 27115494068 died at ~18min). The spare
+    # core + double the RAM fixes it and ~halves wall time. Cost is moot: the
+    # bench gate is path-filtered to engine PRs and the rest of CI is free
+    # GitHub public runners, so monthly Depot usage stays inside the plan's
+    # included minutes regardless of size.
+    runs-on: depot-ubuntu-24.04-4
+    # Headroom for a one-time *cold* cache (full release+bench rebuild) before
+    # the suite starts. A 15-min cap killed the first runs mid-suite, so the
+    # cache never saved and the next run was cold too. Warm runs land in ~8.
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
