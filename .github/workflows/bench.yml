@@ -25,21 +25,26 @@ concurrency:
 jobs:
   bench:
     name: criterion + regression gate
-    runs-on: ubuntu-24.04
+    # Depot single-tenant runners: a dedicated CPU per job (no noisy
+    # neighbours) on a consistent host CPU model. This is what makes the
+    # criterion gate trustworthy — GitHub's shared `ubuntu-24.04` pool is a
+    # heterogeneous mix of Azure VMs whose per-job timing swung ±30–56% on
+    # whichever workload landed next to a noisy neighbour, tripping the
+    # absolute thresholds at random (runs 27080564701, 27080616086,
+    # 27081630605 each failed a *different* workload with no code change).
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
       # Override `.cargo/config.toml`'s `-C target-cpu=native` with a
       # portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT).
-      # GitHub Actions `ubuntu-24.04` runners are a heterogeneous pool of
-      # Azure VMs with different host CPUs. `target-cpu=native` bakes
-      # host-specific instructions (up to AVX-512 on Sapphire Rapids) into
-      # the binary, which then SIGILLs when cargo's cache serves that
-      # binary to a subsequent job running on an older CPU. `x86-64-v2`
-      # is the widest baseline that still lets crc32fast use its SSE4.2
-      # SIMD path (runtime-detected), so there's no perf floor lost on
-      # the WAL path.
+      # Even on Depot's consistent hosts we keep this conservative: the
+      # cargo `target/` cache is keyed on Cargo.lock, not CPU model, so a
+      # cached binary built with `target-cpu=native` could still SIGILL if
+      # Depot ever shifts the underlying CPU class. `x86-64-v2` is the
+      # widest baseline that still lets crc32fast use its SSE4.2 SIMD path
+      # (runtime-detected), so there's no perf floor lost on the WAL path.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
     steps:
@@ -76,8 +81,11 @@ jobs:
       - name: Run regression gate comparator
         run: cargo run -p powdb-bench --bin compare --quiet
 
-      - name: Upload criterion estimates on failure
-        if: failure()
+      # Always upload (not just on failure): the estimates are how we
+      # re-center `baseline/main.json` on the current runner hardware and
+      # diagnose a flake after the fact. They're tiny (~10KB).
+      - name: Upload criterion estimates
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: criterion-estimates
