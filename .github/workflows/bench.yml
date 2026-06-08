@@ -14,7 +14,8 @@ on:
   push:
     branches: [main]
 
-permissions: {}
+permissions:
+  contents: read
 
 # Cancel in-progress runs on the same branch when a new commit lands. Bench
 # runs are expensive and the older one's results would be wasted anyway.
@@ -23,8 +24,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Cheap gate: only the storage/query/bench crates can move the numbers
+  # (powdb-bench depends on nothing else), so a PR that doesn't touch them
+  # cannot regress the benchmark. Skip the ~10-min Depot build+suite for
+  # docs/CI/server/cli/auth/deps PRs entirely. This is a JOB-level skip
+  # (via `needs` + `if`), NOT a workflow-level `on.paths` filter — a
+  # job-level skip reports the required "criterion + regression gate" check
+  # as passed, whereas an `on.paths` skip would leave it pending forever and
+  # block the merge.
+  changes:
+    name: detect engine changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Filter engine paths
+        id: filter
+        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        with:
+          filters: |
+            engine:
+              - 'crates/storage/**'
+              - 'crates/query/**'
+              - 'crates/bench/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/bench.yml'
+
   bench:
     name: criterion + regression gate
+    needs: changes
+    if: ${{ needs.changes.outputs.engine == 'true' }}
     # Depot single-tenant runners: a dedicated CPU per job (no noisy
     # neighbours) on a consistent host CPU model. This is what makes the
     # criterion gate trustworthy — GitHub's shared `ubuntu-24.04` pool is a
@@ -33,7 +71,12 @@ jobs:
     # absolute thresholds at random (runs 27080564701, 27080616086,
     # 27081630605 each failed a *different* workload with no code change).
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 15
+    # Generous: a *cold* Depot cache rebuilds the whole release+bench tree
+    # (~10 min) before the ~8-min suite even starts. The previous 15-min cap
+    # killed the first run mid-suite, so it never saved the cache or uploaded
+    # estimates — leaving the next run cold too. With headroom the first run
+    # completes once, warms the Depot cache, and subsequent runs land in ~10.
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
