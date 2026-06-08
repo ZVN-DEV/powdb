@@ -87,6 +87,16 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      # Run the bench's temp databases on tmpfs (RAM-backed). PowDB scans the
+      # heap with mmap; mmap page-faults are pathologically slow on Depot's
+      # overlay runner filesystem (the suite ran 3× slower than on GitHub's
+      # local NVMe — ~18min vs ~6min — and blocked in I/O-wait long enough
+      # that the Depot runner agent missed heartbeats and the job was killed,
+      # runs 27115494068 + 27116378505). /dev/shm is tmpfs (~half of the
+      # 16GB), vastly more than the few-MB fixtures need, so mmap faults hit
+      # RAM. Bonus: removes disk I/O as a benchmark noise source. tempfile's
+      # TempDir::new() honours TMPDIR.
+      TMPDIR: /dev/shm
       # Override `.cargo/config.toml`'s `-C target-cpu=native` with a
       # portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT).
       # Even on Depot's consistent hosts we keep this conservative: the
