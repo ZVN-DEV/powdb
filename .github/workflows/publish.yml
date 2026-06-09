@@ -90,6 +90,30 @@ jobs:
             sleep 30
           fi
 
+      # powdb-auth is a leaf (argon2 etc., no powdb deps) but powdb-server
+      # depends on it, so it must reach crates.io before the server.
+      - name: Publish powdb-auth
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p powdb-auth --dry-run
+          else
+            cargo publish -p powdb-auth
+            echo "Waiting for crates.io to index powdb-auth..."
+            sleep 30
+          fi
+
+      # powdb-backup depends on storage+query (both already published above)
+      # and powdb-cli depends on backup, so it must precede the cli.
+      - name: Publish powdb-backup
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p powdb-backup --dry-run
+          else
+            cargo publish -p powdb-backup
+            echo "Waiting for crates.io to index powdb-backup..."
+            sleep 30
+          fi
+
       - name: Publish powdb-server
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
@@ -117,6 +141,8 @@ jobs:
             echo "## Published to crates.io" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-storage v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-query v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-auth v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-backup v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-server v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-cli v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           fi
