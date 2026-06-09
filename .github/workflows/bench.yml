@@ -1,110 +1,36 @@
 name: bench
 
-# PowDB regression gate. Runs the criterion suite on every PR to main and on
-# pushes to main. Comparator exits non-zero on regression beyond the gate
-# thresholds (7% per-workload absolute, 2.5x ratio ceiling on the thesis
-# metric).
+# Heavy criterion microbenchmark suite — DELIBERATELY NOT in the required
+# CI / release pipeline.
 #
-# See docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md
-# and the "Bench regression gate" section of AGENTS.md.
-
+# Why it's manual-only:
+#   - It's slow (~6 min on GitHub NVMe, far worse on overlay-FS runners) and
+#     resource-heavy (mmap-based heap scans), so it's a poor merge gate.
+#   - On shared runners the absolute thresholds are dominated by per-VM
+#     timing noise (±30–56%), producing false regressions.
+#   - powdb-bench depends only on powdb-storage + powdb-query, so it gates
+#     nothing the normal CI suite doesn't already cover for correctness.
+#
+# How to use it: trigger on demand (Actions tab → "bench" → Run workflow, or
+# `gh workflow run bench.yml`). For trustworthy numbers, run it on real,
+# single-tenant deployment hardware rather than a shared CI runner. It is NOT
+# a required status check on `main`.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel in-progress runs on the same branch when a new commit lands. Bench
-# runs are expensive and the older one's results would be wasted anyway.
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # Cheap gate: only the storage/query/bench crates can move the numbers
-  # (powdb-bench depends on nothing else), so a PR that doesn't touch them
-  # cannot regress the benchmark. Skip the ~10-min Depot build+suite for
-  # docs/CI/server/cli/auth/deps PRs entirely. This is a JOB-level skip
-  # (via `needs` + `if`), NOT a workflow-level `on.paths` filter — a
-  # job-level skip reports the required "criterion + regression gate" check
-  # as passed, whereas an `on.paths` skip would leave it pending forever and
-  # block the merge.
-  changes:
-    name: detect engine changes
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      engine: ${{ steps.filter.outputs.engine }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-      - name: Filter engine paths
-        id: filter
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
-        with:
-          filters: |
-            engine:
-              - 'crates/storage/**'
-              - 'crates/query/**'
-              - 'crates/bench/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/bench.yml'
-
   bench:
-    name: criterion + regression gate
-    needs: changes
-    if: ${{ needs.changes.outputs.engine == 'true' }}
-    # Depot single-tenant runners: a dedicated CPU per job (no noisy
-    # neighbours) on a consistent host CPU model. This is what makes the
-    # criterion gate trustworthy — GitHub's shared `ubuntu-24.04` pool is a
-    # heterogeneous mix of Azure VMs whose per-job timing swung ±30–56% on
-    # whichever workload landed next to a noisy neighbour, tripping the
-    # absolute thresholds at random (runs 27080564701, 27080616086,
-    # 27081630605 each failed a *different* workload with no code change).
-    #
-    # 4-CPU/16GB (not the 2-CPU default): the suite pins a core for ~minutes
-    # and the heavy workloads churn 100K-row fixtures; on the 2-CPU/8GB box
-    # that starved the Depot runner agent of CPU/memory and it lost contact
-    # with the server mid-suite (run 27115494068 died at ~18min). The spare
-    # core + double the RAM fixes it and ~halves wall time. Cost is moot: the
-    # bench gate is path-filtered to engine PRs and the rest of CI is free
-    # GitHub public runners, so monthly Depot usage stays inside the plan's
-    # included minutes regardless of size.
-    runs-on: depot-ubuntu-24.04-4
-    # Headroom for a one-time *cold* cache (full release+bench rebuild) before
-    # the suite starts. A 15-min cap killed the first runs mid-suite, so the
-    # cache never saved and the next run was cold too. Warm runs land in ~8.
+    name: criterion + regression gate (manual)
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      # Run the bench's temp databases on tmpfs (RAM-backed). PowDB scans the
-      # heap with mmap; mmap page-faults are pathologically slow on Depot's
-      # overlay runner filesystem (the suite ran 3× slower than on GitHub's
-      # local NVMe — ~18min vs ~6min — and blocked in I/O-wait long enough
-      # that the Depot runner agent missed heartbeats and the job was killed,
-      # runs 27115494068 + 27116378505). /dev/shm is tmpfs (~half of the
-      # 16GB), vastly more than the few-MB fixtures need, so mmap faults hit
-      # RAM. Bonus: removes disk I/O as a benchmark noise source. tempfile's
-      # TempDir::new() honours TMPDIR.
-      TMPDIR: /dev/shm
-      # Override `.cargo/config.toml`'s `-C target-cpu=native` with a
-      # portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT).
-      # Even on Depot's consistent hosts we keep this conservative: the
-      # cargo `target/` cache is keyed on Cargo.lock, not CPU model, so a
-      # cached binary built with `target-cpu=native` could still SIGILL if
-      # Depot ever shifts the underlying CPU class. `x86-64-v2` is the
-      # widest baseline that still lets crc32fast use its SSE4.2 SIMD path
-      # (runtime-detected), so there's no perf floor lost on the WAL path.
+      # Portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT) so a
+      # cached binary can't SIGILL across the shared pool's CPU generations.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
     steps:
@@ -121,10 +47,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Cache key is suffixed `-v2` to bust any stale `target/` built
-          # under `target-cpu=native` on a previous runner — the old cache
-          # contained a binary with AVX-512 instructions that crashed on
-          # Skylake-era runners (see SIGILL on run 24210833296).
           key: bench-${{ runner.os }}-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             bench-${{ runner.os }}-v2-
@@ -141,9 +63,6 @@ jobs:
       - name: Run regression gate comparator
         run: cargo run -p powdb-bench --bin compare --quiet
 
-      # Always upload (not just on failure): the estimates are how we
-      # re-center `baseline/main.json` on the current runner hardware and
-      # diagnose a flake after the fact. They're tiny (~10KB).
       - name: Upload criterion estimates
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

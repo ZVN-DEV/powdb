@@ -92,7 +92,5 @@ If the planner emits a different shape for the same logical operation, the fast 
 ## CI
 
 Two workflow files:
-- `.github/workflows/ci.yml` — clippy + fmt + test
-- `.github/workflows/bench.yml` — criterion regression gate
-
-Both are required status checks on `main`.
+- `.github/workflows/ci.yml` — clippy + fmt + test (+ ASan, miri, fuzz, cargo audit, MSRV, examples). **Required status checks on `main`.**
+- `.github/workflows/bench.yml` — criterion microbenchmark suite. **Manual-only (`workflow_dispatch`), NOT a required gate.** It's slow and noise-dominated on shared runners, and `powdb-bench` only depends on `powdb-storage`+`powdb-query`, so it gates nothing the normal suite doesn't already cover. Run it on demand (`gh workflow run bench.yml`), ideally on real single-tenant deployment hardware, when you want a perf check.
