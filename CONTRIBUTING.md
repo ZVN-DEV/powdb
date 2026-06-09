@@ -29,6 +29,8 @@ cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --f
 ```
 crates/storage   # slotted pages, B+ tree, WAL, buffer pool, catalog
 crates/query     # lexer, parser, planner, executor (Engine)
+crates/auth      # user store, roles, argon2id password hashing
+crates/backup    # offline backup/restore (full, incremental, PITR)
 crates/server    # Tokio TCP server + binary wire protocol
 crates/cli       # rustyline REPL (embedded + remote mode)
 crates/bench     # criterion benchmarks + regression gate
@@ -49,7 +51,7 @@ clients/ts       # TypeScript client + demo
 ### Branch protection on `main`
 
 - PRs are required (no direct pushes)
-- 7 status checks must pass: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, and the bench regression gate
+- 7 status checks must pass, all from `ci.yml`: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, and examples-smoke
 - Force-push is rejected by branch protection
 
 Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work** — routine work goes through PRs even when bypass is technically available.
@@ -74,11 +76,13 @@ PRs must pass these gates (see `.github/workflows/`):
 - **asan** — AddressSanitizer run
 - **audit** — `cargo audit` against the advisory database
 - **msrv-consistency** — verifies the declared MSRV (`1.93`) builds
-- **criterion + regression gate** — benchmark must not regress beyond thresholds (`.github/workflows/bench.yml`)
+- **examples-smoke** — terraform validate + compose config + dev.sh cycle on the deploy examples
+
+The criterion benchmark suite (`.github/workflows/bench.yml`) is **manual-only** (`workflow_dispatch`) and is *not* a required PR gate — shared-runner noise makes it unreliable as a blocking check. Run the regression gate locally instead (below).
 
 ## Benchmark Regression Gate
 
-The criterion gate compares each workload's median against baselines in `crates/bench/baseline/main.json`. Thresholds vary by workload (7-20%).
+The criterion gate compares each workload's median against baselines in `crates/bench/baseline/main.json`. Thresholds vary by workload (7-20%). Run it locally with `cargo bench -p powdb-bench && cargo run -p powdb-bench --bin compare`, or on demand in CI with `gh workflow run bench.yml`.
 
 If you intentionally change performance characteristics:
 ```bash

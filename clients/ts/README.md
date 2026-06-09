@@ -243,6 +243,11 @@ Returns a `Promise<Client>`. Options:
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
 
+> **Multi-user servers:** PowDB server 0.4.5 added named users with roles. The
+> 0.3.x client has no `user` option, so it **cannot authenticate to a server
+> running in multi-user mode** (the server requires a username once any user
+> is defined). Shared-password mode (`POWDB_PASSWORD`) works as before.
+
 ### `client.query(query, opts?)`
 
 Sends a PowQL query and returns a `Promise<QueryResult>`:

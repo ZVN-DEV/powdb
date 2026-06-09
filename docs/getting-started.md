@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.4.4 — embedded mode
+PowDB v0.4.5 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit.
 
@@ -118,6 +118,8 @@ Fields without `required` can be omitted -- they default to null:
 powql> insert User { name := "Grace", email := "grace@example.com" }
 1 row affected
 ```
+
+> **Multi-row insert:** you can also insert many rows in one statement by separating row blocks with commas -- `insert User { ... }, { ... }, { ... }`. One statement means one WAL fsync and one network round trip, and validation is all-or-nothing. See [INSERT in the PowQL reference](POWQL.md#insert).
 
 > **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- they share a single fsync at commit and run dozens of times faster, still fully durable. See [Transactions](POWQL.md#transactions).
 
@@ -443,15 +445,15 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.4.4 — remote mode
+PowDB v0.4.5 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `main` (server v0.4.4)
+Connected to db `main` (server v0.4.5)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>
 ```
 
-From here, the same PowQL statements work as embedded mode. Some status messages are normalized by the wire protocol -- for example, DDL statements return an affected-row status such as `0 rows affected` in remote mode instead of the embedded REPL's `type User created` message. The server handles concurrent readers and uses a write-ahead log for durability.
+From here, the same PowQL statements work as embedded mode -- DDL statements return the same friendly status messages too (e.g. `type User created`). The server handles concurrent readers and uses a write-ahead log for durability.
 
 ### Password authentication
 
@@ -532,3 +534,5 @@ relying on the bootstrap env vars.
 This tutorial covered the basics: tables, inserts, queries, aggregates, updates, indexes, and deletes. PowDB supports much more, including joins, group by, subqueries, materialized views, and set operations.
 
 See the full language reference: [PowQL Reference](POWQL.md)
+
+Running in production? Set up backups: [Backup & restore](backup-and-restore.md) covers full and incremental backups plus coarse point-in-time recovery (offline -- stop the server first).

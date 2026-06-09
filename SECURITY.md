@@ -4,7 +4,8 @@
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.4.4           | :white_check_mark: |
+| 0.4.5           | :white_check_mark: |
+| 0.4.4           | :x: (superseded)   |
 | 0.4.1 – 0.4.3   | :x: (yanked)       |
 | 0.4.0           | :white_check_mark: |
 | 0.3.x           | :white_check_mark: |
@@ -14,7 +15,7 @@
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
 > recovery and have been replaced by **v0.4.4**, which adds a permanent
 > durability regression suite. If you are on any of those three versions,
-> upgrade to 0.4.4. See `CHANGELOG.md` for details.
+> upgrade to the latest release (0.4.5). See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability
 
@@ -52,15 +53,20 @@ When both are set, the server requires TLS for all connections. When unset, the 
 
 ## Authentication
 
-PowDB uses single-password authentication via the `POWDB_PASSWORD` environment variable. When set, clients must authenticate before executing queries.
+PowDB supports two authentication modes:
+
+1. **Shared password** — set the `POWDB_PASSWORD` environment variable. All clients authenticate with the same shared secret. Applies only when no named users are defined.
+2. **Named users with roles** (since 0.4.5) — users with `admin`, `readwrite`, or `readonly` roles, managed via `powdb-cli useradd` / `passwd` / `userdel`. Passwords are stored as argon2id hashes only (`auth.json` in the data directory, `0600` on Unix). When `POWDB_ADMIN_USER` and `POWDB_ADMIN_PASSWORD` are both set, the server bootstraps an initial admin on startup without the CLI. Once any user is defined, the shared password is no longer used.
+
+In both modes:
 
 - **Rate limiting**: authentication attempts are rate-limited to prevent brute-force attacks.
 - **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
 - **Connection limits**: the server enforces a maximum number of concurrent connections.
 
-There is no per-user auth or RBAC. The password should be treated as a shared secret for all clients connecting to a given server instance.
+> **Note on the `readonly` role:** in releases up to and including 0.4.5, role storage is in place but read-only restrictions are **not enforced** at the query layer — do not rely on the `readonly` role as a security boundary against writes on those versions. Enforcement at the server dispatch layer ships in the next release: write statements from `readonly` users are rejected with `permission denied`, and unknown roles fail closed.
 
 ## Known Limitations
 
-- Authentication is single-password. There is no per-user auth or RBAC.
-- The query parser has a nesting depth limit but no query timeout mechanism yet.
+- Roles are coarse (`admin` / `readwrite` / `readonly`). There are no per-table ACLs, row-level security, or multi-tenant isolation; `readonly` enforcement is absent in ≤0.4.5 (see note above).
+- The query parser has a nesting depth limit. Runaway queries are bounded by `POWDB_QUERY_TIMEOUT` (default 30s) and the per-query memory budget (`POWDB_QUERY_MEMORY_LIMIT`).

@@ -28,10 +28,20 @@ Notes:
 - `min_machines_running = 1` keeps the database always-on; `auto_stop_machines`
   is `false` so Fly never suspends a stateful service.
 
-## Docker / Compose
+## Docker
 
-See [`docker-compose.yml`](https://github.com/zvndev/powdb/blob/main/docker-compose.yml)
-in the repo root for a local-only quick-start.
+Quick-start with the published image (note: the repo-root `docker-compose.yml`
+is the benchmark harness — it does not define a PowDB service):
+
+```bash
+docker run -d --name powdb \
+  -p 5433:5433 \
+  -v powdb_data:/data \
+  -e POWDB_DATA=/data \
+  -e POWDB_BIND=0.0.0.0 \
+  -e POWDB_PASSWORD=change-me \
+  ghcr.io/zvn-dev/powdb:v0.4.5
+```
 
 ## AWS ECS Fargate + EFS
 

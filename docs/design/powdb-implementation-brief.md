@@ -1,5 +1,7 @@
 # PowDB: Complete implementation brief
 
+> **Historical design doc (pre-implementation).** For current architecture see `CLAUDE.md` / `AGENTS.md`.
+
 This document contains everything needed to implement PowDB from scratch.
 It is the single source of truth — all architectural decisions are backed by
 production benchmarks and explained with rationale.

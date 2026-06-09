@@ -28,13 +28,14 @@ async function main() {
 
   try {
     // Use a unique table name per run so reruns don't collide on a
-    // persistent server. PowQL doesn't have DROP TABLE (yet).
+    // persistent server. (PowQL has `drop <Table>`, but a unique name keeps
+    // the demo side-effect free even if a run is interrupted.)
     const tableName = `Demo${Date.now().toString(36)}`;
     const table = ident(tableName);
     console.log(`→ creating type ${tableName}`);
     await run(
       client,
-      powql`type ${table} { required name: string, required age: int, city: string }`,
+      powql`type ${table} { required name: str, required age: int, city: str }`,
     );
 
     console.log(`→ inserting rows`);
@@ -100,6 +101,9 @@ function printResult(result: QueryResult): void {
       break;
     case "ok":
       console.log(`  → ok (${result.affected} affected)`);
+      break;
+    case "message":
+      console.log(`  → ${result.message}`);
       break;
   }
 }

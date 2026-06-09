@@ -20,9 +20,9 @@
       <a href="getting-started.html">Getting Started</a>
       <a href="powql.html">PowQL Reference</a>
       <a href="#benchmarks">Benchmarks</a>
-      <a href="https://github.com/zvndev/powdb/releases" target="_blank" rel="noopener">Releases</a>
-      <a href="https://github.com/zvndev/powdb/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
-      <a href="https://github.com/zvndev/powdb" class="nav-github" target="_blank" rel="noopener">
+      <a href="https://github.com/ZVN-DEV/powdb/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://github.com/ZVN-DEV/powdb/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
+      <a href="https://github.com/ZVN-DEV/powdb" class="nav-github" target="_blank" rel="noopener">
         <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         GitHub
       </a>
@@ -40,7 +40,7 @@
     </p>
     <div class="hero-actions">
       <a href="getting-started.html" class="btn btn-primary">Get Started</a>
-      <a href="https://github.com/zvndev/powdb" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      <a href="https://github.com/ZVN-DEV/powdb" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
     </div>
     <div class="install-block">
       <span class="prompt">$</span> cargo install powdb-cli
@@ -52,7 +52,7 @@
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows. Both engines in memory-mode. Real numbers, no cherry-picking.</p>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows. Both engines in memory-mode. All 14 workloads — real numbers, no cherry-picking.</p>
     <table>
       <thead>
         <tr>
@@ -116,6 +116,36 @@
           <td>93ns</td>
           <td>282ns</td>
           <td class="speedup">3.0x</td>
+        </tr>
+        <tr>
+          <td>multi_col_and_filter</td>
+          <td>2.22ms</td>
+          <td>4.70ms</td>
+          <td class="speedup">2.1x</td>
+        </tr>
+        <tr>
+          <td>insert_batch_1k</td>
+          <td>238ns</td>
+          <td>320ns</td>
+          <td class="speedup">1.3x</td>
+        </tr>
+        <tr>
+          <td>delete_by_filter</td>
+          <td>1.76ms</td>
+          <td>2.35ms</td>
+          <td class="speedup">1.3x</td>
+        </tr>
+        <tr>
+          <td>scan_filter_project_top100</td>
+          <td>9.6&micro;s</td>
+          <td>12.7&micro;s</td>
+          <td class="speedup">1.3x</td>
+        </tr>
+        <tr>
+          <td>point_lookup_nonindexed</td>
+          <td>350&micro;s</td>
+          <td>432&micro;s</td>
+          <td class="speedup">1.2x</td>
         </tr>
       </tbody>
     </table>
@@ -221,7 +251,7 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
       </div>
       <div class="feature-card">
         <h3>B+ Tree Indexes</h3>
-        <p>Disk-persisted B+ tree indexes in a custom BIDX binary format. Point lookups resolve in under 150ns. Indexes survive restarts and are used automatically.</p>
+        <p>Disk-persisted B+ tree indexes in a custom BIDX binary format. Indexed point lookups resolve in under 100ns. Indexes survive restarts and are used automatically.</p>
       </div>
       <div class="feature-card">
         <h3>WAL + Crash Recovery</h3>
@@ -237,7 +267,7 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
       </div>
       <div class="feature-card">
         <h3>TLS + Authentication</h3>
-        <p>Production-ready security with TLS encryption and password authentication. Set <code>POWDB_PASSWORD</code> to lock down your server.</p>
+        <p>TLS encryption plus two auth modes: a shared password (<code>POWDB_PASSWORD</code>) or named users with roles (admin / readwrite / readonly, argon2id-hashed) shipped in v0.4.5.</p>
       </div>
       <div class="feature-card">
         <h3>Zero C Dependencies</h3>
@@ -248,6 +278,21 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
         <p>PowQL reads left to right: table, filter, order, limit, project. No inside-out clause structure. Queries read like sentences.</p>
       </div>
     </div>
+  </div>
+</section>
+
+<!-- When PowDB is not the right fit -->
+<section class="compare-section">
+  <div class="container">
+    <h2>When PowDB is not the right fit</h2>
+    <p class="section-subtitle">PowDB is pre-1.0 and deliberately scoped. Be honest with yourself before adopting it:</p>
+    <ul style="max-width: 720px; margin: 0 auto; padding-left: 24px; line-height: 1.8;">
+      <li><strong>Pre-1.0 format stability</strong> -- the on-disk format may shift across minor versions. Pin versions and expect to re-import on upgrades until 1.0.</li>
+      <li><strong>No SQL compatibility</strong> -- PowQL is a different language by design. No ORMs, BI dashboards, JDBC drivers, or DB browsers will speak to it.</li>
+      <li><strong>Single-node only</strong> -- no replication, sharding, or consensus.</li>
+      <li><strong>No MVCC, no online backup</strong> -- single writer with parallel readers; backups (full, incremental, PITR) are offline-only today.</li>
+    </ul>
+    <p class="section-subtitle" style="margin-top: 24px;">If any of those are dealbreakers, use SQLite -- and we say so plainly in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/powdb-vs-sqlite.md" target="_blank" rel="noopener">PowDB vs SQLite: when to use which</a>.</p>
   </div>
 </section>
 

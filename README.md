@@ -1,7 +1,6 @@
 # PowDB
 
 [![CI](https://github.com/zvndev/powdb/actions/workflows/ci.yml/badge.svg)](https://github.com/zvndev/powdb/actions/workflows/ci.yml)
-[![bench](https://github.com/zvndev/powdb/actions/workflows/bench.yml/badge.svg)](https://github.com/zvndev/powdb/actions/workflows/bench.yml)
 [![crates.io](https://img.shields.io/crates/v/powdb-cli.svg)](https://crates.io/crates/powdb-cli)
 [![docs.rs](https://img.shields.io/docsrs/powdb-query)](https://docs.rs/powdb-query)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)](https://github.com/zvndev/powdb/blob/main/Cargo.toml)
@@ -30,7 +29,7 @@ Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to 
 | Filter + project | `SELECT name, age FROM User WHERE age > 25` | `User filter .age > 25 { .name, .age }` |
 | Sort + limit | `SELECT * FROM User ORDER BY age DESC LIMIT 10` | `User order .age desc limit 10` |
 | Aggregate with filter | `SELECT AVG(age) FROM User WHERE city = 'NYC'` | `avg(User filter .city = "NYC" { .age })` |
-| Group + having | `SELECT status, COUNT(*) FROM User GROUP BY status HAVING COUNT(*) > 5` | `User group .status having count(*) > 5 { .status, count(*) }` |
+| Group + having | `SELECT status, COUNT(name) FROM User GROUP BY status HAVING COUNT(name) > 5` | `User group .status having count(.name) > 5 { .status, n: count(.name) }` |
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
 
@@ -43,7 +42,7 @@ Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/ma
 cargo install powdb-cli
 cargo install powdb-server
 
-# TypeScript client (Node 18+)
+# TypeScript client (Node 18+) — versions independently of the server crates (currently 0.3.x)
 npm install @zvndev/powdb-client
 
 # Prebuilt binaries (linux x86_64, macos aarch64)
@@ -201,10 +200,14 @@ if (result.kind === "rows") console.table(result.rows);
 | Variable | Default | Description |
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
+| `POWDB_BIND` | `127.0.0.1` | Interface to bind; set `0.0.0.0` behind a platform proxy (Fly, Railway) |
 | `POWDB_DATA` | `./powdb_data` | Data directory (heap files, WAL, catalog, indexes) |
 | `POWDB_PASSWORD` | *(none)* | Shared password required on connect when no named users are defined (set as env var) |
 | `POWDB_ADMIN_USER` / `POWDB_ADMIN_PASSWORD` | *(none)* | Bootstrap an `admin` user on startup when both are set and that user does not yet exist (password never logged) |
+| `POWDB_TLS_CERT` / `POWDB_TLS_KEY` | *(none)* | Paths to PEM cert + key; when both are set the server serves TLS |
 | `POWDB_REQUIRE_TLS` | *(off)* | When set (`1`/`true`), refuse to start if a password is configured without TLS |
+| `POWDB_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
+| `POWDB_QUERY_TIMEOUT` | `30` | Per-query timeout in seconds |
 | `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
@@ -232,6 +235,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Memory-mapped reads (zero-syscall scan path)
 - Compiled integer predicates (branch-free filter at the byte level)
 - Thread-safe concurrent reads via pread(2)/pwrite(2)
+- Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore` — see [docs/backup-and-restore.md](docs/backup-and-restore.md))
 
 **Query engine**
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
@@ -273,6 +277,8 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 crates/
   storage/   Heap files, B+tree, WAL, catalog, page cache, row encoding
   query/     Lexer, parser, planner, executor (Engine), plan cache
+  auth/      User store, roles, argon2id password hashing
+  backup/    Offline backup/restore (full, incremental, PITR)
   server/    Tokio TCP server + binary wire protocol
   cli/       Interactive REPL (embedded + remote modes)
   bench/     Criterion benchmarks + regression gate
@@ -283,12 +289,14 @@ The engine is `powdb_query::executor::Engine`. It owns a `Catalog` (which owns `
 
 ## Benchmarks
 
-PowDB has a CI-enforced regression gate that blocks PRs to `main` if any workload regresses beyond its threshold. Run locally:
+PowDB has a benchmark regression gate that compares every workload against checked-in baselines. Run it locally before and after touching a hot path:
 
 ```bash
 cargo bench -p powdb-bench              # criterion suite (~60s)
 cargo run --release -p powdb-bench --bin compare   # regression gate
 ```
+
+The gate also runs on-demand in CI via `workflow_dispatch` (`.github/workflows/bench.yml`) — it is **not** a required PR gate, because shared-runner noise makes it unreliable as a blocking check. The required PR gates live in `ci.yml`.
 
 Run the PowDB vs SQLite comparison bench:
 
