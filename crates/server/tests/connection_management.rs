@@ -30,6 +30,7 @@ fn encode_connect(db: &str) -> Vec<u8> {
     Message::Connect {
         db_name: db.to_string(),
         password: None,
+        username: None,
     }
     .encode()
 }
@@ -38,6 +39,7 @@ fn encode_connect_with_password(db: &str, password: &str) -> Vec<u8> {
     Message::Connect {
         db_name: db.to_string(),
         password: Some(zeroize::Zeroizing::new(password.to_string())),
+        username: None,
     }
     .encode()
 }
@@ -89,6 +91,7 @@ async fn start_single_conn_server(
             ConnOpts {
                 engine,
                 expected_password: expected_password.map(zeroize::Zeroizing::new),
+                users: Arc::new(powdb_auth::UserStore::new()),
                 shutdown_rx: &mut rx,
                 idle_timeout,
                 query_timeout,
@@ -130,6 +133,7 @@ async fn start_multi_conn_server(
                     ConnOpts {
                         engine: eng,
                         expected_password: pw.map(zeroize::Zeroizing::new),
+                        users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
                         idle_timeout,
                         query_timeout,
@@ -332,6 +336,7 @@ async fn test_max_connections_backpressure() {
                     ConnOpts {
                         engine: eng2,
                         expected_password: None,
+                        users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(5),
                         query_timeout: Duration::from_secs(5),

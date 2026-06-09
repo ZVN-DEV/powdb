@@ -1,4 +1,5 @@
 use crate::protocol::Message;
+use powdb_auth::UserStore;
 use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
@@ -80,6 +81,76 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// An authenticated connection's identity, carried alongside the session for
+/// later per-operation RBAC enforcement (Slice 3). For now it is bound at
+/// connect time and logged; it is not yet consulted per query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    pub name: String,
+    pub role: String,
+}
+
+/// Result of the connect-time authentication decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Authenticated. `principal` is `Some` when a named user authenticated via
+    /// the UserStore, and `None` for the legacy shared-password / open paths
+    /// where there is no per-user identity.
+    Authenticated { principal: Option<Principal> },
+    /// Rejected. The caller sends a generic "authentication failed" error and
+    /// records a rate-limit failure — it must not reveal which check failed.
+    Rejected,
+}
+
+/// Pure, exhaustively-testable authentication decision for a CONNECT handshake.
+///
+/// Policy:
+/// - If `users` has at least one user, multi-user auth is in force: a
+///   `username` is required and `users.authenticate(username, password)` must
+///   succeed. Unknown user, wrong password, or a missing username all reject
+///   with an indistinguishable `Rejected` (no user-vs-password leak).
+/// - If `users` is empty, fall back verbatim to the legacy behavior: when
+///   `expected_password` is `Some`, the candidate must match it (constant time);
+///   when `None`, no auth is required (open). The `username` is ignored here so
+///   that a new client talking to a shared-password server still connects.
+pub fn authenticate_connect(
+    users: &UserStore,
+    expected_password: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> AuthOutcome {
+    if !users.is_empty() {
+        // Multi-user mode: a username is mandatory.
+        let Some(name) = username else {
+            return AuthOutcome::Rejected;
+        };
+        let Some(candidate) = password else {
+            return AuthOutcome::Rejected;
+        };
+        match users.authenticate(name, candidate) {
+            Some(user) => AuthOutcome::Authenticated {
+                principal: Some(Principal {
+                    name: user.name.clone(),
+                    role: user.role.clone(),
+                }),
+            },
+            None => AuthOutcome::Rejected,
+        }
+    } else {
+        // Legacy shared-password fallback (byte-identical to prior behavior).
+        match expected_password {
+            Some(expected) => {
+                if password.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes())) {
+                    AuthOutcome::Authenticated { principal: None }
+                } else {
+                    AuthOutcome::Rejected
+                }
+            }
+            None => AuthOutcome::Authenticated { principal: None },
+        }
+    }
+}
+
 /// Error messages that are safe to forward to the client verbatim.
 const SAFE_ERROR_PREFIXES: &[&str] = &[
     "table not found",
@@ -134,6 +205,10 @@ pub struct ConnOpts<'a> {
     /// Expected client password. Wrapped in `Zeroizing` so the secret is wiped
     /// from memory on drop (defends against leaking via a core dump).
     pub expected_password: Option<Zeroizing<String>>,
+    /// Multi-user store loaded from the data dir at startup. When it has users,
+    /// the handshake authenticates `(username, password)` against it; when empty
+    /// the server falls back to `expected_password`. Shared across connections.
+    pub users: Arc<UserStore>,
     pub shutdown_rx: &'a mut watch::Receiver<bool>,
     pub idle_timeout: Duration,
     pub query_timeout: Duration,
@@ -177,6 +252,7 @@ where
     let ConnOpts {
         engine,
         expected_password,
+        users,
         shutdown_rx,
         idle_timeout,
         query_timeout,
@@ -222,8 +298,15 @@ where
         }
     };
 
+    // The authenticated identity for this connection. Bound at connect time and
+    // carried for later per-operation RBAC enforcement (Slice 3).
+    let _principal: Option<Principal>;
     match connect_msg {
-        Message::Connect { db_name, password } => {
+        Message::Connect {
+            db_name,
+            password,
+            username,
+        } => {
             // Check rate limiting before verifying credentials.
             if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                 if is_rate_limited(limiter, ip) {
@@ -236,12 +319,16 @@ where
                 }
             }
 
-            if let Some(expected) = &expected_password {
-                if !password
-                    .as_deref()
-                    .is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()))
-                {
-                    warn!(peer = %peer, db = %db_name, "auth rejected: bad password");
+            let outcome = authenticate_connect(
+                &users,
+                expected_password.as_ref().map(|p| p.as_str()),
+                username.as_deref(),
+                password.as_ref().map(|p| p.as_str()),
+            );
+
+            match outcome {
+                AuthOutcome::Rejected => {
+                    warn!(peer = %peer, db = %db_name, "auth rejected");
                     // Record the failure for rate limiting.
                     if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                         record_auth_failure(limiter, ip);
@@ -252,12 +339,23 @@ where
                     write_msg(&mut writer, &err).await;
                     return;
                 }
+                AuthOutcome::Authenticated { principal } => {
+                    // Auth succeeded — clear any prior failure count.
+                    if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
+                        clear_auth_failures(limiter, ip);
+                    }
+                    match &principal {
+                        Some(p) => {
+                            info!(peer = %peer, db = %db_name, user = %p.name, role = %p.role, "authenticated");
+                        }
+                        None => {
+                            info!(peer = %peer, db = %db_name, "client connected");
+                        }
+                    }
+                    _principal = principal;
+                }
             }
-            // Auth succeeded — clear any prior failure count.
-            if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                clear_auth_failures(limiter, ip);
-            }
-            info!(peer = %peer, db = %db_name, "client connected");
+
             let ok = Message::ConnectOk {
                 version: env!("CARGO_PKG_VERSION").into(),
             };
@@ -399,5 +497,133 @@ fn value_to_display(v: &Value) -> String {
             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
         Value::Bytes(b)    => format!("<{} bytes>", b.len()),
         Value::Empty       => "{}".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_alice() -> UserStore {
+        let mut s = UserStore::new();
+        s.create_user("alice", "pw", "readwrite").unwrap();
+        s
+    }
+
+    // ---- Empty store: legacy shared-password fallback ----
+
+    #[test]
+    fn empty_store_no_password_is_open() {
+        let s = UserStore::new();
+        assert_eq!(
+            authenticate_connect(&s, None, None, None),
+            AuthOutcome::Authenticated { principal: None }
+        );
+        // Even a stray username/password is accepted (legacy open behavior).
+        assert_eq!(
+            authenticate_connect(&s, None, Some("x"), Some("y")),
+            AuthOutcome::Authenticated { principal: None }
+        );
+    }
+
+    #[test]
+    fn empty_store_correct_shared_password_succeeds() {
+        let s = UserStore::new();
+        assert_eq!(
+            authenticate_connect(&s, Some("pw"), None, Some("pw")),
+            AuthOutcome::Authenticated { principal: None }
+        );
+    }
+
+    #[test]
+    fn empty_store_wrong_shared_password_rejected() {
+        let s = UserStore::new();
+        assert_eq!(
+            authenticate_connect(&s, Some("pw"), None, Some("bad")),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn empty_store_missing_password_rejected_when_expected() {
+        let s = UserStore::new();
+        assert_eq!(
+            authenticate_connect(&s, Some("pw"), None, None),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn empty_store_ignores_username_for_shared_password() {
+        // A new client may send a username even against a shared-password
+        // server; the username is ignored and the password still governs.
+        let s = UserStore::new();
+        assert_eq!(
+            authenticate_connect(&s, Some("pw"), Some("whoever"), Some("pw")),
+            AuthOutcome::Authenticated { principal: None }
+        );
+    }
+
+    // ---- Populated store: multi-user auth ----
+
+    #[test]
+    fn user_auth_success_binds_principal() {
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, None, Some("alice"), Some("pw")),
+            AuthOutcome::Authenticated {
+                principal: Some(Principal {
+                    name: "alice".into(),
+                    role: "readwrite".into(),
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn user_auth_wrong_password_rejected() {
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, None, Some("alice"), Some("bad")),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn user_auth_unknown_user_rejected() {
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, None, Some("mallory"), Some("pw")),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn user_auth_missing_username_rejected() {
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, None, None, Some("pw")),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn user_auth_missing_password_rejected() {
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, Some("pw"), Some("alice"), None),
+            AuthOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn user_auth_ignores_shared_password_when_users_present() {
+        // With users present, the shared password is irrelevant: supplying it as
+        // the password without a valid user must NOT authenticate.
+        let s = store_with_alice();
+        assert_eq!(
+            authenticate_connect(&s, Some("shared"), None, Some("shared")),
+            AuthOutcome::Rejected
+        );
     }
 }

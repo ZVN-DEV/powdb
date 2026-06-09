@@ -465,6 +465,66 @@ POWDB_PASSWORD=mysecret powdb-server
 powdb-cli --remote localhost:5433 --password mysecret
 ```
 
+### Multi-user authentication
+
+PowDB also supports named users with roles, layered on top of the
+single-shared-password model. The auth model is **backward compatible**:
+
+- **No users defined** → the legacy single shared-password model applies
+  (set `POWDB_PASSWORD`, connect with `--password`). If neither a password nor
+  any users are configured, all connections are accepted (development default).
+- **One or more users defined** → the server authenticates each connection's
+  `(username, password)` against the user store (`auth.json` in the data dir),
+  and the shared password is no longer used.
+
+Users live in the data directory's `auth.json` (argon2id hashes only — never
+plaintext, `0600` on Unix). Manage them offline with the CLI, pointing at the
+**same `--data-dir` the server uses**:
+
+```bash
+# Create users (role defaults to readwrite if --role is omitted).
+# Built-in roles: admin, readwrite, readonly.
+powdb-cli --data-dir ./powdb_data useradd alice --role admin --password s3cret
+powdb-cli --data-dir ./powdb_data useradd bob   --role readonly --password hunter2
+
+# The password may also come from the environment (handy in scripts/CI):
+POWDB_NEW_PASSWORD=s3cret powdb-cli --data-dir ./powdb_data useradd carol --role readwrite
+
+# List users (shows name + role only — never password hashes).
+powdb-cli --data-dir ./powdb_data users
+
+# Change a password.
+powdb-cli --data-dir ./powdb_data passwd bob --password newpw
+
+# Remove a user.
+powdb-cli --data-dir ./powdb_data userdel bob
+```
+
+Connect as a named user with `--user`:
+
+```bash
+powdb-cli --remote localhost:5433 --user alice --password s3cret
+```
+
+> The user-admin subcommands edit the data dir directly and require no running
+> server. Edit them while the server is stopped (or before first start); the
+> server loads `auth.json` at startup.
+
+#### Zero-CLI admin bootstrap
+
+For containerized / first-boot deployments you can bootstrap an initial admin
+purely from the environment. When `POWDB_ADMIN_USER` **and**
+`POWDB_ADMIN_PASSWORD` are both set and that user does not already exist, the
+server creates it with role `admin` and persists it on startup (the password is
+never logged):
+
+```bash
+POWDB_ADMIN_USER=root POWDB_ADMIN_PASSWORD=changeme powdb-server --data-dir ./powdb_data
+```
+
+After the admin exists, use `passwd` / `useradd` to manage the rest, and stop
+relying on the bootstrap env vars.
+
 ---
 
 ## What's Next

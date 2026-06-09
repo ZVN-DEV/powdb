@@ -197,6 +197,14 @@ enum Action {
         dest: String,
         apply: Vec<String>,
     },
+    /// Offline user-admin: create a user in the data dir's UserStore.
+    UserAdd { name: String },
+    /// Offline user-admin: delete a user from the data dir's UserStore.
+    UserDel { name: String },
+    /// Offline user-admin: change a user's password in the data dir's UserStore.
+    Passwd { name: String },
+    /// Offline user-admin: list users (name + role) from the data dir's UserStore.
+    Users,
 }
 
 struct CliArgs {
@@ -204,6 +212,9 @@ struct CliArgs {
     remote: Option<String>,
     db: String,
     password: Option<String>,
+    user: Option<String>,
+    /// Role for the `useradd` subcommand (defaults to "readwrite").
+    role: Option<String>,
     exec: Option<String>,
     action: Action,
 }
@@ -215,6 +226,8 @@ fn parse_args() -> CliArgs {
     let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty());
+    let mut user: Option<String> = None;
+    let mut role: Option<String> = None;
     let mut exec: Option<String> = None;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
@@ -259,6 +272,22 @@ fn parse_args() -> CliArgs {
                 }
                 password = Some(argv[i].clone());
             }
+            "--user" | "-u" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--user requires a name");
+                    std::process::exit(2);
+                }
+                user = Some(argv[i].clone());
+            }
+            "--role" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--role requires a value");
+                    std::process::exit(2);
+                }
+                role = Some(argv[i].clone());
+            }
             "--data-dir" | "-d" => {
                 i += 1;
                 if i >= argv.len() {
@@ -286,6 +315,7 @@ fn parse_args() -> CliArgs {
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: main)");
                 println!("        --password <PW>        Password for remote auth");
+                println!("    -u, --user <NAME>          Username for multi-user remote auth");
                 println!(
                     "    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)"
                 );
@@ -309,6 +339,17 @@ fn parse_args() -> CliArgs {
                 println!("        Rebuild a data dir from a backup. Pass --apply once per");
                 println!("        increment (in order) to chain-restore a full base plus");
                 println!("        incrementals for coarse point-in-time restore.");
+                println!();
+                println!("USER ADMIN (offline — operate on --data-dir's user store):");
+                println!("    useradd <NAME> --role <ROLE> --password <PW>");
+                println!("        Create a user. --role defaults to readwrite (admin|readwrite|");
+                println!("        readonly). Password from --password or POWDB_NEW_PASSWORD.");
+                println!("    userdel <NAME>");
+                println!("        Delete a user.");
+                println!("    passwd <NAME> --password <PW>");
+                println!("        Change a user's password (or via POWDB_NEW_PASSWORD).");
+                println!("    users");
+                println!("        List users (name + role).");
                 std::process::exit(0);
             }
             "backup" => {
@@ -356,6 +397,39 @@ fn parse_args() -> CliArgs {
                     apply: Vec::new(),
                 };
             }
+            "useradd" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("useradd requires a user name");
+                    std::process::exit(2);
+                }
+                action = Action::UserAdd {
+                    name: argv[i].clone(),
+                };
+            }
+            "userdel" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("userdel requires a user name");
+                    std::process::exit(2);
+                }
+                action = Action::UserDel {
+                    name: argv[i].clone(),
+                };
+            }
+            "passwd" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("passwd requires a user name");
+                    std::process::exit(2);
+                }
+                action = Action::Passwd {
+                    name: argv[i].clone(),
+                };
+            }
+            "users" => {
+                action = Action::Users;
+            }
             other if !other.starts_with('-') && !saw_positional => {
                 data_dir = other.to_string();
                 saw_positional = true;
@@ -377,7 +451,7 @@ fn parse_args() -> CliArgs {
         Action::Restore { apply, .. } => {
             *apply = restore_apply;
         }
-        Action::Default => {
+        _ => {
             if backup_base.is_some() {
                 eprintln!("--base is only valid with the `backup` subcommand");
                 std::process::exit(2);
@@ -394,6 +468,8 @@ fn parse_args() -> CliArgs {
         remote,
         db,
         password,
+        user,
+        role,
         exec,
         action,
     }
@@ -421,6 +497,23 @@ fn main() {
         } => {
             std::process::exit(run_restore(backup_dir, dest, apply));
         }
+        Action::UserAdd { name } => {
+            std::process::exit(run_useradd(
+                &args.data_dir,
+                name,
+                args.role.as_deref(),
+                args.password.as_deref(),
+            ));
+        }
+        Action::UserDel { name } => {
+            std::process::exit(run_userdel(&args.data_dir, name));
+        }
+        Action::Passwd { name } => {
+            std::process::exit(run_passwd(&args.data_dir, name, args.password.as_deref()));
+        }
+        Action::Users => {
+            std::process::exit(run_users(&args.data_dir));
+        }
         Action::Default => {}
     }
 
@@ -434,6 +527,7 @@ fn main() {
                 remote_addr.clone(),
                 args.db.clone(),
                 args.password.clone(),
+                args.user.clone(),
                 query,
             ));
             std::process::exit(code);
@@ -442,6 +536,7 @@ fn main() {
             remote_addr.clone(),
             args.db.clone(),
             args.password.clone(),
+            args.user.clone(),
         ));
     } else if let Some(query) = args.exec {
         std::process::exit(exec_embedded(&args.data_dir, &query));
@@ -556,6 +651,124 @@ fn run_restore(backup_dir: &str, dest: &str, apply: &[String]) -> i32 {
     }
 }
 
+// ─── User administration (offline / embedded) ───────────────────────────────
+
+/// Resolve a new-user/new-password value from `--password` or, failing that,
+/// the `POWDB_NEW_PASSWORD` env var. Returns `None` when neither is set.
+fn resolve_new_password(flag: Option<&str>) -> Option<String> {
+    flag.map(|s| s.to_string()).or_else(|| {
+        std::env::var("POWDB_NEW_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn run_useradd(data_dir: &str, name: &str, role: Option<&str>, password: Option<&str>) -> i32 {
+    let role = role.unwrap_or("readwrite");
+    let Some(pw) = resolve_new_password(password) else {
+        eprintln!(
+            "Error: a password is required \u{2014} pass --password <PW> or set POWDB_NEW_PASSWORD"
+        );
+        return 2;
+    };
+    let dir = Path::new(data_dir);
+    let mut store = match powdb_auth::UserStore::load(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: failed to load user store from {data_dir}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.create_user(name, &pw, role) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save(dir) {
+        eprintln!("Error: failed to save user store: {e}");
+        return 1;
+    }
+    println!("user '{name}' created (role {role})");
+    0
+}
+
+fn run_userdel(data_dir: &str, name: &str) -> i32 {
+    let dir = Path::new(data_dir);
+    let mut store = match powdb_auth::UserStore::load(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: failed to load user store from {data_dir}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.delete_user(name) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save(dir) {
+        eprintln!("Error: failed to save user store: {e}");
+        return 1;
+    }
+    println!("user '{name}' deleted");
+    0
+}
+
+fn run_passwd(data_dir: &str, name: &str, password: Option<&str>) -> i32 {
+    let Some(pw) = resolve_new_password(password) else {
+        eprintln!(
+            "Error: a password is required \u{2014} pass --password <PW> or set POWDB_NEW_PASSWORD"
+        );
+        return 2;
+    };
+    let dir = Path::new(data_dir);
+    let mut store = match powdb_auth::UserStore::load(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: failed to load user store from {data_dir}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = store.set_password(name, &pw) {
+        eprintln!("Error: {e}");
+        return 1;
+    }
+    if let Err(e) = store.save(dir) {
+        eprintln!("Error: failed to save user store: {e}");
+        return 1;
+    }
+    println!("password updated for user '{name}'");
+    0
+}
+
+fn run_users(data_dir: &str) -> i32 {
+    let dir = Path::new(data_dir);
+    let store = match powdb_auth::UserStore::load(dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: failed to load user store from {data_dir}: {e}");
+            return 1;
+        }
+    };
+    let users = store.list_users();
+    if users.is_empty() {
+        println!("(no users \u{2014} shared-password mode)");
+        return 0;
+    }
+    // Simple table: name + role. Never print password hashes.
+    let name_w = users.iter().map(|(n, _)| n.len()).max().unwrap_or(4).max(4);
+    let role_w = users.iter().map(|(_, r)| r.len()).max().unwrap_or(4).max(4);
+    println!(" {:<name_w$} | {:<role_w$} ", "Name", "Role");
+    println!("-{}-+-{}-", "-".repeat(name_w), "-".repeat(role_w));
+    for (n, r) in &users {
+        println!(" {n:<name_w$} | {r:<role_w$} ");
+    }
+    println!(
+        "({} user{})",
+        users.len(),
+        if users.len() == 1 { "" } else { "s" }
+    );
+    0
+}
+
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
 
 fn exec_embedded(data_dir: &str, query: &str) -> i32 {
@@ -595,7 +808,13 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
 
 // ─── One-shot execution (remote) ────────────────────────────────────────────
 
-async fn exec_remote(addr: String, db: String, password: Option<String>, query: String) -> i32 {
+async fn exec_remote(
+    addr: String,
+    db: String,
+    password: Option<String>,
+    username: Option<String>,
+    query: String,
+) -> i32 {
     let stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
@@ -610,6 +829,7 @@ async fn exec_remote(addr: String, db: String, password: Option<String>, query: 
     let connect = Message::Connect {
         db_name: db,
         password: password.map(Into::into),
+        username,
     };
     if connect.write_to(&mut writer).await.is_err()
         || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
@@ -806,7 +1026,7 @@ fn run_embedded(data_dir: &str) {
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
 
-async fn run_remote(addr: String, db: String, password: Option<String>) {
+async fn run_remote(addr: String, db: String, password: Option<String>, username: Option<String>) {
     eprintln!("PowDB v{} — remote mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Connecting to {addr} ...");
 
@@ -826,6 +1046,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>) {
     let connect = Message::Connect {
         db_name: db.clone(),
         password: password.map(Into::into),
+        username,
     };
     if let Err(e) = connect.write_to(&mut writer).await {
         eprintln!("failed to send CONNECT: {e}");

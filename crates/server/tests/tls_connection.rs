@@ -133,6 +133,7 @@ async fn start_tls_server(
                         powdb_server::handler::ConnOpts {
                             engine: eng,
                             expected_password: None,
+                            users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                             shutdown_rx: &mut rx,
                             idle_timeout: Duration::from_secs(300),
                             query_timeout: Duration::from_secs(30),
