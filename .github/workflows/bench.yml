@@ -1,45 +1,36 @@
 name: bench
 
-# PowDB regression gate. Runs the criterion suite on every PR to main and on
-# pushes to main. Comparator exits non-zero on regression beyond the gate
-# thresholds (7% per-workload absolute, 2.5x ratio ceiling on the thesis
-# metric).
+# Heavy criterion microbenchmark suite — DELIBERATELY NOT in the required
+# CI / release pipeline.
 #
-# See docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md
-# and the "Bench regression gate" section of AGENTS.md.
-
+# Why it's manual-only:
+#   - It's slow (~6 min on GitHub NVMe, far worse on overlay-FS runners) and
+#     resource-heavy (mmap-based heap scans), so it's a poor merge gate.
+#   - On shared runners the absolute thresholds are dominated by per-VM
+#     timing noise (±30–56%), producing false regressions.
+#   - powdb-bench depends only on powdb-storage + powdb-query, so it gates
+#     nothing the normal CI suite doesn't already cover for correctness.
+#
+# How to use it: trigger on demand (Actions tab → "bench" → Run workflow, or
+# `gh workflow run bench.yml`). For trustworthy numbers, run it on real,
+# single-tenant deployment hardware rather than a shared CI runner. It is NOT
+# a required status check on `main`.
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
-permissions: {}
-
-# Cancel in-progress runs on the same branch when a new commit lands. Bench
-# runs are expensive and the older one's results would be wasted anyway.
-concurrency:
-  group: bench-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   bench:
-    name: criterion + regression gate
+    name: criterion + regression gate (manual)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      # Override `.cargo/config.toml`'s `-C target-cpu=native` with a
-      # portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT).
-      # GitHub Actions `ubuntu-24.04` runners are a heterogeneous pool of
-      # Azure VMs with different host CPUs. `target-cpu=native` bakes
-      # host-specific instructions (up to AVX-512 on Sapphire Rapids) into
-      # the binary, which then SIGILLs when cargo's cache serves that
-      # binary to a subsequent job running on an older CPU. `x86-64-v2`
-      # is the widest baseline that still lets crc32fast use its SSE4.2
-      # SIMD path (runtime-detected), so there's no perf floor lost on
-      # the WAL path.
+      # Portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT) so a
+      # cached binary can't SIGILL across the shared pool's CPU generations.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
     steps:
@@ -56,10 +47,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # Cache key is suffixed `-v2` to bust any stale `target/` built
-          # under `target-cpu=native` on a previous runner — the old cache
-          # contained a binary with AVX-512 instructions that crashed on
-          # Skylake-era runners (see SIGILL on run 24210833296).
           key: bench-${{ runner.os }}-v2-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             bench-${{ runner.os }}-v2-
@@ -76,8 +63,8 @@ jobs:
       - name: Run regression gate comparator
         run: cargo run -p powdb-bench --bin compare --quiet
 
-      - name: Upload criterion estimates on failure
-        if: failure()
+      - name: Upload criterion estimates
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: criterion-estimates
