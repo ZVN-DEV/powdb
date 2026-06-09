@@ -50,7 +50,7 @@ npm install @zvndev/powdb-client
 # https://github.com/zvndev/powdb/releases/latest
 
 # Docker
-docker pull ghcr.io/zvndev/powdb:latest
+docker pull ghcr.io/zvn-dev/powdb:latest
 
 # Or build from source
 git clone https://github.com/zvndev/powdb
