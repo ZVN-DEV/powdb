@@ -16,12 +16,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zvndev/powdb.git",
+    "url": "git+https://github.com/ZVN-DEV/powdb.git",
     "directory": "clients/ts"
   },
-  "homepage": "https://zvndev.github.io/powdb/",
+  "homepage": "https://github.com/ZVN-DEV/powdb#readme",
   "bugs": {
-    "url": "https://github.com/zvndev/powdb/issues"
+    "url": "https://github.com/ZVN-DEV/powdb/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "powdb",
