@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-09
+
 ### Added
 - **Multi-user authentication (operator surface).** The server now authenticates
   per-connection `(username, password)` against a persisted user store
@@ -20,10 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POWDB_ADMIN_PASSWORD` on startup when that user does not yet exist. Added
   `UserStore::set_password`. **Backward compatible:** with no users defined, the
   single shared-password model (`POWDB_PASSWORD` / `--password`) still applies.
-
-## [0.4.5] - 2026-06-06
-
-### Added
+  New `powdb-auth` crate.
 - **Full snapshot backup & restore.** `powdb-cli backup <dest>` takes a
   crash-consistent, blake3-verified full snapshot (checkpoint-then-copy of
   `catalog.bin` + every heap + every index, plus an integrity `manifest.json`
