@@ -2914,6 +2914,26 @@ pub(super) fn execute_window(
             std::cmp::Ordering::Equal
         });
 
+        // SQL window-frame semantics: with no `order` clause the frame for an
+        // aggregate window is the ENTIRE partition, not the running prefix.
+        // The loop below computes running values; for the no-order case we
+        // back-fill every row of a partition with the partition's final
+        // (i.e. complete) aggregate once its boundary is reached. Ranking
+        // functions are untouched — row_number/rank/dense_rank are inherently
+        // positional.
+        let whole_partition_frame = wdef.order_by.is_empty()
+            && matches!(
+                wdef.function,
+                WindowFunc::Sum
+                    | WindowFunc::Avg
+                    | WindowFunc::Count
+                    | WindowFunc::Min
+                    | WindowFunc::Max
+            );
+        // Original row indices of the partition currently being scanned
+        // (only tracked when back-filling is needed).
+        let mut partition_row_indices: Vec<usize> = Vec::new();
+
         // Compute window values in sorted order, tracking partition boundaries.
         let mut win_values: Vec<Value> = vec![Value::Empty; n];
         let mut partition_start = 0usize;
@@ -2943,6 +2963,15 @@ pub(super) fn execute_window(
             };
 
             if new_partition {
+                // No-order aggregate frame: the partition that just ended is
+                // complete, so its final running value IS the whole-partition
+                // aggregate. Back-fill it onto every row of that partition.
+                if whole_partition_frame && sorted_pos > 0 {
+                    let final_v = win_values[indices[sorted_pos - 1]].clone();
+                    for ri in partition_row_indices.drain(..) {
+                        win_values[ri] = final_v.clone();
+                    }
+                }
                 partition_start = sorted_pos;
                 running_count = 0;
                 running_int_sum = 0;
@@ -3071,6 +3100,17 @@ pub(super) fn execute_window(
 
             prev_order_key = Some(current_order_key);
             win_values[row_idx] = value;
+            if whole_partition_frame {
+                partition_row_indices.push(row_idx);
+            }
+        }
+
+        // Back-fill the final partition (the loop only flushes at boundaries).
+        if whole_partition_frame && n > 0 {
+            let final_v = win_values[indices[n - 1]].clone();
+            for ri in partition_row_indices.drain(..) {
+                win_values[ri] = final_v.clone();
+            }
         }
 
         // Append the computed window column to each row.

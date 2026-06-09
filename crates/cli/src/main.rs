@@ -1205,6 +1205,19 @@ fn print_local_result(result: &QueryResult) {
     }
 }
 
+/// Render one wire cell for display. The server serializes NULL as the
+/// bareword "null" (the sentinel the TS client's typed decoder matches);
+/// remote mode renders it as `NULL`, matching the embedded REPL. A string
+/// column whose *value* is literally "null" is indistinguishable on the
+/// untyped wire — same tradeoff the TS client documents.
+fn render_remote_cell(cell: &str) -> String {
+    if cell == "null" {
+        "NULL".into()
+    } else {
+        cell.into()
+    }
+}
+
 fn print_remote_result(msg: &Message) {
     match msg {
         Message::ResultRows { columns, rows } => {
@@ -1212,10 +1225,14 @@ fn print_remote_result(msg: &Message) {
                 println!("(empty set)");
                 return;
             }
-            print_table(columns, rows);
+            let rendered: Vec<Vec<String>> = rows
+                .iter()
+                .map(|row| row.iter().map(|c| render_remote_cell(c)).collect())
+                .collect();
+            print_table(columns, &rendered);
         }
         Message::ResultScalar { value } => {
-            println!("{value}");
+            println!("{}", render_remote_cell(value));
         }
         Message::ResultOk { affected } => {
             println!(
@@ -1284,5 +1301,22 @@ fn format_value(v: &Value) -> String {
         ),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
         Value::Empty => "NULL".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_null_sentinel_renders_as_null_like_embedded() {
+        // The wire sends NULL as the bareword "null"; remote display must
+        // match the embedded REPL's `NULL`.
+        assert_eq!(render_remote_cell("null"), "NULL");
+        assert_eq!(format_value(&Value::Empty), "NULL");
+        // Ordinary values pass through untouched.
+        assert_eq!(render_remote_cell("42"), "42");
+        assert_eq!(render_remote_cell(""), "");
+        assert_eq!(render_remote_cell("NULL"), "NULL");
     }
 }

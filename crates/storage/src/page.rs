@@ -25,6 +25,15 @@ const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
 const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
 const DELETED_MARKER: u16 = 0xFFFF;
 
+/// Maximum encoded row size that can ever fit in a single page: a fresh
+/// empty page minus the slot-count word and the row's own slot entry.
+/// Anything larger must be rejected at the heap boundary as a clean
+/// `StorageError::RowTooLarge` — with `panic = "abort"` in release builds,
+/// a panicking insert path would otherwise kill the whole server process
+/// (remote DoS via one oversized `insert`).
+pub const MAX_ROW_DATA_SIZE: usize =
+    PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE - SLOT_ENTRY_SIZE;
+
 /// Byte range holding the page CRC32 (WS3). Lives just after the legacy
 /// 16-byte header so the slot directory at the bottom of the page is
 /// untouched — old and new pages share the same slot/slot_count layout,

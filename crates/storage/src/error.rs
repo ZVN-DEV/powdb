@@ -26,6 +26,12 @@ pub enum StorageError {
 
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
+
+    /// An encoded row exceeds the single-page capacity. Returned cleanly at
+    /// the heap insert/update boundary instead of panicking — with
+    /// `panic = "abort"` a panic here would take down the whole server.
+    #[error("row too large: {size} bytes exceeds max {max} bytes")]
+    RowTooLarge { size: usize, max: usize },
 }
 
 /// Convenience alias used throughout the storage crate.
