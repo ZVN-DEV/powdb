@@ -8,7 +8,7 @@ permissions: {}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: zvndev/powdb
+  IMAGE_NAME: zvn-dev/powdb
 
 jobs:
   test:
