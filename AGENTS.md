@@ -162,7 +162,7 @@ cargo run --release -p powdb-cli                      # embedded REPL
 cargo run --release -p powdb-cli -- --remote host:5433 --password <pw>
 ```
 
-**The REPL is line-oriented.** A statement split across lines fails to parse — write each statement on one line.
+**The REPL buffers lines until braces/parens balance** — multi-line `type`/`insert` paste works; a statement still cannot span two separately-submitted balanced lines.
 
 ### TCP server
 
