@@ -18,7 +18,12 @@
 import * as net from "node:net";
 import * as tls from "node:tls";
 import { EventEmitter } from "node:events";
-import { encode, tryDecode, type Message } from "./protocol.js";
+import {
+  encode,
+  tryDecode,
+  type Message,
+  type WireParam,
+} from "./protocol.js";
 import { PowDBError } from "./errors.js";
 import {
   coerceRows,
@@ -34,6 +39,38 @@ export type QueryResult =
   | { kind: "scalar"; value: string }
   | { kind: "ok"; affected: bigint }
   | { kind: "message"; message: string };
+
+/**
+ * A value bound to a positional `$N` placeholder in {@link Client.query}.
+ *
+ * The server binds these at the token level — a string is substituted as a
+ * literal token, never interpolated — so injection-shaped input is inert.
+ * Numbers bind as ints when integral and floats otherwise; `bigint` always
+ * binds as an int; `null` binds PowQL `null`.
+ */
+export type QueryParam = string | number | bigint | boolean | null;
+
+/** Map a JS {@link QueryParam} to its wire encoding. */
+function toWireParam(p: QueryParam): WireParam {
+  if (p === null) return { tag: "null" };
+  switch (typeof p) {
+    case "string":
+      return { tag: "str", value: p };
+    case "boolean":
+      return { tag: "bool", value: p };
+    case "bigint":
+      return { tag: "int", value: p };
+    case "number":
+      return Number.isInteger(p)
+        ? { tag: "int", value: BigInt(p) }
+        : { tag: "float", value: p };
+    default:
+      throw new PowDBError(
+        `unsupported query parameter type: ${typeof p}`,
+        "protocol_error",
+      );
+  }
+}
 
 export interface ClientOptions {
   host: string;
@@ -235,11 +272,27 @@ export class Client extends EventEmitter<ClientEvents> {
    */
   async query(
     query: string,
-    opts?: { signal?: AbortSignal },
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
   ): Promise<QueryResult> {
+    // Disambiguate the two overloads:
+    //   query(q)                       — no params, no opts
+    //   query(q, opts)                 — legacy 2-arg opts form (back-compat)
+    //   query(q, params)               — positional $N parameters
+    //   query(q, params, opts)         — params + opts
+    const hasParams = Array.isArray(paramsOrOpts);
+    const params = hasParams ? (paramsOrOpts as QueryParam[]) : undefined;
+    const opts = hasParams
+      ? maybeOpts
+      : (paramsOrOpts as { signal?: AbortSignal } | undefined);
+
     const start = Date.now();
     try {
-      const reply = await this.send({ type: "Query", query }, opts);
+      const request: Message =
+        params === undefined
+          ? { type: "Query", query }
+          : { type: "QueryWithParams", query, params: params.map(toWireParam) };
+      const reply = await this.send(request, opts);
       let result: QueryResult;
       switch (reply.type) {
         case "ResultRows":
@@ -638,11 +691,12 @@ function openSocket(
 }
 
 export { encode, tryDecode } from "./protocol.js";
-export type { Message } from "./protocol.js";
+export type { Message, WireParam } from "./protocol.js";
 export {
   MAX_PAYLOAD_SIZE,
   MAX_ROWS,
   MAX_COLUMNS,
+  MAX_PARAMS,
 } from "./protocol.js";
 
 export {

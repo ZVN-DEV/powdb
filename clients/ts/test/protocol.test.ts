@@ -201,6 +201,57 @@ async function main() {
     }
   });
 
+  console.log("\nQueryWithParams — positional $N binding round-trip");
+
+  await test("encode/decode QueryWithParams preserves query and all param types", () => {
+    const buf = encode({
+      type: "QueryWithParams",
+      query: "insert User { name := $1, age := $2, ok := $3, note := $4, f := $5 }",
+      params: [
+        { tag: "str", value: `a"b\\c; drop User` },
+        { tag: "int", value: -7n },
+        { tag: "bool", value: true },
+        { tag: "null" },
+        { tag: "float", value: 2.5 },
+      ],
+    });
+    // New frame must use the dedicated 0x04 tag.
+    assert.equal(buf.readUInt8(0), 0x04);
+    const decoded = tryDecode(buf);
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "QueryWithParams");
+    if (decoded.msg.type === "QueryWithParams") {
+      assert.ok(decoded.msg.query.includes("$1"));
+      assert.equal(decoded.msg.params.length, 5);
+      assert.deepStrictEqual(decoded.msg.params[0], {
+        tag: "str",
+        value: `a"b\\c; drop User`,
+      });
+      assert.deepStrictEqual(decoded.msg.params[1], { tag: "int", value: -7n });
+      assert.deepStrictEqual(decoded.msg.params[2], { tag: "bool", value: true });
+      assert.deepStrictEqual(decoded.msg.params[3], { tag: "null" });
+      assert.deepStrictEqual(decoded.msg.params[4], {
+        tag: "float",
+        value: 2.5,
+      });
+    }
+  });
+
+  await test("decode rejects an unknown param tag", () => {
+    // header + empty query + count=1 + bogus tag 0x63
+    const payload = Buffer.concat([
+      lpString(""),
+      Buffer.from([0x01, 0x00]), // count = 1 (u16 LE)
+      Buffer.from([0x63]), // bogus tag
+    ]);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x04, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /unknown param tag/);
+  });
+
   console.log("\nCancellation — abort during in-flight query");
 
   await test("AbortSignal rejects the pending query without destroying the socket", async () => {
