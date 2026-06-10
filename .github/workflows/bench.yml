@@ -12,9 +12,11 @@ name: bench
 #     nothing the normal CI suite doesn't already cover for correctness.
 #
 # How to use it: trigger on demand (Actions tab → "bench" → Run workflow, or
-# `gh workflow run bench.yml`). For trustworthy numbers, run it on real,
-# single-tenant deployment hardware rather than a shared CI runner. It is NOT
-# a required status check on `main`.
+# `gh workflow run bench.yml`). It runs on a Depot single-tenant runner
+# (depot-ubuntu-24.04-4: 4 vCPU / 16 GB, no noisy neighbours), so the numbers
+# are comparable run-to-run — unlike GitHub's shared pool, where per-VM noise
+# of ±30–56% produced false regressions. It is still NOT a required status
+# check on `main`.
 on:
   workflow_dispatch:
 
@@ -24,11 +26,14 @@ permissions:
 jobs:
   bench:
     name: criterion + regression gate (manual)
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      # Bench temp DBs on tmpfs so disk variance can't pollute timings
+      # (TempDir::new() honours TMPDIR).
+      TMPDIR: /dev/shm
       # Portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT) so a
       # cached binary can't SIGILL across the shared pool's CPU generations.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
