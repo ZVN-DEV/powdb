@@ -899,6 +899,33 @@ async fn exec_remote(
     code
 }
 
+// ─── Multi-line input ───────────────────────────────────────────────────────
+
+/// True when `buffer` has unbalanced `{`/`(` outside string literals, i.e. the
+/// REPL should read another line before executing. String literals follow the
+/// lexer's rules (`crates/query/src/lexer.rs`): a backslash escapes the next
+/// character, so `\"` inside a string does not terminate it.
+fn needs_continuation(buffer: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut in_str = false;
+    let mut chars = buffer.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_str => in_str = false,
+            '"' => in_str = true,
+            // Lexer treats backslash as an escape inside strings; skip the
+            // escaped char so `\"` doesn't toggle the string state.
+            '\\' if in_str => {
+                chars.next();
+            }
+            '{' | '(' if !in_str => depth += 1,
+            '}' | ')' if !in_str => depth -= 1,
+            _ => {}
+        }
+    }
+    depth > 0 || in_str
+}
+
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
 fn run_embedded(data_dir: &str) {
@@ -915,96 +942,121 @@ fn run_embedded(data_dir: &str) {
     rl.load_history(&hist).ok();
 
     let mut timing_enabled = false;
+    let mut buffer = String::new();
 
     loop {
-        let line = match rl.readline("powql> ") {
+        let prompt = if buffer.is_empty() {
+            "powql> "
+        } else {
+            "  ...> "
+        };
+        let line = match rl.readline(prompt) {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Abandon any partial multi-line statement.
+                buffer.clear();
+                continue;
+            }
             Err(e) => {
                 eprintln!("Error: {e}");
                 break;
             }
         };
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        rl.add_history_entry(trimmed).ok();
-
-        // ── Meta-commands ──────────────────────────────────────────────
-        if trimmed.starts_with('.') {
-            match trimmed {
-                ".quit" | ".exit" => break,
-                ".help" => {
-                    println!("Meta-commands:");
-                    println!("  .tables          List all tables");
-                    println!("  .schema <TABLE>  Show columns and types for a table");
-                    println!("  .timing          Toggle query timing on/off");
-                    println!("  .help            Show this help");
-                    println!("  .quit / .exit    Exit the REPL");
-                }
-                ".tables" => {
-                    let tables = engine.catalog().list_tables();
-                    if tables.is_empty() {
-                        println!("(no tables)");
-                    } else {
-                        for t in &tables {
-                            println!("  {t}");
-                        }
-                        println!(
-                            "({} table{})",
-                            tables.len(),
-                            if tables.len() == 1 { "" } else { "s" }
-                        );
+        // Meta-commands are only recognized at the start of a statement.
+        if buffer.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // ── Meta-commands ──────────────────────────────────────────
+            if trimmed.starts_with('.') {
+                rl.add_history_entry(trimmed).ok();
+                match trimmed {
+                    ".quit" | ".exit" => break,
+                    ".help" => {
+                        println!("Meta-commands:");
+                        println!("  .tables          List all tables");
+                        println!("  .schema <TABLE>  Show columns and types for a table");
+                        println!("  .timing          Toggle query timing on/off");
+                        println!("  .help            Show this help");
+                        println!("  .quit / .exit    Exit the REPL");
                     }
-                }
-                ".timing" => {
-                    timing_enabled = !timing_enabled;
-                    println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
-                }
-                cmd if cmd.starts_with(".schema") => {
-                    let table_name = cmd.strip_prefix(".schema").unwrap().trim();
-                    if table_name.is_empty() {
-                        eprintln!("Usage: .schema <TABLE_NAME>");
-                    } else if let Some(schema) = engine.catalog().schema(table_name) {
-                        println!("Table: {}", schema.table_name);
-                        println!("  {:<20} {:<12} Required", "Column", "Type");
-                        println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
-                        for col in &schema.columns {
+                    ".tables" => {
+                        let tables = engine.catalog().list_tables();
+                        if tables.is_empty() {
+                            println!("(no tables)");
+                        } else {
+                            for t in &tables {
+                                println!("  {t}");
+                            }
                             println!(
-                                "  {:<20} {:<12} {}",
-                                col.name,
-                                match col.type_id {
-                                    powdb_storage::types::TypeId::Int => "int",
-                                    powdb_storage::types::TypeId::Float => "float",
-                                    powdb_storage::types::TypeId::Bool => "bool",
-                                    powdb_storage::types::TypeId::Str => "str",
-                                    powdb_storage::types::TypeId::DateTime => "datetime",
-                                    powdb_storage::types::TypeId::Uuid => "uuid",
-                                    powdb_storage::types::TypeId::Bytes => "bytes",
-                                    powdb_storage::types::TypeId::Empty => "empty",
-                                },
-                                if col.required { "yes" } else { "no" }
+                                "({} table{})",
+                                tables.len(),
+                                if tables.len() == 1 { "" } else { "s" }
                             );
                         }
-                    } else {
-                        eprintln!("Error: table '{table_name}' not found");
+                    }
+                    ".timing" => {
+                        timing_enabled = !timing_enabled;
+                        println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
+                    }
+                    cmd if cmd.starts_with(".schema") => {
+                        let table_name = cmd.strip_prefix(".schema").unwrap().trim();
+                        if table_name.is_empty() {
+                            eprintln!("Usage: .schema <TABLE_NAME>");
+                        } else if let Some(schema) = engine.catalog().schema(table_name) {
+                            println!("Table: {}", schema.table_name);
+                            println!("  {:<20} {:<12} Required", "Column", "Type");
+                            println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
+                            for col in &schema.columns {
+                                println!(
+                                    "  {:<20} {:<12} {}",
+                                    col.name,
+                                    match col.type_id {
+                                        powdb_storage::types::TypeId::Int => "int",
+                                        powdb_storage::types::TypeId::Float => "float",
+                                        powdb_storage::types::TypeId::Bool => "bool",
+                                        powdb_storage::types::TypeId::Str => "str",
+                                        powdb_storage::types::TypeId::DateTime => "datetime",
+                                        powdb_storage::types::TypeId::Uuid => "uuid",
+                                        powdb_storage::types::TypeId::Bytes => "bytes",
+                                        powdb_storage::types::TypeId::Empty => "empty",
+                                    },
+                                    if col.required { "yes" } else { "no" }
+                                );
+                            }
+                        } else {
+                            eprintln!("Error: table '{table_name}' not found");
+                        }
+                    }
+                    other => {
+                        eprintln!("Unknown meta-command: {other}");
+                        eprintln!("Type .help for available commands.");
                     }
                 }
-                other => {
-                    eprintln!("Unknown meta-command: {other}");
-                    eprintln!("Type .help for available commands.");
-                }
+                continue;
             }
+        }
+
+        // Accumulate input until braces/parens balance outside strings.
+        buffer.push_str(&line);
+        buffer.push('\n');
+        if needs_continuation(&buffer) {
             continue;
         }
+
+        let statement = buffer.trim().to_string();
+        buffer.clear();
+        if statement.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&statement).ok();
 
         // ── Execute PowQL query ────────────────────────────────────────
         let start = Instant::now();
-        match engine.execute_powql(trimmed) {
+        match engine.execute_powql(&statement) {
             Ok(result) => {
                 print_local_result(&result);
                 if timing_enabled {
@@ -1088,52 +1140,76 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
     rl.load_history(&hist).ok();
 
     let mut timing_enabled = false;
+    let mut buffer = String::new();
 
     loop {
-        let line = match rl.readline("powql> ") {
+        let prompt = if buffer.is_empty() {
+            "powql> "
+        } else {
+            "  ...> "
+        };
+        let line = match rl.readline(prompt) {
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                buffer.clear();
+                continue;
+            }
             Err(e) => {
                 eprintln!("Error: {e}");
                 break;
             }
         };
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        rl.add_history_entry(trimmed).ok();
-
-        // Handle local-only meta-commands in remote mode
-        if trimmed.starts_with('.') {
-            match trimmed {
-                ".quit" | ".exit" => break,
-                ".timing" => {
-                    timing_enabled = !timing_enabled;
-                    println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
-                }
-                ".help" => {
-                    println!("Meta-commands (remote mode):");
-                    println!("  .timing          Toggle query timing on/off");
-                    println!("  .help            Show this help");
-                    println!("  .quit / .exit    Exit the REPL");
-                    println!();
-                    println!("Note: .tables and .schema are only available in embedded mode.");
-                }
-                _ => {
-                    eprintln!("Meta-commands (.tables, .schema) are not supported in remote mode.");
-                    eprintln!("Type .help for available commands.");
-                }
+        // Meta-commands are only recognized at the start of a statement.
+        if buffer.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            // Handle local-only meta-commands in remote mode
+            if trimmed.starts_with('.') {
+                rl.add_history_entry(trimmed).ok();
+                match trimmed {
+                    ".quit" | ".exit" => break,
+                    ".timing" => {
+                        timing_enabled = !timing_enabled;
+                        println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
+                    }
+                    ".help" => {
+                        println!("Meta-commands (remote mode):");
+                        println!("  .timing          Toggle query timing on/off");
+                        println!("  .help            Show this help");
+                        println!("  .quit / .exit    Exit the REPL");
+                        println!();
+                        println!("Note: .tables and .schema are only available in embedded mode.");
+                    }
+                    _ => {
+                        eprintln!(
+                            "Meta-commands (.tables, .schema) are not supported in remote mode."
+                        );
+                        eprintln!("Type .help for available commands.");
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Accumulate input until braces/parens balance outside strings.
+        buffer.push_str(&line);
+        buffer.push('\n');
+        if needs_continuation(&buffer) {
             continue;
         }
 
-        let q = Message::Query {
-            query: trimmed.to_string(),
-        };
+        let statement = buffer.trim().to_string();
+        buffer.clear();
+        if statement.is_empty() {
+            continue;
+        }
+        rl.add_history_entry(&statement).ok();
+
+        let q = Message::Query { query: statement };
         if q.write_to(&mut writer).await.is_err() {
             eprintln!("write error — disconnected");
             break;
@@ -1318,5 +1394,25 @@ mod tests {
         assert_eq!(render_remote_cell("42"), "42");
         assert_eq!(render_remote_cell(""), "");
         assert_eq!(render_remote_cell("NULL"), "NULL");
+    }
+
+    #[test]
+    fn continuation_tracking() {
+        assert!(needs_continuation("type User {"));
+        assert!(needs_continuation("type User {\n  required name: str,"));
+        assert!(!needs_continuation("type User { required name: str }"));
+        // Brace inside a string literal must not count.
+        assert!(!needs_continuation(r#"insert U { s := "}" }"#));
+        assert!(needs_continuation(r#"insert U { s := "}" "#));
+        // Parens.
+        assert!(needs_continuation("count(User filter ("));
+        assert!(!needs_continuation("count(User)"));
+        // Nested.
+        assert!(needs_continuation("insert U { a := (1 + "));
+        // Over-closed input is NOT a continuation — let the parser error.
+        assert!(!needs_continuation("User }"));
+        // Escaped quote inside a string must not end the string.
+        assert!(needs_continuation(r#"insert U { s := "a\" "#));
+        assert!(!needs_continuation(r#"insert U { s := "a\"b" }"#));
     }
 }

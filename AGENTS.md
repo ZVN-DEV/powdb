@@ -66,6 +66,8 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Add a column | `alter User add column status: str` | `ALTER TABLE User ADD COLUMN status TEXT` |
 | Drop a column | `alter User drop column status` | `ALTER TABLE User DROP COLUMN status` |
 | Create an index | `alter User add index .email` | `CREATE INDEX ON User (email)` |
+| Unique column | `type User { unique email: str }` | `CREATE TABLE User (email TEXT UNIQUE)` |
+| Add unique constraint | `alter User add unique .email` | `CREATE UNIQUE INDEX ON User (email)` |
 | Insert | `insert User { name := "Alice", age := 30 }` | `INSERT INTO User (name, age) VALUES ('Alice', 30)` |
 | Scan a table | `User` | `SELECT * FROM User` |
 | Filter | `User filter .age > 30` | `SELECT * FROM User WHERE age > 30` |
@@ -88,7 +90,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Update | `User filter .id = 1 update { age := 31 }` | `UPDATE User SET age = 31 WHERE id = 1` |
 | Update with expr | `User update { age := .age + 1 }` | `UPDATE User SET age = age + 1` |
 | Delete | `User filter .age < 18 delete` | `DELETE FROM User WHERE age < 18` |
-| Upsert | `upsert User on .id { id := 1, name := "Alice" }` | `INSERT ... ON CONFLICT (id) DO UPDATE ...` |
+| Upsert (key must be `unique`) | `upsert User on .id { id := 1, name := "Alice" }` | `INSERT ... ON CONFLICT (id) DO UPDATE ...` |
 | CASE | `case when .age > 30 then "old" else "young" end` | `CASE WHEN age > 30 THEN 'old' ELSE 'young' END` |
 | Materialized view | `materialize OldUsers as User filter .age > 28` | `CREATE MATERIALIZED VIEW OldUsers AS ...` |
 
@@ -119,7 +121,9 @@ Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`
 
 **Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor/`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
 
-`required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`.
+`required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`. `unique` is a sibling prefix keyword (`required unique email: str`, either order) that auto-creates a unique B+tree index and enforces no duplicate non-null values on insert/update/upsert.
+
+**Footgun (since 0.4.7):** `upsert <T> on .<col>` requires `.col` to be **unique** — declare it `unique` in the `type`, or run `alter <T> add unique .<col>` first. Upserting on a non-unique column is now a hard error (this closed a bug where upsert could silently create duplicate keys). `alter add unique` first scans for existing duplicates and fails if any are present; it also rejects a column that already has a non-unique index (no in-place upgrade). Null values are exempt from `unique`.
 
 ---
 
@@ -127,7 +131,7 @@ Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`
 
 These are the design moves that buy the speedup. Understanding them keeps you from accidentally undoing them:
 
-1. **Planner is a pure function.** It does not touch the catalog — it emits `RangeScan` speculatively, and the executor lowers to `Filter(SeqScan)` at runtime if no index exists. This keeps the parser → plan pipeline allocation-free for cache hits.
+1. **Planner is a pure function.** It does not touch the catalog — it emits `RangeScan`/`IndexScan` speculatively. The executor lowers them to `Filter(SeqScan)` at runtime only when no index exists on the column; otherwise it walks the B+tree directly (unique indexes: raw column-value keys; non-unique indexes: composite `(value, rid)` keys via `BTree::range_rids`, heap-fetching matched rows and rechecking exclusive bounds). This keeps the parser → plan pipeline allocation-free for cache hits.
 2. **Plan cache hashes canonical PowQL.** Literals are substituted at lookup time (FNV-1a hash, `crates/query/src/plan_cache.rs`). A repeated `User filter .id = <N>` reuses the same plan for all N.
 3. **Compiled integer predicates.** `Filter(SeqScan)` on simple numeric predicates compiles into a branch-free byte-level check that skips full row decoding. See `execute_plan` fast paths in `crates/query/src/executor/` (module dir).
 4. **mmap-based scans.** The storage layer exposes `try_for_each_row_raw` over memory-mapped heap files. Early termination is a `return ControlFlow::Break`.
@@ -158,7 +162,7 @@ cargo run --release -p powdb-cli                      # embedded REPL
 cargo run --release -p powdb-cli -- --remote host:5433 --password <pw>
 ```
 
-**The REPL is line-oriented.** A statement split across lines fails to parse — write each statement on one line.
+**The REPL buffers lines until braces/parens balance** — multi-line `type`/`insert` paste works; a statement still cannot span two separately-submitted balanced lines.
 
 ### TCP server
 
@@ -183,7 +187,17 @@ if (r.kind === "rows") console.table(r.rows);
 await client.close();
 ```
 
-**No parameter binding yet.** If your input is untrusted, escape it yourself; we don't have prepared-statement placeholders over the wire.
+**Parameter binding (`$1`..`$N`).** Pass untrusted values as positional parameters instead of interpolating them into the query string. Placeholders are 1-based `$N` (not `?` — `??` is the COALESCE operator). Binding happens at the token level on the server: each `$N` is replaced with the literal token for the matching value before parsing, so an injection-shaped string is inert data and can never change the query's shape.
+
+```ts
+// Values pass as the second argument, in $1, $2, … order.
+await client.query("insert User { name := $1, email := $2, age := $3 }", [name, email, age]);
+const r = await client.query("User filter .email = $1 { .name }", [email]);
+// null binds PowQL null; numbers bind int when integral, float otherwise.
+await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
+```
+
+The params form uses the `QueryWithParams` (0x04) wire message and requires `powdb-server >= 0.4.7`. The plain no-params `query(q)` form is unchanged.
 
 Return shapes:
 - `{ kind: "rows", columns: string[], rows: string[][] }` — SELECT-like queries

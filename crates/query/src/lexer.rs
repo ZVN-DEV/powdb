@@ -191,6 +191,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 "multi" => Token::Multi,
                 "link" => Token::Link,
                 "index" => Token::Index,
+                "unique" => Token::Unique,
                 "on" => Token::On,
                 "asc" => Token::Asc,
                 "desc" => Token::Desc,

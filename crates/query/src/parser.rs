@@ -101,6 +101,62 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
         message: e.message,
         position: e.position,
     })?;
+    parse_tokens(tokens)
+}
+
+/// Parse PowQL with `$N` placeholders bound to positional `params`.
+///
+/// Binding happens at the **token level**: the input is lexed, each
+/// `$N` placeholder token is replaced in place with the literal token
+/// for `params[N-1]` (a string param becomes a `StringLit` byte-for-byte,
+/// `null` becomes `Token::Null`), and the resulting token stream is parsed
+/// normally. Values are never re-lexed or string-interpolated, so an
+/// injection-shaped string is inert data — it can never change the query's
+/// shape.
+///
+/// Placeholders are 1-based (`$1`, `$2`, …). A reference to a placeholder
+/// with no corresponding parameter is a clean [`ParseError::Syntax`], as is
+/// a non-numeric `$name` (the named-parameter form belongs to the in-process
+/// prepared API, not the positional wire-binding path).
+pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement, ParseError> {
+    let mut tokens = lex(input).map_err(|e| ParseError::Lex {
+        message: e.message,
+        position: e.position,
+    })?;
+    for tok in tokens.iter_mut() {
+        if let Token::Param(name) = tok {
+            let n: usize = name.parse().map_err(|_| ParseError::Syntax {
+                message: format!(
+                    "positional parameters must be numeric (`$1`, `$2`, …); got `${name}`"
+                ),
+            })?;
+            if n == 0 {
+                return Err(ParseError::Syntax {
+                    message: "parameter placeholders are 1-based; `$0` is invalid".into(),
+                });
+            }
+            let p = params.get(n - 1).ok_or_else(|| ParseError::Syntax {
+                message: format!(
+                    "query references ${n} but only {} parameter(s) were supplied",
+                    params.len()
+                ),
+            })?;
+            *tok = match p {
+                ParamValue::Null => Token::Null,
+                ParamValue::Int(v) => Token::IntLit(*v),
+                ParamValue::Float(v) => Token::FloatLit(*v),
+                ParamValue::Bool(v) => Token::BoolLit(*v),
+                ParamValue::Str(s) => Token::StringLit(s.clone()),
+            };
+        }
+    }
+    parse_tokens(tokens)
+}
+
+/// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
+/// descent over an already-lexed (and possibly param-substituted) token
+/// stream and reject any trailing tokens.
+fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -1314,10 +1370,12 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Literal::Bool(v)))
             }
-            Token::Param(name) => {
-                self.advance();
-                Ok(Expr::Param(name))
-            }
+            // `$N` placeholders are only valid through
+            // `parse_with_params`, which substitutes them for literal
+            // tokens before this expression parser ever runs. Reaching a
+            // raw `Token::Param` here means the caller used the plain
+            // (no-params) path with a placeholder — surface the standard
+            // unexpected-token error so the message names the parameter.
             Token::Null => {
                 self.advance();
                 Ok(Expr::Null)
@@ -1561,6 +1619,23 @@ impl Parser {
                         action: AlterAction::AddIndex { column },
                     }));
                 }
+                // `alter <Table> add unique .<column>`
+                if *self.peek() == Token::Unique {
+                    self.advance();
+                    let column = match self.advance() {
+                        Token::DotIdent(n) => n,
+                        t => {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: ".<column> after add unique".into(),
+                                got: t.display_name(),
+                            })
+                        }
+                    };
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::AddUnique { column },
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -1769,12 +1844,21 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            let required = if *self.peek() == Token::Required {
-                self.advance();
-                true
-            } else {
-                false
-            };
+            // Accept `required` and `unique` modifiers in either order.
+            let (mut required, mut unique) = (false, false);
+            loop {
+                match self.peek() {
+                    Token::Required => {
+                        self.advance();
+                        required = true;
+                    }
+                    Token::Unique => {
+                        self.advance();
+                        unique = true;
+                    }
+                    _ => break,
+                }
+            }
             let field_name = match self.advance() {
                 Token::Ident(n) => n,
                 t => {
@@ -1798,6 +1882,7 @@ impl Parser {
                 name: field_name,
                 type_name,
                 required,
+                unique,
             });
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -1850,6 +1935,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Multi => out.push_str("multi"),
             Token::Link => out.push_str("link"),
             Token::Index => out.push_str("index"),
+            Token::Unique => out.push_str("unique"),
             Token::On => out.push_str("on"),
             Token::Asc => out.push_str("asc"),
             Token::Desc => out.push_str("desc"),
@@ -2874,6 +2960,42 @@ mod tests {
                 AlterAction::AddColumn { required, .. } => assert!(required),
                 other => panic!("expected AddColumn, got {other:?}"),
             },
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_with_unique_modifier() {
+        let stmt = parse("type User { required unique email: str, age: int }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert!(ct.fields[0].required && ct.fields[0].unique);
+                assert!(!ct.fields[1].unique);
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_unique_before_required() {
+        // Modifiers accepted in either order.
+        let stmt = parse("type User { unique required email: str }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert!(ct.fields[0].required && ct.fields[0].unique);
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_unique() {
+        let stmt = parse("alter User add unique .email").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => assert!(matches!(
+                at.action,
+                AlterAction::AddUnique { ref column } if column == "email"
+            )),
             other => panic!("expected AlterTable, got {other:?}"),
         }
     }

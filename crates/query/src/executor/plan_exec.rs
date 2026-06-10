@@ -728,36 +728,32 @@ impl Engine {
                     (values, key_idx)
                 };
 
+                // Upsert requires the `on` column to be unique — otherwise
+                // there is no well-defined row to overwrite and a plain
+                // insert could silently create duplicate keys.
+                if self.catalog.is_index_unique(table, key_column) != Some(true) {
+                    return Err(QueryError::Execution(format!(
+                        "upsert on .{key_column} requires a unique column (declare it with \
+                         `unique {key_column}: <type>` or `alter {table} add unique .{key_column}`)"
+                    )));
+                }
+
                 let key_value = values[key_idx].clone();
 
-                // Probe the index for a conflict.
+                // Probe the unique index for a conflict.
                 let existing = {
                     let tbl = self
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                    if tbl.has_index(key_column) {
-                        // Upsert key lookup: return the first match.
-                        // For unique indexes this is the only match.
-                        // For non-unique indexes on a key column, also
-                        // just the first (upsert semantics).
-                        let rids = tbl.index_lookup_all(key_column, &key_value);
-                        rids.into_iter().next().and_then(|rid| {
-                            tbl.heap
-                                .get(rid)
-                                .map(|data| (rid, decode_row(&tbl.schema, &data)))
-                        })
-                    } else {
-                        // No index — linear scan for the key.
-                        let mut found = None;
-                        for (rid, row) in tbl.scan() {
-                            if row[key_idx] == key_value {
-                                found = Some((rid, row));
-                                break;
-                            }
-                        }
-                        found
-                    }
+                    // The key column is guaranteed unique above, so this
+                    // returns at most one matching row.
+                    let rids = tbl.index_lookup_all(key_column, &key_value);
+                    rids.into_iter().next().and_then(|rid| {
+                        tbl.heap
+                            .get(rid)
+                            .map(|data| (rid, decode_row(&tbl.schema, &data)))
+                    })
                 };
 
                 if let Some((rid, mut existing_row)) = existing {
@@ -1394,16 +1390,15 @@ impl Engine {
                 let columns: Vec<ColumnDef> = fields
                     .iter()
                     .enumerate()
-                    .map(
-                        |(i, (fname, tname, req))| -> Result<ColumnDef, QueryError> {
-                            Ok(ColumnDef {
-                                name: fname.clone(),
-                                type_id: type_name_to_id(tname).map_err(QueryError::TypeError)?,
-                                required: *req,
-                                position: i as u16,
-                            })
-                        },
-                    )
+                    .map(|(i, f)| -> Result<ColumnDef, QueryError> {
+                        Ok(ColumnDef {
+                            name: f.name.clone(),
+                            type_id: type_name_to_id(&f.type_name)
+                                .map_err(QueryError::TypeError)?,
+                            required: f.required,
+                            position: i as u16,
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let schema = Schema {
                     table_name: name.clone(),
@@ -1412,6 +1407,13 @@ impl Engine {
                 self.catalog
                     .create_table(schema)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                // Declaring a field `unique` auto-creates a unique B+tree
+                // index, which is where uniqueness is enforced on writes.
+                for f in fields.iter().filter(|f| f.unique) {
+                    self.catalog
+                        .create_index_unique(name, &f.name, true)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
                 Ok(QueryResult::Created(name.clone()))
             }
 
@@ -1454,6 +1456,48 @@ impl Engine {
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("index on '{table}.{column}' created"),
+                    })
+                }
+                AlterAction::AddUnique { column } => {
+                    // No DropIndex exists, so we cannot upgrade an existing
+                    // non-unique index in place — reject it cleanly.
+                    if self.catalog.has_index(table, column) {
+                        return Err(QueryError::Execution(format!(
+                            "cannot add unique on {table}.{column}: column already indexed"
+                        )));
+                    }
+                    // Scan existing rows for duplicate (non-null) values
+                    // before creating the unique index.
+                    {
+                        let tbl = self
+                            .catalog
+                            .get_table(table)
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                        let col_idx = tbl.schema.column_index(column).ok_or_else(|| {
+                            QueryError::ColumnNotFound {
+                                table: table.to_string(),
+                                column: column.clone(),
+                            }
+                        })?;
+                        let mut seen = std::collections::HashSet::new();
+                        for (_, row) in tbl.scan() {
+                            let v = &row[col_idx];
+                            if v.is_empty() {
+                                continue;
+                            }
+                            if !seen.insert(v.clone()) {
+                                return Err(QueryError::Execution(format!(
+                                    "cannot add unique on {table}.{column}: \
+                                     duplicate value {v:?} exists"
+                                )));
+                            }
+                        }
+                    }
+                    self.catalog
+                        .create_index_unique(table, column, true)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    Ok(QueryResult::Executed {
+                        message: format!("unique index on '{table}.{column}' created"),
                     })
                 }
             },
@@ -1681,9 +1725,45 @@ impl Engine {
                 let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
                 let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
 
-                // Range scans only use the btree fast path for unique indexes,
-                // because non-unique indexes store composite keys (column_value
-                // + RowId) that don't directly compare against raw column values.
+                // Non-unique index: walk the composite (value, rid) leaf
+                // chain between prefix bounds, fetch each row from the heap,
+                // and recheck. The recheck enforces exclusive bounds
+                // (range_rids is inclusive) and defensively skips any decoded
+                // null (nulls are never indexed, so they must not match).
+                if tbl.is_index_unique(column) == Some(false) {
+                    if let Some(btree) = tbl.index(column) {
+                        if start_val.is_some() || end_val.is_some() {
+                            let col_idx = schema.column_index(column).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: column.clone(),
+                                }
+                            })?;
+                            let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
+                            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                            for rid in rids {
+                                if let Some(data) = tbl.heap.get(rid) {
+                                    let row = decode_row(schema, &data);
+                                    if !row[col_idx].is_empty()
+                                        && range_matches(
+                                            &row[col_idx],
+                                            &start_val,
+                                            start_inclusive,
+                                            &end_val,
+                                            end_inclusive,
+                                        )
+                                    {
+                                        rows.push(row);
+                                    }
+                                }
+                            }
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    }
+                }
+
+                // Range scans use the btree fast path for unique indexes,
+                // walking raw column-value keys directly.
                 if tbl.is_index_unique(column) == Some(true) {
                     if let Some(btree) = tbl.index(column) {
                         let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
@@ -2649,10 +2729,12 @@ impl Engine {
                         for (idx, val) in resolved.iter() {
                             row[*idx] = val.clone();
                         }
-                        self.catalog
-                            .update_hinted(table, rid, &row, Some(changed_cols))
-                            .map_err(|e| e.to_string())
-                            .ok();
+                        if let Err(e) =
+                            self.catalog
+                                .update_hinted(table, rid, &row, Some(changed_cols))
+                        {
+                            return Some(Err(QueryError::StorageError(e.to_string())));
+                        }
                         count += 1;
                     }
                     self.view_registry.mark_dependents_dirty(table);
@@ -3357,19 +3439,20 @@ pub(super) fn hash_join(
     QueryResult::Rows { columns, rows }
 }
 
-/// Lower unindexed `RangeScan` nodes to `Filter(SeqScan)` so that all
-/// downstream fast paths (count, project+limit, sort+limit, agg, update,
-/// delete) continue to fire.
+/// Lower unindexed `RangeScan` and `IndexScan` nodes to `Filter(SeqScan)`
+/// so that all downstream fast paths (count, project+limit, sort+limit,
+/// agg, update, delete) continue to fire.
 ///
-/// The planner emits `RangeScan` speculatively for every range inequality
-/// (`.age > 30`) because it has no catalog access. When the column has a
-/// B-tree index, `RangeScan` is the correct plan. When it doesn't, the
-/// executor's `RangeScan` fallback materialises every matching row with
+/// The planner emits `RangeScan` (for `.age > 30`) and `IndexScan` (for
+/// `.email = lit`) speculatively because it has no catalog access. When
+/// the column has a B-tree index, those plans are correct. When it
+/// doesn't, the executor's fallbacks materialise every matching row with
 /// full `decode_row` — bypassing the compiled-predicate fast paths that
-/// `Filter(SeqScan)` would trigger.
+/// `Filter(SeqScan)` would trigger. Lowering both speculative leaf kinds
+/// also keeps EXPLAIN honest: it prints the plan that actually runs.
 ///
 /// This pass runs once per query, before execution.
-pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
+pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
         PlanNode::RangeScan {
             table,
@@ -3378,11 +3461,12 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             end,
         } => {
             if let Some(tbl) = catalog.get_table(table) {
-                // Keep RangeScan only for unique indexes — their btree
-                // stores raw column values. Non-unique indexes store
-                // composite keys that don't directly compare against
-                // column values, so lower them to Filter(SeqScan).
-                if tbl.is_index_unique(column) == Some(true) {
+                // Keep RangeScan whenever ANY index exists on the column:
+                // unique indexes store raw column values, non-unique indexes
+                // store composite (value, rid) keys that the executor walks
+                // natively via BTree::range_rids. Only lower to Filter(SeqScan)
+                // when the column is unindexed.
+                if tbl.has_index(column) {
                     return plan.clone();
                 }
             }
@@ -3395,23 +3479,23 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             }
         }
         PlanNode::Filter { input, predicate } => PlanNode::Filter {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             predicate: predicate.clone(),
         },
         PlanNode::Project { input, fields } => PlanNode::Project {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             fields: fields.clone(),
         },
         PlanNode::Sort { input, keys } => PlanNode::Sort {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             keys: keys.clone(),
         },
         PlanNode::Limit { input, count } => PlanNode::Limit {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             count: count.clone(),
         },
         PlanNode::Offset { input, count } => PlanNode::Offset {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             count: count.clone(),
         },
         PlanNode::Aggregate {
@@ -3419,12 +3503,12 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             function,
             field,
         } => PlanNode::Aggregate {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             function: *function,
             field: field.clone(),
         },
         PlanNode::Distinct { input } => PlanNode::Distinct {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
         },
         PlanNode::GroupBy {
             input,
@@ -3432,7 +3516,7 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             aggregates,
             having,
         } => PlanNode::GroupBy {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             keys: keys.clone(),
             aggregates: aggregates.clone(),
             having: having.clone(),
@@ -3442,25 +3526,25 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             table,
             assignments,
         } => PlanNode::Update {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
             assignments: assignments.clone(),
         },
         PlanNode::Delete { input, table } => PlanNode::Delete {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
         },
         PlanNode::Window { input, windows } => PlanNode::Window {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             windows: windows.clone(),
         },
         PlanNode::Union { left, right, all } => PlanNode::Union {
-            left: Box::new(lower_unindexed_range_scans(catalog, left)),
-            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            left: Box::new(lower_unindexed_scans(catalog, left)),
+            right: Box::new(lower_unindexed_scans(catalog, right)),
             all: *all,
         },
         PlanNode::Explain { input } => PlanNode::Explain {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
         },
         PlanNode::NestedLoopJoin {
             left,
@@ -3468,11 +3552,28 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             on,
             kind,
         } => PlanNode::NestedLoopJoin {
-            left: Box::new(lower_unindexed_range_scans(catalog, left)),
-            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            left: Box::new(lower_unindexed_scans(catalog, left)),
+            right: Box::new(lower_unindexed_scans(catalog, right)),
             on: on.clone(),
             kind: *kind,
         },
+        PlanNode::IndexScan { table, column, key } => {
+            if let Some(tbl) = catalog.get_table(table) {
+                if tbl.has_index(column) {
+                    return plan.clone();
+                }
+            }
+            PlanNode::Filter {
+                input: Box::new(PlanNode::SeqScan {
+                    table: table.clone(),
+                }),
+                predicate: Expr::BinaryOp(
+                    Box::new(Expr::Field(column.clone())),
+                    BinOp::Eq,
+                    Box::new(key.clone()),
+                ),
+            }
+        }
         // Leaf nodes: no children to recurse into.
         _ => plan.clone(),
     }
@@ -3707,12 +3808,15 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         PlanNode::CreateTable { name, fields } => {
             let fs: Vec<String> = fields
                 .iter()
-                .map(|(n, t, r)| {
-                    if *r {
-                        format!("{n}: {t} required")
-                    } else {
-                        format!("{n}: {t}")
+                .map(|f| {
+                    let mut mods = String::new();
+                    if f.required {
+                        mods.push_str(" required");
                     }
+                    if f.unique {
+                        mods.push_str(" unique");
+                    }
+                    format!("{}: {}{mods}", f.name, f.type_name)
                 })
                 .collect();
             format!("{indent}CreateTable name={name} fields=[{}]", fs.join(", "))

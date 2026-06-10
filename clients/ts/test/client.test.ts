@@ -696,6 +696,49 @@ async function main() {
   });
 
   // ──────────────────────────────────────────────────────────
+  console.log("\nPARAMETER BINDING ($N)");
+  // ──────────────────────────────────────────────────────────
+
+  await test("query with params stores injection-shaped strings byte-faithfully", async () => {
+    await client.query(`type ${tbl("P")} { required name: str, age: int }`);
+    const evil = `x"; drop ${tbl("P")}; filter .age > "0`;
+    const ins = await client.query(
+      `insert ${tbl("P")} { name := $1, age := $2 }`,
+      [evil, 9],
+    );
+    assert.equal(ins.kind, "ok");
+    const r = await client.query(`${tbl("P")} filter .age = $1 { .name }`, [9]);
+    assert.equal(r.kind, "rows");
+    if (r.kind === "rows") assert.deepEqual(r.rows, [[evil]]);
+    // The table was not dropped by the injection-shaped string.
+    const c = await client.query(`count(${tbl("P")})`);
+    assertScalar(c, "1");
+  });
+
+  await test("params bind null, bool, int, and float", async () => {
+    await client.query(
+      `type ${tbl("PT")} { required name: str, n: int, f: float, ok: bool }`,
+    );
+    await client.query(
+      `insert ${tbl("PT")} { name := $1, n := $2, f := $3, ok := $4 }`,
+      ["row", -7, 2.5, true],
+    );
+    // null param round-trips as PowQL null.
+    await client.query(
+      `insert ${tbl("PT")} { name := $1, n := $2 }`,
+      ["nullish", null],
+    );
+    const r = await client.query(`${tbl("PT")} filter .n = null { .name }`);
+    assert.equal(r.kind, "rows");
+    if (r.kind === "rows") assert.deepEqual(r.rows, [["nullish"]]);
+  });
+
+  await test("old no-params query path still works", async () => {
+    const r = await client.query(`${tbl("P")} { .name }`);
+    assert.equal(r.kind, "rows");
+  });
+
+  // ──────────────────────────────────────────────────────────
   console.log("\nCONNECTION LIFECYCLE");
   // ──────────────────────────────────────────────────────────
 

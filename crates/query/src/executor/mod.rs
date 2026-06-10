@@ -220,9 +220,8 @@ mod tests;
 pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
-    compute_group_aggregate, execute_window, format_plan_tree, hash_join,
-    lower_unindexed_range_scans, range_matches, synthesize_range_predicate,
-    try_extract_equi_join_keys,
+    compute_group_aggregate, execute_window, format_plan_tree, hash_join, lower_unindexed_scans,
+    range_matches, synthesize_range_predicate, try_extract_equi_join_keys,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -435,7 +434,7 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
-                    let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+                    let plan = lower_unindexed_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
                     // Mission B (post-review): statement-boundary WAL
                     // group commit. Catalog::wal_log now only appends;
@@ -458,7 +457,7 @@ impl Engine {
                                 QueryError::Execution(format!("plan cache lock poisoned: {e}"))
                             })?
                             .insert(hash, plan.clone());
-                        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+                        let plan = lower_unindexed_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
                         if !self.in_transaction {
                             self.catalog
@@ -474,7 +473,7 @@ impl Engine {
             // consistent error shape.
             return match planner::plan(input) {
                 Ok(plan) => {
-                    let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+                    let plan = lower_unindexed_scans(&self.catalog, &plan);
                     let result = self.execute_plan(&plan);
                     if !self.in_transaction {
                         self.catalog
@@ -498,7 +497,7 @@ impl Engine {
         let plan_us = plan_start.elapsed().as_micros();
 
         let exec_start = Instant::now();
-        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
             self.catalog
@@ -530,6 +529,57 @@ impl Engine {
             }
         }
         result
+    }
+
+    /// Execute PowQL with `$N` placeholders bound to positional `params`.
+    ///
+    /// Task 4: parameters are substituted as literal *tokens* before
+    /// parsing (see [`crate::parser::parse_with_params`]), so untrusted
+    /// input can never change the query's shape. This path deliberately
+    /// **bypasses the plan cache** — template caching is a follow-up — and
+    /// otherwise mirrors the non-cached tail of [`Engine::execute_powql`].
+    pub fn execute_powql_with_params(
+        &mut self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+    ) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let stmt = crate::parser::parse_with_params(input, params)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan =
+            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let result = self.execute_plan(&plan);
+        if !self.in_transaction {
+            self.catalog
+                .sync_wal()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        }
+        result
+    }
+
+    /// Read-only variant of [`Engine::execute_powql_with_params`].
+    ///
+    /// Mirrors [`Engine::execute_powql_readonly`]: parses with bound
+    /// params, rejects any write statement with
+    /// [`QueryError::ReadonlyNeedsWrite`] so the caller can escalate to the
+    /// write lock, then executes under a shared borrow. No plan-cache
+    /// interaction.
+    pub fn execute_powql_readonly_with_params(
+        &self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+    ) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let stmt = crate::parser::parse_with_params(input, params)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        if !is_read_only_statement(&stmt) {
+            return Err(QueryError::ReadonlyNeedsWrite);
+        }
+        let plan =
+            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        self.execute_plan_readonly(&plan)
     }
 
     /// Plan cache stats — useful for benches and debugging.
@@ -576,7 +626,7 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
-                let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+                let plan = lower_unindexed_scans(&self.catalog, &plan);
                 return self.execute_plan_readonly(&plan);
             }
             // Miss: plan + insert + execute. The planner is pure, so this
@@ -587,14 +637,14 @@ impl Engine {
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .insert(hash, plan.clone());
-            let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+            let plan = lower_unindexed_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
         let plan =
             crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_range_scans(&self.catalog, &plan);
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
     }
 

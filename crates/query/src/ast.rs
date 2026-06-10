@@ -42,6 +42,13 @@ pub enum AlterAction {
     AddIndex {
         column: String,
     },
+    /// `alter <Table> add unique .<column>` — creates a UNIQUE B+Tree
+    /// index on `column`. Scans existing data first and fails if any
+    /// duplicate (non-null) value is present. Errors if the column is
+    /// already indexed (no in-place upgrade).
+    AddUnique {
+        column: String,
+    },
 }
 
 /// `drop User`
@@ -196,6 +203,9 @@ pub struct FieldDef {
     pub name: String,
     pub type_name: String,
     pub required: bool,
+    /// `true` when declared with the `unique` modifier — auto-creates a
+    /// unique B+Tree index on this column at table-create time.
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,6 +334,22 @@ pub enum Literal {
     Float(f64),
     String(String),
     Bool(bool),
+}
+
+/// A bound value supplied for a `$N` placeholder in
+/// [`crate::parser::parse_with_params`].
+///
+/// Unlike [`Literal`], this carries a `Null` variant so a parameter can
+/// bind PowQL `null` (substituted as `Token::Null`, not a string). Values
+/// are turned into literal *tokens* before parsing, so an injection-shaped
+/// string is inert data — it can never change the query's shape.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamValue {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

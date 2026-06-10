@@ -72,14 +72,16 @@ User group .status having count(.name) > 5 { .status, n: count(.name) }
 
 ## Schema Definition
 
-Tables are defined using the `type` keyword. Each field has a name and a type, optionally prefixed with `required` to enforce non-null values.
+Tables are defined using the `type` keyword. Each field has a name and a type, optionally prefixed with the modifiers `required` (enforce non-null values) and/or `unique` (enforce that no two non-null rows share a value). The modifiers may appear in either order.
+
+Declaring a field `unique` automatically creates a unique B+tree index on that column; duplicate inserts/updates/upserts are then rejected with a `unique constraint violation` error.
 
 ### Syntax
 
 ```
 type <TableName> {
-  [required] <field>: <type>,
-  [required] <field>: <type>,
+  [required] [unique] <field>: <type>,
+  [required] [unique] <field>: <type>,
   ...
 }
 ```
@@ -87,10 +89,10 @@ type <TableName> {
 ### Examples
 
 ```
--- A simple user table
+-- A simple user table; email must be unique across all rows
 type User {
   required name: str,
-  required email: str,
+  required unique email: str,
   age: int
 }
 
@@ -106,7 +108,7 @@ type Record {
 }
 ```
 
-Fields without `required` are nullable -- they can hold empty/null values.
+Fields without `required` are nullable -- they can hold empty/null values. Null values are exempt from the `unique` constraint (multiple rows may be null).
 
 ### Supported Types
 
@@ -251,15 +253,26 @@ o.total
 
 ### Parameters
 
-Query parameters are prefixed with `$` and bound at execution time:
+Positional placeholders `$1`, `$2`, … bind untrusted values without string
+interpolation. They are 1-based (`?` is not a placeholder — `??` is the
+COALESCE operator):
 
 ```
-User filter .age > $min_age
-User filter .name = $target
-insert User { name := $name, email := $email, age := $age }
+User filter .name = $1
+User filter .age > $1 and .age <= $2
+insert User { name := $1, email := $2, age := $3 }
 ```
 
-Parameters enable safe, reusable queries without string interpolation. See [Prepared Queries](#prepared-queries) for the execution API.
+Binding happens at the **token level**: each `$N` is replaced with the
+literal token for the supplied value *before* parsing, so an
+injection-shaped string is inert data and can never change the query's
+shape. A `null` parameter binds PowQL `null`. A placeholder with no
+matching argument (or a `$0`) is a clean parse error.
+
+Over the wire this is the `client.query(powql, params)` form (see
+[AGENTS.md](../AGENTS.md) for the client API and the `QueryWithParams`
+message). For the in-process Rust execution API, see
+[Prepared Queries](#prepared-queries).
 
 ### Comparison Operators
 
@@ -1041,6 +1054,16 @@ alter User add index .age
 
 Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is a no-op.
 
+#### Add Unique
+
+Create a unique B+tree index on a column, enforcing that no two non-null rows share a value:
+
+```
+alter User add unique .email
+```
+
+The command first scans the existing data — if any duplicate (non-null) value is already present, it fails and the index is not created. It also fails if the column already has a (non-unique) index, since there is no in-place index upgrade; drop and recreate the table to change an existing index's uniqueness. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
+
 ### DROP TABLE
 
 Remove a table entirely:
@@ -1148,6 +1171,8 @@ upsert <Table> on .<key_column> { <assignments> } [on conflict { <conflict_assig
 ```
 
 The key column (specified after `on`) is used to detect conflicts. If a row with a matching key already exists, the row is updated with the provided assignments (or the conflict-specific assignments if `on conflict` is given). If no match exists, a new row is inserted.
+
+> **Breaking change (since 0.4.7):** the `on` column must be **unique** — declare it with the `unique` modifier (`unique email: str`) or `alter <Table> add unique .<col>`. Upserting on a non-unique column is rejected with an error. This closes a prior bug where `upsert` on a non-unique column could silently create duplicate-key rows.
 
 ### Examples
 
@@ -1307,6 +1332,8 @@ PowQL has seven data types plus a null representation.
 | **Alter add** | `alter User add column status: str` | `ALTER TABLE User ADD COLUMN status TEXT` |
 | **Alter drop** | `alter User drop column status` | `ALTER TABLE User DROP COLUMN status` |
 | **Create index** | `alter User add index .email` | `CREATE INDEX ON User (email)` |
+| **Unique column** | `type User { unique email: str }` | `CREATE TABLE User (email TEXT UNIQUE)` |
+| **Add unique** | `alter User add unique .email` | `CREATE UNIQUE INDEX ON User (email)` |
 | **Create view** | `materialize V as User filter .active = true` | `CREATE MATERIALIZED VIEW V AS SELECT * FROM User WHERE active` |
 | **Refresh view** | `refresh V` | `REFRESH MATERIALIZED VIEW V` |
 | **Drop view** | `drop view V` | `DROP MATERIALIZED VIEW V` |
@@ -1325,6 +1352,7 @@ PowQL has seven data types plus a null representation.
 | Assignment | `:=` | `=` or `SET col = val` |
 | Table definition | `type Name { ... }` | `CREATE TABLE Name (...)` |
 | Required/NOT NULL | `required field: type` | `field TYPE NOT NULL` |
+| Unique constraint | `unique field: type` | `field TYPE UNIQUE` |
 | String literals | `"double quotes"` | `'single quotes'` |
 | Query shape | Pipeline: `Table verb verb { proj }` | Clausal: `SELECT proj FROM Table WHERE ... ORDER BY ...` |
 | Aggregates | Wrapping: `count(Table filter ...)` | Inline: `SELECT COUNT(*) FROM Table WHERE ...` |

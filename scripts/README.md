@@ -53,3 +53,27 @@ in the cycle fails the CI job (`set -euo pipefail` inside the script).
 
 Resets the criterion benchmark baselines after intentional perf changes.
 Documented inside the script itself.
+
+## `agent-eval/` — agent-DX falsification harness
+
+A model-agnostic, **offline** harness that scores how well an LLM writes
+correct PowQL given only `AGENTS.md` and a schema — and lets you compare that
+hit rate against the same model writing SQL for SQLite over identical data.
+
+```bash
+bash scripts/agent-eval/setup.sh                       # build CLI + seed .golden-data/
+python3 scripts/agent-eval/run.py \
+  scripts/agent-eval/examples/golden-candidates.jsonl  # smoke: 6/7 (one intentional fail)
+```
+
+- `setup.sh` builds `powdb-cli` and seeds a pristine `.golden-data/` dir
+  (gitignored) from `schema.powql` + `seed.powql` — 10 related tables.
+- `tasks.json` holds 26 natural-language tasks, each with a deterministic
+  `check` (`scalar` / `rowcount` / `rows` / `error` / `ok`), covering the
+  AGENTS.md footgun list.
+- `run.py` (Python 3 stdlib only) copies the golden dir per candidate, runs
+  each candidate statement through `powdb-cli --exec`, scores the output, and
+  prints a per-category pass rate. Always exits 0 — it's a measurement tool.
+- No model calls anywhere, and **not wired into CI**. See
+  `scripts/agent-eval/README.md` for the full contract and the SQLite
+  baseline procedure.

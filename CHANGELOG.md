@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Parameter binding over the wire (`$1`..`$N`).** Clients can send a query
+  template plus positional values instead of interpolating untrusted input
+  into the query string. Placeholders are 1-based `$N` (not `?` — `??` is the
+  COALESCE operator). Binding happens at the **token level** on the server:
+  each `$N` is replaced with the literal token for its value before parsing,
+  so an injection-shaped string is inert data and can never change the query's
+  shape. New wire message `QueryWithParams` (`0x04`) — a pure protocol
+  addition; existing messages and pre-0.4.7 clients are unaffected. The
+  TypeScript client gains `client.query(powql, params?)`. Engine API:
+  `Engine::execute_powql_with_params` / `execute_powql_readonly_with_params`.
+- **Unique constraints.** Declare a column unique with the `unique` field
+  modifier (`type User { required unique email: str }`) or add one to an
+  existing table with `alter User add unique .email` (which scans for existing
+  duplicates first and fails if any exist). Declaring `unique` auto-creates a
+  unique B+tree index; enforcement is a storage-layer pre-check shared by the
+  plain, prepared, and upsert write paths, so duplicates are rejected with
+  `unique constraint violation on <table>.<column>` before anything is written
+  or WAL-logged. The constraint survives restart (persisted in the catalog +
+  rebuilt on WAL replay).
+- **Range scans use B+tree indexes.** `>`, `>=`, `<`, `<=`, and `between` on an
+  indexed column now traverse the index (unique: raw keys; non-unique:
+  composite `(value, rid)` keys) instead of always falling back to a full
+  scan — roughly 7× faster on a selective range over 100K rows. NULLs are
+  correctly excluded and exclusive bounds are honored.
+- **`EXPLAIN` shows the executed plan.** Because the planner is pure (no
+  catalog access), it emits speculative `IndexScan`/`RangeScan` nodes; the
+  executor lowers them at runtime when no index exists. `EXPLAIN` now applies
+  the same lowering before printing, so it shows `Filter(SeqScan)` for an
+  unindexed column instead of a misleading `IndexScan`.
+- **Multi-line REPL input.** The `powdb-cli` REPL buffers lines until braces
+  and parentheses balance (outside string literals), so multi-line `type` and
+  `insert` statements can be pasted or typed across lines.
+- **Agent-DX evaluation harness** (`scripts/agent-eval/`). A model-agnostic,
+  offline harness that scores how well an LLM writes PowQL given only
+  `AGENTS.md` and a 10-table schema, with a parallel SQLite baseline for
+  comparison. Not wired into CI.
+
+### Changed
+- **BREAKING:** `upsert <T> on .col` now requires `.col` to be a `unique`
+  column. Declare it with the `unique` modifier or `alter <T> add unique .col`.
+  This fixes a bug where `upsert ... on .id` followed by a plain
+  `insert` of the same id silently produced duplicate rows.
+
+### Fixed
+- Lowering an unindexed equality update to `Filter(SeqScan)` exposed a fused
+  scan-update path that swallowed `update_hinted` errors and still counted the
+  row as modified — which bypassed the v0.4.6 oversized-row guard for that
+  path. Errors now propagate as `StorageError`; all three `oversized_rows`
+  tests pass.
+
 ## [0.4.6] - 2026-06-09
 
 ### Fixed

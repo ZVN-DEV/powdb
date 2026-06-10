@@ -1,0 +1,23 @@
+-- PowDB agent-eval schema: 10 related tables.
+-- One `type` statement per line (setup.sh streams these line-by-line
+-- through `powdb-cli --exec`). Blank lines and `--` comment lines are
+-- skipped by setup.sh / run.py.
+--
+-- NOTE (follow-up): `unique` is NOT used here because the `unique` field
+-- modifier is not merged on this branch. Once Task 3 (UNIQUE constraints)
+-- lands, the natural uniqueness constraints below should be declared:
+--   users.email, users.id, products.sku, categories.id, orders.id,
+--   payments.id, sessions.token, addresses.id, inventory.product_id.
+-- Until then these are plain columns and uniqueness is only a property of
+-- the seed data, not an enforced constraint.
+
+type categories { required id: int, required name: str, parent_id: int }
+type users { required id: int, required name: str, required email: str, city: str, age: int, active: bool }
+type addresses { required id: int, required user_id: int, city: str, country: str, zip: str }
+type products { required id: int, required sku: str, required name: str, category_id: int, price: float, active: bool }
+type inventory { required product_id: int, required quantity: int, warehouse: str }
+type orders { required id: int, required user_id: int, total: float, status: str, city: str }
+type order_items { required id: int, required order_id: int, required product_id: int, quantity: int, unit_price: float }
+type payments { required id: int, required order_id: int, amount: float, method: str, status: str }
+type reviews { required id: int, required product_id: int, required user_id: int, rating: int, body: str }
+type sessions { required id: int, required user_id: int, token: str, active: bool }

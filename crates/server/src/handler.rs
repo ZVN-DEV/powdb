@@ -1,4 +1,4 @@
-use crate::protocol::Message;
+use crate::protocol::{Message, WireParam};
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
@@ -296,6 +296,63 @@ fn dispatch_query(
     eng.execute_powql(query)
 }
 
+/// Convert a wire parameter into the query-crate [`ParamValue`] used for
+/// token-level binding.
+fn wire_param_to_value(p: &WireParam) -> powdb_query::ast::ParamValue {
+    use powdb_query::ast::ParamValue;
+    match p {
+        WireParam::Null => ParamValue::Null,
+        WireParam::Int(v) => ParamValue::Int(*v),
+        WireParam::Float(v) => ParamValue::Float(*v),
+        WireParam::Bool(v) => ParamValue::Bool(*v),
+        WireParam::Str(s) => ParamValue::Str(s.clone()),
+    }
+}
+
+/// Parameterized counterpart of [`dispatch_query`]. Routes through the exact
+/// same role-enforcement and read/write escalation logic, but binds the
+/// `$N` placeholders at the token level via the query crate's
+/// `parse_with_params` path. A string parameter can never change the query's
+/// shape — it is substituted as a literal token, not interpolated text.
+fn dispatch_query_with_params(
+    engine: &Arc<RwLock<Engine>>,
+    query: &str,
+    params: &[WireParam],
+    principal: Option<&Principal>,
+) -> Result<QueryResult, QueryError> {
+    let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
+
+    // Parse once (with params bound) so role enforcement and read/write
+    // classification see exactly the statement that will execute.
+    let stmt_result = parser::parse_with_params(query, &bound).map_err(|e| e.to_string());
+
+    if let Ok(stmt) = &stmt_result {
+        check_statement_permitted(principal, stmt)?;
+    }
+
+    let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
+    if can_try_read {
+        let res = {
+            let eng = engine
+                .read()
+                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+            eng.execute_powql_readonly_with_params(query, &bound)
+        };
+        match res {
+            Ok(r) => return Ok(r),
+            Err(QueryError::ReadonlyNeedsWrite) => {
+                // Escalate to the write path below.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut eng = engine
+        .write()
+        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+    eng.execute_powql_with_params(query, &bound)
+}
+
 pub async fn handle_connection<S>(stream: S, opts: ConnOpts<'_>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -479,6 +536,45 @@ where
                         let query = query.clone();
                         let principal = principal.clone();
                         move || dispatch_query(&engine, &query, principal.as_ref())
+                    });
+                    let abort_handle = handle.abort_handle();
+                    match tokio::time::timeout(query_timeout, handle).await {
+                        Ok(Ok(Ok(result))) => query_result_to_message(result),
+                        Ok(Ok(Err(e))) => Message::Error {
+                            message: sanitize_error(&e.to_string()),
+                        },
+                        Ok(Err(e)) => Message::Error {
+                            message: format!("internal error: {e}"),
+                        },
+                        Err(_) => {
+                            abort_handle.abort();
+                            warn!(peer = %peer, query = %query, "query timeout exceeded");
+                            Message::Error {
+                                message: "query timeout exceeded".into(),
+                            }
+                        }
+                    }
+                }
+            }
+            Message::QueryWithParams { query, params } => {
+                if query.len() > MAX_QUERY_LENGTH {
+                    Message::Error {
+                        message: format!(
+                            "query too large: {} bytes (max {})",
+                            query.len(),
+                            MAX_QUERY_LENGTH
+                        ),
+                    }
+                } else {
+                    debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
+                    let handle = tokio::task::spawn_blocking({
+                        let engine = engine.clone();
+                        let query = query.clone();
+                        let params = params.clone();
+                        let principal = principal.clone();
+                        move || {
+                            dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                        }
                     });
                     let abort_handle = handle.abort_handle();
                     match tokio::time::timeout(query_timeout, handle).await {

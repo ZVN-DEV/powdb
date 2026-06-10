@@ -1,5 +1,16 @@
 use crate::ast::{AggFunc, AlterAction, Assignment, Expr, JoinKind, WindowFunc};
 
+/// A column definition carried by `PlanNode::CreateTable`. Replaces the
+/// old `(name, type_name, required)` tuple so the `unique` modifier can
+/// flow from the parser through to the executor's DDL arm.
+#[derive(Debug, Clone)]
+pub struct CreateField {
+    pub name: String,
+    pub type_name: String,
+    pub required: bool,
+    pub unique: bool,
+}
+
 /// Physical plan nodes — what the executor actually runs.
 #[derive(Debug, Clone)]
 pub enum PlanNode {
@@ -115,7 +126,7 @@ pub enum PlanNode {
     },
     CreateTable {
         name: String,
-        fields: Vec<(String, String, bool)>,
+        fields: Vec<CreateField>,
     },
     /// Create a materialized view: execute query, store results, register.
     CreateView {

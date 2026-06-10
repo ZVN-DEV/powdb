@@ -3292,6 +3292,120 @@ fn test_explain_filter() {
     }
 }
 
+fn explain_text(engine: &mut Engine, q: &str) -> String {
+    match engine.execute_powql(q).unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(s) => s.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_explain_eq_filter_unindexed_shows_seqscan_not_indexscan() {
+    let mut engine = test_engine();
+    // `email` has NO index in test_engine; the planner folds
+    // `.email = lit` to IndexScan speculatively. EXPLAIN must show
+    // what actually runs: Filter over SeqScan.
+    let text = explain_text(
+        &mut engine,
+        r#"explain User filter .email = "alice@ex.com""#,
+    );
+    assert!(!text.contains("IndexScan"), "got: {text}");
+    assert!(text.contains("Filter"), "got: {text}");
+    assert!(text.contains("SeqScan"), "got: {text}");
+}
+
+#[test]
+fn test_explain_eq_filter_indexed_shows_indexscan() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .email").unwrap();
+    let text = explain_text(
+        &mut engine,
+        r#"explain User filter .email = "alice@ex.com""#,
+    );
+    assert!(text.contains("IndexScan"), "got: {text}");
+}
+
+fn sorted_names(r: QueryResult) -> Vec<String> {
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            let mut v: Vec<String> = rows.iter().map(|r| format!("{:?}", r[0])).collect();
+            v.sort();
+            v
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_range_scan_uses_nonunique_index_same_results() {
+    let mut engine = test_engine(); // Alice 30, Bob 25, Charlie 35
+    let unindexed = engine
+        .execute_powql("User filter .age > 26 and .age <= 35 { .name }")
+        .unwrap();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let indexed = engine
+        .execute_powql("User filter .age > 26 and .age <= 35 { .name }")
+        .unwrap();
+    assert_eq!(sorted_names(unindexed), sorted_names(indexed)); // Alice, Charlie
+}
+
+#[test]
+fn test_range_scan_between_uses_nonunique_index() {
+    let mut engine = test_engine();
+    let unindexed = engine
+        .execute_powql("User filter .age between 25 and 30 { .name }")
+        .unwrap();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let indexed = engine
+        .execute_powql("User filter .age between 25 and 30 { .name }")
+        .unwrap();
+    assert_eq!(sorted_names(unindexed), sorted_names(indexed)); // Alice, Bob
+}
+
+#[test]
+fn test_range_scan_indexed_exclusive_bound_excludes_boundary() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .age").unwrap();
+    // Bob is exactly 25; `.age > 25` must exclude him.
+    let names = sorted_names(
+        engine
+            .execute_powql("User filter .age > 25 { .name }")
+            .unwrap(),
+    );
+    assert_eq!(names, vec!["Str(\"Alice\")", "Str(\"Charlie\")"]);
+}
+
+#[test]
+fn test_range_scan_indexed_excludes_nulls() {
+    let mut engine = test_engine();
+    engine
+        .execute_powql(r#"insert User { name := "Dana", email := "d@ex.com" }"#)
+        .unwrap(); // age null
+    engine.execute_powql("alter User add index .age").unwrap();
+    match engine
+        .execute_powql("User filter .age < 100 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3, "null age must not match"),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_explain_range_indexed_shows_rangescan() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let text = explain_text(&mut engine, "explain User filter .age > 26");
+    assert!(text.contains("RangeScan"), "got: {text}");
+}
+
 #[test]
 fn test_explain_does_not_execute() {
     let mut engine = test_engine();
@@ -4299,4 +4413,306 @@ fn test_window_agg_with_order_keeps_running_frame() {
     assert_eq!(by_name["a"], Value::Float(10.0));
     assert_eq!(by_name["b"], Value::Float(15.0));
     assert_eq!(by_name["c"], Value::Float(20.0));
+}
+
+// ---------------------------------------------------------------------------
+// UNIQUE constraint enforcement (Task 3)
+// ---------------------------------------------------------------------------
+
+fn unique_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_uniq_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Acct { required unique email: str, id: int }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Acct { email := "a@x.com", id := 1 }"#)
+        .unwrap();
+    engine
+}
+
+#[test]
+fn test_unique_dup_insert_rejected() {
+    let mut engine = unique_engine();
+    let err = engine
+        .execute_powql(r#"insert Acct { email := "a@x.com", id := 2 }"#)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("unique constraint violation on Acct.email"),
+        "{err}"
+    );
+    match engine.execute_powql("count(Acct)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unique_update_into_dup_rejected() {
+    let mut engine = unique_engine();
+    engine
+        .execute_powql(r#"insert Acct { email := "b@x.com", id := 2 }"#)
+        .unwrap();
+    let err = engine
+        .execute_powql(r#"Acct filter .id = 2 update { email := "a@x.com" }"#)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unique constraint violation"),
+        "{err}"
+    );
+    // The losing row keeps its own value (rolled back / never applied).
+    match engine
+        .execute_powql(r#"Acct filter .email = "b@x.com" { .id }"#)
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unique_update_to_same_value_allowed() {
+    let mut engine = unique_engine();
+    // Updating a unique column to its own current value must NOT trip the
+    // constraint (existing rid == self).
+    engine
+        .execute_powql(r#"Acct filter .id = 1 update { email := "a@x.com", id := 9 }"#)
+        .unwrap();
+    match engine.execute_powql("count(Acct)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_upsert_requires_unique_and_no_dup_ids() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_ups_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type W { unique id: int, v: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"upsert W on .id { id := 1, v := "first" }"#)
+        .unwrap();
+    // Known bug regression: a plain insert of the same id must now fail
+    // instead of silently creating a second id=1 row.
+    assert!(engine
+        .execute_powql(r#"insert W { id := 1, v := "second" }"#)
+        .is_err());
+    engine
+        .execute_powql(r#"upsert W on .id { id := 1, v := "third" }"#)
+        .unwrap();
+    match engine.execute_powql("count(W)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+    // upsert on a NON-unique column is a clean error.
+    engine.execute_powql("type W2 { id: int }").unwrap();
+    let err = engine
+        .execute_powql("upsert W2 on .id { id := 1 }")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a unique column"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_alter_add_unique_fails_on_existing_dups() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_audup_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.execute_powql("type L { e: str }").unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    assert!(engine.execute_powql("alter L add unique .e").is_err());
+}
+
+#[test]
+fn test_alter_add_unique_succeeds_then_enforces() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_au_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.execute_powql("type L { e: str }").unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    engine.execute_powql(r#"insert L { e := "y" }"#).unwrap();
+    engine.execute_powql("alter L add unique .e").unwrap();
+    // Now enforced on subsequent inserts.
+    assert!(engine.execute_powql(r#"insert L { e := "x" }"#).is_err());
+    // Adding unique on an already-indexed column is a clean error.
+    let err = engine.execute_powql("alter L add unique .e").unwrap_err();
+    assert!(err.to_string().contains("already indexed"), "{err}");
+}
+
+#[test]
+fn test_unique_constraint_survives_reopen() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_uniq_re_{}_{}", std::process::id(), id));
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Acct { required unique email: str }")
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Acct { email := "a@x.com" }"#)
+            .unwrap();
+        // Dropped here without explicit checkpoint — recovery path must
+        // restore the unique flag from catalog.bin + WAL replay.
+    }
+    let mut engine = Engine::new(&dir).unwrap();
+    assert!(engine
+        .execute_powql(r#"insert Acct { email := "a@x.com" }"#)
+        .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: wire parameter binding ($1..$N), token-level substitution.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_params_bind_injection_shaped_strings_byte_faithfully() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    let evil = r#"x"; drop User; filter .age > "0"#;
+    engine
+        .execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str(evil.to_string()),
+                ParamValue::Str("e@x.com".into()),
+                ParamValue::Int(40),
+            ],
+        )
+        .unwrap();
+    let r = engine
+        .execute_powql_with_params(
+            "User filter .email = $1 { .name }",
+            &[ParamValue::Str("e@x.com".into())],
+        )
+        .unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Str(evil.to_string()));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Table survived; 4 rows total.
+    match engine.execute_powql("count(User)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 4),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_errors() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    // Out-of-range placeholder is a clean error.
+    assert!(engine
+        .execute_powql_with_params("User filter .age > $2", &[ParamValue::Int(1)])
+        .is_err());
+    // The no-params API rejects an unbound placeholder.
+    assert!(engine.execute_powql("User filter .age > $1").is_err());
+    // Null param round-trips as PowQL null.
+    engine
+        .execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str("N".into()),
+                ParamValue::Str("n@x.com".into()),
+                ParamValue::Null,
+            ],
+        )
+        .unwrap();
+    match engine
+        .execute_powql("User filter .age = null { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_all_types_round_trip() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    engine
+        .execute_powql("type Mix { required name: str, n: int, f: float, ok: bool }")
+        .unwrap();
+    engine
+        .execute_powql_with_params(
+            "insert Mix { name := $1, n := $2, f := $3, ok := $4 }",
+            &[
+                ParamValue::Str("row".into()),
+                ParamValue::Int(-7),
+                ParamValue::Float(2.5),
+                ParamValue::Bool(true),
+            ],
+        )
+        .unwrap();
+    match engine
+        .execute_powql("Mix filter .n = -7 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_readonly_path() {
+    use crate::ast::ParamValue;
+    let engine = {
+        let mut e = test_engine();
+        // mutate up front, then exercise the readonly param path on &self.
+        e.execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str("Zed".into()),
+                ParamValue::Str("z@x.com".into()),
+                ParamValue::Int(99),
+            ],
+        )
+        .unwrap();
+        e
+    };
+    let r = engine
+        .execute_powql_readonly_with_params(
+            "User filter .name = $1 { .age }",
+            &[ParamValue::Str("Zed".into())],
+        )
+        .unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(99));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A write statement through the readonly param path escalates.
+    assert!(matches!(
+        engine.execute_powql_readonly_with_params(
+            "insert User { name := $1, email := $2 }",
+            &[ParamValue::Str("a".into()), ParamValue::Str("b".into())],
+        ),
+        Err(crate::result::QueryError::ReadonlyNeedsWrite)
+    ));
+}
+
+#[test]
+fn test_no_params_regression_path_unchanged() {
+    let mut engine = test_engine();
+    // Plain queries with no placeholders still work identically.
+    match engine
+        .execute_powql("User filter .age > 26 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+        other => panic!("{other:?}"),
+    }
 }

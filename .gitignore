@@ -15,6 +15,11 @@ clients/ts/dist/
 # Bench artifacts
 crates/compare/results.csv
 
+# agent-eval seeded golden data + per-run scoring output (recreated by setup.sh)
+scripts/agent-eval/.golden-data/
+scripts/agent-eval/results.json
+scripts/agent-eval/examples/results.json
+
 # Smoke-audit screenshots (regenerated on demand)
 /landing-desktop.png
 /landing-mobile.png

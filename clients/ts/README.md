@@ -60,6 +60,27 @@ escapeIdent("User");        // → "User" (throws on invalid)
 
 `escapeLiteral` accepts `string | number | bigint | boolean | null`. It rejects `NaN`/`Infinity`, `undefined`, objects, arrays, symbols, and `Date` — convert those yourself before passing them in.
 
+### Parameter binding (`$N`)
+
+For the strongest separation between code and data, pass values as positional `$N` parameters instead of interpolating them. The server binds each placeholder at the **token level** — a string becomes a literal token, never interpolated text — so an injection-shaped value is inert and can never change the query's shape. Placeholders are 1-based (`?` is not a placeholder; `??` is the COALESCE operator).
+
+```typescript
+// Values are passed as the second argument, in $1, $2, … order.
+await client.query("insert User { name := $1, email := $2, age := $3 }", [
+  name,
+  email,
+  age,
+]);
+
+const r = await client.query("User filter .email = $1 { .name }", [email]);
+
+// null binds PowQL null; numbers bind as int when integral, float otherwise;
+// bigint always binds as int.
+await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
+```
+
+`QueryParam` is `string | number | bigint | boolean | null`. The params form sends the `QueryWithParams` (0x04) wire message and **requires powdb-server >= 0.4.7**. The plain `query(q)` and `query(q, { signal })` forms are unchanged.
+
 ## Authentication
 
 For servers using the legacy shared password (`POWDB_PASSWORD`), pass
@@ -277,13 +298,15 @@ Returns a `Promise<Client>`. Options:
 > **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
 > ≥0.4.6 (enforced roles). See the version matrix under Authentication.
 
-### `client.query(query, opts?)`
+### `client.query(query, params?, opts?)`
 
 Sends a PowQL query and returns a `Promise<QueryResult>`:
 
 - `{ kind: "rows", columns: string[], rows: string[][] }` — for SELECT-like queries
 - `{ kind: "scalar", value: string }` — for aggregates (`count`, `sum`, `avg`, etc.)
 - `{ kind: "ok", affected: bigint }` — for mutations (`insert`, `update`, `delete`)
+
+`params?: QueryParam[]` — positional values bound to `$1`, `$2`, … placeholders (see Parameter binding above; requires server ≥0.4.7). When omitted, the plain query path is used. The legacy two-argument `query(q, { signal })` form is still accepted — an array second argument is treated as params, an object as options.
 
 `opts.signal?: AbortSignal` — aborts the returned promise (see Cancellation above).
 

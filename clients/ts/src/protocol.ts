@@ -10,6 +10,12 @@
 export const MSG_CONNECT = 0x01;
 export const MSG_CONNECT_OK = 0x02;
 export const MSG_QUERY = 0x03;
+/**
+ * Query carrying positional `$N` parameters. Pure protocol addition: old
+ * servers reject it with the existing "unknown message type" error, and the
+ * plain `MSG_QUERY` frame is unchanged. Requires powdb-server ≥ 0.4.7.
+ */
+export const MSG_QUERY_PARAMS = 0x04;
 export const MSG_RESULT_ROWS = 0x07;
 export const MSG_RESULT_SCALAR = 0x08;
 export const MSG_RESULT_OK = 0x09;
@@ -30,6 +36,25 @@ export const MAX_ROWS = 10_000_000;
 /** Maximum number of columns allowed in a result set. */
 export const MAX_COLUMNS = 4096;
 
+/** Maximum number of bound parameters in a QueryWithParams message. */
+export const MAX_PARAMS = 4096;
+
+/**
+ * A positional parameter value for {@link MSG_QUERY_PARAMS}. Wire encoding
+ * per param: a 1-byte tag followed by the body —
+ *   `0` null (no body), `1` int (8B LE i64), `2` float (8B LE f64),
+ *   `3` bool (1B), `4` str (length-prefixed UTF-8).
+ *
+ * Integral numbers are sent as ints, non-integral numbers as floats; `null`
+ * binds PowQL `null`. `bigint` is always an int.
+ */
+export type WireParam =
+  | { tag: "null" }
+  | { tag: "int"; value: bigint }
+  | { tag: "float"; value: number }
+  | { tag: "bool"; value: boolean }
+  | { tag: "str"; value: string };
+
 export type Message =
   | {
       type: "Connect";
@@ -46,6 +71,7 @@ export type Message =
     }
   | { type: "ConnectOk"; version: string }
   | { type: "Query"; query: string }
+  | { type: "QueryWithParams"; query: string; params: WireParam[] }
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
   | { type: "ResultScalar"; value: string }
   | { type: "ResultOk"; affected: bigint }
@@ -86,6 +112,42 @@ export function encode(msg: Message): Buffer {
       payload = encodeString(msg.query);
       msgType = MSG_QUERY;
       break;
+    case "QueryWithParams": {
+      const parts: Buffer[] = [encodeString(msg.query)];
+      const count = Buffer.alloc(2);
+      count.writeUInt16LE(msg.params.length, 0);
+      parts.push(count);
+      for (const p of msg.params) {
+        switch (p.tag) {
+          case "null":
+            parts.push(Buffer.from([0]));
+            break;
+          case "int": {
+            const b = Buffer.alloc(9);
+            b.writeUInt8(1, 0);
+            b.writeBigInt64LE(p.value, 1);
+            parts.push(b);
+            break;
+          }
+          case "float": {
+            const b = Buffer.alloc(9);
+            b.writeUInt8(2, 0);
+            b.writeDoubleLE(p.value, 1);
+            parts.push(b);
+            break;
+          }
+          case "bool":
+            parts.push(Buffer.from([3, p.value ? 1 : 0]));
+            break;
+          case "str":
+            parts.push(Buffer.from([4]), encodeString(p.value));
+            break;
+        }
+      }
+      payload = Buffer.concat(parts);
+      msgType = MSG_QUERY_PARAMS;
+      break;
+    }
     case "ResultRows": {
       const parts: Buffer[] = [];
       const colCount = Buffer.alloc(2);
@@ -188,6 +250,37 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       return { type: "ConnectOk", version: decodeString(payload, cursor) };
     case MSG_QUERY:
       return { type: "Query", query: decodeString(payload, cursor) };
+    case MSG_QUERY_PARAMS: {
+      const query = decodeString(payload, cursor);
+      const count = readU16(payload, cursor, "param count");
+      if (count > MAX_PARAMS) {
+        throw new Error(`too many parameters: ${count} (max ${MAX_PARAMS})`);
+      }
+      const params: WireParam[] = [];
+      for (let i = 0; i < count; i++) {
+        const tag = readU8(payload, cursor, "param tag");
+        switch (tag) {
+          case 0:
+            params.push({ tag: "null" });
+            break;
+          case 1:
+            params.push({ tag: "int", value: readI64(payload, cursor, "int param") });
+            break;
+          case 2:
+            params.push({ tag: "float", value: readF64(payload, cursor, "float param") });
+            break;
+          case 3:
+            params.push({ tag: "bool", value: readU8(payload, cursor, "bool param") !== 0 });
+            break;
+          case 4:
+            params.push({ tag: "str", value: decodeString(payload, cursor) });
+            break;
+          default:
+            throw new Error(`unknown param tag: ${tag}`);
+        }
+      }
+      return { type: "QueryWithParams", query, params };
+    }
     case MSG_RESULT_ROWS: {
       const colCount = readU16(payload, cursor, "column count");
       if (colCount > MAX_COLUMNS) {
@@ -257,6 +350,33 @@ function decodeString(buf: Buffer, cursor: { pos: number }): string {
   const s = buf.toString("utf8", cursor.pos, cursor.pos + len);
   cursor.pos += len;
   return s;
+}
+
+function readU8(buf: Buffer, cursor: { pos: number }, label: string): number {
+  if (cursor.pos + 1 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readUInt8(cursor.pos);
+  cursor.pos += 1;
+  return value;
+}
+
+function readI64(buf: Buffer, cursor: { pos: number }, label: string): bigint {
+  if (cursor.pos + 8 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readBigInt64LE(cursor.pos);
+  cursor.pos += 8;
+  return value;
+}
+
+function readF64(buf: Buffer, cursor: { pos: number }, label: string): number {
+  if (cursor.pos + 8 > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = buf.readDoubleLE(cursor.pos);
+  cursor.pos += 8;
+  return value;
 }
 
 function readU16(buf: Buffer, cursor: { pos: number }, label: string): number {

@@ -372,6 +372,27 @@ impl Table {
     /// straight through `BTree::insert_int` to skip the generic
     /// `Value::Ord` dispatch on every binary-search comparison.
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
+        // Unique constraint pre-check: reject the insert BEFORE touching
+        // the heap if any unique column already holds the incoming value.
+        // Every write path that can change an indexed column (plain,
+        // prepared, upsert) funnels through here or `update_hinted`; the
+        // byte-patch fast paths are guarded to never touch indexed columns.
+        for entry in &self.indexed_cols {
+            if !entry.unique {
+                continue;
+            }
+            let val = &values[entry.col_idx];
+            if !val.is_empty() && entry.btree.lookup(val).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unique constraint violation on {}.{}",
+                        self.schema.table_name, entry.col_name
+                    ),
+                ));
+            }
+        }
+
         encode_row_into_with_layout(
             &self.schema,
             &self.row_layout,
@@ -828,6 +849,38 @@ impl Table {
         };
 
         let old_row = if touches_index { self.get(rid) } else { None };
+
+        // Unique constraint pre-check (before any heap mutation): a unique
+        // column's new value must not already exist on a DIFFERENT row.
+        // Updating a row to its own current value is always legal.
+        if touches_index {
+            for entry in &self.indexed_cols {
+                if !entry.unique {
+                    continue;
+                }
+                let new_val = &values[entry.col_idx];
+                if new_val.is_empty() {
+                    continue;
+                }
+                // No change to this column's value → cannot create a dup.
+                if let Some(old) = old_row.as_ref() {
+                    if &old[entry.col_idx] == new_val {
+                        continue;
+                    }
+                }
+                if let Some(existing_rid) = entry.btree.lookup(new_val) {
+                    if existing_rid != rid {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "unique constraint violation on {}.{}",
+                                self.schema.table_name, entry.col_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
 
         encode_row_into_with_layout(
             &self.schema,
