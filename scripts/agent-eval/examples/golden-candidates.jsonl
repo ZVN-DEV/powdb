@@ -1,0 +1,7 @@
+{"task_id": "count-01", "statement": "count(users)"}
+{"task_id": "group-01", "statement": "orders group .city { .city, n: count(.id) } having n >= 2"}
+{"task_id": "ddl-01", "statement": "create table foo { id: int }"}
+{"task_id": "subq-01", "statement": "users filter .id in (orders filter .total > 500 { .user_id }) { .name }"}
+{"task_id": "count-02", "statement": "count(orders filter .status = \"paid\")"}
+{"task_id": "alias-02", "statement": "orders group .city { .city, count: count(.id) }"}
+{"task_id": "count-04", "statement": "count(users filter .age > 100)"}

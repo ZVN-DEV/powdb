@@ -1,0 +1,183 @@
+[
+  {
+    "id": "ddl-01",
+    "prompt": "Create a table named foo with a single integer column id. (Reminder: PowDB is not SQL.)",
+    "tables_hint": [],
+    "check": { "type": "error" },
+    "note": "Gotcha: the CREATE TABLE keyword is `type`, not `create table`. A `create table ...` statement must be rejected."
+  },
+  {
+    "id": "alias-01",
+    "prompt": "Count the orders in each city, returning the city and the count aliased as `n`.",
+    "tables_hint": ["orders"],
+    "check": { "type": "rowcount", "expected": 3 },
+    "note": "Gotcha: alias syntax is `n: count(.id)` (alias before colon), not `count(.id) as n`."
+  },
+  {
+    "id": "alias-02",
+    "prompt": "Count the orders in each city, returning the city and the count aliased with the name `count`.",
+    "tables_hint": ["orders"],
+    "check": { "type": "error" },
+    "note": "Gotcha: an aggregate keyword like `count` cannot be used as an alias name; `count: count(.id)` fails with `expected alias name`."
+  },
+  {
+    "id": "eq-01",
+    "prompt": "Return the names of users whose city is exactly NYC.",
+    "tables_hint": ["users"],
+    "check": { "type": "rows", "expected": [["Alice"], ["Bob"]] },
+    "note": "Gotcha: equality is `=`, not `==`. Field refs need a leading dot: `.city`."
+  },
+  {
+    "id": "count-01",
+    "prompt": "How many users are there in total?",
+    "tables_hint": ["users"],
+    "check": { "type": "scalar", "expected": "5" },
+    "note": "count-all form is `count(users)` (there is no bare `count(*)`)."
+  },
+  {
+    "id": "count-02",
+    "prompt": "How many orders have status 'paid'?",
+    "tables_hint": ["orders"],
+    "check": { "type": "scalar", "expected": "4" },
+    "note": "Filtered aggregate: count(orders filter .status = \"paid\")."
+  },
+  {
+    "id": "count-03",
+    "prompt": "How many order_items rows are there?",
+    "tables_hint": ["order_items"],
+    "check": { "type": "scalar", "expected": "6" }
+  },
+  {
+    "id": "count-04",
+    "prompt": "How many users are active?",
+    "tables_hint": ["users"],
+    "check": { "type": "scalar", "expected": "3" },
+    "note": "Boolean compare: .active = true."
+  },
+  {
+    "id": "proj-01",
+    "prompt": "List the names of all active products.",
+    "tables_hint": ["products"],
+    "check": { "type": "rowcount", "expected": 4 },
+    "note": "Projection is trailing braces `{ .name }`, not SELECT."
+  },
+  {
+    "id": "group-01",
+    "prompt": "Count orders per city; return only cities with at least 2 orders, as city and count `n`.",
+    "tables_hint": ["orders"],
+    "check": { "type": "rowcount", "expected": 2 },
+    "note": "group + having; having references the alias `n`."
+  },
+  {
+    "id": "group-02",
+    "prompt": "For each product that has 2 or more reviews, return the product_id and review count `n`.",
+    "tables_hint": ["reviews"],
+    "check": { "type": "rows", "expected": [["1", "2"]] },
+    "note": "group + having on reviews; only product 1 has 2 reviews."
+  },
+  {
+    "id": "join-01",
+    "prompt": "Inner join users to their orders, returning user name and order total. (Put the smaller table on the right.)",
+    "tables_hint": ["users", "orders"],
+    "check": { "type": "rowcount", "expected": 6 },
+    "note": "inner join with `as` aliases and `on u.id = o.user_id`."
+  },
+  {
+    "id": "join-02",
+    "prompt": "Left join users to sessions, returning every user's name alongside their session token (null where there is no session).",
+    "tables_hint": ["users", "sessions"],
+    "check": { "type": "rowcount", "expected": 5 },
+    "note": "left join keeps all 5 users; Dave and Erin have null tokens."
+  },
+  {
+    "id": "subq-01",
+    "prompt": "Return the names of users who have placed at least one order with a total greater than 500.",
+    "tables_hint": ["users", "orders"],
+    "check": { "type": "rows", "expected": [["Alice"], ["Carol"], ["Dave"]] },
+    "note": "IN-subquery: users filter .id in (orders filter .total > 500 { .user_id })."
+  },
+  {
+    "id": "null-01",
+    "prompt": "Return the names of top-level categories (those with no parent).",
+    "tables_hint": ["categories"],
+    "check": { "type": "rows", "expected": [["Books"], ["Electronics"]] },
+    "note": "Null check is `.parent_id = null`, not IS NULL."
+  },
+  {
+    "id": "between-01",
+    "prompt": "Return the names of users whose age is between 25 and 45 inclusive.",
+    "tables_hint": ["users"],
+    "check": { "type": "rows", "expected": [["Alice"], ["Carol"], ["Dave"]] },
+    "note": "between is inclusive: .age between 25 and 45."
+  },
+  {
+    "id": "distinct-01",
+    "prompt": "Return the distinct category_id values used by products.",
+    "tables_hint": ["products"],
+    "check": { "type": "rowcount", "expected": 3 },
+    "note": "distinct projection: products distinct { .category_id }."
+  },
+  {
+    "id": "distinct-02",
+    "prompt": "How many distinct cities appear in the orders table?",
+    "tables_hint": ["orders"],
+    "check": { "type": "scalar", "expected": "3" },
+    "note": "count(distinct orders { .city })."
+  },
+  {
+    "id": "txn-01",
+    "prompt": "Inside a transaction, insert a throwaway order (id 99, user_id 1, total 1.0, status 'x', city 'Z'), then roll back, then count the orders. The count must be unchanged.",
+    "tables_hint": ["orders"],
+    "check": { "type": "scalar", "expected": "6" },
+    "note": "begin / insert / rollback / count(orders) as one statement batch separated by `;`."
+  },
+  {
+    "id": "alter-01",
+    "prompt": "Add a string column `nickname` to the users table.",
+    "tables_hint": ["users"],
+    "check": { "type": "ok" },
+    "note": "DDL uses `alter users add column nickname: str` (not ADD COLUMN ... TEXT)."
+  },
+  {
+    "id": "alter-02",
+    "prompt": "Create an index on the users.city column.",
+    "tables_hint": ["users"],
+    "check": { "type": "ok" },
+    "note": "alter users add index .city."
+  },
+  {
+    "id": "order-01",
+    "prompt": "Return the name and age of the two oldest users after skipping the single oldest (i.e. order by age descending, offset 1, limit 2).",
+    "tables_hint": ["users"],
+    "check": { "type": "rows", "expected": [["Alice", "30"], ["Dave", "28"]] },
+    "note": "order .age desc offset 1 limit 2 { .name, .age }."
+  },
+  {
+    "id": "case-01",
+    "prompt": "For every user, return a label that is 'adult' when age is 18 or more, otherwise 'minor'.",
+    "tables_hint": ["users"],
+    "check": { "type": "rowcount", "expected": 5 },
+    "note": "case when .age >= 18 then \"adult\" else \"minor\" end, aliased."
+  },
+  {
+    "id": "upsert-01",
+    "prompt": "Upsert an inventory row keyed on product_id: set product_id 1 to quantity 999 in warehouse W1.",
+    "tables_hint": ["inventory"],
+    "check": { "type": "ok" },
+    "note": "upsert inventory on .product_id { ... }. On this branch upsert works on any column (UNIQUE not yet merged)."
+  },
+  {
+    "id": "agg-01",
+    "prompt": "What is the average review rating across all reviews?",
+    "tables_hint": ["reviews"],
+    "check": { "type": "scalar", "expected": "4.25" },
+    "note": "avg(reviews { .rating })."
+  },
+  {
+    "id": "agg-02",
+    "prompt": "What is the total of all order totals for paid orders?",
+    "tables_hint": ["orders"],
+    "check": { "type": "scalar", "expected": "3036" },
+    "note": "sum(orders filter .status = \"paid\" { .total })."
+  }
+]
