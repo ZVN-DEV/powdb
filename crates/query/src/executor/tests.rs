@@ -3292,6 +3292,46 @@ fn test_explain_filter() {
     }
 }
 
+fn explain_text(engine: &mut Engine, q: &str) -> String {
+    match engine.execute_powql(q).unwrap() {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Str(s) => s.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_explain_eq_filter_unindexed_shows_seqscan_not_indexscan() {
+    let mut engine = test_engine();
+    // `email` has NO index in test_engine; the planner folds
+    // `.email = lit` to IndexScan speculatively. EXPLAIN must show
+    // what actually runs: Filter over SeqScan.
+    let text = explain_text(
+        &mut engine,
+        r#"explain User filter .email = "alice@ex.com""#,
+    );
+    assert!(!text.contains("IndexScan"), "got: {text}");
+    assert!(text.contains("Filter"), "got: {text}");
+    assert!(text.contains("SeqScan"), "got: {text}");
+}
+
+#[test]
+fn test_explain_eq_filter_indexed_shows_indexscan() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .email").unwrap();
+    let text = explain_text(
+        &mut engine,
+        r#"explain User filter .email = "alice@ex.com""#,
+    );
+    assert!(text.contains("IndexScan"), "got: {text}");
+}
+
 #[test]
 fn test_explain_does_not_execute() {
     let mut engine = test_engine();

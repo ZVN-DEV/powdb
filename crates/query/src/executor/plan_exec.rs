@@ -2649,10 +2649,12 @@ impl Engine {
                         for (idx, val) in resolved.iter() {
                             row[*idx] = val.clone();
                         }
-                        self.catalog
-                            .update_hinted(table, rid, &row, Some(changed_cols))
-                            .map_err(|e| e.to_string())
-                            .ok();
+                        if let Err(e) =
+                            self.catalog
+                                .update_hinted(table, rid, &row, Some(changed_cols))
+                        {
+                            return Some(Err(QueryError::StorageError(e.to_string())));
+                        }
                         count += 1;
                     }
                     self.view_registry.mark_dependents_dirty(table);
@@ -3357,19 +3359,20 @@ pub(super) fn hash_join(
     QueryResult::Rows { columns, rows }
 }
 
-/// Lower unindexed `RangeScan` nodes to `Filter(SeqScan)` so that all
-/// downstream fast paths (count, project+limit, sort+limit, agg, update,
-/// delete) continue to fire.
+/// Lower unindexed `RangeScan` and `IndexScan` nodes to `Filter(SeqScan)`
+/// so that all downstream fast paths (count, project+limit, sort+limit,
+/// agg, update, delete) continue to fire.
 ///
-/// The planner emits `RangeScan` speculatively for every range inequality
-/// (`.age > 30`) because it has no catalog access. When the column has a
-/// B-tree index, `RangeScan` is the correct plan. When it doesn't, the
-/// executor's `RangeScan` fallback materialises every matching row with
+/// The planner emits `RangeScan` (for `.age > 30`) and `IndexScan` (for
+/// `.email = lit`) speculatively because it has no catalog access. When
+/// the column has a B-tree index, those plans are correct. When it
+/// doesn't, the executor's fallbacks materialise every matching row with
 /// full `decode_row` — bypassing the compiled-predicate fast paths that
-/// `Filter(SeqScan)` would trigger.
+/// `Filter(SeqScan)` would trigger. Lowering both speculative leaf kinds
+/// also keeps EXPLAIN honest: it prints the plan that actually runs.
 ///
 /// This pass runs once per query, before execution.
-pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
+pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
         PlanNode::RangeScan {
             table,
@@ -3395,23 +3398,23 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             }
         }
         PlanNode::Filter { input, predicate } => PlanNode::Filter {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             predicate: predicate.clone(),
         },
         PlanNode::Project { input, fields } => PlanNode::Project {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             fields: fields.clone(),
         },
         PlanNode::Sort { input, keys } => PlanNode::Sort {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             keys: keys.clone(),
         },
         PlanNode::Limit { input, count } => PlanNode::Limit {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             count: count.clone(),
         },
         PlanNode::Offset { input, count } => PlanNode::Offset {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             count: count.clone(),
         },
         PlanNode::Aggregate {
@@ -3419,12 +3422,12 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             function,
             field,
         } => PlanNode::Aggregate {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             function: *function,
             field: field.clone(),
         },
         PlanNode::Distinct { input } => PlanNode::Distinct {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
         },
         PlanNode::GroupBy {
             input,
@@ -3432,7 +3435,7 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             aggregates,
             having,
         } => PlanNode::GroupBy {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             keys: keys.clone(),
             aggregates: aggregates.clone(),
             having: having.clone(),
@@ -3442,25 +3445,25 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             table,
             assignments,
         } => PlanNode::Update {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
             assignments: assignments.clone(),
         },
         PlanNode::Delete { input, table } => PlanNode::Delete {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
         },
         PlanNode::Window { input, windows } => PlanNode::Window {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
             windows: windows.clone(),
         },
         PlanNode::Union { left, right, all } => PlanNode::Union {
-            left: Box::new(lower_unindexed_range_scans(catalog, left)),
-            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            left: Box::new(lower_unindexed_scans(catalog, left)),
+            right: Box::new(lower_unindexed_scans(catalog, right)),
             all: *all,
         },
         PlanNode::Explain { input } => PlanNode::Explain {
-            input: Box::new(lower_unindexed_range_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans(catalog, input)),
         },
         PlanNode::NestedLoopJoin {
             left,
@@ -3468,11 +3471,28 @@ pub(super) fn lower_unindexed_range_scans(catalog: &Catalog, plan: &PlanNode) ->
             on,
             kind,
         } => PlanNode::NestedLoopJoin {
-            left: Box::new(lower_unindexed_range_scans(catalog, left)),
-            right: Box::new(lower_unindexed_range_scans(catalog, right)),
+            left: Box::new(lower_unindexed_scans(catalog, left)),
+            right: Box::new(lower_unindexed_scans(catalog, right)),
             on: on.clone(),
             kind: *kind,
         },
+        PlanNode::IndexScan { table, column, key } => {
+            if let Some(tbl) = catalog.get_table(table) {
+                if tbl.has_index(column) {
+                    return plan.clone();
+                }
+            }
+            PlanNode::Filter {
+                input: Box::new(PlanNode::SeqScan {
+                    table: table.clone(),
+                }),
+                predicate: Expr::BinaryOp(
+                    Box::new(Expr::Field(column.clone())),
+                    BinOp::Eq,
+                    Box::new(key.clone()),
+                ),
+            }
+        }
         // Leaf nodes: no children to recurse into.
         _ => plan.clone(),
     }
