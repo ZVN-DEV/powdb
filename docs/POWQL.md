@@ -253,15 +253,26 @@ o.total
 
 ### Parameters
 
-Query parameters are prefixed with `$` and bound at execution time:
+Positional placeholders `$1`, `$2`, … bind untrusted values without string
+interpolation. They are 1-based (`?` is not a placeholder — `??` is the
+COALESCE operator):
 
 ```
-User filter .age > $min_age
-User filter .name = $target
-insert User { name := $name, email := $email, age := $age }
+User filter .name = $1
+User filter .age > $1 and .age <= $2
+insert User { name := $1, email := $2, age := $3 }
 ```
 
-Parameters enable safe, reusable queries without string interpolation. See [Prepared Queries](#prepared-queries) for the execution API.
+Binding happens at the **token level**: each `$N` is replaced with the
+literal token for the supplied value *before* parsing, so an
+injection-shaped string is inert data and can never change the query's
+shape. A `null` parameter binds PowQL `null`. A placeholder with no
+matching argument (or a `$0`) is a clean parse error.
+
+Over the wire this is the `client.query(powql, params)` form (see
+[AGENTS.md](../AGENTS.md) for the client API and the `QueryWithParams`
+message). For the in-process Rust execution API, see
+[Prepared Queries](#prepared-queries).
 
 ### Comparison Operators
 

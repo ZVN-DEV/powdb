@@ -4567,3 +4567,152 @@ fn test_unique_constraint_survives_reopen() {
         .execute_powql(r#"insert Acct { email := "a@x.com" }"#)
         .is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: wire parameter binding ($1..$N), token-level substitution.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_params_bind_injection_shaped_strings_byte_faithfully() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    let evil = r#"x"; drop User; filter .age > "0"#;
+    engine
+        .execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str(evil.to_string()),
+                ParamValue::Str("e@x.com".into()),
+                ParamValue::Int(40),
+            ],
+        )
+        .unwrap();
+    let r = engine
+        .execute_powql_with_params(
+            "User filter .email = $1 { .name }",
+            &[ParamValue::Str("e@x.com".into())],
+        )
+        .unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Str(evil.to_string()));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Table survived; 4 rows total.
+    match engine.execute_powql("count(User)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 4),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_errors() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    // Out-of-range placeholder is a clean error.
+    assert!(engine
+        .execute_powql_with_params("User filter .age > $2", &[ParamValue::Int(1)])
+        .is_err());
+    // The no-params API rejects an unbound placeholder.
+    assert!(engine.execute_powql("User filter .age > $1").is_err());
+    // Null param round-trips as PowQL null.
+    engine
+        .execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str("N".into()),
+                ParamValue::Str("n@x.com".into()),
+                ParamValue::Null,
+            ],
+        )
+        .unwrap();
+    match engine
+        .execute_powql("User filter .age = null { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_all_types_round_trip() {
+    use crate::ast::ParamValue;
+    let mut engine = test_engine();
+    engine
+        .execute_powql("type Mix { required name: str, n: int, f: float, ok: bool }")
+        .unwrap();
+    engine
+        .execute_powql_with_params(
+            "insert Mix { name := $1, n := $2, f := $3, ok := $4 }",
+            &[
+                ParamValue::Str("row".into()),
+                ParamValue::Int(-7),
+                ParamValue::Float(2.5),
+                ParamValue::Bool(true),
+            ],
+        )
+        .unwrap();
+    match engine
+        .execute_powql("Mix filter .n = -7 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_params_readonly_path() {
+    use crate::ast::ParamValue;
+    let engine = {
+        let mut e = test_engine();
+        // mutate up front, then exercise the readonly param path on &self.
+        e.execute_powql_with_params(
+            "insert User { name := $1, email := $2, age := $3 }",
+            &[
+                ParamValue::Str("Zed".into()),
+                ParamValue::Str("z@x.com".into()),
+                ParamValue::Int(99),
+            ],
+        )
+        .unwrap();
+        e
+    };
+    let r = engine
+        .execute_powql_readonly_with_params(
+            "User filter .name = $1 { .age }",
+            &[ParamValue::Str("Zed".into())],
+        )
+        .unwrap();
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(99));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A write statement through the readonly param path escalates.
+    assert!(matches!(
+        engine.execute_powql_readonly_with_params(
+            "insert User { name := $1, email := $2 }",
+            &[ParamValue::Str("a".into()), ParamValue::Str("b".into())],
+        ),
+        Err(crate::result::QueryError::ReadonlyNeedsWrite)
+    ));
+}
+
+#[test]
+fn test_no_params_regression_path_unchanged() {
+    let mut engine = test_engine();
+    // Plain queries with no placeholders still work identically.
+    match engine
+        .execute_powql("User filter .age > 26 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+        other => panic!("{other:?}"),
+    }
+}

@@ -336,6 +336,22 @@ pub enum Literal {
     Bool(bool),
 }
 
+/// A bound value supplied for a `$N` placeholder in
+/// [`crate::parser::parse_with_params`].
+///
+/// Unlike [`Literal`], this carries a `Null` variant so a parameter can
+/// bind PowQL `null` (substituted as `Token::Null`, not a string). Values
+/// are turned into literal *tokens* before parsing, so an injection-shaped
+/// string is inert data — it can never change the query's shape.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamValue {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinOp {
     Eq,

@@ -187,7 +187,17 @@ if (r.kind === "rows") console.table(r.rows);
 await client.close();
 ```
 
-**No parameter binding yet.** If your input is untrusted, escape it yourself; we don't have prepared-statement placeholders over the wire.
+**Parameter binding (`$1`..`$N`).** Pass untrusted values as positional parameters instead of interpolating them into the query string. Placeholders are 1-based `$N` (not `?` — `??` is the COALESCE operator). Binding happens at the token level on the server: each `$N` is replaced with the literal token for the matching value before parsing, so an injection-shaped string is inert data and can never change the query's shape.
+
+```ts
+// Values pass as the second argument, in $1, $2, … order.
+await client.query("insert User { name := $1, email := $2, age := $3 }", [name, email, age]);
+const r = await client.query("User filter .email = $1 { .name }", [email]);
+// null binds PowQL null; numbers bind int when integral, float otherwise.
+await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
+```
+
+The params form uses the `QueryWithParams` (0x04) wire message and requires `powdb-server >= 0.4.7`. The plain no-params `query(q)` form is unchanged.
 
 Return shapes:
 - `{ kind: "rows", columns: string[], rows: string[][] }` — SELECT-like queries

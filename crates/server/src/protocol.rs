@@ -4,6 +4,10 @@ use zeroize::Zeroizing;
 const MSG_CONNECT: u8 = 0x01;
 const MSG_CONNECT_OK: u8 = 0x02;
 const MSG_QUERY: u8 = 0x03;
+/// Query carrying positional `$N` parameters (Task 4). Pure protocol
+/// addition: old clients never send it, and old servers reject it with the
+/// existing "unknown message type" error — no existing frame changes shape.
+const MSG_QUERY_PARAMS: u8 = 0x04;
 const MSG_RESULT_ROWS: u8 = 0x07;
 const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
@@ -26,6 +30,23 @@ const MAX_COLUMNS: usize = 4096;
 /// Maximum number of rows allowed in a single result message.
 const MAX_ROWS: usize = 10_000_000;
 
+/// Maximum number of bound parameters in a single QueryWithParams message.
+const MAX_PARAMS: usize = 4096;
+
+/// A positional parameter value carried by [`Message::QueryWithParams`].
+///
+/// Wire encoding per param: a 1-byte tag followed by the body —
+///   `0` null (no body), `1` int (8B LE i64), `2` float (8B LE f64),
+///   `3` bool (1B), `4` str (length-prefixed UTF-8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireParam {
+    Null,
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Connect {
@@ -45,6 +66,11 @@ pub enum Message {
     },
     Query {
         query: String,
+    },
+    /// A query string with positional `$N` parameters bound at the server.
+    QueryWithParams {
+        query: String,
+        params: Vec<WireParam>,
     },
     ResultRows {
         columns: Vec<String>,
@@ -93,6 +119,32 @@ impl Message {
             }
             Message::ConnectOk { version } => (MSG_CONNECT_OK, encode_string(version)),
             Message::Query { query } => (MSG_QUERY, encode_string(query)),
+            Message::QueryWithParams { query, params } => {
+                let mut buf = encode_string(query);
+                buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
+                for p in params {
+                    match p {
+                        WireParam::Null => buf.push(0),
+                        WireParam::Int(v) => {
+                            buf.push(1);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        WireParam::Float(v) => {
+                            buf.push(2);
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                        WireParam::Bool(v) => {
+                            buf.push(3);
+                            buf.push(if *v { 1 } else { 0 });
+                        }
+                        WireParam::Str(s) => {
+                            buf.push(4);
+                            buf.extend_from_slice(&encode_string(s));
+                        }
+                    }
+                }
+                (MSG_QUERY_PARAMS, buf)
+            }
             Message::ResultRows { columns, rows } => {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&(columns.len() as u16).to_le_bytes());
@@ -183,6 +235,64 @@ impl Message {
             MSG_QUERY => {
                 let query = decode_string(payload, &mut 0)?;
                 Ok(Message::Query { query })
+            }
+            MSG_QUERY_PARAMS => {
+                let mut pos = 0;
+                let query = decode_string(payload, &mut pos)?;
+                if pos + 2 > payload.len() {
+                    return Err("truncated param count".into());
+                }
+                let count_bytes: [u8; 2] = payload[pos..pos + 2]
+                    .try_into()
+                    .map_err(|_| "invalid param count bytes".to_string())?;
+                let count = u16::from_le_bytes(count_bytes) as usize;
+                pos += 2;
+                if count > MAX_PARAMS {
+                    return Err("too many parameters".into());
+                }
+                let mut params = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if pos >= payload.len() {
+                        return Err("truncated param tag".into());
+                    }
+                    let tag = payload[pos];
+                    pos += 1;
+                    let p = match tag {
+                        0 => WireParam::Null,
+                        1 => {
+                            if pos + 8 > payload.len() {
+                                return Err("truncated int param".into());
+                            }
+                            let b: [u8; 8] = payload[pos..pos + 8]
+                                .try_into()
+                                .map_err(|_| "invalid int param bytes".to_string())?;
+                            pos += 8;
+                            WireParam::Int(i64::from_le_bytes(b))
+                        }
+                        2 => {
+                            if pos + 8 > payload.len() {
+                                return Err("truncated float param".into());
+                            }
+                            let b: [u8; 8] = payload[pos..pos + 8]
+                                .try_into()
+                                .map_err(|_| "invalid float param bytes".to_string())?;
+                            pos += 8;
+                            WireParam::Float(f64::from_le_bytes(b))
+                        }
+                        3 => {
+                            if pos + 1 > payload.len() {
+                                return Err("truncated bool param".into());
+                            }
+                            let v = payload[pos] != 0;
+                            pos += 1;
+                            WireParam::Bool(v)
+                        }
+                        4 => WireParam::Str(decode_string(payload, &mut pos)?),
+                        other => return Err(format!("unknown param tag: {other}")),
+                    };
+                    params.push(p);
+                }
+                Ok(Message::QueryWithParams { query, params })
             }
             MSG_RESULT_ROWS => {
                 let mut pos = 0;
@@ -489,6 +599,47 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_decode_query_with_params() {
+        let msg = Message::QueryWithParams {
+            query: "insert User { name := $1, age := $2, ok := $3, note := $4 }".into(),
+            params: vec![
+                WireParam::Str(r#"a"b\c; drop User"#.into()),
+                WireParam::Int(-7),
+                WireParam::Bool(true),
+                WireParam::Null,
+            ],
+        };
+        let bytes = msg.encode();
+        // The new frame must use the dedicated 0x04 tag.
+        assert_eq!(bytes[0], 0x04);
+        match Message::decode(&bytes).unwrap() {
+            Message::QueryWithParams { query, params } => {
+                assert!(query.contains("$1"));
+                assert_eq!(params.len(), 4);
+                assert!(matches!(&params[0], WireParam::Str(s) if s == r#"a"b\c; drop User"#));
+                assert!(matches!(&params[1], WireParam::Int(-7)));
+                assert!(matches!(&params[2], WireParam::Bool(true)));
+                assert!(matches!(&params[3], WireParam::Null));
+            }
+            other => panic!("expected QueryWithParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_query_with_params_float_round_trip() {
+        let msg = Message::QueryWithParams {
+            query: "T filter .f = $1".into(),
+            params: vec![WireParam::Float(2.5)],
+        };
+        match Message::decode(&msg.encode()).unwrap() {
+            Message::QueryWithParams { params, .. } => {
+                assert!(matches!(&params[0], WireParam::Float(f) if (*f - 2.5).abs() < 1e-12));
+            }
+            other => panic!("expected QueryWithParams, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_decode_garbage_never_panics() {
         // Feed a wide range of malformed/truncated byte sequences to the
         // wire-protocol decode path. Every one must return Err, never panic:
@@ -506,6 +657,37 @@ mod tests {
             vec![0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF],
             // RESULT_OK with a truncated 8-byte affected field.
             vec![0x09, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03],
+            // QUERY_PARAMS (0x04) claiming a query string len with no data.
+            vec![0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // QUERY_PARAMS: empty query string, claims 1 param, no param bytes.
+            vec![
+                0x04, 0x00, 0x06, 0x00, 0x00, 0x00, // header, payload_len=6
+                0x00, 0x00, 0x00, 0x00, // query string len = 0
+                0x01, 0x00, // param count = 1, then nothing
+            ],
+            // QUERY_PARAMS: 1 int param with a truncated i64 body.
+            vec![
+                0x04, 0x00, 0x0B, 0x00, 0x00, 0x00, // header, payload_len=11
+                0x00, 0x00, 0x00, 0x00, // query len = 0
+                0x01, 0x00, // param count = 1
+                0x01, // tag = int, then only 3 of 8 bytes
+                0x01, 0x02, 0x03,
+            ],
+            // QUERY_PARAMS: 1 str param with a truncated string body.
+            vec![
+                0x04, 0x00, 0x0F, 0x00, 0x00, 0x00, // header, payload_len=15
+                0x00, 0x00, 0x00, 0x00, // query len = 0
+                0x01, 0x00, // param count = 1
+                0x04, // tag = str
+                0xFF, 0xFF, 0xFF, 0xFF, // str len huge, no data
+            ],
+            // QUERY_PARAMS: unknown param tag byte.
+            vec![
+                0x04, 0x00, 0x0B, 0x00, 0x00, 0x00, // header, payload_len=11
+                0x00, 0x00, 0x00, 0x00, // query len = 0
+                0x01, 0x00, // param count = 1
+                0x63, // bogus tag
+            ],
         ];
         for bytes in cases {
             let result = Message::decode(&bytes);
