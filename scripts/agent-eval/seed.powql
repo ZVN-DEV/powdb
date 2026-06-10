@@ -1,0 +1,76 @@
+-- PowDB agent-eval seed data. Deterministic; every expected answer in
+-- tasks.json is hand-computed against exactly these rows. One `insert`
+-- per line (setup.sh streams line-by-line). Do not reorder or edit
+-- without updating tasks.json expected values.
+
+-- categories: 4 rows (Electronics root, with two children; Books root)
+insert categories { id := 1, name := "Electronics", parent_id := null }
+insert categories { id := 2, name := "Phones", parent_id := 1 }
+insert categories { id := 3, name := "Laptops", parent_id := 1 }
+insert categories { id := 4, name := "Books", parent_id := null }
+
+-- users: 5 rows. cities: NYC x2 (1,2), LA x2 (3,4), SF x1 (5).
+-- ages: 30,22,45,28,17. active: t,f,t,t,f. user 5 is a minor.
+insert users { id := 1, name := "Alice", email := "alice@ex.com", city := "NYC", age := 30, active := true }
+insert users { id := 2, name := "Bob", email := "bob@ex.com", city := "NYC", age := 22, active := false }
+insert users { id := 3, name := "Carol", email := "carol@ex.com", city := "LA", age := 45, active := true }
+insert users { id := 4, name := "Dave", email := "dave@ex.com", city := "LA", age := 28, active := true }
+insert users { id := 5, name := "Erin", email := "erin@ex.com", city := "SF", age := 17, active := false }
+
+-- addresses: one per user, plus a second for Alice. age column absent.
+insert addresses { id := 1, user_id := 1, city := "NYC", country := "US", zip := "10001" }
+insert addresses { id := 2, user_id := 2, city := "NYC", country := "US", zip := "10002" }
+insert addresses { id := 3, user_id := 3, city := "LA", country := "US", zip := "90001" }
+insert addresses { id := 4, user_id := 4, city := "LA", country := "US", zip := "90002" }
+insert addresses { id := 5, user_id := 5, city := "SF", country := "US", zip := "94101" }
+insert addresses { id := 6, user_id := 1, city := "Boston", country := "US", zip := "02108" }
+
+-- products: 5 rows across 3 leaf categories. prices vary; one inactive.
+insert products { id := 1, sku := "P-PHONE-1", name := "Phone X", category_id := 2, price := 699.0, active := true }
+insert products { id := 2, sku := "P-PHONE-2", name := "Phone Y", category_id := 2, price := 499.0, active := true }
+insert products { id := 3, sku := "P-LAP-1", name := "Laptop Pro", category_id := 3, price := 1299.0, active := true }
+insert products { id := 4, sku := "P-LAP-2", name := "Laptop Air", category_id := 3, price := 999.0, active := false }
+insert products { id := 5, sku := "P-BOOK-1", name := "PowQL Book", category_id := 4, price := 39.0, active := true }
+
+-- inventory: one row per product; product 4 out of stock (qty 0).
+insert inventory { product_id := 1, quantity := 50, warehouse := "W1" }
+insert inventory { product_id := 2, quantity := 20, warehouse := "W1" }
+insert inventory { product_id := 3, quantity := 5, warehouse := "W2" }
+insert inventory { product_id := 4, quantity := 0, warehouse := "W2" }
+insert inventory { product_id := 5, quantity := 200, warehouse := "W3" }
+
+-- orders: 6 rows. order.city denormalized from the placing user.
+-- city counts: NYC x3 (o1,o2,o3), LA x2 (o4,o5), SF x1 (o6).
+-- status: paid x4 (o1,o2,o4,o5), pending x1 (o3), cancelled x1 (o6).
+insert orders { id := 1, user_id := 1, total := 699.0, status := "paid", city := "NYC" }
+insert orders { id := 2, user_id := 1, total := 39.0, status := "paid", city := "NYC" }
+insert orders { id := 3, user_id := 2, total := 499.0, status := "pending", city := "NYC" }
+insert orders { id := 4, user_id := 3, total := 1299.0, status := "paid", city := "LA" }
+insert orders { id := 5, user_id := 4, total := 999.0, status := "paid", city := "LA" }
+insert orders { id := 6, user_id := 5, total := 39.0, status := "cancelled", city := "SF" }
+
+-- order_items: line items. ratings/body absent.
+insert order_items { id := 1, order_id := 1, product_id := 1, quantity := 1, unit_price := 699.0 }
+insert order_items { id := 2, order_id := 2, product_id := 5, quantity := 1, unit_price := 39.0 }
+insert order_items { id := 3, order_id := 3, product_id := 2, quantity := 1, unit_price := 499.0 }
+insert order_items { id := 4, order_id := 4, product_id := 3, quantity := 1, unit_price := 1299.0 }
+insert order_items { id := 5, order_id := 5, product_id := 4, quantity := 1, unit_price := 999.0 }
+insert order_items { id := 6, order_id := 6, product_id := 5, quantity := 1, unit_price := 39.0 }
+
+-- payments: one per non-cancelled order (5 rows; order 6 cancelled, no payment).
+insert payments { id := 1, order_id := 1, amount := 699.0, method := "card", status := "settled" }
+insert payments { id := 2, order_id := 2, amount := 39.0, method := "card", status := "settled" }
+insert payments { id := 3, order_id := 3, amount := 499.0, method := "paypal", status := "pending" }
+insert payments { id := 4, order_id := 4, amount := 1299.0, method := "card", status := "settled" }
+insert payments { id := 5, order_id := 5, amount := 999.0, method := "card", status := "settled" }
+
+-- reviews: 4 rows. ratings 5,4,3,5. product 1 has two reviews.
+insert reviews { id := 1, product_id := 1, user_id := 1, rating := 5, body := "great" }
+insert reviews { id := 2, product_id := 1, user_id := 3, rating := 4, body := "good" }
+insert reviews { id := 3, product_id := 3, user_id := 4, rating := 3, body := "ok" }
+insert reviews { id := 4, product_id := 5, user_id := 1, rating := 5, body := "love it" }
+
+-- sessions: 3 rows. active: t,f,t.
+insert sessions { id := 1, user_id := 1, token := "tok-aaa", active := true }
+insert sessions { id := 2, user_id := 2, token := "tok-bbb", active := false }
+insert sessions { id := 3, user_id := 3, token := "tok-ccc", active := true }
