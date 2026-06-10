@@ -23,7 +23,11 @@ primary_region = "iad"
   POWDB_DATA = "/data"
   POWDB_PORT = "5433"
   # Bind all interfaces — the server defaults to 127.0.0.1, which Fly's proxy can't reach.
-  POWDB_BIND = "0.0.0.0"
+  # MUST be "[::]" (dual-stack IPv6), NOT "0.0.0.0": Fly's private `.internal`
+  # network and `fly proxy` route over IPv6, so an IPv4-only bind makes the proxy
+  # fail with "handshake read error: Connection reset by peer". The server does
+  # `format!("{bind}:{port}")`, so "[::]" → "[::]:5433" and accepts both stacks.
+  POWDB_BIND = "[::]"
   # Phase 1 hardening: refuse to start when a password is set without TLS.
   # Leave OFF until you've mounted certs via secrets (POWDB_TLS_CERT /
   # POWDB_TLS_KEY) or fronted the service with a TLS-terminating proxy.
