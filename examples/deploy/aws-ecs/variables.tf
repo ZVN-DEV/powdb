@@ -13,7 +13,7 @@ variable "name_prefix" {
 variable "powdb_image" {
   description = "Container image for powdb-server."
   type        = string
-  default     = "ghcr.io/zvn-dev/powdb:v0.4.6"
+  default     = "ghcr.io/zvn-dev/powdb:v0.4.7"
 }
 
 variable "powdb_port" {
