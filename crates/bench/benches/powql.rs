@@ -231,6 +231,37 @@ fn bench_powql_filter_only(c: &mut Criterion) {
     });
 }
 
+// ───── Workload: range_scan_indexed ────────────────────────────────────────
+//
+// Selective range over a NON-unique B+tree index on `age`. The executor walks
+// composite (value, rid) keys and heap-fetches only the matching rows, so a
+// narrow range should beat the full SeqScan of `filter_only`. Mirrors the
+// `filter_only` setup but adds a non-unique index and uses a tight bound.
+
+fn bench_range_scan_indexed(c: &mut Criterion) {
+    let (mut engine, _tmp) = setup_user_fixture();
+    // `alter ... add index` creates a NON-unique B+tree index.
+    engine
+        .execute_powql("alter User add index .age")
+        .expect("build age index");
+
+    // Narrow range (3 of 60 distinct ages ≈ 5% selectivity).
+    let queries = gen_queries(|i| {
+        let lo = 20 + (i % 40);
+        format!("User filter .age >= {lo} and .age < {}", lo + 3)
+    });
+    warm_plan_cache(&mut engine, &queries);
+
+    let mut idx: usize = 0;
+    c.bench_function("range_scan_indexed", |b| {
+        b.iter(|| {
+            let q = &queries[idx % queries.len()];
+            idx = idx.wrapping_add(1);
+            black_box(engine.execute_powql(q).expect("query failed"))
+        });
+    });
+}
+
 // ───── Legacy 5b. powql_filter_projection ──────────────────────────────────
 //
 // Kept as-is for gate continuity. Non-index filter with projection.
@@ -659,6 +690,7 @@ criterion_group! {
         // Legacy + workload 1/3 (thesis guards, gate continuity).
         bench_powql_point,
         bench_powql_filter_only,
+        bench_range_scan_indexed,
         bench_powql_filter_projection,
         bench_powql_aggregation,
         // Workload 2.

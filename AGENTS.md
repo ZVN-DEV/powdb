@@ -127,7 +127,7 @@ Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`
 
 These are the design moves that buy the speedup. Understanding them keeps you from accidentally undoing them:
 
-1. **Planner is a pure function.** It does not touch the catalog — it emits `RangeScan` speculatively, and the executor lowers to `Filter(SeqScan)` at runtime if no index exists. This keeps the parser → plan pipeline allocation-free for cache hits.
+1. **Planner is a pure function.** It does not touch the catalog — it emits `RangeScan`/`IndexScan` speculatively. The executor lowers them to `Filter(SeqScan)` at runtime only when no index exists on the column; otherwise it walks the B+tree directly (unique indexes: raw column-value keys; non-unique indexes: composite `(value, rid)` keys via `BTree::range_rids`, heap-fetching matched rows and rechecking exclusive bounds). This keeps the parser → plan pipeline allocation-free for cache hits.
 2. **Plan cache hashes canonical PowQL.** Literals are substituted at lookup time (FNV-1a hash, `crates/query/src/plan_cache.rs`). A repeated `User filter .id = <N>` reuses the same plan for all N.
 3. **Compiled integer predicates.** `Filter(SeqScan)` on simple numeric predicates compiles into a branch-free byte-level check that skips full row decoding. See `execute_plan` fast paths in `crates/query/src/executor/` (module dir).
 4. **mmap-based scans.** The storage layer exposes `try_for_each_row_raw` over memory-mapped heap files. Early termination is a `return ControlFlow::Break`.

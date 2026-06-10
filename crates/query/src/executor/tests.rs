@@ -3332,6 +3332,80 @@ fn test_explain_eq_filter_indexed_shows_indexscan() {
     assert!(text.contains("IndexScan"), "got: {text}");
 }
 
+fn sorted_names(r: QueryResult) -> Vec<String> {
+    match r {
+        QueryResult::Rows { rows, .. } => {
+            let mut v: Vec<String> = rows.iter().map(|r| format!("{:?}", r[0])).collect();
+            v.sort();
+            v
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_range_scan_uses_nonunique_index_same_results() {
+    let mut engine = test_engine(); // Alice 30, Bob 25, Charlie 35
+    let unindexed = engine
+        .execute_powql("User filter .age > 26 and .age <= 35 { .name }")
+        .unwrap();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let indexed = engine
+        .execute_powql("User filter .age > 26 and .age <= 35 { .name }")
+        .unwrap();
+    assert_eq!(sorted_names(unindexed), sorted_names(indexed)); // Alice, Charlie
+}
+
+#[test]
+fn test_range_scan_between_uses_nonunique_index() {
+    let mut engine = test_engine();
+    let unindexed = engine
+        .execute_powql("User filter .age between 25 and 30 { .name }")
+        .unwrap();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let indexed = engine
+        .execute_powql("User filter .age between 25 and 30 { .name }")
+        .unwrap();
+    assert_eq!(sorted_names(unindexed), sorted_names(indexed)); // Alice, Bob
+}
+
+#[test]
+fn test_range_scan_indexed_exclusive_bound_excludes_boundary() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .age").unwrap();
+    // Bob is exactly 25; `.age > 25` must exclude him.
+    let names = sorted_names(
+        engine
+            .execute_powql("User filter .age > 25 { .name }")
+            .unwrap(),
+    );
+    assert_eq!(names, vec!["Str(\"Alice\")", "Str(\"Charlie\")"]);
+}
+
+#[test]
+fn test_range_scan_indexed_excludes_nulls() {
+    let mut engine = test_engine();
+    engine
+        .execute_powql(r#"insert User { name := "Dana", email := "d@ex.com" }"#)
+        .unwrap(); // age null
+    engine.execute_powql("alter User add index .age").unwrap();
+    match engine
+        .execute_powql("User filter .age < 100 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 3, "null age must not match"),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_explain_range_indexed_shows_rangescan() {
+    let mut engine = test_engine();
+    engine.execute_powql("alter User add index .age").unwrap();
+    let text = explain_text(&mut engine, "explain User filter .age > 26");
+    assert!(text.contains("RangeScan"), "got: {text}");
+}
+
 #[test]
 fn test_explain_does_not_execute() {
     let mut engine = test_engine();

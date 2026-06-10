@@ -1681,9 +1681,45 @@ impl Engine {
                 let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
                 let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
 
-                // Range scans only use the btree fast path for unique indexes,
-                // because non-unique indexes store composite keys (column_value
-                // + RowId) that don't directly compare against raw column values.
+                // Non-unique index: walk the composite (value, rid) leaf
+                // chain between prefix bounds, fetch each row from the heap,
+                // and recheck. The recheck enforces exclusive bounds
+                // (range_rids is inclusive) and defensively skips any decoded
+                // null (nulls are never indexed, so they must not match).
+                if tbl.is_index_unique(column) == Some(false) {
+                    if let Some(btree) = tbl.index(column) {
+                        if start_val.is_some() || end_val.is_some() {
+                            let col_idx = schema.column_index(column).ok_or_else(|| {
+                                QueryError::ColumnNotFound {
+                                    table: String::new(),
+                                    column: column.clone(),
+                                }
+                            })?;
+                            let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
+                            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                            for rid in rids {
+                                if let Some(data) = tbl.heap.get(rid) {
+                                    let row = decode_row(schema, &data);
+                                    if !row[col_idx].is_empty()
+                                        && range_matches(
+                                            &row[col_idx],
+                                            &start_val,
+                                            start_inclusive,
+                                            &end_val,
+                                            end_inclusive,
+                                        )
+                                    {
+                                        rows.push(row);
+                                    }
+                                }
+                            }
+                            return Ok(QueryResult::Rows { columns, rows });
+                        }
+                    }
+                }
+
+                // Range scans use the btree fast path for unique indexes,
+                // walking raw column-value keys directly.
                 if tbl.is_index_unique(column) == Some(true) {
                     if let Some(btree) = tbl.index(column) {
                         let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
@@ -3381,11 +3417,12 @@ pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
             end,
         } => {
             if let Some(tbl) = catalog.get_table(table) {
-                // Keep RangeScan only for unique indexes — their btree
-                // stores raw column values. Non-unique indexes store
-                // composite keys that don't directly compare against
-                // column values, so lower them to Filter(SeqScan).
-                if tbl.is_index_unique(column) == Some(true) {
+                // Keep RangeScan whenever ANY index exists on the column:
+                // unique indexes store raw column values, non-unique indexes
+                // store composite (value, rid) keys that the executor walks
+                // natively via BTree::range_rids. Only lower to Filter(SeqScan)
+                // when the column is unindexed.
+                if tbl.has_index(column) {
                     return plan.clone();
                 }
             }

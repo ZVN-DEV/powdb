@@ -926,6 +926,32 @@ impl BTree {
         self.lookup_prefix(&Value::Int(col_val))
     }
 
+    /// Range scan over a NON-unique index: return RowIds for all entries
+    /// whose column value lies in [start, end] (inclusive; pass None for
+    /// an unbounded side). Composite-key bounds reuse the prefix encoding:
+    /// (start, RowId::MIN) .. (end, RowId::MAX). The caller is expected to
+    /// recheck exclusive bounds against the decoded row.
+    pub fn range_rids(&self, start: Option<&Value>, end: Option<&Value>) -> Vec<RowId> {
+        let collect = |pairs: Vec<(Value, RowId)>| {
+            pairs
+                .into_iter()
+                .filter_map(|(k, _)| Self::rid_from_composite(&k))
+                .collect()
+        };
+        match (start, end) {
+            (Some(s), Some(e)) => {
+                let lo = Self::make_prefix_start(s);
+                let hi = Self::make_prefix_end(e);
+                self.range(&lo, &hi)
+                    .filter_map(|(k, _)| Self::rid_from_composite(&k))
+                    .collect()
+            }
+            (Some(s), None) => collect(self.range_from(&Self::make_prefix_start(s))),
+            (None, Some(e)) => collect(self.range_to(&Self::make_prefix_end(e))),
+            (None, None) => collect(self.range_from(&Self::make_prefix_start(&Value::Empty))),
+        }
+    }
+
     /// Delete a specific (col_val, rid) entry from a non-unique
     /// secondary index.
     pub fn delete_non_unique(&mut self, col_val: &Value, rid: RowId) -> bool {
@@ -1994,6 +2020,39 @@ mod tests {
 
         let hits = bt.lookup_prefix_int(999);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_non_unique_range_rids() {
+        let mut bt = temp_btree("nonunique_range");
+        let rids: Vec<RowId> = (0..6u32)
+            .map(|i| RowId {
+                page_id: i,
+                slot_index: 0,
+            })
+            .collect();
+        for (i, rid) in rids.iter().enumerate() {
+            bt.insert_non_unique_int((i as i64) * 10, *rid); // 0,10,20,30,40,50
+        }
+        // 10 <= v <= 30 → rids[1..=3]
+        let hits = bt.range_rids(Some(&Value::Int(10)), Some(&Value::Int(30)));
+        assert_eq!(hits, vec![rids[1], rids[2], rids[3]]);
+        // unbounded below
+        let hits = bt.range_rids(None, Some(&Value::Int(10)));
+        assert_eq!(hits, vec![rids[0], rids[1]]);
+        // unbounded above
+        let hits = bt.range_rids(Some(&Value::Int(40)), None);
+        assert_eq!(hits, vec![rids[4], rids[5]]);
+        // duplicates within the range all come back
+        bt.insert_non_unique_int(
+            20,
+            RowId {
+                page_id: 99,
+                slot_index: 7,
+            },
+        );
+        let hits = bt.range_rids(Some(&Value::Int(20)), Some(&Value::Int(20)));
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]
