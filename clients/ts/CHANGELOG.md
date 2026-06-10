@@ -6,11 +6,37 @@ All notable changes to `@zvndev/powdb-client`.
 
 | Client version | Compatible PowDB server | Notes |
 |---|---|---|
+| 0.4.x | 0.3.x – 0.4.x | Wire protocol v1 plus the optional Connect `username` field. **Multi-user mode requires client ≥0.4.0 AND server ≥0.4.6** (the server enforces roles as of 0.4.6; 0.4.5 accepted the username but did not enforce `readonly`). When `user` is omitted the Connect frame is byte-identical to the 0.3.x shape, so legacy shared-password and no-auth servers work unchanged. |
 | 0.3.x | 0.3.x – 0.4.x | Wire protocol v1. The client warns only on a major-version mismatch, so any `0.x` server connects. Minor server bumps may add new opcodes; the client tolerates unknown response codes by surfacing `PowDBError`. Pin both ends. **Caveat:** the 0.3.x client has no `user` option, so it cannot authenticate to a 0.4.5+ server running in **multi-user mode** (the server requires a username once any named user is defined). Shared-password mode works fine. |
 
 The client warns on major-version mismatch with the server during the
 handshake. Within `0.x`, treat any minor-version skew between client and
 server as best-effort and pin both ends.
+
+## [0.4.0] — 2026-06-09
+
+### Added
+- `user` option on `ClientOptions` (and therefore `PoolOptions`) for
+  multi-user authentication. The username is sent as a length-prefixed
+  string appended after the password in the Connect frame, mirroring
+  `crates/server/src/protocol.rs`. When omitted, the frame stays
+  byte-identical to the 0.3.x legacy shape, so older servers are unaffected.
+- Live integration suite (`pnpm run test:auth`) covering readwrite/readonly
+  roles, `permission denied` on readonly writes, and `auth_failed` on
+  missing user / wrong password / unknown user.
+
+### Changed
+- Version jumps to **0.4.0** (semver-minor for a feature in 0.x), which also
+  intentionally aligns the client's minor with the server's: multi-user mode
+  end-to-end requires client ≥0.4.0 and server ≥0.4.6.
+- The exported `Message` Connect variant now carries `username: string | null`.
+  Callers constructing Connect frames directly via `encode(...)` must add the
+  field (pass `null` for legacy behaviour).
+
+### Fixed
+- `sourceMap`/`declarationMap` disabled in `tsconfig.json` — the tarball no
+  longer ships 12 dead `.map` files (they pointed at `src/`, which the 0.3.4
+  `files` allowlist already excluded, so they were broken references).
 
 ## [0.3.5] — 2026-06-05
 

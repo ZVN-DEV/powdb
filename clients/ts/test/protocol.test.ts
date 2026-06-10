@@ -119,6 +119,88 @@ async function main() {
     assert.throws(() => tryDecode(frame), /truncated affected count/);
   });
 
+  console.log("\nConnect frame — optional username (multi-user auth)");
+
+  // Helper: length-prefixed string, identical to the wire encoding.
+  const lpString = (s: string): Buffer => {
+    const bytes = Buffer.from(s, "utf8");
+    const out = Buffer.alloc(4 + bytes.length);
+    out.writeUInt32LE(bytes.length, 0);
+    bytes.copy(out, 4);
+    return out;
+  };
+
+  await test("encodes Connect with username after password (round-trip)", () => {
+    const buf = encode({
+      type: "Connect",
+      dbName: "main",
+      password: "pw",
+      username: "alice",
+    });
+    const decoded = tryDecode(buf);
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "Connect");
+    if (decoded.msg.type === "Connect") {
+      assert.equal(decoded.msg.dbName, "main");
+      assert.equal(decoded.msg.password, "pw");
+      assert.equal(decoded.msg.username, "alice");
+    }
+  });
+
+  await test("encodes Connect with null username as byte-identical legacy frame", () => {
+    const buf = encode({
+      type: "Connect",
+      dbName: "main",
+      password: "pw",
+      username: null,
+    });
+    // Hand-build the pre-username (0.3.x) frame: header + dbName + password,
+    // with NO trailing username field. Old servers must see exactly this.
+    const payload = Buffer.concat([lpString("main"), lpString("pw")]);
+    const expected = Buffer.alloc(6 + payload.length);
+    expected.writeUInt8(0x01, 0); // MSG_CONNECT
+    expected.writeUInt8(0, 1); // flags
+    expected.writeUInt32LE(payload.length, 2);
+    payload.copy(expected, 6);
+    assert.deepStrictEqual(buf, expected);
+  });
+
+  await test("decodes legacy Connect frame (no username bytes) with username=null", () => {
+    // Frame as produced by a 0.3.x client: dbName + password only.
+    const payload = Buffer.concat([lpString("main"), lpString("pw")]);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x01, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    const decoded = tryDecode(frame);
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "Connect");
+    if (decoded.msg.type === "Connect") {
+      assert.equal(decoded.msg.username, null);
+    }
+  });
+
+  await test("decodes empty (len=0) username as null, mirroring the server", () => {
+    // Server treats a zero-length username string as None.
+    const payload = Buffer.concat([
+      lpString("main"),
+      lpString("pw"),
+      lpString(""),
+    ]);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x01, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    const decoded = tryDecode(frame);
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "Connect");
+    if (decoded.msg.type === "Connect") {
+      assert.equal(decoded.msg.username, null);
+    }
+  });
+
   console.log("\nCancellation — abort during in-flight query");
 
   await test("AbortSignal rejects the pending query without destroying the socket", async () => {
