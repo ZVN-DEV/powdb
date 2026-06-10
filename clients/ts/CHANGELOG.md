@@ -6,12 +6,27 @@ All notable changes to `@zvndev/powdb-client`.
 
 | Client version | Compatible PowDB server | Notes |
 |---|---|---|
+| 0.5.x | 0.4.7+ | Adds `client.query(powql, params)` for `$N` parameter binding. The `QueryWithParams` (`0x04`) wire message is only understood by server ≥0.4.7; parameterized queries against an older server error out. Plain `query(powql)` calls remain compatible with 0.3.x–0.4.x. |
 | 0.4.x | 0.3.x – 0.4.x | Wire protocol v1 plus the optional Connect `username` field. **Multi-user mode requires client ≥0.4.0 AND server ≥0.4.6** (the server enforces roles as of 0.4.6; 0.4.5 accepted the username but did not enforce `readonly`). When `user` is omitted the Connect frame is byte-identical to the 0.3.x shape, so legacy shared-password and no-auth servers work unchanged. |
 | 0.3.x | 0.3.x – 0.4.x | Wire protocol v1. The client warns only on a major-version mismatch, so any `0.x` server connects. Minor server bumps may add new opcodes; the client tolerates unknown response codes by surfacing `PowDBError`. Pin both ends. **Caveat:** the 0.3.x client has no `user` option, so it cannot authenticate to a 0.4.5+ server running in **multi-user mode** (the server requires a username once any named user is defined). Shared-password mode works fine. |
 
 The client warns on major-version mismatch with the server during the
 handshake. Within `0.x`, treat any minor-version skew between client and
 server as best-effort and pin both ends.
+
+## [0.5.0] — 2026-06-10
+
+### Added
+- **Parameter binding** — `client.query(powql, params)` accepts a second
+  argument of positional values bound to `$1`, `$2`, … placeholders in the
+  PowQL text. Values are sent as a typed parameter list in the new
+  `QueryWithParams` (`0x04`) wire message and bound at the token level on the
+  server, so they are injection-inert and byte-faithful (a value containing
+  PowQL syntax is stored verbatim, never re-parsed). Requires server ≥0.4.7.
+
+### Compatibility
+- Parameterized queries require **server ≥0.4.7**. Plain `query(powql)` (no
+  params) is unchanged and still works against 0.3.x–0.4.x servers.
 
 ## [0.4.0] — 2026-06-09
 
