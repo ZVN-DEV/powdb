@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.4.5 — embedded mode
+PowDB v0.4.6 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit.
 
@@ -445,9 +445,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.4.5 — remote mode
+PowDB v0.4.6 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `main` (server v0.4.5)
+Connected to db `main` (server v0.4.6)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>
