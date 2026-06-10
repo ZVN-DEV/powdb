@@ -60,6 +60,36 @@ escapeIdent("User");        // → "User" (throws on invalid)
 
 `escapeLiteral` accepts `string | number | bigint | boolean | null`. It rejects `NaN`/`Infinity`, `undefined`, objects, arrays, symbols, and `Date` — convert those yourself before passing them in.
 
+## Authentication
+
+For servers using the legacy shared password (`POWDB_PASSWORD`), pass
+`password` alone. For servers with named users (multi-user mode), pass
+`user` + `password`:
+
+```typescript
+const client = await Client.connect({
+  host: "localhost",
+  port: 5433,
+  user: "alice",          // named user (multi-user mode)
+  password: "s3cret",
+});
+```
+
+Roles are enforced server-side: a `readonly` user's writes are rejected with
+a `PowDBError` (`code: "query_failed"`, message containing `permission
+denied`) — the connection stays usable for reads. A missing or wrong
+`user`/`password` rejects the handshake with `code: "auth_failed"`.
+
+Version matrix for multi-user mode:
+
+| | Requirement |
+|---|---|
+| Client | ≥0.4.0 (adds the `user` option) |
+| Server | ≥0.4.6 (enforces roles; 0.4.5 accepted usernames but did not enforce `readonly`) |
+
+When `user` is omitted the Connect frame is byte-identical to the 0.3.x
+client's, so legacy shared-password and no-auth servers work unchanged.
+
 ## Connection pooling
 
 For multi-query workloads (web servers, batch jobs), use `Pool`:
@@ -239,14 +269,13 @@ Returns a `Promise<Client>`. Options:
 | `host` | `string` | *(required)* | Server hostname or IP |
 | `port` | `number` | *(required)* | Server port |
 | `dbName` | `string` | `"default"` | Database name |
-| `password` | `string \| null` | `null` | Server password (if auth is enabled) |
+| `password` | `string \| null` | `null` | Password — shared (`POWDB_PASSWORD`) or the named user's |
+| `user` | `string` | *(omitted)* | User name for multi-user servers (see Authentication above). Omit for shared-password / no-auth servers |
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
 
-> **Multi-user servers:** PowDB server 0.4.5 added named users with roles. The
-> 0.3.x client has no `user` option, so it **cannot authenticate to a server
-> running in multi-user mode** (the server requires a username once any user
-> is defined). Shared-password mode (`POWDB_PASSWORD`) works as before.
+> **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
+> ≥0.4.6 (enforced roles). See the version matrix under Authentication.
 
 ### `client.query(query, opts?)`
 

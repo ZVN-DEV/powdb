@@ -31,7 +31,19 @@ export const MAX_ROWS = 10_000_000;
 export const MAX_COLUMNS = 4096;
 
 export type Message =
-  | { type: "Connect"; dbName: string; password: string | null }
+  | {
+      type: "Connect";
+      dbName: string;
+      password: string | null;
+      /**
+       * Optional user name for multi-user authentication (server ≥0.4.6
+       * enforces roles). Encoded as a length-prefixed string appended AFTER
+       * the password field. When `null` the field is omitted entirely, so the
+       * frame is byte-identical to the pre-username (0.3.x) shape and old
+       * servers accept it unchanged.
+       */
+      username: string | null;
+    }
   | { type: "ConnectOk"; version: string }
   | { type: "Query"; query: string }
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
@@ -54,7 +66,15 @@ export function encode(msg: Message): Buffer {
       const dbBuf = encodeString(msg.dbName);
       const pwBuf =
         msg.password === null ? u32LE(0) : encodeString(msg.password);
-      payload = Buffer.concat([dbBuf, pwBuf]);
+      // Username rides after the password (append-only extension, mirrors
+      // crates/server/src/protocol.rs). The server reads it only when bytes
+      // remain after the password, so omitting it when null keeps the frame
+      // byte-identical to the legacy 0.3.x shape.
+      const parts = [dbBuf, pwBuf];
+      if (msg.username !== null) {
+        parts.push(encodeString(msg.username));
+      }
+      payload = Buffer.concat(parts);
       msgType = MSG_CONNECT;
       break;
     }
@@ -155,7 +175,14 @@ function decodePayload(msgType: number, payload: Buffer): Message {
         const p = decodeString(payload, cursor);
         password = p.length === 0 ? null : p;
       }
-      return { type: "Connect", dbName, password };
+      // Optional trailing username (mirror the server: present only when
+      // bytes remain after the password; empty string means null).
+      let username: string | null = null;
+      if (cursor.pos < payload.length) {
+        const u = decodeString(payload, cursor);
+        username = u.length === 0 ? null : u;
+      }
+      return { type: "Connect", dbName, password, username };
     }
     case MSG_CONNECT_OK:
       return { type: "ConnectOk", version: decodeString(payload, cursor) };

@@ -27,7 +27,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.3.5";
+export const CLIENT_VERSION = "0.4.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -40,6 +40,13 @@ export interface ClientOptions {
   port: number;
   dbName?: string;
   password?: string | null;
+  /**
+   * User name for multi-user authentication. Servers ≥0.4.5 with named users
+   * defined require a `(user, password)` pair; role enforcement (readonly vs
+   * readwrite) requires server ≥0.4.6. Omit for legacy shared-password or
+   * no-auth servers — the Connect frame is then byte-identical to 0.3.x.
+   */
+  user?: string;
   /** Connection timeout in ms. Defaults to 5000. */
   connectTimeoutMs?: number;
   /**
@@ -133,6 +140,7 @@ export class Client extends EventEmitter<ClientEvents> {
       port,
       dbName = "default",
       password = null,
+      user,
       connectTimeoutMs = 5000,
       tls: tlsOpt = false,
     } = opts;
@@ -184,7 +192,9 @@ export class Client extends EventEmitter<ClientEvents> {
       socket.on("close", onClose);
     });
 
-    socket.write(encode({ type: "Connect", dbName, password }));
+    socket.write(
+      encode({ type: "Connect", dbName, password, username: user ?? null }),
+    );
     const reply = await handshake;
 
     if (reply.type === "Error") {
