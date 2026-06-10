@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-09
+
 ### Fixed
 - **Oversized rows no longer kill the server (remote DoS).** Inserting or
   updating a row whose encoded size exceeds one 4 KB page (`MAX_ROW_DATA_SIZE`,

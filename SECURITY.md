@@ -4,7 +4,8 @@
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.4.5           | :white_check_mark: |
+| 0.4.6           | :white_check_mark: |
+| 0.4.5           | :x: (superseded)   |
 | 0.4.4           | :x: (superseded)   |
 | 0.4.1 – 0.4.3   | :x: (yanked)       |
 | 0.4.0           | :white_check_mark: |
@@ -15,7 +16,7 @@
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
 > recovery and have been replaced by **v0.4.4**, which adds a permanent
 > durability regression suite. If you are on any of those three versions,
-> upgrade to the latest release (0.4.5). See `CHANGELOG.md` for details.
+> upgrade to the latest release (0.4.6). See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability
 
@@ -64,9 +65,9 @@ In both modes:
 - **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
 - **Connection limits**: the server enforces a maximum number of concurrent connections.
 
-> **Note on the `readonly` role:** in releases up to and including 0.4.5, role storage is in place but read-only restrictions are **not enforced** at the query layer — do not rely on the `readonly` role as a security boundary against writes on those versions. Enforcement at the server dispatch layer ships in the next release: write statements from `readonly` users are rejected with `permission denied`, and unknown roles fail closed.
+> **Note on the `readonly` role:** in releases up to and including 0.4.5, role storage is in place but read-only restrictions are **not enforced** at the query layer — do not rely on the `readonly` role as a security boundary against writes on those versions. Read-only restrictions are **enforced as of 0.4.6** at the server dispatch layer: write statements from `readonly` users are rejected with `permission denied`, and unknown roles fail closed.
 
 ## Known Limitations
 
-- Roles are coarse (`admin` / `readwrite` / `readonly`). There are no per-table ACLs, row-level security, or multi-tenant isolation; `readonly` enforcement is absent in ≤0.4.5 (see note above).
+- Roles are coarse (`admin` / `readwrite` / `readonly`). There are no per-table ACLs, row-level security, or multi-tenant isolation; `readonly` enforcement is absent in ≤0.4.5 and enforced from 0.4.6 (see note above).
 - The query parser has a nesting depth limit. Runaway queries are bounded by `POWDB_QUERY_TIMEOUT` (default 30s) and the per-query memory budget (`POWDB_QUERY_MEMORY_LIMIT`).
