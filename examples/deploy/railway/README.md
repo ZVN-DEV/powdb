@@ -45,9 +45,11 @@ The host/port come from the TCP proxy you configured in step 4.
   are pinned to a region; if Railway moves your service across regions,
   you'll need to snapshot and restore manually. Pin the region in the
   dashboard for production.
-- **No managed backups.** Schedule a sidecar `cron` that runs
-  `powdb-cli` exports against the volume, or snapshot the volume via
-  Railway's API on a schedule.
+- **No managed backups.** Use `powdb-cli backup` (full / incremental,
+  plus coarse PITR on restore) against the volume — but note backups are
+  **offline**: stop the server first, so schedule them in a maintenance
+  window or snapshot the volume via Railway's API instead. See
+  [docs/backup-and-restore.md](../../../docs/backup-and-restore.md).
 - **Bandwidth pricing.** Heavy benchmark traffic over the TCP proxy bills
   egress. For benchmark runs, use the Fly.io or AWS examples — Railway
   is best for developer-friendly persistent deploys, not for hammering.

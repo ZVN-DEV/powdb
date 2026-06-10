@@ -22,6 +22,8 @@ primary_region = "iad"
   RUST_LOG = "info"
   POWDB_DATA = "/data"
   POWDB_PORT = "5433"
+  # Bind all interfaces — the server defaults to 127.0.0.1, which Fly's proxy can't reach.
+  POWDB_BIND = "0.0.0.0"
   # Phase 1 hardening: refuse to start when a password is set without TLS.
   # Leave OFF until you've mounted certs via secrets (POWDB_TLS_CERT /
   # POWDB_TLS_KEY) or fronted the service with a TLS-terminating proxy.

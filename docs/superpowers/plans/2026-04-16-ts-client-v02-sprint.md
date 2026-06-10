@@ -1,4 +1,7 @@
 # Sprint Plan — PowDB TS Driver v0.2
+
+> **Completed / historical.** This sprint shipped in client 0.3.x; kept for provenance.
+
 Generated: 2026-04-16
 Based on: conversation review of `clients/ts/` (see session thread)
 

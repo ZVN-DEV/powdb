@@ -1,5 +1,6 @@
 use crate::disk::DiskManager;
-use crate::page::{iter_page_slots, Page, PageType, PAGE_SIZE};
+use crate::error::StorageError;
+use crate::page::{iter_page_slots, Page, PageType, MAX_ROW_DATA_SIZE, PAGE_SIZE};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -347,6 +348,24 @@ impl HeapFile {
         }
     }
 
+    /// Reject rows that can never fit in a single page. This is the clean
+    /// error boundary for user-supplied oversized values: every mutation
+    /// entry point (`insert`, `update`) checks BEFORE touching any page so
+    /// no partial state (e.g. the delete half of a delete+insert update)
+    /// can land first. With `panic = "abort"` in release builds, the old
+    /// `expect("row too large for empty page")` was a remote DoS.
+    #[inline]
+    fn check_row_size(row_data: &[u8]) -> io::Result<()> {
+        if row_data.len() > MAX_ROW_DATA_SIZE {
+            return Err(StorageError::RowTooLarge {
+                size: row_data.len(),
+                max: MAX_ROW_DATA_SIZE,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Insert encoded row data. Returns RowId.
     ///
     /// Mission C Phase 1: uses the hot-page write-back cache. The common
@@ -354,6 +373,7 @@ impl HeapFile {
     /// disk syscalls; the page stays pinned until a different page is
     /// touched or an explicit flush runs.
     pub fn insert(&mut self, row_data: &[u8]) -> io::Result<RowId> {
+        Self::check_row_size(row_data)?;
         // WS1 invariant: the persistent mmap covers a snapshot of the file
         // taken at `enable_mmap()` time (length = num_pages * PAGE_SIZE).
         // It only becomes unsafe — covering a stale/short region relative
@@ -426,7 +446,14 @@ impl HeapFile {
         // a crash, and that path (`insert_at`) re-initialises a malformed
         // page before use — so the hot path pays nothing here.
         let mut page = Page::new(page_id, PageType::Data);
-        let slot = page.insert(row_data).expect("row too large for empty page");
+        // `check_row_size` at the top of `insert` guarantees this fits, but
+        // keep a graceful error (never a panic) as defence in depth.
+        let slot = page.insert(row_data).ok_or_else(|| {
+            io::Error::from(StorageError::RowTooLarge {
+                size: row_data.len(),
+                max: MAX_ROW_DATA_SIZE,
+            })
+        })?;
         if page.free_space() >= 64 {
             self.pages_with_space.push(page_id);
             self.mark_free(page_id);
@@ -863,6 +890,10 @@ impl HeapFile {
     /// Mission C Phase 1: in-place updates land on the hot page directly.
     /// `update_by_filter` and `update_by_pk` both route here.
     pub fn update(&mut self, rid: RowId, row_data: &[u8]) -> io::Result<RowId> {
+        // Reject oversized rows BEFORE the delete+insert fallback below can
+        // delete the old row — otherwise a failed oversized update would
+        // destroy the existing data.
+        Self::check_row_size(row_data)?;
         self.ensure_hot(rid.page_id)?;
         {
             let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
@@ -1803,6 +1834,78 @@ mod tests {
         // A full scan must also see exactly the rows we inserted.
         assert_eq!(heap.scan().count(), 2000);
 
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_oversized_insert_returns_error_and_heap_survives() {
+        let (mut heap, path) = temp_heap("oversized_insert");
+        let schema = user_schema();
+
+        // A row larger than any empty page can hold must be a clean error,
+        // not a panic (panic = "abort" kills the whole server process).
+        let big = vec![0xABu8; PAGE_SIZE];
+        let err = heap.insert(&big).unwrap_err();
+        assert!(
+            err.to_string().contains("row too large"),
+            "unexpected error: {err}"
+        );
+
+        // The heap must remain fully usable afterwards.
+        let rid = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("ok".into()), Value::Int(1)],
+            ))
+            .unwrap();
+        assert!(heap.get(rid).is_some());
+        assert_eq!(heap.scan().count(), 1);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_insert_at_max_row_size_succeeds() {
+        use crate::page::MAX_ROW_DATA_SIZE;
+        let (mut heap, path) = temp_heap("max_row");
+        // Exactly the max must still fit on a fresh page.
+        let exact = vec![0x42u8; MAX_ROW_DATA_SIZE];
+        let rid = heap.insert(&exact).unwrap();
+        assert_eq!(heap.get(rid).unwrap().len(), MAX_ROW_DATA_SIZE);
+        // One byte more must be rejected.
+        let over = vec![0x42u8; MAX_ROW_DATA_SIZE + 1];
+        let err = heap.insert(&over).unwrap_err();
+        assert!(
+            err.to_string().contains("row too large"),
+            "unexpected error: {err}"
+        );
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_oversized_update_returns_error_and_row_intact() {
+        let (mut heap, path) = temp_heap("oversized_update");
+        let schema = user_schema();
+        let rid = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("Alice".into()), Value::Int(30)],
+            ))
+            .unwrap();
+        let old_bytes = heap.get(rid).unwrap();
+
+        // Updating to an oversized row must fail cleanly WITHOUT deleting
+        // the old row (the delete+insert fallback must not fire).
+        let big = vec![0xCDu8; PAGE_SIZE];
+        let err = heap.update(rid, &big).unwrap_err();
+        assert!(
+            err.to_string().contains("row too large"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(heap.get(rid).unwrap(), old_bytes, "old row must survive");
+        assert_eq!(heap.scan().count(), 1);
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

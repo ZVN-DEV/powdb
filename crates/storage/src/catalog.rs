@@ -8,6 +8,21 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Reject an encoded row that exceeds the single-page capacity BEFORE it is
+/// appended to the WAL. The heap performs the same check at its own insert/
+/// update boundary, but the update paths log to the WAL first — a logged
+/// record whose row the heap then rejects would poison the next replay.
+fn check_encoded_row_size(encoded: &[u8]) -> io::Result<()> {
+    if encoded.len() > crate::page::MAX_ROW_DATA_SIZE {
+        return Err(crate::error::StorageError::RowTooLarge {
+            size: encoded.len(),
+            max: crate::page::MAX_ROW_DATA_SIZE,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Validate that a name (table or column) is safe for use in file paths and
 /// follows the identifier convention: starts with a letter or underscore,
 /// followed by letters, digits, or underscores.
@@ -935,6 +950,9 @@ impl Catalog {
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        // Reject oversized rows BEFORE appending the WAL record: a logged
+        // Update that the heap then rejects would poison the next replay.
+        check_encoded_row_size(&wal_bytes)?;
         let tx_id = self.next_tx();
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
         self.by_name_mut(table)?.update(rid, values)
@@ -961,6 +979,8 @@ impl Catalog {
         let tbl = self.by_name_mut(table)?;
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        // Same pre-WAL size gate as [`Self::update`].
+        check_encoded_row_size(&wal_bytes)?;
         let tx_id = self.next_tx();
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
         self.by_name_mut(table)?

@@ -19,6 +19,9 @@ PowDB is a from-scratch database engine with its own query language (PowQL). No 
 powdb-cli ──→ powdb-server ──→ powdb-query ──→ powdb-storage
                                     ↑                ↑
                               powdb-bench      powdb-compare
+
+powdb-auth   ←── powdb-server, powdb-cli   (user store + roles; no inter-crate deps)
+powdb-backup ←── powdb-cli                 (depends on powdb-storage + powdb-query)
 ```
 
 ### Query Pipeline
@@ -30,7 +33,7 @@ PowQL text → Lexer (token stream) → Parser (AST) → Planner (PlanNode tree)
 - **Lexer** (`crates/query/src/lexer.rs`): Tokenizes PowQL input
 - **Parser** (`crates/query/src/parser.rs`): Recursive descent, produces `Statement` AST
 - **Planner** (`crates/query/src/planner.rs`): Pure function (no catalog access), produces `PlanNode` tree. Speculatively emits `RangeScan` for range inequalities
-- **Executor** (`crates/query/src/executor.rs`): Runs plans against the storage engine. Has fast paths for common patterns (count, project+limit, sort+limit, agg, update, delete). Lowers `RangeScan` → `Filter(SeqScan)` at runtime when no index exists
+- **Executor** (`crates/query/src/executor/` module dir): Runs plans against the storage engine. Has fast paths for common patterns (count, project+limit, sort+limit, agg, update, delete). Lowers `RangeScan` → `Filter(SeqScan)` at runtime when no index exists
 - **Plan Cache** (`crates/query/src/plan_cache.rs`): FNV-1a hash, stores canonical plans, substitutes literals at lookup time
 
 ### Storage Engine
@@ -81,7 +84,7 @@ cargo run -p powdb-bench --bin compare
 3. Add parser production to `crates/query/src/parser.rs`
 4. Add plan node (if needed) to `crates/query/src/plan.rs`
 5. Add planner case to `crates/query/src/planner.rs`
-6. Add executor case to `crates/query/src/executor.rs`
+6. Add executor case to `crates/query/src/executor/` (start in `mod.rs` / `plan_exec.rs`)
 
 ### Adding an executor fast path
 Fast paths match on specific `PlanNode` shapes in `execute_plan()`. Pattern-match the plan tree and handle it before the generic recursive executor. Always verify with benchmarks.

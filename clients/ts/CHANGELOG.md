@@ -6,7 +6,7 @@ All notable changes to `@zvndev/powdb-client`.
 
 | Client version | Compatible PowDB server | Notes |
 |---|---|---|
-| 0.3.x | 0.3.x – 0.4.x | Wire protocol v1. The client warns only on a major-version mismatch, so any `0.x` server connects. Minor server bumps may add new opcodes; the client tolerates unknown response codes by surfacing `PowDBError`. Pin both ends. |
+| 0.3.x | 0.3.x – 0.4.x | Wire protocol v1. The client warns only on a major-version mismatch, so any `0.x` server connects. Minor server bumps may add new opcodes; the client tolerates unknown response codes by surfacing `PowDBError`. Pin both ends. **Caveat:** the 0.3.x client has no `user` option, so it cannot authenticate to a 0.4.5+ server running in **multi-user mode** (the server requires a username once any named user is defined). Shared-password mode works fine. |
 
 The client warns on major-version mismatch with the server during the
 handshake. Within `0.x`, treat any minor-version skew between client and

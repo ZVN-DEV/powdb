@@ -1,5 +1,5 @@
 use crate::protocol::Message;
-use powdb_auth::UserStore;
+use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
@@ -81,13 +81,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// An authenticated connection's identity, carried alongside the session for
-/// later per-operation RBAC enforcement (Slice 3). For now it is bound at
-/// connect time and logged; it is not yet consulted per query.
+/// An authenticated connection's identity. Bound at connect time and consulted
+/// on every query by [`dispatch_query`] to enforce the user's role: a
+/// `readonly` principal may only execute read statements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub name: String,
     pub role: String,
+}
+
+/// Whether `role` grants the `Write` permission. Unknown role names fail
+/// closed (no write). Shared-password / open / embedded modes never construct
+/// a [`Principal`], so they are unaffected by this gate.
+fn role_can_write(role: &str) -> bool {
+    Role::builtin(role).is_some_and(|r| r.allows(Permission::Write))
+}
+
+/// Enforce the principal's role against a parsed statement. Returns an error
+/// for any non-read statement (insert/update/delete/upsert/DDL/view ops/
+/// transaction control) when the role does not grant `Write`.
+///
+/// Classification uses the parsed AST via
+/// [`powdb_query::executor::is_read_only_statement`] — the exact same
+/// classifier the RwLock read/write split relies on — so the permission
+/// boundary and the concurrency boundary can never disagree.
+fn check_statement_permitted(
+    principal: Option<&Principal>,
+    stmt: &powdb_query::ast::Statement,
+) -> Result<(), QueryError> {
+    let Some(p) = principal else {
+        // No per-user identity (shared-password or open mode): full access,
+        // byte-identical to the pre-RBAC behavior.
+        return Ok(());
+    };
+    if is_read_only_statement(stmt) || role_can_write(&p.role) {
+        return Ok(());
+    }
+    Err(QueryError::Execution(format!(
+        "permission denied: role '{}' cannot execute write statements",
+        p.role
+    )))
 }
 
 /// Result of the connect-time authentication decision.
@@ -169,6 +202,8 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "cannot",
     "no such",
     "already exists",
+    "permission denied",
+    "row too large",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -219,8 +254,24 @@ pub struct ConnOpts<'a> {
 /// Execute a query against the engine under the RwLock. Read-only
 /// statements acquire `.read()` so concurrent SELECTs can scan in
 /// parallel; mutations acquire `.write()`.
-fn dispatch_query(engine: &Arc<RwLock<Engine>>, query: &str) -> Result<QueryResult, QueryError> {
+///
+/// When `principal` is `Some`, the user's role is enforced first: a role
+/// without the `Write` permission (i.e. `readonly`) gets a clean
+/// "permission denied" error for any non-read statement, before any lock
+/// is taken or any engine state is touched.
+fn dispatch_query(
+    engine: &Arc<RwLock<Engine>>,
+    query: &str,
+    principal: Option<&Principal>,
+) -> Result<QueryResult, QueryError> {
     let stmt_result = parser::parse(query).map_err(|e| e.to_string());
+
+    // Role enforcement happens on the parsed AST. Statements that fail to
+    // parse fall through — the engine returns the parse error itself and
+    // can never execute anything for them.
+    if let Ok(stmt) = &stmt_result {
+        check_statement_permitted(principal, stmt)?;
+    }
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
@@ -298,9 +349,9 @@ where
         }
     };
 
-    // The authenticated identity for this connection. Bound at connect time and
-    // carried for later per-operation RBAC enforcement (Slice 3).
-    let _principal: Option<Principal>;
+    // The authenticated identity for this connection. Bound at connect time
+    // and enforced on every query by `dispatch_query`.
+    let principal: Option<Principal>;
     match connect_msg {
         Message::Connect {
             db_name,
@@ -339,12 +390,14 @@ where
                     write_msg(&mut writer, &err).await;
                     return;
                 }
-                AuthOutcome::Authenticated { principal } => {
+                AuthOutcome::Authenticated {
+                    principal: auth_principal,
+                } => {
                     // Auth succeeded — clear any prior failure count.
                     if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                         clear_auth_failures(limiter, ip);
                     }
-                    match &principal {
+                    match &auth_principal {
                         Some(p) => {
                             info!(peer = %peer, db = %db_name, user = %p.name, role = %p.role, "authenticated");
                         }
@@ -352,7 +405,7 @@ where
                             info!(peer = %peer, db = %db_name, "client connected");
                         }
                     }
-                    _principal = principal;
+                    principal = auth_principal;
                 }
             }
 
@@ -424,7 +477,8 @@ where
                     let handle = tokio::task::spawn_blocking({
                         let engine = engine.clone();
                         let query = query.clone();
-                        move || dispatch_query(&engine, &query)
+                        let principal = principal.clone();
+                        move || dispatch_query(&engine, &query, principal.as_ref())
                     });
                     let abort_handle = handle.abort_handle();
                     match tokio::time::timeout(query_timeout, handle).await {
@@ -496,13 +550,97 @@ fn value_to_display(v: &Value) -> String {
             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
         Value::Bytes(b)    => format!("<{} bytes>", b.len()),
-        Value::Empty       => "{}".into(),
+        // NULL is serialized as the bareword "null" on the wire. This is the
+        // sentinel the TypeScript client's typed-row decoder already
+        // documents and matches (`coerceValue` treats the exact token
+        // "null" as NULL for non-str columns); the previous "{}" rendering
+        // was a bug that neither the TS client nor the CLI recognized.
+        Value::Empty       => "null".into(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Wire NULL rendering (Fix: remote protocol rendered NULL as `{}`) ----
+
+    #[test]
+    fn null_serializes_as_null_bareword_on_wire() {
+        assert_eq!(value_to_display(&Value::Empty), "null");
+    }
+
+    // ---- Role enforcement (Fix: readonly role was not enforced) ----
+
+    fn parsed(q: &str) -> powdb_query::ast::Statement {
+        parser::parse(q).unwrap()
+    }
+
+    fn principal(role: &str) -> Option<Principal> {
+        Some(Principal {
+            name: "u".into(),
+            role: role.into(),
+        })
+    }
+
+    #[test]
+    fn readonly_can_read_but_not_write() {
+        let p = principal("readonly");
+        // Reads pass.
+        assert!(check_statement_permitted(p.as_ref(), &parsed("User")).is_ok());
+        assert!(check_statement_permitted(p.as_ref(), &parsed("count(User)")).is_ok());
+        assert!(check_statement_permitted(p.as_ref(), &parsed("explain User")).is_ok());
+        // Writes, DDL, and transaction control are denied.
+        for q in [
+            r#"insert User { name := "x" }"#,
+            "User filter .id = 1 update { age := 2 }",
+            "User filter .id = 1 delete",
+            "drop User",
+            "alter User add column c: str",
+            "type T { required id: int }",
+            "begin",
+            "commit",
+            "rollback",
+        ] {
+            let err = check_statement_permitted(p.as_ref(), &parsed(q))
+                .expect_err(&format!("must deny: {q}"));
+            assert!(
+                err.to_string().contains("permission denied"),
+                "unexpected error for {q}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readwrite_and_admin_have_full_query_access() {
+        for role in ["readwrite", "admin"] {
+            let p = principal(role);
+            assert!(check_statement_permitted(p.as_ref(), &parsed("User")).is_ok());
+            assert!(check_statement_permitted(
+                p.as_ref(),
+                &parsed(r#"insert User { name := "x" }"#)
+            )
+            .is_ok());
+            assert!(check_statement_permitted(p.as_ref(), &parsed("drop User")).is_ok());
+        }
+    }
+
+    #[test]
+    fn unknown_role_fails_closed_for_writes() {
+        let p = principal("mystery");
+        assert!(check_statement_permitted(p.as_ref(), &parsed("User")).is_ok());
+        assert!(
+            check_statement_permitted(p.as_ref(), &parsed(r#"insert User { name := "x" }"#))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn no_principal_means_full_access() {
+        // Shared-password / open mode: no per-user identity, no restriction.
+        assert!(check_statement_permitted(None, &parsed("drop User")).is_ok());
+        assert!(check_statement_permitted(None, &parsed(r#"insert User { name := "x" }"#)).is_ok());
+    }
 
     fn store_with_alice() -> UserStore {
         let mut s = UserStore::new();

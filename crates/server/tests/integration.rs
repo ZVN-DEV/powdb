@@ -335,6 +335,25 @@ async fn test_empty_store_shared_password_fallback() {
         stream.write_all(&frame).await.unwrap();
         let resp = read_response(&mut stream).await;
         assert_eq!(resp[0], 0x02, "correct shared password should connect");
+
+        // Shared-password mode has no per-user role: writes must keep
+        // working exactly as before role enforcement existed.
+        stream
+            .write_all(&encode_query("type Item { required name: str }"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert!(
+            resp[0] == 0x09 || resp[0] == 0x0B,
+            "shared-password DDL must succeed, got 0x{:02X}",
+            resp[0]
+        );
+        stream
+            .write_all(&encode_query(r#"insert Item { name := "widget" }"#))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x09, "shared-password insert must succeed");
     }
 
     // Wrong shared password → ERROR.
@@ -349,6 +368,184 @@ async fn test_empty_store_shared_password_fallback() {
         stream.write_all(&frame).await.unwrap();
         let resp = read_response(&mut stream).await;
         assert_eq!(resp[0], 0x0A, "wrong shared password should be rejected");
+    }
+
+    handle.abort();
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
+/// Fix 2 (authorization bypass): the `readonly` role must be enforced at the
+/// server dispatch boundary. A readonly user can run read statements but every
+/// write (insert/update/delete/DDL/transaction control) is rejected with a
+/// clean "permission denied" error — and the connection stays alive.
+/// `readwrite` and `admin` users keep full query access.
+#[tokio::test]
+async fn test_readonly_role_enforced_over_tcp() {
+    use powdb_auth::UserStore;
+    use powdb_server::protocol::Message;
+    use std::sync::{Arc, RwLock};
+
+    let test_id = std::process::id();
+    let port = 18500 + (test_id % 1000) as u16;
+    let data_dir = std::env::temp_dir().join(format!("powdb_rbac_{test_id}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let mut store = UserStore::new();
+    store.create_user("root", "pw", "admin").unwrap();
+    store.create_user("rw", "pw", "readwrite").unwrap();
+    store.create_user("ro", "pw", "readonly").unwrap();
+    let users = Arc::new(store);
+
+    let data_dir_str = data_dir.to_str().unwrap().to_string();
+    let addr = format!("127.0.0.1:{port}");
+    let bind_addr = addr.clone();
+
+    let handle = tokio::spawn(async move {
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let eng = engine.clone();
+            let users = users.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                powdb_server::handler::handle_connection(
+                    stream,
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        expected_password: None,
+                        users,
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr: Some(peer),
+                    },
+                )
+                .await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Admin seeds the schema + one row.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "pw", "root"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "admin should connect");
+
+        stream
+            .write_all(&encode_query("type User { required name: str, age: int }"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert!(
+            resp[0] == 0x09 || resp[0] == 0x0B,
+            "admin DDL should succeed, got 0x{:02X}",
+            resp[0]
+        );
+
+        stream
+            .write_all(&encode_query(
+                r#"insert User { name := "Alice", age := 30 }"#,
+            ))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x09, "admin insert should succeed");
+    }
+
+    // Readonly user: reads OK, every write shape rejected, connection alive.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "pw", "ro"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "readonly user should connect");
+
+        // Reads succeed.
+        stream.write_all(&encode_query("User")).await.unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x07, "readonly select should return rows");
+
+        stream
+            .write_all(&encode_query("count(User)"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x08, "readonly count should return scalar");
+
+        // Every write statement is rejected with a clean permission error.
+        let writes = [
+            r#"insert User { name := "Mallory", age := 1 }"#,
+            r#"User filter .name = "Alice" update { age := 99 }"#,
+            r#"User filter .name = "Alice" delete"#,
+            "drop User",
+            "alter User add column hacked: str",
+            "begin",
+        ];
+        for q in writes {
+            stream.write_all(&encode_query(q)).await.unwrap();
+            let resp = read_response(&mut stream).await;
+            assert_eq!(
+                resp[0], 0x0A,
+                "readonly write must be rejected: {q} (got 0x{:02X})",
+                resp[0]
+            );
+            match Message::decode(&resp).unwrap() {
+                Message::Error { message } => assert!(
+                    message.contains("permission denied"),
+                    "expected permission-denied error for {q}, got: {message}"
+                ),
+                other => panic!("expected Error for {q}, got {other:?}"),
+            }
+        }
+
+        // The connection survives the rejections.
+        stream.write_all(&encode_query("User")).await.unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x07, "connection must stay alive after denials");
+
+        // And nothing was actually written/dropped.
+        stream
+            .write_all(&encode_query("count(User)"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x08, "table must still exist");
+        match Message::decode(&resp).unwrap() {
+            Message::ResultScalar { value } => {
+                assert_eq!(value, "1", "row count must be unchanged")
+            }
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    // Readwrite user keeps full write access.
+    {
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(&encode_connect_user("testdb", "pw", "rw"))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "readwrite user should connect");
+
+        stream
+            .write_all(&encode_query(r#"insert User { name := "Bob", age := 25 }"#))
+            .await
+            .unwrap();
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x09, "readwrite insert should succeed");
     }
 
     handle.abort();

@@ -47,8 +47,11 @@ between the two.
 - **You're already shipping the C toolchain.** If your build already
   compiles `aws-lc`, `openssl`, or any other C dep, the
   `libsqlite3-sys` cost is zero.
-- **You want full MVCC, RBAC, online backups, or any of the
-  decade-of-features SQLite has.** PowDB has none of these yet.
+- **You want full MVCC, online backups, or any of the decade-of-features
+  SQLite has.** PowDB 0.4.5 shipped role-based users (admin / readwrite /
+  readonly) and offline full/incremental backup with coarse point-in-time
+  recovery, but there is still no MVCC and no *online* backup -- backups
+  require stopping the server.
 
 ## Side-by-side feature table
 
@@ -67,6 +70,7 @@ between the two.
 | Server mode               | Yes (binary wire protocol, TLS, auth)                | Not in core (extensions exist)                        |
 | Fuzz testing              | 3 cargo-fuzz targets (lexer, parser, roundtrip)      | OSS-Fuzz, decades of corpora                          |
 | Crash recovery            | WAL replay + page-zero recovery + index rebuild      | WAL/rollback journal                                  |
+| Backup                    | Offline full/incremental + coarse PITR (0.4.5)       | Online backup API, `.backup`, VACUUM INTO             |
 | On-disk format stability  | Pre-1.0, may shift                                   | Stable for decades                                    |
 | Production deployments    | Pre-1.0                                              | Billions                                              |
 
@@ -134,7 +138,7 @@ Results land in `crates/compare/results.csv`.
 ## Caveats and roadmap
 
 - **PowDB is pre-1.0.** The on-disk format may shift across minor versions.
-  Pin a version (`cargo install powdb-cli --version 0.4.4 --locked`) and
+  Pin a version (`cargo install powdb-cli --version 0.4.5 --locked`) and
   expect to re-bench / re-import on upgrades until 1.0.
 - **SQLite is the safe default.** Decades of production exposure, an
   enormous test suite, and tools everywhere. If you're not sure, you

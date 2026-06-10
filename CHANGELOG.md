@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Oversized rows no longer kill the server (remote DoS).** Inserting or
+  updating a row whose encoded size exceeds one 4 KB page (`MAX_ROW_DATA_SIZE`,
+  4070 bytes) previously hit a `panic!` in the heap layer, which — combined with
+  `panic = "abort"` — terminated the entire server process. Any connected client
+  could take down the database with a single ~5 KB string insert. The heap now
+  rejects oversized rows with a graceful `row too large: N bytes exceeds max M
+  bytes` query error before anything is written or WAL-logged (an oversized
+  update can no longer poison WAL replay), and the connection and server keep
+  running. There is still no large-object/overflow-page support — values over
+  ~4 KB are rejected, not stored.
+- **`readonly` role is now enforced at the query layer.** Previously the role
+  was authenticated and stored but never checked: a `readonly` user could
+  insert, update, delete, and drop tables. The server now classifies each
+  parsed statement and rejects writes (DML, DDL, view DDL, and transaction
+  control) from `readonly` principals with `permission denied: role 'readonly'
+  cannot execute write statements`. Unknown roles fail closed. Shared-password
+  mode, open mode, and embedded use are unaffected.
+- **NULL values now arrive as `null` on the wire instead of `{}`.** The server
+  serialized SQL NULLs as `{}`, which the remote CLI displayed verbatim and
+  which broke the TS client's documented `"null"` sentinel for typed-row
+  decoding. The wire serialization is now the bareword `null`, and the remote
+  REPL renders it as `NULL`, matching embedded mode.
+- **Window aggregates without `order` now compute the whole-partition value.**
+  `avg(.x) over (partition .d)` previously returned a running aggregate per
+  row (frame = partition start → current row) even with no `order` clause; per
+  standard semantics the frame is now the entire partition. Ordered windows
+  keep the running-frame behavior; ranking functions are unchanged.
+
+### Documentation
+- Ecosystem-wide accuracy sweep: site pages synced to v0.4.5 (banners were
+  v0.2.0, MSRV corrected to 1.93), crates.io homepage URL fixed (was a 404),
+  README/CONTRIBUTING/AGENTS no longer claim the bench suite is a CI merge
+  gate, SECURITY.md documents both auth modes and the ≤0.4.5 readonly caveat,
+  RELEASES.md covers all six crates + the Docker image, deploy examples fixed
+  (`fly.toml` was missing `POWDB_BIND=0.0.0.0`), TS client docs document the
+  multi-user-server incompatibility, and AGENTS.md gained small-model-tested
+  gotchas (reserved aggregate keywords as aliases; line-oriented REPL).
+
 ## [0.4.5] - 2026-06-09
 
 ### Added

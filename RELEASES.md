@@ -3,9 +3,10 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.4.4** (all four crates live on crates.io).
+> **Current release: v0.4.5** (all six crates live on crates.io, including the
+> new `powdb-auth` and `powdb-backup`).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
-> 0.4.4 fixes them and adds a standing durability regression suite. See
+> 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
 
 ## Registries
@@ -13,10 +14,13 @@ When cutting a release, follow the checklist at the bottom.
 | Target | Package | Registry URL |
 |--------|---------|-------------|
 | **crates.io** | `powdb-storage` | https://crates.io/crates/powdb-storage |
+| **crates.io** | `powdb-auth` | https://crates.io/crates/powdb-auth |
 | **crates.io** | `powdb-query` | https://crates.io/crates/powdb-query |
+| **crates.io** | `powdb-backup` | https://crates.io/crates/powdb-backup |
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
+| **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
 ## GitHub Releases
 
@@ -35,9 +39,11 @@ when a `v*` tag is pushed.
 Inter-crate dependencies require publishing in this order:
 
 1. `powdb-storage` (no inter-crate deps)
-2. `powdb-query` (depends on storage)
-3. `powdb-server` (depends on storage + query)
-4. `powdb-cli` (depends on storage + query + server)
+2. `powdb-auth` (no inter-crate deps)
+3. `powdb-query` (depends on storage)
+4. `powdb-backup` (depends on storage + query)
+5. `powdb-server` (depends on storage + query + auth)
+6. `powdb-cli` (depends on storage + query + server + backup + auth)
 
 Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
 
@@ -45,12 +51,14 @@ Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `pow
 
 ```
 [ ] Update workspace version in root Cargo.toml
-[ ] Update inter-crate dep versions in query/server/cli Cargo.toml
+[ ] Update inter-crate dep versions in query/backup/server/cli Cargo.toml
 [ ] Update clients/ts/package.json version
 [ ] Update CHANGELOG.md
 [ ] Commit: "chore: release vX.Y.Z"
 [ ] cargo publish -p powdb-storage
+[ ] cargo publish -p powdb-auth
 [ ] cargo publish -p powdb-query
+[ ] cargo publish -p powdb-backup
 [ ] cargo publish -p powdb-server
 [ ] cargo publish -p powdb-cli
 [ ] cd clients/ts && npm publish --access public

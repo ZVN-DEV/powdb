@@ -4172,3 +4172,131 @@ fn test_memory_limit_default_allows_normal_query() {
         _ => panic!("expected rows"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Window aggregates without `order`: frame must be the ENTIRE partition,
+// not a running prefix. (`avg(.sal) over (partition .dept)` used to return
+// 10/15/20 for salaries 10/20/30 instead of 20/20/20.)
+// ---------------------------------------------------------------------------
+
+fn window_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_win_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Emp { required name: str, required dept: str, required sal: int }")
+        .unwrap();
+    for (name, dept, sal) in [
+        ("a", "eng", 10),
+        ("b", "eng", 20),
+        ("c", "eng", 30),
+        ("d", "ops", 100),
+        ("e", "ops", 300),
+    ] {
+        engine
+            .execute_powql(&format!(
+                r#"insert Emp {{ name := "{name}", dept := "{dept}", sal := {sal} }}"#
+            ))
+            .unwrap();
+    }
+    engine
+}
+
+/// Extract (name → window value) pairs from a two-column result.
+fn window_col_by_name(result: QueryResult) -> std::collections::HashMap<String, Value> {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            let name_idx = columns.iter().position(|c| c == "name").unwrap();
+            let win_idx = columns.len() - 1;
+            rows.into_iter()
+                .map(|r| {
+                    let name = match &r[name_idx] {
+                        Value::Str(s) => s.clone(),
+                        other => panic!("expected name string, got {other:?}"),
+                    };
+                    (name, r[win_idx].clone())
+                })
+                .collect()
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_window_agg_without_order_uses_whole_partition() {
+    let mut engine = window_engine();
+    let result = engine
+        .execute_powql("Emp { .name, davg: avg(.sal) over (partition .dept) }")
+        .unwrap();
+    let by_name = window_col_by_name(result);
+    // eng partition avg = (10+20+30)/3 = 20 for EVERY row.
+    for n in ["a", "b", "c"] {
+        assert_eq!(by_name[n], Value::Float(20.0), "row {n}");
+    }
+    // ops partition avg = (100+300)/2 = 200 for both rows.
+    for n in ["d", "e"] {
+        assert_eq!(by_name[n], Value::Float(200.0), "row {n}");
+    }
+}
+
+#[test]
+fn test_window_sum_count_min_max_without_order_whole_partition() {
+    let mut engine = window_engine();
+
+    let by_name = window_col_by_name(
+        engine
+            .execute_powql("Emp { .name, dsum: sum(.sal) over (partition .dept) }")
+            .unwrap(),
+    );
+    for n in ["a", "b", "c"] {
+        assert_eq!(by_name[n], Value::Int(60), "sum row {n}");
+    }
+    for n in ["d", "e"] {
+        assert_eq!(by_name[n], Value::Int(400), "sum row {n}");
+    }
+
+    let by_name = window_col_by_name(
+        engine
+            .execute_powql("Emp { .name, dcnt: count(.sal) over (partition .dept) }")
+            .unwrap(),
+    );
+    for n in ["a", "b", "c"] {
+        assert_eq!(by_name[n], Value::Int(3), "count row {n}");
+    }
+
+    let by_name = window_col_by_name(
+        engine
+            .execute_powql("Emp { .name, dmin: min(.sal) over (partition .dept) }")
+            .unwrap(),
+    );
+    for n in ["a", "b", "c"] {
+        assert_eq!(by_name[n], Value::Int(10), "min row {n}");
+    }
+
+    let by_name = window_col_by_name(
+        engine
+            .execute_powql("Emp { .name, dmax: max(.sal) over (partition .dept) }")
+            .unwrap(),
+    );
+    for n in ["a", "b", "c"] {
+        assert_eq!(by_name[n], Value::Int(30), "max row {n}");
+    }
+    for n in ["d", "e"] {
+        assert_eq!(by_name[n], Value::Int(300), "max row {n}");
+    }
+}
+
+#[test]
+fn test_window_agg_with_order_keeps_running_frame() {
+    // WITH an explicit `order`, the running (rows-so-far) frame is the
+    // existing documented behavior — it must not change.
+    let mut engine = window_engine();
+    let by_name = window_col_by_name(
+        engine
+            .execute_powql("Emp { .name, ravg: avg(.sal) over (partition .dept order .sal) }")
+            .unwrap(),
+    );
+    assert_eq!(by_name["a"], Value::Float(10.0));
+    assert_eq!(by_name["b"], Value::Float(15.0));
+    assert_eq!(by_name["c"], Value::Float(20.0));
+}

@@ -19,13 +19,13 @@ The measurable result: 3–10× faster than SQLite on aggregate and scan workloa
 - **Embedded / edge / serverless workloads** where query latency is a tight budget and you don't want SQLite's quirks.
 - **Single-node analytics** over tables that fit on disk. The scan path is zero-syscall (mmap) and filters are compiled to byte-level predicates.
 - **You control both sides** (the DB and the app). PowDB has no Postgres wire protocol, no ODBC, no legacy compatibility. The client is a TCP binary protocol or an in-process Engine.
-- **You want to read the code.** Four crates, ~20K lines, no generated parsers, no plan-language IR.
+- **You want to read the code.** Eight crates, ~45K lines, no generated parsers, no plan-language IR.
 
 ### When it's *not* the right choice
 
 - You need a drop-in Postgres/MySQL replacement. PowQL is a different language; there is **no SQL compatibility layer**, and that is a deliberate design decision (the translation tier is the thing we're removing).
 - You need multi-node replication, sharding, or Raft-style consensus. Single-node only today.
-- You need fine-grained ACLs, row-level security, or multi-tenant isolation. Auth is a single shared password.
+- You need fine-grained ACLs, row-level security, or multi-tenant isolation. Auth is named users with coarse roles (admin/readwrite/readonly) since 0.4.5 — shared-password mode still available — but nothing per-table or per-row.
 - You need user-defined functions, stored procedures, or triggers.
 
 ---
@@ -109,6 +109,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `AND`, `OR`, `NOT` | `and`, `or`, `not` (lowercase) |
 | `User.posts` (link navigation) | not yet implemented |
 | `let x := ...` | not yet implemented |
+| `count: count(.name)` (aggregate keyword as alias) | fails `expected alias name` — `sum:` fails too; use `n:`, `cnt:`, `total:` |
 
 ---
 
@@ -116,7 +117,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 
 Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`.
 
-**Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor.rs`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
+**Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor/`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
 
 `required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`.
 
@@ -128,7 +129,7 @@ These are the design moves that buy the speedup. Understanding them keeps you fr
 
 1. **Planner is a pure function.** It does not touch the catalog — it emits `RangeScan` speculatively, and the executor lowers to `Filter(SeqScan)` at runtime if no index exists. This keeps the parser → plan pipeline allocation-free for cache hits.
 2. **Plan cache hashes canonical PowQL.** Literals are substituted at lookup time (FNV-1a hash, `crates/query/src/plan_cache.rs`). A repeated `User filter .id = <N>` reuses the same plan for all N.
-3. **Compiled integer predicates.** `Filter(SeqScan)` on simple numeric predicates compiles into a branch-free byte-level check that skips full row decoding. See `execute_plan` fast paths in `crates/query/src/executor.rs`.
+3. **Compiled integer predicates.** `Filter(SeqScan)` on simple numeric predicates compiles into a branch-free byte-level check that skips full row decoding. See `execute_plan` fast paths in `crates/query/src/executor/` (module dir).
 4. **mmap-based scans.** The storage layer exposes `try_for_each_row_raw` over memory-mapped heap files. Early termination is a `return ControlFlow::Break`.
 5. **Slotted 4KB pages + persistent B+tree indexes.** Standard, but the index format (BIDX, binary) is crash-safe and survives restart with no rebuild.
 6. **WAL with group commit at statement boundaries.** Writes are durable by default; throughput is maintained by batching.
@@ -156,6 +157,8 @@ let result = engine.execute_powql("User filter .age > 25 { .name, .age }")?;
 cargo run --release -p powdb-cli                      # embedded REPL
 cargo run --release -p powdb-cli -- --remote host:5433 --password <pw>
 ```
+
+**The REPL is line-oriented.** A statement split across lines fails to parse — write each statement on one line.
 
 ### TCP server
 
@@ -201,9 +204,9 @@ Return shapes:
 
 ## What's shipped vs. what's planned
 
-Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE, materialized views with auto-refresh, upsert, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth, TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes.
+Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline).
 
-Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, default operator (`??`), UDFs, per-row permissions, replication.
+Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, UDFs, per-row permissions, replication.
 
 ---
 
@@ -211,9 +214,7 @@ Planned (design doc only — don't use): link navigation (`User.posts`), `let` b
 
 Build: `cargo build --workspace`. Test: `cargo test --workspace`. Lint: `cargo clippy --workspace --all-targets -- -D warnings`. Format: `cargo fmt --all`.
 
-CI gates on `main`:
-- `clippy + fmt + test` — `.github/workflows/ci.yml`
-- `criterion + regression gate` — `.github/workflows/bench.yml` (blocks merges if any of 7 load-bearing workloads regress >7% against the checked-in baseline)
+CI gates on `main` (all in `.github/workflows/ci.yml`): clippy/fmt/test (2-OS matrix), miri, asan, cargo audit, MSRV consistency, examples-smoke. `.github/workflows/bench.yml` (criterion + regression gate) is **manual-only** (`workflow_dispatch`) and NOT a merge gate — run the gate locally instead (see above).
 
 Internal docs:
 - `CLAUDE.md` — codebase guide for Claude Code (architecture, crate graph, common patterns)

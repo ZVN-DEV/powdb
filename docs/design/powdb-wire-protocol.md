@@ -1,5 +1,7 @@
 # PowDB: Wire protocol and engine architecture
 
+> **Historical design doc (pre-implementation).** For current architecture see `CLAUDE.md` / `AGENTS.md`.
+
 ## Engine architecture
 
 PowDB is a library first, server second. The core engine is a single library
