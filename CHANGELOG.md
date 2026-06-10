@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-10
+
 ### Added
 - **Parameter binding over the wire (`$1`..`$N`).** Clients can send a query
   template plus positional values instead of interpolating untrusted input

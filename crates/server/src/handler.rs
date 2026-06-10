@@ -204,6 +204,7 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "already exists",
     "permission denied",
     "row too large",
+    "unique constraint violation",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -664,6 +665,26 @@ mod tests {
     #[test]
     fn null_serializes_as_null_bareword_on_wire() {
         assert_eq!(value_to_display(&Value::Empty), "null");
+    }
+
+    // ---- Error sanitization allowlist ----
+
+    #[test]
+    fn unique_violation_error_surfaces_to_remote_clients() {
+        // The storage layer reports the actionable message; the server must
+        // not replace it with the generic "query execution error".
+        assert_eq!(
+            sanitize_error("unique constraint violation on User.email"),
+            "unique constraint violation on User.email"
+        );
+    }
+
+    #[test]
+    fn internal_errors_stay_generic() {
+        assert_eq!(
+            sanitize_error("some internal io panic detail"),
+            "query execution error"
+        );
     }
 
     // ---- Role enforcement (Fix: readonly role was not enforced) ----
