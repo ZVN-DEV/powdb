@@ -24,6 +24,7 @@ pub enum Token {
     Multi,        // multi
     Link,         // link
     Index,        // index
+    Unique,       // unique
     On,           // on
     Conflict,     // conflict
     Asc,          // asc
@@ -175,6 +176,7 @@ impl Token {
             Token::Multi => "'multi'".into(),
             Token::Link => "'link'".into(),
             Token::Index => "'index'".into(),
+            Token::Unique => "'unique'".into(),
             Token::On => "'on'".into(),
             Token::Conflict => "'conflict'".into(),
             Token::Asc => "'asc'".into(),

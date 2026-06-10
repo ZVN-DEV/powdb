@@ -66,6 +66,8 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Add a column | `alter User add column status: str` | `ALTER TABLE User ADD COLUMN status TEXT` |
 | Drop a column | `alter User drop column status` | `ALTER TABLE User DROP COLUMN status` |
 | Create an index | `alter User add index .email` | `CREATE INDEX ON User (email)` |
+| Unique column | `type User { unique email: str }` | `CREATE TABLE User (email TEXT UNIQUE)` |
+| Add unique constraint | `alter User add unique .email` | `CREATE UNIQUE INDEX ON User (email)` |
 | Insert | `insert User { name := "Alice", age := 30 }` | `INSERT INTO User (name, age) VALUES ('Alice', 30)` |
 | Scan a table | `User` | `SELECT * FROM User` |
 | Filter | `User filter .age > 30` | `SELECT * FROM User WHERE age > 30` |
@@ -88,7 +90,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Update | `User filter .id = 1 update { age := 31 }` | `UPDATE User SET age = 31 WHERE id = 1` |
 | Update with expr | `User update { age := .age + 1 }` | `UPDATE User SET age = age + 1` |
 | Delete | `User filter .age < 18 delete` | `DELETE FROM User WHERE age < 18` |
-| Upsert | `upsert User on .id { id := 1, name := "Alice" }` | `INSERT ... ON CONFLICT (id) DO UPDATE ...` |
+| Upsert (key must be `unique`) | `upsert User on .id { id := 1, name := "Alice" }` | `INSERT ... ON CONFLICT (id) DO UPDATE ...` |
 | CASE | `case when .age > 30 then "old" else "young" end` | `CASE WHEN age > 30 THEN 'old' ELSE 'young' END` |
 | Materialized view | `materialize OldUsers as User filter .age > 28` | `CREATE MATERIALIZED VIEW OldUsers AS ...` |
 
@@ -119,7 +121,9 @@ Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`
 
 **Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor/`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
 
-`required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`.
+`required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`. `unique` is a sibling prefix keyword (`required unique email: str`, either order) that auto-creates a unique B+tree index and enforces no duplicate non-null values on insert/update/upsert.
+
+**Footgun (since 0.4.7):** `upsert <T> on .<col>` requires `.col` to be **unique** — declare it `unique` in the `type`, or run `alter <T> add unique .<col>` first. Upserting on a non-unique column is now a hard error (this closed a bug where upsert could silently create duplicate keys). `alter add unique` first scans for existing duplicates and fails if any are present; it also rejects a column that already has a non-unique index (no in-place upgrade). Null values are exempt from `unique`.
 
 ---
 

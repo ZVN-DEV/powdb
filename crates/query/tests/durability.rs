@@ -190,7 +190,9 @@ fn test_mixed_mutations_survive_crash() {
         let mut engine = Engine::new(&dir).unwrap();
         exec(
             &mut engine,
-            "type P { required id: int, price: int, tag: str }",
+            // `id` is unique so `upsert P on .id` is valid (breaking change
+            // since 0.4.7: the upsert key column must be unique).
+            "type P { required unique id: int, price: int, tag: str }",
         );
         for i in 1..=300i64 {
             exec(

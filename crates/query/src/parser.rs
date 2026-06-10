@@ -1561,6 +1561,23 @@ impl Parser {
                         action: AlterAction::AddIndex { column },
                     }));
                 }
+                // `alter <Table> add unique .<column>`
+                if *self.peek() == Token::Unique {
+                    self.advance();
+                    let column = match self.advance() {
+                        Token::DotIdent(n) => n,
+                        t => {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: ".<column> after add unique".into(),
+                                got: t.display_name(),
+                            })
+                        }
+                    };
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::AddUnique { column },
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -1769,12 +1786,21 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            let required = if *self.peek() == Token::Required {
-                self.advance();
-                true
-            } else {
-                false
-            };
+            // Accept `required` and `unique` modifiers in either order.
+            let (mut required, mut unique) = (false, false);
+            loop {
+                match self.peek() {
+                    Token::Required => {
+                        self.advance();
+                        required = true;
+                    }
+                    Token::Unique => {
+                        self.advance();
+                        unique = true;
+                    }
+                    _ => break,
+                }
+            }
             let field_name = match self.advance() {
                 Token::Ident(n) => n,
                 t => {
@@ -1798,6 +1824,7 @@ impl Parser {
                 name: field_name,
                 type_name,
                 required,
+                unique,
             });
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -1850,6 +1877,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Multi => out.push_str("multi"),
             Token::Link => out.push_str("link"),
             Token::Index => out.push_str("index"),
+            Token::Unique => out.push_str("unique"),
             Token::On => out.push_str("on"),
             Token::Asc => out.push_str("asc"),
             Token::Desc => out.push_str("desc"),
@@ -2874,6 +2902,42 @@ mod tests {
                 AlterAction::AddColumn { required, .. } => assert!(required),
                 other => panic!("expected AddColumn, got {other:?}"),
             },
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_with_unique_modifier() {
+        let stmt = parse("type User { required unique email: str, age: int }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert!(ct.fields[0].required && ct.fields[0].unique);
+                assert!(!ct.fields[1].unique);
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_unique_before_required() {
+        // Modifiers accepted in either order.
+        let stmt = parse("type User { unique required email: str }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert!(ct.fields[0].required && ct.fields[0].unique);
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_unique() {
+        let stmt = parse("alter User add unique .email").unwrap();
+        match stmt {
+            Statement::AlterTable(at) => assert!(matches!(
+                at.action,
+                AlterAction::AddUnique { ref column } if column == "email"
+            )),
             other => panic!("expected AlterTable, got {other:?}"),
         }
     }

@@ -42,6 +42,13 @@ pub enum AlterAction {
     AddIndex {
         column: String,
     },
+    /// `alter <Table> add unique .<column>` — creates a UNIQUE B+Tree
+    /// index on `column`. Scans existing data first and fails if any
+    /// duplicate (non-null) value is present. Errors if the column is
+    /// already indexed (no in-place upgrade).
+    AddUnique {
+        column: String,
+    },
 }
 
 /// `drop User`
@@ -196,6 +203,9 @@ pub struct FieldDef {
     pub name: String,
     pub type_name: String,
     pub required: bool,
+    /// `true` when declared with the `unique` modifier — auto-creates a
+    /// unique B+Tree index on this column at table-create time.
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

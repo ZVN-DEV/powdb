@@ -728,36 +728,32 @@ impl Engine {
                     (values, key_idx)
                 };
 
+                // Upsert requires the `on` column to be unique — otherwise
+                // there is no well-defined row to overwrite and a plain
+                // insert could silently create duplicate keys.
+                if self.catalog.is_index_unique(table, key_column) != Some(true) {
+                    return Err(QueryError::Execution(format!(
+                        "upsert on .{key_column} requires a unique column (declare it with \
+                         `unique {key_column}: <type>` or `alter {table} add unique .{key_column}`)"
+                    )));
+                }
+
                 let key_value = values[key_idx].clone();
 
-                // Probe the index for a conflict.
+                // Probe the unique index for a conflict.
                 let existing = {
                     let tbl = self
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                    if tbl.has_index(key_column) {
-                        // Upsert key lookup: return the first match.
-                        // For unique indexes this is the only match.
-                        // For non-unique indexes on a key column, also
-                        // just the first (upsert semantics).
-                        let rids = tbl.index_lookup_all(key_column, &key_value);
-                        rids.into_iter().next().and_then(|rid| {
-                            tbl.heap
-                                .get(rid)
-                                .map(|data| (rid, decode_row(&tbl.schema, &data)))
-                        })
-                    } else {
-                        // No index — linear scan for the key.
-                        let mut found = None;
-                        for (rid, row) in tbl.scan() {
-                            if row[key_idx] == key_value {
-                                found = Some((rid, row));
-                                break;
-                            }
-                        }
-                        found
-                    }
+                    // The key column is guaranteed unique above, so this
+                    // returns at most one matching row.
+                    let rids = tbl.index_lookup_all(key_column, &key_value);
+                    rids.into_iter().next().and_then(|rid| {
+                        tbl.heap
+                            .get(rid)
+                            .map(|data| (rid, decode_row(&tbl.schema, &data)))
+                    })
                 };
 
                 if let Some((rid, mut existing_row)) = existing {
@@ -1394,16 +1390,15 @@ impl Engine {
                 let columns: Vec<ColumnDef> = fields
                     .iter()
                     .enumerate()
-                    .map(
-                        |(i, (fname, tname, req))| -> Result<ColumnDef, QueryError> {
-                            Ok(ColumnDef {
-                                name: fname.clone(),
-                                type_id: type_name_to_id(tname).map_err(QueryError::TypeError)?,
-                                required: *req,
-                                position: i as u16,
-                            })
-                        },
-                    )
+                    .map(|(i, f)| -> Result<ColumnDef, QueryError> {
+                        Ok(ColumnDef {
+                            name: f.name.clone(),
+                            type_id: type_name_to_id(&f.type_name)
+                                .map_err(QueryError::TypeError)?,
+                            required: f.required,
+                            position: i as u16,
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let schema = Schema {
                     table_name: name.clone(),
@@ -1412,6 +1407,13 @@ impl Engine {
                 self.catalog
                     .create_table(schema)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                // Declaring a field `unique` auto-creates a unique B+tree
+                // index, which is where uniqueness is enforced on writes.
+                for f in fields.iter().filter(|f| f.unique) {
+                    self.catalog
+                        .create_index_unique(name, &f.name, true)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
                 Ok(QueryResult::Created(name.clone()))
             }
 
@@ -1454,6 +1456,48 @@ impl Engine {
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("index on '{table}.{column}' created"),
+                    })
+                }
+                AlterAction::AddUnique { column } => {
+                    // No DropIndex exists, so we cannot upgrade an existing
+                    // non-unique index in place — reject it cleanly.
+                    if self.catalog.has_index(table, column) {
+                        return Err(QueryError::Execution(format!(
+                            "cannot add unique on {table}.{column}: column already indexed"
+                        )));
+                    }
+                    // Scan existing rows for duplicate (non-null) values
+                    // before creating the unique index.
+                    {
+                        let tbl = self
+                            .catalog
+                            .get_table(table)
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                        let col_idx = tbl.schema.column_index(column).ok_or_else(|| {
+                            QueryError::ColumnNotFound {
+                                table: table.to_string(),
+                                column: column.clone(),
+                            }
+                        })?;
+                        let mut seen = std::collections::HashSet::new();
+                        for (_, row) in tbl.scan() {
+                            let v = &row[col_idx];
+                            if v.is_empty() {
+                                continue;
+                            }
+                            if !seen.insert(v.clone()) {
+                                return Err(QueryError::Execution(format!(
+                                    "cannot add unique on {table}.{column}: \
+                                     duplicate value {v:?} exists"
+                                )));
+                            }
+                        }
+                    }
+                    self.catalog
+                        .create_index_unique(table, column, true)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    Ok(QueryResult::Executed {
+                        message: format!("unique index on '{table}.{column}' created"),
                     })
                 }
             },
@@ -3764,12 +3808,15 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         PlanNode::CreateTable { name, fields } => {
             let fs: Vec<String> = fields
                 .iter()
-                .map(|(n, t, r)| {
-                    if *r {
-                        format!("{n}: {t} required")
-                    } else {
-                        format!("{n}: {t}")
+                .map(|f| {
+                    let mut mods = String::new();
+                    if f.required {
+                        mods.push_str(" required");
                     }
+                    if f.unique {
+                        mods.push_str(" unique");
+                    }
+                    format!("{}: {}{mods}", f.name, f.type_name)
                 })
                 .collect();
             format!("{indent}CreateTable name={name} fields=[{}]", fs.join(", "))

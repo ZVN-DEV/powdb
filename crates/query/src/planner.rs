@@ -509,7 +509,12 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
     let fields = ct
         .fields
         .into_iter()
-        .map(|f| (f.name, f.type_name, f.required))
+        .map(|f| crate::plan::CreateField {
+            name: f.name,
+            type_name: f.type_name,
+            required: f.required,
+            unique: f.unique,
+        })
         .collect();
     Ok(PlanNode::CreateTable {
         name: ct.name,

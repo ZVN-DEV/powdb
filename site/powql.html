@@ -71,7 +71,7 @@
         <tr><td>Null</td><td><em>(empty)</em></td><td>0 bytes</td><td>Absence of a value</td></tr>
       </tbody>
     </table>
-    <p>Fields marked <code>required</code> cannot be null. All other fields are nullable by default. Use <code>is null</code> / <code>is not null</code> to check, and <code>??</code> to coalesce.</p>
+    <p>Fields marked <code>required</code> cannot be null. All other fields are nullable by default. Use <code>is null</code> / <code>is not null</code> to check, and <code>??</code> to coalesce. A field marked <code>unique</code> (e.g. <code>required unique email: str</code>, modifiers in either order) auto-creates a unique index and rejects duplicate non-null values on insert/update/upsert.</p>
 
     <!-- Schema Definition -->
     <h2 id="schema">Schema Definition</h2>
@@ -304,7 +304,8 @@ User filter .age < 18 delete
 User delete</code></pre>
 
     <h3>UPSERT</h3>
-    <pre><code>-- Insert or update on conflict
+    <p>The <code>on</code> column must be <code>unique</code> (since 0.4.7) — declare it <code>unique</code> in the <code>type</code> or run <code>alter User add unique .email</code> first.</p>
+    <pre><code>-- Insert or update on conflict (.email must be unique)
 upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
 
 -- Explicit conflict handling
@@ -342,7 +343,10 @@ alter User drop column email
 
 -- Create an index
 alter User add index .email
-alter User add index .age</code></pre>
+alter User add index .age
+
+-- Add a unique constraint (scans for existing dups first; fails if any)
+alter User add unique .email</code></pre>
 
     <h3>Drop Table</h3>
     <pre><code>drop User</code></pre>
@@ -451,6 +455,16 @@ User { .name, running_total: sum(.amount) over (order .date) }</code></pre>
           <td><code>CREATE INDEX ON User (email)</code></td>
         </tr>
         <tr>
+          <td>Unique column</td>
+          <td><code>type User { unique email: str }</code></td>
+          <td><code>CREATE TABLE User (email TEXT UNIQUE)</code></td>
+        </tr>
+        <tr>
+          <td>Add unique</td>
+          <td><code>alter User add unique .email</code></td>
+          <td><code>CREATE UNIQUE INDEX ON User (email)</code></td>
+        </tr>
+        <tr>
           <td>Alias</td>
           <td><code>User { full_name: .name }</code></td>
           <td><code>SELECT name AS full_name FROM User</code></td>
@@ -476,6 +490,7 @@ User { .name, running_total: sum(.amount) over (order .date) }</code></pre>
         <tr><td>Assignment</td><td><code>:=</code></td><td><code>=</code> or <code>SET col = val</code></td></tr>
         <tr><td>Table definition</td><td><code>type Name { ... }</code></td><td><code>CREATE TABLE Name (...)</code></td></tr>
         <tr><td>Required / NOT NULL</td><td><code>required field: type</code></td><td><code>field TYPE NOT NULL</code></td></tr>
+        <tr><td>Unique constraint</td><td><code>unique field: type</code></td><td><code>field TYPE UNIQUE</code></td></tr>
         <tr><td>String literals</td><td><code>"double quotes"</code></td><td><code>'single quotes'</code></td></tr>
         <tr><td>Query shape</td><td>Pipeline: <code>Table verb verb { proj }</code></td><td>Clausal: <code>SELECT proj FROM Table WHERE ...</code></td></tr>
         <tr><td>Aggregates</td><td>Wrapping: <code>count(Table filter ...)</code></td><td>Inline: <code>SELECT COUNT(*) FROM ...</code></td></tr>

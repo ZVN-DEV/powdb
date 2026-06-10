@@ -4414,3 +4414,156 @@ fn test_window_agg_with_order_keeps_running_frame() {
     assert_eq!(by_name["b"], Value::Float(15.0));
     assert_eq!(by_name["c"], Value::Float(20.0));
 }
+
+// ---------------------------------------------------------------------------
+// UNIQUE constraint enforcement (Task 3)
+// ---------------------------------------------------------------------------
+
+fn unique_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_uniq_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Acct { required unique email: str, id: int }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Acct { email := "a@x.com", id := 1 }"#)
+        .unwrap();
+    engine
+}
+
+#[test]
+fn test_unique_dup_insert_rejected() {
+    let mut engine = unique_engine();
+    let err = engine
+        .execute_powql(r#"insert Acct { email := "a@x.com", id := 2 }"#)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("unique constraint violation on Acct.email"),
+        "{err}"
+    );
+    match engine.execute_powql("count(Acct)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unique_update_into_dup_rejected() {
+    let mut engine = unique_engine();
+    engine
+        .execute_powql(r#"insert Acct { email := "b@x.com", id := 2 }"#)
+        .unwrap();
+    let err = engine
+        .execute_powql(r#"Acct filter .id = 2 update { email := "a@x.com" }"#)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unique constraint violation"),
+        "{err}"
+    );
+    // The losing row keeps its own value (rolled back / never applied).
+    match engine
+        .execute_powql(r#"Acct filter .email = "b@x.com" { .id }"#)
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unique_update_to_same_value_allowed() {
+    let mut engine = unique_engine();
+    // Updating a unique column to its own current value must NOT trip the
+    // constraint (existing rid == self).
+    engine
+        .execute_powql(r#"Acct filter .id = 1 update { email := "a@x.com", id := 9 }"#)
+        .unwrap();
+    match engine.execute_powql("count(Acct)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_upsert_requires_unique_and_no_dup_ids() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_ups_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type W { unique id: int, v: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"upsert W on .id { id := 1, v := "first" }"#)
+        .unwrap();
+    // Known bug regression: a plain insert of the same id must now fail
+    // instead of silently creating a second id=1 row.
+    assert!(engine
+        .execute_powql(r#"insert W { id := 1, v := "second" }"#)
+        .is_err());
+    engine
+        .execute_powql(r#"upsert W on .id { id := 1, v := "third" }"#)
+        .unwrap();
+    match engine.execute_powql("count(W)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected scalar, got {other:?}"),
+    }
+    // upsert on a NON-unique column is a clean error.
+    engine.execute_powql("type W2 { id: int }").unwrap();
+    let err = engine
+        .execute_powql("upsert W2 on .id { id := 1 }")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires a unique column"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_alter_add_unique_fails_on_existing_dups() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_audup_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.execute_powql("type L { e: str }").unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    assert!(engine.execute_powql("alter L add unique .e").is_err());
+}
+
+#[test]
+fn test_alter_add_unique_succeeds_then_enforces() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_au_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.execute_powql("type L { e: str }").unwrap();
+    engine.execute_powql(r#"insert L { e := "x" }"#).unwrap();
+    engine.execute_powql(r#"insert L { e := "y" }"#).unwrap();
+    engine.execute_powql("alter L add unique .e").unwrap();
+    // Now enforced on subsequent inserts.
+    assert!(engine.execute_powql(r#"insert L { e := "x" }"#).is_err());
+    // Adding unique on an already-indexed column is a clean error.
+    let err = engine.execute_powql("alter L add unique .e").unwrap_err();
+    assert!(err.to_string().contains("already indexed"), "{err}");
+}
+
+#[test]
+fn test_unique_constraint_survives_reopen() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_uniq_re_{}_{}", std::process::id(), id));
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Acct { required unique email: str }")
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Acct { email := "a@x.com" }"#)
+            .unwrap();
+        // Dropped here without explicit checkpoint — recovery path must
+        // restore the unique flag from catalog.bin + WAL replay.
+    }
+    let mut engine = Engine::new(&dir).unwrap();
+    assert!(engine
+        .execute_powql(r#"insert Acct { email := "a@x.com" }"#)
+        .is_err());
+}

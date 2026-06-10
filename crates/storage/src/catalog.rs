@@ -1185,6 +1185,20 @@ impl Catalog {
         self.persist()
     }
 
+    /// Whether `table.column` has a UNIQUE index. Returns `Some(true)` for
+    /// a unique index, `Some(false)` for a non-unique index, and `None`
+    /// when the column is not indexed or the table is unknown.
+    pub fn is_index_unique(&self, table: &str, column: &str) -> Option<bool> {
+        self.get_table(table)?.is_index_unique(column)
+    }
+
+    /// Whether `table.column` has any index (unique or non-unique).
+    pub fn has_index(&self, table: &str, column: &str) -> bool {
+        self.get_table(table)
+            .map(|t| t.has_index(column))
+            .unwrap_or(false)
+    }
+
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
         Ok(self
             .by_name(table)?
