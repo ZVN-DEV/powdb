@@ -200,7 +200,7 @@ if (result.kind === "rows") console.table(result.rows);
 | Variable | Default | Description |
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
-| `POWDB_BIND` | `127.0.0.1` | Interface to bind; set `0.0.0.0` behind a platform proxy (Fly, Railway) |
+| `POWDB_BIND` | `127.0.0.1` | Interface to bind; set `0.0.0.0` behind an IPv4 platform proxy (Railway, Docker, ECS). On **Fly.io** use `[::]` instead — its `.internal` network and `fly proxy` route over IPv6, so `0.0.0.0` makes the proxy reset the connection |
 | `POWDB_DATA` | `./powdb_data` | Data directory (heap files, WAL, catalog, indexes) |
 | `POWDB_PASSWORD` | *(none)* | Shared password required on connect when no named users are defined (set as env var) |
 | `POWDB_ADMIN_USER` / `POWDB_ADMIN_PASSWORD` | *(none)* | Bootstrap an `admin` user on startup when both are set and that user does not yet exist (password never logged) |
