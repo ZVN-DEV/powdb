@@ -1,8 +1,11 @@
 //! `powdb-auth` — argon2id password hashing and a persisted user/role store.
 //!
-//! Slice 1 of PowDB's RBAC epic. This crate is **additive**: it is a tested
-//! library + data model and is not yet wired into the server or CLI, so it
-//! does not change any runtime behavior.
+//! Provides PowDB's RBAC primitives: the [`role`] permission lattice, the
+//! [`hash`] argon2id password hashing, and the persisted [`store::UserStore`].
+//! These are live in production: `powdb-server` loads the [`store::UserStore`]
+//! at startup and enforces the [`role`] lattice on every query
+//! (`crates/server/src/handler.rs`), and `powdb-cli` manages users via the
+//! `useradd`/`passwd`/`userdel` subcommands.
 
 pub mod error;
 pub mod hash;

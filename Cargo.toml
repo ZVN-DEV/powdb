@@ -26,9 +26,25 @@ blake3 = "1"
 # - lto = true: enables cross-crate inlining (executor → storage → page).
 #   This is the load-bearing flag — every fast path crosses crate boundaries.
 # - codegen-units = 1: single codegen unit, slower compile, faster runtime.
-# - panic = "abort": no unwinding tables on hot branches; smaller binary.
 # - strip = "symbols": shrink binary, no impact on perf.
 # Estimated overall impact vs default release: 5-15% across-the-board.
+#
+# panic = "abort" — DELIBERATE crash-only design, not just a size/perf knob.
+# PowDB holds shared, mutable engine state (catalog + page cache) behind a
+# single `RwLock<Engine>` shared across every connection. If a query thread
+# were to panic mid-mutation while unwinding, it would (a) poison the lock,
+# bricking every subsequent request with "lock poisoned", and (b) potentially
+# leave the in-memory catalog/page state inconsistent with the on-disk WAL,
+# with no in-process path back to a consistent state. Aborting instead turns a
+# panic into a fast, clean process exit: a supervisor (Docker `restart`,
+# systemd `Restart=on-failure`, Fly auto-restart, ECS task restart) brings the
+# server back up, and WAL replay deterministically recovers to the last
+# durable, consistent state — a path that is exercised by the durability test
+# suite (crates/query/tests/durability.rs) on every CI run. For a stateful
+# engine, "crash and recover from the log" is safer and more available than
+# "limp along on possibly-corrupt shared state". This is why a process
+# supervisor with auto-restart is REQUIRED in production (see
+# examples/deploy/README.md and the Production checklist in README.md).
 [profile.release]
 lto = true
 codegen-units = 1
@@ -36,3 +52,13 @@ panic = "abort"
 opt-level = 3
 debug = false
 strip = "symbols"
+
+# Lint policy promoted from CI into the workspace so `cargo clippy` fails
+# locally with the same rules CI enforces (`-D warnings`), instead of only
+# surfacing after a push. Inherited by every crate via `[lints] workspace =
+# true`. `clippy::all = deny` mirrors the existing CI gate exactly — the code
+# already passes `clippy -D warnings`, so promoting the same group to `deny`
+# introduces no new failures; it just moves the feedback from post-push to the
+# local `cargo clippy`.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }

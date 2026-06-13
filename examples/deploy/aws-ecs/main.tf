@@ -213,6 +213,12 @@ resource "aws_ecs_service" "powdb" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
+  # AUTO-RESTART (MANDATORY for PowDB): an ECS service continuously reconciles
+  # running tasks toward `desired_count`, so if the task exits or is killed,
+  # ECS launches a fresh one automatically. This is exactly the supervised
+  # restart PowDB relies on — it is crash-only by design (panic = "abort" →
+  # fast exit → restart → WAL replay recovers to a consistent state). Do NOT
+  # replace this with a one-shot RunTask; you would lose auto-restart.
   # PowDB is single-writer — never run 2 tasks against the same EFS dir.
   deployment_maximum_percent         = 100
   deployment_minimum_healthy_percent = 0

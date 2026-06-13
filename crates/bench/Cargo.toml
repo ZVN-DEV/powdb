@@ -31,3 +31,6 @@ harness = false
 [[bench]]
 name = "powql"
 harness = false
+
+[lints]
+workspace = true

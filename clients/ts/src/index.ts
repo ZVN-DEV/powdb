@@ -32,7 +32,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.4.0";
+export const CLIENT_VERSION = "0.5.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }

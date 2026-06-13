@@ -3,6 +3,30 @@
 Reference configurations for self-hosting `powdb-server`. These are templates,
 not live deployments — replace placeholder names and secrets before running.
 
+## Why auto-restart is required (read this first)
+
+**PowDB is crash-only by design, so a process supervisor with auto-restart is
+MANDATORY in production.** The server is built with `panic = "abort"`: on an
+unrecoverable error it exits immediately rather than trying to limp along in a
+half-broken state. On the next start, WAL replay rolls the data dir forward to
+the last consistent state, recovering committed writes. This is fast and safe —
+but it only works if *something* restarts the process.
+
+Every example here ships with auto-restart already wired in:
+
+| Example            | Auto-restart mechanism                                              |
+| ------------------ | ------------------------------------------------------------------ |
+| Fly.io             | `auto_start_machines = true`, `min_machines_running = 1` (fly.toml) |
+| Railway            | `restartPolicyType = "ON_FAILURE"` (railway.toml)                  |
+| Cloudflare Tunnel  | `restart: unless-stopped` on both services (docker-compose.yml)    |
+| AWS ECS Fargate    | the service reconciles tasks toward `desired_count = 1` (main.tf)  |
+
+If you adapt these to another platform, keep an equivalent supervisor
+(systemd `Restart=always`, Kubernetes Deployment/`restartPolicy: Always`,
+`docker run --restart unless-stopped`, etc.). Running `powdb-server` as a bare,
+unsupervised process means a single crash leaves the database **down** until a
+human restarts it — even though the data on disk is fully recoverable.
+
 ## Fly.io
 
 [`fly.toml`](./fly.toml) is a minimal stateful TCP deployment: one machine,

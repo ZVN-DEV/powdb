@@ -1,8 +1,9 @@
 //! Persisted user/role store backed by `auth.json`.
 //!
 //! Passwords are never stored in plaintext — only argon2id PHC hashes.
-//! On Unix the on-disk file is written with mode `0600`. This slice is
-//! additive: nothing in the server/cli reads this store yet.
+//! On Unix the on-disk file is written with mode `0600`. `powdb-server` loads
+//! this store at startup and authenticates every connection against it;
+//! `powdb-cli` manages it via the `useradd`/`passwd`/`userdel` subcommands.
 
 use std::collections::BTreeMap;
 use std::fs;

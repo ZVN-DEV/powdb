@@ -1,8 +1,11 @@
 //! Permission and role model for PowDB RBAC.
 //!
 //! A small, fixed permission lattice plus three builtin roles
-//! (`admin`, `readwrite`, `readonly`). This slice does not enforce
-//! permissions anywhere — it only defines the data model.
+//! (`admin`, `readwrite`, `readonly`). The lattice is enforced at the server
+//! dispatch layer (`crates/server/src/handler.rs::check_statement_permitted`):
+//! reads need [`Permission::Read`], row mutations need [`Permission::Write`],
+//! schema changes need [`Permission::Ddl`], and [`Permission::Admin`] is
+//! reserved for user/role management (CLI-only today).
 
 use std::collections::BTreeSet;
 
@@ -49,11 +52,14 @@ impl Role {
         }
     }
 
-    /// Builtin `readwrite` role: read + write.
+    /// Builtin `readwrite` role: read + write + schema definition. An
+    /// application-tier user is expected to create and evolve its own tables
+    /// and indexes, so `readwrite` includes `Ddl`. It does NOT include
+    /// `Admin` (user/role management stays admin-only).
     pub fn readwrite() -> Role {
         Role {
             name: "readwrite".to_string(),
-            permissions: BTreeSet::from([Permission::Read, Permission::Write]),
+            permissions: BTreeSet::from([Permission::Read, Permission::Write, Permission::Ddl]),
         }
     }
 
@@ -108,15 +114,15 @@ mod tests {
     }
 
     #[test]
-    fn readwrite_has_read_and_write_only() {
+    fn readwrite_has_read_write_and_ddl_but_not_admin() {
         let r = Role::readwrite();
         assert_eq!(
             r.permissions,
-            BTreeSet::from([Permission::Read, Permission::Write])
+            BTreeSet::from([Permission::Read, Permission::Write, Permission::Ddl])
         );
         assert!(r.allows(Permission::Read));
         assert!(r.allows(Permission::Write));
-        assert!(!r.allows(Permission::Ddl));
+        assert!(r.allows(Permission::Ddl));
         assert!(!r.allows(Permission::Admin));
     }
 

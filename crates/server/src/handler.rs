@@ -90,16 +90,48 @@ pub struct Principal {
     pub role: String,
 }
 
-/// Whether `role` grants the `Write` permission. Unknown role names fail
-/// closed (no write). Shared-password / open / embedded modes never construct
-/// a [`Principal`], so they are unaffected by this gate.
-fn role_can_write(role: &str) -> bool {
-    Role::builtin(role).is_some_and(|r| r.allows(Permission::Write))
+/// Whether a parsed statement is data-definition (schema) work: creating,
+/// altering, or dropping a type or view. `explain <ddl>` is classified by its
+/// inner statement so `explain drop User` needs the same permission as
+/// `drop User`. Mutations that change *rows* (insert/update/delete/upsert/
+/// refresh) and transaction control are NOT DDL — they fall under `Write`.
+fn is_ddl_statement(stmt: &powdb_query::ast::Statement) -> bool {
+    use powdb_query::ast::Statement;
+    let inner = match stmt {
+        Statement::Explain(inner) => inner.as_ref(),
+        other => other,
+    };
+    matches!(
+        inner,
+        Statement::CreateType(_)
+            | Statement::AlterTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
+    )
 }
 
-/// Enforce the principal's role against a parsed statement. Returns an error
-/// for any non-read statement (insert/update/delete/upsert/DDL/view ops/
-/// transaction control) when the role does not grant `Write`.
+/// The capability a parsed statement requires under the RBAC lattice
+/// (`crates/auth/src/role.rs`). Reads need [`Permission::Read`]; schema
+/// definition needs [`Permission::Ddl`]; every other mutation needs
+/// [`Permission::Write`]. [`Permission::Admin`] is reserved for user/role
+/// management, which is CLI-only today and never reaches this wire path.
+fn required_permission(stmt: &powdb_query::ast::Statement) -> Permission {
+    if is_read_only_statement(stmt) {
+        Permission::Read
+    } else if is_ddl_statement(stmt) {
+        Permission::Ddl
+    } else {
+        Permission::Write
+    }
+}
+
+/// Enforce the principal's role against a parsed statement using the full
+/// permission lattice. Reads are always permitted (any authenticated role can
+/// read — unknown role names still read but fail closed on any mutation).
+/// Mutations require the specific capability the statement maps to: row
+/// mutations need `Write`, schema changes need `Ddl`. Unknown role names
+/// resolve to no builtin and therefore grant nothing beyond reads.
 ///
 /// Classification uses the parsed AST via
 /// [`powdb_query::executor::is_read_only_statement`] — the exact same
@@ -114,11 +146,22 @@ fn check_statement_permitted(
         // byte-identical to the pre-RBAC behavior.
         return Ok(());
     };
-    if is_read_only_statement(stmt) || role_can_write(&p.role) {
+    // Reads are permitted for every authenticated principal (preserves the
+    // pre-lattice contract that any connected role may run read-only queries).
+    if is_read_only_statement(stmt) {
         return Ok(());
     }
+    let needed = required_permission(stmt);
+    if Role::builtin(&p.role).is_some_and(|r| r.allows(needed)) {
+        return Ok(());
+    }
+    let kind = if needed == Permission::Ddl {
+        "schema-definition"
+    } else {
+        "write"
+    };
     Err(QueryError::Execution(format!(
-        "permission denied: role '{}' cannot execute write statements",
+        "permission denied: role '{}' cannot execute {kind} statements",
         p.role
     )))
 }
@@ -205,6 +248,13 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "permission denied",
     "row too large",
     "unique constraint violation",
+    // Resource-limit errors carry actionable guidance (e.g. "add a LIMIT
+    // clause") and leak no internal state, so surface them verbatim instead
+    // of masking them to the generic message. See QueryError::{SortLimit,
+    // JoinLimit,MemoryLimit}Exceeded in crates/query/src/result.rs.
+    "sort input exceeds",
+    "join result exceeds",
+    "query exceeded memory budget",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -685,6 +735,21 @@ mod tests {
             sanitize_error("some internal io panic detail"),
             "query execution error"
         );
+    }
+
+    #[test]
+    fn resource_limit_errors_surface_actionable_hints() {
+        // These carry user-actionable guidance and leak no internal state, so
+        // they must reach the client verbatim — not be masked to the generic
+        // message. The exact strings come from QueryError's Display impl
+        // (crates/query/src/result.rs).
+        for msg in [
+            "sort input exceeds row limit — add a LIMIT clause",
+            "join result exceeds row limit",
+            "query exceeded memory budget: requested 100 bytes, limit 50 bytes",
+        ] {
+            assert_eq!(sanitize_error(msg), msg, "should pass through verbatim");
+        }
     }
 
     // ---- Role enforcement (Fix: readonly role was not enforced) ----

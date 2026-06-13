@@ -328,7 +328,7 @@ fn parse_args() -> CliArgs {
                     "    Remote REPL:         powdb-cli --remote 127.0.0.1:5433 --password secret"
                 );
                 println!("    One-shot:            powdb-cli --exec 'count(User)'");
-                println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 | limit 5'");
+                println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 limit 5'");
                 println!();
                 println!("SUBCOMMANDS:");
                 println!("    backup <DEST_DIR> [--base <FULL_DIR>]");
