@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **RBAC now enforces the full permission lattice.** The server maps each
+  statement to the capability it needs — reads → `Read`, row mutations
+  (insert/update/delete/upsert) → `Write`, schema changes (create/alter/drop
+  type or view) → `Ddl` — and checks it against the user's role. The
+  `readwrite` role now explicitly carries `Ddl` (application users create and
+  evolve their own tables), so **this is behavior-preserving**: readwrite and
+  admin keep full access, readonly is still read-only, and any authenticated
+  role may still run read-only queries. `Admin` remains reserved for user/role
+  management (CLI-only).
+- **Automated post-publish durability smoke** (`scripts/smoke-release.sh`),
+  wired as a required gate in `release.yml`: installs the built binaries, runs
+  the README PowQL flow over the wire, then `kill -9`s the server and restarts
+  it to assert WAL replay recovers every row and the unique constraint still
+  holds. This is the exact gate whose absence caused the v0.4.1–0.4.3 data-loss
+  yanks; it now runs on every tagged release.
+- **MSRV build job** in CI that compiles the workspace with the pinned 1.93
+  toolchain (the previous job only checked that the version string matched the
+  docs).
+
+### Changed
+- **Resource-limit errors now reach remote clients verbatim.** Sort, join, and
+  per-query memory-budget errors (e.g. "sort input exceeds row limit — add a
+  LIMIT clause") were being masked to the generic "query execution error" by
+  the wire sanitizer. They carry actionable guidance and leak no internal
+  state, so they are now on the safe-error allowlist.
+
+### Fixed
+- CLI `--help` showed a remote one-shot example using a `|` pipe operator that
+  PowQL does not have; corrected to the whitespace-pipeline syntax so the
+  example runs as written.
+- CI `cargo audit` no longer fails on three `postgres`-only RUSTSEC advisories
+  whose entire dependency path is confined to the `publish = false`
+  `powdb-compare` benchmark crate (scoped ignore in `.cargo/audit.toml` + the
+  audit action, with provenance comments). No shipping crate is affected.
+- Dockerfile dependency-cache stage now copies the `powdb-auth` and
+  `powdb-backup` manifests it was silently missing, so the cached layer covers
+  the full server/CLI dependency closure.
+- TypeScript client version drift: the `CLIENT_VERSION` handshake constant,
+  the built `dist`, and the README now all agree with `package.json` (0.5.0),
+  and a CI job asserts they can't diverge again.
+
+### Internal
+- Documented `panic = "abort"` as a deliberate **crash-only** design: on a
+  panic the server exits fast and a supervisor restarts it, with WAL replay
+  recovering to a consistent state — safer for a stateful engine than
+  unwinding into a poisoned lock. Every deploy example is confirmed to run
+  under an auto-restart policy, and the requirement is now documented in
+  `examples/deploy/README.md`.
+- Promoted the CI lint policy into `[workspace.lints]` (`clippy::all = deny`)
+  so `cargo clippy` fails locally with the same rules CI enforces.
+- Removed ~190 LOC of dead, never-wired snapshot-isolation scaffolding
+  (`storage::mvcc`, `storage::tx`) that was shipping in the `powdb-storage`
+  crate; the live engine uses `RwLock` concurrency.
+- Refreshed stale `powdb-auth` doc-comments that claimed the crate was "not
+  yet wired into the server or CLI" — it has enforced auth/RBAC since 0.4.6.
+
 ## [0.4.7] - 2026-06-10
 
 ### Added

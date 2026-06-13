@@ -94,6 +94,7 @@ If the planner emits a different shape for the same logical operation, the fast 
 
 ## CI
 
-Two workflow files:
-- `.github/workflows/ci.yml` — clippy + fmt + test (+ ASan, miri, fuzz, cargo audit, MSRV, examples). **Required status checks on `main`.**
+Three workflow files:
+- `.github/workflows/ci.yml` — clippy + fmt + test + doctest (+ ASan, miri, cargo audit, MSRV, examples smoke). **Required status checks on `main`.**
+- `.github/workflows/fuzz.yml` — cargo-fuzz targets. **Separate** from ci.yml (PR-triggered + nightly cron at 07:00 UTC + `workflow_dispatch`); not part of the required check set above.
 - `.github/workflows/bench.yml` — criterion microbenchmark suite. **Manual-only (`workflow_dispatch`), NOT a required gate.** Runs on a Depot single-tenant runner (`depot-ubuntu-24.04-4`, tmpfs temp DBs), so numbers are comparable run-to-run; `baseline/main.json` must only ever be rebaselined from a Depot run of this workflow, never from a laptop. `powdb-bench` only depends on `powdb-storage`+`powdb-query`, so it gates nothing the normal suite doesn't already cover. Run it on demand: `gh workflow run bench.yml`.

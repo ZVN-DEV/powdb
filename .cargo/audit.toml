@@ -1,0 +1,32 @@
+# cargo-audit configuration.
+#
+# `cargo audit` reads this file from `.cargo/audit.toml` (relative to the repo
+# root). The CI `audit` job uses the `rustsec/audit-check` GitHub Action, which
+# does NOT read this file — it takes the same advisory IDs via its `ignore:`
+# input (see .github/workflows/ci.yml). Keep the two lists in sync.
+#
+# Policy: we ONLY ignore advisories whose entire dependency path is confined to
+# `crates/compare` (powdb-compare), which is `publish = false` — a benchmark-only
+# crate that pulls `postgres = "0.19"` and `mysql = "25"` purely to compare PowDB
+# against Postgres/MySQL. None of these crates ship in powdb-storage / powdb-query
+# / powdb-server / powdb-cli / powdb-auth / powdb-backup, so no published artifact
+# is affected. We do NOT broadly disable auditing — only the three postgres DoS
+# advisories below are vulnerabilities (the action's hard-fail trigger); the
+# remaining unmaintained/unsound entries are non-failing warnings and are left
+# visible on purpose.
+[advisories]
+ignore = [
+    # postgres-protocol < 0.6.12: unbounded SCRAM iteration count → CPU-exhaustion
+    # DoS from a malicious server. Path: postgres-protocol → tokio-postgres →
+    # postgres → powdb-compare (publish=false, bench-only). No shipping crate.
+    "RUSTSEC-2026-0179",
+
+    # postgres-protocol < 0.6.12: panic decoding a malformed `hstore` value → DoS.
+    # Same powdb-compare-only path. No shipping crate.
+    "RUSTSEC-2026-0180",
+
+    # tokio-postgres < 0.7.18: panic on a `DataRow` with fewer fields than columns
+    # → DoS. Path: tokio-postgres → postgres → powdb-compare (publish=false,
+    # bench-only). No shipping crate.
+    "RUSTSEC-2026-0178",
+]

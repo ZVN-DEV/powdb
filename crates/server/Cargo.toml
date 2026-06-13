@@ -28,3 +28,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
+
+[lints]
+workspace = true

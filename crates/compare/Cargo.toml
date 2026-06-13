@@ -25,3 +25,6 @@ mysql = { version = "25", default-features = false, features = ["default-rustls"
 [[bin]]
 name = "compare-engines"
 path = "src/main.rs"
+
+[lints]
+workspace = true
