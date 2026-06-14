@@ -4,7 +4,8 @@
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.4.7           | :white_check_mark: |
+| 0.4.8           | :white_check_mark: |
+| 0.4.7           | :x: (superseded)   |
 | 0.4.6           | :x: (superseded)   |
 | 0.4.5           | :x: (superseded)   |
 | 0.4.4           | :x: (superseded)   |
@@ -17,7 +18,7 @@
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
 > recovery and have been replaced by **v0.4.4**, which adds a permanent
 > durability regression suite. If you are on any of those three versions,
-> upgrade to the latest release (0.4.7). See `CHANGELOG.md` for details.
+> upgrade to the latest release (0.4.8). See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability
 
