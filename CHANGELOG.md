@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-06-10
+
 ### Added
 - **RBAC now enforces the full permission lattice.** The server maps each
   statement to the capability it needs — reads → `Read`, row mutations
