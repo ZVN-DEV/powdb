@@ -296,7 +296,7 @@ impl Engine {
     /// // Engine is ready — the directory now contains a catalog.
     /// ```
     pub fn new(data_dir: &Path) -> io::Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
+        powdb_storage::create_data_dir_secure(data_dir)?;
         // Try to reopen an existing database first; only create a fresh
         // catalog when there isn't one already on disk.
         let catalog = match Catalog::open(data_dir) {

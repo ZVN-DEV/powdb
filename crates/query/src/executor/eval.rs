@@ -663,7 +663,11 @@ pub(super) fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
             _ => Value::Empty,
         },
         BinOp::Div => match (left, right) {
-            (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
+            // `checked_div` guards BOTH divide-by-zero AND the `i64::MIN / -1`
+            // overflow case, which panics even in release builds (and with
+            // `panic = "abort"` that is a remotely-craftable process crash).
+            // Returning `Empty` on either matches the sibling arithmetic arms.
+            (Value::Int(a), Value::Int(b)) => a.checked_div(*b).map_or(Value::Empty, Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),
