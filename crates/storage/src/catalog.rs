@@ -144,7 +144,7 @@ impl Catalog {
     /// catalog.create_table(schema).unwrap();
     /// ```
     pub fn create(data_dir: &Path) -> io::Result<Self> {
-        std::fs::create_dir_all(data_dir)?;
+        crate::create_data_dir_secure(data_dir)?;
         let wal_path = data_dir.join(WAL_FILE);
         let wal = Wal::create(&wal_path, WAL_BATCH_SIZE)?;
         let cat = Catalog {

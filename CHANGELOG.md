@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-06-15
+
+### Security
+- **Fixed two remotely-craftable denial-of-service crashes** surfaced by the
+  2026-06-14 product review. Both are process aborts under the deliberate
+  `panic = "abort"` release profile, so an unauthenticated-but-connected client
+  could take the server down with a single query:
+  - **Integer-division overflow** (`crates/query/src/executor/eval.rs`): `i64::MIN / -1`
+    panics even in release. Division now uses `checked_div` and returns the
+    empty set on overflow or divide-by-zero, matching the other arithmetic arms.
+  - **Unbounded `LIMIT` pre-allocation** (`crates/query/src/executor/plan_exec.rs`):
+    the sort+limit fast path reserved a top-N heap of the raw user `LIMIT` up
+    front (e.g. `order .x limit 99999999999` → multi-terabyte reservation →
+    allocator abort). The pre-allocation is now capped; the heap still grows on
+    demand to the true limit.
+- **Data directory is now created `0700` on Unix** (`powdb_storage::create_data_dir_secure`).
+  Previously the directory — and the heap/WAL/index files holding all row data —
+  were created under the default umask and were world/group readable. `auth.json`
+  was already `0600`; this extends the same posture to the table data, matching
+  PostgreSQL's owner-only data-directory model.
+
+### Internal
+- Regression tests for all three fixes in `crates/query/tests/safety_limits.rs`
+  (the malicious division and huge-`LIMIT` queries, plus a `0700` permission
+  assertion) so they cannot silently regress.
+
 ## [0.4.8] - 2026-06-10
 
 ### Added

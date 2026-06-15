@@ -2374,6 +2374,13 @@ impl Engine {
             // for proper column naming.
             return Ok(None);
         }
+        // The top-N heaps never hold more than `limit` rows, but `limit` is an
+        // attacker-supplied literal (`order .x limit 99999999999`). Reserving
+        // that capacity up front would allocate gigabytes and abort the
+        // process before a single row is read. Cap the pre-allocation; the
+        // heaps still grow on demand up to the true `limit`.
+        const TOPN_PREALLOC_CAP: usize = 4096;
+        let prealloc = limit.min(TOPN_PREALLOC_CAP);
         let schema = self
             .catalog
             .schema(table)
@@ -2443,9 +2450,9 @@ impl Engine {
             TypeId::Int => {
                 let mut seq: u64 = 0;
                 let mut heap_desc: BinaryHeap<Reverse<(i64, u64, Vec<u8>)>> =
-                    BinaryHeap::with_capacity(limit);
+                    BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> =
-                    BinaryHeap::with_capacity(limit);
+                    BinaryHeap::with_capacity(prealloc);
 
                 self.catalog
                     .for_each_row_raw(table, |_rid, data| {
@@ -2513,9 +2520,9 @@ impl Engine {
                 // - Hot loop is branch-cheap (one compare + one xor)
                 let mut seq: u64 = 0;
                 let mut heap_desc: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> =
-                    BinaryHeap::with_capacity(limit);
+                    BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(u64, u64, Vec<u8>)> =
-                    BinaryHeap::with_capacity(limit);
+                    BinaryHeap::with_capacity(prealloc);
 
                 self.catalog
                     .for_each_row_raw(table, |_rid, data| {
