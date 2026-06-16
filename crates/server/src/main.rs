@@ -428,6 +428,7 @@ async fn main() {
                         let tx_gate = tx_gate.clone();
                         let pw = args.password.clone();
                         let users = users.clone();
+                        let tx_gate = tx_gate.clone();
                         let mut rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
@@ -441,9 +442,7 @@ async fn main() {
                                         handler::handle_connection(
                                             tls_stream,
                                             handler::ConnOpts {
-                                                engine: eng,
-                                                tx_gate,
-                                                expected_password: pw,
+                                                engine: eng, tx_gate: tx_gate.clone(), expected_password: pw,
                                                 users,
                                                 shutdown_rx: &mut rx,
                                                 idle_timeout: idle,
@@ -461,9 +460,7 @@ async fn main() {
                                 handler::handle_connection(
                                     stream,
                                     handler::ConnOpts {
-                                        engine: eng,
-                                        tx_gate,
-                                        expected_password: pw,
+                                        engine: eng, tx_gate, expected_password: pw,
                                         users,
                                         shutdown_rx: &mut rx,
                                         idle_timeout: idle,

@@ -83,6 +83,7 @@ async fn start_single_conn_server(
     let addr = listener.local_addr().unwrap();
     let tx_gate = new_tx_gate();
 
+    let tx_gate = powdb_server::handler::new_tx_gate();
     tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
         let mut rx = shutdown_rx;
@@ -120,6 +121,7 @@ async fn start_multi_conn_server(
     let addr = listener.local_addr().unwrap();
     let tx_gate = new_tx_gate();
 
+    let tx_gate = powdb_server::handler::new_tx_gate();
     tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -129,6 +131,7 @@ async fn start_multi_conn_server(
             let eng = engine.clone();
             let tx_gate = tx_gate.clone();
             let pw = expected_password.clone();
+            let gate = tx_gate.clone();
             let mut rx = shutdown_rx.clone();
             let rl = rate_limiter.clone();
             tokio::spawn(async move {
@@ -136,7 +139,7 @@ async fn start_multi_conn_server(
                     stream,
                     ConnOpts {
                         engine: eng,
-                        tx_gate,
+                        tx_gate: gate,
                         expected_password: pw.map(zeroize::Zeroizing::new),
                         users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
@@ -326,7 +329,7 @@ async fn test_max_connections_backpressure() {
 
     let sem = semaphore.clone();
     let eng = engine.clone();
-    let tx_gate = new_tx_gate();
+    let tx_gate = powdb_server::handler::new_tx_gate();
     tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -335,14 +338,14 @@ async fn test_max_connections_backpressure() {
             };
             let permit = sem.clone().acquire_owned().await.unwrap();
             let eng2 = eng.clone();
-            let tx_gate = tx_gate.clone();
+            let gate = tx_gate.clone();
             let mut rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 handle_connection(
                     stream,
                     ConnOpts {
                         engine: eng2,
-                        tx_gate,
+                        tx_gate: gate,
                         expected_password: None,
                         users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
