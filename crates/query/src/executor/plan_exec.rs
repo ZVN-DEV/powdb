@@ -4,24 +4,14 @@ use crate::ast::*;
 use crate::plan::*;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{
-    decode_column, decode_row, patch_var_column_in_place, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE,
-};
+use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
 use powdb_storage::types::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use super::compiled::*;
-
-#[inline]
-fn row_body_base(row: &[u8]) -> usize {
-    if row.len() >= ROW_PREFIX_SIZE && &row[0..4] == ROW_MAGIC {
-        ROW_PREFIX_SIZE
-    } else {
-        0
-    }
-}
 use super::eval::*;
+use super::row_body_base;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::{ViewDef, ViewRegistry};
 

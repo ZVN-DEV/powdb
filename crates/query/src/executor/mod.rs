@@ -12,7 +12,7 @@ use crate::plan_cache::PlanCache;
 use crate::planner;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{decode_column, decode_row, RowLayout};
+use powdb_storage::row::{decode_column, decode_row, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 use powdb_storage::view::ViewRegistry;
 
@@ -29,6 +29,20 @@ use self::eval::*;
 /// any external code matching on the string representation. New code should
 /// match on `QueryError::ReadonlyNeedsWrite` directly.
 pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
+
+/// Return the byte offset where the row body starts.
+///
+/// v0.5 rows begin with the `PROW` magic/version prefix. Legacy rows start
+/// directly with the row body. Raw executor fast paths must add this base
+/// before reading body-relative bitmap/data offsets.
+#[inline]
+pub(crate) fn row_body_base(row: &[u8]) -> usize {
+    if row.len() >= ROW_PREFIX_SIZE && &row[0..4] == ROW_MAGIC {
+        ROW_PREFIX_SIZE
+    } else {
+        0
+    }
+}
 
 /// Query frontend dialect. PowQL remains the default/native dialect; SQL is
 /// an explicit frontend that lowers to the same AST before planning.
@@ -76,12 +90,14 @@ pub(super) fn check_join_limit(row_count: usize) -> Result<(), QueryError> {
 //
 //   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row body
 //     encoding stores `bitmap_size = n_cols.div_ceil(8)` bytes of bitmap
-//     starting at body offset 2. So `base + 2 + $bmp_byte < row_len`
-//     and `get_unchecked(2 + $bmp_byte)` is inside the row slice.
+//     starting at body offset 2. So `bmp_off = row_body_base(row) + 2 +
+//     $bmp_byte < row_len`, and `get_unchecked(bmp_off)` is inside the
+//     row slice.
 //   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` is body-relative for a fixed-size
 //     column. Every fixed-size column contributes `fixed_size(type_id)`
-//     bytes to the fixed region, so the row always has `[$off .. $off+8]`
-//     available for any i64/f64 column — enforced by the row encoder
+//     bytes to the fixed region, so the row always has
+//     `[data_off .. data_off + 8]` available for any i64/f64 column, where
+//     `data_off = row_body_base(row) + $off` — enforced by the row encoder
 //     (`storage/src/row.rs`) and the schema invariant that a row with a
 //     given schema has enough body bytes for `2 + bitmap_size + fixed_region_size`.
 //   - Both macros are only invoked from `agg_single_col_fast`, which
@@ -103,11 +119,7 @@ macro_rules! agg_int_loop {
                     if !pred(data) {
                         return;
                     }
-                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
-                        ROW_PREFIX_SIZE
-                    } else {
-                        0
-                    };
+                    let base = row_body_base(data);
                     let bmp_off = base + 2 + bmp_byte;
                     let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
@@ -139,11 +151,7 @@ macro_rules! agg_int_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
-                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
-                        ROW_PREFIX_SIZE
-                    } else {
-                        0
-                    };
+                    let base = row_body_base(data);
                     let bmp_off = base + 2 + bmp_byte;
                     let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.
@@ -184,11 +192,7 @@ macro_rules! agg_float_loop {
                     if !pred(data) {
                         return;
                     }
-                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
-                        ROW_PREFIX_SIZE
-                    } else {
-                        0
-                    };
+                    let base = row_body_base(data);
                     let bmp_off = base + 2 + bmp_byte;
                     let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
@@ -220,11 +224,7 @@ macro_rules! agg_float_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
-                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
-                        ROW_PREFIX_SIZE
-                    } else {
-                        0
-                    };
+                    let base = row_body_base(data);
                     let bmp_off = base + 2 + bmp_byte;
                     let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.

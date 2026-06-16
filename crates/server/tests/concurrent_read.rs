@@ -165,8 +165,9 @@ fn concurrent_readers_make_progress_in_parallel() {
 /// **IndexScan** path: `filter .id = <literal>` with a B-tree index on
 /// `id` plans as `IndexScan`, which calls `btree.lookup_int` →
 /// `heap.get(rid)` → `disk.read_page` with *no* mmap fallback. Each
-/// thread hammers random ids from a 100K-row table, well past the
-/// single-slot hot-page cache, so nearly every lookup hits `read_page`.
+/// thread hammers random ids from a 12K-row table, well past the
+/// single-slot hot-page cache, so most lookups hit `read_page` while the
+/// test still fits the full workspace release gate.
 /// Each row carries a known `payload` derived from its `id`, so any
 /// byte-level cross-feed between threads shows up as a payload that
 /// doesn't match its id. On the unpatched code this test fails loudly;
@@ -202,8 +203,9 @@ fn concurrent_readers_see_uncorrupted_rows() {
         eng.execute_powql("type Row { required id: int, required payload: str }")
             .unwrap();
         // Seed via the prepared-insert fast path — parse + plan once,
-        // bind new literals per row. Without this, seeding N=100K rows
-        // through `execute_powql` format!() strings takes ~10 minutes
+        // bind new literals per row. Without this, seeding many rows
+        // through `execute_powql` format!() strings is dominated by
+        // repeated parse/plan/catalog resolution
         // because each call re-parses/re-plans/re-resolves the catalog.
         let prep = eng
             .prepare(r#"insert Row { id := 0, payload := "x" }"#)

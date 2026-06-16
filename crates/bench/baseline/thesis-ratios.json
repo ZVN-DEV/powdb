@@ -33,8 +33,8 @@
       "numerator": "insert_single",
       "denominator": "btree_lookup",
       "ceiling": 300.0,
-      "observed_at_last_edit": 266.3,
-      "meaning": "Insert hot path vs a B-tree probe. Previous ceilings: 10.0, 12.0, 14.0, 16.0 (all pre-hardening). Post-hardening (LSN-tagged pages, CRC32 catalog, WAL infrastructure, bounds checks, StorageError enum) the insert path accumulated significant per-call overhead. CI observed 77659ns / 291ns = 266.3x. The absolute gate on insert_single (10%) is the real regression detector; this ratio catches structural regressions. Issue filed to investigate and optimize the insert_single hot path."
+      "observed_at_last_edit": 1.122,
+      "meaning": "Insert hot path vs a B-tree probe. Earlier post-hardening CI observed 77659ns / 291ns = 266.3x and justified the broad 300x ceiling while insert_single carried significant per-call hardening overhead. The v0.5.0 release-gate rebaseline observed 227.3ns / 202.6ns = 1.122x on the current Criterion data, so the ratio is no longer near the ceiling. Keep the 300x ceiling temporarily as a historical structural tripwire until a follow-up benchmark-policy pass decides whether to tighten or retire it; the absolute gate on insert_single remains the real regression detector."
     }
   }
 }
