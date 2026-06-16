@@ -153,6 +153,33 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
     parse_tokens(tokens)
 }
 
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.bytes().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.bytes().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+fn keyword_suggestion(word: &str) -> Option<&'static str> {
+    const STATEMENT_KEYWORDS: &[&str] = &[
+        "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
+        "select", "type", "update", "upsert",
+    ];
+    let lower = word.to_ascii_lowercase();
+    STATEMENT_KEYWORDS
+        .iter()
+        .copied()
+        .filter(|kw| edit_distance(&lower, kw) <= 2)
+        .min_by_key(|kw| edit_distance(&lower, kw))
+}
+
 /// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
 /// descent over an already-lexed (and possibly param-substituted) token
 /// stream and reject any trailing tokens.
@@ -169,12 +196,17 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
     // returned rows. A parse error here tells users that the syntax
     // they wrote isn't recognized.
     if !matches!(parser.peek(), Token::Eof) {
-        return Err(ParseError::Syntax {
-            message: format!(
-                "unexpected trailing token: {}",
-                parser.peek().display_name()
-            ),
-        });
+        let mut message = format!(
+            "unexpected trailing token near token {}: {}",
+            parser.pos,
+            parser.peek().display_name()
+        );
+        if let Some(Token::Ident(first)) = parser.tokens.first() {
+            if let Some(suggestion) = keyword_suggestion(first) {
+                message.push_str(&format!("; did you mean `{suggestion}`?"));
+            }
+        }
+        return Err(ParseError::Syntax { message });
     }
     Ok(stmt)
 }
@@ -3481,5 +3513,18 @@ mod tests {
             msg.contains("delete"),
             "error should mention 'delete', got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_parser_dx_tests {
+    use super::*;
+
+    #[test]
+    fn typoed_statement_keyword_gets_suggestion() {
+        let err = parse("updat User set age = 1").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("near token"), "{msg}");
+        assert!(msg.contains("did you mean `update`"), "{msg}");
     }
 }
