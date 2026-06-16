@@ -16,6 +16,8 @@ export const MSG_QUERY = 0x03;
  * plain `MSG_QUERY` frame is unchanged. Requires powdb-server ≥ 0.4.7.
  */
 export const MSG_QUERY_PARAMS = 0x04;
+/** SQL query frame. Plain Query remains PowQL for backward compatibility. */
+export const MSG_QUERY_SQL = 0x05;
 export const MSG_RESULT_ROWS = 0x07;
 export const MSG_RESULT_SCALAR = 0x08;
 export const MSG_RESULT_OK = 0x09;
@@ -71,6 +73,7 @@ export type Message =
     }
   | { type: "ConnectOk"; version: string }
   | { type: "Query"; query: string }
+  | { type: "QuerySql"; query: string }
   | { type: "QueryWithParams"; query: string; params: WireParam[] }
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
   | { type: "ResultScalar"; value: string }
@@ -111,6 +114,10 @@ export function encode(msg: Message): Buffer {
     case "Query":
       payload = encodeString(msg.query);
       msgType = MSG_QUERY;
+      break;
+    case "QuerySql":
+      payload = encodeString(msg.query);
+      msgType = MSG_QUERY_SQL;
       break;
     case "QueryWithParams": {
       const parts: Buffer[] = [encodeString(msg.query)];
@@ -250,6 +257,10 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       return { type: "ConnectOk", version: decodeString(payload, cursor) };
     case MSG_QUERY:
       return { type: "Query", query: decodeString(payload, cursor) };
+    case MSG_QUERY_SQL: {
+      const query = decodeString(payload, cursor);
+      return { type: "QuerySql", query };
+    }
     case MSG_QUERY_PARAMS: {
       const query = decodeString(payload, cursor);
       const count = readU16(payload, cursor, "param count");

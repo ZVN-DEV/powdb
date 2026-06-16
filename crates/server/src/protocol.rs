@@ -8,6 +8,8 @@ const MSG_QUERY: u8 = 0x03;
 /// addition: old clients never send it, and old servers reject it with the
 /// existing "unknown message type" error — no existing frame changes shape.
 const MSG_QUERY_PARAMS: u8 = 0x04;
+/// SQL query frame. Plain Query remains PowQL for backward compatibility.
+const MSG_QUERY_SQL: u8 = 0x05;
 const MSG_RESULT_ROWS: u8 = 0x07;
 const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
@@ -67,6 +69,10 @@ pub enum Message {
     Query {
         query: String,
     },
+    /// A SQL query string.
+    QuerySql {
+        query: String,
+    },
     /// A query string with positional `$N` parameters bound at the server.
     QueryWithParams {
         query: String,
@@ -119,6 +125,7 @@ impl Message {
             }
             Message::ConnectOk { version } => (MSG_CONNECT_OK, encode_string(version)),
             Message::Query { query } => (MSG_QUERY, encode_string(query)),
+            Message::QuerySql { query } => (MSG_QUERY_SQL, encode_string(query)),
             Message::QueryWithParams { query, params } => {
                 let mut buf = encode_string(query);
                 buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
@@ -235,6 +242,10 @@ impl Message {
             MSG_QUERY => {
                 let query = decode_string(payload, &mut 0)?;
                 Ok(Message::Query { query })
+            }
+            MSG_QUERY_SQL => {
+                let query = decode_string(payload, &mut 0)?;
+                Ok(Message::QuerySql { query })
             }
             MSG_QUERY_PARAMS => {
                 let mut pos = 0;
@@ -595,6 +606,18 @@ mod tests {
         match decoded {
             Message::Error { message } => assert_eq!(message, "table not found"),
             _ => panic!("expected Error"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_query_sql() {
+        let msg = Message::QuerySql {
+            query: "SELECT * FROM User".into(),
+        };
+        let decoded = Message::decode(&msg.encode()).unwrap();
+        match decoded {
+            Message::QuerySql { query } => assert_eq!(query, "SELECT * FROM User"),
+            other => panic!("expected QuerySql, got {other:?}"),
         }
     }
 

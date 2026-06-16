@@ -30,6 +30,14 @@ use self::eval::*;
 /// match on `QueryError::ReadonlyNeedsWrite` directly.
 pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
 
+/// Query frontend dialect. PowQL remains the default/native dialect; SQL is
+/// an explicit frontend that lowers to the same AST before planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDialect {
+    PowQL,
+    Sql,
+}
+
 /// Plan cache capacity. Bench workloads fill ~15 slots; real apps will sit
 /// comfortably in 256. Lookup is O(1), collisions clear the cache (see
 /// `plan_cache::PlanCache::insert`).
@@ -382,6 +390,30 @@ impl Engine {
         mem_budget::charge(total, self.query_memory_limit)
     }
 
+    /// Dispatch to the requested query frontend.
+    pub fn execute_with_dialect(
+        &mut self,
+        dialect: QueryDialect,
+        input: &str,
+    ) -> Result<QueryResult, QueryError> {
+        match dialect {
+            QueryDialect::PowQL => self.execute_powql(input),
+            QueryDialect::Sql => self.execute_sql(input),
+        }
+    }
+
+    /// Read-only variant of [`Engine::execute_with_dialect`].
+    pub fn execute_readonly_with_dialect(
+        &self,
+        dialect: QueryDialect,
+        input: &str,
+    ) -> Result<QueryResult, QueryError> {
+        match dialect {
+            QueryDialect::PowQL => self.execute_powql_readonly(input),
+            QueryDialect::Sql => self.execute_sql_readonly(input),
+        }
+    }
+
     /// Parse + plan + execute a PowQL query.
     ///
     /// # Examples
@@ -529,6 +561,98 @@ impl Engine {
             }
         }
         result
+    }
+
+    /// Parse + plan + execute a SQL query through the SQL frontend.
+    ///
+    /// SQL is lowered to the existing PowDB AST and to canonical PowQL text.
+    /// The canonical PowQL text is used as the plan-cache key, so equivalent
+    /// SQL and PowQL spellings share cached plans.
+    pub fn execute_sql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let parsed = crate::sql::parse_sql_with_canonical(input)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+
+        if !tracing::enabled!(Level::INFO) {
+            if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+                let cached = self
+                    .plan_cache
+                    .lock()
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                    .get_with_substitution(hash, &literals);
+                if let Some(plan) = cached {
+                    let plan = lower_unindexed_scans(&self.catalog, &plan);
+                    let result = self.execute_plan(&plan);
+                    if !self.in_transaction {
+                        self.catalog
+                            .commit_autocommit()
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    }
+                    return result;
+                }
+
+                let plan = crate::planner::plan_statement(parsed.statement)
+                    .map_err(|e| QueryError::Parse(e.to_string()))?;
+                self.plan_cache
+                    .lock()
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                    .insert(hash, plan.clone());
+                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                let result = self.execute_plan(&plan);
+                if !self.in_transaction {
+                    self.catalog
+                        .commit_autocommit()
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
+                return result;
+            }
+        }
+
+        let plan = crate::planner::plan_statement(parsed.statement)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let result = self.execute_plan(&plan);
+        if !self.in_transaction {
+            self.catalog
+                .commit_autocommit()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        }
+        result
+    }
+
+    /// Read-only variant of [`Engine::execute_sql`].
+    pub fn execute_sql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let parsed = crate::sql::parse_sql_with_canonical(input)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        if !is_read_only_statement(&parsed.statement) {
+            return Err(QueryError::ReadonlyNeedsWrite);
+        }
+
+        if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+            let cached = self
+                .plan_cache
+                .lock()
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                .get_with_substitution(hash, &literals);
+            if let Some(plan) = cached {
+                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                return self.execute_plan_readonly(&plan);
+            }
+            let plan = crate::planner::plan_statement(parsed.statement)
+                .map_err(|e| QueryError::Parse(e.to_string()))?;
+            self.plan_cache
+                .lock()
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                .insert(hash, plan.clone());
+            let plan = lower_unindexed_scans(&self.catalog, &plan);
+            return self.execute_plan_readonly(&plan);
+        }
+
+        let plan = crate::planner::plan_statement(parsed.statement)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        self.execute_plan_readonly(&plan)
     }
 
     /// Execute PowQL with `$N` placeholders bound to positional `params`.
