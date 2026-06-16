@@ -9,23 +9,22 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 /// Tracks per-IP authentication failure counts for rate limiting.
 pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
 
-/// Shared gate that serializes connection-scoped transactions against every
-/// other server-side statement. A connection that successfully executes
-/// `begin` keeps an owned guard until `commit`/`rollback` (or disconnect-time
-/// rollback), so other connections cannot interleave writes or observe
-/// uncommitted state while the underlying Engine transaction is open.
-pub type TxGate = Arc<AsyncMutex<()>>;
+/// Gate that serializes wire-protocol statements while an explicit
+/// transaction is open on any connection. The connection that runs `begin`
+/// keeps an owned permit until `commit`, `rollback`, disconnect, or timeout,
+/// preventing other connections from observing or joining uncommitted state.
+pub type TxGate = Arc<Semaphore>;
 
-/// Create a new transaction gate for one server Engine.
+/// Create a transaction gate for a shared engine.
 pub fn new_tx_gate() -> TxGate {
-    Arc::new(AsyncMutex::new(()))
+    Arc::new(Semaphore::new(1))
 }
 
 /// Maximum query text length accepted from the wire (1 MB).
@@ -300,7 +299,6 @@ async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Messa
 /// argument list short.
 pub struct ConnOpts<'a> {
     pub engine: Arc<RwLock<Engine>>,
-    /// Server-wide transaction gate for connection-scoped explicit transactions.
     pub tx_gate: TxGate,
     /// Expected client password. Wrapped in `Zeroizing` so the secret is wiped
     /// from memory on drop (defends against leaking via a core dump).
@@ -372,38 +370,6 @@ fn wire_param_to_value(p: &WireParam) -> powdb_query::ast::ParamValue {
         WireParam::Bool(v) => ParamValue::Bool(*v),
         WireParam::Str(s) => ParamValue::Str(s.clone()),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TxAction {
-    Begin,
-    Commit,
-    Rollback,
-}
-
-fn tx_action_from_stmt(stmt: &powdb_query::ast::Statement) -> Option<TxAction> {
-    use powdb_query::ast::Statement;
-    match stmt {
-        Statement::Begin => Some(TxAction::Begin),
-        Statement::Commit => Some(TxAction::Commit),
-        Statement::Rollback => Some(TxAction::Rollback),
-        _ => None,
-    }
-}
-
-fn classify_tx_action(query: &str) -> Option<TxAction> {
-    parser::parse(query)
-        .ok()
-        .as_ref()
-        .and_then(tx_action_from_stmt)
-}
-
-fn classify_tx_action_with_params(query: &str, params: &[WireParam]) -> Option<TxAction> {
-    let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
-    parser::parse_with_params(query, &bound)
-        .ok()
-        .as_ref()
-        .and_then(tx_action_from_stmt)
 }
 
 /// Parameterized counterpart of [`dispatch_query`]. Routes through the exact
@@ -483,96 +449,225 @@ fn dispatch_query_with_params(
     eng.execute_powql_with_params(query, &bound)
 }
 
-struct SessionTx {
-    gate: TxGate,
-    held: Option<OwnedMutexGuard<()>>,
+async fn execute_wire_query(
+    engine: Arc<RwLock<Engine>>,
+    tx_gate: TxGate,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    query: String,
+    principal: Option<Principal>,
+    query_timeout: Duration,
+) -> Message {
+    match classify_query_transaction_control(&query) {
+        Some(TransactionControl::Begin) => {
+            if tx_permit.is_some() {
+                return Message::Error {
+                    message: sanitize_error("transaction already active"),
+                };
+            }
+            let permit = match tx_gate.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Message::Error {
+                        message: "query execution error".into(),
+                    }
+                }
+            };
+            let response = run_blocking_query(
+                engine,
+                query,
+                principal,
+                query_timeout,
+                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+            )
+            .await;
+            if is_success_response(&response) {
+                *tx_permit = Some(permit);
+            }
+            response
+        }
+        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
+            let response = run_blocking_query(
+                engine,
+                query,
+                principal,
+                query_timeout,
+                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+            )
+            .await;
+            if is_success_response(&response) {
+                tx_permit.take();
+            }
+            response
+        }
+        None if tx_permit.is_some() => {
+            run_blocking_query(
+                engine,
+                query,
+                principal,
+                query_timeout,
+                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+            )
+            .await
+        }
+        None => {
+            let permit = match tx_gate.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Message::Error {
+                        message: "query execution error".into(),
+                    }
+                }
+            };
+            let response = run_blocking_query(
+                engine,
+                query,
+                principal,
+                query_timeout,
+                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+            )
+            .await;
+            drop(permit);
+            response
+        }
+    }
 }
 
-impl SessionTx {
-    fn new(gate: TxGate) -> Self {
-        Self { gate, held: None }
-    }
-
-    async fn run_query(
-        &mut self,
-        engine: Arc<RwLock<Engine>>,
-        query: String,
-        principal: Option<Principal>,
-    ) -> Result<QueryResult, QueryError> {
-        let action = classify_tx_action(&query);
-        let _statement_guard = self.acquire_for(action).await;
-        let result = tokio::task::spawn_blocking(move || {
-            dispatch_query(&engine, &query, principal.as_ref())
-        })
-        .await
-        .map_err(|e| QueryError::Execution(format!("internal error: {e}")))?;
-        self.update_after(action, result)
-    }
-
-    async fn run_query_with_params(
-        &mut self,
-        engine: Arc<RwLock<Engine>>,
-        query: String,
-        params: Vec<WireParam>,
-        principal: Option<Principal>,
-    ) -> Result<QueryResult, QueryError> {
-        let action = classify_tx_action_with_params(&query, &params);
-        let _statement_guard = self.acquire_for(action).await;
-        let result = tokio::task::spawn_blocking(move || {
-            dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
-        })
-        .await
-        .map_err(|e| QueryError::Execution(format!("internal error: {e}")))?;
-        self.update_after(action, result)
-    }
-
-    async fn acquire_for(&mut self, action: Option<TxAction>) -> Option<OwnedMutexGuard<()>> {
-        if self.held.is_some() {
-            return None;
-        }
-        let guard = self.gate.clone().lock_owned().await;
-        if action == Some(TxAction::Begin) {
-            self.held = Some(guard);
-            None
-        } else {
-            Some(guard)
-        }
-    }
-
-    fn update_after(
-        &mut self,
-        action: Option<TxAction>,
-        result: Result<QueryResult, QueryError>,
-    ) -> Result<QueryResult, QueryError> {
-        match (action, &result) {
-            (Some(TxAction::Begin), Err(_)) => {
-                self.held.take();
+async fn execute_wire_query_with_params(
+    engine: Arc<RwLock<Engine>>,
+    tx_gate: TxGate,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    query: String,
+    params: Vec<WireParam>,
+    principal: Option<Principal>,
+    query_timeout: Duration,
+) -> Message {
+    match classify_params_transaction_control(&query, &params) {
+        Some(TransactionControl::Begin) => {
+            if tx_permit.is_some() {
+                return Message::Error {
+                    message: sanitize_error("transaction already active"),
+                };
             }
-            (Some(TxAction::Commit | TxAction::Rollback), Ok(_)) => {
-                self.held.take();
+            let permit = match tx_gate.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Message::Error {
+                        message: "query execution error".into(),
+                    }
+                }
+            };
+            let response = run_blocking_query(
+                engine,
+                (query, params),
+                principal,
+                query_timeout,
+                |engine, (query, params), principal| {
+                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                },
+            )
+            .await;
+            if is_success_response(&response) {
+                *tx_permit = Some(permit);
             }
-            _ => {}
+            response
         }
-        result
+        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
+            let response = run_blocking_query(
+                engine,
+                (query, params),
+                principal,
+                query_timeout,
+                |engine, (query, params), principal| {
+                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                },
+            )
+            .await;
+            if is_success_response(&response) {
+                tx_permit.take();
+            }
+            response
+        }
+        None if tx_permit.is_some() => {
+            run_blocking_query(
+                engine,
+                (query, params),
+                principal,
+                query_timeout,
+                |engine, (query, params), principal| {
+                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                },
+            )
+            .await
+        }
+        None => {
+            let permit = match tx_gate.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return Message::Error {
+                        message: "query execution error".into(),
+                    }
+                }
+            };
+            let response = run_blocking_query(
+                engine,
+                (query, params),
+                principal,
+                query_timeout,
+                |engine, (query, params), principal| {
+                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                },
+            )
+            .await;
+            drop(permit);
+            response
+        }
     }
+}
 
-    async fn rollback_if_open(
-        &mut self,
-        engine: Arc<RwLock<Engine>>,
-        principal: Option<Principal>,
-    ) {
-        if self.held.is_none() {
-            return;
+async fn run_blocking_query<T, F>(
+    engine: Arc<RwLock<Engine>>,
+    input: T,
+    principal: Option<Principal>,
+    query_timeout: Duration,
+    f: F,
+) -> Message
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<RwLock<Engine>>, T, Option<Principal>) -> Result<QueryResult, QueryError>
+        + Send
+        + 'static,
+{
+    let handle = tokio::task::spawn_blocking(move || f(engine, input, principal));
+    let abort_handle = handle.abort_handle();
+    match tokio::time::timeout(query_timeout, handle).await {
+        Ok(Ok(Ok(result))) => query_result_to_message(result),
+        Ok(Ok(Err(e))) => Message::Error {
+            message: sanitize_error(&e.to_string()),
+        },
+        Ok(Err(e)) => Message::Error {
+            message: format!("internal error: {e}"),
+        },
+        Err(_) => {
+            abort_handle.abort();
+            Message::Error {
+                message: "query timeout exceeded".into(),
+            }
         }
-        let result = tokio::task::spawn_blocking(move || {
-            dispatch_query(&engine, "rollback", principal.as_ref())
-        })
-        .await;
-        if let Err(e) = result {
-            error!(error = %e, "failed to join disconnect rollback task");
-        }
-        self.held.take();
     }
+}
+
+fn is_success_response(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::ResultRows { .. }
+            | Message::ResultScalar { .. }
+            | Message::ResultOk { .. }
+            | Message::ResultMessage { .. }
+    )
+}
+
+fn rollback_open_transaction(engine: Arc<RwLock<Engine>>, principal: Option<Principal>) {
+    let _ = dispatch_query(&engine, "rollback", principal.as_ref());
 }
 
 pub async fn handle_connection<S>(stream: S, opts: ConnOpts<'_>)
@@ -706,7 +801,7 @@ where
         }
     }
 
-    let mut session_tx = SessionTx::new(tx_gate);
+    let mut tx_permit: Option<OwnedSemaphorePermit> = None;
 
     // Main query loop with idle timeout and shutdown awareness.
     loop {
@@ -756,22 +851,25 @@ where
                     }
                 } else {
                     debug!(peer = %peer, query = %query, "received query");
-                    let query_for_timeout = query.clone();
-                    match tokio::time::timeout(
+                    let response = execute_wire_query(
+                        engine.clone(),
+                        tx_gate.clone(),
+                        &mut tx_permit,
+                        query.clone(),
+                        principal.clone(),
                         query_timeout,
-                        session_tx.run_query(engine.clone(), query, principal.clone()),
                     )
-                    .await
+                    .await;
+                    if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
                     {
-                        Ok(Ok(result)) => query_result_to_message(result),
-                        Ok(Err(e)) => Message::Error {
-                            message: sanitize_error(&e.to_string()),
-                        },
-                        Err(_) => {
-                            warn!(peer = %peer, query = %query_for_timeout, "query timeout exceeded");
-                            Message::Error {
-                                message: "query timeout exceeded".into(),
-                            }
+                        warn!(peer = %peer, query = %query, "query timeout exceeded");
+                        if tx_permit.is_some() {
+                            let engine = engine.clone();
+                            let principal = principal.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                rollback_open_transaction(engine, principal)
+                            })
+                            .await;
                         }
                         tx_permit.take();
                     }
@@ -789,27 +887,26 @@ where
                     }
                 } else {
                     debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
-                    let query_for_timeout = query.clone();
-                    match tokio::time::timeout(
+                    let response = execute_wire_query_with_params(
+                        engine.clone(),
+                        tx_gate.clone(),
+                        &mut tx_permit,
+                        query.clone(),
+                        params.clone(),
+                        principal.clone(),
                         query_timeout,
-                        session_tx.run_query_with_params(
-                            engine.clone(),
-                            query,
-                            params,
-                            principal.clone(),
-                        ),
                     )
-                    .await
+                    .await;
+                    if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
                     {
-                        Ok(Ok(result)) => query_result_to_message(result),
-                        Ok(Err(e)) => Message::Error {
-                            message: sanitize_error(&e.to_string()),
-                        },
-                        Err(_) => {
-                            warn!(peer = %peer, query = %query_for_timeout, "query timeout exceeded");
-                            Message::Error {
-                                message: "query timeout exceeded".into(),
-                            }
+                        warn!(peer = %peer, query = %query, "query timeout exceeded");
+                        if tx_permit.is_some() {
+                            let engine = engine.clone();
+                            let principal = principal.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                rollback_open_transaction(engine, principal)
+                            })
+                            .await;
                         }
                         tx_permit.take();
                     }
@@ -830,9 +927,12 @@ where
         }
     }
 
-    session_tx
-        .rollback_if_open(engine.clone(), principal.clone())
-        .await;
+    if tx_permit.take().is_some() {
+        let engine = engine.clone();
+        let principal = principal.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || rollback_open_transaction(engine, principal)).await;
+    }
 
     info!(peer = %peer, "client disconnected");
 }

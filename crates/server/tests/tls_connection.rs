@@ -124,7 +124,7 @@ async fn start_tls_server(
                 Err(_) => break,
             };
             let eng = engine.clone();
-            let gate = tx_gate.clone();
+            let tx_gate = tx_gate.clone();
             let acc = acceptor.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
 
@@ -134,7 +134,7 @@ async fn start_tls_server(
                         tls_stream,
                         powdb_server::handler::ConnOpts {
                             engine: eng,
-                            tx_gate: gate,
+                            tx_gate,
                             expected_password: None,
                             users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                             shutdown_rx: &mut rx,

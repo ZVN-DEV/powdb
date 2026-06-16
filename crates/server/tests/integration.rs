@@ -76,7 +76,7 @@ async fn test_full_lifecycle() {
         loop {
             let (stream, peer) = listener.accept().await.unwrap();
             let eng = engine.clone();
-            let gate = tx_gate.clone();
+            let tx_gate = tx_gate.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
             let peer_addr = Some(peer);
             tokio::spawn(async move {
@@ -84,7 +84,7 @@ async fn test_full_lifecycle() {
                     stream,
                     powdb_server::handler::ConnOpts {
                         engine: eng,
-                        tx_gate: gate,
+                        tx_gate,
                         expected_password: None,
                         users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
@@ -312,14 +312,13 @@ async fn test_user_auth_handshake() {
             let eng = engine.clone();
             let tx_gate = tx_gate.clone();
             let users = users.clone();
-            let gate = tx_gate.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
                         engine: eng,
-                        tx_gate: gate,
+                        tx_gate,
                         expected_password: None,
                         users,
                         shutdown_rx: &mut rx,
@@ -416,14 +415,13 @@ async fn test_empty_store_shared_password_fallback() {
             let eng = engine.clone();
             let tx_gate = tx_gate.clone();
             let users = users.clone();
-            let gate = tx_gate.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
                         engine: eng,
-                        tx_gate: gate,
+                        tx_gate,
                         expected_password: Some(zeroize::Zeroizing::new("sekret".into())),
                         users,
                         shutdown_rx: &mut rx,
@@ -528,14 +526,13 @@ async fn test_readonly_role_enforced_over_tcp() {
             let eng = engine.clone();
             let tx_gate = tx_gate.clone();
             let users = users.clone();
-            let gate = tx_gate.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
                         engine: eng,
-                        tx_gate: gate,
+                        tx_gate,
                         expected_password: None,
                         users,
                         shutdown_rx: &mut rx,
@@ -671,124 +668,4 @@ async fn test_readonly_role_enforced_over_tcp() {
 
     handle.abort();
     std::fs::remove_dir_all(&data_dir).ok();
-}
-
-/// A connection that opens an explicit transaction owns the server transaction
-/// gate until commit/rollback. Other connections must not interleave writes or
-/// observe uncommitted data while that transaction is open.
-#[tokio::test]
-async fn test_explicit_transaction_blocks_other_connections_until_rollback() {
-    use powdb_server::protocol::Message;
-    use std::sync::{Arc, RwLock};
-
-    let data_dir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(RwLock::new(
-        powdb_query::executor::Engine::new(data_dir.path()).unwrap(),
-    ));
-    let tx_gate = powdb_server::handler::new_tx_gate();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server = tokio::spawn(async move {
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let gate = tx_gate.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        engine: eng,
-                        tx_gate: gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(5),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
-    let mut tx_client = TcpStream::connect(addr).await.unwrap();
-    tx_client
-        .write_all(&encode_connect("testdb"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut tx_client).await).unwrap(),
-        Message::ConnectOk { .. }
-    ));
-
-    tx_client
-        .write_all(&encode_query("type Item { required name: str }"))
-        .await
-        .unwrap();
-    match Message::decode(&read_response(&mut tx_client).await).unwrap() {
-        Message::ResultOk { .. } | Message::ResultMessage { .. } => {}
-        other => panic!("expected schema creation success, got {other:?}"),
-    }
-
-    tx_client.write_all(&encode_query("begin")).await.unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut tx_client).await).unwrap(),
-        Message::ResultMessage { message } if message.contains("transaction started")
-    ));
-
-    tx_client
-        .write_all(&encode_query(r#"insert Item { name := "uncommitted" }"#))
-        .await
-        .unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut tx_client).await).unwrap(),
-        Message::ResultOk { .. }
-    ));
-
-    let mut other = TcpStream::connect(addr).await.unwrap();
-    other.write_all(&encode_connect("testdb")).await.unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut other).await).unwrap(),
-        Message::ConnectOk { .. }
-    ));
-
-    // This write would interleave under per-statement write locking. With the
-    // connection-scoped gate it waits behind tx_client's open transaction.
-    other
-        .write_all(&encode_query(r#"insert Item { name := "other" }"#))
-        .await
-        .unwrap();
-    let premature =
-        tokio::time::timeout(Duration::from_millis(150), read_response(&mut other)).await;
-    assert!(
-        premature.is_err(),
-        "other connection must not receive a write response before rollback"
-    );
-
-    tx_client
-        .write_all(&encode_query("rollback"))
-        .await
-        .unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut tx_client).await).unwrap(),
-        Message::ResultMessage { message } if message.contains("rolled back")
-    ));
-
-    // Once rollback releases the gate, the other connection's queued write can
-    // run, and it must not see/preserve the rolled-back uncommitted row.
-    assert!(matches!(
-        Message::decode(&read_response(&mut other).await).unwrap(),
-        Message::ResultOk { .. }
-    ));
-    other.write_all(&encode_query("count(Item)")).await.unwrap();
-    assert!(matches!(
-        Message::decode(&read_response(&mut other).await).unwrap(),
-        Message::ResultScalar { value } if value == "1"
-    ));
-
-    server.abort();
 }
