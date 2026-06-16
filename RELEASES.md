@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.4.7** (all six crates live on crates.io).
+> **Current release candidate: v0.5.0** (publish/deploy only after explicit production authority).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

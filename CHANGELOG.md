@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-16
+
+### Added
+- **Connection-scoped explicit transactions over TCP.** `BEGIN` now owns the transaction on the connection that opened it; other connections wait behind the transaction gate until `COMMIT`, `ROLLBACK`, disconnect, or timeout, preventing cross-connection visibility into uncommitted state.
+- **Self-identifying storage formats.** Heap files, pages, rows, and WAL files now carry magic/version metadata, reject unknown future versions, preserve legacy-read compatibility, and expose format introspection docs in `docs/FORMAT.md`.
+- **SQL frontend (explicit dialect).** A production SQL subset lowers into the existing PowQL AST/plan path with `Engine::execute_sql`, read-only SQL execution, wire protocol `QuerySql` (`0x05`), TypeScript `querySql`, SQL/PowQL plan-cache parity, unsupported-feature errors, and `docs/SQL.md`.
+
+### Changed
+- **Bench baselines refreshed for the v0.5.0 foundation.** The release gate now compares against post-format-versioning/post-SQL measurements; the `scan_filter_count_over_btree_lookup` thesis ratio was relaxed only because `btree_lookup` improved materially while aggregate absolute performance remained inside its gate.
+- Remote CLI default database naming now matches the TypeScript client default (`default`).
+
+### Fixed
+- WAL replay now honors transaction commit boundaries, so uncommitted records do not replay after crash recovery.
+- Rollback now discards uncommitted WAL writer spillover before reopening/replay, including multi-page dirty inserts.
+- Raw aggregate/order fast paths now account for the `PROW` row-format prefix before reading null bitmaps and fixed-width values. This restores integer/float aggregate and sort correctness after row versioning.
+- Parser diagnostics now include clearer trailing-token positions and typo suggestions for statement-like keywords.
+- The concurrent-read corruption regression remains a real indexed `heap.get`/`disk.read_page` race check but is bounded enough to complete in full workspace/release runs.
+- The unused storage `BufferPool` module and tests were removed to eliminate dead API surface before 0.5.0.
+- Unix/Windows disk-positioned I/O paths now use platform `FileExt` helpers instead of a Windows TODO.
+
+### Verification
+- Release gate passed locally before publishing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace`, full `cargo test --workspace -- --nocapture`, TypeScript client runtime tests, release-binary durability smoke, nightly fuzz target builds/short runs, and the bench comparator after rebaseline.
+
 ## [0.4.9] - 2026-06-15
 
 ### Security

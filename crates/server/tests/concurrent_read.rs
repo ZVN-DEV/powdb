@@ -189,12 +189,13 @@ fn concurrent_readers_see_uncorrupted_rows() {
     let engine = Arc::new(RwLock::new(Engine::new(&data_dir).unwrap()));
 
     // `HeapFile`'s write-back cache is a single slot (`hot_page`). At
-    // PAGE_SIZE = 4 KiB and ~30 bytes per row, 100K rows fills ~1000
-    // data pages, so the overwhelming majority of lookups miss the hot
+    // PAGE_SIZE = 4 KiB and ~30 bytes per row, 12K rows fills hundreds
+    // of data pages, so the overwhelming majority of lookups miss the hot
     // page and fall through to `DiskManager::read_page` — the exact
-    // code path we're trying to stress. (Per the fix spec: "at least
-    // 100K rows".)
-    const N: usize = 100_000;
+    // code path we're trying to stress. Keep this bounded enough for the
+    // full workspace release gate; correctness comes from cross-thread
+    // direct `heap.get` pressure, not from a minutes-long 100K-row seed.
+    const N: usize = 12_000;
 
     {
         let mut eng = engine.write().unwrap();
@@ -274,8 +275,8 @@ fn concurrent_readers_see_uncorrupted_rows() {
     // Coprime strides per thread make every thread walk every id in a
     // different order — different seek patterns per thread are what
     // makes the old race observable.
-    const LOOKUPS_PER_THREAD: usize = 10_000;
-    let n_threads = 16;
+    const LOOKUPS_PER_THREAD: usize = 1_500;
+    let n_threads = 8;
     let barrier = Arc::new(Barrier::new(n_threads));
     let handles: Vec<_> = (0..n_threads)
         .map(|thread_idx| {

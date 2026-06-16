@@ -2032,7 +2032,7 @@ impl Engine {
         };
         let bitmap_byte = col_idx / 8;
         let bitmap_bit = (col_idx % 8) as u32;
-        let data_offset = 2 + fast.bitmap_size + byte_offset;
+        let body_data_offset = 2 + fast.bitmap_size + byte_offset;
 
         // Optional compiled filter.
         let compiled_pred: Option<CompiledPredicate> = match predicate {
@@ -2080,7 +2080,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             count += 1;
                             sum_i128 += v as i128;
@@ -2104,7 +2104,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             min_v = Some(match min_v {
                                 Some(m) => m.min(v),
@@ -2122,7 +2122,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             max_v = Some(match max_v {
                                 Some(m) => m.max(v),
@@ -2140,7 +2140,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |_v: i64| {
                             count += 1;
                         }
@@ -2155,7 +2155,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             seen.insert(v);
                         }
@@ -2176,7 +2176,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             sum += v;
                         }
@@ -2192,7 +2192,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             sum += v;
                             count += 1;
@@ -2215,7 +2215,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             min_v = Some(match min_v {
                                 Some(m) => {
@@ -2239,7 +2239,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             max_v = Some(match max_v {
                                 Some(m) => {
@@ -2263,7 +2263,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |_v: f64| {
                             count += 1;
                         }
@@ -2283,7 +2283,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             seen.insert(v.to_bits());
                         }
@@ -2444,7 +2444,7 @@ impl Engine {
         };
         let sort_bitmap_byte = sort_idx / 8;
         let sort_bitmap_bit = (sort_idx % 8) as u32;
-        let sort_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
+        let sort_body_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
 
         let compiled_pred: Option<CompiledPredicate> = match predicate {
             Some(pred) => match compile_predicate(pred, &all_columns, &fast, &schema) {
@@ -2478,10 +2478,15 @@ impl Engine {
                             }
                         }
                         // Inlined int-column reader: null check + i64 decode.
-                        if data.len() < sort_data_offset + 8 {
+                        let base = row_body_base(data);
+                        let sort_data_offset = base + sort_body_data_offset;
+                        if data.len() < sort_data_offset + 8
+                            || data.len() <= base + 2 + sort_bitmap_byte
+                        {
                             return;
                         }
-                        let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                        let is_null =
+                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
                         }
@@ -2547,10 +2552,15 @@ impl Engine {
                                 return;
                             }
                         }
-                        if data.len() < sort_data_offset + 8 {
+                        let base = row_body_base(data);
+                        let sort_data_offset = base + sort_body_data_offset;
+                        if data.len() < sort_data_offset + 8
+                            || data.len() <= base + 2 + sort_bitmap_byte
+                        {
                             return;
                         }
-                        let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                        let is_null =
+                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
                         }

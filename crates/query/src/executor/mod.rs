@@ -74,16 +74,16 @@ pub(super) fn check_join_limit(row_count: usize) -> Result<(), QueryError> {
 //
 // SAFETY (shared across every call site below):
 //
-//   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row
+//   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row body
 //     encoding stores `bitmap_size = n_cols.div_ceil(8)` bytes of bitmap
-//     starting at offset 2. So `2 + $bmp_byte < 2 + bitmap_size ≤ row_len`
+//     starting at body offset 2. So `base + 2 + $bmp_byte < row_len`
 //     and `get_unchecked(2 + $bmp_byte)` is inside the row slice.
-//   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` for a fixed-size
+//   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` is body-relative for a fixed-size
 //     column. Every fixed-size column contributes `fixed_size(type_id)`
 //     bytes to the fixed region, so the row always has `[$off .. $off+8]`
 //     available for any i64/f64 column — enforced by the row encoder
 //     (`storage/src/row.rs`) and the schema invariant that a row with a
-//     given schema has `row_len ≥ 2 + bitmap_size + fixed_region_size`.
+//     given schema has enough body bytes for `2 + bitmap_size + fixed_region_size`.
 //   - Both macros are only invoked from `agg_single_col_fast`, which
 //     early-returns if the column isn't Int/Float (8-byte fixed) and
 //     early-returns if `fast.fixed_offsets[col_idx]` is `None`.
@@ -103,27 +103,35 @@ macro_rules! agg_int_loop {
                     if !pred(data) {
                         return;
                     }
+                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+                        ROW_PREFIX_SIZE
+                    } else {
+                        0
+                    };
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
                     // short to contain the bitmap byte or the 8-byte value.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
-                    // The bitmap byte lives at offset 2..2+bitmap_size in the
-                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
+                    // The bitmap byte lives at body offset 2..2+bitmap_size in
+                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
                     // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
-                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
-                    // to an 8-byte i64 in the fixed-size region of the row.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                    // points to an 8-byte i64 in the fixed-size region of the row.
                     // The pointer cast is valid because we read exactly 8
                     // bytes via from_le_bytes. Corrupt rows are rejected by
                     // the bounds guard.
-                    let $v: i64 =
-                        unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: i64 = unsafe {
+                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -131,20 +139,28 @@ macro_rules! agg_int_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
+                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+                        ROW_PREFIX_SIZE
+                    } else {
+                        0
+                    };
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let $v: i64 =
-                        unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: i64 = unsafe {
+                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -168,27 +184,35 @@ macro_rules! agg_float_loop {
                     if !pred(data) {
                         return;
                     }
+                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+                        ROW_PREFIX_SIZE
+                    } else {
+                        0
+                    };
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
                     // short to contain the bitmap byte or the 8-byte value.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
-                    // The bitmap byte lives at offset 2..2+bitmap_size in the
-                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
+                    // The bitmap byte lives at body offset 2..2+bitmap_size in
+                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
                     // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
-                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
-                    // to an 8-byte f64 in the fixed-size region of the row.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                    // points to an 8-byte f64 in the fixed-size region of the row.
                     // The pointer cast is valid because we read exactly 8
                     // bytes via from_le_bytes. Corrupt rows are rejected by
                     // the bounds guard.
-                    let $v: f64 =
-                        unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: f64 = unsafe {
+                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -196,20 +220,28 @@ macro_rules! agg_float_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
+                    let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+                        ROW_PREFIX_SIZE
+                    } else {
+                        0
+                    };
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let $v: f64 =
-                        unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: f64 = unsafe {
+                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
