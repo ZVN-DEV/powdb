@@ -311,6 +311,7 @@ async fn main() {
         "per-query memory budget"
     );
     let engine = Arc::new(RwLock::new(engine));
+    let tx_gate = handler::new_tx_gate();
 
     // Load the multi-user store from the same data dir. When it has users, the
     // handshake authenticates (username, password) against it; when empty the
@@ -424,6 +425,7 @@ async fn main() {
                         };
                         info!(peer = %peer, "accepted connection");
                         let eng = engine.clone();
+                        let tx_gate = tx_gate.clone();
                         let pw = args.password.clone();
                         let users = users.clone();
                         let mut rx = shutdown_rx.clone();
@@ -439,10 +441,14 @@ async fn main() {
                                         handler::handle_connection(
                                             tls_stream,
                                             handler::ConnOpts {
-                                                engine: eng, expected_password: pw,
+                                                engine: eng,
+                                                tx_gate,
+                                                expected_password: pw,
                                                 users,
-                                                shutdown_rx: &mut rx, idle_timeout: idle,
-                                                query_timeout: qtimeout, rate_limiter: Some(&rl),
+                                                shutdown_rx: &mut rx,
+                                                idle_timeout: idle,
+                                                query_timeout: qtimeout,
+                                                rate_limiter: Some(&rl),
                                                 peer_addr,
                                             },
                                         ).await;
@@ -455,10 +461,14 @@ async fn main() {
                                 handler::handle_connection(
                                     stream,
                                     handler::ConnOpts {
-                                        engine: eng, expected_password: pw,
+                                        engine: eng,
+                                        tx_gate,
+                                        expected_password: pw,
                                         users,
-                                        shutdown_rx: &mut rx, idle_timeout: idle,
-                                        query_timeout: qtimeout, rate_limiter: Some(&rl),
+                                        shutdown_rx: &mut rx,
+                                        idle_timeout: idle,
+                                        query_timeout: qtimeout,
+                                        rate_limiter: Some(&rl),
                                         peer_addr,
                                     },
                                 ).await;

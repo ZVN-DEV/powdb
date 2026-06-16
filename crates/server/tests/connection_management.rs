@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use powdb_query::executor::Engine;
-use powdb_server::handler::{handle_connection, new_rate_limiter, ConnOpts};
+use powdb_server::handler::{handle_connection, new_rate_limiter, new_tx_gate, ConnOpts};
 use powdb_server::protocol::Message;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,7 @@ async fn start_single_conn_server(
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let tx_gate = new_tx_gate();
 
     tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
@@ -90,6 +91,7 @@ async fn start_single_conn_server(
             stream,
             ConnOpts {
                 engine,
+                tx_gate,
                 expected_password: expected_password.map(zeroize::Zeroizing::new),
                 users: Arc::new(powdb_auth::UserStore::new()),
                 shutdown_rx: &mut rx,
@@ -116,6 +118,7 @@ async fn start_multi_conn_server(
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let tx_gate = new_tx_gate();
 
     tokio::spawn(async move {
         loop {
@@ -124,6 +127,7 @@ async fn start_multi_conn_server(
                 Err(_) => break,
             };
             let eng = engine.clone();
+            let tx_gate = tx_gate.clone();
             let pw = expected_password.clone();
             let mut rx = shutdown_rx.clone();
             let rl = rate_limiter.clone();
@@ -132,6 +136,7 @@ async fn start_multi_conn_server(
                     stream,
                     ConnOpts {
                         engine: eng,
+                        tx_gate,
                         expected_password: pw.map(zeroize::Zeroizing::new),
                         users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
@@ -321,6 +326,7 @@ async fn test_max_connections_backpressure() {
 
     let sem = semaphore.clone();
     let eng = engine.clone();
+    let tx_gate = new_tx_gate();
     tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -329,12 +335,14 @@ async fn test_max_connections_backpressure() {
             };
             let permit = sem.clone().acquire_owned().await.unwrap();
             let eng2 = eng.clone();
+            let tx_gate = tx_gate.clone();
             let mut rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 handle_connection(
                     stream,
                     ConnOpts {
                         engine: eng2,
+                        tx_gate,
                         expected_password: None,
                         users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
