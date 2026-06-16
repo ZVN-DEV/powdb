@@ -403,6 +403,38 @@ impl Wal {
         self.synced_len = 0;
         Ok(())
     }
+
+    /// Discard records appended since the last successful [`Self::flush`].
+    ///
+    /// This is intentionally different from `flush`: it must not flush the
+    /// current `BufWriter`, because rollback uses it to abandon uncommitted
+    /// transaction records. `BufWriter::into_parts` lets us drop the buffered
+    /// bytes without writing them, then we truncate any large records that
+    /// had already spilled through to the file back to the last synced
+    /// boundary.
+    pub fn discard_pending(&mut self) -> io::Result<()> {
+        if matches!(self.sync_mode, WalSyncMode::Off) {
+            self.pending = 0;
+            return Ok(());
+        }
+
+        if let Some(writer) = self.writer.take() {
+            let (_file, _buffer) = writer.into_parts();
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        file.set_len(self.synced_len)?;
+        file.sync_data()?;
+        self.writer = Some(BufWriter::new(file));
+        self.pending = 0;
+        self.synced_len = 0;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

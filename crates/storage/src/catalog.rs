@@ -671,11 +671,15 @@ impl Catalog {
         for tbl in &mut self.tables {
             tbl.heap.discard_dirty();
         }
-        self.pending_autocommit_tx_ids.clear();
-
-        // Step 2: re-open the catalog from disk and replay only records that
-        // were durable before BEGIN. `discard_and_truncate_to` has already
-        // dropped buffered bytes and truncated any file-visible spillover.
+        // Step 2: discard WAL records appended since the last explicit
+        // sync point. Large pending records can spill through BufWriter and
+        // become file-visible before `sync_wal()`; truncating to the last
+        // synced boundary prevents `open()` below from replaying rolled-back
+        // transaction records.
+        self.wal.discard_pending()?;
+        // Step 3: re-open the catalog from disk. The heap files on disk
+        // still reflect the last checkpoint (pre-transaction state)
+        // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
         let sync_mode = self.wal.sync_mode();
         let restored = Self::open(&data_dir)?;
