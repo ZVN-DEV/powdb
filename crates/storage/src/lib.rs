@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod catalog;
 pub mod disk;
 pub mod error;
+pub mod format;
 pub mod heap;
 pub mod page;
 pub mod row;

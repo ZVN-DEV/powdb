@@ -36,7 +36,7 @@ const ORDER: usize = 256;
 //   byte. For Str: u32 len + UTF-8 bytes. For Uuid: 16 bytes. For Bytes:
 //   u32 len + raw bytes. For Empty: no payload.
 const BTREE_MAGIC: &[u8; 4] = b"BIDX";
-const BTREE_VERSION: u16 = 1;
+pub const BTREE_VERSION: u16 = 1;
 const NODE_TAG_INTERNAL: u8 = 0;
 const NODE_TAG_LEAF: u8 = 1;
 

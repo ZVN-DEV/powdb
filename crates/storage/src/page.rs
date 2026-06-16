@@ -44,6 +44,25 @@ const CRC_SIZE: usize = 4;
 /// `flags` bit 0: set when the page carries a CRC32 in `[CRC_OFFSET..]`.
 /// Pre-WS3 files have this clear; their pages are read without verification.
 const FLAG_HAS_CHECKSUM: u8 = 0b0000_0001;
+const PAGE_VERSION_SHIFT: u8 = 4;
+const PAGE_VERSION_MASK: u8 = 0b1111_0000;
+pub const PAGE_FORMAT_VERSION: u8 = 1;
+
+#[inline]
+fn encode_page_version(version: u8) -> u8 {
+    version << PAGE_VERSION_SHIFT
+}
+
+#[inline]
+pub fn page_format_version_from_flags(flags: u8) -> crate::error::Result<u8> {
+    let version = (flags & PAGE_VERSION_MASK) >> PAGE_VERSION_SHIFT;
+    if version > PAGE_FORMAT_VERSION {
+        return Err(crate::error::StorageError::PageCorrupt(format!(
+            "unsupported page format version: {version}"
+        )));
+    }
+    Ok(version)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -91,10 +110,10 @@ impl Page {
         let mut data = [0u8; PAGE_SIZE];
         data[0..4].copy_from_slice(&page_id.to_le_bytes());
         data[4] = page_type as u8;
-        data[5] = FLAG_HAS_CHECKSUM; // flags: this page carries a CRC32
-                                     // Row data starts after the full header (which now includes the
-                                     // 4-byte CRC field). The CRC bytes [16..20] are reserved and never
-                                     // hold row data on a checksummed page.
+        // flags: checksum + page format version. Row data starts after the
+        // full header (which includes the 4-byte CRC field). The CRC bytes
+        // [16..20] are reserved and never hold row data on a checksummed page.
+        data[5] = FLAG_HAS_CHECKSUM | encode_page_version(PAGE_FORMAT_VERSION);
         let free_start = PAGE_HEADER_SIZE as u16;
         data[6..8].copy_from_slice(&free_start.to_le_bytes());
         // slot_count = 0 (unchanged location: very bottom of page)
@@ -109,6 +128,9 @@ impl Page {
     /// reads on the heap go through [`from_bytes_verified`] instead.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() != PAGE_SIZE {
+            return None;
+        }
+        if page_format_version_from_flags(buf[5]).is_err() {
             return None;
         }
         let mut data = [0u8; PAGE_SIZE];
@@ -127,6 +149,7 @@ impl Page {
                 buf.len()
             )));
         }
+        page_format_version_from_flags(buf[5])?;
         // Validate-if-present: only pages stamped with FLAG_HAS_CHECKSUM
         // carry a CRC. Older pages are trusted (no checksum to check).
         if buf[5] & FLAG_HAS_CHECKSUM != 0 {
@@ -156,7 +179,7 @@ impl Page {
     /// WS3: stamping happens on the *flush* path (once per dirty page),
     /// not per row insert/update, to keep the write-path regression small.
     pub fn stamp_checksum(&mut self) {
-        self.data[5] |= FLAG_HAS_CHECKSUM;
+        self.data[5] |= FLAG_HAS_CHECKSUM | encode_page_version(PAGE_FORMAT_VERSION);
         let crc = checksum_with_crc_zeroed(&self.data);
         self.data[CRC_OFFSET..CRC_OFFSET + CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
     }

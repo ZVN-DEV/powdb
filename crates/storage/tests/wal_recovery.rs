@@ -354,8 +354,10 @@ fn test_crash_recovery_update_by_pk_fast_path() {
         let layout = powdb_storage::row::RowLayout::new(&schema);
         let bitmap_size = layout.bitmap_size();
         // age is column index 2 — fixed Int, 8 bytes.
-        let age_off = 2 + bitmap_size + layout.fixed_offset(2).unwrap();
-        let age_bitmap_byte = 2;
+        let age_off =
+            powdb_storage::row::ROW_PREFIX_SIZE + 2 + bitmap_size + layout.fixed_offset(2).unwrap();
+        let row_prefix = powdb_storage::row::ROW_PREFIX_SIZE;
+        let age_bitmap_byte = row_prefix + 2;
         let age_bit_mask = 1u8 << 2;
         let new_age: i64 = 999;
         let ok = cat

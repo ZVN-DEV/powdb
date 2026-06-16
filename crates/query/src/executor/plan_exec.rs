@@ -4,12 +4,23 @@ use crate::ast::*;
 use crate::plan::*;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
+use powdb_storage::row::{
+    decode_column, decode_row, patch_var_column_in_place, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE,
+};
 use powdb_storage::types::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use super::compiled::*;
+
+#[inline]
+fn row_body_base(row: &[u8]) -> usize {
+    if row.len() >= ROW_PREFIX_SIZE && &row[0..4] == ROW_MAGIC {
+        ROW_PREFIX_SIZE
+    } else {
+        0
+    }
+}
 use super::eval::*;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::{ViewDef, ViewRegistry};
@@ -930,10 +941,12 @@ impl Engine {
                             let ok = self
                                 .catalog
                                 .update_row_bytes_logged(table, rid, |row| {
+                                    let base = row_body_base(row);
                                     for p in &patches {
-                                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                                        row[base + p.bitmap_byte_off] &= !p.bit_mask;
                                         let field_bytes = p.bytes.as_slice();
-                                        row[p.field_off..p.field_off + field_bytes.len()]
+                                        row[base + p.field_off
+                                            ..base + p.field_off + field_bytes.len()]
                                             .copy_from_slice(field_bytes);
                                     }
                                 })
@@ -2677,10 +2690,11 @@ impl Engine {
             let result = self
                 .catalog
                 .scan_patch_matching_logged(table, compiled, |row| {
+                    let base = row_body_base(row);
                     for p in &patches {
-                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                        row[base + p.bitmap_byte_off] &= !p.bit_mask;
                         let field_bytes = p.bytes.as_slice();
-                        row[p.field_off..p.field_off + field_bytes.len()]
+                        row[base + p.field_off..base + p.field_off + field_bytes.len()]
                             .copy_from_slice(field_bytes);
                     }
                     Some(row.len() as u16)

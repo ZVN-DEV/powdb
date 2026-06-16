@@ -14,7 +14,8 @@
 use powdb_storage::wal::{Wal, WalRecordType};
 use std::io::Write;
 
-const WAL_HEADER_SIZE: usize = 17;
+const WAL_FILE_HEADER_SIZE: usize = 8;
+const WAL_RECORD_HEADER_SIZE: usize = 25;
 
 fn temp_wal(name: &str) -> (Wal, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!(
@@ -53,8 +54,9 @@ fn test_crc_bit_flip_in_first_record() {
     // Read the raw WAL file and flip the CRC field (bytes 4..8).
     let mut data = std::fs::read(&path).unwrap();
     assert!(data.len() >= 8, "WAL file too short");
-    data[4] ^= 0xFF;
-    data[5] ^= 0xFF;
+    let start = WAL_FILE_HEADER_SIZE;
+    data[start + 4] ^= 0xFF;
+    data[start + 5] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -75,8 +77,12 @@ fn test_crc_bit_flip_in_second_record() {
 
     let mut data = std::fs::read(&path).unwrap();
     // Find the start of the second record by reading the first record's length.
-    let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let second_start = first_len;
+    let first_len = u32::from_le_bytes(
+        data[WAL_FILE_HEADER_SIZE..WAL_FILE_HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let second_start = WAL_FILE_HEADER_SIZE + first_len;
     assert!(
         data.len() > second_start + 8,
         "WAL file too short for second record"
@@ -106,9 +112,9 @@ fn test_data_payload_corruption() {
 
     let mut data = std::fs::read(&path).unwrap();
     // Corrupt a byte in the data payload of the first record.
-    // Data starts at offset WAL_HEADER_SIZE (17).
-    if data.len() > WAL_HEADER_SIZE + 2 {
-        data[WAL_HEADER_SIZE + 2] ^= 0xFF;
+    // Data starts at offset WAL_RECORD_HEADER_SIZE (17).
+    if data.len() > WAL_RECORD_HEADER_SIZE + 2 {
+        data[WAL_RECORD_HEADER_SIZE + 2] ^= 0xFF;
     }
     std::fs::write(&path, &data).unwrap();
 
@@ -130,7 +136,7 @@ fn test_tx_id_corruption() {
 
     let mut data = std::fs::read(&path).unwrap();
     // tx_id is at offset 8..16 in the first record.
-    data[8] ^= 0xFF;
+    data[WAL_FILE_HEADER_SIZE + 8] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -146,7 +152,7 @@ fn test_record_type_corruption() {
 
     let mut data = std::fs::read(&path).unwrap();
     // Record type is at offset 16 in the first record.
-    data[16] ^= 0xFF;
+    data[WAL_FILE_HEADER_SIZE + 16] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -167,9 +173,13 @@ fn test_truncated_mid_first_record() {
     let path = write_valid_records("trunc_mid_first", 3);
 
     let data = std::fs::read(&path).unwrap();
-    let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let first_len = u32::from_le_bytes(
+        data[WAL_FILE_HEADER_SIZE..WAL_FILE_HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     // Truncate to half of the first record.
-    std::fs::write(&path, &data[..first_len / 2]).unwrap();
+    std::fs::write(&path, &data[..WAL_FILE_HEADER_SIZE + first_len / 2]).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
     let records = wal.read_all().unwrap();
@@ -186,7 +196,7 @@ fn test_truncated_mid_first_record() {
 fn test_truncated_mid_header() {
     let path = write_valid_records("trunc_header", 1);
 
-    // Truncate to just 10 bytes (less than WAL_HEADER_SIZE).
+    // Truncate to just 10 bytes (less than WAL_RECORD_HEADER_SIZE).
     let data = std::fs::read(&path).unwrap();
     std::fs::write(&path, &data[..10.min(data.len())]).unwrap();
 
@@ -202,9 +212,13 @@ fn test_truncated_between_records() {
     let path = write_valid_records("trunc_between", 3);
 
     let data = std::fs::read(&path).unwrap();
-    let first_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let first_len = u32::from_le_bytes(
+        data[WAL_FILE_HEADER_SIZE..WAL_FILE_HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     // Keep the full first record plus a few extra bytes (partial second header).
-    let truncate_at = first_len + 5;
+    let truncate_at = WAL_FILE_HEADER_SIZE + first_len + 5;
     std::fs::write(&path, &data[..truncate_at.min(data.len())]).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -277,7 +291,7 @@ fn test_empty_wal_file() {
 
 // ── Corrupted length field ────────────────────────────────────────────
 
-/// Set the length field to zero (less than WAL_HEADER_SIZE). The reader
+/// Set the length field to zero (less than WAL_RECORD_HEADER_SIZE). The reader
 /// should treat this as corruption and stop.
 #[test]
 fn test_zero_length_field() {
@@ -285,10 +299,10 @@ fn test_zero_length_field() {
 
     let mut data = std::fs::read(&path).unwrap();
     // Set the first record's length to 0.
-    data[0] = 0;
-    data[1] = 0;
-    data[2] = 0;
-    data[3] = 0;
+    data[WAL_FILE_HEADER_SIZE] = 0;
+    data[WAL_FILE_HEADER_SIZE + 1] = 0;
+    data[WAL_FILE_HEADER_SIZE + 2] = 0;
+    data[WAL_FILE_HEADER_SIZE + 3] = 0;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -297,18 +311,18 @@ fn test_zero_length_field() {
     std::fs::remove_file(&path).ok();
 }
 
-/// Set the length field to a value smaller than WAL_HEADER_SIZE (e.g. 5).
+/// Set the length field to a value smaller than WAL_RECORD_HEADER_SIZE (e.g. 5).
 /// The checked_sub in read_all should catch this.
 #[test]
 fn test_length_smaller_than_header() {
     let path = write_valid_records("len_small", 2);
 
     let mut data = std::fs::read(&path).unwrap();
-    // Set length to 5 (less than WAL_HEADER_SIZE=17).
-    data[0] = 5;
-    data[1] = 0;
-    data[2] = 0;
-    data[3] = 0;
+    // Set length to 5 (less than WAL_RECORD_HEADER_SIZE=17).
+    data[WAL_FILE_HEADER_SIZE] = 5;
+    data[WAL_FILE_HEADER_SIZE + 1] = 0;
+    data[WAL_FILE_HEADER_SIZE + 2] = 0;
+    data[WAL_FILE_HEADER_SIZE + 3] = 0;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -325,10 +339,10 @@ fn test_huge_length_field() {
 
     let mut data = std::fs::read(&path).unwrap();
     // Set the first record's length to 0x20000000 (512MB).
-    data[0] = 0x00;
-    data[1] = 0x00;
-    data[2] = 0x00;
-    data[3] = 0x20;
+    data[WAL_FILE_HEADER_SIZE] = 0x00;
+    data[WAL_FILE_HEADER_SIZE + 1] = 0x00;
+    data[WAL_FILE_HEADER_SIZE + 2] = 0x00;
+    data[WAL_FILE_HEADER_SIZE + 3] = 0x20;
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
@@ -347,7 +361,7 @@ fn test_corruption_mid_stream() {
 
     let data = std::fs::read(&path).unwrap();
     // Walk through records to find the start of the 4th.
-    let mut offset = 0usize;
+    let mut offset = WAL_FILE_HEADER_SIZE;
     for _ in 0..3 {
         let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += len;

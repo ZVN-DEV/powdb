@@ -5,6 +5,7 @@ use crate::plan::*;
 use crate::planner;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
+use powdb_storage::row::{ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 
 use super::compiled::*;
@@ -421,11 +422,17 @@ impl Engine {
         let ok = self
             .catalog
             .update_row_bytes_logged_by_slot(fast_table_slot, rid, |row| {
+                let base = if row.len() >= ROW_PREFIX_SIZE && &row[0..4] == ROW_MAGIC {
+                    ROW_PREFIX_SIZE
+                } else {
+                    0
+                };
                 // Idempotent null-bit clear — safe even when the column was
                 // already non-null (the overwhelmingly common case).
-                row[bitmap_byte_off] &= !bit_mask;
+                row[base + bitmap_byte_off] &= !bit_mask;
                 let field_bytes = bytes.as_slice();
-                row[field_off..field_off + field_bytes.len()].copy_from_slice(field_bytes);
+                row[base + field_off..base + field_off + field_bytes.len()]
+                    .copy_from_slice(field_bytes);
             })
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
 

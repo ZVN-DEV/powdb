@@ -5,7 +5,7 @@
 //!   2. Page::insert → Page::get returns the exact encoded bytes.
 
 use powdb_storage::page::{Page, PageType};
-use powdb_storage::row::{decode_row, encode_row};
+use powdb_storage::row::{decode_row, encode_row, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 
 use proptest::prelude::*;
@@ -115,9 +115,15 @@ proptest! {
     fn row_encode_decode_roundtrip((schema, row) in schema_and_row()) {
         let encoded = encode_row(&schema, &row);
 
-        // Length prefix should match buffer length.
-        let stored_len = u16::from_le_bytes(encoded[0..2].try_into().unwrap()) as usize;
-        prop_assert_eq!(stored_len, encoded.len());
+        prop_assert_eq!(&encoded[0..4], ROW_MAGIC);
+        // Length prefix is stored inside the versioned row body and should
+        // match body length, not the 6-byte format prefix.
+        let stored_len = u16::from_le_bytes(
+            encoded[ROW_PREFIX_SIZE..ROW_PREFIX_SIZE + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        prop_assert_eq!(stored_len, encoded.len() - ROW_PREFIX_SIZE);
 
         let decoded = decode_row(&schema, &encoded);
         prop_assert_eq!(decoded.len(), row.len());

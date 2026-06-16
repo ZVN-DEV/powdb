@@ -36,8 +36,46 @@ impl WalRecordType {
     }
 }
 
+pub const WAL_MAGIC: &[u8; 4] = b"PWAL";
+pub const WAL_FORMAT_VERSION: u16 = 1;
+const WAL_FILE_HEADER_SIZE: u64 = 8;
+
 /// WAL record header: len(4) + crc32(4) + tx_id(8) + type(1) + lsn(8) = 25 bytes
 const WAL_HEADER_SIZE: usize = 25;
+
+fn write_wal_file_header(file: &mut File) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(WAL_MAGIC)?;
+    file.write_all(&WAL_FORMAT_VERSION.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn wal_records_start(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        write_wal_file_header(file)?;
+        return Ok(WAL_FILE_HEADER_SIZE);
+    }
+    if len >= WAL_FILE_HEADER_SIZE {
+        file.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; WAL_FILE_HEADER_SIZE as usize];
+        file.read_exact(&mut hdr)?;
+        if &hdr[0..4] == WAL_MAGIC {
+            let version = u16::from_le_bytes(hdr[4..6].try_into().expect("2-byte WAL version"));
+            if version != WAL_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported WAL format version: {version}"),
+                ));
+            }
+            return Ok(WAL_FILE_HEADER_SIZE);
+        }
+    }
+    // Legacy 0.4.x WAL: no file header; records start at byte 0.
+    Ok(0)
+}
 
 /// Maximum allowed size for a single WAL record's data payload.
 /// Records claiming more than 256 MB are treated as corruption and
@@ -92,17 +130,19 @@ pub struct Wal {
     /// before [`Self::flush`] is called. Those bytes are file-visible but
     /// not transaction-durable. Rollback truncates back to this boundary so
     /// a same-process reopen cannot replay uncommitted records.
+    records_start: u64,
     synced_len: u64,
 }
 
 impl Wal {
     pub fn create(path: &Path, batch_size: usize) -> io::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
             .truncate(true)
             .open(path)?;
+        write_wal_file_header(&mut file)?;
         Ok(Wal {
             path: path.to_path_buf(),
             writer: Some(BufWriter::new(file)),
@@ -110,16 +150,18 @@ impl Wal {
             pending: 0,
             sync_mode: WalSyncMode::default(),
             next_lsn: 1,
-            synced_len: 0,
+            records_start: WAL_FILE_HEADER_SIZE,
+            synced_len: WAL_FILE_HEADER_SIZE,
         })
     }
 
     pub fn open(path: &Path, batch_size: usize) -> io::Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(path)?;
+        let records_start = wal_records_start(&mut file)?;
         let synced_len = file.metadata()?.len();
         Ok(Wal {
             path: path.to_path_buf(),
@@ -128,6 +170,7 @@ impl Wal {
             pending: 0,
             sync_mode: WalSyncMode::default(),
             next_lsn: 1,
+            records_start,
             synced_len,
         })
     }
@@ -303,7 +346,8 @@ impl Wal {
     pub fn read_all(&self) -> io::Result<Vec<WalRecord>> {
         let mut file = File::open(&self.path)?;
         let file_len = file.metadata()?.len();
-        let mut pos = 0u64;
+        let mut file_for_header = File::open(&self.path)?;
+        let mut pos = wal_records_start(&mut file_for_header)?;
         let mut records = Vec::new();
 
         while pos + WAL_HEADER_SIZE as u64 <= file_len {
@@ -393,14 +437,16 @@ impl Wal {
 
     /// Truncate the WAL (after checkpoint).
     pub fn truncate(&mut self) -> io::Result<()> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .truncate(true)
             .open(&self.path)?;
+        write_wal_file_header(&mut file)?;
         self.writer = Some(BufWriter::new(file));
+        self.records_start = WAL_FILE_HEADER_SIZE;
         self.pending = 0;
-        self.synced_len = 0;
+        self.synced_len = WAL_FILE_HEADER_SIZE;
         Ok(())
     }
 
@@ -432,7 +478,7 @@ impl Wal {
         file.sync_data()?;
         self.writer = Some(BufWriter::new(file));
         self.pending = 0;
-        self.synced_len = 0;
+        self.synced_len = self.records_start;
         Ok(())
     }
 }

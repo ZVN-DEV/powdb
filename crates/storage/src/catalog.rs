@@ -76,7 +76,7 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
-const CATALOG_VERSION: u16 = 3;
+pub const CATALOG_VERSION: u16 = 3;
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
