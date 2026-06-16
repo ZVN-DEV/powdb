@@ -3898,6 +3898,84 @@ fn test_commit_persists_across_reopen() {
 }
 
 #[test]
+fn test_uncommitted_transaction_wal_records_do_not_replay_after_crash() {
+    // More than WAL_BATCH_SIZE row records forces the WAL to auto-flush inside
+    // the explicit transaction. Without commit-boundary replay, those flushed
+    // but uncommitted records used to become durable after a hard crash.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "powdb_tx_uncommitted_replay_{}_{}",
+        std::process::id(),
+        id
+    ));
+
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Item { required id: int, required name: str }")
+        .unwrap();
+    engine.execute_powql("begin").unwrap();
+    for i in 0..70 {
+        engine
+            .execute_powql(&format!(
+                r#"insert Item {{ id := {i}, name := "pending-{i}" }}"#
+            ))
+            .unwrap();
+    }
+    // Simulate process death: skip Engine/Catalog Drop so no checkpoint can
+    // cleanly flush pages or truncate the WAL.
+    std::mem::forget(engine);
+
+    let engine = Engine::new(&dir).unwrap();
+    let count = engine.execute_powql_readonly("count(Item)").unwrap();
+    assert!(
+        matches!(count, QueryResult::Scalar(Value::Int(0))),
+        "uncommitted transaction rows must not replay after crash"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn test_rollback_discards_auto_flushed_transaction_wal_records() {
+    // Rollback must truncate to the BEGIN WAL boundary even if the WAL's batch
+    // threshold flushed some transaction records before ROLLBACK.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "powdb_tx_rollback_autoflush_{}_{}",
+        std::process::id(),
+        id
+    ));
+
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Item { required id: int, required name: str }")
+        .unwrap();
+    engine.execute_powql("begin").unwrap();
+    for i in 0..70 {
+        engine
+            .execute_powql(&format!(
+                r#"insert Item {{ id := {i}, name := "rolled-{i}" }}"#
+            ))
+            .unwrap();
+    }
+    engine.execute_powql("rollback").unwrap();
+
+    let count = engine.execute_powql("count(Item)").unwrap();
+    assert!(
+        matches!(count, QueryResult::Scalar(Value::Int(0))),
+        "rollback must discard rows even after WAL auto-flush"
+    );
+    drop(engine);
+
+    let engine = Engine::new(&dir).unwrap();
+    let count = engine.execute_powql_readonly("count(Item)").unwrap();
+    assert!(
+        matches!(count, QueryResult::Scalar(Value::Int(0))),
+        "rolled-back rows must stay gone after reopen"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn test_rollback_undoes_inserts_no_trace() {
     // Verify the rolled-back row is completely gone, not just from count
     // but also invisible to a filter query.

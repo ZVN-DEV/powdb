@@ -1588,6 +1588,9 @@ impl Engine {
                         "already in a transaction (nested transactions not supported)".into(),
                     ));
                 }
+                self.catalog
+                    .begin_transaction()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 self.in_transaction = true;
                 Ok(QueryResult::Executed {
                     message: "transaction started".to_string(),
@@ -1600,10 +1603,10 @@ impl Engine {
                         "no active transaction to commit".into(),
                     ));
                 }
-                self.in_transaction = false;
                 self.catalog
-                    .sync_wal()
+                    .commit_transaction()
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                self.in_transaction = false;
                 Ok(QueryResult::Executed {
                     message: "transaction committed".to_string(),
                 })

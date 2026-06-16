@@ -143,6 +143,59 @@ fn test_clean_shutdown_no_replay() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Rollback regression: uncommitted inserts that span multiple heap pages
+/// leave one dirty hot page plus earlier parked dirty pages in the deferred
+/// dirty buffer. `ROLLBACK` must discard both layers before replacing the
+/// catalog; otherwise the old catalog's drop/checkpoint path can leak the
+/// rolled-back rows to disk.
+#[test]
+fn test_rollback_discards_multi_page_dirty_inserts() {
+    let dir = temp_dir("rollback_multi_page");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(user_schema()).unwrap();
+        cat.checkpoint().unwrap();
+
+        // Each row is large enough that this batch crosses many 4KiB pages,
+        // forcing HeapFile to park previous dirty hot pages in dirty_buffer.
+        let payload = "x".repeat(900);
+        for i in 0..40i64 {
+            cat.insert(
+                "users",
+                &vec![Value::Int(i), Value::Str(format!("{payload}_{i}"))],
+            )
+            .unwrap();
+        }
+
+        let visible_before_rollback = cat.scan("users").unwrap().count();
+        assert_eq!(
+            visible_before_rollback, 40,
+            "uncommitted rows should be visible inside the transaction"
+        );
+
+        cat.rollback_to_last_sync().unwrap();
+
+        let visible_after_rollback = cat.scan("users").unwrap().count();
+        assert_eq!(
+            visible_after_rollback, 0,
+            "rollback must drop hot and buffered dirty pages"
+        );
+    }
+
+    {
+        let cat = Catalog::open(&dir).unwrap();
+        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        assert!(
+            rows.is_empty(),
+            "rolled-back multi-page dirty inserts must not persist after reopen"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Delete recovery: insert some rows cleanly, then delete a few, crash.
 /// Replay should reapply the deletes on the freshly-opened heap. This is
 /// an explicit check that deletes are idempotent on replay — a "double

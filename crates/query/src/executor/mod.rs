@@ -443,7 +443,7 @@ impl Engine {
                     // (pure reads pay zero fsync).
                     if !self.in_transaction {
                         self.catalog
-                            .sync_wal()
+                            .commit_autocommit()
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
                     return result;
@@ -461,7 +461,7 @@ impl Engine {
                         let result = self.execute_plan(&plan);
                         if !self.in_transaction {
                             self.catalog
-                                .sync_wal()
+                                .commit_autocommit()
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         }
                         result
@@ -477,7 +477,7 @@ impl Engine {
                     let result = self.execute_plan(&plan);
                     if !self.in_transaction {
                         self.catalog
-                            .sync_wal()
+                            .commit_autocommit()
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
                     result
@@ -501,7 +501,7 @@ impl Engine {
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         let exec_us = exec_start.elapsed().as_micros();
@@ -552,7 +552,7 @@ impl Engine {
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         result

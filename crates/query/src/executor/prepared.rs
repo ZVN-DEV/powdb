@@ -287,7 +287,7 @@ impl Engine {
                 // not flush — flush it now so the executor's contract is
                 // "WAL is on disk before this returns".
                 self.catalog
-                    .sync_wal()
+                    .commit_autocommit()
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 return Ok(result);
             }
@@ -337,7 +337,7 @@ impl Engine {
             }
             // Mission B (post-review): statement-boundary WAL group commit.
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
@@ -478,7 +478,7 @@ impl Engine {
             res?;
             // Mission B (post-review): statement-boundary WAL group commit.
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }

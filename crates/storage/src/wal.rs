@@ -15,6 +15,7 @@ pub enum WalRecordType {
     DdlDropTable = 7,
     DdlAddColumn = 8,
     DdlDropColumn = 9,
+    Begin = 10,
 }
 
 impl WalRecordType {
@@ -29,6 +30,7 @@ impl WalRecordType {
             7 => Some(WalRecordType::DdlDropTable),
             8 => Some(WalRecordType::DdlAddColumn),
             9 => Some(WalRecordType::DdlDropColumn),
+            10 => Some(WalRecordType::Begin),
             _ => None,
         }
     }
@@ -77,13 +79,20 @@ pub enum WalSyncMode {
 
 pub struct Wal {
     path: PathBuf,
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
     batch_size: usize,
     pending: usize,
     sync_mode: WalSyncMode,
     /// Monotonic LSN counter. Starts at 1 (0 means "no WAL record has
     /// ever touched this page") and increments by 1 on every `append`.
     next_lsn: u64,
+    /// File length as of the last successful WAL sync/truncate/open.
+    ///
+    /// `BufWriter` may write large pending records through to the OS file
+    /// before [`Self::flush`] is called. Those bytes are file-visible but
+    /// not transaction-durable. Rollback truncates back to this boundary so
+    /// a same-process reopen cannot replay uncommitted records.
+    synced_len: u64,
 }
 
 impl Wal {
@@ -96,11 +105,12 @@ impl Wal {
             .open(path)?;
         Ok(Wal {
             path: path.to_path_buf(),
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             batch_size,
             pending: 0,
             sync_mode: WalSyncMode::default(),
             next_lsn: 1,
+            synced_len: 0,
         })
     }
 
@@ -110,13 +120,15 @@ impl Wal {
             .read(true)
             .append(true)
             .open(path)?;
+        let synced_len = file.metadata()?.len();
         Ok(Wal {
             path: path.to_path_buf(),
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
             batch_size,
             pending: 0,
             sync_mode: WalSyncMode::default(),
             next_lsn: 1,
+            synced_len,
         })
     }
 
@@ -199,12 +211,16 @@ impl Wal {
         let crc = crc32fast::hash(&crc_input);
 
         // Write: len + crc + tx_id + type + lsn + data
-        self.writer.write_all(&total_len.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&tx_id.to_le_bytes())?;
-        self.writer.write_all(&[record_type as u8])?;
-        self.writer.write_all(&lsn.to_le_bytes())?;
-        self.writer.write_all(data)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL writer unavailable"))?;
+        writer.write_all(&total_len.to_le_bytes())?;
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&tx_id.to_le_bytes())?;
+        writer.write_all(&[record_type as u8])?;
+        writer.write_all(&lsn.to_le_bytes())?;
+        writer.write_all(data)?;
 
         self.pending += 1;
         if self.pending >= self.batch_size {
@@ -223,15 +239,63 @@ impl Wal {
         if batch == 0 {
             return Ok(());
         }
-        self.writer.flush()?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| io::Error::other("WAL writer unavailable"))?;
+        writer.flush()?;
         // SQLite-style synchronous knob: only the explicit fsync is gated.
         // The BufWriter::flush above always runs so a process crash still
         // recovers cleanly via `read_all`.
         if matches!(self.sync_mode, WalSyncMode::Full) {
-            self.writer.get_ref().sync_data()?;
+            writer.get_ref().sync_data()?;
         }
+        self.synced_len = writer.get_ref().metadata()?.len();
         self.pending = 0;
         debug!(records = batch, "wal group commit");
+        Ok(())
+    }
+
+    /// True when records have been appended to the in-memory WAL buffer
+    /// since the last durable flush.
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.pending > 0
+    }
+
+    /// Flush pending WAL bytes, then return the durable file length. Used as
+    /// an explicit-transaction rollback boundary.
+    pub fn synced_len(&mut self) -> io::Result<u64> {
+        self.flush()?;
+        Ok(self.synced_len)
+    }
+
+    /// Discard buffered (not-yet-flushed) WAL bytes and truncate the durable
+    /// log back to `len`. This is intentionally not implemented by dropping
+    /// the existing BufWriter: BufWriter's Drop attempts to flush buffered
+    /// bytes, which would resurrect rolled-back records.
+    pub fn discard_and_truncate_to(&mut self, len: u64) -> io::Result<()> {
+        if matches!(self.sync_mode, WalSyncMode::Off) {
+            self.pending = 0;
+            self.synced_len = len;
+            return Ok(());
+        }
+
+        if let Some(writer) = self.writer.take() {
+            let (_file, _buffer_result) = writer.into_parts();
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        file.set_len(len)?;
+        file.seek(SeekFrom::End(0))?;
+        file.sync_data()?;
+        self.writer = Some(BufWriter::new(file));
+        self.pending = 0;
+        self.synced_len = len;
         Ok(())
     }
 
@@ -334,8 +398,9 @@ impl Wal {
             .read(true)
             .truncate(true)
             .open(&self.path)?;
-        self.writer = BufWriter::new(file);
+        self.writer = Some(BufWriter::new(file));
         self.pending = 0;
+        self.synced_len = 0;
         Ok(())
     }
 }
