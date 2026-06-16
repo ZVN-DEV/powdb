@@ -350,7 +350,7 @@ impl Engine {
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).
         self.catalog
-            .sync_wal()
+            .commit_autocommit()
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
         result
     }
