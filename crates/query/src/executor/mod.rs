@@ -12,7 +12,7 @@ use crate::plan_cache::PlanCache;
 use crate::planner;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
-use powdb_storage::row::{decode_column, decode_row, RowLayout};
+use powdb_storage::row::{decode_column, decode_row, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 use powdb_storage::view::ViewRegistry;
 
@@ -29,6 +29,28 @@ use self::eval::*;
 /// any external code matching on the string representation. New code should
 /// match on `QueryError::ReadonlyNeedsWrite` directly.
 pub const READONLY_NEEDS_WRITE: &str = "__POWDB_READONLY_NEEDS_WRITE__";
+
+/// Return the byte offset where the row body starts.
+///
+/// v0.5 rows begin with the `PROW` magic/version prefix. Legacy rows start
+/// directly with the row body. Raw executor fast paths must add this base
+/// before reading body-relative bitmap/data offsets.
+#[inline]
+pub(crate) fn row_body_base(row: &[u8]) -> usize {
+    if row.len() >= ROW_PREFIX_SIZE && &row[0..4] == ROW_MAGIC {
+        ROW_PREFIX_SIZE
+    } else {
+        0
+    }
+}
+
+/// Query frontend dialect. PowQL remains the default/native dialect; SQL is
+/// an explicit frontend that lowers to the same AST before planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryDialect {
+    PowQL,
+    Sql,
+}
 
 /// Plan cache capacity. Bench workloads fill ~15 slots; real apps will sit
 /// comfortably in 256. Lookup is O(1), collisions clear the cache (see
@@ -66,16 +88,18 @@ pub(super) fn check_join_limit(row_count: usize) -> Result<(), QueryError> {
 //
 // SAFETY (shared across every call site below):
 //
-//   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row
+//   - `$bmp_byte` is `col_idx / 8` where `col_idx < n_cols`, and the row body
 //     encoding stores `bitmap_size = n_cols.div_ceil(8)` bytes of bitmap
-//     starting at offset 2. So `2 + $bmp_byte < 2 + bitmap_size ≤ row_len`
-//     and `get_unchecked(2 + $bmp_byte)` is inside the row slice.
-//   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` for a fixed-size
+//     starting at body offset 2. So `bmp_off = row_body_base(row) + 2 +
+//     $bmp_byte < row_len`, and `get_unchecked(bmp_off)` is inside the
+//     row slice.
+//   - `$off = 2 + bitmap_size + fixed_offsets[col_idx]` is body-relative for a fixed-size
 //     column. Every fixed-size column contributes `fixed_size(type_id)`
-//     bytes to the fixed region, so the row always has `[$off .. $off+8]`
-//     available for any i64/f64 column — enforced by the row encoder
+//     bytes to the fixed region, so the row always has
+//     `[data_off .. data_off + 8]` available for any i64/f64 column, where
+//     `data_off = row_body_base(row) + $off` — enforced by the row encoder
 //     (`storage/src/row.rs`) and the schema invariant that a row with a
-//     given schema has `row_len ≥ 2 + bitmap_size + fixed_region_size`.
+//     given schema has enough body bytes for `2 + bitmap_size + fixed_region_size`.
 //   - Both macros are only invoked from `agg_single_col_fast`, which
 //     early-returns if the column isn't Int/Float (8-byte fixed) and
 //     early-returns if `fast.fixed_offsets[col_idx]` is `None`.
@@ -95,27 +119,31 @@ macro_rules! agg_int_loop {
                     if !pred(data) {
                         return;
                     }
+                    let base = row_body_base(data);
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
                     // short to contain the bitmap byte or the 8-byte value.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
-                    // The bitmap byte lives at offset 2..2+bitmap_size in the
-                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
+                    // The bitmap byte lives at body offset 2..2+bitmap_size in
+                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
                     // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
-                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
-                    // to an 8-byte i64 in the fixed-size region of the row.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                    // points to an 8-byte i64 in the fixed-size region of the row.
                     // The pointer cast is valid because we read exactly 8
                     // bytes via from_le_bytes. Corrupt rows are rejected by
                     // the bounds guard.
-                    let $v: i64 =
-                        unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: i64 = unsafe {
+                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -123,20 +151,24 @@ macro_rules! agg_int_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
+                    let base = row_body_base(data);
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let $v: i64 =
-                        unsafe { i64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: i64 = unsafe {
+                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -160,27 +192,31 @@ macro_rules! agg_float_loop {
                     if !pred(data) {
                         return;
                     }
+                    let base = row_body_base(data);
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows that are too
                     // short to contain the bitmap byte or the 8-byte value.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
-                    // The bitmap byte lives at offset 2..2+bitmap_size in the
-                    // row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
+                    // The bitmap byte lives at body offset 2..2+bitmap_size in
+                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
                     // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
-                    // `off = 2 + bitmap_size + fixed_offsets[col_idx]` points
-                    // to an 8-byte f64 in the fixed-size region of the row.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                    // points to an 8-byte f64 in the fixed-size region of the row.
                     // The pointer cast is valid because we read exactly 8
                     // bytes via from_le_bytes. Corrupt rows are rejected by
                     // the bounds guard.
-                    let $v: f64 =
-                        unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: f64 = unsafe {
+                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -188,20 +224,24 @@ macro_rules! agg_float_loop {
             $self
                 .catalog
                 .for_each_row_raw($table, |_rid, data| {
+                    let base = row_body_base(data);
+                    let bmp_off = base + 2 + bmp_byte;
+                    let data_off = base + off;
                     // Bounds guard: skip corrupt/truncated rows.
-                    if 2 + bmp_byte >= data.len() || off + 8 > data.len() {
+                    if bmp_off >= data.len() || data_off + 8 > data.len() {
                         return;
                     }
-                    // SAFETY: `2 + bmp_byte < data.len()` is checked above.
+                    // SAFETY: `bmp_off < data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(2 + bmp_byte) };
+                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
                     if (bmp >> bmp_bit) & 1 == 1 {
                         return;
                     }
-                    // SAFETY: `off + 8 <= data.len()` is checked above.
+                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
                     // See the predicate branch for the full invariant.
-                    let $v: f64 =
-                        unsafe { f64::from_le_bytes(*(data.as_ptr().add(off) as *const [u8; 8])) };
+                    let $v: f64 = unsafe {
+                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
+                    };
                     $body
                 })
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -382,6 +422,30 @@ impl Engine {
         mem_budget::charge(total, self.query_memory_limit)
     }
 
+    /// Dispatch to the requested query frontend.
+    pub fn execute_with_dialect(
+        &mut self,
+        dialect: QueryDialect,
+        input: &str,
+    ) -> Result<QueryResult, QueryError> {
+        match dialect {
+            QueryDialect::PowQL => self.execute_powql(input),
+            QueryDialect::Sql => self.execute_sql(input),
+        }
+    }
+
+    /// Read-only variant of [`Engine::execute_with_dialect`].
+    pub fn execute_readonly_with_dialect(
+        &self,
+        dialect: QueryDialect,
+        input: &str,
+    ) -> Result<QueryResult, QueryError> {
+        match dialect {
+            QueryDialect::PowQL => self.execute_powql_readonly(input),
+            QueryDialect::Sql => self.execute_sql_readonly(input),
+        }
+    }
+
     /// Parse + plan + execute a PowQL query.
     ///
     /// # Examples
@@ -443,7 +507,7 @@ impl Engine {
                     // (pure reads pay zero fsync).
                     if !self.in_transaction {
                         self.catalog
-                            .sync_wal()
+                            .commit_autocommit()
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
                     return result;
@@ -461,7 +525,7 @@ impl Engine {
                         let result = self.execute_plan(&plan);
                         if !self.in_transaction {
                             self.catalog
-                                .sync_wal()
+                                .commit_autocommit()
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         }
                         result
@@ -477,7 +541,7 @@ impl Engine {
                     let result = self.execute_plan(&plan);
                     if !self.in_transaction {
                         self.catalog
-                            .sync_wal()
+                            .commit_autocommit()
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     }
                     result
@@ -501,7 +565,7 @@ impl Engine {
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         let exec_us = exec_start.elapsed().as_micros();
@@ -531,6 +595,98 @@ impl Engine {
         result
     }
 
+    /// Parse + plan + execute a SQL query through the SQL frontend.
+    ///
+    /// SQL is lowered to the existing PowDB AST and to canonical PowQL text.
+    /// The canonical PowQL text is used as the plan-cache key, so equivalent
+    /// SQL and PowQL spellings share cached plans.
+    pub fn execute_sql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let parsed = crate::sql::parse_sql_with_canonical(input)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+
+        if !tracing::enabled!(Level::INFO) {
+            if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+                let cached = self
+                    .plan_cache
+                    .lock()
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                    .get_with_substitution(hash, &literals);
+                if let Some(plan) = cached {
+                    let plan = lower_unindexed_scans(&self.catalog, &plan);
+                    let result = self.execute_plan(&plan);
+                    if !self.in_transaction {
+                        self.catalog
+                            .commit_autocommit()
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    }
+                    return result;
+                }
+
+                let plan = crate::planner::plan_statement(parsed.statement)
+                    .map_err(|e| QueryError::Parse(e.to_string()))?;
+                self.plan_cache
+                    .lock()
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                    .insert(hash, plan.clone());
+                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                let result = self.execute_plan(&plan);
+                if !self.in_transaction {
+                    self.catalog
+                        .commit_autocommit()
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
+                return result;
+            }
+        }
+
+        let plan = crate::planner::plan_statement(parsed.statement)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let result = self.execute_plan(&plan);
+        if !self.in_transaction {
+            self.catalog
+                .commit_autocommit()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        }
+        result
+    }
+
+    /// Read-only variant of [`Engine::execute_sql`].
+    pub fn execute_sql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
+        let _budget = self.enter_memory_budget();
+        let parsed = crate::sql::parse_sql_with_canonical(input)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        if !is_read_only_statement(&parsed.statement) {
+            return Err(QueryError::ReadonlyNeedsWrite);
+        }
+
+        if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+            let cached = self
+                .plan_cache
+                .lock()
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                .get_with_substitution(hash, &literals);
+            if let Some(plan) = cached {
+                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                return self.execute_plan_readonly(&plan);
+            }
+            let plan = crate::planner::plan_statement(parsed.statement)
+                .map_err(|e| QueryError::Parse(e.to_string()))?;
+            self.plan_cache
+                .lock()
+                .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                .insert(hash, plan.clone());
+            let plan = lower_unindexed_scans(&self.catalog, &plan);
+            return self.execute_plan_readonly(&plan);
+        }
+
+        let plan = crate::planner::plan_statement(parsed.statement)
+            .map_err(|e| QueryError::Parse(e.to_string()))?;
+        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        self.execute_plan_readonly(&plan)
+    }
+
     /// Execute PowQL with `$N` placeholders bound to positional `params`.
     ///
     /// Task 4: parameters are substituted as literal *tokens* before
@@ -552,7 +708,7 @@ impl Engine {
         let result = self.execute_plan(&plan);
         if !self.in_transaction {
             self.catalog
-                .sync_wal()
+                .commit_autocommit()
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         result

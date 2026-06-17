@@ -1,7 +1,7 @@
 //! Compiled predicates and fast-path layout utilities.
 
 use crate::ast::*;
-use powdb_storage::row::{decode_column, RowLayout};
+use powdb_storage::row::{decode_column, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 
 /// Mission C Phase 4: precomputed byte-patch for the in-place update fast
@@ -187,6 +187,12 @@ impl CompiledLeaf {
     /// match folds into the caller's tight loop with LTO.
     #[inline]
     fn eval(&self, data: &[u8]) -> bool {
+        let base = if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+            ROW_PREFIX_SIZE
+        } else {
+            0
+        };
+        let data = &data[base..];
         match self {
             CompiledLeaf::Int {
                 data_offset,

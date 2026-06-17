@@ -1,5 +1,7 @@
 # PowQL Language Reference
 
+> Looking for SQL syntax? See [`docs/SQL.md`](SQL.md). SQL is an explicit frontend that lowers to the existing PowDB AST; native PowQL remains the default wire/query language.
+
 PowQL is the query language for PowDB, a Rust-native embedded database with compiled query execution. PowQL is designed to be modern, concise, and pipeline-oriented while remaining immediately familiar to anyone who knows SQL.
 
 ---

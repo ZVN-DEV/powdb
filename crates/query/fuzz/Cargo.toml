@@ -32,3 +32,9 @@ name = "fuzz_roundtrip"
 path = "fuzz_targets/fuzz_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_sql"
+path = "fuzz_targets/fuzz_sql.rs"
+test = false
+doc = false

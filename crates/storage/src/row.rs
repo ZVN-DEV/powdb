@@ -1,13 +1,66 @@
 use crate::types::*;
 use std::io;
 
+pub const ROW_MAGIC: &[u8; 4] = b"PROW";
+pub const ROW_FORMAT_VERSION: u16 = 1;
+pub const ROW_PREFIX_SIZE: usize = 6;
+
+#[inline]
+pub fn row_format_version(data: &[u8]) -> io::Result<u16> {
+    if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+        let version = u16::from_le_bytes(data[4..6].try_into().expect("2-byte row version"));
+        if version > ROW_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported row format version: {version}"),
+            ));
+        }
+        Ok(version)
+    } else {
+        Ok(0)
+    }
+}
+
+#[inline]
+pub fn validate_row_format(data: &[u8]) -> io::Result<()> {
+    let _ = row_format_version(data)?;
+    Ok(())
+}
+
+#[inline]
+fn row_body_offset(data: &[u8]) -> io::Result<usize> {
+    if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+        row_format_version(data)?;
+        Ok(ROW_PREFIX_SIZE)
+    } else {
+        Ok(0)
+    }
+}
+
+#[inline]
+fn row_body(data: &[u8]) -> &[u8] {
+    let offset = row_body_offset(data).expect("unsupported row format version");
+    &data[offset..]
+}
+
+fn prepend_row_prefix(out: &mut Vec<u8>) {
+    let body_len = out.len();
+    out.resize(body_len + ROW_PREFIX_SIZE, 0);
+    out.copy_within(0..body_len, ROW_PREFIX_SIZE);
+    out[0..4].copy_from_slice(ROW_MAGIC);
+    out[4..6].copy_from_slice(&ROW_FORMAT_VERSION.to_le_bytes());
+}
+
 /// Encode a row of values into the compact binary format.
 ///
-/// Layout: [length: u16] [null_bitmap] [fixed columns packed] [var offset table] [var data]
+/// Layout: ["PROW": 4 bytes] [version: u16] [body]. The body keeps the
+/// legacy layout: [length: u16] [null_bitmap] [fixed columns packed]
+/// [var offset table] [var data]. Legacy rows without the prefix still decode
+/// as row format version 0.
 ///
 /// Fixed columns are written in schema order, with placeholder zeros for Empty values.
 /// Variable columns use an offset table (n_var + 1 entries) pointing into var data.
-/// Overhead: 2 bytes (length) + ceil(n_cols/8) bytes (bitmap).
+/// Overhead: 6 bytes (prefix) + 2 bytes (length) + ceil(n_cols/8) bytes (bitmap).
 ///
 /// Mission C Phase 2: kept as a thin wrapper around [`encode_row_into`] so
 /// existing tests continue to work. Hot callers (bench insert/update loops)
@@ -207,6 +260,7 @@ pub fn encode_row_into_with_layout(
     out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
     debug_assert_eq!(out.len(), total_size);
+    prepend_row_prefix(out);
 }
 
 /// Fallible version of [`encode_row_into_with_layout`] — returns an error
@@ -350,6 +404,7 @@ pub fn try_encode_row_into_with_layout(
     out[end_pos..end_pos + 2].copy_from_slice(&var_cursor.to_le_bytes());
 
     debug_assert_eq!(out.len(), total_size);
+    prepend_row_prefix(out);
     Ok(())
 }
 
@@ -428,6 +483,7 @@ impl RowLayout {
 /// column type.
 #[inline]
 pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: usize) -> Value {
+    let data = row_body(data);
     let col = &schema.columns[col_idx];
 
     // Check null bitmap
@@ -532,10 +588,11 @@ pub fn patch_var_column_in_place(
     col_idx: usize,
     new_value: Option<&[u8]>,
 ) -> Option<u16> {
+    let base = row_body_offset(bytes).ok()?;
     let var_idx = layout.var_index[col_idx].expect("not a var column");
     let n_var = layout.n_var;
 
-    let offset_table_start = 2 + layout.bitmap_size + layout.fixed_region_size;
+    let offset_table_start = base + 2 + layout.bitmap_size + layout.fixed_region_size;
     let var_data_start = offset_table_start + (n_var + 1) * 2;
 
     // Read old offsets for this var column from the offset table.
@@ -592,7 +649,7 @@ pub fn patch_var_column_in_place(
     }
 
     // Null bitmap: clear or set the bit depending on new value.
-    let bitmap_byte = 2 + col_idx / 8;
+    let bitmap_byte = base + 2 + col_idx / 8;
     let bit_mask = 1u8 << (col_idx % 8);
     if new_value.is_none() {
         bytes[bitmap_byte] |= bit_mask;
@@ -602,7 +659,8 @@ pub fn patch_var_column_in_place(
 
     // Update the 2-byte length prefix.
     let new_row_len = old_row_len - delta;
-    bytes[0..2].copy_from_slice(&(new_row_len as u16).to_le_bytes());
+    let new_body_len = new_row_len - base;
+    bytes[base..base + 2].copy_from_slice(&(new_body_len as u16).to_le_bytes());
 
     Some(new_row_len as u16)
 }
@@ -613,6 +671,7 @@ pub fn patch_var_column_in_place(
 /// it into Filter+SeqScan when the inliner decides it's worth it.
 #[inline]
 pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
+    let data = row_body(data);
     let n_cols = schema.columns.len();
     let bitmap_size = n_cols.div_ceil(8);
 
@@ -830,8 +889,10 @@ mod tests {
         let encoded = encode_row(&schema, &row);
         let pure_data = 5 + 17 + 8 + 1; // "Alice" + "alice@example.com" + i64 + bool = 31
         let overhead = encoded.len() - pure_data;
-        // 2B length + 1B bitmap + 6B var offset table (3 entries * 2B) = 9B overhead
-        assert!(overhead <= 10, "overhead was {overhead}, expected <= 10");
+        // 6B row format prefix + 2B length + 1B bitmap + 6B var offset table
+        // (3 entries * 2B) = 15B overhead. The explicit prefix is the
+        // v0.5.0 format guard that prevents silent row misdecode.
+        assert!(overhead <= 16, "overhead was {overhead}, expected <= 16");
     }
 
     #[test]

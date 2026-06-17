@@ -115,6 +115,7 @@ async fn start_tls_server(
     tokio::spawn(async move {
         let engine = powdb_query::executor::Engine::new(std::path::Path::new(&data_dir)).unwrap();
         let engine = Arc::new(std::sync::RwLock::new(engine));
+        let tx_gate = powdb_server::handler::new_tx_gate();
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
         loop {
@@ -123,6 +124,7 @@ async fn start_tls_server(
                 Err(_) => break,
             };
             let eng = engine.clone();
+            let tx_gate = tx_gate.clone();
             let acc = acceptor.clone();
             let (_, mut rx) = tokio::sync::watch::channel(false);
 
@@ -132,6 +134,7 @@ async fn start_tls_server(
                         tls_stream,
                         powdb_server::handler::ConnOpts {
                             engine: eng,
+                            tx_gate,
                             expected_password: None,
                             users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                             shutdown_rx: &mut rx,

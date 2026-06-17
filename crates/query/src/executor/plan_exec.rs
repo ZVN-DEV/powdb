@@ -11,6 +11,7 @@ use std::collections::BinaryHeap;
 
 use super::compiled::*;
 use super::eval::*;
+use super::row_body_base;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::{ViewDef, ViewRegistry};
 
@@ -930,10 +931,12 @@ impl Engine {
                             let ok = self
                                 .catalog
                                 .update_row_bytes_logged(table, rid, |row| {
+                                    let base = row_body_base(row);
                                     for p in &patches {
-                                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                                        row[base + p.bitmap_byte_off] &= !p.bit_mask;
                                         let field_bytes = p.bytes.as_slice();
-                                        row[p.field_off..p.field_off + field_bytes.len()]
+                                        row[base + p.field_off
+                                            ..base + p.field_off + field_bytes.len()]
                                             .copy_from_slice(field_bytes);
                                     }
                                 })
@@ -1588,6 +1591,9 @@ impl Engine {
                         "already in a transaction (nested transactions not supported)".into(),
                     ));
                 }
+                self.catalog
+                    .begin_transaction()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 self.in_transaction = true;
                 Ok(QueryResult::Executed {
                     message: "transaction started".to_string(),
@@ -1600,10 +1606,10 @@ impl Engine {
                         "no active transaction to commit".into(),
                     ));
                 }
-                self.in_transaction = false;
                 self.catalog
-                    .sync_wal()
+                    .commit_transaction()
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                self.in_transaction = false;
                 Ok(QueryResult::Executed {
                     message: "transaction committed".to_string(),
                 })
@@ -2016,7 +2022,7 @@ impl Engine {
         };
         let bitmap_byte = col_idx / 8;
         let bitmap_bit = (col_idx % 8) as u32;
-        let data_offset = 2 + fast.bitmap_size + byte_offset;
+        let body_data_offset = 2 + fast.bitmap_size + byte_offset;
 
         // Optional compiled filter.
         let compiled_pred: Option<CompiledPredicate> = match predicate {
@@ -2064,7 +2070,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             count += 1;
                             sum_i128 += v as i128;
@@ -2088,7 +2094,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             min_v = Some(match min_v {
                                 Some(m) => m.min(v),
@@ -2106,7 +2112,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             max_v = Some(match max_v {
                                 Some(m) => m.max(v),
@@ -2124,7 +2130,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |_v: i64| {
                             count += 1;
                         }
@@ -2139,7 +2145,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: i64| {
                             seen.insert(v);
                         }
@@ -2160,7 +2166,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             sum += v;
                         }
@@ -2176,7 +2182,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             sum += v;
                             count += 1;
@@ -2199,7 +2205,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             min_v = Some(match min_v {
                                 Some(m) => {
@@ -2223,7 +2229,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             max_v = Some(match max_v {
                                 Some(m) => {
@@ -2247,7 +2253,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |_v: f64| {
                             count += 1;
                         }
@@ -2267,7 +2273,7 @@ impl Engine {
                         compiled_pred,
                         bitmap_byte,
                         bitmap_bit,
-                        data_offset,
+                        body_data_offset,
                         |v: f64| {
                             seen.insert(v.to_bits());
                         }
@@ -2428,7 +2434,7 @@ impl Engine {
         };
         let sort_bitmap_byte = sort_idx / 8;
         let sort_bitmap_bit = (sort_idx % 8) as u32;
-        let sort_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
+        let sort_body_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
 
         let compiled_pred: Option<CompiledPredicate> = match predicate {
             Some(pred) => match compile_predicate(pred, &all_columns, &fast, &schema) {
@@ -2462,10 +2468,15 @@ impl Engine {
                             }
                         }
                         // Inlined int-column reader: null check + i64 decode.
-                        if data.len() < sort_data_offset + 8 {
+                        let base = row_body_base(data);
+                        let sort_data_offset = base + sort_body_data_offset;
+                        if data.len() < sort_data_offset + 8
+                            || data.len() <= base + 2 + sort_bitmap_byte
+                        {
                             return;
                         }
-                        let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                        let is_null =
+                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
                         }
@@ -2531,10 +2542,15 @@ impl Engine {
                                 return;
                             }
                         }
-                        if data.len() < sort_data_offset + 8 {
+                        let base = row_body_base(data);
+                        let sort_data_offset = base + sort_body_data_offset;
+                        if data.len() < sort_data_offset + 8
+                            || data.len() <= base + 2 + sort_bitmap_byte
+                        {
                             return;
                         }
-                        let is_null = (data[2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                        let is_null =
+                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
                         if is_null {
                             return;
                         }
@@ -2674,10 +2690,11 @@ impl Engine {
             let result = self
                 .catalog
                 .scan_patch_matching_logged(table, compiled, |row| {
+                    let base = row_body_base(row);
                     for p in &patches {
-                        row[p.bitmap_byte_off] &= !p.bit_mask;
+                        row[base + p.bitmap_byte_off] &= !p.bit_mask;
                         let field_bytes = p.bytes.as_slice();
-                        row[p.field_off..p.field_off + field_bytes.len()]
+                        row[base + p.field_off..base + p.field_off + field_bytes.len()]
                             .copy_from_slice(field_bytes);
                     }
                     Some(row.len() as u16)

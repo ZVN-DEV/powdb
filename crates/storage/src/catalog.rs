@@ -3,6 +3,7 @@ use crate::table::Table;
 use crate::types::*;
 use crate::wal::{Wal, WalRecordType, WalSyncMode};
 use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,7 +76,7 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
-const CATALOG_VERSION: u16 = 3;
+pub const CATALOG_VERSION: u16 = 3;
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
@@ -112,10 +113,19 @@ pub struct Catalog {
     /// touching the heap so a mid-write crash can be recovered from on the
     /// next open. Flushed to disk at the end of every top-level op.
     wal: Wal,
-    /// Monotonic transaction-id counter — one "operation = transaction"
-    /// under our minimum-viable scope. Incremented per mutation so WAL
-    /// records can be grouped by op on replay if needed.
+    /// Monotonic transaction-id counter. Autocommit statements may allocate
+    /// multiple ids (one per row-level primitive), while explicit transactions
+    /// reuse one id for the whole BEGIN..COMMIT scope.
     next_tx_id: u64,
+    /// Active explicit transaction id, if any. Owned by the connection/session
+    /// driving this catalog through `Engine`.
+    active_tx_id: Option<u64>,
+    /// Durable WAL byte offset captured at BEGIN. ROLLBACK truncates back to
+    /// this boundary so auto-flushed uncommitted records cannot replay later.
+    tx_start_len: Option<u64>,
+    /// Autocommit row-mutation tx ids appended since the previous group commit.
+    /// `commit_autocommit` writes commit markers for these ids before fsync.
+    pending_autocommit_tx_ids: Vec<u64>,
     /// Has this catalog been cleanly checkpointed at least once since it
     /// was opened? Used by `Drop` to decide whether to treat its own flush
     /// as fatal (it isn't — we still try best-effort).
@@ -153,6 +163,9 @@ impl Catalog {
             data_dir: data_dir.to_path_buf(),
             wal,
             next_tx_id: 1,
+            active_tx_id: None,
+            tx_start_len: None,
+            pending_autocommit_tx_ids: Vec::new(),
             checkpointed: false,
         };
         cat.persist()?;
@@ -199,6 +212,9 @@ impl Catalog {
             data_dir: data_dir.to_path_buf(),
             wal,
             next_tx_id: 1,
+            active_tx_id: None,
+            tx_start_len: None,
+            pending_autocommit_tx_ids: Vec::new(),
             checkpointed: false,
         };
         cat.replay_wal()?;
@@ -261,11 +277,45 @@ impl Catalog {
         // higher LSN — silently dropping the record (one of the v0.4.x
         // data-loss bugs). Every record now carries its real RowId (inserts
         // included), so the target page is always known.
+        let has_boundaries = records.iter().any(|rec| {
+            matches!(
+                rec.record_type,
+                WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback
+            )
+        });
+        let mut committed_tx_ids = HashSet::new();
+        if has_boundaries {
+            for rec in &records {
+                match rec.record_type {
+                    WalRecordType::Commit => {
+                        committed_tx_ids.insert(rec.tx_id);
+                    }
+                    WalRecordType::Rollback => {
+                        committed_tx_ids.remove(&rec.tx_id);
+                    }
+                    WalRecordType::Begin => {}
+                    _ => {}
+                }
+            }
+        }
+
         let mut replayed_inserts = 0usize;
         let mut replayed_updates = 0usize;
         let mut replayed_deletes = 0usize;
         let mut skipped = 0usize;
+        let mut skipped_uncommitted = 0usize;
         for rec in records {
+            let tx_committed =
+                rec.tx_id == 0 || !has_boundaries || committed_tx_ids.contains(&rec.tx_id);
+            if !tx_committed
+                && matches!(
+                    rec.record_type,
+                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
+                )
+            {
+                skipped_uncommitted += 1;
+                continue;
+            }
             match rec.record_type {
                 WalRecordType::Insert => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
@@ -318,11 +368,8 @@ impl Catalog {
                         }
                     }
                 }
-                WalRecordType::Commit | WalRecordType::Rollback => {
-                    // Mission 2: one-op-one-transaction model — Commit /
-                    // Rollback markers are unused. Kept here so a future
-                    // mission that adds multi-op transactions can extend
-                    // replay without a WAL format break.
+                WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => {
+                    // Boundary records were consumed in the first pass.
                 }
                 WalRecordType::DdlCreateTable => {
                     if let Some(schema) = decode_ddl_create_table(&rec.data) {
@@ -429,7 +476,8 @@ impl Catalog {
             updates = replayed_updates,
             deletes = replayed_deletes,
             skipped = skipped,
-            "WAL replay complete (LSN-based idempotent)"
+            skipped_uncommitted = skipped_uncommitted,
+            "WAL replay complete (commit-boundary + LSN idempotent)"
         );
         // Persist the replayed changes to disk before truncating the WAL,
         // otherwise a crash between here and the next checkpoint would lose
@@ -482,12 +530,57 @@ impl Catalog {
         Ok(())
     }
 
-    /// Allocate a new transaction id for a single top-level op.
+    /// Allocate or return the transaction id for the current mutation.
     #[inline]
     fn next_tx(&mut self) -> u64 {
+        if let Some(id) = self.active_tx_id {
+            return id;
+        }
         let id = self.next_tx_id;
         self.next_tx_id = self.next_tx_id.wrapping_add(1);
         id
+    }
+
+    /// Begin a connection/session-scoped explicit transaction.
+    pub fn begin_transaction(&mut self) -> io::Result<()> {
+        let start_len = self.wal.synced_len()?;
+        let id = self.next_tx_id;
+        self.next_tx_id = self.next_tx_id.wrapping_add(1);
+        self.active_tx_id = Some(id);
+        self.tx_start_len = Some(start_len);
+        self.pending_autocommit_tx_ids.clear();
+        if !self.wal.is_off() {
+            self.wal.append(id, WalRecordType::Begin, &[])?;
+            self.wal.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the active explicit transaction by appending a durable boundary
+    /// marker after its row records.
+    pub fn commit_transaction(&mut self) -> io::Result<()> {
+        if let Some(id) = self.active_tx_id.take() {
+            if !self.wal.is_off() {
+                self.wal.append(id, WalRecordType::Commit, &[])?;
+                self.wal.flush()?;
+            }
+        }
+        self.tx_start_len = None;
+        Ok(())
+    }
+
+    /// Commit any autocommit row mutations accumulated by the current
+    /// statement. Pure reads/DDL have no pending tx ids and fall through to a
+    /// cheap WAL flush/no-op.
+    pub fn commit_autocommit(&mut self) -> io::Result<()> {
+        if !self.wal.is_off() && !self.pending_autocommit_tx_ids.is_empty() {
+            self.pending_autocommit_tx_ids.sort_unstable();
+            self.pending_autocommit_tx_ids.dedup();
+            for id in self.pending_autocommit_tx_ids.drain(..) {
+                self.wal.append(id, WalRecordType::Commit, &[])?;
+            }
+        }
+        self.wal.flush()
     }
 
     /// Append a mutation record to the WAL buffer. **Does not flush.**
@@ -522,7 +615,11 @@ impl Catalog {
             return Ok(());
         }
         let payload = encode_wal_payload(table, rid, row_bytes);
-        self.wal.append(tx_id, record_type, &payload)
+        self.wal.append(tx_id, record_type, &payload)?;
+        if self.active_tx_id.is_none() {
+            self.pending_autocommit_tx_ids.push(tx_id);
+        }
+        Ok(())
     }
 
     /// Flush any buffered WAL records to disk. Called by the executor
@@ -561,12 +658,26 @@ impl Catalog {
     /// would then read the flushed (uncommitted) rows back, defeating
     /// the entire rollback.
     pub fn rollback_to_last_sync(&mut self) -> io::Result<()> {
+        let start_len = self.tx_start_len.take().unwrap_or(0);
+        if let Some(id) = self.active_tx_id.take() {
+            if !self.wal.is_off() {
+                let _ = self.wal.append(id, WalRecordType::Rollback, &[]);
+            }
+        }
+        self.wal.discard_and_truncate_to(start_len)?;
+
         // Step 1: throw away every uncommitted in-memory write so the
         // upcoming Drop of `*self` has nothing dirty to flush.
         for tbl in &mut self.tables {
             tbl.heap.discard_dirty();
         }
-        // Step 2: re-open the catalog from disk. The heap files on disk
+        // Step 2: discard WAL records appended since the last explicit
+        // sync point. Large pending records can spill through BufWriter and
+        // become file-visible before `sync_wal()`; truncating to the last
+        // synced boundary prevents `open()` below from replaying rolled-back
+        // transaction records.
+        self.wal.discard_pending()?;
+        // Step 3: re-open the catalog from disk. The heap files on disk
         // still reflect the last checkpoint (pre-transaction state)
         // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
@@ -753,22 +864,20 @@ impl Catalog {
         if self.wal.is_off() {
             return self.tables[slot].insert(values);
         }
-        let Catalog {
-            tables,
-            wal,
-            next_tx_id,
-            ..
-        } = self;
+        let tx_id = self.next_tx();
+        let autocommit = self.active_tx_id.is_none();
+        let Catalog { tables, wal, .. } = self;
         let tbl = &mut tables[slot];
         let mut wal_bytes: Vec<u8> = Vec::new();
         encode_row_into(&tbl.schema, values, &mut wal_bytes);
         // Insert first so the WAL record carries the real RowId (see
         // `insert` for the ordering/durability argument).
         let new_rid = tbl.insert(values)?;
-        let tx_id = *next_tx_id;
-        *next_tx_id = next_tx_id.wrapping_add(1);
         let payload = encode_wal_payload(&tbl.schema.table_name, new_rid, &wal_bytes);
         wal.append(tx_id, WalRecordType::Insert, &payload)?;
+        if autocommit {
+            self.pending_autocommit_tx_ids.push(tx_id);
+        }
         let lsn = wal.last_appended_lsn();
         if lsn > 0 {
             tbl.heap.set_page_lsn(new_rid.page_id, lsn)?;
@@ -810,6 +919,9 @@ impl Catalog {
         for &rid in rids {
             let payload = encode_wal_payload(table, rid, &[]);
             self.wal.append(tx_id, WalRecordType::Delete, &payload)?;
+        }
+        if self.active_tx_id.is_none() && !rids.is_empty() {
+            self.pending_autocommit_tx_ids.push(tx_id);
         }
         self.by_name_mut(table)?.delete_many(rids)
     }
@@ -862,6 +974,7 @@ impl Catalog {
             )
         })?;
         let tx_id = self.next_tx();
+        let autocommit = self.active_tx_id.is_none();
         // Split-borrow the catalog fields so the hook can write into
         // `wal` while the scan pins `tables[slot]` mutably.
         let Catalog { tables, wal, .. } = self;
@@ -889,6 +1002,9 @@ impl Catalog {
             // which would fail the outer flush below as well.
             let _ = wal.append(tx_id, WalRecordType::Delete, &payload);
         })?;
+        if autocommit && count > 0 {
+            self.pending_autocommit_tx_ids.push(tx_id);
+        }
         // Flush is deferred to the executor's statement-end `sync_wal`.
         Ok(count)
     }
@@ -924,6 +1040,7 @@ impl Catalog {
             )
         })?;
         let tx_id = self.next_tx();
+        let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
         let tbl = &mut tables[slot];
         let name_bytes = table.as_bytes();
@@ -938,6 +1055,9 @@ impl Catalog {
             payload.extend_from_slice(row_bytes);
             let _ = wal.append(tx_id, WalRecordType::Update, &payload);
         })?;
+        if autocommit && result.0 > 0 {
+            self.pending_autocommit_tx_ids.push(tx_id);
+        }
         Ok(result)
     }
 

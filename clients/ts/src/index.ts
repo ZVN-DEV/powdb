@@ -331,6 +331,54 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 
   /**
+   * Run a SQL statement through the server-side SQL frontend. The plain
+   * {@link query} method remains PowQL for wire compatibility.
+   */
+  async querySql(
+    query: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<QueryResult> {
+    const start = Date.now();
+    try {
+      const reply = await this.send({ type: "QuerySql", query }, opts);
+      let result: QueryResult;
+      switch (reply.type) {
+        case "ResultRows":
+          result = { kind: "rows", columns: reply.columns, rows: reply.rows };
+          break;
+        case "ResultScalar":
+          result = { kind: "scalar", value: reply.value };
+          break;
+        case "ResultOk":
+          result = { kind: "ok", affected: reply.affected };
+          break;
+        case "ResultMessage":
+          result = { kind: "message", message: reply.message };
+          break;
+        case "Error":
+          throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+        default:
+          throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
+      }
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
    * Like {@link query}, but coerces string result columns to typed JS values
    * using the caller-supplied schema. See `./typed.ts` for the coercion
    * rules and supported column types.

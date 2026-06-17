@@ -12,4 +12,5 @@ pub mod plan;
 pub mod plan_cache;
 pub mod planner;
 pub mod result;
+pub mod sql;
 pub mod token;

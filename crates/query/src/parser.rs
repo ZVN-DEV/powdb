@@ -153,6 +153,33 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
     parse_tokens(tokens)
 }
 
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, ca) in a.bytes().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.bytes().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+fn keyword_suggestion(word: &str) -> Option<&'static str> {
+    const STATEMENT_KEYWORDS: &[&str] = &[
+        "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
+        "select", "type", "update", "upsert",
+    ];
+    let lower = word.to_ascii_lowercase();
+    STATEMENT_KEYWORDS
+        .iter()
+        .copied()
+        .filter(|kw| edit_distance(&lower, kw) <= 2)
+        .min_by_key(|kw| edit_distance(&lower, kw))
+}
+
 /// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
 /// descent over an already-lexed (and possibly param-substituted) token
 /// stream and reject any trailing tokens.
@@ -169,12 +196,17 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
     // returned rows. A parse error here tells users that the syntax
     // they wrote isn't recognized.
     if !matches!(parser.peek(), Token::Eof) {
-        return Err(ParseError::Syntax {
-            message: format!(
-                "unexpected trailing token: {}",
-                parser.peek().display_name()
-            ),
-        });
+        let mut message = format!(
+            "unexpected trailing token near token {}: {}",
+            parser.pos,
+            parser.peek().display_name()
+        );
+        if let Some(Token::Ident(first)) = parser.tokens.first() {
+            if let Some(suggestion) = keyword_suggestion(first) {
+                message.push_str(&format!("; did you mean `{suggestion}`?"));
+            }
+        }
+        return Err(ParseError::Syntax { message });
     }
     Ok(stmt)
 }
@@ -693,190 +725,28 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            let first = self.advance();
-            if *self.peek() == Token::Colon {
-                // alias: expr
-                self.advance();
-                let alias = match first {
+            // `alias: expr` is detected with two-token lookahead so the bare
+            // form can parse a full expression from its first token. Every
+            // projection slot — aliased or bare — flows through the shared
+            // expression parser, so fields, qualified refs, aggregates, window
+            // functions, scalar calls, CASE/CAST, and arithmetic like `.a - 1`
+            // are all accepted. Previously the bare slot used a restricted
+            // dispatch that rejected any binary operator with "expected field".
+            if matches!(self.peek(), Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Colon))
+            {
+                let alias = match self.advance() {
                     Token::Ident(name) => name,
-                    _ => {
-                        return Err(ParseError::Syntax {
-                            message: "expected alias name".into(),
-                        })
-                    }
+                    _ => unreachable!("guarded by the matches! above"),
                 };
+                self.advance(); // consume ':'
                 let expr = self.parse_expr()?;
                 fields.push(ProjectionField {
                     alias: Some(alias),
                     expr,
                 });
             } else {
-                let expr = match first {
-                    // Mission E1.2: `{ u.name }` — a qualifier followed by
-                    // `.field` folds into a QualifiedField so join projections
-                    // can pull from a specific source.
-                    Token::Ident(name) => {
-                        if let Token::DotIdent(field) = self.peek().clone() {
-                            self.advance();
-                            Expr::QualifiedField {
-                                qualifier: name,
-                                field,
-                            }
-                        } else {
-                            Expr::Field(name)
-                        }
-                    }
-                    Token::DotIdent(name) => Expr::Field(name),
-                    Token::RowNumber | Token::Rank | Token::DenseRank => {
-                        let wfunc = match first {
-                            Token::RowNumber => WindowFunc::RowNumber,
-                            Token::Rank => WindowFunc::Rank,
-                            Token::DenseRank => WindowFunc::DenseRank,
-                            _ => {
-                                return Err(ParseError::Syntax {
-                                    message: "unexpected window function token".into(),
-                                })
-                            }
-                        };
-                        self.expect(&Token::LParen)?;
-                        self.expect(&Token::RParen)?;
-                        let (partition_by, order_by) = self.parse_over_clause()?;
-                        Expr::Window {
-                            function: wfunc,
-                            args: vec![],
-                            partition_by,
-                            order_by,
-                        }
-                    }
-                    Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
-                        let mut func = match first {
-                            Token::Count => AggFunc::Count,
-                            Token::Avg => AggFunc::Avg,
-                            Token::Sum => AggFunc::Sum,
-                            Token::Min => AggFunc::Min,
-                            Token::Max => AggFunc::Max,
-                            _ => {
-                                return Err(ParseError::Syntax {
-                                    message: "unexpected aggregate token".into(),
-                                })
-                            }
-                        };
-                        self.expect(&Token::LParen)?;
-                        // count(*) — count all rows
-                        if func == AggFunc::Count && *self.peek() == Token::Star {
-                            self.advance();
-                            self.expect(&Token::RParen)?;
-                            // Check for OVER — count(*) over (...)
-                            if *self.peek() == Token::Over {
-                                let (partition_by, order_by) = self.parse_over_clause()?;
-                                Expr::Window {
-                                    function: WindowFunc::Count,
-                                    args: vec![Expr::Field("*".into())],
-                                    partition_by,
-                                    order_by,
-                                }
-                            } else {
-                                Expr::FunctionCall(
-                                    AggFunc::Count,
-                                    Box::new(Expr::Field("*".into())),
-                                )
-                            }
-                        } else {
-                            // count(distinct .field) → CountDistinct
-                            if func == AggFunc::Count && *self.peek() == Token::Distinct {
-                                self.advance();
-                                func = AggFunc::CountDistinct;
-                            }
-                            let inner = self.parse_expr()?;
-                            self.expect(&Token::RParen)?;
-                            // Check for OVER — e.g. sum(.salary) over (...)
-                            if *self.peek() == Token::Over {
-                                let wfunc =
-                                    match func {
-                                        AggFunc::Count => WindowFunc::Count,
-                                        AggFunc::Avg => WindowFunc::Avg,
-                                        AggFunc::Sum => WindowFunc::Sum,
-                                        AggFunc::Min => WindowFunc::Min,
-                                        AggFunc::Max => WindowFunc::Max,
-                                        _ => return Err(ParseError::Unsupported {
-                                            feature:
-                                                "count(distinct ...) over (...) is not supported"
-                                                    .into(),
-                                        }),
-                                    };
-                                let (partition_by, order_by) = self.parse_over_clause()?;
-                                Expr::Window {
-                                    function: wfunc,
-                                    args: vec![inner],
-                                    partition_by,
-                                    order_by,
-                                }
-                            } else {
-                                Expr::FunctionCall(func, Box::new(inner))
-                            }
-                        }
-                    }
-                    Token::Upper
-                    | Token::Lower
-                    | Token::Length
-                    | Token::Trim
-                    | Token::Substring
-                    | Token::Concat
-                    | Token::Abs
-                    | Token::Round
-                    | Token::Ceil
-                    | Token::Floor
-                    | Token::Sqrt
-                    | Token::Pow
-                    | Token::Now
-                    | Token::Extract
-                    | Token::DateAdd
-                    | Token::DateDiff => {
-                        let func = token_to_scalar_fn(&first);
-                        self.expect(&Token::LParen)?;
-                        let mut args = Vec::new();
-                        while !matches!(self.peek(), Token::RParen | Token::Eof) {
-                            args.push(self.parse_expr()?);
-                            if *self.peek() == Token::Comma {
-                                self.advance();
-                            }
-                        }
-                        self.expect(&Token::RParen)?;
-                        Expr::ScalarFunc(func, args)
-                    }
-                    Token::Cast => {
-                        self.expect(&Token::LParen)?;
-                        let inner = self.parse_expr()?;
-                        self.expect(&Token::Comma)?;
-                        let cast_type = self.parse_cast_type()?;
-                        self.expect(&Token::RParen)?;
-                        Expr::Cast(Box::new(inner), cast_type)
-                    }
-                    Token::Case => {
-                        let mut whens = Vec::new();
-                        while *self.peek() == Token::When {
-                            self.advance();
-                            let condition = self.parse_expr()?;
-                            self.expect(&Token::Then)?;
-                            let result = self.parse_expr()?;
-                            whens.push((Box::new(condition), Box::new(result)));
-                        }
-                        let else_expr = if *self.peek() == Token::Else {
-                            self.advance();
-                            Some(Box::new(self.parse_expr()?))
-                        } else {
-                            None
-                        };
-                        self.expect(&Token::End)?;
-                        Expr::Case { whens, else_expr }
-                    }
-                    _ => {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "field".into(),
-                            got: first.display_name(),
-                        })
-                    }
-                };
+                let expr = self.parse_expr()?;
                 fields.push(ProjectionField { alias: None, expr });
             }
             if *self.peek() == Token::Comma {
@@ -3481,5 +3351,18 @@ mod tests {
             msg.contains("delete"),
             "error should mention 'delete', got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_parser_dx_tests {
+    use super::*;
+
+    #[test]
+    fn typoed_statement_keyword_gets_suggestion() {
+        let err = parse("updat User set age = 1").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("near token"), "{msg}");
+        assert!(msg.contains("did you mean `update`"), "{msg}");
     }
 }

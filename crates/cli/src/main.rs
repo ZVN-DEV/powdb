@@ -1,4 +1,5 @@
 use powdb_query::executor::Engine;
+use powdb_query::lexer::POWQL_KEYWORDS;
 use powdb_query::result::QueryResult;
 use powdb_server::protocol::Message;
 use powdb_storage::types::Value;
@@ -16,86 +17,8 @@ use tracing_subscriber::EnvFilter;
 
 // ─── Tab completion helper ─────────────────────────────────────────────────
 
-const POWQL_KEYWORDS: &[&str] = &[
-    "abs",
-    "alter",
-    "and",
-    "as",
-    "asc",
-    "avg",
-    "begin",
-    "between",
-    "bool",
-    "bytes",
-    "case",
-    "cast",
-    "ceil",
-    "coalesce",
-    "commit",
-    "concat",
-    "count",
-    "cross",
-    "datetime",
-    "delete",
-    "desc",
-    "distinct",
-    "drop",
-    "else",
-    "end",
-    "exec",
-    "explain",
-    "extract",
-    "false",
-    "filter",
-    "float",
-    "floor",
-    "group",
-    "having",
-    "in",
-    "index",
-    "inner",
-    "insert",
-    "int",
-    "is",
-    "join",
-    "left",
-    "length",
-    "like",
-    "limit",
-    "lower",
-    "max",
-    "min",
-    "not",
-    "now",
-    "null",
-    "offset",
-    "on",
-    "or",
-    "order",
-    "pow",
-    "prepare",
-    "refresh",
-    "required",
-    "rollback",
-    "round",
-    "sqrt",
-    "str",
-    "substring",
-    "sum",
-    "then",
-    "trim",
-    "true",
-    "type",
-    "union",
-    "update",
-    "upper",
-    "upsert",
-    "uuid",
-    "view",
-    "when",
-    "where",
-];
-
+const CLI_COMMANDS: &[&str] = &["exec", "prepare"];
+const DEFAULT_DB_NAME: &str = "default";
 const META_COMMANDS: &[&str] = &[".exit", ".help", ".quit", ".schema", ".tables", ".timing"];
 
 struct PowqlHelper;
@@ -123,6 +46,22 @@ impl Completer for PowqlHelper {
                     matches.push(Pair {
                         display: cmd.to_string(),
                         replacement: cmd.to_string(),
+                    });
+                }
+            }
+        } else if start == 0 && !word.is_empty() {
+            for kw in POWQL_KEYWORDS.iter().chain(CLI_COMMANDS.iter()) {
+                if kw.starts_with(&lower) {
+                    let replacement = if word.chars().next().is_some_and(|c| c.is_uppercase()) {
+                        let mut s = kw.to_string();
+                        s[..1].make_ascii_uppercase();
+                        s
+                    } else {
+                        kw.to_string()
+                    };
+                    matches.push(Pair {
+                        display: kw.to_string(),
+                        replacement,
                     });
                 }
             }
@@ -222,7 +161,7 @@ struct CliArgs {
 fn parse_args() -> CliArgs {
     let mut data_dir = "./powdb_data".to_string();
     let mut remote: Option<String> = None;
-    let mut db: String = "main".to_string();
+    let mut db: String = DEFAULT_DB_NAME.to_string();
     let mut password: Option<String> = std::env::var("POWDB_PASSWORD")
         .ok()
         .filter(|s| !s.is_empty());
@@ -313,7 +252,7 @@ fn parse_args() -> CliArgs {
                 println!("OPTIONS:");
                 println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
-                println!("        --db <NAME>            Database name (default: main)");
+                println!("        --db <NAME>            Database name (default: default)");
                 println!("        --password <PW>        Password for remote auth");
                 println!("    -u, --user <NAME>          Username for multi-user remote auth");
                 println!(
@@ -1394,6 +1333,34 @@ mod tests {
         assert_eq!(render_remote_cell("42"), "42");
         assert_eq!(render_remote_cell(""), "");
         assert_eq!(render_remote_cell("NULL"), "NULL");
+    }
+
+    #[test]
+    fn remote_db_default_matches_ts_client() {
+        assert_eq!(DEFAULT_DB_NAME, "default");
+    }
+
+    #[test]
+    fn completion_keywords_include_current_lexer_surface() {
+        for required in [
+            "upsert",
+            "conflict",
+            "row_number",
+            "dense_rank",
+            "over",
+            "partition",
+            "date_add",
+            "date_diff",
+            "unique",
+            "materialized",
+            "explain",
+        ] {
+            assert!(
+                POWQL_KEYWORDS.contains(&required),
+                "lexer keyword missing from CLI completion source: {required}"
+            );
+        }
+        assert!(CLI_COMMANDS.contains(&"exec"));
     }
 
     #[test]

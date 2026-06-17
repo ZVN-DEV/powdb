@@ -3,14 +3,79 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-// Unix-only: PowDB is Unix-first (see RUSTFLAGS story). `FileExt::read_exact_at`
-// and `write_all_at` map to pread(2)/pwrite(2), which are atomic with respect
-// to the kernel file offset per POSIX and are therefore safe to call
-// concurrently on a shared `&File` from multiple threads.
-// TODO(windows): Implement equivalent using `std::os::windows::fs::FileExt`
-// (`seek_read`/`seek_write`) if we ever support Windows.
+// Positioned I/O helpers. Unix uses pread(2)/pwrite(2); Windows uses
+// FileExt::seek_read/seek_write with explicit offsets. Both avoid mutating the
+// shared file cursor, which is required for concurrent page reads.
 #[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
+
+#[cfg(unix)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = file.write_at(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write full page at offset",
+            ));
+        }
+        offset += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = file.seek_write(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write full page at offset",
+            ));
+        }
+        offset += n as u64;
+        buf = &buf[n..];
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = file.read_at(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to read full page at offset",
+            ));
+        }
+        offset += n as u64;
+        let tmp = buf;
+        buf = &mut tmp[n..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to read full page at offset",
+            ));
+        }
+        offset += n as u64;
+        let tmp = buf;
+        buf = &mut tmp[n..];
+    }
+    Ok(())
+}
 
 /// Manages page-level I/O to a single data file.
 /// Each page is PAGE_SIZE bytes at offset = page_id * PAGE_SIZE.
@@ -42,7 +107,7 @@ impl DiskManager {
         let id = self.num_pages;
         let zeros = [0u8; PAGE_SIZE];
         let offset = id as u64 * PAGE_SIZE as u64;
-        self.file.write_all_at(&zeros, offset)?;
+        write_all_at(&self.file, &zeros, offset)?;
         self.num_pages += 1;
         Ok(id)
     }
@@ -52,7 +117,7 @@ impl DiskManager {
         let offset = page_id as u64 * PAGE_SIZE as u64;
         // pwrite(2): atomic w.r.t. the kernel file offset, so this is safe
         // on a shared `&File` across threads.
-        self.file.write_all_at(data, offset)?;
+        write_all_at(&self.file, data, offset)?;
         Ok(())
     }
 
@@ -63,7 +128,7 @@ impl DiskManager {
         // reader threads can call this concurrently through a shared `&self`
         // (and thus a shared `&File`) without interfering with each other.
         // This is the correctness foundation for `unsafe impl Sync for HeapFile`.
-        self.file.read_exact_at(&mut buf, offset)?;
+        read_exact_at(&self.file, &mut buf, offset)?;
         Ok(buf)
     }
 

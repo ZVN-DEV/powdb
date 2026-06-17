@@ -1,10 +1,71 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
 use crate::page::{iter_page_slots, Page, PageType, MAX_ROW_DATA_SIZE, PAGE_SIZE};
+use crate::row::validate_row_format;
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
+
+pub const HEAP_MAGIC: &[u8; 5] = b"PHEAP";
+pub const HEAP_FORMAT_VERSION: u16 = 2;
+const HEAP_SUPERBLOCK_OFFSET: usize = crate::page::PAGE_HEADER_SIZE;
+const HEAP_SUPERBLOCK_FIRST_DATA_PAGE: u32 = 1;
+
+fn heap_superblock_page() -> Page {
+    let page = Page::new(0, PageType::Meta);
+    let mut bytes = *page.as_bytes();
+    let mut pos = HEAP_SUPERBLOCK_OFFSET;
+    bytes[pos..pos + HEAP_MAGIC.len()].copy_from_slice(HEAP_MAGIC);
+    pos += HEAP_MAGIC.len();
+    bytes[pos..pos + 2].copy_from_slice(&HEAP_FORMAT_VERSION.to_le_bytes());
+    pos += 2;
+    bytes[pos..pos + 2].copy_from_slice(&0u16.to_le_bytes()); // flags
+    pos += 2;
+    bytes[pos..pos + 2].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+    pos += 2;
+    bytes[pos..pos + 4].copy_from_slice(&HEAP_SUPERBLOCK_FIRST_DATA_PAGE.to_le_bytes());
+    let mut page = Page::from_bytes(&bytes).expect("fresh heap superblock is a valid page");
+    page.stamp_checksum();
+    page
+}
+
+fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<u32> {
+    if buf[4] != PageType::Meta as u8 {
+        return Ok(0);
+    }
+    let mut pos = HEAP_SUPERBLOCK_OFFSET;
+    if &buf[pos..pos + HEAP_MAGIC.len()] != HEAP_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad heap superblock magic",
+        ));
+    }
+    pos += HEAP_MAGIC.len();
+    let version = u16::from_le_bytes(buf[pos..pos + 2].try_into().expect("2-byte heap version"));
+    pos += 2;
+    if version != HEAP_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported heap format version: {version}"),
+        ));
+    }
+    pos += 2; // flags
+    let page_size = u16::from_le_bytes(buf[pos..pos + 2].try_into().expect("2-byte page size"));
+    pos += 2;
+    if page_size as usize != PAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported heap page size: {page_size}"),
+        ));
+    }
+    let first_data_page = u32::from_le_bytes(
+        buf[pos..pos + 4]
+            .try_into()
+            .expect("4-byte first data page"),
+    );
+    Ok(first_data_page)
+}
 
 /// A single dirty page pinned in memory for write-back coalescing.
 ///
@@ -26,6 +87,7 @@ struct HotPage {
 /// Tracks which pages have free space for fast insertion.
 pub struct HeapFile {
     disk: DiskManager,
+    first_data_page: u32,
     /// Pages with known free space. Iteration order matters for the
     /// `insert` fallback path, so this is a `Vec`. Membership is tracked
     /// in `in_free_list` for O(1) `contains` checks.
@@ -67,9 +129,15 @@ pub struct HeapFile {
 
 impl HeapFile {
     pub fn create(path: &Path) -> io::Result<Self> {
-        let disk = DiskManager::create(path)?;
+        let mut disk = DiskManager::create(path)?;
+        let page_id = disk.allocate_page()?;
+        debug_assert_eq!(page_id, 0);
+        let superblock = heap_superblock_page();
+        disk.write_page(0, superblock.as_bytes())?;
+        disk.flush()?;
         Ok(HeapFile {
             disk,
+            first_data_page: HEAP_SUPERBLOCK_FIRST_DATA_PAGE,
             pages_with_space: Vec::new(),
             in_free_list: Vec::new(),
             mmap_ptr: None,
@@ -81,9 +149,15 @@ impl HeapFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut disk = DiskManager::open(path)?;
         let num_pages = disk.num_pages();
+        let first_data_page = if num_pages == 0 {
+            0
+        } else {
+            let page0 = disk.read_page(0)?;
+            heap_first_data_page(&page0)?
+        };
         let mut pages_with_space = Vec::new();
         let mut in_free_list = vec![false; num_pages as usize];
-        for i in 0..num_pages {
+        for i in first_data_page..num_pages {
             if let Ok(buf) = disk.read_page(i) {
                 // Mission 2: a page whose `page_type` byte is 0 was
                 // allocated by [`DiskManager::allocate_page`] (which
@@ -110,6 +184,9 @@ impl HeapFile {
                     continue;
                 }
                 if let Some(page) = Page::from_bytes(&buf) {
+                    for (_slot, row) in iter_page_slots(&buf) {
+                        validate_row_format(row)?;
+                    }
                     if page.free_space() > 64 {
                         pages_with_space.push(i);
                         in_free_list[i as usize] = true;
@@ -119,12 +196,25 @@ impl HeapFile {
         }
         Ok(HeapFile {
             disk,
+            first_data_page,
             pages_with_space,
             in_free_list,
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
         })
+    }
+
+    pub fn format_version(&self) -> u16 {
+        if self.first_data_page == 0 {
+            1
+        } else {
+            HEAP_FORMAT_VERSION
+        }
+    }
+
+    pub fn first_data_page(&self) -> u32 {
+        self.first_data_page
     }
 
     /// O(1) check: is `page_id` currently on the free-space list?
