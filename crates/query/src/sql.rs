@@ -20,7 +20,11 @@ pub fn parse_sql(input: &str) -> Result<Statement, ParseError> {
 
 pub fn parse_sql_with_canonical(input: &str) -> Result<ParsedSql, ParseError> {
     let toks = lex_sql(input)?;
-    let mut p = SqlParser { toks, pos: 0 };
+    let mut p = SqlParser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let canonical_powql = p.statement()?;
     if !p.at_end() {
         return Err(ParseError::Syntax {
@@ -199,9 +203,18 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
     Ok(out)
 }
 
+/// Bound on SQL expression-parser recursion. The from-scratch SQL pre-parser
+/// recurses on parentheses / `NOT` / operator right-hand sides before the
+/// canonical text is handed to the PowQL parser, so its own guard must match
+/// PowQL's `MAX_NESTING_DEPTH` (64). Without it, a deeply nested SQL string
+/// arriving over the wire overflows the stack and — with panic=abort — aborts
+/// the whole server process.
+const MAX_SQL_NESTING_DEPTH: usize = 64;
+
 struct SqlParser {
     toks: Vec<SqlTok>,
     pos: usize,
+    depth: usize,
 }
 
 impl SqlParser {
@@ -765,8 +778,22 @@ impl SqlParser {
     }
 
     fn expr_bp(&mut self, min_bp: u8, stop: &[&str]) -> Result<String, ParseError> {
+        // Guard the recursive descent against stack overflow. Error paths below
+        // abort the whole parse, so only the success path needs to restore the
+        // counter (done right before the final `Ok`).
+        self.depth += 1;
+        if self.depth > MAX_SQL_NESTING_DEPTH {
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_SQL_NESTING_DEPTH,
+            });
+        }
         let mut lhs = if self.eat_kw("not") {
-            format!("not {}", self.expr_bp(7, stop)?)
+            // Standard SQL: `NOT` binds looser than comparison, so `NOT x = 1`
+            // is `NOT (x = 1)`. Parse the comparison (min_bp 5 admits `=`/`<`/…
+            // but stops before AND/OR) and parenthesize it so the canonical
+            // PowQL re-parse is unambiguous regardless of PowQL's own NOT
+            // precedence.
+            format!("not ({})", self.expr_bp(5, stop)?)
         } else if self.eat_kw("exists") {
             if self.eat_sym('(') {
                 if self.is_kw("select") {
@@ -885,6 +912,7 @@ impl SqlParser {
             let rhs = self.expr_bp(r_bp, stop)?;
             lhs = format!("{lhs} {op} {rhs}");
         }
+        self.depth -= 1;
         Ok(lhs)
     }
 

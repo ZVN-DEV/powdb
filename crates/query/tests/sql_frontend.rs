@@ -68,3 +68,81 @@ fn sql_readonly_rejects_writes() {
         .unwrap_err();
     assert_eq!(err.to_string(), "__POWDB_READONLY_NEEDS_WRITE__");
 }
+
+fn seeded_engine() -> (tempfile::TempDir, Engine) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type T { required id: int, required x: int }")
+        .unwrap();
+    engine
+        .execute_powql("insert T { id := 1, x := 1 }, { id := 2, x := 5 }")
+        .unwrap();
+    (dir, engine)
+}
+
+/// Regression: a deeply-nested SQL expression must return a parse error, not
+/// overflow the stack and abort the process. Reachable over the wire via
+/// MSG_QUERY_SQL, so an unbounded-recursion overflow + panic=abort is a remote
+/// DoS. The PowQL guard (MAX_NESTING_DEPTH) runs in the second stage and never
+/// fires because the SQL pre-parser overflows first.
+#[test]
+fn sql_deeply_nested_expression_errors_instead_of_aborting() {
+    let n = 50_000usize;
+    let mut q = String::from("SELECT a FROM T WHERE ");
+    q.push_str(&"(".repeat(n));
+    q.push('1');
+    q.push_str(&")".repeat(n));
+    let r = powdb_query::sql::parse_sql(&q);
+    assert!(r.is_err(), "deep nesting should error, not abort");
+}
+
+/// Regression: `NOT x = 1` is standard SQL `NOT (x = 1)`, not `(NOT x) = 1`.
+/// Row id=2 has x=5, so the predicate is true for it.
+#[test]
+fn sql_not_binds_looser_than_comparison() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine
+        .execute_sql("SELECT id FROM T WHERE NOT x = 1")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "NOT (x = 1) should match the x=5 row");
+            assert_eq!(rows[0][0], Value::Int(2));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Regression: arithmetic in a bare (un-aliased) projection must parse and
+/// evaluate. Previously PowQL's projection grammar only accepted a single
+/// field/agg token in a bare slot, so `SELECT x - 1` (→ PowQL `T { .x - 1 }`)
+/// failed with "expected field, got '-'".
+#[test]
+fn sql_subtraction_in_bare_projection() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine
+        .execute_sql("SELECT x - 1 FROM T WHERE id = 2")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(4), "5 - 1 = 4");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// The same computed-projection support must hold for native PowQL, not just
+/// the SQL frontend — this is an engine-level grammar fix.
+#[test]
+fn powql_subtraction_in_bare_projection() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine.execute_powql("T filter .id = 2 { .x - 1 }").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(4), "5 - 1 = 4");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
