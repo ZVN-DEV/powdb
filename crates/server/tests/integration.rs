@@ -280,6 +280,119 @@ async fn explicit_transaction_blocks_other_connections_until_closed() {
     std::fs::remove_dir_all(&data_dir).ok();
 }
 
+/// A connection that drops while holding an open transaction must (1) roll back
+/// its uncommitted writes and (2) release the TxGate so the next connection can
+/// transact normally. Guards the connection-teardown path in `handle_connection`
+/// (the buggy form released the permit before awaiting the rollback, which could
+/// roll back a *different* connection's freshly-begun transaction).
+#[tokio::test]
+async fn dropped_connection_mid_transaction_rolls_back_and_frees_gate() {
+    use powdb_server::protocol::Message;
+    use std::sync::{Arc, RwLock};
+
+    let unique = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let data_dir = std::env::temp_dir().join(format!("powdb_tx_drop_{unique}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let data_dir_str = data_dir.to_str().unwrap().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let tx_gate = powdb_server::handler::new_tx_gate();
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let eng = engine.clone();
+            let tx_gate = tx_gate.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                powdb_server::handler::handle_connection(
+                    stream,
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        tx_gate,
+                        expected_password: None,
+                        users: Arc::new(powdb_auth::UserStore::new()),
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr: Some(peer),
+                    },
+                )
+                .await;
+            });
+        }
+    });
+
+    // Connection A: open a transaction, insert an uncommitted row, then drop the
+    // socket WITHOUT committing or rolling back.
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    a.write_all(&encode_connect("testdb")).await.unwrap();
+    assert_eq!(read_response(&mut a).await[0], 0x02);
+    a.write_all(&encode_query("type Item { required name: str }"))
+        .await
+        .unwrap();
+    let resp = read_response(&mut a).await;
+    assert!(resp[0] == 0x09 || resp[0] == 0x0B);
+    a.write_all(&encode_query("begin")).await.unwrap();
+    assert_eq!(read_response(&mut a).await[0], 0x0B);
+    a.write_all(&encode_query(r#"insert Item { name := "uncommitted" }"#))
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut a).await[0], 0x09);
+    drop(a); // abrupt disconnect mid-transaction
+
+    // Connection B: the gate must be free (this would hang/timeout otherwise),
+    // and A's uncommitted row must have been rolled back on teardown.
+    let mut b = TcpStream::connect(addr).await.unwrap();
+    b.write_all(&encode_connect("testdb")).await.unwrap();
+    assert_eq!(read_response(&mut b).await[0], 0x02);
+
+    b.write_all(&encode_query("count(Item)")).await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(5), read_response(&mut b))
+        .await
+        .expect("gate must be released after A drops mid-transaction");
+    assert_eq!(resp[0], 0x08);
+    match Message::decode(&resp).unwrap() {
+        Message::ResultScalar { value } => {
+            assert_eq!(value, "0", "A's uncommitted insert must be rolled back")
+        }
+        other => panic!("expected count scalar, got {other:?}"),
+    }
+
+    // B can then run its own transaction normally and durably commit.
+    b.write_all(&encode_query("begin")).await.unwrap();
+    assert_eq!(read_response(&mut b).await[0], 0x0B);
+    b.write_all(&encode_query(r#"insert Item { name := "committed" }"#))
+        .await
+        .unwrap();
+    assert_eq!(read_response(&mut b).await[0], 0x09);
+    b.write_all(&encode_query("commit")).await.unwrap();
+    assert_eq!(read_response(&mut b).await[0], 0x0B);
+    b.write_all(&encode_query("count(Item)")).await.unwrap();
+    let resp = read_response(&mut b).await;
+    match Message::decode(&resp).unwrap() {
+        Message::ResultScalar { value } => {
+            assert_eq!(value, "1", "B's committed row must persist")
+        }
+        other => panic!("expected count scalar, got {other:?}"),
+    }
+
+    handle.abort();
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
 /// Drive the REAL handshake with a populated UserStore: a valid (user,password)
 /// connects; wrong password, unknown user, and a missing username all reject.
 #[tokio::test]

@@ -1085,12 +1085,19 @@ where
         }
     }
 
-    if tx_permit.take().is_some() {
+    // Roll back any open transaction the client left behind on disconnect.
+    // The permit must stay alive in `tx_permit` for the duration of the awaited
+    // rollback and be released only afterwards — mirroring the query-timeout
+    // path above. Using `tx_permit.take().is_some()` here would drop the permit
+    // (freeing the TxGate) *before* the rollback runs, letting another
+    // connection BEGIN a transaction that this stale rollback would then clobber.
+    if tx_permit.is_some() {
         let engine = engine.clone();
         let principal = principal.clone();
         let _ =
             tokio::task::spawn_blocking(move || rollback_open_transaction(engine, principal)).await;
     }
+    tx_permit.take();
 
     info!(peer = %peer, "client disconnected");
 }
