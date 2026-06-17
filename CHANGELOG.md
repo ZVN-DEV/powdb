@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-17
+
+### Changed
+- Bumped `zeroize` 1.8.2 → 1.9.0, the dependency used to scrub secrets from memory in `powdb-auth` and `powdb-server`.
+
+### Internal
+- Pinned the fuzz workflow to an explicit `nightly` toolchain so cargo-fuzz builds survive `dtolnay/rust-toolchain` SHA bumps.
+- Routine dev-dependency bumps (`postgres` test harness, `@types/node`) and a remaining-work backlog docs refresh. No runtime or wire-protocol changes.
+
 ## [0.5.0] - 2026-06-16
 
 ### Added
