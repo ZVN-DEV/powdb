@@ -28,7 +28,7 @@ The live Fly instance has two trivially-craftable remote-crash bugs. This is a s
 | 0.2 | Fix `LIMIT` pre-allocation crash | Attacker supplies a huge `LIMIT` → pre-alloc OOM/panic. Cap or lazily allocate. Remote DoS. **[FACT]** | ✅ |
 | 0.3 | Tighten data-dir permissions | Restrict on-disk data directory perms (0700). **[FACT]** | ✅ |
 | 0.4 | Regression tests for 0.1–0.3 | Craft the malicious queries as tests so they can't regress. | ✅ |
-| 0.5 | Branch + PR + deploy | Ship to the live instance once merged. | ☐ |
+| 0.5 | Branch + PR + deploy | Shipped: PR #91 merged; 6 crates on crates.io; GitHub release + binaries + ghcr `v0.4.9`; Fly redeployed + live-verified. | ✅ |
 
 **Acceptance:** both malicious queries return clean query-level errors; fuzz the arithmetic + `LIMIT`/`OFFSET` paths briefly while you're in there.
 
