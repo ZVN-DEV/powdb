@@ -48,6 +48,14 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          # cargo-fuzz needs nightly (`-Z sanitizer`). The channel is derived
+          # from the action ref, but this step pins the action to a SHA (for
+          # supply-chain safety), and a SHA can't convey "nightly" — so without
+          # this explicit input the action installs *stable* and every fuzz
+          # build fails with "the option `Z` is only accepted on nightly".
+          # Setting it explicitly keeps fuzz working across dependabot SHA bumps.
+          toolchain: nightly
 
       - name: Cargo cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
