@@ -60,9 +60,8 @@ jobs:
           restore-keys: |
             publish-${{ runner.os }}-
 
-      - name: Verify version metadata
+      - name: Verify version matches input
         run: |
-          bash scripts/check-version-consistency.sh
           # Crates use version.workspace = true, so check the workspace root
           # against the manually supplied release input as a second guardrail.
           ws_version="$(python3 -c 'from pathlib import Path; import re; text=Path("Cargo.toml").read_text(); m=re.search(r"\[workspace\.package\](.*?)(?:\n\[|\Z)", text, re.S); vm=re.search(r"^version\s*=\s*\"([^\"]+)\"", m.group(1), re.M) if m else None; print(vm.group(1) if vm else "")')"

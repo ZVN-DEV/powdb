@@ -742,11 +742,6 @@ function openSocket(
   });
 }
 
-
-function asBuffer(chunk: Buffer | string): Buffer {
-  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-}
-
 export { encode, tryDecode } from "./protocol.js";
 export type { Message, WireParam } from "./protocol.js";
 export {
