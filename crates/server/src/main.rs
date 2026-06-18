@@ -255,6 +255,37 @@ fn build_tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Resolve when the process receives a termination signal: SIGINT (Ctrl-C) or,
+/// on Unix, SIGTERM — the signal Docker (`docker stop`), Kubernetes (pod
+/// termination), and systemd send on stop. Awaiting only `ctrl_c()` would let
+/// SIGTERM fall through to the kernel default and kill the process before the
+/// graceful drain + checkpoint could run. On non-Unix targets only Ctrl-C is
+/// available.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                // Failing to install the SIGTERM handler is non-fatal: fall back
+                // to SIGINT-only so the server still starts and Ctrl-C still drains.
+                warn!(error = %e, "could not install SIGTERM handler; only Ctrl-C will drain");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Bootstrap an admin user from `POWDB_ADMIN_USER` / `POWDB_ADMIN_PASSWORD`.
 ///
 /// Creates the user with role "admin" only when both values are present AND the
@@ -482,8 +513,8 @@ async fn main() {
                 }
             }
 
-            // Graceful shutdown on SIGINT (Ctrl-C).
-            _ = tokio::signal::ctrl_c() => {
+            // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (docker/k8s/systemd).
+            _ = shutdown_signal() => {
                 warn!("received shutdown signal, draining connections...");
                 let _ = shutdown_tx.send(true);
                 break;
