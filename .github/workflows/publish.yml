@@ -60,22 +60,35 @@ jobs:
           restore-keys: |
             publish-${{ runner.os }}-
 
-      - name: Verify version matches input
+      - name: Verify version metadata
         run: |
-          # Crates use version.workspace = true, so check the workspace root.
-          ws_version=$(sed -n '/\[workspace\.package\]/,/^\[/{ s/^version = "\(.*\)"/\1/p; }' Cargo.toml)
+          bash scripts/check-version-consistency.sh
+          # Crates use version.workspace = true, so check the workspace root
+          # against the manually supplied release input as a second guardrail.
+          ws_version="$(python3 -c 'from pathlib import Path; import re; text=Path("Cargo.toml").read_text(); m=re.search(r"\[workspace\.package\](.*?)(?:\n\[|\Z)", text, re.S); vm=re.search(r"^version\s*=\s*\"([^\"]+)\"", m.group(1), re.M) if m else None; print(vm.group(1) if vm else "")')"
           if [ "$ws_version" != "${{ inputs.version }}" ]; then
             echo "::error::workspace version ($ws_version) does not match input (${{ inputs.version }})"
             exit 1
           fi
           echo "Workspace version matches ${{ inputs.version }}"
 
+      - name: Check repository version consistency
+        run: bash scripts/check-version-consistency.sh
+
+      - name: Enable pnpm from packageManager
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.29.3 --activate
+
       - name: Run tests
         run: cargo test --workspace
 
-      # Publish in dependency order. Each crate must be indexed by crates.io
-      # before the next dependent crate can be published. The sleep gives the
-      # index time to propagate.
+      - name: Package smoke (npm pack + cargo package list)
+        run: bash scripts/smoke-package.sh
+
+      # Publish in the RELEASES.md dependency order. Each crate must be indexed
+      # by crates.io before the next dependent crate can be published. The
+      # sleep gives the index time to propagate.
 
       - name: Publish powdb-storage
         run: |
@@ -87,18 +100,8 @@ jobs:
             sleep 30
           fi
 
-      - name: Publish powdb-query
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-query --dry-run
-          else
-            cargo publish -p powdb-query
-            echo "Waiting for crates.io to index powdb-query..."
-            sleep 30
-          fi
-
       # powdb-auth is a leaf (argon2 etc., no powdb deps) but powdb-server
-      # depends on it, so it must reach crates.io before the server.
+      # depends on it, so publish it before query/server to match RELEASES.md.
       - name: Publish powdb-auth
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
@@ -106,6 +109,16 @@ jobs:
           else
             cargo publish -p powdb-auth
             echo "Waiting for crates.io to index powdb-auth..."
+            sleep 30
+          fi
+
+      - name: Publish powdb-query
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p powdb-query --dry-run
+          else
+            cargo publish -p powdb-query
+            echo "Waiting for crates.io to index powdb-query..."
             sleep 30
           fi
 

@@ -41,6 +41,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Package smoke (npm pack + cargo package list)
+        run: bash scripts/smoke-package.sh
+
   build:
     name: build (${{ matrix.target }})
     needs: test
@@ -139,9 +142,28 @@ jobs:
       - name: Durability smoke against release binary
         run: bash scripts/smoke-release.sh
 
+  npm-package-smoke:
+    name: TypeScript npm package smoke
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Check repository version consistency
+        run: bash scripts/check-version-consistency.sh
+
+      - name: npm pack dry-run
+        working-directory: clients/ts
+        run: |
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm install --frozen-lockfile
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm build
+          npm pack --dry-run
+
   release:
     name: create release
-    needs: [build, smoke-release]
+    needs: [build, smoke-release, npm-package-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

@@ -42,7 +42,7 @@ Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/ma
 cargo install powdb-cli
 cargo install powdb-server
 
-# TypeScript client (Node 18+) — versions independently of the server crates (see npmjs.com/package/@zvndev/powdb-client for the current version)
+# TypeScript client (Node 18+) — version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
 # Prebuilt binaries (linux x86_64, macos aarch64)

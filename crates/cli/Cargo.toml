@@ -12,11 +12,11 @@ categories = ["database", "command-line-utilities"]
 documentation = "https://docs.rs/powdb-cli"
 
 [dependencies]
-powdb-storage = { version = "0.5.0", path = "../storage" }
-powdb-query = { version = "0.5.0", path = "../query" }
-powdb-server = { version = "0.5.0", path = "../server" }
-powdb-backup = { version = "0.5.0", path = "../backup" }
-powdb-auth = { version = "0.5.0", path = "../auth" }
+powdb-storage = { version = "0.5.1", path = "../storage" }
+powdb-query = { version = "0.5.1", path = "../query" }
+powdb-server = { version = "0.5.1", path = "../server" }
+powdb-backup = { version = "0.5.1", path = "../backup" }
+powdb-auth = { version = "0.5.1", path = "../auth" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tracing.workspace = true

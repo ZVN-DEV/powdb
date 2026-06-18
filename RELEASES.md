@@ -51,8 +51,10 @@ Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `pow
 ```
 [ ] Update workspace version in root Cargo.toml
 [ ] Update inter-crate dep versions in query/backup/server/cli Cargo.toml
-[ ] Update clients/ts/package.json version
-[ ] Update CHANGELOG.md
+[ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
+[ ] Update CHANGELOG.md and the Current release line in RELEASES.md
+[ ] Run bash scripts/check-version-consistency.sh
+[ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
 [ ] Commit: "chore: release vX.Y.Z"
 [ ] cargo publish -p powdb-storage
 [ ] cargo publish -p powdb-auth
@@ -60,7 +62,7 @@ Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `pow
 [ ] cargo publish -p powdb-backup
 [ ] cargo publish -p powdb-server
 [ ] cargo publish -p powdb-cli
-[ ] cd clients/ts && npm publish --access public
+[ ] cd clients/ts && npm pack --dry-run && npm publish --access public
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
 [ ] Verify GitHub Release workflow creates binaries
 [ ] Smoke-test the installed crates.io binary: run the README's documented

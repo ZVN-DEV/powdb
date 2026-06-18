@@ -50,6 +50,10 @@ export type QueryResult =
  */
 export type QueryParam = string | number | bigint | boolean | null;
 
+function socketChunkToBuffer(chunk: Buffer | string): Buffer {
+  return typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+}
+
 /** Map a JS {@link QueryParam} to its wire encoding. */
 function toWireParam(p: QueryParam): WireParam {
   if (p === null) return { tag: "null" };
@@ -165,7 +169,7 @@ export class Client extends EventEmitter<ClientEvents> {
     this.socket = socket;
     this.serverVersion = serverVersion;
 
-    this.socket.on("data", (chunk) => this.onData(chunk));
+    this.socket.on("data", (chunk) => this.onData(socketChunkToBuffer(chunk)));
     this.socket.on("error", (err) => this.onClose(err));
     this.socket.on("close", () => this.onClose(null));
   }
@@ -193,8 +197,8 @@ export class Client extends EventEmitter<ClientEvents> {
         socket.removeListener("error", onError);
         socket.removeListener("close", onClose);
       };
-      const onData = (chunk: Buffer) => {
-        scratch = Buffer.concat([scratch, chunk]);
+      const onData = (chunk: Buffer | string) => {
+        scratch = Buffer.concat([scratch, socketChunkToBuffer(chunk)]);
         let decoded: { msg: Message; consumed: number } | null;
         try {
           decoded = tryDecode(scratch);
@@ -736,6 +740,11 @@ function openSocket(
       socket.connect(port, host);
     }
   });
+}
+
+
+function asBuffer(chunk: Buffer | string): Buffer {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 }
 
 export { encode, tryDecode } from "./protocol.js";

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-06-17
+
+- Kept the npm client release in lockstep with PowDB workspace v0.5.1.
+- No TypeScript API changes; this is a dependency/version-alignment release.
+
+
 All notable changes to `@zvndev/powdb-client`.
 
 ## Compatibility

@@ -49,6 +49,41 @@ yourself. This is a guardrail against pidfile corruption.
 scripts/dev.sh down` on ubuntu so the script doesn't bit-rot. Any error
 in the cycle fails the CI job (`set -euo pipefail` inside the script).
 
+## `check-version-consistency.sh` — release metadata drift gate
+
+```bash
+bash scripts/check-version-consistency.sh
+```
+
+Checks that the workspace version, publishable inter-crate dependency versions,
+`clients/ts/package.json`, `clients/ts/src/index.ts` `CLIENT_VERSION`,
+`CHANGELOG.md`, and `RELEASES.md` all agree. CI runs this as the
+`version consistency` job, and release/publish workflows run it before packaging.
+
+## `quality` / `quality.sh` — one-command local quality gate
+
+```bash
+scripts/quality help     # describe modes
+scripts/quality fast     # version check + rustfmt + TS pure checks via pnpm 10
+bash scripts/quality.sh --full
+```
+
+Default mode mirrors the highest-signal local CI checks without requiring
+optional scanners. `--full` adds clippy, workspace tests, doc tests,
+server-backed TypeScript tests, package smoke, and optional supply-chain scans
+when `cargo-audit` / `gitleaks` are installed.
+
+## `smoke-package.sh` — credential-free package smoke
+
+```bash
+bash scripts/smoke-package.sh
+```
+
+Runs the version consistency gate, builds and dry-runs/import-smokes the TypeScript npm
+package via `npm exec --package=pnpm@10.29.3`, then validates the publishable Rust crates with
+`cargo package --list`. Release and publish workflows use this before artifact
+creation or credentialed publishing.
+
 ## `update-bench-baseline.sh`
 
 Resets the criterion benchmark baselines after intentional perf changes.
@@ -77,3 +112,22 @@ python3 scripts/agent-eval/run.py \
 - No model calls anywhere, and **not wired into CI**. See
   `scripts/agent-eval/README.md` for the full contract and the SQLite
   baseline procedure.
+## Quality and release gates
+
+Use these repo-local gates before opening or merging infrastructure/release PRs:
+
+```bash
+bash scripts/check-version-consistency.sh  # workspace/crate/TS/docs version lockstep
+scripts/quality help                       # document local quality modes
+scripts/quality --fast                     # quick non-destructive local smoke
+scripts/quality                            # default Rust fmt/check/clippy/test gate
+scripts/quality --full                     # CI-parity where local tools/deps exist
+```
+
+`check-version-consistency.sh` fails if the workspace version, publishable
+inter-crate dependency pins, `clients/ts/package.json`, `CLIENT_VERSION`,
+`CHANGELOG.md`, or `RELEASES.md` drift apart. The CI version-consistency job and
+publish workflow call the same script so local release prep and CI share one
+source of truth.
+
+`quality` and `smoke-package.sh` invoke pnpm through `npm exec --package=pnpm@10.29.3`, so they do not depend on local Corepack signing keys or a pre-existing `clients/ts/node_modules`. Optional security tools are still local-only; if `cargo-audit` or `gitleaks` are missing, the script prints install hints and skips only those optional checks.
