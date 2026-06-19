@@ -8,6 +8,18 @@ When cutting a release, follow the checklist at the bottom.
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
 
+## v0.6.1 Local Handoff Status
+
+`codex/hardening-0.6.1` is a local hardening candidate for `v0.6.1`. The
+candidate intentionally has not been pushed, tagged, published, or deployed.
+See `docs/strategy/2026-06-19-v0.6.1-release-handoff.md` for exact release
+notes, verification evidence, and blockers.
+
+Before publication, create a dedicated version-bump commit for `0.6.1`, rerun
+the release gates below, and get Kirby sign-off. Do not publish crates, npm
+packages, container images, tags, GitHub releases, or public deployments from
+this handoff state.
+
 ## Registries
 
 | Target | Package | Registry URL |

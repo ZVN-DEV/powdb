@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `powdb-server` now applies `POWDB_REQUIRE_TLS=1` to every credentialed auth
+  mode: shared-password auth, named-user auth, and first-run admin bootstrap
+  auth. Operators can no longer accidentally enable named users or bootstrap
+  admin credentials over plaintext TCP when TLS is required.
+- Backup restore now rejects unsafe manifest file names before writing files:
+  absolute paths, `..`, path separators, Windows drive/ADS-style colons,
+  unexpected file names, and mismatched incremental delta targets are all
+  refused. This closes the path-traversal restore class for full and
+  incremental backup archives.
+- Remote row responses are now capped before wire serialization. Oversized
+  materialized result sets return an actionable `result too large` error
+  instead of letting one query allocate unbounded response memory.
+
+### Fixed
+- Query timeout handling no longer claims a blocking query was aborted while
+  the underlying work can still continue in the blocking executor. The timeout
+  counter now represents threshold breaches, and the handler waits for the work
+  to finish before replying so timed-out writes cannot keep mutating detached
+  from the connection lifecycle.
+- Deployment examples and release docs no longer pin stale `v0.4.8` container
+  tags in active examples; they now point at the current `v0.6.0` release line
+  until the dedicated `v0.6.1` version-bump commit is made.
+
+### Known limitations
+- Full cooperative query cancellation is still planned work rather than part of
+  this hardening patch. See
+  `docs/strategy/2026-06-19-query-cancellation-hardening.md` for the scoped
+  implementation plan.
+
 ## [0.6.0] - 2026-06-19
 
 ### Added
