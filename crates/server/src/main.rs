@@ -51,17 +51,17 @@ fn parse_require_tls(raw: Option<&str>) -> bool {
 }
 
 /// Enforce the TLS requirement at startup. When `require_tls` is set, a server
-/// configured with a password but no TLS cert/key would transmit credentials
-/// in cleartext — refuse to start. Returns `Err` with a message describing the
-/// misconfiguration; `Ok(())` otherwise.
+/// configured with any credential-based auth but no TLS cert/key would transmit
+/// credentials in cleartext — refuse to start. Returns `Err` with a message
+/// describing the misconfiguration; `Ok(())` otherwise.
 fn check_tls_requirement(
     require_tls: bool,
-    password_set: bool,
+    auth_configured: bool,
     tls_configured: bool,
 ) -> Result<(), String> {
-    if require_tls && password_set && !tls_configured {
+    if require_tls && auth_configured && !tls_configured {
         return Err(
-            "POWDB_REQUIRE_TLS is set but a password is configured without TLS \
+            "POWDB_REQUIRE_TLS is set but authentication is configured without TLS \
              (provide --tls-cert and --tls-key, or unset POWDB_REQUIRE_TLS)"
                 .to_string(),
         );
@@ -203,7 +203,7 @@ fn parse_args() -> Args {
                 println!("        --tls-key <PATH>       TLS private key file (PEM)");
                 println!("        --idle-timeout <SECS>  Idle connection timeout (default: 300)");
                 println!(
-                    "        --query-timeout <SECS> Per-query execution timeout (default: 30)"
+                    "        --query-timeout <SECS> Per-query timeout threshold metric (default: 30)"
                 );
                 println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
                 println!("    -V, --version              Print version and exit");
@@ -421,18 +421,23 @@ async fn main() {
 
     let tls_enabled = tls_acceptor.is_some();
 
+    let auth_configured = args.password.is_some() || !users.is_empty();
+
     // WS4: enforce TLS when required. Refuse to start (rather than silently
-    // transmitting credentials in cleartext) if a password is set without TLS.
-    if let Err(msg) = check_tls_requirement(args.require_tls, args.password.is_some(), tls_enabled)
-    {
+    // transmitting credentials in cleartext) if any auth mode is enabled without
+    // TLS. This covers shared-password auth, persisted named users, and
+    // just-bootstrapped admins.
+    if let Err(msg) = check_tls_requirement(args.require_tls, auth_configured, tls_enabled) {
         error!("{msg}");
         std::process::exit(2);
     }
 
-    // CRITICAL: warn when password auth is enabled without TLS encryption.
-    if args.password.is_some() && tls_acceptor.is_none() {
-        warn!("WARNING: Password authentication enabled without TLS. Credentials will be sent in plaintext.");
-        eprintln!("!!! CRITICAL: Password authentication enabled without TLS. Credentials will be sent in plaintext. !!!");
+    // CRITICAL: warn when credential auth is enabled without TLS encryption.
+    if auth_configured && tls_acceptor.is_none() {
+        warn!(
+            "WARNING: Authentication enabled without TLS. Credentials will be sent in plaintext."
+        );
+        eprintln!("!!! CRITICAL: Authentication enabled without TLS. Credentials will be sent in plaintext. !!!");
     }
 
     let addr = format!("{}:{}", args.bind, args.port);
@@ -460,7 +465,7 @@ async fn main() {
     };
 
     info!(
-        addr = %addr, data_dir = %args.data_dir, auth = %args.password.is_some(),
+        addr = %addr, data_dir = %args.data_dir, auth = auth_configured,
         tls = tls_enabled,
         idle_timeout = args.idle_timeout_secs, query_timeout = args.query_timeout_secs,
         "powdb server listening"
@@ -596,6 +601,14 @@ mod tests {
     #[test]
     fn require_tls_rejects_password_without_tls() {
         // POWDB_REQUIRE_TLS=1 + password set + no TLS cert/key → hard error.
+        let err = check_tls_requirement(true, true, false);
+        assert!(err.is_err(), "expected startup refusal");
+    }
+
+    #[test]
+    fn require_tls_rejects_named_user_auth_without_tls() {
+        // The caller passes auth_configured=true for either shared-password or
+        // named-user auth. Named users must not silently bypass REQUIRE_TLS.
         let err = check_tls_requirement(true, true, false);
         assert!(err.is_err(), "expected startup refusal");
     }

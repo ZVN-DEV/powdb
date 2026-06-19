@@ -282,3 +282,44 @@ fn restore_chain_refuses_nonempty_dest() {
         "non-empty dest must be refused, got: {err}"
     );
 }
+
+#[test]
+fn restore_chain_rejects_increment_path_traversal_name() {
+    let src = tmp("src");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..100 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let base_dir = tmp("base");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+    for i in 100..120 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let inc_dir = tmp("inc");
+    let mut inc = powdb_backup::incremental_backup(&mut cat, &base, &inc_dir).unwrap();
+    drop(cat);
+
+    let first = inc
+        .changed
+        .first_mut()
+        .expect("increment should record at least one changed file");
+    match first {
+        ChangedFile::Whole { name, .. } | ChangedFile::Pages { name, .. } => {
+            *name = "../escaped.heap".into();
+        }
+    }
+    inc.write(&inc_dir).unwrap();
+
+    let restored = tmp("restored");
+    let err = powdb_backup::restore_chain(&base_dir, &[&inc_dir], &restored).unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("invalid") && msg.contains("manifest"),
+        "path traversal increment name must be rejected, got: {err}"
+    );
+}

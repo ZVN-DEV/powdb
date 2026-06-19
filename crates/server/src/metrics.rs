@@ -203,7 +203,7 @@ impl Metrics {
         counter(
             &mut out,
             "powdb_query_timeouts_total",
-            "Total queries aborted by the per-query timeout.",
+            "Total queries whose execution exceeded the configured query timeout threshold.",
             self.query_timeouts_total.load(Relaxed),
         );
         counter(

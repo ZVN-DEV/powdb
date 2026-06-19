@@ -32,6 +32,14 @@ pub fn new_tx_gate() -> TxGate {
 /// Maximum query text length accepted from the wire (1 MB).
 const MAX_QUERY_LENGTH: usize = 1024 * 1024;
 
+/// Maximum encoded response payload size (64 MB). The wire format is still a
+/// single frame today, so oversized result sets must fail cleanly instead of
+/// building an unbounded `Vec<Vec<String>>` and frame in memory.
+#[cfg(not(test))]
+const MAX_RESPONSE_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const MAX_RESPONSE_PAYLOAD_SIZE: usize = 1024;
+
 /// Timeout for writing a response to the client. Prevents slow-drain
 /// clients from blocking the handler indefinitely.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -268,6 +276,7 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "sort input exceeds",
     "join result exceeds",
     "query exceeded memory budget",
+    "result too large",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -784,11 +793,31 @@ where
 {
     let _in_flight = metrics.in_flight_guard();
     let start = Instant::now();
-    let handle = tokio::task::spawn_blocking(move || f(engine, input, principal));
-    let abort_handle = handle.abort_handle();
-    let (message, outcome) = match tokio::time::timeout(query_timeout, handle).await {
-        Ok(Ok(Ok(result))) => (query_result_to_message(result), QueryOutcome::Ok),
-        Ok(Ok(Err(e))) => {
+    let mut handle = tokio::task::spawn_blocking(move || f(engine, input, principal));
+    let mut exceeded_timeout = false;
+    let join_result = tokio::select! {
+        result = &mut handle => result,
+        _ = tokio::time::sleep(query_timeout) => {
+            exceeded_timeout = true;
+            // `spawn_blocking` tasks that have started cannot be aborted safely.
+            // Wait for completion before replying so a client never receives a
+            // timeout while the same query keeps running and possibly mutating
+            // state in the background.
+            handle.await
+        }
+    };
+
+    let (message, outcome) = match join_result {
+        Ok(Ok(result)) => match query_result_to_message(result) {
+            Ok(message) => (message, QueryOutcome::Ok),
+            Err(e) => (
+                Message::Error {
+                    message: sanitize_error(&e.to_string()),
+                },
+                QueryOutcome::Error,
+            ),
+        },
+        Ok(Err(e)) => {
             let outcome = if matches!(e, QueryError::MemoryLimitExceeded { .. }) {
                 QueryOutcome::MemoryLimit
             } else {
@@ -801,23 +830,18 @@ where
                 outcome,
             )
         }
-        Ok(Err(e)) => (
+        Err(e) => (
             Message::Error {
                 message: format!("internal error: {e}"),
             },
             QueryOutcome::Error,
         ),
-        Err(_) => {
-            abort_handle.abort();
-            (
-                Message::Error {
-                    message: "query timeout exceeded".into(),
-                },
-                QueryOutcome::Timeout,
-            )
-        }
     };
-    metrics.record_query(start.elapsed(), outcome);
+    if exceeded_timeout {
+        metrics.record_query(start.elapsed(), QueryOutcome::Timeout);
+    } else {
+        metrics.record_query(start.elapsed(), outcome);
+    }
     message
 }
 
@@ -1028,19 +1052,6 @@ where
                         &metrics,
                     )
                     .await;
-                    if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
-                    {
-                        warn!(peer = %peer, query = %query, "query timeout exceeded");
-                        if tx_permit.is_some() {
-                            let engine = engine.clone();
-                            let principal = principal.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                rollback_open_transaction(engine, principal)
-                            })
-                            .await;
-                        }
-                        tx_permit.take();
-                    }
                     response
                 }
             }
@@ -1065,19 +1076,6 @@ where
                         &metrics,
                     )
                     .await;
-                    if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
-                    {
-                        warn!(peer = %peer, query = %query, "SQL query timeout exceeded");
-                        if tx_permit.is_some() {
-                            let engine = engine.clone();
-                            let principal = principal.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                rollback_open_transaction(engine, principal)
-                            })
-                            .await;
-                        }
-                        tx_permit.take();
-                    }
                     response
                 }
             }
@@ -1103,19 +1101,6 @@ where
                         &metrics,
                     )
                     .await;
-                    if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
-                    {
-                        warn!(peer = %peer, query = %query, "query timeout exceeded");
-                        if tx_permit.is_some() {
-                            let engine = engine.clone();
-                            let principal = principal.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                rollback_open_transaction(engine, principal)
-                            })
-                            .await;
-                        }
-                        tx_permit.take();
-                    }
                     response
                 }
             }
@@ -1150,26 +1135,51 @@ where
     info!(peer = %peer, "client disconnected");
 }
 
-fn query_result_to_message(result: QueryResult) -> Message {
+fn charge_response_bytes(total: &mut usize, bytes: usize) -> Result<(), QueryError> {
+    *total = total.saturating_add(bytes);
+    if *total > MAX_RESPONSE_PAYLOAD_SIZE {
+        return Err(QueryError::Execution(format!(
+            "result too large: encoded response exceeds {} bytes; add a limit or narrower projection",
+            MAX_RESPONSE_PAYLOAD_SIZE
+        )));
+    }
+    Ok(())
+}
+
+fn query_result_to_message(result: QueryResult) -> Result<Message, QueryError> {
     match result {
         QueryResult::Rows { columns, rows } => {
-            let str_rows: Vec<Vec<String>> = rows
-                .iter()
-                .map(|row| row.iter().map(value_to_display).collect())
-                .collect();
-            Message::ResultRows {
-                columns,
-                rows: str_rows,
+            let mut encoded_bytes = 2usize; // column count
+            let mut out_columns = Vec::with_capacity(columns.len());
+            for col in columns {
+                charge_response_bytes(&mut encoded_bytes, 4 + col.len())?;
+                out_columns.push(col);
             }
+            charge_response_bytes(&mut encoded_bytes, 4)?; // row count
+
+            let mut str_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut str_row = Vec::with_capacity(row.len());
+                for value in row {
+                    let display = value_to_display(&value);
+                    charge_response_bytes(&mut encoded_bytes, 4 + display.len())?;
+                    str_row.push(display);
+                }
+                str_rows.push(str_row);
+            }
+            Ok(Message::ResultRows {
+                columns: out_columns,
+                rows: str_rows,
+            })
         }
-        QueryResult::Scalar(val) => Message::ResultScalar {
+        QueryResult::Scalar(val) => Ok(Message::ResultScalar {
             value: value_to_display(&val),
-        },
-        QueryResult::Modified(n) => Message::ResultOk { affected: n },
-        QueryResult::Created(name) => Message::ResultMessage {
+        }),
+        QueryResult::Modified(n) => Ok(Message::ResultOk { affected: n }),
+        QueryResult::Created(name) => Ok(Message::ResultMessage {
             message: format!("type {name} created"),
-        },
-        QueryResult::Executed { message } => Message::ResultMessage { message },
+        }),
+        QueryResult::Executed { message } => Ok(Message::ResultMessage { message }),
     }
 }
 
@@ -1234,9 +1244,24 @@ mod tests {
             "sort input exceeds row limit — add a LIMIT clause",
             "join result exceeds row limit",
             "query exceeded memory budget: requested 100 bytes, limit 50 bytes",
+            "result too large: encoded response exceeds 1024 bytes; add a limit or narrower projection",
         ] {
             assert_eq!(sanitize_error(msg), msg, "should pass through verbatim");
         }
+    }
+
+    #[test]
+    fn oversized_result_is_rejected_before_wire_encoding() {
+        let long = "x".repeat(MAX_RESPONSE_PAYLOAD_SIZE);
+        let result = QueryResult::Rows {
+            columns: vec!["payload".into()],
+            rows: vec![vec![Value::Str(long)]],
+        };
+        let err = query_result_to_message(result).unwrap_err();
+        assert!(
+            err.to_string().starts_with("result too large"),
+            "unexpected error: {err}"
+        );
     }
 
     // ---- Role enforcement (Fix: readonly role was not enforced) ----
