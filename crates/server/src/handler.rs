@@ -1,3 +1,4 @@
+use crate::metrics::{Metrics, QueryOutcome};
 use crate::protocol::{Message, WireParam};
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine};
@@ -313,6 +314,8 @@ pub struct ConnOpts<'a> {
     pub query_timeout: Duration,
     pub rate_limiter: Option<&'a AuthRateLimiter>,
     pub peer_addr: Option<std::net::SocketAddr>,
+    /// Shared server metrics. Always present; tests pass `Arc::new(Metrics::new())`.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Execute a query against the engine under the RwLock. Read-only
@@ -495,6 +498,7 @@ async fn execute_wire_query(
     query: String,
     principal: Option<Principal>,
     query_timeout: Duration,
+    metrics: &Arc<Metrics>,
 ) -> Message {
     match classify_query_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
@@ -516,6 +520,7 @@ async fn execute_wire_query(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -530,6 +535,7 @@ async fn execute_wire_query(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -544,6 +550,7 @@ async fn execute_wire_query(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await
@@ -562,6 +569,7 @@ async fn execute_wire_query(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -578,6 +586,7 @@ async fn execute_wire_query_sql(
     query: String,
     principal: Option<Principal>,
     query_timeout: Duration,
+    metrics: &Arc<Metrics>,
 ) -> Message {
     match classify_sql_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
@@ -599,6 +608,7 @@ async fn execute_wire_query_sql(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -613,6 +623,7 @@ async fn execute_wire_query_sql(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -627,6 +638,7 @@ async fn execute_wire_query_sql(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await
@@ -645,6 +657,7 @@ async fn execute_wire_query_sql(
                 query,
                 principal,
                 query_timeout,
+                metrics,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -654,6 +667,10 @@ async fn execute_wire_query_sql(
     }
 }
 
+// One over clippy's default arg limit: the metrics handle was threaded through
+// to instrument the typed query result. Bundling these into a struct would add
+// more noise than it removes for an internal dispatcher.
+#[allow(clippy::too_many_arguments)]
 async fn execute_wire_query_with_params(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
@@ -662,6 +679,7 @@ async fn execute_wire_query_with_params(
     params: Vec<WireParam>,
     principal: Option<Principal>,
     query_timeout: Duration,
+    metrics: &Arc<Metrics>,
 ) -> Message {
     match classify_params_transaction_control(&query, &params) {
         Some(TransactionControl::Begin) => {
@@ -683,6 +701,7 @@ async fn execute_wire_query_with_params(
                 (query, params),
                 principal,
                 query_timeout,
+                metrics,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -699,6 +718,7 @@ async fn execute_wire_query_with_params(
                 (query, params),
                 principal,
                 query_timeout,
+                metrics,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -715,6 +735,7 @@ async fn execute_wire_query_with_params(
                 (query, params),
                 principal,
                 query_timeout,
+                metrics,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -735,6 +756,7 @@ async fn execute_wire_query_with_params(
                 (query, params),
                 principal,
                 query_timeout,
+                metrics,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -751,6 +773,7 @@ async fn run_blocking_query<T, F>(
     input: T,
     principal: Option<Principal>,
     query_timeout: Duration,
+    metrics: &Arc<Metrics>,
     f: F,
 ) -> Message
 where
@@ -759,23 +782,43 @@ where
         + Send
         + 'static,
 {
+    let _in_flight = metrics.in_flight_guard();
+    let start = Instant::now();
     let handle = tokio::task::spawn_blocking(move || f(engine, input, principal));
     let abort_handle = handle.abort_handle();
-    match tokio::time::timeout(query_timeout, handle).await {
-        Ok(Ok(Ok(result))) => query_result_to_message(result),
-        Ok(Ok(Err(e))) => Message::Error {
-            message: sanitize_error(&e.to_string()),
-        },
-        Ok(Err(e)) => Message::Error {
-            message: format!("internal error: {e}"),
-        },
+    let (message, outcome) = match tokio::time::timeout(query_timeout, handle).await {
+        Ok(Ok(Ok(result))) => (query_result_to_message(result), QueryOutcome::Ok),
+        Ok(Ok(Err(e))) => {
+            let outcome = if matches!(e, QueryError::MemoryLimitExceeded { .. }) {
+                QueryOutcome::MemoryLimit
+            } else {
+                QueryOutcome::Error
+            };
+            (
+                Message::Error {
+                    message: sanitize_error(&e.to_string()),
+                },
+                outcome,
+            )
+        }
+        Ok(Err(e)) => (
+            Message::Error {
+                message: format!("internal error: {e}"),
+            },
+            QueryOutcome::Error,
+        ),
         Err(_) => {
             abort_handle.abort();
-            Message::Error {
-                message: "query timeout exceeded".into(),
-            }
+            (
+                Message::Error {
+                    message: "query timeout exceeded".into(),
+                },
+                QueryOutcome::Timeout,
+            )
         }
-    }
+    };
+    metrics.record_query(start.elapsed(), outcome);
+    message
 }
 
 fn is_success_response(msg: &Message) -> bool {
@@ -806,6 +849,7 @@ where
         query_timeout,
         rate_limiter,
         peer_addr,
+        metrics,
     } = opts;
 
     let peer = peer_addr
@@ -877,6 +921,7 @@ where
             match outcome {
                 AuthOutcome::Rejected => {
                     warn!(peer = %peer, db = %db_name, "auth rejected");
+                    metrics.inc_auth_failure();
                     // Record the failure for rate limiting.
                     if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                         record_auth_failure(limiter, ip);
@@ -980,6 +1025,7 @@ where
                         query.clone(),
                         principal.clone(),
                         query_timeout,
+                        &metrics,
                     )
                     .await;
                     if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
@@ -1016,6 +1062,7 @@ where
                         query.clone(),
                         principal.clone(),
                         query_timeout,
+                        &metrics,
                     )
                     .await;
                     if matches!(&response, Message::Error { message } if message == "query timeout exceeded")
@@ -1053,6 +1100,7 @@ where
                         params.clone(),
                         principal.clone(),
                         query_timeout,
+                        &metrics,
                     )
                     .await;
                     if matches!(&response, Message::Error { message } if message == "query timeout exceeded")

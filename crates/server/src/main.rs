@@ -1,5 +1,6 @@
 use powdb_query::executor::Engine;
 use powdb_server::handler;
+use powdb_server::metrics::{serve_metrics, Metrics};
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
@@ -22,6 +23,8 @@ struct Args {
     tls_key: Option<String>,
     query_memory_limit: usize,
     require_tls: bool,
+    /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
+    metrics_addr: Option<String>,
 }
 
 /// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
@@ -93,6 +96,10 @@ fn parse_args() -> Args {
         .ok()
         .filter(|s| !s.is_empty());
     let mut tls_key: Option<String> = std::env::var("POWDB_TLS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    // Optional Prometheus metrics endpoint (host:port). Off unless set.
+    let mut metrics_addr: Option<String> = std::env::var("POWDB_METRICS_ADDR")
         .ok()
         .filter(|s| !s.is_empty());
     // WS2: per-query memory budget. Env-only (no CLI flag) for now.
@@ -170,6 +177,14 @@ fn parse_args() -> Args {
                 }
                 tls_key = Some(argv[i].clone());
             }
+            "--metrics-addr" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--metrics-addr requires a value");
+                    std::process::exit(2);
+                }
+                metrics_addr = Some(argv[i].clone());
+            }
             "--version" | "-V" => {
                 println!("powdb-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -190,6 +205,7 @@ fn parse_args() -> Args {
                 println!(
                     "        --query-timeout <SECS> Per-query execution timeout (default: 30)"
                 );
+                println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
                 println!();
@@ -200,6 +216,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
+                println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
             }
@@ -223,6 +240,7 @@ fn parse_args() -> Args {
         tls_key,
         query_memory_limit,
         require_tls,
+        metrics_addr,
     }
 }
 
@@ -426,6 +444,21 @@ async fn main() {
         }
     };
 
+    // Optional metrics endpoint. Construct the registry now (handlers always
+    // hold an Arc<Metrics>) and bind eagerly so a port conflict fails fast at
+    // startup, consistent with the main listener above.
+    let metrics = Arc::new(Metrics::new());
+    let metrics_listener = match args.metrics_addr.as_deref() {
+        Some(maddr) => match TcpListener::bind(maddr).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                error!(addr = %maddr, error = %e, "failed to bind metrics endpoint");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     info!(
         addr = %addr, data_dir = %args.data_dir, auth = %args.password.is_some(),
         tls = tls_enabled,
@@ -437,6 +470,15 @@ async fn main() {
 
     // Shutdown broadcast: `false` initially, flipped to `true` on SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Spawn the metrics endpoint now that the shutdown channel exists, so it
+    // drains with the rest of the server on SIGINT/SIGTERM.
+    if let Some(ml) = metrics_listener {
+        if let Some(maddr) = args.metrics_addr.as_deref() {
+            info!(addr = %maddr, "metrics endpoint listening");
+        }
+        tokio::spawn(serve_metrics(ml, metrics.clone(), shutdown_rx.clone()));
+    }
 
     let idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     let query_timeout = std::time::Duration::from_secs(args.query_timeout_secs);
@@ -464,8 +506,13 @@ async fn main() {
                         let qtimeout = query_timeout;
                         let rl = rate_limiter.clone();
                         let tls = tls_acceptor.clone();
+                        let m = metrics.clone();
                         tokio::spawn(async move {
                             let peer_addr = Some(peer);
+                            m.inc_connection_accepted();
+                            // RAII gauge: decremented when this task ends, even
+                            // on an early return or panic.
+                            let _active = m.active_guard();
                             if let Some(acceptor) = tls {
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
@@ -481,10 +528,12 @@ async fn main() {
                                                 query_timeout: qtimeout,
                                                 rate_limiter: Some(&rl),
                                                 peer_addr,
+                                                metrics: m.clone(),
                                             },
                                         ).await;
                                     }
                                     Err(e) => {
+                                        m.inc_tls_failure();
                                         warn!(peer = %peer, error = %e, "TLS handshake failed");
                                     }
                                 }
@@ -501,6 +550,7 @@ async fn main() {
                                         query_timeout: qtimeout,
                                         rate_limiter: Some(&rl),
                                         peer_addr,
+                                        metrics: m.clone(),
                                     },
                                 ).await;
                             }

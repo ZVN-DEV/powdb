@@ -4,4 +4,5 @@
 //! and concurrent query execution via `spawn_blocking`.
 
 pub mod handler;
+pub mod metrics;
 pub mod protocol;

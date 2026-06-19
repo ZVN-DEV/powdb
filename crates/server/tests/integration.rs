@@ -92,6 +92,7 @@ async fn test_full_lifecycle() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr,
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -217,6 +218,7 @@ async fn explicit_transaction_blocks_other_connections_until_closed() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -328,6 +330,7 @@ async fn dropped_connection_mid_transaction_rolls_back_and_frees_gate() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -439,6 +442,7 @@ async fn test_user_auth_handshake() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -542,6 +546,7 @@ async fn test_empty_store_shared_password_fallback() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -653,6 +658,7 @@ async fn test_readonly_role_enforced_over_tcp() {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
