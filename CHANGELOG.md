@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `powdb-server` now drains gracefully on **SIGTERM**, not just SIGINT (Ctrl-C). `docker stop`, Kubernetes pod termination, and systemd all send SIGTERM — previously the process was killed by the signal, skipping the connection drain and `catalog.checkpoint()`. Committed data was still recovered via WAL replay on restart, but in-flight queries were cut and the WAL was left un-checkpointed (slower recovery).
+
 ## [0.5.1] - 2026-06-17
 
 ### Changed

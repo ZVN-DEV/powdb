@@ -266,6 +266,107 @@ jobs:
           sleep 1
           bash scripts/dev.sh down
 
+  version-consistency:
+    name: version consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Check release/version metadata
+        run: bash scripts/check-version-consistency.sh
+
+  ts-client:
+    name: TypeScript client (build + tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ts-client-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ts-client-${{ runner.os }}-
+
+      - name: Configure pnpm store
+        working-directory: clients/ts
+        run: npm exec --yes --package=pnpm@10.29.3 -- pnpm config set store-dir .pnpm-store
+
+      - name: pnpm cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: clients/ts/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('clients/ts/pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-${{ runner.os }}-
+
+      - name: Install TypeScript dependencies
+        working-directory: clients/ts
+        run: npm exec --yes --package=pnpm@10.29.3 -- pnpm install --frozen-lockfile
+
+      - name: Build TypeScript package
+        working-directory: clients/ts
+        run: npm exec --yes --package=pnpm@10.29.3 -- pnpm build
+
+      - name: Run pure TypeScript tests
+        working-directory: clients/ts
+        run: |
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:escape
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:protocol
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:typed
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:errors
+
+      - name: Build release powdb-server for server-backed TypeScript tests
+        run: cargo build --release -p powdb-server
+
+      - name: Run server-backed TypeScript tests
+        working-directory: clients/ts
+        run: |
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:auth
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:pool
+
+  secret-scan:
+    name: gitleaks secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # The gitleaks GitHub Action wrapper requires a paid license for
+      # organization repos (ZVN-DEV is an org) and hard-fails without a
+      # GITLEAKS_LICENSE secret before scanning anything. The gitleaks CLI
+      # itself is MIT-licensed and free, so we pin and run the binary directly
+      # — same `gitleaks detect` invocation as scripts/quality.sh, at $0.
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install gitleaks CLI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (working tree, low-noise config)
+        run: gitleaks detect --no-git --redact --config .gitleaks.toml --source .
+
   audit:
     name: cargo audit (advisories)
     runs-on: ubuntu-24.04
@@ -291,26 +392,3 @@ jobs:
           #   RUSTSEC-2026-0180  postgres-protocol hstore DoS (→ powdb-compare)
           #   RUSTSEC-2026-0178  tokio-postgres DataRow DoS   (→ powdb-compare)
           ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178
-
-  ts-client-version:
-    name: ts-client version consistency
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-
-      # Guard against the version drift we hit once: the CLIENT_VERSION
-      # constant sent in the handshake (in src/ — the source of truth; dist/ is
-      # gitignored and built from it at publish time) must match package.json.
-      # Uses the runner's preinstalled Node — no extra action, no install.
-      - name: Assert package.json === CLIENT_VERSION
-        working-directory: clients/ts
-        run: |
-          PKG_VER="$(node -p "require('./package.json').version")"
-          SRC_VER="$(grep -oE 'CLIENT_VERSION = "[^"]+"' src/index.ts | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          echo "package.json=$PKG_VER  src CLIENT_VERSION=$SRC_VER"
-          if [ "$PKG_VER" != "$SRC_VER" ]; then
-            echo "::error::TS client version drift: package.json=$PKG_VER but src CLIENT_VERSION=$SRC_VER — bump CLIENT_VERSION in clients/ts/src/index.ts to match package.json, then 'npm run build'"
-            exit 1
-          fi

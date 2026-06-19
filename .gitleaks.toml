@@ -1,0 +1,9 @@
+title = "PowDB gitleaks configuration"
+
+[allowlist]
+description = "Exact documented placeholders that are intentionally non-secret."
+regexes = [
+  '''ci-smoke-not-a-real-secret''',
+  '''example-(password|token|secret)''',
+  '''(changeme|not-a-real-secret)''',
+]

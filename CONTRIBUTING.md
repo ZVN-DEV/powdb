@@ -43,15 +43,15 @@ clients/ts       # TypeScript client + demo
 **Never push directly to `main`.** Every change — docs, CI tweaks, version bumps, "trivial" fixes, all of it — goes through a pull request.
 
 1. Create a branch from `main` (kebab-case)
-2. Make changes, run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`
-3. Run `cargo test --workspace` — all tests must pass
-4. Run `cargo run --release -p powdb-compare` to check for performance regressions
+2. Make changes, then run `scripts/quality fast` for the local fast gate
+3. Before review, run `bash scripts/quality.sh --full` or document any unavailable optional security tools
+4. Run `cargo run --release -p powdb-compare` to check for performance regressions when the change can affect query/storage performance
 5. Push the branch and open a PR against `main` using the template in `.github/pull_request_template.md`
 
 ### Branch protection on `main`
 
 - PRs are required (no direct pushes)
-- 7 status checks must pass, all from `ci.yml`: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, and examples-smoke
+- Required status checks must pass, all from `ci.yml`: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, examples-smoke, version consistency, TypeScript client, and gitleaks secret scan
 - Force-push is rejected by branch protection
 
 Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work** — routine work goes through PRs even when bypass is technically available.
@@ -77,6 +77,9 @@ PRs must pass these gates (see `.github/workflows/`):
 - **audit** — `cargo audit` against the advisory database
 - **msrv-consistency** — verifies the declared MSRV (`1.93`) builds
 - **examples-smoke** — terraform validate + compose config + dev.sh cycle on the deploy examples
+- **version consistency** — `scripts/check-version-consistency.sh` prevents Rust/TypeScript/changelog/release-doc drift
+- **TypeScript client build + tests** — installs with `pnpm --frozen-lockfile`, builds, and runs pure plus server-backed client tests
+- **gitleaks secret scan** — low-noise supply-chain/secret scan with documented placeholder allowlist
 
 The criterion benchmark suite (`.github/workflows/bench.yml`) is **manual-only** (`workflow_dispatch`) and is *not* a required PR gate — shared-runner noise makes it unreliable as a blocking check. Run the regression gate locally instead (below).
 
@@ -113,3 +116,22 @@ The planner has no catalog access (it's a pure function). Plan lowering (e.g., `
 ## License
 
 MIT
+
+### Local quality gate
+
+TypeScript checks use `npm exec --package=pnpm@10.29.3` so contributors do not need a globally activated pnpm/Corepack setup.
+
+
+Before submitting infrastructure, release, or client changes, run the shared
+local gate that mirrors CI where practical:
+
+```bash
+scripts/quality help
+scripts/quality --fast   # quick local smoke
+scripts/quality          # default fmt/check/clippy/test gate
+```
+
+For release prep, also run `bash scripts/check-version-consistency.sh` so the
+Rust workspace version, publishable inter-crate dependency pins, TypeScript
+client metadata, changelog, and release notes stay in lockstep.
+
