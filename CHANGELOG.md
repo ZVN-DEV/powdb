@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-19
+
 ### Security
 - `powdb-server` now applies `POWDB_REQUIRE_TLS=1` to every credentialed auth
   mode: shared-password auth, named-user auth, and first-run admin bootstrap
@@ -27,9 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter now represents threshold breaches, and the handler waits for the work
   to finish before replying so timed-out writes cannot keep mutating detached
   from the connection lifecycle.
-- Deployment examples and release docs no longer pin stale `v0.4.8` container
-  tags in active examples; they now point at the current `v0.6.0` release line
-  until the dedicated `v0.6.1` version-bump commit is made.
+- Deployment examples and release docs no longer pin stale container/image
+  versions in active examples; they now point at the current `v0.6.1` release
+  line.
 
 ### Known limitations
 - Full cooperative query cancellation is still planned work rather than part of
