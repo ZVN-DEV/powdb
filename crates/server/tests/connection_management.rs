@@ -99,6 +99,7 @@ async fn start_single_conn_server(
                 query_timeout,
                 rate_limiter: rl.as_ref(),
                 peer_addr: Some(peer),
+                metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
             },
         )
         .await;
@@ -144,6 +145,7 @@ async fn start_multi_conn_server(
                         query_timeout,
                         rate_limiter: rl.as_ref(),
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;
@@ -350,6 +352,7 @@ async fn test_max_connections_backpressure() {
                         query_timeout: Duration::from_secs(5),
                         rate_limiter: None,
                         peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                     },
                 )
                 .await;

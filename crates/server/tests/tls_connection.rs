@@ -142,6 +142,7 @@ async fn start_tls_server(
                             query_timeout: Duration::from_secs(30),
                             rate_limiter: None,
                             peer_addr: Some(peer),
+                            metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
                         },
                     )
                     .await;
