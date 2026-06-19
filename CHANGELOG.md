@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-19
+
 ### Added
 - `powdb-server` can serve a Prometheus `/metrics` endpoint on a separate, opt-in HTTP listener (`--metrics-addr` / `POWDB_METRICS_ADDR`, e.g. `127.0.0.1:9090`). Exposes the four golden signals plus security and build identity: `powdb_connections_active`, `powdb_connections_accepted_total`, `powdb_queries_total{result}`, `powdb_queries_in_flight`, `powdb_query_duration_seconds` (histogram), `powdb_query_timeouts_total`, `powdb_query_memory_limit_exceeded_total`, `powdb_auth_failures_total`, `powdb_tls_handshake_failures_total`, `powdb_build_info`, and `powdb_uptime_seconds`. Zero new dependencies; scrapes are lock-free (never touch the engine lock). The endpoint is unauthenticated — bind it to localhost or a private network.
 
