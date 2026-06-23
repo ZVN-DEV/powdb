@@ -138,7 +138,7 @@ Results land in `crates/compare/results.csv`.
 ## Caveats and roadmap
 
 - **PowDB is pre-1.0.** The on-disk format may shift across minor versions.
-  Pin a version (`cargo install powdb-cli --version 0.4.8 --locked`) and
+  Pin a version (`cargo install powdb-cli --version 0.6.1 --locked`) and
   expect to re-bench / re-import on upgrades until 1.0.
 - **SQLite is the safe default.** Decades of production exposure, an
   enormous test suite, and tools everywhere. If you're not sure, you

@@ -64,13 +64,13 @@ docker run -d --name powdb \
   -e POWDB_DATA=/data \
   -e POWDB_BIND=0.0.0.0 \
   -e POWDB_PASSWORD=change-me \
-  ghcr.io/zvn-dev/powdb:v0.4.8
+  ghcr.io/zvn-dev/powdb:v0.6.1
 ```
 
 ## AWS ECS Fargate + EFS
 
 [`aws-ecs/`](./aws-ecs/) is a Terraform module that provisions an ECS
-cluster, a single Fargate task running `ghcr.io/zvn-dev/powdb:v0.4.8`, and
+cluster, a single Fargate task running `ghcr.io/zvn-dev/powdb:v0.6.1`, and
 an EFS file system backing `POWDB_DATA`. Read
 [`aws-ecs/README.md`](./aws-ecs/README.md) for trade-offs (single-writer,
 EFS fsync latency) before applying.
@@ -90,7 +90,7 @@ the repo Dockerfile. Best for developer-friendly hosted deploys; see the
 
 ## Other platforms
 
-PowDB ships a multi-arch container image at `ghcr.io/zvn-dev/powdb`. Any
+PowDB ships a container image at `ghcr.io/zvn-dev/powdb`. Any
 platform that can run a long-lived TCP container with a persistent volume
 (Hetzner, EC2 direct, k8s with a PVC) will work — the above are just
 worked examples.

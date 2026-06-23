@@ -230,6 +230,34 @@ fn restore_rejects_unknown_manifest_format() {
 }
 
 #[test]
+fn restore_rejects_manifest_path_traversal_name() {
+    let src = tmp("travsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let backup = tmp("travbkp");
+    let mut manifest = powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+
+    manifest.files[0].name = "../escaped.heap".into();
+    manifest.write(&backup).unwrap();
+
+    let dest = tmp("travdest");
+    let err = powdb_backup::restore(&backup, &dest).unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("invalid") && msg.contains("manifest"),
+        "path traversal manifest name must be rejected, got: {err}"
+    );
+    assert!(
+        !backup.parent().unwrap().join("escaped.heap").exists(),
+        "restore must not write outside the destination"
+    );
+}
+
+#[test]
 fn restore_rejects_a_tampered_backup() {
     let src = tmp("tsrc");
     let mut cat = Catalog::create(&src).unwrap();

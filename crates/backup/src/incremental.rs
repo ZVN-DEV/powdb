@@ -1,5 +1,7 @@
 use crate::manifest::{BackupManifest, ChangedFile, IncrementManifest};
-use crate::restore::{ensure_empty_dir, verify_and_copy_full};
+use crate::restore::{
+    ensure_empty_dir, validate_backup_file_name, validate_delta_file_name, verify_and_copy_full,
+};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::page::{page_lsn, PAGE_SIZE};
 use std::io;
@@ -141,6 +143,7 @@ pub fn restore_chain(full_dir: &Path, increment_dirs: &[&Path], dest: &Path) -> 
                     len: _,
                     blake3_hex,
                 } => {
+                    validate_backup_file_name(name)?;
                     let bytes = std::fs::read(inc_dir.join(name))?;
                     let hash = blake3::hash(&bytes).to_hex().to_string();
                     if &hash != blake3_hex {
@@ -158,6 +161,7 @@ pub fn restore_chain(full_dir: &Path, increment_dirs: &[&Path], dest: &Path) -> 
                     delta_len: _,
                     delta_blake3_hex,
                 } => {
+                    validate_delta_file_name(delta_file, name)?;
                     let delta = std::fs::read(inc_dir.join(delta_file))?;
                     let hash = blake3::hash(&delta).to_hex().to_string();
                     if &hash != delta_blake3_hex {

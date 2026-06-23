@@ -1,6 +1,6 @@
 //! Integration tests for PowDB server connection management.
 //!
-//! Tests idle timeout, query timeout, rate limiting, max connections
+//! Tests idle timeout, query timeout threshold, rate limiting, max connections
 //! backpressure, graceful shutdown, malformed protocol handling, and
 //! connection reuse after errors.
 
@@ -203,9 +203,9 @@ async fn test_idle_timeout() {
     }
 }
 
-/// Test 2: Query timeout returns an error for slow queries.
+/// Test 2: Query timeout threshold is wired without detaching blocking work.
 #[tokio::test]
-async fn test_query_timeout() {
+async fn test_query_timeout_threshold_does_not_detach_query() {
     let (engine, _tmp) = fresh_engine();
 
     // Set up a table so the query actually does work
@@ -221,7 +221,7 @@ async fn test_query_timeout() {
         engine,
         None,
         Duration::from_secs(5),
-        Duration::from_millis(1), // Very short query timeout
+        Duration::from_millis(1), // Very short timeout threshold
         shutdown_rx,
         None,
     )
@@ -233,25 +233,19 @@ async fn test_query_timeout() {
     let msg = read_message(&mut stream).await.unwrap();
     assert!(matches!(msg, Message::ConnectOk { .. }));
 
-    // Send a query - with 1ms timeout, spawn_blocking overhead alone may exceed it
+    // Send a query. If the threshold elapses, the server now waits for the
+    // blocking task to finish before replying, because started spawn_blocking
+    // tasks cannot be cancelled safely.
     stream.write_all(&encode_query("Item")).await.unwrap();
 
     let msg = read_message(&mut stream).await.unwrap();
     match msg {
-        Message::Error { message } => {
-            assert!(
-                message.contains("query timeout exceeded"),
-                "expected 'query timeout exceeded' error, got: {message}"
-            );
-        }
-        // If the query finishes fast enough (table is empty), that is also fine.
-        // The point is verifying the timeout mechanism is wired up.
         Message::ResultRows { .. } => {
-            // Query finished before the timeout - acceptable for an empty table.
-            // At least verify the mechanism exists by checking the handler compiles
-            // with the timeout path.
+            // Query completed and no detached execution remains behind the
+            // response. This is the conservative v0.6.1 mitigation until the
+            // executor has cooperative cancellation points.
         }
-        other => panic!("expected Error or ResultRows, got: {other:?}"),
+        other => panic!("expected ResultRows, got: {other:?}"),
     }
 }
 
