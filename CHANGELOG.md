@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-26
+
 ### Security
 - **Fixed three remotely-triggerable denial-of-service vectors** found in the
   2026-06-26 code review (all are process aborts/exhaustion under the deliberate
