@@ -392,3 +392,39 @@ jobs:
           #   RUSTSEC-2026-0180  postgres-protocol hstore DoS (→ powdb-compare)
           #   RUSTSEC-2026-0178  tokio-postgres DataRow DoS   (→ powdb-compare)
           ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178
+
+  # Single aggregator gate. Make THIS the only required status check on `main`
+  # (Settings → Branches → branch protection → require "ci-success"). It depends
+  # on every other CI job and fails if any of them did not succeed, so the full
+  # matrix — asan, miri, MSRV, ts-client, secret-scan, audit, examples-smoke —
+  # actually blocks merges instead of running green-or-red beside an unguarded
+  # required set. Add new jobs to the `needs` list below when you add them.
+  ci-success:
+    name: ci-success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - lint-test
+      - miri
+      - asan
+      - msrv-consistency
+      - msrv-build
+      - examples-smoke
+      - version-consistency
+      - ts-client
+      - secret-scan
+      - audit
+    steps:
+      - name: Verify every required job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Upstream job results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required CI job did not succeed (results: $RESULTS)"
+              exit 1
+            fi
+          done
+          echo "All required CI jobs succeeded."
