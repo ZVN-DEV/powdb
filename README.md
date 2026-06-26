@@ -33,7 +33,9 @@ Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to 
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
 
-Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/zvndev/powdb/blob/main/docs/backup-and-restore.md)
+**Already think in SQL?** Since v0.5.0 PowDB also accepts a supported subset of SQL through a frontend that lowers to the same PowQL plan tree (and shares the plan cache) — see [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md). PowQL remains the native, fastest path.
+
+Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | SQL frontend: [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/zvndev/powdb/blob/main/docs/backup-and-restore.md)
 
 ## Install
 
@@ -241,6 +243,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 
 **Query engine**
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
+- SQL frontend: a supported subset of SQL lowered to the PowQL AST, sharing the plan cache ([docs/SQL.md](docs/SQL.md))
 - Joins (nested-loop + hash join for equi-joins)
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
@@ -268,7 +271,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Authentication: shared password (`POWDB_PASSWORD`) or named users with roles (argon2id-hashed)
 
 **Pure Rust core**
-- No SQL parsing layer, no `libsqlite3-sys`, no bindgen
+- No `libsqlite3-sys`, no bindgen, no embedded C SQL engine (the SQL frontend is pure-Rust and lowers to PowQL)
 - Storage, query, and CLI are 100% Rust
 - TLS (`powdb-server` only) pulls `aws-lc-sys`; disable the `tls` feature for a C-free build
 - Single `cargo install` on any platform Rust supports

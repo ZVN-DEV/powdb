@@ -2,24 +2,22 @@
 
 ## Supported Versions
 
+PowDB ships security fixes only for the latest minor series. Upgrade to the
+latest release to stay supported.
+
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.4.9           | :white_check_mark: |
-| 0.4.8           | :x: (superseded)   |
-| 0.4.7           | :x: (superseded)   |
-| 0.4.6           | :x: (superseded)   |
-| 0.4.5           | :x: (superseded)   |
-| 0.4.4           | :x: (superseded)   |
+| 0.6.x           | :white_check_mark: |
+| 0.5.x           | :x: (superseded)   |
+| 0.4.4 – 0.4.9   | :x: (superseded)   |
 | 0.4.1 – 0.4.3   | :x: (yanked)       |
-| 0.4.0           | :white_check_mark: |
-| 0.3.x           | :white_check_mark: |
-| 0.2.x           | :white_check_mark: |
-| 0.1.x           | :x:                |
+| ≤ 0.4.0         | :x:                |
 
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
-> recovery and have been replaced by **v0.4.4**, which adds a permanent
-> durability regression suite. If you are on any of those three versions,
-> upgrade to the latest release (0.4.9). See `CHANGELOG.md` for details.
+> recovery and were replaced by **v0.4.4**, which added a permanent durability
+> regression suite. If you are on any of those three versions — or any release
+> older than the current minor series — upgrade to the latest 0.6.x release.
+> See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability
 

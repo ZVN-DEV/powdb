@@ -50,4 +50,10 @@ grep -qE "^## \[$workspace_version\]" CHANGELOG.md \
 grep -q "Current release: v$workspace_version" RELEASES.md \
   || fail "RELEASES.md current release does not reference v$workspace_version"
 
-log "Rust crate versions, TS client version, changelog, and release docs agree."
+# SECURITY.md must list the current minor series (e.g. 0.6.x) as supported, so
+# the supported-versions table can't silently fall behind the shipping release.
+minor_series="${workspace_version%.*}.x"
+grep -F ':white_check_mark:' SECURITY.md | grep -qF "$minor_series" \
+  || fail "SECURITY.md does not list $minor_series as a supported version (workspace is $workspace_version)"
+
+log "Rust crate versions, TS client version, changelog, release docs, and SECURITY.md supported versions agree."
