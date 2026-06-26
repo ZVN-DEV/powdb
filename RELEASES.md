@@ -3,22 +3,10 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.6.1** (production hardening for TLS auth enforcement, backup restore manifests, remote response caps, and query-timeout semantics; v0.6.0 added an opt-in Prometheus `/metrics` endpoint + SIGTERM graceful shutdown on 2026-06-19).
+> **Current release: v0.6.2** (security + correctness patch: fixes three remotely-triggerable DoS vectors — pre-auth wire-decode memory amplification, parser stack overflow on unary-prefix chains, and the recursive LIKE matcher — plus two query-correctness bugs: `avg()` over NULLs and subquery comparisons over datetime/uuid/bytes/NULL).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
-
-## v0.6.1 Local Handoff Status
-
-`codex/hardening-0.6.1` is a local hardening and version-bump candidate for
-`v0.6.1`. The candidate intentionally has not been pushed, tagged, published,
-or deployed.
-See `docs/strategy/2026-06-19-v0.6.1-release-handoff.md` for exact release
-notes, verification evidence, and blockers.
-
-Before publication, rerun the release gates below and get Kirby sign-off. Do
-not publish crates, npm packages, container images, tags, GitHub releases, or
-public deployments from this handoff state.
 
 ## Registries
 
