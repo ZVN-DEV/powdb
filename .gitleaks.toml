@@ -1,5 +1,10 @@
 title = "PowDB gitleaks configuration"
 
+# Inherit gitleaks' built-in rule set. Without this, supplying --config replaces
+# the default rules with the (empty) set below, so the scan would detect nothing.
+[extend]
+useDefault = true
+
 [allowlist]
 description = "Exact documented placeholders that are intentionally non-secret."
 regexes = [
