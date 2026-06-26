@@ -8,7 +8,7 @@ This file exists so that an agent (or a person) who has never seen PowDB can wal
 
 ## What PowDB is
 
-PowDB is an embeddable database engine written from scratch in Rust. It speaks its own query language (PowQL), not SQL. The core thesis:
+PowDB is an embeddable database engine written from scratch in Rust. Its native query language is **PowQL**; since v0.5.0 it also accepts a supported subset of **SQL** through a frontend that lowers to the same PowQL AST (see `docs/SQL.md`). PowQL is the native, fastest path. The core thesis:
 
 > Most of what a SQL engine does is *translate your query* into something executable. We remove that tier. PowQL is designed so the parser's AST **is already a plan tree** — no rewriting, no cost-based planning, no bytecode VM.
 
@@ -23,7 +23,7 @@ The measurable result: 3–10× faster than SQLite on aggregate and scan workloa
 
 ### When it's *not* the right choice
 
-- You need a drop-in Postgres/MySQL replacement. PowQL is a different language; there is **no SQL compatibility layer**, and that is a deliberate design decision (the translation tier is the thing we're removing).
+- You need a drop-in Postgres/MySQL replacement. PowDB has a SQL frontend (a supported subset that lowers to PowQL — see `docs/SQL.md`), but it is **not** wire-compatible with Postgres/MySQL, does not implement full SQL, and has no ODBC/JDBC or Postgres wire protocol. Treat SQL as a convenience surface, not a compatibility layer; PowQL remains the native path.
 - You need multi-node replication, sharding, or Raft-style consensus. Single-node only today.
 - You need fine-grained ACLs, row-level security, or multi-tenant isolation. Auth is named users with coarse roles (admin/readwrite/readonly) since 0.4.5 — shared-password mode still available — but nothing per-table or per-row.
 - You need user-defined functions, stored procedures, or triggers.
@@ -218,7 +218,7 @@ Return shapes:
 
 ## What's shipped vs. what's planned
 
-Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline).
+Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL — `docs/SQL.md`).
 
 Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, UDFs, per-row permissions, replication.
 
@@ -228,7 +228,7 @@ Planned (design doc only — don't use): link navigation (`User.posts`), `let` b
 
 Build: `cargo build --workspace`. Test: `cargo test --workspace`. Lint: `cargo clippy --workspace --all-targets -- -D warnings`. Format: `cargo fmt --all`.
 
-CI gates on `main` (all in `.github/workflows/ci.yml`): clippy/fmt/test (2-OS matrix), miri, asan, cargo audit, MSRV consistency, examples-smoke. `.github/workflows/bench.yml` (criterion + regression gate) is **manual-only** (`workflow_dispatch`) and NOT a merge gate — run the gate locally instead (see above).
+CI gates on `main` (all in `.github/workflows/ci.yml`): clippy/fmt/test (2-OS matrix), miri, asan, cargo audit, MSRV consistency, examples-smoke, ts-client, secret-scan — all wired into a single `ci-success` aggregator job that is the one required status check (it fails if any job fails). `.github/workflows/bench.yml` (criterion + regression gate) is **manual-only** (`workflow_dispatch`) and NOT a merge gate — run the gate locally instead (see above).
 
 Internal docs:
 - `CLAUDE.md` — codebase guide for Claude Code (architecture, crate graph, common patterns)

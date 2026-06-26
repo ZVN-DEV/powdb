@@ -37,10 +37,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results. Such values are now carried verbatim through subquery substitution
   via a runtime-only AST node. (`crates/query/src/executor/eval.rs`)
 
+### Documentation
+- Reconciled the SQL story across `README.md`, `AGENTS.md`, and `CLAUDE.md`:
+  these onboarding docs previously asserted "no SQL / no translation layer"
+  even though the SQL frontend shipped in v0.5.0. They now describe SQL as a
+  supported-subset frontend that lowers to the PowQL AST (PowQL remains the
+  native path) and link `docs/SQL.md`. `CLAUDE.md` no longer instructs agents
+  to refuse SQL work.
+- Refreshed the `SECURITY.md` supported-versions table to the 0.6.x line.
+
 ### Internal
-- Regression tests for all five fixes (parser depth, LIKE adversarial input,
-  wire-decode amplification, avg-over-NULL generic path, correlated subquery
-  over datetime/NULL).
+- CI now feeds every job (clippy/fmt/test, miri, asan, MSRV, examples-smoke,
+  ts-client, secret-scan, audit) into a single `ci-success` aggregator job so
+  branch protection can require one check and still gate on the whole matrix —
+  closing the gap where safety jobs could fail without blocking a merge.
+- `scripts/check-version-consistency.sh` now also asserts `SECURITY.md` lists
+  the current minor series as supported, so the supported-versions table can't
+  drift behind the shipping release.
+- Regression tests for all five code-review fixes (parser depth, LIKE
+  adversarial input, wire-decode amplification, avg-over-NULL generic path,
+  correlated subquery over datetime/NULL).
 
 ## [0.6.1] - 2026-06-19
 
