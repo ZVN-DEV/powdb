@@ -364,8 +364,8 @@ jobs:
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
-      - name: Run gitleaks (working tree, low-noise config)
-        run: gitleaks detect --no-git --redact --config .gitleaks.toml --source .
+      - name: Run gitleaks (git repo, low-noise config)
+        run: gitleaks detect --redact --config .gitleaks.toml --source .
 
   audit:
     name: cargo audit (advisories)

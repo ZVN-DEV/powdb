@@ -49,7 +49,7 @@ run_optional_scans() {
     skip "cargo-audit not installed (cargo install cargo-audit)"
   fi
   if command -v gitleaks >/dev/null 2>&1; then
-    run gitleaks detect --no-git --redact --config .gitleaks.toml
+    run gitleaks detect --redact --config .gitleaks.toml --source .
   else
     skip "gitleaks not installed (CI runs gitleaks/gitleaks-action)"
   fi
