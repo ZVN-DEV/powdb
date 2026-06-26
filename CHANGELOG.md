@@ -7,14 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Internal
-- CI now feeds every job (clippy/fmt/test, miri, asan, MSRV, examples-smoke,
-  ts-client, secret-scan, audit) into a single `ci-success` aggregator job so
-  branch protection can require one check and still gate on the whole matrix —
-  closing the gap where safety jobs could fail without blocking a merge.
-- `scripts/check-version-consistency.sh` now also asserts `SECURITY.md` lists
-  the current minor series as supported, so the supported-versions table can't
-  drift behind the shipping release.
+### Security
+- **Fixed three remotely-triggerable denial-of-service vectors** found in the
+  2026-06-26 code review (all are process aborts/exhaustion under the deliberate
+  `panic = "abort"` profile, so a connected — and in the first case
+  unauthenticated — client could disrupt the server):
+  - **Pre-auth memory amplification** (`crates/server/src/protocol.rs`): a
+    ~12-byte `RESULT_ROWS` frame declaring up to 10M zero-column rows forced a
+    ~240 MB allocation during the pre-auth read. The decoder now bounds the
+    row/column/param preallocation by the actual remaining payload and rejects
+    counts that cannot fit.
+  - **Parser stack overflow** (`crates/query/src/parser.rs`): chained unary
+    prefixes (`not not … .x`, `exists …`) recursed through `parse_primary`
+    without the nesting-depth guard. The depth limit now covers that recursion.
+  - **`LIKE` stack overflow / exponential backtracking**
+    (`crates/query/src/executor/eval.rs`): `col like "…"` used a recursive
+    matcher that overflowed on long inputs and backtracked exponentially on
+    patterns like `%a%a%`. Replaced with an iterative two-pointer matcher
+    (O(n·m) time, O(1) stack).
+
+### Fixed
+- **`avg()` over a column containing NULLs** returned the wrong value on the
+  generic aggregate path: it divided by the total row count instead of the count
+  of non-null values, and disagreed with the compiled fast path. Both paths now
+  divide by the contributing count and return the empty value when there are
+  none. (`crates/query/src/executor/{plan_exec,mod}.rs`)
+- **Correlated and `IN`-subquery comparisons over `datetime`, `uuid`, `bytes`,
+  and NULL values** silently coerced those values to `0`, producing wrong
+  results. Such values are now carried verbatim through subquery substitution
+  via a runtime-only AST node. (`crates/query/src/executor/eval.rs`)
 
 ### Documentation
 - Reconciled the SQL story across `README.md`, `AGENTS.md`, and `CLAUDE.md`:
@@ -24,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native path) and link `docs/SQL.md`. `CLAUDE.md` no longer instructs agents
   to refuse SQL work.
 - Refreshed the `SECURITY.md` supported-versions table to the 0.6.x line.
+
+### Internal
+- CI now feeds every job (clippy/fmt/test, miri, asan, MSRV, examples-smoke,
+  ts-client, secret-scan, audit) into a single `ci-success` aggregator job so
+  branch protection can require one check and still gate on the whole matrix —
+  closing the gap where safety jobs could fail without blocking a merge.
+- `scripts/check-version-consistency.sh` now also asserts `SECURITY.md` lists
+  the current minor series as supported, so the supported-versions table can't
+  drift behind the shipping release.
+- Regression tests for all five code-review fixes (parser depth, LIKE
+  adversarial input, wire-decode amplification, avg-over-NULL generic path,
+  correlated subquery over datetime/NULL).
 
 ## [0.6.1] - 2026-06-19
 

@@ -1521,6 +1521,7 @@ impl Engine {
                                 .iter()
                                 .position(|c| c == col)
                                 .ok_or("col not found")?;
+                            let mut count: u64 = 0;
                             let sum: f64 = rows
                                 .iter()
                                 .filter_map(|r| match &r[idx] {
@@ -1528,9 +1529,13 @@ impl Engine {
                                     Value::Float(v) => Some(*v),
                                     _ => None,
                                 })
+                                .inspect(|_| count += 1)
                                 .sum();
-                            let count = rows.len() as f64;
-                            Ok(QueryResult::Scalar(Value::Float(sum / count)))
+                            if count == 0 {
+                                Ok(QueryResult::Scalar(Value::Empty))
+                            } else {
+                                Ok(QueryResult::Scalar(Value::Float(sum / count as f64)))
+                            }
                         }
                         AggFunc::Sum => {
                             let col = field.as_ref().ok_or("sum requires field")?;

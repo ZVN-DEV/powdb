@@ -1,3 +1,5 @@
+use powdb_storage::types::Value;
+
 /// Top-level PowQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -324,6 +326,11 @@ pub enum Expr {
     },
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
     Cast(Box<Expr>, CastType),
+    /// A runtime-materialized literal carrying a concrete Value. Produced only
+    /// during subquery/correlated substitution (post-planning) for values that
+    /// have no Literal form (NULL, datetime, uuid, bytes); never emitted by the
+    /// parser/canonicalizer.
+    ValueLit(Value),
     /// The `null` literal — produces `Value::Empty`.
     Null,
 }

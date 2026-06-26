@@ -422,6 +422,31 @@ fn test_fastpath_agg_avg() {
 }
 
 #[test]
+fn test_avg_over_nulls_generic_path() {
+    // Regression: the generic (non-compiled) AVG path divided the sum by the
+    // total row count instead of the count of contributing (non-null) values,
+    // disagreeing with the compiled fast path. AVG must ignore NULLs.
+    let mut engine = test_engine(); // Alice 30, Bob 25, Charlie 35
+                                    // Diana has a NULL age (age column omitted).
+    engine
+        .execute_powql(r#"insert User { name := "Diana", email := "diana@ex.com" }"#)
+        .unwrap();
+    // The `upper(.name) != "ZZZ"` predicate keeps every row but is not
+    // compilable, so this avg goes through the GENERIC aggregate path
+    // (agg_single_col_fast bails on the scalar-func filter).
+    let result = engine
+        .execute_powql(r#"avg(User filter upper(.name) != "ZZZ" { .age })"#)
+        .unwrap();
+    match result {
+        QueryResult::Scalar(Value::Float(v)) => {
+            // sum(non-null ages)=90, count(non-null)=3 → 30.0 (NOT 90/4=22.5).
+            assert!((v - 30.0).abs() < 1e-9, "expected 30.0, got {v}");
+        }
+        other => panic!("expected Float, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_fastpath_agg_min_max() {
     let n: i64 = 300;
     let mut engine = mission_a_engine(n);
@@ -3525,6 +3550,48 @@ fn test_correlated_not_exists_subquery() {
             assert!(names.contains(&&Value::Str("Charlie".into())));
         }
         _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_correlated_subquery_datetime_and_null() {
+    // Regression: value_to_expr coerced DateTime (and NULL) outer values to
+    // Int(0) during correlated-subquery substitution, so the comparison was
+    // always false and matching rows were wrongly excluded.
+    let mut engine = test_engine();
+    engine
+        .execute_powql("type Appt { required who: str, sched: datetime }")
+        .unwrap();
+    let ts = 1705321845000000_i64; // 2024-01-15 12:30:45 UTC
+    engine
+        .execute_powql(&format!(
+            r#"insert Appt {{ who := "Alice", sched := {ts} }}"#
+        ))
+        .unwrap();
+    // Bob's sched is NULL (column omitted).
+    engine
+        .execute_powql(r#"insert Appt { who := "Bob" }"#)
+        .unwrap();
+    engine
+        .execute_powql("type Slot { required ts: datetime }")
+        .unwrap();
+    engine
+        .execute_powql(&format!("insert Slot {{ ts := {ts} }}"))
+        .unwrap();
+
+    // Correlated EXISTS: an Appt matches when a Slot exists at its `sched`
+    // time. The outer `.sched` (a DateTime, NULL for Bob) is substituted into
+    // the subquery filter. Alice's slot exists → matches; Bob's sched is NULL
+    // → no slot matches → excluded.
+    let result = engine
+        .execute_powql("Appt filter exists (Slot filter .ts = .sched) { .who }")
+        .unwrap();
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "only Alice has a matching slot");
+            assert_eq!(rows[0][0], Value::Str("Alice".into()));
+        }
+        other => panic!("expected rows, got {other:?}"),
     }
 }
 

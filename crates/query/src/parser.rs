@@ -1219,6 +1219,23 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        // Guard recursion here too: unary prefixes (`not`, `exists`, `not exists`)
+        // recurse straight back into parse_primary without going through parse_expr,
+        // so a chain like `not not … .x` would otherwise overflow the stack (process
+        // abort under panic=abort). See test_unary_prefix_nesting_depth_limit.
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+        let result = self.parse_primary_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         match self.peek().clone() {
             Token::DotIdent(name) => {
                 self.advance();
@@ -3283,6 +3300,22 @@ mod tests {
         for _ in 0..70 {
             query.push(')');
         }
+        let result = parse(&query);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("nesting depth"),
+            "expected nesting depth error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_unary_prefix_nesting_depth_limit() {
+        // A long chain of `not` prefixes recurses through parse_primary
+        // without passing through parse_expr's guard. It must error cleanly
+        // at the depth limit instead of overflowing the stack.
+        let query = String::from("User filter ") + &"not ".repeat(5000) + ".active";
         let result = parse(&query);
         assert!(result.is_err());
         let err = result.unwrap_err();

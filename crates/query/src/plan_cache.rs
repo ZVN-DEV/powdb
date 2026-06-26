@@ -436,6 +436,9 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        // Runtime-only literal (correlated/subquery substitution); never
+        // reaches the plan cache, and it occupies no source literal slot.
+        Expr::ValueLit(_) => {}
         Expr::Null => {}
     }
 }
@@ -497,6 +500,9 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        // Runtime-only literal (correlated/subquery substitution); never
+        // reaches the plan cache, so there is nothing to substitute.
+        Expr::ValueLit(_) => {}
         Expr::Null => {}
     }
 }
@@ -777,6 +783,7 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            Expr::ValueLit(_) => {}
             Expr::Null => {}
         }
     }
