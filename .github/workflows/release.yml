@@ -161,6 +161,56 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm build
           npm pack --dry-run
 
+  npm-publish:
+    name: publish to npm (OIDC trusted publishing)
+    needs: [build, smoke-release, npm-package-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Token-less publish via npm Trusted Publishing. No NPM secret is stored
+    # anywhere — the job proves its identity to npm with a short-lived OIDC
+    # token. Requires a trusted publisher configured once on npmjs.com for
+    # @zvndev/powdb-client (org: ZVN-DEV, repo: powdb, workflow: release.yml).
+    # See docs/ci/trusted-publishing.md.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (trusted publishing requires npm >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Verify git tag matches package.json version
+        working-directory: clients/ts
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::git tag v$tag does not match clients/ts/package.json ($pkg)"
+            exit 1
+          fi
+          echo "tag v$tag matches package.json version"
+
+      - name: Install dependencies and build
+        working-directory: clients/ts
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.29.3 --activate
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Publish to npm (token-less, with provenance)
+        working-directory: clients/ts
+        run: npm publish --provenance --access public
+
   release:
     name: create release
     needs: [build, smoke-release, npm-package-smoke]
