@@ -35,6 +35,8 @@ const MAX_ROWS: usize = 10_000_000;
 /// Maximum number of bound parameters in a single QueryWithParams message.
 const MAX_PARAMS: usize = 4096;
 
+const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
+
 /// A positional parameter value carried by [`Message::QueryWithParams`].
 ///
 /// Wire encoding per param: a 1-byte tag followed by the body —
@@ -261,7 +263,7 @@ impl Message {
                 if count > MAX_PARAMS {
                     return Err("too many parameters".into());
                 }
-                let mut params = Vec::with_capacity(count);
+                let mut params = Vec::with_capacity(count.min(payload.len() - pos));
                 for _ in 0..count {
                     if pos >= payload.len() {
                         return Err("truncated param tag".into());
@@ -318,7 +320,8 @@ impl Message {
                 if col_count > MAX_COLUMNS {
                     return Err("too many columns".into());
                 }
-                let mut columns = Vec::with_capacity(col_count);
+                let mut columns =
+                    Vec::with_capacity(col_count.min((payload.len() - pos) / STRING_LEN_PREFIX));
                 for _ in 0..col_count {
                     columns.push(decode_string(payload, &mut pos)?);
                 }
@@ -332,6 +335,18 @@ impl Message {
                 pos += 4;
                 if row_count > MAX_ROWS {
                     return Err("too many rows".into());
+                }
+                // Never preallocate (or iterate) proportional to an untrusted count: each row
+                // carries `col_count` length-prefixed strings of >= STRING_LEN_PREFIX bytes, so
+                // the remaining payload bounds how many rows can follow. A zero-column row
+                // consumes no bytes (vacuous bound), so a tiny frame could otherwise declare
+                // millions of rows and force a huge allocation (reachable pre-auth). Reject it.
+                let max_rows = match col_count.checked_mul(STRING_LEN_PREFIX) {
+                    Some(0) | None => 0,
+                    Some(per_row) => (payload.len() - pos) / per_row,
+                };
+                if row_count > max_rows {
+                    return Err("row count exceeds payload size".into());
                 }
                 let mut rows = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
@@ -739,6 +754,37 @@ mod tests {
             let mut m = valid.clone();
             m[i] = 0xFF;
             let _ = Message::decode(&m);
+        }
+    }
+
+    #[test]
+    fn test_decode_result_rows_rejects_amplified_row_count() {
+        // A tiny frame that declares col_count=0 and row_count=10_000_000.
+        // With zero columns each row consumes no bytes, so the old decoder
+        // would allocate/iterate 10M empty rows from ~12 bytes (reachable
+        // pre-auth). The amplification guard must reject it.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u16.to_le_bytes()); // col_count = 0
+        payload.extend_from_slice(&10_000_000u32.to_le_bytes()); // row_count = 10M
+        let mut frame = vec![MSG_RESULT_ROWS, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        assert!(
+            Message::decode(&frame).is_err(),
+            "amplified row count must be rejected"
+        );
+
+        // A normal small ResultRows must still round-trip unchanged.
+        let msg = Message::ResultRows {
+            columns: vec!["a".into()],
+            rows: vec![vec!["x".into()]],
+        };
+        match Message::decode(&msg.encode()).unwrap() {
+            Message::ResultRows { columns, rows } => {
+                assert_eq!(columns, vec!["a"]);
+                assert_eq!(rows, vec![vec!["x".to_string()]]);
+            }
+            other => panic!("expected ResultRows, got {other:?}"),
         }
     }
 

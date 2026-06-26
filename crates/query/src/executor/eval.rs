@@ -173,7 +173,10 @@ pub(super) fn value_to_expr(val: Value) -> Expr {
         Value::Float(v) => Expr::Literal(Literal::Float(v)),
         Value::Str(v) => Expr::Literal(Literal::String(v)),
         Value::Bool(v) => Expr::Literal(Literal::Bool(v)),
-        _ => Expr::Literal(Literal::Int(0)),
+        Value::Empty => Expr::Null,
+        // DateTime / Uuid / Bytes have no Literal form; carry the value verbatim
+        // so subquery comparisons see the real value, not a bogus Int(0).
+        other => Expr::ValueLit(other),
     }
 }
 
@@ -345,6 +348,7 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             let val = eval_expr(inner, row, columns);
             eval_cast(val, *cast_type)
         }
+        Expr::ValueLit(v) => v.clone(),
         Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => {
             Value::Empty
         }
@@ -681,33 +685,59 @@ pub(super) fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
 }
 
 /// SQL LIKE pattern match. `%` matches any sequence (including empty),
-/// `_` matches exactly one character. No escape character for now.
+/// `_` matches exactly one character. No escape character. Iterative
+/// two-pointer with backtracking — O(n·m) time, O(1) stack (a recursive
+/// matcher stack-overflows / backtracks exponentially on adversarial input).
 pub(super) fn like_match(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
-    like_dp(&t, &p, 0, 0)
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let mut star: Option<usize> = None; // index in p of the last '%'
+    let mut star_ti = 0usize; // text index when that '%' was taken
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
-fn like_dp(t: &[char], p: &[char], ti: usize, pi: usize) -> bool {
-    if pi == p.len() {
-        return ti == t.len();
+#[cfg(test)]
+mod tests {
+    use super::like_match;
+
+    #[test]
+    fn test_like_match_correctness() {
+        assert!(like_match("abc", "a%c"));
+        assert!(like_match("abc", "a_c"));
+        assert!(like_match("abc", "a%"));
+        assert!(like_match("abc", "%b%"));
+        assert!(like_match("abc", "abc"));
+        assert!(!like_match("abc", "a%d"));
+        assert!(like_match("", "%"));
+        assert!(like_match("ax", "a_"));
+        assert!(!like_match("a", "a_"));
     }
-    if p[pi] == '%' {
-        // '%' can match zero or more characters — try both.
-        // Skip consecutive '%' to avoid exponential blowup.
-        let mut pi2 = pi;
-        while pi2 < p.len() && p[pi2] == '%' {
-            pi2 += 1;
-        }
-        for i in ti..=t.len() {
-            if like_dp(t, p, i, pi2) {
-                return true;
-            }
-        }
-        false
-    } else if ti < t.len() && (p[pi] == '_' || p[pi] == t[ti]) {
-        like_dp(t, p, ti + 1, pi + 1)
-    } else {
-        false
+
+    #[test]
+    fn test_like_match_adversarial_no_overflow() {
+        // A recursive / exponential matcher would overflow the stack or hang
+        // here. The iterative two-pointer matcher returns quickly.
+        let text = "a".repeat(50_000);
+        assert!(!like_match(&text, "%a%a%a%b"));
     }
 }
