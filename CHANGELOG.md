@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Embedded mode — `powdb` crate** (the SQLite-shaped front door). Run the
+  engine **in-process**, no server/socket: `Database::open(dir)` →
+  `.query(powql)` / `.query_sql(sql)` / `.query_readonly(...)`. Single-op
+  latency becomes the engine's own cost (no wire round-trip) and the database
+  works offline — the foundation for local-first apps. Reuses the same storage
+  engine, indexes, WAL durability, and PowQL/SQL frontends as the server.
+  Panic-safe for embedding: every query is wrapped in `catch_unwind`; a caught
+  panic poisons the handle (further calls error) and skips the clean checkpoint
+  so torn in-memory state is never persisted — committed data is recovered from
+  the WAL on reopen (crash-only, scoped to the handle). See
+  `docs/design/2026-06-27-embedded-mode-design.md`. The Node native addon
+  (`@zvndev/powdb-embedded`) wrapping this lands next.
 - **Unix domain socket listener** (write-performance / transport) — start the
   server with `--socket <path>` (or `POWDB_SOCKET=<path>`) to listen on a Unix
   domain socket in addition to TCP. Same-host clients avoid the TCP/IP stack

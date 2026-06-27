@@ -1819,6 +1819,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "powdb"
+version = "0.6.2"
+dependencies = [
+ "powdb-query",
+ "powdb-storage",
+ "tempfile",
+]
+
+[[package]]
 name = "powdb-auth"
 version = "0.6.2"
 dependencies = [
