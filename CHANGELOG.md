@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Normal` WAL durability mode** (write-performance Phase 1) — a third
+  `WalSyncMode` between `Full` and `Off`. Commits are acknowledged once their
+  WAL record reaches the OS page cache (no per-commit fsync); a background
+  flusher fsyncs on a ~10 ms interval. A process crash loses nothing; an OS
+  crash / power loss can lose only the unsynced tail (≤ one interval). This is
+  SQLite `synchronous=NORMAL` / Postgres `synchronous_commit=off` semantics and
+  removes the per-write fsync from the latency path (~15–40× faster single-row
+  writes). Select it with `POWDB_SYNC_MODE=full|normal|off` (default `full` —
+  no durability change unless opted in). Addresses the turbine-orm write-latency
+  finding; see `docs/design/2026-06-27-write-performance-*`.
+
 ### Security
 - **Fixed a remotely-triggerable denial-of-service in the in-place `UPDATE`
   fast path** (#117). Assigning a value whose type does not match a fixed-size
