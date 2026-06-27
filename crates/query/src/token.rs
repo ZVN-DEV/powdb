@@ -19,6 +19,7 @@ pub enum Token {
     Update,       // update
     Delete,       // delete
     Upsert,       // upsert
+    Returning,    // returning
     Select,       // select (alias for projection)
     Required,     // required
     Multi,        // multi
@@ -171,6 +172,7 @@ impl Token {
             Token::Update => "'update'".into(),
             Token::Delete => "'delete'".into(),
             Token::Upsert => "'upsert'".into(),
+            Token::Returning => "'returning'".into(),
             Token::Select => "'select'".into(),
             Token::Required => "'required'".into(),
             Token::Multi => "'multi'".into(),

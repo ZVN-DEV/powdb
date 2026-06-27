@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`insert ... returning`** (write-performance Phase 3) — an `insert` ending
+  with `returning` now returns the inserted row(s) (all columns) as a result
+  set instead of a modified-count, so a client no longer needs a follow-up
+  `SELECT` to read the row back (removes the ORM reselect round-trip). Works
+  for single- and multi-row inserts and over the wire (the inserted rows come
+  back on the existing rows path). `update`/`delete` `returning` to follow.
 - **`Normal` WAL durability mode** (write-performance Phase 1) — a third
   `WalSyncMode` between `Full` and `Off`. Commits are acknowledged once their
   WAL record reaches the OS page cache (no per-commit fsync); a background

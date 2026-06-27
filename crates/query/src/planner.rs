@@ -440,6 +440,7 @@ fn plan_insert(ins: InsertExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::Insert {
         table: ins.target,
         rows: ins.rows,
+        returning: ins.returning,
     })
 }
 

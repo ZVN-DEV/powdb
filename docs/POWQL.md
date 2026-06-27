@@ -901,6 +901,17 @@ rollback boundary.) The whole batch is also charged against
 `POWDB_QUERY_MEMORY_LIMIT`, so an over-large batch errors rather than exhausting
 memory.
 
+**`returning`.** End an insert with `returning` to get the inserted row(s) back
+(all columns) as a result set instead of a modified-count — so you don't need a
+follow-up `SELECT` to read the row you just wrote:
+
+```
+insert User { name := "Alice", email := "alice@example.com", age := 30 } returning
+```
+
+This works for single- and multi-row inserts and returns over the same rows
+path as a query, so a client gets the written rows in the same round trip.
+
 ### UPDATE
 
 Update rows matching an optional filter. Supports both literal values and expressions:

@@ -646,16 +646,24 @@ impl Engine {
                 }
             }
 
-            PlanNode::Insert { table, rows } => {
+            PlanNode::Insert {
+                table,
+                rows,
+                returning,
+            } => {
                 // Build + validate EVERY row before inserting any, so a bad
                 // row (unknown/missing/uncoercible field) aborts the whole
                 // statement without a partial write. The WAL fsync happens
                 // once at statement end, so N rows = N appends + 1 fsync.
+                let mut returning_columns: Vec<String> = Vec::new();
                 let all_values: Vec<Vec<Value>> = {
                     let schema = self
                         .catalog
                         .schema(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                    if *returning {
+                        returning_columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    }
                     let mut all = Vec::with_capacity(rows.len());
                     for assignments in rows {
                         let mut values = vec![Value::Empty; schema.columns.len()];
@@ -695,7 +703,14 @@ impl Engine {
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 }
                 self.view_registry.mark_dependents_dirty(table);
-                Ok(QueryResult::Modified(n))
+                if *returning {
+                    Ok(QueryResult::Rows {
+                        columns: returning_columns,
+                        rows: all_values,
+                    })
+                } else {
+                    Ok(QueryResult::Modified(n))
+                }
             }
 
             PlanNode::Upsert {
@@ -3810,7 +3825,7 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                 agg_strs.join(", "),
             )
         }
-        PlanNode::Insert { table, rows } => {
+        PlanNode::Insert { table, rows, .. } => {
             let cols: Vec<&str> = rows
                 .first()
                 .map(|r| r.iter().map(|a| a.field.as_str()).collect())

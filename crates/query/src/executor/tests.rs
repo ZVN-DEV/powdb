@@ -4968,3 +4968,55 @@ fn test_engine_normal_sync_mode_persists_across_reopen() {
         other => panic!("expected 2 rows after Normal-mode reopen, got {other:?}"),
     }
 }
+
+#[test]
+fn test_insert_returning_yields_inserted_row() {
+    // RETURNING: `insert ... returning` returns the inserted row(s) as Rows
+    // (kills the ORM reselect round-trip).
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"insert User { name := "Dana", email := "d@x.com", age := 40 } returning"#)
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 1);
+            let name_idx = columns.iter().position(|c| c == "name").expect("name col");
+            let age_idx = columns.iter().position(|c| c == "age").expect("age col");
+            assert_eq!(rows[0][name_idx], Value::Str("Dana".into()));
+            assert_eq!(rows[0][age_idx], Value::Int(40));
+        }
+        other => panic!("expected Rows from insert ... returning, got {other:?}"),
+    }
+    // The row is actually persisted (3 seed rows + 1).
+    match engine.execute_powql("count(User)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 4),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_insert_multi_row_returning_yields_all_rows() {
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(
+            r#"insert User { name := "A", email := "a2@x.com", age := 1 }, { name := "B", email := "b2@x.com", age := 2 } returning"#,
+        )
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+        other => panic!("expected 2 Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_insert_without_returning_still_modified() {
+    // Additive: a plain insert (no `returning`) is unchanged.
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"insert User { name := "Eve", email := "e@x.com", age := 50 }"#)
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+}

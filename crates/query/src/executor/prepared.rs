@@ -112,10 +112,14 @@ impl Engine {
             // Single-row inserts only: the byte-level fast path patches one
             // row's worth of scratch. Multi-row `insert T {..},{..}` falls
             // through to the generic plan path (always correct).
-            PlanNode::Insert { table, rows }
-                if rows.len() == 1
-                    && rows[0].iter().all(|a| matches!(a.value, Expr::Literal(_)))
-                    && param_count == rows[0].len() =>
+            PlanNode::Insert {
+                table,
+                rows,
+                returning,
+            } if !returning
+                && rows.len() == 1
+                && rows[0].iter().all(|a| matches!(a.value, Expr::Literal(_)))
+                && param_count == rows[0].len() =>
             {
                 let assignments = &rows[0];
                 let table_slot = self

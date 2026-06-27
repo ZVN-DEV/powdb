@@ -162,6 +162,9 @@ pub struct InsertExpr {
     /// One assignment-block per row. Always contains at least one row;
     /// `insert T { .. }` yields one, `insert T { .. }, { .. }` yields many.
     pub rows: Vec<Vec<Assignment>>,
+    /// `true` when the statement ends with `returning` — the executor returns
+    /// the inserted rows (all columns) instead of a modified-count.
+    pub returning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
