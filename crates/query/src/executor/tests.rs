@@ -5020,3 +5020,126 @@ fn test_insert_without_returning_still_modified() {
         other => panic!("expected Modified, got {other:?}"),
     }
 }
+
+#[test]
+fn test_update_returning_yields_updated_rows() {
+    // RETURNING: `... update { .. } returning` returns the POST-update row(s).
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"User filter .name = "Alice" update { age := 99 } returning"#)
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 1);
+            let name_idx = columns.iter().position(|c| c == "name").expect("name col");
+            let age_idx = columns.iter().position(|c| c == "age").expect("age col");
+            assert_eq!(rows[0][name_idx], Value::Str("Alice".into()));
+            // Post-image: the new value, not the old 30.
+            assert_eq!(rows[0][age_idx], Value::Int(99));
+        }
+        other => panic!("expected Rows from update ... returning, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_expression_path() {
+    // The expression-update path (`age := .age + 5`) also returns post-image.
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"User filter .name = "Bob" update { age := .age + 5 } returning"#)
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 1);
+            let age_idx = columns.iter().position(|c| c == "age").expect("age col");
+            assert_eq!(rows[0][age_idx], Value::Int(30)); // Bob was 25
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_returning_coerces_int_into_float() {
+    // #118 guard on the returning path: int → float column must coerce, and the
+    // returned post-image must show the coerced float, not raw i64 bits.
+    let mut engine = acct_engine();
+    match engine
+        .execute_powql(r#"Acct filter .id = "a" update { balance := 10 } returning"#)
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            let bal_idx = columns
+                .iter()
+                .position(|c| c == "balance")
+                .expect("balance col");
+            assert_eq!(rows[0][bal_idx], Value::Float(10.0));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_update_without_returning_still_modified() {
+    // Additive: a plain update (no `returning`) is unchanged.
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"User filter .name = "Alice" update { age := 99 }"#)
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_delete_returning_yields_deleted_rows() {
+    // RETURNING: `... delete returning` returns the PRE-delete row(s).
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"User filter .name = "Alice" delete returning"#)
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(rows.len(), 1);
+            let name_idx = columns.iter().position(|c| c == "name").expect("name col");
+            assert_eq!(rows[0][name_idx], Value::Str("Alice".into()));
+        }
+        other => panic!("expected Rows from delete ... returning, got {other:?}"),
+    }
+    // The row is actually gone (3 seed rows - 1).
+    match engine.execute_powql("count(User)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_delete_returning_multi_row() {
+    // Multiple matches: every deleted row comes back.
+    let mut engine = test_engine();
+    match engine
+        .execute_powql("User filter .age > 28 delete returning")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2), // Alice(30), Charlie(35)
+        other => panic!("expected 2 Rows, got {other:?}"),
+    }
+    match engine.execute_powql("count(User)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn test_delete_without_returning_still_modified() {
+    // Additive: a plain delete (no `returning`) is unchanged.
+    let mut engine = test_engine();
+    match engine
+        .execute_powql(r#"User filter .name = "Alice" delete"#)
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+}

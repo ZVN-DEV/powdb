@@ -122,10 +122,16 @@ pub enum PlanNode {
         input: Box<PlanNode>,
         table: String,
         assignments: Vec<Assignment>,
+        /// `true` when `returning` was requested — executor returns the
+        /// post-update rows instead of a modified-count.
+        returning: bool,
     },
     Delete {
         input: Box<PlanNode>,
         table: String,
+        /// `true` when `returning` was requested — executor returns the
+        /// pre-delete rows instead of a modified-count.
+        returning: bool,
     },
     CreateTable {
         name: String,

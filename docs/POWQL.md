@@ -930,6 +930,13 @@ User update { age := .age * 2 }
 User filter .age > 28 update { age := .age + 1 }
 ```
 
+End an update with `returning` to get the **post-update** row(s) back (all
+columns) as a result set instead of a modified-count:
+
+```
+User filter .name = "Alice" update { age := 31 } returning
+```
+
 ### DELETE
 
 Delete rows matching an optional filter:
@@ -944,6 +951,14 @@ Delete all rows (use with care):
 
 ```
 User delete
+```
+
+End a delete with `returning` to get the **pre-delete** row(s) back (all
+columns) as a result set instead of a modified-count — useful for archiving or
+auditing what you removed in the same round trip:
+
+```
+User filter .age < 18 delete returning
 ```
 
 ---

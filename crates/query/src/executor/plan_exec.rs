@@ -823,6 +823,7 @@ impl Engine {
                 input,
                 table,
                 assignments,
+                returning,
             } => {
                 // Mission C Phase 3: resolve assignments against a borrowed
                 // schema, then drop the borrow before the mutation loop.
@@ -881,6 +882,56 @@ impl Engine {
                 // Mission C Phase 2: the hint Table::update_hinted needs to
                 // decide whether to read the old row for index diff.
                 let changed_cols: Vec<usize> = col_indices.clone();
+
+                // ── RETURNING path ──────────────────────────────────────
+                // `returning` materializes the post-update row image, so the
+                // byte-patch / fused fast paths (which never decode a row)
+                // can't serve it. Take the generic decode→mutate→collect
+                // route. Opt-in only: when `returning` is false every path
+                // below is byte-for-byte unchanged.
+                if *returning {
+                    let columns: Vec<String> = {
+                        let schema_ref = self
+                            .catalog
+                            .schema(table)
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                        schema_ref.columns.iter().map(|c| c.name.clone()).collect()
+                    };
+                    let matching_rids = self.collect_rids_for_mutation(input, table)?;
+                    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_rids.len());
+                    for rid in matching_rids {
+                        let mut row = match self.catalog.get(table, rid) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        match &resolved_assignments {
+                            // Literal path: apply the pre-coerced values.
+                            Some(resolved) => {
+                                for (idx, val) in resolved.iter() {
+                                    row[*idx] = val.clone();
+                                }
+                            }
+                            // Expression path: evaluate each RHS against the
+                            // (progressively mutated) row, matching the
+                            // non-returning expr path exactly.
+                            None => {
+                                for (i, asgn) in assignments.iter().enumerate() {
+                                    let val = eval_expr(&asgn.value, &row, &columns);
+                                    row[col_indices[i]] = val;
+                                }
+                            }
+                        }
+                        self.catalog
+                            .update_hinted(table, rid, &row, Some(&changed_cols))
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        out_rows.push(row);
+                    }
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Ok(QueryResult::Rows {
+                        columns,
+                        rows: out_rows,
+                    });
+                }
 
                 // ── Fused scan+update for Update(Filter(SeqScan)) ────────
                 // Perf sprint: instead of the two-pass collect-RIDs-then-loop
@@ -1111,7 +1162,42 @@ impl Engine {
                 Ok(QueryResult::Modified(count))
             }
 
-            PlanNode::Delete { input, table } => {
+            PlanNode::Delete {
+                input,
+                table,
+                returning,
+            } => {
+                // ── RETURNING path ──────────────────────────────────────
+                // `returning` needs the pre-delete row image, so read each
+                // matched row before removing it. The fused single-pass
+                // delete primitives below never decode rows, so they can't
+                // serve this. Opt-in only: when `returning` is false the
+                // fast paths below are byte-for-byte unchanged.
+                if *returning {
+                    let columns: Vec<String> = {
+                        let schema_ref = self
+                            .catalog
+                            .schema(table)
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                        schema_ref.columns.iter().map(|c| c.name.clone()).collect()
+                    };
+                    let matching_rids = self.collect_rids_for_mutation(input, table)?;
+                    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_rids.len());
+                    for rid in &matching_rids {
+                        if let Some(row) = self.catalog.get(table, *rid) {
+                            out_rows.push(row);
+                        }
+                    }
+                    self.catalog
+                        .delete_many(table, &matching_rids)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    self.view_registry.mark_dependents_dirty(table);
+                    return Ok(QueryResult::Rows {
+                        columns,
+                        rows: out_rows,
+                    });
+                }
+
                 // Mission C Phase 3: no schema clone — collect_rids_for_mutation
                 // looks up schema internally when it needs one, and the mutation
                 // loop doesn't need the schema at all.
@@ -3593,14 +3679,21 @@ pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
             input,
             table,
             assignments,
+            returning,
         } => PlanNode::Update {
             input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
             assignments: assignments.clone(),
+            returning: *returning,
         },
-        PlanNode::Delete { input, table } => PlanNode::Delete {
+        PlanNode::Delete {
+            input,
+            table,
+            returning,
+        } => PlanNode::Delete {
             input: Box::new(lower_unindexed_scans(catalog, input)),
             table: table.clone(),
+            returning: *returning,
         },
         PlanNode::Window { input, windows } => PlanNode::Window {
             input: Box::new(lower_unindexed_scans(catalog, input)),
@@ -3861,17 +3954,24 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             input,
             table,
             assignments,
+            returning,
         } => {
             let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
             let child = format_plan_tree(input, depth + 1);
+            let ret = if *returning { " returning" } else { "" };
             format!(
-                "{indent}Update table={table} set=[{}]\n{child}",
+                "{indent}Update table={table} set=[{}]{ret}\n{child}",
                 cols.join(", ")
             )
         }
-        PlanNode::Delete { input, table } => {
+        PlanNode::Delete {
+            input,
+            table,
+            returning,
+        } => {
             let child = format_plan_tree(input, depth + 1);
-            format!("{indent}Delete table={table}\n{child}")
+            let ret = if *returning { " returning" } else { "" };
+            format!("{indent}Delete table={table}{ret}\n{child}")
         }
         PlanNode::CreateTable { name, fields } => {
             let fs: Vec<String> = fields
