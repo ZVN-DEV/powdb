@@ -1,0 +1,32 @@
+# Standalone workspace — deliberately NOT a member of the root PowDB workspace.
+# This artifact is built with `panic = "unwind"` so the embedded engine can
+# `catch_unwind` at the FFI boundary and never abort the host Node process (the
+# server's crate keeps `panic = "abort"`). An empty [workspace] table detaches
+# this crate from the parent workspace so it gets its own profile.
+[workspace]
+
+[package]
+name = "powdb-node"
+version = "0.6.2"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Node native addon (napi-rs) exposing the embedded PowDB engine in-process"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The embedded facade (in-process Database + panic-safe handle). Path dep on the
+# sibling crates; rebuilt here under panic = "unwind".
+powdb = { path = "../../crates/powdb" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+panic = "unwind"
+opt-level = 3

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Embedded mode — Node addon `@zvndev/powdb-embedded`** (`bindings/node/`).
+  A napi-rs native addon exposing the in-process engine to JavaScript with no
+  server/socket: `Database.open(dir)` → `.query(powql)` / `.querySql(sql)` /
+  `.queryReadonly(...)`. Results match the `@zvndev/powdb-client` `QueryResult`
+  shape exactly (rows as `string[][]`, `affected` as `bigint`) so embedded and
+  networked code paths are interchangeable — the foundation for local-first
+  apps (e.g. `turbinePowDB({ embedded })`). Built as a standalone
+  `panic = "unwind"` workspace so a query panic is caught and surfaced as a JS
+  error rather than aborting the host process.
 - **Embedded mode — `powdb` crate** (the SQLite-shaped front door). Run the
   engine **in-process**, no server/socket: `Database::open(dir)` →
   `.query(powql)` / `.query_sql(sql)` / `.query_readonly(...)`. Single-op

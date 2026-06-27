@@ -1183,24 +1183,11 @@ fn query_result_to_message(result: QueryResult) -> Result<Message, QueryError> {
     }
 }
 
+// Canonical wire rendering lives on `Value` (`powdb_storage`) so the server,
+// CLI, and embedded bindings render results identically. Kept as a thin alias
+// to minimize churn at the call sites in this module.
 fn value_to_display(v: &Value) -> String {
-    match v {
-        Value::Int(n)      => n.to_string(),
-        Value::Float(n)    => format!("{n}"),
-        Value::Bool(b)     => b.to_string(),
-        Value::Str(s)      => s.clone(),
-        Value::DateTime(t) => format!("{t}"),
-        Value::Uuid(u)     => format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
-            u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]),
-        Value::Bytes(b)    => format!("<{} bytes>", b.len()),
-        // NULL is serialized as the bareword "null" on the wire. This is the
-        // sentinel the TypeScript client's typed-row decoder already
-        // documents and matches (`coerceValue` treats the exact token
-        // "null" as NULL for non-str columns); the previous "{}" rendering
-        // was a bug that neither the TS client nor the CLI recognized.
-        Value::Empty       => "null".into(),
-    }
+    v.to_wire_string()
 }
 
 #[cfg(test)]

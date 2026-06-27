@@ -76,6 +76,29 @@ impl Value {
     pub fn is_empty(&self) -> bool {
         matches!(self, Value::Empty)
     }
+
+    /// Canonical wire/text rendering of a value, shared by the server protocol,
+    /// the CLI, and the embedded bindings so a result is identical however it is
+    /// read. `Empty` (NULL) renders as the bareword `null` — the sentinel the
+    /// typed-row decoders recognize; a UUID renders as the canonical hyphenated
+    /// form; bytes render as a `<N bytes>` placeholder (the binary wire path
+    /// does not stringify raw bytes).
+    pub fn to_wire_string(&self) -> String {
+        match self {
+            Value::Int(n) => n.to_string(),
+            Value::Float(n) => format!("{n}"),
+            Value::Bool(b) => b.to_string(),
+            Value::Str(s) => s.clone(),
+            Value::DateTime(t) => format!("{t}"),
+            Value::Uuid(u) => format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+            ),
+            Value::Bytes(b) => format!("<{} bytes>", b.len()),
+            Value::Empty => "null".into(),
+        }
+    }
 }
 
 // NOTE on cross-numeric equality: `PartialEq` (and `Hash`) deliberately do
@@ -224,6 +247,25 @@ pub struct RowId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_value_to_wire_string() {
+        assert_eq!(Value::Int(42).to_wire_string(), "42");
+        assert_eq!(Value::Bool(true).to_wire_string(), "true");
+        assert_eq!(Value::Str("hi".into()).to_wire_string(), "hi");
+        // NULL renders as the bareword the typed-row decoders recognize.
+        assert_eq!(Value::Empty.to_wire_string(), "null");
+        // UUID renders in canonical hyphenated form.
+        assert_eq!(
+            Value::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00
+            ])
+            .to_wire_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(Value::Bytes(vec![1, 2, 3]).to_wire_string(), "<3 bytes>");
+    }
 
     #[test]
     fn test_value_type_id() {
