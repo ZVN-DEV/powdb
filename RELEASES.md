@@ -19,6 +19,7 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
+| **npm** | `@zvndev/powdb-embedded` (in-process Node addon, prebuilt binaries for all platforms) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
 | **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
 ## GitHub Releases
@@ -58,8 +59,15 @@ one-time setup and the reusable standard.
 - **crates.io** — `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
   authenticated via `rust-lang/crates-io-auth-action`. Kept manual because
   publishing to crates.io is irreversible.
-- **npm** — published automatically by `release.yml` on a `v*` tag push, with
-  provenance. No manual `npm publish`, no token to make.
+- **npm (`@zvndev/powdb-client`)** — published automatically by `release.yml`
+  on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
+- **npm (`@zvndev/powdb-embedded`)** — published by `publish-node-addon.yml`
+  (manual `workflow_dispatch`). It first builds the native addon on a per-platform
+  runner matrix (macOS arm64/x64, Linux x64/arm64, Windows x64), then publishes
+  one fat package bundling all five prebuilt `.node` binaries, token-less with
+  provenance. `dry_run=true` (the default) packs every platform without
+  publishing. Kept manual because the binary matrix is slow and the package is
+  released on demand, not on every `v*` tag.
 
 ## Release Checklist
 
@@ -67,6 +75,7 @@ one-time setup and the reusable standard.
 [ ] Update workspace version in root Cargo.toml
 [ ] Update inter-crate dep versions in query/backup/server/cli Cargo.toml
 [ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
+[ ] Update bindings/node/package.json version (@zvndev/powdb-embedded, lockstep)
 [ ] Update CHANGELOG.md and the Current release line in RELEASES.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
@@ -84,4 +93,9 @@ one-time setup and the reusable standard.
     PowQL flow, then kill -9 the server and restart to confirm WAL replay
     recovers the data (v0.4.1–v0.4.3 shipped data-loss P0s that the
     pre-publish gates missed because none exercised a real crash + restart)
+[ ] Publish the embedded Node addon: run publish-node-addon.yml with
+    dry_run=true to validate the full platform matrix, then re-run with
+    dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
+    First-ever release of this name needs a one-time bootstrap `npm publish`
+    + trusted-publisher config — see docs/ci/trusted-publishing.md
 ```

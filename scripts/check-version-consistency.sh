@@ -45,6 +45,12 @@ client_version="$(sed -n 's/^export const CLIENT_VERSION = "\([^"]*\)";.*/\1/p' 
 [[ "$client_version" == "$ts_package_version" ]] \
   || fail "CLIENT_VERSION $client_version != TS package version $ts_package_version"
 
+# Embedded Node addon (@zvndev/powdb-embedded) ships in lockstep with the
+# workspace version, same as the TS client.
+addon_version="$($node_bin -p "require('./bindings/node/package.json').version")"
+[[ "$addon_version" == "$workspace_version" ]] \
+  || fail "bindings/node/package.json version $addon_version != workspace $workspace_version"
+
 grep -qE "^## \[$workspace_version\]" CHANGELOG.md \
   || fail "CHANGELOG.md is missing a top-level entry for [$workspace_version]"
 grep -q "Current release: v$workspace_version" RELEASES.md \

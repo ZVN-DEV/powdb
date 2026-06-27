@@ -40,6 +40,14 @@ and workflow run that built it. Free supply-chain transparency.
 > `npm publish` while logged in locally to create it, then configure trusted
 > publishing for every release after. Existing packages: just configure.
 
+> **PowDB npm packages (2 configs):**
+> - `@zvndev/powdb-client` — workflow `release.yml`, env `npm-publish`.
+> - `@zvndev/powdb-embedded` — workflow `publish-node-addon.yml`, env
+>   `npm-publish`. This is the embedded Node addon; it ships **one** package
+>   with prebuilt binaries for all platforms bundled in (no per-platform
+>   sub-packages), so only this single name needs a trusted publisher. It's a
+>   brand-new name, so it needs the one bootstrap `npm publish` above first.
+
 ### crates.io
 
 Same idea, but configured **per crate** (a workspace with 6 published crates
