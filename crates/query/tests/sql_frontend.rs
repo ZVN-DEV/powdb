@@ -146,3 +146,162 @@ fn powql_subtraction_in_bare_projection() {
         other => panic!("expected rows, got {other:?}"),
     }
 }
+
+/// SQL `INSERT ... RETURNING *` returns the inserted row, so an ORM gets the
+/// row back in one round-trip instead of a write followed by a reselect. PowQL
+/// already supports `insert ... returning`; this wires the SQL surface to it.
+#[test]
+fn sql_insert_returning_star_yields_inserted_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, name TEXT)")
+        .unwrap();
+    match engine
+        .execute_sql("INSERT INTO User (id, name) VALUES (1, 'Ada') RETURNING *")
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(1));
+            assert_eq!(rows[0][1], Value::Str("Ada".into()));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// The createMany case: a multi-row `INSERT ... VALUES (..),(..) RETURNING *`
+/// returns every inserted row in one statement (one round-trip, one fsync).
+#[test]
+fn sql_multi_row_insert_returning_star_yields_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, name TEXT)")
+        .unwrap();
+    match engine
+        .execute_sql(
+            "INSERT INTO User (id, name) VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Mary') RETURNING *",
+        )
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Value::Int(1));
+            assert_eq!(rows[1][1], Value::Str("Grace".into()));
+            assert_eq!(rows[2][0], Value::Int(3));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// A plain `INSERT` (no RETURNING) still reports an affected-row count rather
+/// than materializing rows — RETURNING stays opt-in.
+#[test]
+fn sql_insert_without_returning_reports_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, name TEXT)")
+        .unwrap();
+    match engine
+        .execute_sql("INSERT INTO User (id, name) VALUES (1, 'Ada')")
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+}
+
+/// `UPDATE ... SET ... WHERE ... RETURNING *` returns the post-image of the
+/// updated rows.
+#[test]
+fn sql_update_returning_star_yields_post_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, age INTEGER)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO User (id, age) VALUES (1, 37)")
+        .unwrap();
+    match engine
+        .execute_sql("UPDATE User SET age = 38 WHERE id = 1 RETURNING *")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(1));
+            assert_eq!(rows[0][1], Value::Int(38), "post-image: the new age");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// `UPDATE` with no `WHERE` still parses a trailing `RETURNING *` (the clause
+/// must not be swallowed into the SET assignments).
+#[test]
+fn sql_update_returning_without_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, age INTEGER)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO User (id, age) VALUES (1, 37), (2, 40)")
+        .unwrap();
+    match engine
+        .execute_sql("UPDATE User SET age = 50 RETURNING *")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|r| r[1] == Value::Int(50)));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// `DELETE ... WHERE ... RETURNING *` returns the pre-image of the deleted rows.
+#[test]
+fn sql_delete_returning_star_yields_pre_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_sql("CREATE TABLE User (id INTEGER NOT NULL UNIQUE, name TEXT)")
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO User (id, name) VALUES (1, 'Ada'), (2, 'Grace')")
+        .unwrap();
+    match engine
+        .execute_sql("DELETE FROM User WHERE id = 2 RETURNING *")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Int(2));
+            assert_eq!(rows[0][1], Value::Str("Grace".into()), "pre-image");
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // The row is actually gone.
+    match engine.execute_sql("SELECT id FROM User").unwrap() {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// PowQL's `returning` is all-columns, so a projected `RETURNING id, name` is
+/// rejected with a clear error rather than silently returning every column.
+#[test]
+fn sql_returning_column_list_is_unsupported() {
+    let err = powdb_query::sql::parse_sql(
+        "INSERT INTO User (id, name) VALUES (1, 'Ada') RETURNING id, name",
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("column projection"),
+        "error should explain the column-projection limitation, got: {err}"
+    );
+}

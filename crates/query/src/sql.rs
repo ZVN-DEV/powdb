@@ -529,16 +529,20 @@ impl SqlParser {
                 break;
             }
         }
-        Ok(format!("insert {table} {}", rows.join(", ")))
+        let mut out = format!("insert {table} {}", rows.join(", "));
+        if self.returning_clause()? {
+            out.push_str(" returning");
+        }
+        Ok(out)
     }
 
     fn update(&mut self) -> Result<String, ParseError> {
         self.expect_kw("update")?;
         let table = self.expect_ident("table name")?;
         self.expect_kw("set")?;
-        let assigns = self.assignment_list_until(&["where"])?;
+        let assigns = self.assignment_list_until(&["where", "returning"])?;
         let filter = if self.eat_kw("where") {
-            Some(self.expr_until(&[])?)
+            Some(self.expr_until(&["returning"])?)
         } else {
             None
         };
@@ -550,6 +554,9 @@ impl SqlParser {
         out.push_str(" update { ");
         out.push_str(&assigns.join(", "));
         out.push_str(" }");
+        if self.returning_clause()? {
+            out.push_str(" returning");
+        }
         Ok(out)
     }
 
@@ -558,7 +565,7 @@ impl SqlParser {
         self.expect_kw("from")?;
         let table = self.expect_ident("table name")?;
         let filter = if self.eat_kw("where") {
-            Some(self.expr_until(&[])?)
+            Some(self.expr_until(&["returning"])?)
         } else {
             None
         };
@@ -568,7 +575,28 @@ impl SqlParser {
             out.push_str(&f);
         }
         out.push_str(" delete");
+        if self.returning_clause()? {
+            out.push_str(" returning");
+        }
         Ok(out)
+    }
+
+    /// Parse an optional trailing `RETURNING *`, returning whether it was
+    /// present. PowQL's `returning` clause always yields every column, so a
+    /// projected `RETURNING a, b` is rejected rather than silently widened to
+    /// all columns.
+    fn returning_clause(&mut self) -> Result<bool, ParseError> {
+        if !self.eat_kw("returning") {
+            return Ok(false);
+        }
+        if !self.eat_sym('*') {
+            return Err(ParseError::Syntax {
+                message: "RETURNING currently supports only `RETURNING *` \
+                          (column projection is not yet supported)"
+                    .into(),
+            });
+        }
+        Ok(true)
     }
 
     fn create(&mut self) -> Result<String, ParseError> {

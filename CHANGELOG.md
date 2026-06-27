@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes and over the wire (the rows come back on the existing rows path).
   `returning` is opt-in: without it, every existing fast path (byte-patch,
   fused single-pass scan/update/delete) is unchanged.
+- **SQL `RETURNING *`** (write-performance Phase 3) — the SQL frontend now
+  accepts an optional trailing `RETURNING *` on `INSERT`/`UPDATE`/`DELETE`,
+  lowering to PowQL's `returning` clause. ORMs hitting the SQL surface (the
+  standard `INSERT INTO t (...) VALUES (...), (...) RETURNING *` createMany
+  shape) get the inserted/updated/deleted rows back in one round-trip instead of
+  a write followed by a reselect. Column-projected `RETURNING a, b` returns an
+  explicit unsupported-feature error (PowQL `returning` is all-columns). See
+  `docs/SQL.md`.
 - **`Normal` WAL durability mode** (write-performance Phase 1) — a third
   `WalSyncMode` between `Full` and `Off`. Commits are acknowledged once their
   WAL record reaches the OS page cache (no per-commit fsync); a background
