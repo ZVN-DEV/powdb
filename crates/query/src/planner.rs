@@ -470,6 +470,7 @@ fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
         input: Box::new(source),
         table: upd.source,
         assignments: upd.assignments,
+        returning: upd.returning,
     })
 }
 
@@ -494,6 +495,7 @@ fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::Delete {
         input: Box::new(source),
         table: del.source,
+        returning: del.returning,
     })
 }
 

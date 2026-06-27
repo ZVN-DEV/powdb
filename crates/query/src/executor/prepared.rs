@@ -178,10 +178,14 @@ impl Engine {
     fn try_build_update_pk_fast(catalog: &Catalog, plan: &PlanNode) -> Option<UpdatePkFast> {
         // Top level must be `Update { input: IndexScan(...), ... }`.
         let (table, input, assignments) = match plan {
+            // `returning` must materialize the post-update row image, which the
+            // byte-patch fast path can't produce — fall through to the generic
+            // executor arm.
             PlanNode::Update {
                 table,
                 input,
                 assignments,
+                returning: false,
             } => (table, input.as_ref(), assignments),
             _ => return None,
         };

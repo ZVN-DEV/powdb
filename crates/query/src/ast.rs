@@ -172,12 +172,18 @@ pub struct UpdateExpr {
     pub source: String,
     pub filter: Option<Expr>,
     pub assignments: Vec<Assignment>,
+    /// `true` when the statement ends with `returning` — the executor returns
+    /// the post-update rows (all columns) instead of a modified-count.
+    pub returning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteExpr {
     pub source: String,
     pub filter: Option<Expr>,
+    /// `true` when the statement ends with `returning` — the executor returns
+    /// the pre-delete rows (all columns) instead of a modified-count.
+    pub returning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

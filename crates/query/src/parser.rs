@@ -429,10 +429,16 @@ impl Parser {
                     }
                     self.advance();
                     let assignments = self.parse_assignments()?;
+                    // Optional trailing `returning` — return the post-update rows.
+                    let returning = *self.peek() == Token::Returning;
+                    if returning {
+                        self.advance();
+                    }
                     return Ok(Statement::UpdateQuery(UpdateExpr {
                         source,
                         filter,
                         assignments,
+                        returning,
                     }));
                 }
                 Token::Delete => {
@@ -442,7 +448,16 @@ impl Parser {
                         });
                     }
                     self.advance();
-                    return Ok(Statement::DeleteQuery(DeleteExpr { source, filter }));
+                    // Optional trailing `returning` — return the pre-delete rows.
+                    let returning = *self.peek() == Token::Returning;
+                    if returning {
+                        self.advance();
+                    }
+                    return Ok(Statement::DeleteQuery(DeleteExpr {
+                        source,
+                        filter,
+                        returning,
+                    }));
                 }
                 _ => break,
             }
@@ -2026,7 +2041,17 @@ mod tests {
                 assert_eq!(upd.source, "User");
                 assert!(upd.filter.is_some());
                 assert_eq!(upd.assignments.len(), 1);
+                assert!(!upd.returning);
             }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_returning() {
+        let stmt = parse(r#"User filter .name = "Alice" update { age := 31 } returning"#).unwrap();
+        match stmt {
+            Statement::UpdateQuery(upd) => assert!(upd.returning),
             _ => panic!("expected update"),
         }
     }
@@ -2038,7 +2063,17 @@ mod tests {
             Statement::DeleteQuery(del) => {
                 assert_eq!(del.source, "User");
                 assert!(del.filter.is_some());
+                assert!(!del.returning);
             }
+            _ => panic!("expected delete"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_returning() {
+        let stmt = parse("User filter .age < 18 delete returning").unwrap();
+        match stmt {
+            Statement::DeleteQuery(del) => assert!(del.returning),
             _ => panic!("expected delete"),
         }
     }
