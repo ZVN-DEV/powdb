@@ -2,9 +2,13 @@ name: publish
 
 # Publishes PowDB crates to crates.io in dependency order.
 #
-# Requires the CARGO_REGISTRY_TOKEN repository secret to be set.
-# Generate a token at https://crates.io/settings/tokens with "publish-update"
-# scope, then add it at Settings > Secrets > Actions > CARGO_REGISTRY_TOKEN.
+# Token-less via crates.io Trusted Publishing (OIDC). No CARGO_REGISTRY_TOKEN
+# secret is stored — the job mints a short-lived token from crates.io using the
+# workflow's GitHub OIDC identity. Requires a trusted publisher configured once
+# PER CRATE on crates.io (each crate > Settings > Trusted Publishing): owner
+# ZVN-DEV, repo powdb, workflow publish.yml. All six publishable crates
+# (storage, auth, query, backup, server, cli) must be configured. See
+# docs/ci/trusted-publishing.md.
 #
 # Usage:
 #   - Trigger manually via workflow_dispatch with a version string
@@ -31,9 +35,12 @@ jobs:
     name: publish crates
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    environment: crates-publish
+    permissions:
+      contents: read
+      id-token: write # mint a short-lived crates.io token via OIDC
     env:
       CARGO_TERM_COLOR: always
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       # The repo's .cargo/config.toml sets `target-cpu=native` for local M1 dev.
       # On GitHub's heterogeneous shared-runner fleet that flag makes rustc emit
       # instructions the underlying (often live-migrated) silicon can't execute,
@@ -84,6 +91,19 @@ jobs:
 
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
+
+      # crates.io Trusted Publishing: exchange the GitHub OIDC identity for a
+      # short-lived crates.io token (~30 min). Only needed for a real publish;
+      # `cargo publish --dry-run` does not authenticate, so it is skipped on a
+      # dry run (which also means a dry run does not require OIDC to be set up).
+      - name: Authenticate to crates.io (OIDC trusted publishing)
+        id: crates_auth
+        if: ${{ inputs.dry_run == false }}
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Export crates.io token for the publish steps
+        if: ${{ inputs.dry_run == false }}
+        run: echo "CARGO_REGISTRY_TOKEN=${{ steps.crates_auth.outputs.token }}" >> "$GITHUB_ENV"
 
       # Publish in the RELEASES.md dependency order. Each crate must be indexed
       # by crates.io before the next dependent crate can be published. The

@@ -46,6 +46,21 @@ Inter-crate dependencies require publishing in this order:
 
 Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
 
+## Publishing is token-less (Trusted Publishing / OIDC)
+
+Both registries publish from CI with **no stored token** — neither
+`CARGO_REGISTRY_TOKEN` nor an npm token exists anymore. The workflows mint
+short-lived credentials from their GitHub OIDC identity. This is configured once
+per package/crate on the registry websites; see
+[`docs/ci/trusted-publishing.md`](docs/ci/trusted-publishing.md) for the
+one-time setup and the reusable standard.
+
+- **crates.io** — `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
+  authenticated via `rust-lang/crates-io-auth-action`. Kept manual because
+  publishing to crates.io is irreversible.
+- **npm** — published automatically by `release.yml` on a `v*` tag push, with
+  provenance. No manual `npm publish`, no token to make.
+
 ## Release Checklist
 
 ```
@@ -62,9 +77,9 @@ Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `pow
 [ ] cargo publish -p powdb-backup
 [ ] cargo publish -p powdb-server
 [ ] cargo publish -p powdb-cli
-[ ] cd clients/ts && npm pack --dry-run && npm publish --access public
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
-[ ] Verify GitHub Release workflow creates binaries
+[ ] Verify GitHub Release workflow creates binaries AND auto-publishes npm
+    (@zvndev/powdb-client) token-less via release.yml — no manual npm publish
 [ ] Smoke-test the installed crates.io binary: run the README's documented
     PowQL flow, then kill -9 the server and restart to confirm WAL replay
     recovers the data (v0.4.1–v0.4.3 shipped data-loss P0s that the
