@@ -4861,3 +4861,81 @@ fn test_no_params_regression_path_unchanged() {
         other => panic!("{other:?}"),
     }
 }
+
+// ── #117 / #118: the in-place UPDATE fast path must coerce the assigned
+// value to the target column's declared type before writing fixed bytes ──
+//
+// `Acct` has a fixed-size `balance: float` (→ byte-patch fast path), an
+// indexed `id` (forces the IndexScan update path / plan_exec.rs:913 site) and
+// a non-indexed `tag` (forces the fused Filter(SeqScan) path /
+// try_fused_scan_update's :2679 site).
+fn acct_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_acct_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Acct { required unique id: str, balance: float, tag: int }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Acct { id := "a", balance := 1.5, tag := 1 }"#)
+        .unwrap();
+    engine
+}
+
+fn acct_balance(engine: &mut Engine) -> Value {
+    match engine
+        .execute_powql(r#"Acct filter .id = "a" { .balance }"#)
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => rows[0][0].clone(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_int_into_float_column_coerces_indexed_path() {
+    // #118: int assigned to a float column on the indexed fast path must be
+    // coerced to f64, not stored as the raw i64 bit pattern (which read back
+    // as the denormal ~5e-323).
+    let mut engine = acct_engine();
+    engine
+        .execute_powql(r#"Acct filter .id = "a" update { balance := 10 }"#)
+        .unwrap();
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_update_int_into_float_column_coerces_seqscan_path() {
+    // #118 via the fused Filter(SeqScan) path (filter on the non-indexed tag).
+    let mut engine = acct_engine();
+    engine
+        .execute_powql("Acct filter .tag = 1 update { balance := 10 }")
+        .unwrap();
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_update_str_into_float_column_errors_not_panic_indexed_path() {
+    // #117: a str assigned to a fixed-size (float) column on the indexed fast
+    // path must return a typed error, NOT hit `unreachable!` and abort.
+    let mut engine = acct_engine();
+    let result = engine.execute_powql(r#"Acct filter .id = "a" update { balance := "oops" }"#);
+    assert!(
+        result.is_err(),
+        "type-mismatched UPDATE must return Err, got {result:?}"
+    );
+    // The row must be untouched.
+    assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
+}
+
+#[test]
+fn test_update_str_into_float_column_errors_not_panic_seqscan_path() {
+    // #117 via the fused Filter(SeqScan) path (try_fused_scan_update).
+    let mut engine = acct_engine();
+    let result = engine.execute_powql(r#"Acct filter .tag = 1 update { balance := "oops" }"#);
+    assert!(
+        result.is_err(),
+        "type-mismatched UPDATE via seqscan must return Err, got {result:?}"
+    );
+    assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
+}

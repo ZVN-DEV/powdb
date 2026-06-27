@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Fixed a remotely-triggerable denial-of-service in the in-place `UPDATE`
+  fast path** (#117). Assigning a value whose type does not match a fixed-size
+  column (e.g. a `str` into a `float` column) reached
+  `unreachable!("all_fixed_nonnull guard lied")` and, under the deliberate
+  `panic = "abort"` profile, took the whole server process down for every
+  connection. The fast path now coerces each assignment to the column's
+  declared type before writing bytes and returns a typed `TypeError` on a
+  genuine mismatch. Reported by the turbine-orm integration.
+
+### Fixed
+- **`UPDATE` now coerces an integer assigned to a `float` column to `f64`**
+  (#118) instead of writing the raw i64 bit pattern (which read back as a
+  denormal such as `5e-323`) — silent numeric corruption on the in-place
+  update fast path. `INSERT` already coerced correctly; the byte-patch
+  `UPDATE` path bypassed it. Fix covers both the indexed and the fused
+  `Filter(SeqScan)` update paths. Reported by the turbine-orm integration.
+
 ## [0.6.2] - 2026-06-26
 
 ### Security
