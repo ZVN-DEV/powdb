@@ -830,11 +830,35 @@ impl Engine {
                             })
                         })
                         .collect::<Result<_, _>>()?;
-                    let vals: Result<Vec<Value>, _> = assignments
+                    // Resolve each assignment to a literal value. If any is a
+                    // non-literal expression, fall back (None) to the per-row
+                    // expression-eval path below.
+                    let raw_vals: Result<Vec<Value>, _> = assignments
                         .iter()
                         .map(|a| literal_to_value(&a.value))
                         .collect();
-                    (indices, vals.ok())
+                    // Coerce each literal to its target column's declared type
+                    // before it can reach the byte-patch fast path (the same
+                    // coercion the INSERT path applies). Without this, an int
+                    // assigned to a float column is written as raw i64 bits
+                    // (#118 silent corruption) and a str assigned to a
+                    // fixed-size column reaches `unreachable!` and aborts the
+                    // whole server (#117 remote DoS). A genuine type mismatch
+                    // is a hard error to the client, not an expr-path fallback.
+                    let coerced = match raw_vals {
+                        Ok(raws) => {
+                            let mut out = Vec::with_capacity(raws.len());
+                            for (raw, &idx) in raws.into_iter().zip(indices.iter()) {
+                                out.push(
+                                    coerce_value(raw, &schema_ref.columns[idx])
+                                        .map_err(QueryError::TypeError)?,
+                                );
+                            }
+                            Some(out)
+                        }
+                        Err(_) => None,
+                    };
+                    (indices, coerced)
                 };
                 let resolved_assignments: Option<Vec<(usize, Value)>> =
                     literal_vals.map(|vals| col_indices.iter().copied().zip(vals).collect());
