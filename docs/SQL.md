@@ -5,9 +5,9 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 ## Supported production subset
 
 - `SELECT [DISTINCT] ... FROM ... [JOIN ... ON ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...] [OFFSET ...]`
-- `INSERT INTO T (a, b) VALUES (1, 'x'), (2, 'y')`
-- `UPDATE T SET a = ... WHERE ...`
-- `DELETE FROM T WHERE ...`
+- `INSERT INTO T (a, b) VALUES (1, 'x'), (2, 'y') [RETURNING *]`
+- `UPDATE T SET a = ... WHERE ... [RETURNING *]`
+- `DELETE FROM T WHERE ... [RETURNING *]`
 - `CREATE TABLE T (...)`, including `NOT NULL` and `UNIQUE` column modifiers
 - `CREATE [UNIQUE] INDEX name ON T (col)`
 - `ALTER TABLE T ADD/DROP COLUMN ...`
@@ -16,9 +16,11 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 
 Supported expressions include literals, column references, qualified join references, arithmetic, boolean `AND`/`OR`/`NOT`, comparisons, `IS [NOT] NULL`, `LIKE`, aggregate/scalar function calls that already exist in PowQL, and `count(*)`.
 
+`INSERT`/`UPDATE`/`DELETE` accept an optional trailing `RETURNING *`, which returns the affected rows in the same statement (insert/update return the post-image, delete returns the pre-image) — so an ORM gets its rows back in one round-trip instead of a write followed by a reselect. This lowers to PowQL's `returning` clause.
+
 ## Intentional unsupported errors
 
-The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, and SQL `BETWEEN`. Use native PowQL for those shapes until the SQL subset is expanded.
+The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, SQL `BETWEEN`, and column-projected `RETURNING a, b` (only `RETURNING *` is supported, because PowQL's `returning` is all-columns). Use native PowQL for those shapes until the SQL subset is expanded.
 
 ## Plan-cache parity
 
