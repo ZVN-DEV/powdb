@@ -656,7 +656,16 @@ impl Parser {
             self.advance(); // consume the comma between row blocks
             rows.push(self.parse_assignments()?);
         }
-        Ok(Statement::Insert(InsertExpr { target, rows }))
+        // Optional trailing `returning` — return the inserted rows.
+        let returning = *self.peek() == Token::Returning;
+        if returning {
+            self.advance();
+        }
+        Ok(Statement::Insert(InsertExpr {
+            target,
+            rows,
+            returning,
+        }))
     }
 
     /// Parse: `upsert Table on .key_col { assignments } [on conflict { update_assignments }]`
@@ -1816,6 +1825,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Update => out.push_str("update"),
             Token::Delete => out.push_str("delete"),
             Token::Upsert => out.push_str("upsert"),
+            Token::Returning => out.push_str("returning"),
             Token::Conflict => out.push_str("conflict"),
             Token::Select => out.push_str("select"),
             Token::Required => out.push_str("required"),

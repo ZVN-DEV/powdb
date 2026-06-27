@@ -200,6 +200,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Update => hash_byte(h, 0x16),
         Token::Delete => hash_byte(h, 0x17),
         Token::Upsert => hash_byte(h, 0x18),
+        Token::Returning => hash_byte(h, 0x6F),
         Token::Select => hash_byte(h, 0x19),
         Token::Required => hash_byte(h, 0x1A),
         Token::Multi => hash_byte(h, 0x1B),

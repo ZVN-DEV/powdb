@@ -107,6 +107,9 @@ pub enum PlanNode {
         table: String,
         /// One assignment-block per row to insert. Always at least one.
         rows: Vec<Vec<Assignment>>,
+        /// `true` when `returning` was requested — executor returns the
+        /// inserted rows instead of a modified-count.
+        returning: bool,
     },
     /// UPSERT: probe index on `key_column` — if miss, insert; if hit, update.
     Upsert {
