@@ -13,6 +13,8 @@ import { strict as assert } from "node:assert";
 
 const HOST = process.env.POWDB_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.POWDB_PORT ?? "15433");
+// Set by run-with-server.ts when a Unix-domain-socket listener is available.
+const SOCKET = process.env.POWDB_SOCKET;
 
 let client: Client;
 let passed = 0;
@@ -777,6 +779,23 @@ async function main() {
         err.message.includes("timeout") || err.message.includes("ETIMEDOUT"),
         `unexpected error: ${err.message}`
       );
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nUnix domain socket");
+  // ──────────────────────────────────────────────────────────
+
+  await test("connects over a unix domain socket via { path }", async () => {
+    if (!SOCKET) {
+      throw new Error("POWDB_SOCKET not set — harness did not expose a socket");
+    }
+    const uds = await Client.connect({ path: SOCKET });
+    try {
+      const r = await uds.query("count(" + users + ")");
+      assert.equal(r.kind, "scalar", `expected scalar over UDS, got ${r.kind}`);
+    } finally {
+      await uds.close();
     }
   });
 

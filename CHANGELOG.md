@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Unix domain socket listener** (write-performance / transport) — start the
+  server with `--socket <path>` (or `POWDB_SOCKET=<path>`) to listen on a Unix
+  domain socket in addition to TCP. Same-host clients avoid the TCP/IP stack
+  (~2× lower round-trip latency), which is the dominant cost per op for
+  co-located clients. Additive: the TCP listener always runs; the socket is
+  local-only (no TLS, no IP rate-limiting). The TypeScript client gains a
+  `{ path }` connection option (`Client.connect({ path: "/run/powdb.sock" })`).
+  See `docs/design/2026-06-27-beating-sqlite-latency-design.md`.
 - **`insert`/`update`/`delete ... returning`** (write-performance Phase 3) — a
   write statement ending with `returning` now returns the affected rows (all
   columns) as a result set instead of a modified-count, so a client no longer

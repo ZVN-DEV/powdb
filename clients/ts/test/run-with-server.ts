@@ -109,6 +109,9 @@ async function main() {
 
   const port = await getFreePort();
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "powdb-ts-test-"));
+  // Also expose a Unix domain socket so the client's `{ path }` connection
+  // mode is exercised end-to-end alongside TCP.
+  const socketPath = path.join(dataDir, "powdb.sock");
   const serverLog: string[] = [];
   const server = spawn(
     "cargo",
@@ -122,6 +125,8 @@ async function main() {
       host,
       "--port",
       String(port),
+      "--socket",
+      socketPath,
       "--data-dir",
       dataDir,
     ],
@@ -149,6 +154,7 @@ async function main() {
       ...process.env,
       POWDB_HOST: host,
       POWDB_PORT: String(port),
+      POWDB_SOCKET: socketPath,
     });
     if (code !== 0) {
       console.error("\nPowDB server log tail:");
