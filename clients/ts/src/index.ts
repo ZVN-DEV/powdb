@@ -77,8 +77,17 @@ function toWireParam(p: QueryParam): WireParam {
 }
 
 export interface ClientOptions {
-  host: string;
-  port: number;
+  /** TCP host. Required unless `path` (a Unix domain socket) is given. */
+  host?: string;
+  /** TCP port. Required unless `path` (a Unix domain socket) is given. */
+  port?: number;
+  /**
+   * Path to a Unix domain socket. When set, the client connects over the
+   * socket instead of TCP (same-host, ~2× lower round-trip latency) and
+   * `host`/`port`/`tls` are ignored. Requires a server started with
+   * `--socket <path>`.
+   */
+  path?: string;
   dbName?: string;
   password?: string | null;
   /**
@@ -179,6 +188,7 @@ export class Client extends EventEmitter<ClientEvents> {
     const {
       host,
       port,
+      path,
       dbName = "default",
       password = null,
       user,
@@ -186,7 +196,18 @@ export class Client extends EventEmitter<ClientEvents> {
       tls: tlsOpt = false,
     } = opts;
 
-    const socket = await openSocket(host, port, connectTimeoutMs, tlsOpt);
+    if (path === undefined && (host === undefined || port === undefined)) {
+      throw new PowDBError(
+        "connect requires either { path } (Unix socket) or { host, port } (TCP)",
+        "connect_failed",
+      );
+    }
+
+    const socket = await openSocket(
+      { host, port, path },
+      connectTimeoutMs,
+      tlsOpt,
+    );
 
     // We need to read the initial ConnectOk before wiring up the normal
     // pending-queue machinery, so we do a one-shot handshake here.
@@ -252,7 +273,7 @@ export class Client extends EventEmitter<ClientEvents> {
     const serverMajor = majorOf(reply.version);
     const clientMajor = majorOf(CLIENT_VERSION);
     if (serverMajor !== clientMajor) {
-      const key = `${host}:${port}`;
+      const key = path ?? `${host}:${port}`;
       if (!versionWarnings.has(key)) {
         versionWarnings.add(key);
         console.warn(
@@ -695,9 +716,15 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 }
 
+interface SocketTarget {
+  host?: string;
+  port?: number;
+  /** Unix domain socket path. When set, takes precedence over host/port. */
+  path?: string;
+}
+
 function openSocket(
-  host: string,
-  port: number,
+  target: SocketTarget,
   timeoutMs: number,
   tlsOpt: boolean | tls.ConnectionOptions,
 ): Promise<net.Socket> {
@@ -711,8 +738,8 @@ function openSocket(
     const onConnect = () => {
       clearTimeout(timer);
       socket.setNoDelay(true);
-      // Enable TCP keepalive on the underlying OS socket so dead peers are
-      // detected even when the app is otherwise idle.
+      // Enable keepalive on the underlying OS socket so dead peers are detected
+      // even when the app is otherwise idle. (No-op for Unix sockets.)
       socket.setKeepAlive(true, 30_000);
       resolve(socket);
     };
@@ -723,13 +750,19 @@ function openSocket(
       reject(new PowDBError(`connect failed: ${err.message}`, "connect_failed", { cause: err }));
     };
 
-    if (tlsOpt) {
+    if (target.path !== undefined) {
+      // Unix domain socket: no TLS (local, same-host), no host/port.
+      socket = new net.Socket();
+      socket.once("connect", onConnect);
+      socket.once("error", onError);
+      socket.connect(target.path);
+    } else if (tlsOpt) {
       // TLS path: `tls.connect` wraps an underlying net.Socket. `secureConnect`
       // fires once the TLS handshake is complete — that is the right hook for
       // "ready to send application data".
       const tlsOptions: tls.ConnectionOptions =
         tlsOpt === true ? {} : tlsOpt;
-      const tlsSock = tls.connect(port, host, tlsOptions);
+      const tlsSock = tls.connect(target.port!, target.host!, tlsOptions);
       socket = tlsSock;
       tlsSock.once("secureConnect", onConnect);
       tlsSock.once("error", onError);
@@ -737,7 +770,7 @@ function openSocket(
       socket = new net.Socket();
       socket.once("connect", onConnect);
       socket.once("error", onError);
-      socket.connect(port, host);
+      socket.connect(target.port!, target.host!);
     }
   });
 }

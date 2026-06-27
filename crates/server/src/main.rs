@@ -2,7 +2,8 @@ use powdb_query::executor::{Engine, WalSyncMode};
 use powdb_server::handler;
 use powdb_server::metrics::{serve_metrics, Metrics};
 use std::sync::{Arc, RwLock};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -25,6 +26,10 @@ struct Args {
     require_tls: bool,
     /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
     metrics_addr: Option<String>,
+    /// Filesystem path for an optional Unix-domain-socket listener; `None` =
+    /// off. Additive: the TCP listener always runs. UDS removes the TCP/IP
+    /// stack from the same-host path (~2× lower round-trip latency).
+    socket: Option<String>,
 }
 
 /// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
@@ -114,6 +119,8 @@ fn parse_args() -> Args {
     let mut metrics_addr: Option<String> = std::env::var("POWDB_METRICS_ADDR")
         .ok()
         .filter(|s| !s.is_empty());
+    // Optional Unix-domain-socket path. Off unless set.
+    let mut socket: Option<String> = std::env::var("POWDB_SOCKET").ok().filter(|s| !s.is_empty());
     // WS2: per-query memory budget. Env-only (no CLI flag) for now.
     let query_memory_limit =
         parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
@@ -197,6 +204,14 @@ fn parse_args() -> Args {
                 }
                 metrics_addr = Some(argv[i].clone());
             }
+            "--socket" | "-s" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--socket requires a value");
+                    std::process::exit(2);
+                }
+                socket = Some(argv[i].clone());
+            }
             "--version" | "-V" => {
                 println!("powdb-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -210,6 +225,7 @@ fn parse_args() -> Args {
                 println!("OPTIONS:");
                 println!("    -p, --port <PORT>          TCP port to listen on (default: 5433)");
                 println!("    -b, --bind <ADDR>          Bind address (default: 127.0.0.1)");
+                println!("    -s, --socket <PATH>        Also listen on a Unix domain socket (same-host, ~2x lower latency)");
                 println!("    -d, --data-dir <PATH>      Data directory (default: ./powdb_data)");
                 println!("        --tls-cert <PATH>      TLS certificate file (PEM)");
                 println!("        --tls-key <PATH>       TLS private key file (PEM)");
@@ -229,6 +245,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
+                println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
@@ -254,7 +271,45 @@ fn parse_args() -> Args {
         query_memory_limit,
         require_tls,
         metrics_addr,
+        socket,
     }
+}
+
+/// Serve one accepted connection to completion over any stream type — plain
+/// TCP, TLS-over-TCP, or a Unix domain socket. Every accept arm funnels through
+/// here so the per-connection `ConnOpts` wiring lives in exactly one place.
+#[allow(clippy::too_many_arguments)]
+async fn run_connection<S>(
+    stream: S,
+    peer_addr: Option<std::net::SocketAddr>,
+    engine: Arc<RwLock<Engine>>,
+    tx_gate: handler::TxGate,
+    expected_password: Option<Zeroizing<String>>,
+    users: Arc<powdb_auth::UserStore>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    idle_timeout: std::time::Duration,
+    query_timeout: std::time::Duration,
+    rate_limiter: handler::AuthRateLimiter,
+    metrics: Arc<Metrics>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    handler::handle_connection(
+        stream,
+        handler::ConnOpts {
+            engine,
+            tx_gate,
+            expected_password,
+            users,
+            shutdown_rx: &mut shutdown_rx,
+            idle_timeout,
+            query_timeout,
+            rate_limiter: Some(&rate_limiter),
+            peer_addr,
+            metrics,
+        },
+    )
+    .await;
 }
 
 /// Load TLS certificate and key files, returning a configured `TlsAcceptor`.
@@ -493,6 +548,26 @@ async fn main() {
         None => None,
     };
 
+    // Optional Unix-domain-socket listener (same-host clients). Additive: the
+    // TCP listener above always runs. Remove a stale socket file from a prior
+    // unclean exit first — `bind` fails if the path already exists.
+    let unix_listener = match args.socket.as_deref() {
+        Some(path) => {
+            let _ = std::fs::remove_file(path);
+            match UnixListener::bind(path) {
+                Ok(l) => {
+                    info!(socket = %path, "unix domain socket listening");
+                    Some(l)
+                }
+                Err(e) => {
+                    error!(socket = %path, error = %e, "failed to bind unix socket");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
     info!(
         addr = %addr, data_dir = %args.data_dir, auth = auth_configured,
         tls = tls_enabled,
@@ -535,7 +610,7 @@ async fn main() {
                         let tx_gate = tx_gate.clone();
                         let pw = args.password.clone();
                         let users = users.clone();
-                        let mut rx = shutdown_rx.clone();
+                        let rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
                         let rl = rate_limiter.clone();
@@ -550,20 +625,9 @@ async fn main() {
                             if let Some(acceptor) = tls {
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
-                                        handler::handle_connection(
-                                            tls_stream,
-                                            handler::ConnOpts {
-                                                engine: eng,
-                                                tx_gate,
-                                                expected_password: pw,
-                                                users,
-                                                shutdown_rx: &mut rx,
-                                                idle_timeout: idle,
-                                                query_timeout: qtimeout,
-                                                rate_limiter: Some(&rl),
-                                                peer_addr,
-                                                metrics: m.clone(),
-                                            },
+                                        run_connection(
+                                            tls_stream, peer_addr, eng, tx_gate, pw, users, rx,
+                                            idle, qtimeout, rl, m.clone(),
                                         ).await;
                                     }
                                     Err(e) => {
@@ -572,20 +636,9 @@ async fn main() {
                                     }
                                 }
                             } else {
-                                handler::handle_connection(
-                                    stream,
-                                    handler::ConnOpts {
-                                        engine: eng,
-                                        tx_gate,
-                                        expected_password: pw,
-                                        users,
-                                        shutdown_rx: &mut rx,
-                                        idle_timeout: idle,
-                                        query_timeout: qtimeout,
-                                        rate_limiter: Some(&rl),
-                                        peer_addr,
-                                        metrics: m.clone(),
-                                    },
+                                run_connection(
+                                    stream, peer_addr, eng, tx_gate, pw, users, rx, idle,
+                                    qtimeout, rl, m.clone(),
                                 ).await;
                             }
                             drop(permit);
@@ -593,6 +646,48 @@ async fn main() {
                     }
                     Err(e) => {
                         error!(error = %e, "accept error");
+                    }
+                }
+            }
+
+            // Accept new connections on the optional Unix domain socket. When
+            // no socket is configured this future never resolves, so the arm is
+            // inert. UDS is same-host and local-only, so no TLS and no
+            // IP-based rate limiting (peer_addr = None).
+            result = async {
+                match &unix_listener {
+                    Some(l) => l.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok((stream, _addr)) => {
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        info!("accepted unix-socket connection");
+                        let eng = engine.clone();
+                        let tx_gate = tx_gate.clone();
+                        let pw = args.password.clone();
+                        let users = users.clone();
+                        let rx = shutdown_rx.clone();
+                        let idle = idle_timeout;
+                        let qtimeout = query_timeout;
+                        let rl = rate_limiter.clone();
+                        let m = metrics.clone();
+                        tokio::spawn(async move {
+                            m.inc_connection_accepted();
+                            let _active = m.active_guard();
+                            run_connection(
+                                stream, None, eng, tx_gate, pw, users, rx, idle, qtimeout, rl,
+                                m.clone(),
+                            ).await;
+                            drop(permit);
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "unix accept error");
                     }
                 }
             }
@@ -619,6 +714,12 @@ async fn main() {
     // Engine `Drop` calls `catalog.checkpoint()` which flushes heap pages
     // and truncates the WAL.
     drop(engine);
+
+    // Remove the socket file so a restart can re-bind cleanly (bind fails if
+    // the path already exists).
+    if let Some(path) = args.socket.as_deref() {
+        let _ = std::fs::remove_file(path);
+    }
     info!("clean shutdown complete");
 }
 
