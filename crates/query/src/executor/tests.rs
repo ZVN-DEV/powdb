@@ -4939,3 +4939,32 @@ fn test_update_str_into_float_column_errors_not_panic_seqscan_path() {
     );
     assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
 }
+
+#[test]
+fn test_engine_normal_sync_mode_persists_across_reopen() {
+    // Phase 1: the engine honors WalSyncMode::Normal end-to-end. In Normal,
+    // commits don't fsync per statement (the latency win); a clean shutdown is
+    // still durable, so rows survive a reopen.
+    use super::WalSyncMode;
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_engine_normal_{}_{}", std::process::id(), id));
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.set_wal_sync_mode(WalSyncMode::Normal);
+        engine
+            .execute_powql("type T { required id: int, required v: int }")
+            .unwrap();
+        engine
+            .execute_powql("insert T { id := 1, v := 100 }")
+            .unwrap();
+        engine
+            .execute_powql("insert T { id := 2, v := 200 }")
+            .unwrap();
+    } // clean drop → durable
+    let mut engine = Engine::new(&dir).unwrap();
+    match engine.execute_powql("count(T)").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("expected 2 rows after Normal-mode reopen, got {other:?}"),
+    }
+}

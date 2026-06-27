@@ -1,6 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +116,22 @@ pub struct WalRecord {
 pub enum WalSyncMode {
     #[default]
     Full,
+    /// `Normal` — every commit buffers its record through to the OS
+    /// (`BufWriter::flush`, so the bytes are file-visible) and returns
+    /// WITHOUT an fsync; a background flusher fsyncs on a fixed interval
+    /// ([`NORMAL_FSYNC_INTERVAL`]). A *process* crash loses nothing (replay
+    /// reads the bytes already in the OS page cache); an *OS* crash / power
+    /// loss can lose only the unsynced tail (≤ one interval of writes). This
+    /// is SQLite `synchronous=NORMAL` / Postgres `synchronous_commit=off`
+    /// semantics: opt-in, bounded-loss, and ~15–40× faster single-row writes
+    /// because the fsync leaves the commit/lock path.
+    Normal,
     Off,
 }
+
+/// How often the background flusher fsyncs in [`WalSyncMode::Normal`]. This is
+/// the upper bound on the crash-loss window (OS-crash / power-loss only).
+const NORMAL_FSYNC_INTERVAL: Duration = Duration::from_millis(10);
 
 pub struct Wal {
     path: PathBuf,
@@ -132,6 +150,84 @@ pub struct Wal {
     /// a same-process reopen cannot replay uncommitted records.
     records_start: u64,
     synced_len: u64,
+    /// Monotonic counter bumped on every durable-intent `flush()` (non-Off).
+    /// The Normal background flusher fsyncs whenever `dirty_gen > synced_gen`.
+    dirty_gen: Arc<AtomicU64>,
+    /// Highest `dirty_gen` value known to be fsync-durable. Advanced by Full's
+    /// inline fsync and by the Normal background flusher.
+    synced_gen: Arc<AtomicU64>,
+    /// Background fsync thread; present only while in `Normal` mode.
+    flusher: Option<Flusher>,
+}
+
+/// Background fsync worker for [`WalSyncMode::Normal`]. Owns a cloned WAL file
+/// descriptor and fsyncs it on [`NORMAL_FSYNC_INTERVAL`] whenever new bytes
+/// have been buffered, keeping the fsync off the commit/lock path. fsync on the
+/// cloned fd flushes the same underlying file (inode) the writer appends to.
+struct Flusher {
+    handle: Option<JoinHandle<()>>,
+    /// `(stop, condvar)` — set `stop=true` + notify to wake the thread early.
+    ctl: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Flusher {
+    fn spawn(
+        file: File,
+        dirty_gen: Arc<AtomicU64>,
+        synced_gen: Arc<AtomicU64>,
+        interval: Duration,
+    ) -> Flusher {
+        let ctl: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+        let ctl_thread = Arc::clone(&ctl);
+        let handle = std::thread::Builder::new()
+            .name("powdb-wal-flusher".into())
+            .spawn(move || {
+                let (lock, cvar) = &*ctl_thread;
+                loop {
+                    let stopping = {
+                        let stop = lock.lock().expect("wal flusher lock");
+                        if *stop {
+                            true
+                        } else {
+                            let (stop, _timeout) =
+                                cvar.wait_timeout(stop, interval).expect("wal flusher wait");
+                            *stop
+                        }
+                    };
+                    // fsync if the writer has buffered new bytes since last sync.
+                    let d = dirty_gen.load(Ordering::Acquire);
+                    if d > synced_gen.load(Ordering::Acquire) && file.sync_data().is_ok() {
+                        synced_gen.store(d, Ordering::Release);
+                    }
+                    if stopping {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn wal flusher thread");
+        Flusher {
+            handle: Some(handle),
+            ctl,
+        }
+    }
+
+    fn stop(&mut self) {
+        {
+            let (lock, cvar) = &*self.ctl;
+            let mut stop = lock.lock().expect("wal flusher lock");
+            *stop = true;
+            cvar.notify_all();
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl Wal {
@@ -152,6 +248,9 @@ impl Wal {
             next_lsn: 1,
             records_start: WAL_FILE_HEADER_SIZE,
             synced_len: WAL_FILE_HEADER_SIZE,
+            dirty_gen: Arc::new(AtomicU64::new(0)),
+            synced_gen: Arc::new(AtomicU64::new(0)),
+            flusher: None,
         })
     }
 
@@ -172,13 +271,57 @@ impl Wal {
             next_lsn: 1,
             records_start,
             synced_len,
+            dirty_gen: Arc::new(AtomicU64::new(0)),
+            synced_gen: Arc::new(AtomicU64::new(0)),
+            flusher: None,
         })
     }
 
     /// Toggle the durability mode. See [`WalSyncMode`] for the contract.
-    /// The change takes effect on the next `flush()`.
+    /// Starts the background flusher when entering `Normal`, and stops it when
+    /// leaving `Normal`. The fsync-behavior change takes effect on the next
+    /// `flush()`.
     pub fn set_sync_mode(&mut self, mode: WalSyncMode) {
+        if mode == self.sync_mode {
+            return;
+        }
         self.sync_mode = mode;
+        match mode {
+            WalSyncMode::Normal => self.start_flusher(),
+            WalSyncMode::Full | WalSyncMode::Off => self.stop_flusher(),
+        }
+    }
+
+    /// Spawn the Normal-mode background flusher if not already running. The
+    /// flusher fsyncs a cloned WAL fd, so it never contends on the writer.
+    fn start_flusher(&mut self) {
+        if self.flusher.is_some() {
+            return;
+        }
+        if let Some(writer) = self.writer.as_ref() {
+            if let Ok(file) = writer.get_ref().try_clone() {
+                self.flusher = Some(Flusher::spawn(
+                    file,
+                    Arc::clone(&self.dirty_gen),
+                    Arc::clone(&self.synced_gen),
+                    NORMAL_FSYNC_INTERVAL,
+                ));
+            }
+        }
+    }
+
+    /// Stop the background flusher (final fsync + join), if running.
+    fn stop_flusher(&mut self) {
+        if let Some(mut f) = self.flusher.take() {
+            f.stop();
+        }
+    }
+
+    /// The highest dirty generation known to be fsync-durable. Advances on
+    /// every Full commit and on each Normal background-flusher cycle. Exposed
+    /// for tests and (future) metrics.
+    pub fn synced_generation(&self) -> u64 {
+        self.synced_gen.load(Ordering::Acquire)
     }
 
     /// Returns the current sync mode (used by tests + introspection).
@@ -282,18 +425,32 @@ impl Wal {
         if batch == 0 {
             return Ok(());
         }
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| io::Error::other("WAL writer unavailable"))?;
-        writer.flush()?;
-        // SQLite-style synchronous knob: only the explicit fsync is gated.
-        // The BufWriter::flush above always runs so a process crash still
-        // recovers cleanly via `read_all`.
-        if matches!(self.sync_mode, WalSyncMode::Full) {
-            writer.get_ref().sync_data()?;
+        let is_full = matches!(self.sync_mode, WalSyncMode::Full);
+        let is_off = matches!(self.sync_mode, WalSyncMode::Off);
+        // Borrow the writer only for the I/O, then drop it before touching the
+        // generation counters (which borrow `self`).
+        let new_len = {
+            let writer = self
+                .writer
+                .as_mut()
+                .ok_or_else(|| io::Error::other("WAL writer unavailable"))?;
+            writer.flush()?;
+            // SQLite-style synchronous knob: only the explicit fsync is gated.
+            // The BufWriter::flush above always runs so a process crash still
+            // recovers cleanly via `read_all`. In `Full` we fsync inline here;
+            // in `Normal` the background flusher fsyncs off this path.
+            if is_full {
+                writer.get_ref().sync_data()?;
+            }
+            writer.get_ref().metadata()?.len()
+        };
+        if !is_off {
+            let gen = self.dirty_gen.fetch_add(1, Ordering::Release) + 1;
+            if is_full {
+                self.synced_gen.store(gen, Ordering::Release);
+            }
         }
-        self.synced_len = writer.get_ref().metadata()?.len();
+        self.synced_len = new_len;
         self.pending = 0;
         debug!(records = batch, "wal group commit");
         Ok(())
@@ -483,6 +640,23 @@ impl Wal {
     }
 }
 
+impl Drop for Wal {
+    fn drop(&mut self) {
+        // Clean shutdown must be durable regardless of mode: push any buffered
+        // bytes to the OS and fsync, so a Normal-mode commit that hasn't yet
+        // hit the background flusher's interval is still durable on a graceful
+        // exit. (A process *crash* skips this — Normal's bounded-loss contract
+        // only applies to OS-crash / power-loss, which this cannot help.)
+        if !matches!(self.sync_mode, WalSyncMode::Off) {
+            if let Some(writer) = self.writer.as_mut() {
+                let _ = writer.flush();
+                let _ = writer.get_ref().sync_data();
+            }
+        }
+        self.stop_flusher();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +695,52 @@ mod tests {
         let records = wal.read_all().unwrap();
         assert_eq!(records.len(), 4);
         drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_normal_mode_persists_records_across_reopen() {
+        // NORMAL durability: commits are acked after the buffered bytes reach
+        // the OS (BufWriter::flush) without a per-commit fsync; a background
+        // flusher + clean shutdown make them durable. Data must survive a
+        // clean close + reopen.
+        let path =
+            std::env::temp_dir().join(format!("powdb_wal_normal_reopen_{}", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        {
+            let mut wal = Wal::create(&path, 4).unwrap();
+            wal.set_sync_mode(WalSyncMode::Normal);
+            assert_eq!(wal.sync_mode(), WalSyncMode::Normal);
+            wal.append(1, WalRecordType::Insert, b"n1").unwrap();
+            wal.append(1, WalRecordType::Insert, b"n2").unwrap();
+            wal.flush().unwrap();
+        } // drop: stop flusher + final fsync
+        let wal = Wal::open(&path, 4).unwrap();
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].data, b"n1");
+        assert_eq!(records[1].data, b"n2");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_normal_mode_background_flusher_syncs_off_commit_path() {
+        // In NORMAL mode flush() must NOT fsync inline; the background flusher
+        // fsyncs on its interval and advances the synced generation. Proves the
+        // fsync is off the commit path (the latency win) yet still happens.
+        let path = std::env::temp_dir().join(format!("powdb_wal_normal_bg_{}", std::process::id()));
+        std::fs::remove_file(&path).ok();
+        let mut wal = Wal::create(&path, 1000).unwrap(); // large batch: no auto-flush
+        wal.set_sync_mode(WalSyncMode::Normal);
+        wal.append(1, WalRecordType::Insert, b"bg1").unwrap();
+        wal.flush().unwrap(); // buffers to OS + marks dirty; no inline fsync
+                              // The background flusher should fsync within its (~10 ms) interval.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            wal.synced_generation() >= 1,
+            "background flusher did not sync (synced_generation = {})",
+            wal.synced_generation()
+        );
         std::fs::remove_file(&path).ok();
     }
 

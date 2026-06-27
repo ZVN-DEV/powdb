@@ -1,4 +1,4 @@
-use powdb_query::executor::Engine;
+use powdb_query::executor::{Engine, WalSyncMode};
 use powdb_server::handler;
 use powdb_server::metrics::{serve_metrics, Metrics};
 use std::sync::{Arc, RwLock};
@@ -39,6 +39,18 @@ fn parse_query_memory_limit(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
+/// Parse `POWDB_SYNC_MODE` (`full` | `normal` | `off`). Defaults to `Full` —
+/// the safe, fully-durable mode — on unset/empty/unknown. `normal` trades a
+/// bounded crash-loss window (OS-crash/power-loss only) for ~15–40× faster
+/// writes; `off` disables durability entirely and is bench-only.
+fn parse_sync_mode(raw: Option<&str>) -> WalSyncMode {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("normal") => WalSyncMode::Normal,
+        Some("off") => WalSyncMode::Off,
+        _ => WalSyncMode::Full,
+    }
 }
 
 /// Parse the `POWDB_REQUIRE_TLS` env value. Truthy on `1`/`true` (any case);
@@ -217,6 +229,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
+                println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
             }
@@ -345,7 +358,7 @@ async fn main() {
 
     let args = parse_args();
 
-    let engine = match Engine::with_memory_limit(
+    let mut engine = match Engine::with_memory_limit(
         std::path::Path::new(&args.data_dir),
         args.query_memory_limit,
     ) {
@@ -359,6 +372,22 @@ async fn main() {
         query_memory_limit = args.query_memory_limit,
         "per-query memory budget"
     );
+
+    // WAL durability mode (POWDB_SYNC_MODE). Default Full is fully durable.
+    let sync_mode = parse_sync_mode(std::env::var("POWDB_SYNC_MODE").ok().as_deref());
+    engine.set_wal_sync_mode(sync_mode);
+    match sync_mode {
+        WalSyncMode::Full => info!("WAL sync mode: full (fsync every commit — fully durable)"),
+        WalSyncMode::Normal => warn!(
+            "WAL sync mode: NORMAL — commits fsync on a background interval; an OS crash or \
+             power loss may lose up to the last ~10ms of writes (process crashes lose nothing)"
+        ),
+        WalSyncMode::Off => warn!(
+            "WAL sync mode: OFF — NO durability; a crash loses all writes since the last \
+             checkpoint. Bench/test use only, never production"
+        ),
+    }
+
     let engine = Arc::new(RwLock::new(engine));
     let tx_gate = handler::new_tx_gate();
 
@@ -628,6 +657,19 @@ mod tests {
     fn require_tls_off_is_backward_compatible() {
         // Default off: password without TLS is allowed (just warned).
         assert!(check_tls_requirement(false, true, false).is_ok());
+    }
+
+    #[test]
+    fn parse_sync_mode_env() {
+        assert_eq!(parse_sync_mode(Some("normal")), WalSyncMode::Normal);
+        assert_eq!(parse_sync_mode(Some("NORMAL")), WalSyncMode::Normal);
+        assert_eq!(parse_sync_mode(Some(" normal ")), WalSyncMode::Normal);
+        assert_eq!(parse_sync_mode(Some("off")), WalSyncMode::Off);
+        assert_eq!(parse_sync_mode(Some("full")), WalSyncMode::Full);
+        // Unset / empty / unknown all fall back to the safe Full default.
+        assert_eq!(parse_sync_mode(None), WalSyncMode::Full);
+        assert_eq!(parse_sync_mode(Some("")), WalSyncMode::Full);
+        assert_eq!(parse_sync_mode(Some("bogus")), WalSyncMode::Full);
     }
 
     #[test]

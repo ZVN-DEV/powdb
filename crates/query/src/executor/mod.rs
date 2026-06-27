@@ -15,6 +15,7 @@ use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{decode_column, decode_row, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 use powdb_storage::view::ViewRegistry;
+pub use powdb_storage::wal::WalSyncMode;
 
 use std::io;
 use std::path::Path;
@@ -379,6 +380,14 @@ impl Engine {
     /// Override the per-query memory limit in bytes (builder-style).
     pub fn set_query_memory_limit(&mut self, limit_bytes: usize) {
         self.query_memory_limit = limit_bytes;
+    }
+
+    /// Set the WAL durability mode (see [`WalSyncMode`]). `Full` (the default)
+    /// fsyncs every commit; `Normal` moves the fsync to a background flusher
+    /// with a bounded crash-loss window; `Off` is bench-only (no durability).
+    /// Wired from the server's `POWDB_SYNC_MODE` / `--sync-mode` config.
+    pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
+        self.catalog.set_wal_sync_mode(mode);
     }
 
     /// Enter a budgeted-statement frame for the current query. The returned
