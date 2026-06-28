@@ -51,6 +51,10 @@ pub enum Error {
     Query(QueryError),
     /// The handle is poisoned: a previous call panicked. Reopen the database.
     Poisoned,
+    /// Opening the database panicked (e.g. a corrupt heap/index header). Caught
+    /// at the boundary so it never aborts the embedded host. The data directory
+    /// is likely corrupt; restore from a backup.
+    OpenPanicked,
 }
 
 impl std::fmt::Display for Error {
@@ -61,6 +65,10 @@ impl std::fmt::Display for Error {
             Error::Poisoned => write!(
                 f,
                 "database handle is poisoned (a previous call panicked); reopen the database"
+            ),
+            Error::OpenPanicked => write!(
+                f,
+                "opening the database panicked (data directory may be corrupt); restore from a backup"
             ),
         }
     }
@@ -90,11 +98,8 @@ pub struct Database {
 impl Database {
     /// Open (or create) a database at `dir`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
-        let engine = Engine::new(dir.as_ref()).map_err(Error::Open)?;
-        Ok(Self {
-            engine: Some(engine),
-            poisoned: AtomicBool::new(false),
-        })
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| Engine::new(dir))))
     }
 
     /// Open with an explicit per-query memory budget (bytes).
@@ -102,7 +107,21 @@ impl Database {
         dir: impl AsRef<Path>,
         limit_bytes: usize,
     ) -> Result<Self, Error> {
-        let engine = Engine::with_memory_limit(dir.as_ref(), limit_bytes).map_err(Error::Open)?;
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::with_memory_limit(dir, limit_bytes)
+        })))
+    }
+
+    /// Turn a `catch_unwind`'d engine-open result into a `Database`. A panic in
+    /// the open path (e.g. a corrupt heap/index header) becomes
+    /// [`Error::OpenPanicked`] instead of unwinding past the boundary and
+    /// aborting the embedded host — the same crash-only contract the query
+    /// methods use, applied to open.
+    fn wrap_open(result: std::thread::Result<std::io::Result<Engine>>) -> Result<Self, Error> {
+        let engine = result
+            .map_err(|_| Error::OpenPanicked)?
+            .map_err(Error::Open)?;
         Ok(Self {
             engine: Some(engine),
             poisoned: AtomicBool::new(false),
@@ -244,5 +263,35 @@ mod tests {
             other => panic!("expected 1 row after poisoned-drop reopen, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt data directory must surface as an `Err`, never unwind/abort the
+    /// embedded host. A trashed heap header panics deep in the open path; the
+    /// facade's `catch_unwind` must convert that into `Error::OpenPanicked`.
+    /// (Only meaningful under `panic = "unwind"`, which the Node addon and the
+    /// test profile use.)
+    #[test]
+    fn open_with_corrupt_heap_returns_error_not_panic() {
+        let dir = std::env::temp_dir().join(format!("powdb_corrupt_heap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.query("type T { required id: int }").unwrap();
+            db.query("insert T { id := 1 }").unwrap();
+            // Clean drop checkpoints: the heap file is now the durable state.
+        }
+        let heap = dir.join("T.heap");
+        let mut bytes = std::fs::read(&heap).unwrap();
+        for b in bytes.iter_mut().take(20) {
+            *b = 0xFF;
+        }
+        std::fs::write(&heap, &bytes).unwrap();
+
+        let result = Database::open(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "corrupt heap must return Err, not panic/abort the host"
+        );
     }
 }

@@ -1,5 +1,6 @@
 pub mod btree;
 pub mod catalog;
+pub mod dir_lock;
 pub mod disk;
 pub mod error;
 pub mod format;
