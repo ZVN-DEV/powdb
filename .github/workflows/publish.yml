@@ -35,7 +35,14 @@ jobs:
     name: publish crates
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: crates-publish
+    # No GitHub Actions `environment:` here on purpose. crates.io Trusted
+    # Publishing matches a publisher configured with a blank environment only
+    # against runs that present no environment claim; declaring one here made the
+    # OIDC token carry an environment the (blank) crates.io configs didn't match,
+    # so token minting failed with "No Trusted Publishing config found". The
+    # `crates-publish` environment carried no protection rules, so dropping it
+    # costs nothing. To reintroduce protected publishing later, re-add the
+    # environment here AND set the same name on every crate's crates.io config.
     permissions:
       contents: read
       id-token: write # mint a short-lived crates.io token via OIDC
