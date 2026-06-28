@@ -56,9 +56,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             rustflags: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            rustflags: "-C target-cpu=x86-64-v2"
+          # Windows (x86_64-pc-windows-msvc) is intentionally omitted: the
+          # storage engine uses Unix-only APIs directly (std::os::unix, raw
+          # libc mmap/munmap, AsRawFd), so it does not compile on Windows yet
+          # (deferred Windows phase). Re-add once the engine is ported.
     env:
       CARGO_TERM_COLOR: always
 
@@ -141,8 +142,8 @@ jobs:
           count="$(ls -1 ./*.node 2>/dev/null | wc -l | tr -d ' ')"
           echo "Found $count platform binaries:"
           ls -1 ./*.node
-          if [ "$count" -ne 5 ]; then
-            echo "::error::expected 5 platform .node binaries, found $count — refusing to publish a partial set"
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 platform .node binaries (macOS arm64/x64, Linux x64/arm64; Windows deferred), found $count — refusing to publish a partial set"
             exit 1
           fi
           test -f index.js || { echo "::error::index.js (napi loader) missing"; exit 1; }
@@ -161,8 +162,8 @@ jobs:
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "## Dry run complete" >> "$GITHUB_STEP_SUMMARY"
-            echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 5 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 4 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Published @zvndev/powdb-embedded v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "Single package with prebuilt binaries for macOS (arm64/x64), Linux (x64/arm64), Windows (x64)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Single package with prebuilt binaries for macOS (arm64/x64), Linux (x64/arm64). Windows deferred (Unix-only engine)." >> "$GITHUB_STEP_SUMMARY"
           fi
