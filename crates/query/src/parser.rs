@@ -1789,11 +1789,20 @@ impl Parser {
                     })
                 }
             };
+            // Optional `default <literal>` — value applied when an insert
+            // omits this column.
+            let default = if *self.peek() == Token::Default {
+                self.advance();
+                Some(self.parse_default_literal()?)
+            } else {
+                None
+            };
             fields.push(FieldDef {
                 name: field_name,
                 type_name,
                 required,
                 unique,
+                default,
             });
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -1801,6 +1810,22 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(Statement::CreateType(CreateTypeExpr { name, fields }))
+    }
+
+    /// Parse the literal following a `default` column modifier. Only scalar
+    /// literals are allowed — expression defaults (e.g. `now()`) are not yet
+    /// supported.
+    fn parse_default_literal(&mut self) -> Result<Literal, ParseError> {
+        match self.advance() {
+            Token::IntLit(v) => Ok(Literal::Int(v)),
+            Token::FloatLit(v) => Ok(Literal::Float(v)),
+            Token::StringLit(v) => Ok(Literal::String(v)),
+            Token::BoolLit(v) => Ok(Literal::Bool(v)),
+            t => Err(ParseError::UnexpectedToken {
+                expected: "literal default value".into(),
+                got: t.display_name(),
+            }),
+        }
     }
 }
 
@@ -1844,6 +1869,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Conflict => out.push_str("conflict"),
             Token::Select => out.push_str("select"),
             Token::Required => out.push_str("required"),
+            Token::Default => out.push_str("default"),
             Token::Multi => out.push_str("multi"),
             Token::Link => out.push_str("link"),
             Token::Index => out.push_str("index"),

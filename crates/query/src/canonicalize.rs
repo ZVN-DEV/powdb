@@ -203,6 +203,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Returning => hash_byte(h, 0x6F),
         Token::Select => hash_byte(h, 0x19),
         Token::Required => hash_byte(h, 0x1A),
+        Token::Default => hash_byte(h, 0x22),
         Token::Multi => hash_byte(h, 0x1B),
         Token::Link => hash_byte(h, 0x1C),
         Token::Index => hash_byte(h, 0x1D),

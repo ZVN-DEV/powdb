@@ -67,6 +67,10 @@ pub struct Table {
     /// the indexed columns out of the raw page bytes without running the
     /// full per-row offset calculation every call.
     row_layout: RowLayout,
+    /// Per-column literal defaults, aligned to `schema.columns` by position.
+    /// Empty means "no defaults" (the common case); otherwise `defaults[i]`
+    /// is the default for column `i`, or `None` if that column has none.
+    defaults: Vec<Option<Value>>,
 }
 
 impl Table {
@@ -80,6 +84,7 @@ impl Table {
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
+            defaults: Vec::new(),
         })
     }
 
@@ -116,6 +121,7 @@ impl Table {
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
             row_layout,
+            defaults: Vec::new(),
         };
 
         for meta in indexed_col_metas {
@@ -182,6 +188,18 @@ impl Table {
                 unique: c.unique,
             })
             .collect()
+    }
+
+    /// Install the per-column defaults (called at create time and on reopen
+    /// from the persisted catalog). Aligned to `schema.columns` by position.
+    pub(crate) fn set_defaults(&mut self, defaults: Vec<Option<Value>>) {
+        self.defaults = defaults;
+    }
+
+    /// Per-column defaults, aligned to `schema.columns` by position. Empty when
+    /// no column has a default.
+    pub(crate) fn defaults(&self) -> &[Option<Value>] {
+        &self.defaults
     }
 
     /// Recalculate the cached row layout from the current schema. Must be

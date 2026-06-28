@@ -76,7 +76,9 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
-pub const CATALOG_VERSION: u16 = 3;
+/// Version 4 appends a per-table column-defaults section after the indexed
+/// column list. Older files (v1–v3) load cleanly with no defaults.
+pub const CATALOG_VERSION: u16 = 4;
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
@@ -192,6 +194,7 @@ impl Catalog {
         for CatalogEntry {
             schema,
             indexed_cols,
+            defaults,
         } in entries
         {
             let name = schema.table_name.clone();
@@ -200,7 +203,8 @@ impl Catalog {
             // missing (e.g. first open after upgrade from catalog v1) it
             // falls back to rebuilding from the heap scan and saving to
             // disk so subsequent opens hit the fast path.
-            let table = Table::open_with_indexes(schema, data_dir, &indexed_cols)?;
+            let mut table = Table::open_with_indexes(schema, data_dir, &indexed_cols)?;
+            table.set_defaults(defaults);
             name_to_slot.insert(name, tables.len());
             tables.push(table);
         }
@@ -372,9 +376,10 @@ impl Catalog {
                     // Boundary records were consumed in the first pass.
                 }
                 WalRecordType::DdlCreateTable => {
-                    if let Some(schema) = decode_ddl_create_table(&rec.data) {
+                    if let Some((schema, defaults)) = decode_ddl_create_table(&rec.data) {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
-                            if let Ok(table) = Table::create(schema, &self.data_dir) {
+                            if let Ok(mut table) = Table::create(schema, &self.data_dir) {
+                                table.set_defaults(defaults);
                                 let slot = self.tables.len();
                                 let name = table.schema.table_name.clone();
                                 self.tables.push(table);
@@ -706,6 +711,18 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
+        self.create_table_with_defaults(schema, Vec::new())
+    }
+
+    /// Create a table whose columns carry literal defaults. `defaults` is
+    /// aligned to `schema.columns` by position (and may be shorter / empty for
+    /// columns without a default). The defaults are WAL-logged and persisted in
+    /// the catalog so they survive a restart.
+    pub fn create_table_with_defaults(
+        &mut self,
+        schema: Schema,
+        defaults: Vec<Option<Value>>,
+    ) -> io::Result<()> {
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {
             validate_column_name(&col.name)?;
@@ -718,17 +735,26 @@ impl Catalog {
             ));
         }
         if !self.wal.is_off() {
-            let payload = encode_ddl_create_table(&schema);
+            let payload = encode_ddl_create_table(&schema, &defaults);
             self.wal
                 .append(0, WalRecordType::DdlCreateTable, &payload)?;
             self.wal.flush()?;
         }
-        let table = Table::create(schema, &self.data_dir)?;
+        let mut table = Table::create(schema, &self.data_dir)?;
+        table.set_defaults(defaults);
         let slot = self.tables.len();
         self.tables.push(table);
         self.name_to_slot.insert(name, slot);
         self.persist()?;
         Ok(())
+    }
+
+    /// Per-column literal defaults for a table, aligned to its columns by
+    /// position. `None` when the table is unknown; an empty slice when no
+    /// column has a default.
+    pub fn column_defaults(&self, table: &str) -> Option<&[Option<Value>]> {
+        let slot = *self.name_to_slot.get(table)?;
+        Some(self.tables[slot].defaults())
     }
 
     /// Write the current set of schemas to disk atomically (write-then-rename).
@@ -744,6 +770,7 @@ impl Catalog {
             .map(|t| CatalogEntryRef {
                 schema: &t.schema,
                 indexed_cols: t.indexed_column_metas(),
+                defaults: t.defaults(),
             })
             .collect();
         write_catalog_file(&tmp_path, &entries)?;
@@ -1649,7 +1676,7 @@ fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
 
 // ─── DDL WAL payload codecs ─────────────────────────────────────────────────
 
-fn encode_ddl_create_table(schema: &Schema) -> Vec<u8> {
+fn encode_ddl_create_table(schema: &Schema, defaults: &[Option<Value>]) -> Vec<u8> {
     let name = schema.table_name.as_bytes();
     let mut out = Vec::new();
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -1663,10 +1690,13 @@ fn encode_ddl_create_table(schema: &Schema) -> Vec<u8> {
         out.push(col.required as u8);
         out.extend_from_slice(&col.position.to_le_bytes());
     }
+    // Trailing defaults section. Records written before defaults existed have
+    // no trailing bytes, so the decoder treats their absence as "no defaults".
+    encode_defaults_section(&mut out, defaults);
     out
 }
 
-fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
+fn decode_ddl_create_table(data: &[u8]) -> Option<(Schema, Vec<Option<Value>>)> {
     let mut pos = 0usize;
     if data.len() < 4 {
         return None;
@@ -1715,10 +1745,20 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<Schema> {
             position,
         });
     }
-    Some(Schema {
-        table_name,
-        columns,
-    })
+    // Trailing defaults section is present on records written after the feature
+    // landed; older records end here, decoding to no defaults.
+    let defaults = if pos < data.len() {
+        decode_defaults_section(data, &mut pos, columns.len())?
+    } else {
+        Vec::new()
+    };
+    Some((
+        Schema {
+            table_name,
+            columns,
+        },
+        defaults,
+    ))
 }
 
 fn encode_ddl_drop_table(table_name: &str) -> Vec<u8> {
@@ -1853,12 +1893,122 @@ pub(crate) struct IndexedColMeta {
 pub(crate) struct CatalogEntry {
     pub schema: Schema,
     pub indexed_cols: Vec<IndexedColMeta>,
+    /// Per-column defaults aligned to `schema.columns` by position. Empty when
+    /// no column has a default (v1–v3 files always decode to empty).
+    pub defaults: Vec<Option<Value>>,
 }
 
 /// Borrowed view passed to the writer.
 pub(crate) struct CatalogEntryRef<'a> {
     pub schema: &'a Schema,
     pub indexed_cols: Vec<IndexedColMeta>,
+    pub defaults: &'a [Option<Value>],
+}
+
+// ─── Column-default codecs (shared by catalog.bin and the WAL DDL record) ────
+
+/// Encode a single scalar value: a `type_id` tag byte followed by a
+/// type-specific, length-prefixed (for variable-width types) payload. Lossless
+/// — used to persist literal column defaults.
+fn encode_value_blob(out: &mut Vec<u8>, v: &Value) {
+    out.push(v.type_id() as u8);
+    match v {
+        Value::Int(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Float(f) => out.extend_from_slice(&f.to_bits().to_le_bytes()),
+        Value::Bool(b) => out.push(*b as u8),
+        Value::Str(s) => {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::DateTime(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Uuid(u) => out.extend_from_slice(u),
+        Value::Bytes(b) => {
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        Value::Empty => {}
+    }
+}
+
+/// Inverse of [`encode_value_blob`]. Returns `None` on any malformed/truncated
+/// input so a corrupt record fails closed rather than panicking.
+fn decode_value_blob(data: &[u8], pos: &mut usize) -> Option<Value> {
+    let tag = *data.get(*pos)?;
+    *pos += 1;
+    let type_id = TypeId::from_u8(tag)?;
+    let take_fixed = |pos: &mut usize, n: usize| -> Option<Vec<u8>> {
+        if *pos + n > data.len() {
+            return None;
+        }
+        let slice = data[*pos..*pos + n].to_vec();
+        *pos += n;
+        Some(slice)
+    };
+    match type_id {
+        TypeId::Empty => Some(Value::Empty),
+        TypeId::Int => Some(Value::Int(i64::from_le_bytes(
+            take_fixed(pos, 8)?.try_into().ok()?,
+        ))),
+        TypeId::Float => Some(Value::Float(f64::from_bits(u64::from_le_bytes(
+            take_fixed(pos, 8)?.try_into().ok()?,
+        )))),
+        TypeId::Bool => Some(Value::Bool(take_fixed(pos, 1)?[0] != 0)),
+        TypeId::DateTime => Some(Value::DateTime(i64::from_le_bytes(
+            take_fixed(pos, 8)?.try_into().ok()?,
+        ))),
+        TypeId::Uuid => Some(Value::Uuid(take_fixed(pos, 16)?.try_into().ok()?)),
+        TypeId::Str => {
+            let len = u32::from_le_bytes(take_fixed(pos, 4)?.try_into().ok()?) as usize;
+            Some(Value::Str(String::from_utf8(take_fixed(pos, len)?).ok()?))
+        }
+        TypeId::Bytes => {
+            let len = u32::from_le_bytes(take_fixed(pos, 4)?.try_into().ok()?) as usize;
+            Some(Value::Bytes(take_fixed(pos, len)?))
+        }
+    }
+}
+
+/// Encode the per-table defaults as a sparse list: a `u16` count of columns
+/// that have a default, then `(position: u16, value blob)` pairs. The common
+/// "no defaults" case costs two bytes.
+fn encode_defaults_section(out: &mut Vec<u8>, defaults: &[Option<Value>]) {
+    let present: Vec<(u16, &Value)> = defaults
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.as_ref().map(|v| (i as u16, v)))
+        .collect();
+    out.extend_from_slice(&(present.len() as u16).to_le_bytes());
+    for (pos, v) in present {
+        out.extend_from_slice(&pos.to_le_bytes());
+        encode_value_blob(out, v);
+    }
+}
+
+/// Inverse of [`encode_defaults_section`]. Builds a `Vec` of length `n_cols`
+/// with `None` for columns without a default. Returns `None` on truncation.
+fn decode_defaults_section(
+    data: &[u8],
+    pos: &mut usize,
+    n_cols: usize,
+) -> Option<Vec<Option<Value>>> {
+    if *pos + 2 > data.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes(data[*pos..*pos + 2].try_into().ok()?) as usize;
+    *pos += 2;
+    let mut out = vec![None; n_cols];
+    for _ in 0..count {
+        if *pos + 2 > data.len() {
+            return None;
+        }
+        let col = u16::from_le_bytes(data[*pos..*pos + 2].try_into().ok()?) as usize;
+        *pos += 2;
+        let value = decode_value_blob(data, pos)?;
+        if col < n_cols {
+            out[col] = Some(value);
+        }
+    }
+    Some(out)
 }
 
 fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Result<()> {
@@ -1889,6 +2039,8 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
             buf.extend_from_slice(cn);
             buf.push(if meta.unique { 1 } else { 0 });
         }
+        // Per-table column defaults (version 4).
+        encode_defaults_section(&mut buf, entry.defaults);
     }
 
     // Append a CRC32 checksum of the entire payload so the reader can
@@ -2015,12 +2167,22 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             Vec::new()
         };
 
+        // Version 4 appends a column-defaults section after the index list.
+        let defaults = if version >= 4 {
+            decode_defaults_section(buf, &mut pos, columns.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated catalog defaults")
+            })?
+        } else {
+            Vec::new()
+        };
+
         entries.push(CatalogEntry {
             schema: Schema {
                 table_name,
                 columns,
             },
             indexed_cols,
+            defaults,
         });
     }
 
@@ -2104,6 +2266,54 @@ mod tests {
     fn temp_catalog(name: &str) -> Catalog {
         let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
+    }
+
+    fn schema_two_cols() -> Schema {
+        Schema {
+            table_name: "T".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "status".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn ddl_create_table_codec_roundtrips_defaults() {
+        let schema = schema_two_cols();
+        let defaults = vec![None, Some(Value::Str("active".into()))];
+        let encoded = encode_ddl_create_table(&schema, &defaults);
+        let (decoded_schema, decoded_defaults) = decode_ddl_create_table(&encoded).unwrap();
+        assert_eq!(decoded_schema.columns.len(), 2);
+        assert_eq!(decoded_defaults, defaults);
+    }
+
+    #[test]
+    fn ddl_create_table_codec_back_compat_without_defaults_section() {
+        // Simulate a record written before column defaults existed: the
+        // old encoder stopped right after the columns, with no trailing
+        // defaults section. The new decoder must read it as "no defaults".
+        let schema = schema_two_cols();
+        let full = encode_ddl_create_table(&schema, &[]);
+        // The "no defaults" section is a trailing u16 count of 0 (two bytes);
+        // chop it off to mimic the pre-feature on-disk shape.
+        let legacy = &full[..full.len() - 2];
+        let (decoded_schema, decoded_defaults) = decode_ddl_create_table(legacy).unwrap();
+        assert_eq!(decoded_schema.columns.len(), 2);
+        assert!(
+            decoded_defaults.is_empty(),
+            "a record with no trailing defaults section decodes to no defaults"
+        );
     }
 
     #[test]

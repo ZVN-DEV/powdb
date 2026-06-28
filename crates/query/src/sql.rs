@@ -581,6 +581,27 @@ impl SqlParser {
         Ok(out)
     }
 
+    /// Parse a single literal following a column `DEFAULT`, rendered as PowQL
+    /// literal text. Only scalar literals are accepted (no expression
+    /// defaults), matching the PowQL `default` modifier.
+    fn default_literal(&mut self) -> Result<String, ParseError> {
+        match self.bump() {
+            Some(SqlTok::Number(n)) => Ok(n),
+            Some(SqlTok::String(s)) => Ok(quote_powql_string(&s)),
+            Some(SqlTok::Word(w))
+                if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false") =>
+            {
+                Ok(w.to_ascii_lowercase())
+            }
+            other => Err(ParseError::Syntax {
+                message: format!(
+                    "DEFAULT requires a literal value, got {}",
+                    other.map(|t| t.display()).unwrap_or_else(|| "<eof>".into())
+                ),
+            }),
+        }
+    }
+
     /// Parse an optional trailing `RETURNING *`, returning whether it was
     /// present. PowQL's `returning` clause always yields every column, so a
     /// projected `RETURNING a, b` is rejected rather than silently widened to
@@ -613,12 +634,15 @@ impl SqlParser {
                 let ty = self.sql_type()?;
                 let mut required = false;
                 let mut unique = false;
+                let mut default: Option<String> = None;
                 loop {
                     if self.eat_kw("not") {
                         self.expect_kw("null")?;
                         required = true;
                     } else if self.eat_kw("unique") {
                         unique = true;
+                    } else if self.eat_kw("default") {
+                        default = Some(self.default_literal()?);
                     } else if self.eat_kw("null") {
                     } else {
                         break;
@@ -636,7 +660,11 @@ impl SqlParser {
                 } else {
                     format!("{} ", mods.join(" "))
                 };
-                fields.push(format!("{prefix}{name}: {ty}"));
+                let suffix = match default {
+                    Some(lit) => format!(" default {lit}"),
+                    None => String::new(),
+                };
+                fields.push(format!("{prefix}{name}: {ty}{suffix}"));
                 let _ = self.eat_sym(',');
             }
             return Ok(format!("type {table} {{ {} }}", fields.join(", ")));

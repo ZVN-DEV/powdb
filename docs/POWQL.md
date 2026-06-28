@@ -78,6 +78,17 @@ Tables are defined using the `type` keyword. Each field has a name and a type, o
 
 Declaring a field `unique` automatically creates a unique B+tree index on that column; duplicate inserts/updates/upserts are then rejected with a `unique constraint violation` error.
 
+A field may declare a literal **`default`** after its type — the value applied when an insert (or upsert-insert) omits that column. The default is applied before the required-column check, so a `required` column with a default may be omitted. Defaults must be scalar literals (`int`, `float`, `str`, `bool`); expression defaults (e.g. a generated timestamp) are not yet supported. A default whose type does not match the column is rejected at `type`-creation time.
+
+```powql
+type Account {
+    required unique id: int,
+    status: str default "active",
+    credits: int default 0,
+    verified: bool default false
+}
+```
+
 ### Syntax
 
 ```
@@ -876,7 +887,7 @@ insert User { name := "Alice", email := "alice@example.com", age := 30 }
 insert User { name := "Bob", email := "bob@example.com" }
 ```
 
-Omitted fields default to null. Required fields must be provided.
+Omitted fields take their column's `default` if one is declared, otherwise null. Required fields must be provided unless they declare a default.
 
 **Multi-row insert.** Separate row blocks with commas to insert many rows in a
 single statement. Each block is independent and may set a different subset of

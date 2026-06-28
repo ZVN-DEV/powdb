@@ -8,7 +8,7 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 - `INSERT INTO T (a, b) VALUES (1, 'x'), (2, 'y') [RETURNING *]`
 - `UPDATE T SET a = ... WHERE ... [RETURNING *]`
 - `DELETE FROM T WHERE ... [RETURNING *]`
-- `CREATE TABLE T (...)`, including `NOT NULL` and `UNIQUE` column modifiers
+- `CREATE TABLE T (...)`, including `NOT NULL`, `UNIQUE`, and `DEFAULT <literal>` column modifiers
 - `CREATE [UNIQUE] INDEX name ON T (col)`
 - `ALTER TABLE T ADD/DROP COLUMN ...`
 - `DROP TABLE`, `DROP VIEW`
