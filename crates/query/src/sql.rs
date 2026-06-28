@@ -217,6 +217,62 @@ struct SqlParser {
     depth: usize,
 }
 
+/// One item in a SELECT projection, after lowering to canonical PowQL text.
+struct Projection {
+    /// Canonical PowQL for this item, e.g. `count(*)`, `sum(.x)`, `n: .x + 1`.
+    /// Used for the row/grouped projection path (`Table { ... }`).
+    text: String,
+    /// Set when the whole item is a single aggregate call. Drives the rewrite
+    /// of an ungrouped aggregate SELECT into PowQL's aggregate form
+    /// (`count(Table filter ...)`), which the row-projection path can't express.
+    agg: Option<AggCall>,
+}
+
+/// A standalone aggregate call in a projection (`count(*)`, `sum(x)`, ...).
+struct AggCall {
+    /// Lowercased function name: `count` | `sum` | `avg` | `min` | `max`.
+    func: String,
+    arg: AggArg,
+}
+
+enum AggArg {
+    /// `count(*)`.
+    Star,
+    /// `sum(x)` etc. — the lowered PowQL field reference (e.g. `.x`).
+    Field(String),
+}
+
+impl AggCall {
+    /// Canonical PowQL text for the grouped/row projection path.
+    fn canonical(&self) -> String {
+        match &self.arg {
+            AggArg::Star => format!("{}(*)", self.func),
+            AggArg::Field(f) => format!("{}({f})", self.func),
+        }
+    }
+}
+
+/// Lower a single ungrouped aggregate over `inner` (an already-lowered PowQL
+/// source pipeline, e.g. `T filter .x > 3`) into PowQL's aggregate form.
+/// `count(*)`/`count(col)` both count rows; the non-null nuance of SQL
+/// `count(col)` is not yet modeled. The other aggregates carry their column in
+/// a trailing PowQL projection (`sum(T { .x })`).
+fn build_ungrouped_aggregate(agg: &AggCall, inner: &str) -> Result<String, ParseError> {
+    match agg.func.as_str() {
+        "count" => Ok(format!("count({inner})")),
+        "sum" | "avg" | "min" | "max" => match &agg.arg {
+            AggArg::Field(f) => Ok(format!("{}({inner} {{ {f} }})", agg.func)),
+            AggArg::Star => Err(ParseError::Unsupported {
+                feature: format!("{0}(*) is not valid; {0}() needs a column", agg.func),
+            }),
+        },
+        // try_aggregate only constructs the five names above.
+        other => Err(ParseError::Syntax {
+            message: format!("unknown aggregate function `{other}`"),
+        }),
+    }
+}
+
 impl SqlParser {
     fn at_end(&self) -> bool {
         self.pos >= self.toks.len()
@@ -369,6 +425,9 @@ impl SqlParser {
             None
         };
 
+        let has_joins = !joins.is_empty();
+        let has_group = group.is_some();
+
         let mut out = source;
         for j in joins {
             out.push(' ');
@@ -405,33 +464,107 @@ impl SqlParser {
             out.push_str(" offset ");
             out.push_str(&o);
         }
-        if let Some(p) = projection {
+        if let Some(items) = projection {
+            // An ungrouped aggregate (`SELECT count(*) FROM t`) is not a row
+            // projection — PowQL expresses it as `count(t filter ...)`, which
+            // yields a scalar. Without this the SQL frontend lowered it to
+            // `t { count(*) }` and returned one null row per source row.
+            if !has_group && items.iter().any(|p| p.agg.is_some()) {
+                if has_joins || distinct {
+                    return Err(ParseError::Unsupported {
+                        feature: "aggregates over a join or with DISTINCT and no GROUP BY are not supported by the SQL frontend".into(),
+                    });
+                }
+                if items.len() != 1 {
+                    return Err(ParseError::Unsupported {
+                        feature: "multiple aggregates, or an aggregate mixed with plain columns, without GROUP BY are not supported; aggregate a single expression or add GROUP BY".into(),
+                    });
+                }
+                // SAFETY: len == 1 and the item is an aggregate (any() above).
+                let agg = items.into_iter().next().unwrap().agg.unwrap();
+                return build_ungrouped_aggregate(&agg, &out);
+            }
             out.push_str(" { ");
-            out.push_str(&p.join(", "));
+            out.push_str(
+                &items
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
             out.push_str(" }");
         }
         Ok(out)
     }
 
-    fn projection_list(&mut self) -> Result<Option<Vec<String>>, ParseError> {
+    fn projection_list(&mut self) -> Result<Option<Vec<Projection>>, ParseError> {
         if self.eat_sym('*') {
             return Ok(None);
         }
         let mut fields = Vec::new();
         loop {
-            let expr = self.expr_until(&["from", "as"])?;
-            let field = if self.eat_kw("as") {
+            // Detect a standalone aggregate (`count(*)`, `sum(x)`) so an
+            // ungrouped aggregate SELECT can be rewritten into PowQL's aggregate
+            // form. Anything else (incl. an aggregate inside a larger
+            // expression) falls through to the generic expression lowering.
+            let (expr, agg) = match self.try_aggregate()? {
+                Some(a) => (a.canonical(), Some(a)),
+                None => (self.expr_until(&["from", "as"])?, None),
+            };
+            let text = if self.eat_kw("as") {
                 let alias = self.expect_ident("projection alias")?;
                 format!("{alias}: {expr}")
             } else {
                 expr
             };
-            fields.push(field);
+            fields.push(Projection { text, agg });
             if !self.eat_sym(',') {
                 break;
             }
         }
         Ok(Some(fields))
+    }
+
+    /// Parse a standalone aggregate call (`count(*)`, `count(x)`, `sum(x)`, ...)
+    /// when it is the *entire* projection item. Returns `None` (restoring the
+    /// cursor) for non-aggregates, `count(distinct ...)`, or an aggregate that
+    /// is only part of a larger expression — those take the generic path.
+    fn try_aggregate(&mut self) -> Result<Option<AggCall>, ParseError> {
+        let Some(SqlTok::Word(w)) = self.peek().cloned() else {
+            return Ok(None);
+        };
+        let func = w.to_ascii_lowercase();
+        if !matches!(func.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+            return Ok(None);
+        }
+        let save = self.pos;
+        self.pos += 1; // consume the function name
+        if !self.eat_sym('(') {
+            self.pos = save;
+            return Ok(None);
+        }
+        let arg = if func == "count" && self.eat_sym('*') {
+            AggArg::Star
+        } else if func == "count" && self.is_kw("distinct") {
+            // count(distinct ...) has different semantics — let the generic path
+            // (which already understands `distinct`) handle it.
+            self.pos = save;
+            return Ok(None);
+        } else {
+            AggArg::Field(self.expr_bp(0, &[])?)
+        };
+        // Only an aggregate that fills the whole projection item is rewritable;
+        // otherwise (e.g. `count(*) + 1`) restore and reparse as an expression.
+        if self.eat_sym(')')
+            && (matches!(self.peek(), Some(SqlTok::Symbol(',')))
+                || self.is_kw("as")
+                || self.is_kw("from"))
+        {
+            Ok(Some(AggCall { func, arg }))
+        } else {
+            self.pos = save;
+            Ok(None)
+        }
     }
 
     fn table_ref(&mut self) -> Result<String, ParseError> {

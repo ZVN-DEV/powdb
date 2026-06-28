@@ -305,3 +305,104 @@ fn sql_returning_column_list_is_unsupported() {
         "error should explain the column-projection limitation, got: {err}"
     );
 }
+
+// --- Ungrouped aggregates (regression: `SELECT count(*)` must aggregate) ------
+//
+// Before the fix the SQL frontend lowered `SELECT count(*) FROM T` as a *row
+// projection* `T { count(*) }`, so it returned one null row per source row
+// instead of a scalar count. `count(*)` is documented (docs/SQL.md) and is the
+// README's headline SQL example, so this was a silent wrong-answer bug across
+// both the server `QuerySql` path and the embedded addon.
+
+/// `SELECT count(*) FROM T` must lower to PowQL's aggregate form `count(T)`.
+#[test]
+fn sql_count_star_lowers_to_powql_aggregate() {
+    let parsed = powdb_query::sql::parse_sql_with_canonical("SELECT count(*) FROM T").unwrap();
+    assert_eq!(parsed.canonical_powql, "count(T)");
+}
+
+#[test]
+fn sql_count_star_aggregates_to_scalar() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine.execute_sql("SELECT count(*) FROM T").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("expected Scalar(2), got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_count_star_with_where_filters_then_counts() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine
+        .execute_sql("SELECT count(*) FROM T WHERE x > 3")
+        .unwrap()
+    {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("expected Scalar(1), got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_count_star_alias_still_aggregates() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine.execute_sql("SELECT count(*) AS n FROM T").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("expected Scalar(2), got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_sum_aggregates_to_scalar() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine.execute_sql("SELECT sum(x) FROM T").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 6),
+        other => panic!("expected Scalar(6), got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_max_aggregates_to_scalar() {
+    let (_dir, mut engine) = seeded_engine();
+    match engine.execute_sql("SELECT max(x) FROM T").unwrap() {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 5),
+        other => panic!("expected Scalar(5), got {other:?}"),
+    }
+}
+
+/// PowQL has no single-statement form for several ungrouped aggregates at once,
+/// so the SQL frontend must reject it with a clear error rather than silently
+/// returning garbage rows.
+#[test]
+fn sql_multiple_ungrouped_aggregates_error_not_garbage() {
+    let (_dir, mut engine) = seeded_engine();
+    let r = engine.execute_sql("SELECT count(*), sum(x) FROM T");
+    assert!(
+        r.is_err(),
+        "multiple ungrouped aggregates should error, got: {r:?}"
+    );
+}
+
+/// Grouped `count(*)` was already correct (the planner extracts it per group);
+/// the ungrouped-aggregate fix must not regress it. `x=5` appears twice.
+#[test]
+fn sql_grouped_count_star_counts_per_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type T { required id: int, required x: int }")
+        .unwrap();
+    engine
+        .execute_powql("insert T { id := 1, x := 1 }, { id := 2, x := 5 }, { id := 3, x := 5 }")
+        .unwrap();
+    match engine
+        .execute_sql("SELECT x, count(*) FROM T GROUP BY x ORDER BY x")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], vec![Value::Int(1), Value::Int(1)]);
+            assert_eq!(rows[1], vec![Value::Int(5), Value::Int(2)]);
+        }
+        other => panic!("expected grouped rows, got {other:?}"),
+    }
+}
