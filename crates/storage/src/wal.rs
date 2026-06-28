@@ -196,8 +196,21 @@ impl Flusher {
                     };
                     // fsync if the writer has buffered new bytes since last sync.
                     let d = dirty_gen.load(Ordering::Acquire);
-                    if d > synced_gen.load(Ordering::Acquire) && file.sync_data().is_ok() {
-                        synced_gen.store(d, Ordering::Release);
+                    if d > synced_gen.load(Ordering::Acquire) {
+                        match file.sync_data() {
+                            Ok(()) => synced_gen.store(d, Ordering::Release),
+                            // In Normal mode this background fsync is the ONLY
+                            // durability point. Swallowing the error (the old
+                            // `&& .is_ok()`) meant an ENOSPC/EIO would keep the
+                            // writer acking commits that never reached stable
+                            // storage, with no signal. Surface it; synced_gen
+                            // stays un-advanced so the next tick retries.
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "WAL background fsync failed; commits since the last \
+                                 successful sync are not yet durable (will retry)"
+                            ),
+                        }
                     }
                     if stopping {
                         break;
