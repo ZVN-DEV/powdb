@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-27
+
+The write-performance + ORM-ergonomics + embedded-mode release. Highlights:
+opt-in `Normal` WAL durability (15–40× faster single-row writes), `RETURNING`
+on PowQL **and** SQL, column `default` values, `auto`-increment columns, a Unix
+domain socket transport, and **embedded mode** — run the engine in-process via
+the `powdb` Rust crate or the `@zvndev/powdb-embedded` Node addon. `Full`
+durability remains the default; the on-disk catalog format moved to v5 and older
+catalogs (v1–v4) still load.
+
 ### Added
 - **Embedded mode — Node addon `@zvndev/powdb-embedded`** (`bindings/node/`).
   A napi-rs native addon exposing the in-process engine to JavaScript with no

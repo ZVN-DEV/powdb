@@ -13,9 +13,9 @@ categories = ["database", "database-implementations"]
 documentation = "https://docs.rs/powdb"
 
 [dependencies]
-powdb-query = { version = "0.6.2", path = "../query" }
+powdb-query = { version = "0.7.0", path = "../query" }
 # Re-exported for `Value`, which appears in the public `QueryResult` API.
-powdb-storage = { version = "0.6.2", path = "../storage" }
+powdb-storage = { version = "0.7.0", path = "../storage" }
 
 [dev-dependencies]
 tempfile = "3"
