@@ -17,6 +17,7 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-query` | https://crates.io/crates/powdb-query |
 | **crates.io** | `powdb-backup` | https://crates.io/crates/powdb-backup |
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
+| **crates.io** | `powdb` (embedded facade — in-process Rust API) | https://crates.io/crates/powdb |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
 | **npm** | `@zvndev/powdb-embedded` (in-process Node addon, prebuilt binaries for all platforms) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
@@ -43,7 +44,8 @@ Inter-crate dependencies require publishing in this order:
 3. `powdb-query` (depends on storage)
 4. `powdb-backup` (depends on storage + query)
 5. `powdb-server` (depends on storage + query + auth)
-6. `powdb-cli` (depends on storage + query + server + backup + auth)
+6. `powdb` (embedded facade — depends on storage + query)
+7. `powdb-cli` (depends on storage + query + server + backup + auth)
 
 Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
 
@@ -85,6 +87,7 @@ one-time setup and the reusable standard.
 [ ] cargo publish -p powdb-query
 [ ] cargo publish -p powdb-backup
 [ ] cargo publish -p powdb-server
+[ ] cargo publish -p powdb       # embedded facade (depends on storage + query)
 [ ] cargo publish -p powdb-cli
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
 [ ] Verify GitHub Release workflow creates binaries AND auto-publishes npm
