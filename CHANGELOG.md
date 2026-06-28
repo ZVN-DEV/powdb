@@ -116,6 +116,16 @@ catalogs (v1–v4) still load.
   path already handled v3/v4; only the gate was stale. It is now a range check
   (`1..=CATALOG_VERSION`) so older catalogs always load and the next bump can't
   reintroduce the gap. Caught by the v0.7.0 pre-release audit before publish.
+- **Catalog open rejects an implausible table count instead of over-allocating.**
+  A corrupt or hostile `catalog.bin` could claim billions of tables and make the
+  reader attempt a multi-gigabyte allocation (host abort — fatal in embedded
+  mode). The count is now bounded by the file length before any allocation, the
+  same guard the b-tree loader already had.
+- **The Normal-mode WAL background flusher now reports fsync failures.** It
+  previously swallowed them (`&& sync_data().is_ok()`); in `WalSyncMode::Normal`
+  that background fsync is the *only* durability point, so a silent `ENOSPC`/`EIO`
+  let the server keep acking non-durable commits. Failures are now logged (and
+  the sync is retried on the next tick).
 - **`UPDATE` now coerces an integer assigned to a `float` column to `f64`**
   (#118) instead of writing the raw i64 bit pattern (which read back as a
   denormal such as `5e-323`) — silent numeric corruption on the in-place

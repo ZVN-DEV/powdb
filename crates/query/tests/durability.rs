@@ -17,7 +17,7 @@
 //! their high LSNs, post-restart writes reuse persisted LSNs and replay
 //! discards them as "already applied."
 
-use powdb_query::executor::Engine;
+use powdb_query::executor::{Engine, WalSyncMode};
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
 
@@ -77,6 +77,41 @@ fn int_field(engine: &mut Engine, query: &str, field: &str) -> Option<i64> {
 /// them — the writes vanish. LSNs must be monotonic across restarts:
 /// `next_lsn` has to be restored to `max(page LSN) + 1` on open.
 ///
+/// #121 Normal WAL sync mode: its headline guarantee is that a *process* crash
+/// (the `panic = "abort"` → supervisor-restart path) loses nothing committed.
+/// Normal mode skips the per-commit fsync (the latency win) but still write()s
+/// each WAL record immediately, so the bytes live in the OS page cache and a
+/// process crash — modeled by `std::mem::forget` (no Drop ⇒ no checkpoint, no
+/// final flush) — cannot lose them; replay on reopen recovers every row. Normal
+/// trades away only the ~10ms power-loss window that Full's fsync closes, which
+/// a process-crash test can't (and doesn't) assert. All other durability tests
+/// here run the default Full mode, so this is the one that exercises Normal.
+#[test]
+fn test_normal_mode_writes_survive_process_crash() {
+    let dir = temp_dir("normal_mode_crash");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.set_wal_sync_mode(WalSyncMode::Normal);
+        exec(&mut engine, "type K { required id: int, v: int }");
+        for i in 1..=200i64 {
+            exec(&mut engine, &format!("insert K {{ id := {i}, v := {i} }}"));
+        }
+        assert_eq!(count(&mut engine, "count(K)"), 200);
+        std::mem::forget(engine); // hard process crash: no Drop, no flush
+    }
+
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        assert_eq!(
+            count(&mut engine, "count(K)"),
+            200,
+            "Normal-mode writes must survive a process crash via WAL replay"
+        );
+    }
+}
+
 /// Sequence: insert 200 → hard crash → reopen (replay stamps pages) →
 /// insert 50 → hard crash → reopen → all 250 must be present.
 #[test]

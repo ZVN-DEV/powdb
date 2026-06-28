@@ -2210,6 +2210,19 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     ) as usize;
     pos += 4;
 
+    // Don't size an allocation from an unvalidated count: a corrupt or hostile
+    // catalog could claim billions of tables and make the `Vec::with_capacity`
+    // below attempt a huge allocation (host abort — fatal in embedded mode). A
+    // file of `buf.len()` bytes can describe at most that many tables (each
+    // needs several header bytes), so a larger count is corrupt. Mirrors the
+    // btree's node-count guard.
+    if n_tables > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("catalog file corrupt: implausible table count {n_tables}"),
+        ));
+    }
+
     let mut entries = Vec::with_capacity(n_tables);
     for _ in 0..n_tables {
         let name_len = read_u32(buf, &mut pos)? as usize;
@@ -2497,6 +2510,38 @@ mod tests {
             );
             fs::remove_file(&path).ok();
         }
+    }
+
+    #[test]
+    fn read_catalog_file_rejects_implausible_table_count() {
+        // A corrupt/hostile catalog must not be trusted to size an allocation:
+        // `Vec::with_capacity(n_tables)` on an unvalidated u32 would attempt a
+        // huge allocation and abort the host. A file can describe at most as
+        // many tables as it has bytes, so a count exceeding the payload length
+        // is rejected with a clear error before any allocation. (We use a small
+        // implausible count over a tiny buffer; a genuinely huge count would
+        // abort the test runner pre-fix, but it hits the very same guard.)
+        use std::io::Write as _;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(CATALOG_MAGIC);
+        buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
+        buf.extend_from_slice(&1000u32.to_le_bytes()); // claims 1000 tables…
+                                                       // …but no table data follows (payload is only 10 bytes).
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        let path =
+            std::env::temp_dir().join(format!("powdb_cat_badcount_{}.bin", std::process::id()));
+        fs::File::create(&path).unwrap().write_all(&buf).unwrap();
+
+        let msg = match read_catalog_file(&path) {
+            Ok(_) => panic!("implausible table count must be rejected, got Ok"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("implausible table count"),
+            "expected an implausible-table-count error, got: {msg}"
+        );
+        fs::remove_file(&path).ok();
     }
 
     #[test]
