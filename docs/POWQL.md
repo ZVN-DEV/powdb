@@ -80,9 +80,11 @@ Declaring a field `unique` automatically creates a unique B+tree index on that c
 
 A field may declare a literal **`default`** after its type — the value applied when an insert (or upsert-insert) omits that column. The default is applied before the required-column check, so a `required` column with a default may be omitted. Defaults must be scalar literals (`int`, `float`, `str`, `bool`); expression defaults (e.g. a generated timestamp) are not yet supported. A default whose type does not match the column is rejected at `type`-creation time.
 
+An integer field may declare the **`auto`** modifier (typically `unique auto id: int`) — when an insert omits it, the engine assigns the next value from a per-table sequence. The assigned id comes back through `insert ... returning`. The sequence resumes above the highest existing id after a restart (recovered from the data, so a process crash never reuses an id of a committed row). An explicit value is allowed and pushes the sequence past it. `auto` requires an `int` column and cannot be combined with `default`. Auto-assignment applies on `insert` (not on `upsert`).
+
 ```powql
 type Account {
-    required unique id: int,
+    unique auto id: int,
     status: str default "active",
     credits: int default 0,
     verified: bool default false
@@ -536,7 +538,7 @@ type Order { required id: int, required user_id: int, required total: float, pro
 type Product { required id: int, required name: str, price: float }
 ```
 
-PowDB does not generate implicit IDs -- every column must be explicitly defined.
+Every column must be explicitly defined — there are no hidden/implicit columns. An id is still its own declared column, but an integer column marked `auto` (see the `auto` modifier above) is assigned from a per-table sequence when omitted, so callers don't have to generate ids themselves.
 
 ### Syntax
 

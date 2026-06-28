@@ -518,6 +518,7 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
             required: f.required,
             unique: f.unique,
             default: f.default,
+            auto: f.auto,
         })
         .collect();
     Ok(PlanNode::CreateTable {

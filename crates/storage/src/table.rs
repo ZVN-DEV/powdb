@@ -71,6 +71,15 @@ pub struct Table {
     /// Empty means "no defaults" (the common case); otherwise `defaults[i]`
     /// is the default for column `i`, or `None` if that column has none.
     defaults: Vec<Option<Value>>,
+    /// Which columns are `auto` (auto-incrementing), aligned to
+    /// `schema.columns`. Empty means no auto columns (the common case).
+    auto_cols: Vec<bool>,
+    /// Next value to assign per auto column, aligned to `schema.columns`.
+    /// Lazily computed from the persisted rows on first insert after open
+    /// (so the sequence resumes above the highest existing id), guarded by
+    /// `auto_next_ready`.
+    auto_next: Vec<i64>,
+    auto_next_ready: bool,
 }
 
 impl Table {
@@ -85,6 +94,9 @@ impl Table {
             indexed_cols: Vec::new(),
             row_layout,
             defaults: Vec::new(),
+            auto_cols: Vec::new(),
+            auto_next: Vec::new(),
+            auto_next_ready: false,
         })
     }
 
@@ -122,6 +134,9 @@ impl Table {
             indexed_cols: Vec::new(),
             row_layout,
             defaults: Vec::new(),
+            auto_cols: Vec::new(),
+            auto_next: Vec::new(),
+            auto_next_ready: false,
         };
 
         for meta in indexed_col_metas {
@@ -200,6 +215,81 @@ impl Table {
     /// no column has a default.
     pub(crate) fn defaults(&self) -> &[Option<Value>] {
         &self.defaults
+    }
+
+    /// Install which columns are `auto` (called at create time and on reopen
+    /// from the persisted catalog), aligned to `schema.columns` by position.
+    pub(crate) fn set_auto_cols(&mut self, auto_cols: Vec<bool>) {
+        self.auto_cols = auto_cols;
+        // Force the counters to be recomputed from the current rows on next use.
+        self.auto_next_ready = false;
+    }
+
+    /// Whether this table has any `auto` column.
+    pub(crate) fn has_auto(&self) -> bool {
+        self.auto_cols.iter().any(|&a| a)
+    }
+
+    /// Which columns are `auto`, aligned to `schema.columns`. Empty when none.
+    pub(crate) fn auto_cols(&self) -> &[bool] {
+        &self.auto_cols
+    }
+
+    /// Fill any omitted (`Empty`) `auto` column in `values` from the per-table
+    /// sequence and advance it. An explicitly-provided value is left as-is but
+    /// still pushes the sequence past it, so later auto ids never collide with
+    /// an id the caller chose. No-op when the table has no auto columns.
+    pub(crate) fn assign_auto(&mut self, values: &mut [Value]) {
+        if !self.has_auto() {
+            return;
+        }
+        if !self.auto_next_ready {
+            self.init_auto_next();
+        }
+        for (i, &is_auto) in self.auto_cols.iter().enumerate() {
+            if !is_auto || i >= values.len() {
+                continue;
+            }
+            match values[i] {
+                Value::Empty => {
+                    values[i] = Value::Int(self.auto_next[i]);
+                    self.auto_next[i] += 1;
+                }
+                Value::Int(v) if v >= self.auto_next[i] => {
+                    self.auto_next[i] = v + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Seed each auto column's next value to one past the highest value already
+    /// stored, so the sequence resumes correctly after a restart (committed
+    /// rows are already replayed from the WAL by the time inserts run). An
+    /// empty column starts at 1.
+    fn init_auto_next(&mut self) {
+        let n = self.schema.columns.len();
+        let mut next = vec![1i64; n];
+        let auto_idxs: Vec<usize> = self
+            .auto_cols
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &a)| if a { Some(i) } else { None })
+            .collect();
+        if !auto_idxs.is_empty() {
+            for (_rid, row) in self.heap.scan() {
+                let decoded = crate::row::decode_row(&self.schema, &row);
+                for &i in &auto_idxs {
+                    if let Some(Value::Int(v)) = decoded.get(i) {
+                        if *v >= next[i] {
+                            next[i] = *v + 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.auto_next = next;
+        self.auto_next_ready = true;
     }
 
     /// Recalculate the cached row layout from the current schema. Must be

@@ -11,6 +11,9 @@ pub struct CreateField {
     pub unique: bool,
     /// Literal default applied when an insert omits this column.
     pub default: Option<Literal>,
+    /// `true` when declared `auto` — integer column auto-assigned from a
+    /// per-table sequence when an insert omits it.
+    pub auto: bool,
 }
 
 /// Physical plan nodes — what the executor actually runs.

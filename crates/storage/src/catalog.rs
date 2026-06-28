@@ -77,8 +77,9 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 const CATALOG_FILE: &str = "catalog.bin";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// Version 4 appends a per-table column-defaults section after the indexed
-/// column list. Older files (v1–v3) load cleanly with no defaults.
-pub const CATALOG_VERSION: u16 = 4;
+/// column list; version 5 appends an auto-increment column section after that.
+/// Older files load cleanly (no defaults / no auto columns).
+pub const CATALOG_VERSION: u16 = 5;
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
@@ -195,6 +196,7 @@ impl Catalog {
             schema,
             indexed_cols,
             defaults,
+            auto_cols,
         } in entries
         {
             let name = schema.table_name.clone();
@@ -205,6 +207,7 @@ impl Catalog {
             // disk so subsequent opens hit the fast path.
             let mut table = Table::open_with_indexes(schema, data_dir, &indexed_cols)?;
             table.set_defaults(defaults);
+            table.set_auto_cols(auto_cols);
             name_to_slot.insert(name, tables.len());
             tables.push(table);
         }
@@ -376,10 +379,12 @@ impl Catalog {
                     // Boundary records were consumed in the first pass.
                 }
                 WalRecordType::DdlCreateTable => {
-                    if let Some((schema, defaults)) = decode_ddl_create_table(&rec.data) {
+                    if let Some((schema, defaults, auto_cols)) = decode_ddl_create_table(&rec.data)
+                    {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
                             if let Ok(mut table) = Table::create(schema, &self.data_dir) {
                                 table.set_defaults(defaults);
+                                table.set_auto_cols(auto_cols);
                                 let slot = self.tables.len();
                                 let name = table.schema.table_name.clone();
                                 self.tables.push(table);
@@ -711,17 +716,29 @@ impl Catalog {
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
-        self.create_table_with_defaults(schema, Vec::new())
+        self.create_table_full(schema, Vec::new(), Vec::new())
     }
 
     /// Create a table whose columns carry literal defaults. `defaults` is
     /// aligned to `schema.columns` by position (and may be shorter / empty for
-    /// columns without a default). The defaults are WAL-logged and persisted in
-    /// the catalog so they survive a restart.
+    /// columns without a default).
     pub fn create_table_with_defaults(
         &mut self,
         schema: Schema,
         defaults: Vec<Option<Value>>,
+    ) -> io::Result<()> {
+        self.create_table_full(schema, defaults, Vec::new())
+    }
+
+    /// Create a table with per-column literal defaults and auto-increment
+    /// flags. Both vecs are aligned to `schema.columns` by position (and may be
+    /// empty). Defaults and auto flags are WAL-logged and persisted in the
+    /// catalog so they survive a restart.
+    pub fn create_table_full(
+        &mut self,
+        schema: Schema,
+        defaults: Vec<Option<Value>>,
+        auto_cols: Vec<bool>,
     ) -> io::Result<()> {
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {
@@ -735,13 +752,14 @@ impl Catalog {
             ));
         }
         if !self.wal.is_off() {
-            let payload = encode_ddl_create_table(&schema, &defaults);
+            let payload = encode_ddl_create_table(&schema, &defaults, &auto_cols);
             self.wal
                 .append(0, WalRecordType::DdlCreateTable, &payload)?;
             self.wal.flush()?;
         }
         let mut table = Table::create(schema, &self.data_dir)?;
         table.set_defaults(defaults);
+        table.set_auto_cols(auto_cols);
         let slot = self.tables.len();
         self.tables.push(table);
         self.name_to_slot.insert(name, slot);
@@ -755,6 +773,22 @@ impl Catalog {
     pub fn column_defaults(&self, table: &str) -> Option<&[Option<Value>]> {
         let slot = *self.name_to_slot.get(table)?;
         Some(self.tables[slot].defaults())
+    }
+
+    /// Which columns of a table are `auto`, aligned to its columns by position.
+    /// `None` when the table is unknown; an empty slice when none are auto.
+    pub fn auto_columns(&self, table: &str) -> Option<&[bool]> {
+        let slot = *self.name_to_slot.get(table)?;
+        Some(self.tables[slot].auto_cols())
+    }
+
+    /// Fill any omitted (`Empty`) auto column in `values` from the table's
+    /// sequence and advance it. No-op when the table is unknown or has no auto
+    /// columns.
+    pub fn assign_auto_columns(&mut self, table: &str, values: &mut [Value]) {
+        if let Some(&slot) = self.name_to_slot.get(table) {
+            self.tables[slot].assign_auto(values);
+        }
     }
 
     /// Write the current set of schemas to disk atomically (write-then-rename).
@@ -771,6 +805,7 @@ impl Catalog {
                 schema: &t.schema,
                 indexed_cols: t.indexed_column_metas(),
                 defaults: t.defaults(),
+                auto_cols: t.auto_cols(),
             })
             .collect();
         write_catalog_file(&tmp_path, &entries)?;
@@ -1676,7 +1711,11 @@ fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
 
 // ─── DDL WAL payload codecs ─────────────────────────────────────────────────
 
-fn encode_ddl_create_table(schema: &Schema, defaults: &[Option<Value>]) -> Vec<u8> {
+fn encode_ddl_create_table(
+    schema: &Schema,
+    defaults: &[Option<Value>],
+    auto_cols: &[bool],
+) -> Vec<u8> {
     let name = schema.table_name.as_bytes();
     let mut out = Vec::new();
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -1690,13 +1729,15 @@ fn encode_ddl_create_table(schema: &Schema, defaults: &[Option<Value>]) -> Vec<u
         out.push(col.required as u8);
         out.extend_from_slice(&col.position.to_le_bytes());
     }
-    // Trailing defaults section. Records written before defaults existed have
-    // no trailing bytes, so the decoder treats their absence as "no defaults".
+    // Trailing sections. Records written before each feature existed simply
+    // lack the corresponding trailing bytes, so the decoder treats their
+    // absence as "none" (length-detected, append-only).
     encode_defaults_section(&mut out, defaults);
+    encode_auto_section(&mut out, auto_cols);
     out
 }
 
-fn decode_ddl_create_table(data: &[u8]) -> Option<(Schema, Vec<Option<Value>>)> {
+fn decode_ddl_create_table(data: &[u8]) -> Option<(Schema, Vec<Option<Value>>, Vec<bool>)> {
     let mut pos = 0usize;
     if data.len() < 4 {
         return None;
@@ -1745,10 +1786,15 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<(Schema, Vec<Option<Value>>)> 
             position,
         });
     }
-    // Trailing defaults section is present on records written after the feature
-    // landed; older records end here, decoding to no defaults.
+    // Trailing sections are present on records written after each feature
+    // landed; older records end early, decoding to "none".
     let defaults = if pos < data.len() {
         decode_defaults_section(data, &mut pos, columns.len())?
+    } else {
+        Vec::new()
+    };
+    let auto_cols = if pos < data.len() {
+        decode_auto_section(data, &mut pos, columns.len())?
     } else {
         Vec::new()
     };
@@ -1758,6 +1804,7 @@ fn decode_ddl_create_table(data: &[u8]) -> Option<(Schema, Vec<Option<Value>>)> 
             columns,
         },
         defaults,
+        auto_cols,
     ))
 }
 
@@ -1896,6 +1943,9 @@ pub(crate) struct CatalogEntry {
     /// Per-column defaults aligned to `schema.columns` by position. Empty when
     /// no column has a default (v1–v3 files always decode to empty).
     pub defaults: Vec<Option<Value>>,
+    /// Which columns are `auto`, aligned to `schema.columns`. Empty when none
+    /// (v1–v4 files always decode to empty).
+    pub auto_cols: Vec<bool>,
 }
 
 /// Borrowed view passed to the writer.
@@ -1903,6 +1953,7 @@ pub(crate) struct CatalogEntryRef<'a> {
     pub schema: &'a Schema,
     pub indexed_cols: Vec<IndexedColMeta>,
     pub defaults: &'a [Option<Value>],
+    pub auto_cols: &'a [bool],
 }
 
 // ─── Column-default codecs (shared by catalog.bin and the WAL DDL record) ────
@@ -2011,6 +2062,43 @@ fn decode_defaults_section(
     Some(out)
 }
 
+/// Encode the per-table `auto` columns as a sparse list: a `u16` count of auto
+/// columns, then their positions (`u16` each). "No auto columns" costs two
+/// bytes.
+fn encode_auto_section(out: &mut Vec<u8>, auto_cols: &[bool]) {
+    let present: Vec<u16> = auto_cols
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &a)| if a { Some(i as u16) } else { None })
+        .collect();
+    out.extend_from_slice(&(present.len() as u16).to_le_bytes());
+    for pos in present {
+        out.extend_from_slice(&pos.to_le_bytes());
+    }
+}
+
+/// Inverse of [`encode_auto_section`]. Builds a `bool` vec of length `n_cols`.
+/// Returns `None` on truncation.
+fn decode_auto_section(data: &[u8], pos: &mut usize, n_cols: usize) -> Option<Vec<bool>> {
+    if *pos + 2 > data.len() {
+        return None;
+    }
+    let count = u16::from_le_bytes(data[*pos..*pos + 2].try_into().ok()?) as usize;
+    *pos += 2;
+    let mut out = vec![false; n_cols];
+    for _ in 0..count {
+        if *pos + 2 > data.len() {
+            return None;
+        }
+        let col = u16::from_le_bytes(data[*pos..*pos + 2].try_into().ok()?) as usize;
+        *pos += 2;
+        if col < n_cols {
+            out[col] = true;
+        }
+    }
+    Some(out)
+}
+
 fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     buf.extend_from_slice(CATALOG_MAGIC);
@@ -2041,6 +2129,8 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
         }
         // Per-table column defaults (version 4).
         encode_defaults_section(&mut buf, entry.defaults);
+        // Per-table auto-increment columns (version 5).
+        encode_auto_section(&mut buf, entry.auto_cols);
     }
 
     // Append a CRC32 checksum of the entire payload so the reader can
@@ -2176,6 +2266,15 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             Vec::new()
         };
 
+        // Version 5 appends an auto-increment column section after that.
+        let auto_cols = if version >= 5 {
+            decode_auto_section(buf, &mut pos, columns.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated catalog auto columns")
+            })?
+        } else {
+            Vec::new()
+        };
+
         entries.push(CatalogEntry {
             schema: Schema {
                 table_name,
@@ -2183,6 +2282,7 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             },
             indexed_cols,
             defaults,
+            auto_cols,
         });
     }
 
@@ -2289,31 +2389,47 @@ mod tests {
     }
 
     #[test]
-    fn ddl_create_table_codec_roundtrips_defaults() {
+    fn ddl_create_table_codec_roundtrips_defaults_and_auto() {
         let schema = schema_two_cols();
         let defaults = vec![None, Some(Value::Str("active".into()))];
-        let encoded = encode_ddl_create_table(&schema, &defaults);
-        let (decoded_schema, decoded_defaults) = decode_ddl_create_table(&encoded).unwrap();
+        let auto_cols = vec![true, false];
+        let encoded = encode_ddl_create_table(&schema, &defaults, &auto_cols);
+        let (decoded_schema, decoded_defaults, decoded_auto) =
+            decode_ddl_create_table(&encoded).unwrap();
         assert_eq!(decoded_schema.columns.len(), 2);
         assert_eq!(decoded_defaults, defaults);
+        assert_eq!(decoded_auto, auto_cols);
     }
 
     #[test]
-    fn ddl_create_table_codec_back_compat_without_defaults_section() {
-        // Simulate a record written before column defaults existed: the
+    fn ddl_create_table_codec_back_compat_without_trailing_sections() {
+        // Simulate a record written before column defaults / auto existed: the
         // old encoder stopped right after the columns, with no trailing
-        // defaults section. The new decoder must read it as "no defaults".
+        // sections. The new decoder must read those as "none".
         let schema = schema_two_cols();
-        let full = encode_ddl_create_table(&schema, &[]);
-        // The "no defaults" section is a trailing u16 count of 0 (two bytes);
-        // chop it off to mimic the pre-feature on-disk shape.
-        let legacy = &full[..full.len() - 2];
-        let (decoded_schema, decoded_defaults) = decode_ddl_create_table(legacy).unwrap();
+        let full = encode_ddl_create_table(&schema, &[], &[]);
+        // Each empty trailing section is a u16 count of 0 (two bytes); chop
+        // both off to mimic the pre-feature on-disk shape.
+        let legacy = &full[..full.len() - 4];
+        let (decoded_schema, decoded_defaults, decoded_auto) =
+            decode_ddl_create_table(legacy).unwrap();
         assert_eq!(decoded_schema.columns.len(), 2);
-        assert!(
-            decoded_defaults.is_empty(),
-            "a record with no trailing defaults section decodes to no defaults"
-        );
+        assert!(decoded_defaults.is_empty(), "no defaults section -> empty");
+        assert!(decoded_auto.is_empty(), "no auto section -> empty");
+    }
+
+    #[test]
+    fn ddl_create_table_codec_back_compat_defaults_but_no_auto() {
+        // A record from the column-defaults release (#129) has a defaults
+        // section but no auto section; the auto-aware decoder must still read it.
+        let schema = schema_two_cols();
+        let defaults = vec![None, Some(Value::Str("active".into()))];
+        let full = encode_ddl_create_table(&schema, &defaults, &[]);
+        // Drop only the trailing auto section (its empty u16 count).
+        let legacy = &full[..full.len() - 2];
+        let (_schema, decoded_defaults, decoded_auto) = decode_ddl_create_table(legacy).unwrap();
+        assert_eq!(decoded_defaults, defaults);
+        assert!(decoded_auto.is_empty());
     }
 
     #[test]
