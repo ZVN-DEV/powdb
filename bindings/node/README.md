@@ -18,10 +18,30 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
 ## API
 
 - `Database.open(dir)` — open or create a database at `dir`.
+- `Database.openWithMemoryLimit(dir, limitBytes)` — open with an explicit
+  per-query memory budget (caps sort/join/GROUP BY materialization).
 - `db.query(powql)` — run a PowQL statement.
 - `db.querySql(sql)` — run a SQL statement (lowered to PowQL).
 - `db.queryReadonly(powql)` — run a read-only statement.
+- `db.setSyncMode(mode)` — set WAL durability: `"full"` | `"normal"` | `"off"`.
 - `db.isPoisoned()` — `true` if a previous call panicked (reopen the database).
+
+## Write performance / durability
+
+By default the database runs in `"full"` durability — one `fsync` per commit,
+the safest mode, but each write waits on the disk. For write-heavy workloads that
+tolerate a small, bounded crash-loss window, switch to `"normal"`: the `fsync`
+moves to an off-lock background flusher, so commits return at memory speed.
+
+```js
+const db = Database.open("./data");
+db.setSyncMode("normal"); // fast writes; bounded crash-loss window
+```
+
+- `"full"` (default) — fsync every commit; no loss on crash; slowest writes.
+- `"normal"` — background fsync; a crash may lose only the last few ms of
+  commits; much faster writes.
+- `"off"` — no durability; tests/benchmarks only.
 
 Results match the `@zvndev/powdb-client` `QueryResult` shape, so embedded and
 networked code paths are interchangeable:

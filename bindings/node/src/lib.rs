@@ -98,6 +98,26 @@ impl Database {
             .map_err(to_napi_err)
     }
 
+    /// Open (or create) a database at `dir` with an explicit per-query memory
+    /// budget in bytes (caps sort/join/GROUP BY materialization).
+    #[napi(factory)]
+    pub fn open_with_memory_limit(dir: String, limit_bytes: i64) -> napi::Result<Database> {
+        let limit = usize::try_from(limit_bytes)
+            .map_err(|_| napi::Error::from_reason("limit_bytes must be a non-negative integer"))?;
+        Inner::open_with_memory_limit(&dir, limit)
+            .map(|inner| Database { inner })
+            .map_err(to_napi_err)
+    }
+
+    /// Set the WAL durability mode: `"full"` (default — one fsync per commit,
+    /// safest), `"normal"` (off-lock background fsync — much faster writes, a
+    /// bounded crash-loss window), or `"off"` (no durability — tests/bench
+    /// only). `"normal"` is what closes the embedded write gap vs SQLite.
+    #[napi]
+    pub fn set_sync_mode(&mut self, mode: String) -> napi::Result<()> {
+        self.inner.set_sync_mode_str(&mode).map_err(to_napi_err)
+    }
+
     /// Run a PowQL statement.
     #[napi]
     pub fn query(&mut self, powql: String) -> napi::Result<QueryResultJs> {

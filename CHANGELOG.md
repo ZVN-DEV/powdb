@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-06-28
+
+A correctness, safety, and embedded-write-performance patch driven by the Turbine
+ORM team's v0.7.0 adoption review plus a PowDB-side audit.
+
+### Fixed
+
+- **SQL `count(*)` (and ungrouped `sum`/`avg`/`min`/`max`) now aggregate.** The
+  SQL frontend lowered an ungrouped aggregate `SELECT` to a row projection
+  (`T { count(*) }`) and returned one null row per source row instead of a
+  scalar — a silent wrong answer on both the server `QuerySql` path and the
+  embedded addon, present since the SQL frontend shipped (v0.5.0). It now lowers
+  to PowQL's aggregate form (`count(T filter ...)`). Multiple ungrouped
+  aggregates, or an aggregate over a join / with `DISTINCT`, return a clear
+  unsupported-feature error instead of garbage. Grouped aggregates were already
+  correct.
+- **Embedded `open()` is panic-safe.** A corrupt heap/index header panicked deep
+  in the open path; under `panic = "unwind"` (the Node addon) that could abort
+  the host process. `Database::open` / `open_with_memory_limit` are now wrapped
+  in `catch_unwind` and return `Error::OpenPanicked`.
+- Version drift: `bindings/node/Cargo.toml` was stuck at 0.6.2.
+
+### Added
+
+- **Data-directory lock.** A PID-based lock file prevents two separate live
+  processes from opening the same data directory (concurrent writers corrupt the
+  heap/WAL). Same-process reopen (after a crash) and dead-owner takeover are
+  allowed, so crash recovery is unaffected.
+- **Embedded durability control.** `@zvndev/powdb-embedded` gains
+  `db.setSyncMode("full" | "normal" | "off")` and a
+  `Database.openWithMemoryLimit(dir, limitBytes)` factory. `"normal"` moves the
+  fsync off the commit path (background flusher), closing the embedded write gap
+  versus SQLite. `"full"` remains the default.
+
 ## [0.7.0] - 2026-06-27
 
 The write-performance + ORM-ergonomics + embedded-mode release. Highlights:

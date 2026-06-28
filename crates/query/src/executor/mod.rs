@@ -291,6 +291,12 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
 
 pub struct Engine {
     catalog: Catalog,
+    /// Exclusive PID-based lock on the data directory, held for the engine's
+    /// lifetime so two separate processes can't open the same dir and corrupt
+    /// the heap/WAL. Released on clean drop; a `mem::forget` crash leaves a
+    /// stale lock the next open takes over. Leading `_`: it does its work
+    /// through `Drop`, never read directly.
+    _dir_lock: powdb_storage::dir_lock::DirLock,
     /// Mission D9 — cached parsed+planned query trees keyed by canonical
     /// hash. Saves the ~3μs parse+plan cost on repeat queries that differ
     /// only in literal values.
@@ -338,6 +344,9 @@ impl Engine {
     /// ```
     pub fn new(data_dir: &Path) -> io::Result<Self> {
         powdb_storage::create_data_dir_secure(data_dir)?;
+        // Refuse to open a directory another live process already holds, before
+        // touching any on-disk state (concurrent writers corrupt the heap/WAL).
+        let dir_lock = powdb_storage::dir_lock::DirLock::acquire(data_dir)?;
         // Try to reopen an existing database first; only create a fresh
         // catalog when there isn't one already on disk.
         let catalog = match Catalog::open(data_dir) {
@@ -355,6 +364,7 @@ impl Engine {
             ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
         Ok(Engine {
             catalog,
+            _dir_lock: dir_lock,
             plan_cache: Mutex::new(PlanCache::new(PLAN_CACHE_CAPACITY)),
             insert_values_scratch: Vec::new(),
             view_registry,
