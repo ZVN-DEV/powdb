@@ -831,7 +831,13 @@ impl Engine {
                                 }
                             })?;
                             if idx != key_idx {
-                                existing_row[idx] = literal_to_value(&a.value)?;
+                                // Coerce to the target column type, same as the
+                                // UPDATE and INSERT paths — an int→float literal
+                                // here would otherwise persist as raw i64 bits
+                                // (#118 corruption on the upsert conflict path).
+                                existing_row[idx] =
+                                    coerce_value(literal_to_value(&a.value)?, &schema.columns[idx])
+                                        .map_err(QueryError::TypeError)?;
                                 indices.push(idx);
                             }
                         }
@@ -863,7 +869,11 @@ impl Engine {
                 // Try literal-only path first; fall back to per-row expression
                 // evaluation if any assignment contains a non-literal expression
                 // (e.g., `age := .age + 1`).
-                let (col_indices, literal_vals): (Vec<usize>, Option<Vec<Value>>) = {
+                let (col_indices, literal_vals, target_cols): (
+                    Vec<usize>,
+                    Option<Vec<Value>>,
+                    Vec<ColumnDef>,
+                ) = {
                     let schema_ref = self
                         .catalog
                         .schema(table)
@@ -879,6 +889,13 @@ impl Engine {
                             })
                         })
                         .collect::<Result<_, _>>()?;
+                    // The target column defs (aligned with `assignments`), owned
+                    // so the per-row expression path can coerce without holding a
+                    // catalog borrow across the mutation loop.
+                    let target_cols: Vec<ColumnDef> = indices
+                        .iter()
+                        .map(|&idx| schema_ref.columns[idx].clone())
+                        .collect();
                     // Resolve each assignment to a literal value. If any is a
                     // non-literal expression, fall back (None) to the per-row
                     // expression-eval path below.
@@ -907,7 +924,7 @@ impl Engine {
                         }
                         Err(_) => None,
                     };
-                    (indices, coerced)
+                    (indices, coerced, target_cols)
                 };
                 let resolved_assignments: Option<Vec<(usize, Value)>> =
                     literal_vals.map(|vals| col_indices.iter().copied().zip(vals).collect());
@@ -945,12 +962,15 @@ impl Engine {
                                 }
                             }
                             // Expression path: evaluate each RHS against the
-                            // (progressively mutated) row, matching the
-                            // non-returning expr path exactly.
+                            // (progressively mutated) row, then coerce to the
+                            // target column type before writing — same guard the
+                            // literal path gets, matching the non-returning expr
+                            // path exactly (#117/#118 on computed assignments).
                             None => {
                                 for (i, asgn) in assignments.iter().enumerate() {
                                     let val = eval_expr(&asgn.value, &row, &columns);
-                                    row[col_indices[i]] = val;
+                                    row[col_indices[i]] = coerce_value(val, &target_cols[i])
+                                        .map_err(QueryError::TypeError)?;
                                 }
                             }
                         }
@@ -1184,7 +1204,13 @@ impl Engine {
                     };
                     for (i, asgn) in assignments.iter().enumerate() {
                         let val = eval_expr(&asgn.value, &row, &col_names);
-                        row[col_indices[i]] = val;
+                        // Coerce to the target column type before writing, so a
+                        // computed int→float assignment stores f64 (not raw i64
+                        // bits, #118) and a str→fixed-col assignment returns a
+                        // typed error instead of hitting the encoder's
+                        // `unreachable!` and aborting the process (#117).
+                        row[col_indices[i]] =
+                            coerce_value(val, &target_cols[i]).map_err(QueryError::TypeError)?;
                     }
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))

@@ -854,6 +854,9 @@ mod tests {
     fn env_limit_is_applied_to_engine() {
         let limit = parse_query_memory_limit(Some("2048"));
         let dir = std::env::temp_dir().join(format!("powdb_srv_memlimit_{}", std::process::id()));
+        // Hermetic: the path is pid-derived (not unique per run), so a stale dir
+        // from an earlier run — or a reused pid — must not leak into this test.
+        let _ = std::fs::remove_dir_all(&dir);
         let engine = Engine::with_memory_limit(&dir, limit).unwrap();
         assert_eq!(engine.query_memory_limit(), 2048);
     }

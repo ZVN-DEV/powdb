@@ -4940,6 +4940,103 @@ fn test_update_str_into_float_column_errors_not_panic_seqscan_path() {
     assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
 }
 
+// ── #117 / #118 redux: the EXPRESSION update path (non-literal RHS) must
+// coerce too. #119 only fixed the literal fast path; a non-literal RHS such as
+// `balance := .tag + 9` falls through to the per-row eval_expr loop, which wrote
+// the raw eval result into the row with no coercion — re-opening both the #118
+// (silent float corruption) and #117 (str → fixed-col `unreachable!` abort)
+// holes on any computed assignment. These mirror the literal tests above but
+// drive the expr path via a column reference. ──
+
+#[test]
+fn test_update_int_expr_into_float_column_coerces_plain_path() {
+    // #118 via the expression path: `.tag` (int 1) + 9 = int 10 assigned to the
+    // float `balance` must be coerced to f64, not stored as the raw i64 bits.
+    let mut engine = acct_engine();
+    engine
+        .execute_powql("Acct filter .id = \"a\" update { balance := .tag + 9 }")
+        .unwrap();
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_update_int_expr_into_float_column_coerces_returning_path() {
+    // Same #118 hole on the separate RETURNING expr write site: the returned
+    // post-image AND the persisted row must both be the coerced f64.
+    let mut engine = acct_engine();
+    let result = engine
+        .execute_powql("Acct filter .id = \"a\" update { balance := .tag + 9 } returning")
+        .unwrap();
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            let bidx = columns.iter().position(|c| c == "balance").unwrap();
+            assert_eq!(
+                rows[0][bidx],
+                Value::Float(10.0),
+                "RETURNING post-image must carry the coerced float, got {:?}",
+                rows[0][bidx]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_update_str_expr_into_float_column_errors_not_panic_plain_path() {
+    // #117 via the expression path: `.id` (str "a") assigned to the float
+    // `balance` must return a typed error, NOT hit `unreachable!` and abort.
+    let mut engine = acct_engine();
+    let result = engine.execute_powql("Acct filter .id = \"a\" update { balance := .id }");
+    assert!(
+        result.is_err(),
+        "type-mismatched expr UPDATE must return Err, got {result:?}"
+    );
+    assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
+}
+
+#[test]
+fn test_update_str_expr_into_float_column_errors_not_panic_returning_path() {
+    // #117 on the RETURNING expr write site.
+    let mut engine = acct_engine();
+    let result =
+        engine.execute_powql("Acct filter .id = \"a\" update { balance := .id } returning");
+    assert!(
+        result.is_err(),
+        "type-mismatched expr UPDATE (returning) must return Err, got {result:?}"
+    );
+    assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
+}
+
+// ── #117 / #118 redux: the UPSERT on-conflict path applies its assignments
+// with the same raw write #119 fixed for UPDATE. A type-mismatched literal on
+// conflict (`upsert Acct on .id { id := "a", balance := 10 / "oops" }`) must be
+// coerced too — otherwise int→float silently corrupts and str→float aborts. ──
+
+#[test]
+fn test_upsert_conflict_int_into_float_column_coerces() {
+    // #118 on the upsert conflict-update path: int literal 10 applied to the
+    // float `balance` must coerce to f64, not store the raw i64 bit pattern.
+    let mut engine = acct_engine();
+    engine
+        .execute_powql(r#"upsert Acct on .id { id := "a", balance := 10 }"#)
+        .unwrap();
+    assert_eq!(acct_balance(&mut engine), Value::Float(10.0));
+}
+
+#[test]
+fn test_upsert_conflict_str_into_float_column_errors_not_panic() {
+    // #117 on the upsert conflict-update path: str applied to the float
+    // `balance` must return a typed error, NOT hit `unreachable!` and abort.
+    let mut engine = acct_engine();
+    let result = engine.execute_powql(r#"upsert Acct on .id { id := "a", balance := "oops" }"#);
+    assert!(
+        result.is_err(),
+        "type-mismatched upsert must return Err, got {result:?}"
+    );
+    assert_eq!(acct_balance(&mut engine), Value::Float(1.5));
+}
+
 #[test]
 fn test_engine_normal_sync_mode_persists_across_reopen() {
     // Phase 1: the engine honors WalSyncMode::Normal end-to-end. In Normal,

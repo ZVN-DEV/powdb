@@ -107,12 +107,33 @@ catalogs (v1–v4) still load.
   genuine mismatch. Reported by the turbine-orm integration.
 
 ### Fixed
+- **The on-disk catalog now loads every format version from 1 up to the
+  current one.** The format-version gate accepted only `{1, 2, CATALOG_VERSION}`,
+  so when `CATALOG_VERSION` moved to 5 this release it silently *rejected*
+  catalogs written at version 3 (v0.6.x) or 4 (an intermediate build) with
+  `unsupported catalog version` — a database created by a v0.6.x server would
+  fail to open after upgrading, i.e. **data loss on upgrade**. The field-reading
+  path already handled v3/v4; only the gate was stale. It is now a range check
+  (`1..=CATALOG_VERSION`) so older catalogs always load and the next bump can't
+  reintroduce the gap. Caught by the v0.7.0 pre-release audit before publish.
 - **`UPDATE` now coerces an integer assigned to a `float` column to `f64`**
   (#118) instead of writing the raw i64 bit pattern (which read back as a
   denormal such as `5e-323`) — silent numeric corruption on the in-place
   update fast path. `INSERT` already coerced correctly; the byte-patch
   `UPDATE` path bypassed it. Fix covers both the indexed and the fused
   `Filter(SeqScan)` update paths. Reported by the turbine-orm integration.
+- **Completed that coercion fix across the remaining write paths** (#117/#118).
+  The previous fix only covered literal assignments; a *computed* assignment
+  (any non-literal RHS, e.g. `balance := .tag + 9`) took the per-row
+  expression path, which wrote the evaluated value into the row with no
+  coercion — and so did the `UPSERT` on-conflict path. Consequences: an
+  int-valued expression into a `float` column silently corrupted the row
+  (#118), and a str-valued expression into a fixed-size column reached the
+  row encoder's `unreachable!` and **aborted the process** (`panic = "abort"`)
+  — a remotely-triggerable DoS (#117). All write paths (`INSERT`, literal and
+  expression `UPDATE` including `RETURNING`, and `UPSERT`) now coerce each
+  assignment to the target column's declared type and return a typed error on
+  a genuine mismatch. Reported by the turbine-orm integration.
 
 ## [0.6.2] - 2026-06-26
 

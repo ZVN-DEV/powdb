@@ -2188,12 +2188,16 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog header"))?,
     );
     pos += 2;
-    // Mission 3: accept version 1 files for forward compatibility.
-    // `create_index` was the only mutator that added indexes before, and
-    // those indexes were in-memory only, so on open we simply treat them
-    // as absent and let the first `create_index` call repopulate the
-    // metadata (and mint a version 2 file).
-    if version != CATALOG_VERSION && version != 1 && version != 2 {
+    // Accept every version from 1 up to the current CATALOG_VERSION: the
+    // field-reading staircase below fills in fields a newer version added
+    // (indexed-col uniqueness at v3, defaults at v4, auto columns at v5) and
+    // defaults them for older files, so any 1..=CATALOG_VERSION file loads.
+    // A range check (not an enumerated list) is what makes this back-compat
+    // hold automatically on the next bump — the previous `version != 1 &&
+    // version != 2 && version != CATALOG_VERSION` form silently rejected the
+    // intermediate v3/v4 files when the constant moved to 5, which would have
+    // failed to open a v0.6.x database on upgrade (data loss).
+    if version == 0 || version > CATALOG_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported catalog version: {version}"),
@@ -2430,6 +2434,69 @@ mod tests {
         let (_schema, decoded_defaults, decoded_auto) = decode_ddl_create_table(legacy).unwrap();
         assert_eq!(decoded_defaults, defaults);
         assert!(decoded_auto.is_empty());
+    }
+
+    #[test]
+    fn read_catalog_file_accepts_intermediate_versions_3_and_4() {
+        // Regression: the version gate accepted only {1, 2, CATALOG_VERSION}, so
+        // a catalog written at version 3 (v0.6.x) or 4 (the column-defaults
+        // release) was rejected with "unsupported catalog version" — the
+        // database would fail to open on upgrade from those releases = data
+        // loss. The field-reading staircase already handles v3/v4; only the gate
+        // was stale. Build faithful v3/v4 catalog files by hand and confirm they
+        // load (defaults/auto default to empty for the versions that lack them).
+        use std::io::Write as _;
+        fn write_legacy_catalog(path: &std::path::Path, version: u16) {
+            let mut buf: Vec<u8> = Vec::new();
+            buf.extend_from_slice(CATALOG_MAGIC);
+            buf.extend_from_slice(&version.to_le_bytes());
+            buf.extend_from_slice(&1u32.to_le_bytes()); // n_tables
+                                                        // table "T"
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(b"T");
+            buf.extend_from_slice(&2u16.to_le_bytes()); // n_cols
+                                                        // col id: Int, required, pos 0
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(b"id");
+            buf.push(TypeId::Int as u8);
+            buf.push(1);
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            // col status: Str, not required, pos 1
+            buf.extend_from_slice(&6u32.to_le_bytes());
+            buf.extend_from_slice(b"status");
+            buf.push(TypeId::Str as u8);
+            buf.push(0);
+            buf.extend_from_slice(&1u16.to_le_bytes());
+            // version >= 3: indexed-column section (count 0).
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            // version >= 4: column-defaults section (none here). v3 omits it.
+            if version >= 4 {
+                encode_defaults_section(&mut buf, &[None, None]);
+            }
+            // v3/v4 never wrote the v5 auto section.
+            let crc = crc32fast::hash(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            let mut f = fs::File::create(path).unwrap();
+            f.write_all(&buf).unwrap();
+        }
+
+        for version in [3u16, 4u16] {
+            let path = std::env::temp_dir().join(format!(
+                "powdb_cat_v{version}_compat_{}.bin",
+                std::process::id()
+            ));
+            write_legacy_catalog(&path, version);
+            let entries = read_catalog_file(&path)
+                .unwrap_or_else(|e| panic!("version {version} catalog must load, got: {e}"));
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].schema.table_name, "T");
+            assert_eq!(entries[0].schema.columns.len(), 2);
+            assert!(
+                entries[0].auto_cols.is_empty(),
+                "v{version} has no auto cols"
+            );
+            fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
