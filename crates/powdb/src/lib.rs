@@ -55,6 +55,8 @@ pub enum Error {
     /// at the boundary so it never aborts the embedded host. The data directory
     /// is likely corrupt; restore from a backup.
     OpenPanicked,
+    /// A caller-supplied argument was invalid (e.g. an unknown sync-mode name).
+    InvalidArgument(String),
 }
 
 impl std::fmt::Display for Error {
@@ -70,7 +72,19 @@ impl std::fmt::Display for Error {
                 f,
                 "opening the database panicked (data directory may be corrupt); restore from a backup"
             ),
+            Error::InvalidArgument(msg) => write!(f, "{msg}"),
         }
+    }
+}
+
+/// Parse a JS-/CLI-facing sync-mode name into a [`WalSyncMode`] (case
+/// insensitive). `None` for anything other than `full` / `normal` / `off`.
+pub fn parse_sync_mode(mode: &str) -> Option<WalSyncMode> {
+    match mode.to_ascii_lowercase().as_str() {
+        "full" => Some(WalSyncMode::Full),
+        "normal" => Some(WalSyncMode::Normal),
+        "off" => Some(WalSyncMode::Off),
+        _ => None,
     }
 }
 
@@ -149,6 +163,19 @@ impl Database {
         if let Some(engine) = self.engine.as_mut() {
             engine.set_wal_sync_mode(mode);
         }
+    }
+
+    /// Set the WAL durability mode from a string (`"full"` | `"normal"` |
+    /// `"off"`, case insensitive) — the form the Node addon and CLIs use.
+    /// Errors on an unknown name rather than silently keeping the old mode.
+    pub fn set_sync_mode_str(&mut self, mode: &str) -> Result<(), Error> {
+        let parsed = parse_sync_mode(mode).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "unknown sync mode {mode:?}; expected \"full\", \"normal\", or \"off\""
+            ))
+        })?;
+        self.set_sync_mode(parsed);
+        Ok(())
     }
 
     /// Whether the handle has been poisoned by a caught panic.
@@ -262,6 +289,30 @@ mod tests {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
             other => panic!("expected 1 row after poisoned-drop reopen, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_sync_mode_is_case_insensitive_and_rejects_unknown() {
+        assert!(matches!(parse_sync_mode("full"), Some(WalSyncMode::Full)));
+        assert!(matches!(
+            parse_sync_mode("Normal"),
+            Some(WalSyncMode::Normal)
+        ));
+        assert!(matches!(parse_sync_mode("OFF"), Some(WalSyncMode::Off)));
+        assert!(parse_sync_mode("bogus").is_none());
+    }
+
+    #[test]
+    fn set_sync_mode_str_sets_known_and_errors_on_unknown() {
+        let dir = std::env::temp_dir().join(format!("powdb_syncstr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type T { required id: int }").unwrap();
+        db.set_sync_mode_str("normal").unwrap();
+        // A write still commits under Normal durability.
+        db.query("insert T { id := 1 }").unwrap();
+        assert!(db.set_sync_mode_str("bogus").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

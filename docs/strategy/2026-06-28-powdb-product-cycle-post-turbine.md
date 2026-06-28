@@ -59,7 +59,7 @@ workaround, hedged adapter).
 
 | # | Item | Type | Pri | Owner | Plan |
 |---|---|---|---|---|---|
-| A | **Embedded `setSyncMode` / `openWithMemoryLimit` napi methods** | perf | **P1** | PowDB | Facade already has `set_sync_mode`; add thin `#[napi]` methods (string→`WalSyncMode`). Unlocks embedded `Normal` writes (~0.01–0.02 ms) → **beats SQLite on writes**. The single highest-ROI item. |
+| A | **Embedded `setSyncMode` / `openWithMemoryLimit` napi methods** | perf | **P1** | PowDB | ✅ **done in 0.7.1.** Thin `#[napi]` methods over the facade (`set_sync_mode_str` parses `"full"/"normal"/"off"`, TDD'd in the facade). Unlocks embedded `Normal` writes (~0.01–0.02 ms) → **beats SQLite on writes**. The single highest-ROI item. |
 | B | **Packaging: all platforms via CI + musl** | packaging | **P1** | PowDB | 0.7.0 addon shipped 3/5 prebuilds (Intel-mac + Windows dropped; the CI count guard was bypassed by the token-bootstrap). Republish via CI; add `x86_64-unknown-linux-musl` for Alpine/distroless. Windows still blocked (Unix-only engine). |
 | C | **count(*) fix** | correctness | **P0** | PowDB | ✅ done in 0.7.1. |
 | D | **open panic-safety + data-dir lock** | safety | P2→done | PowDB | ✅ done in 0.7.1 (Turbine #3). |
@@ -70,11 +70,10 @@ workaround, hedged adapter).
 
 ## 5. Release sequence
 
-**0.7.1 — correctness + safety (this PR, ready):** items C + D + version-drift
-fix. Cut as soon as CI is green. Because the embedded addon must be **republished**
-to pick up the facade changes anyway, **fold item A (`setSyncMode`) into the same
-0.7.1 addon build** — it's small, it's the headline write win, and it avoids a
-second addon republish. Recommendation: A ships in 0.7.1.
+**0.7.1 — correctness + safety + embedded write knob (this PR):** items **A + C
++ D** + version-drift fix. Item A (`setSyncMode`) was folded in because the
+embedded addon republishes for the facade changes anyway — so the headline write
+win ships now, no second republish. Cut as soon as CI is green.
 
 **0.7.2 — packaging (item B):** republish the addon through CI for all buildable
 platforms + musl, once trusted publishing (F) is fixed so it's token-less.
