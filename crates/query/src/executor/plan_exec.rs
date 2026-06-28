@@ -665,6 +665,7 @@ impl Engine {
                         returning_columns = schema.columns.iter().map(|c| c.name.clone()).collect();
                     }
                     let defaults = self.catalog.column_defaults(table).unwrap_or(&[]);
+                    let auto = self.catalog.auto_columns(table).unwrap_or(&[]);
                     let mut all = Vec::with_capacity(rows.len());
                     for assignments in rows {
                         let mut values = vec![Value::Empty; schema.columns.len()];
@@ -689,8 +690,11 @@ impl Engine {
                             }
                         }
                         for col in &schema.columns {
-                            if col.required && matches!(values[col.position as usize], Value::Empty)
-                            {
+                            let pos = col.position as usize;
+                            // Auto columns are exempt from the required check —
+                            // they are filled from the sequence just below.
+                            let is_auto = auto.get(pos).copied().unwrap_or(false);
+                            if col.required && !is_auto && matches!(values[pos], Value::Empty) {
                                 return Err(QueryError::Execution(format!(
                                     "column '{}' is required but no value was provided",
                                     col.name
@@ -701,6 +705,14 @@ impl Engine {
                     }
                     all
                 };
+                // Assign auto-increment columns now that the immutable
+                // schema/defaults/auto borrows are released. Done here (not in
+                // the build loop) so the assigned ids land in `all_values` and
+                // flow back through `returning`.
+                let mut all_values = all_values;
+                for values in all_values.iter_mut() {
+                    self.catalog.assign_auto_columns(table, values);
+                }
                 // Charge the materialized batch against the per-query memory
                 // budget before inserting — keeps multi-row insert consistent
                 // with every other full-materialization point (sort/join/group)
@@ -1558,10 +1570,29 @@ impl Engine {
                 // type mismatch (`count: int default "x"`) is rejected at DDL
                 // time and the stored default is ready to drop into inserts.
                 let mut defaults: Vec<Option<Value>> = vec![None; columns.len()];
+                let mut auto_cols: Vec<bool> = vec![false; columns.len()];
                 for (i, f) in fields.iter().enumerate() {
                     if let Some(lit) = &f.default {
                         let raw = literal_value_from(lit);
                         defaults[i] = Some(coerce_value(raw, &columns[i])?);
+                    }
+                    if f.auto {
+                        // Auto-increment only makes sense on an integer column,
+                        // and combining it with a literal default is
+                        // contradictory (both want to supply the value).
+                        if columns[i].type_id != TypeId::Int {
+                            return Err(QueryError::TypeError(format!(
+                                "auto column '{}' must be of type int",
+                                f.name
+                            )));
+                        }
+                        if f.default.is_some() {
+                            return Err(QueryError::TypeError(format!(
+                                "auto column '{}' cannot also declare a default",
+                                f.name
+                            )));
+                        }
+                        auto_cols[i] = true;
                     }
                 }
                 let schema = Schema {
@@ -1569,7 +1600,7 @@ impl Engine {
                     columns,
                 };
                 self.catalog
-                    .create_table_with_defaults(schema, defaults)
+                    .create_table_full(schema, defaults, auto_cols)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 // Declaring a field `unique` auto-creates a unique B+tree
                 // index, which is where uniqueness is enforced on writes.

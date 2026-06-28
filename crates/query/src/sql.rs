@@ -634,6 +634,7 @@ impl SqlParser {
                 let ty = self.sql_type()?;
                 let mut required = false;
                 let mut unique = false;
+                let mut auto = false;
                 let mut default: Option<String> = None;
                 loop {
                     if self.eat_kw("not") {
@@ -641,6 +642,8 @@ impl SqlParser {
                         required = true;
                     } else if self.eat_kw("unique") {
                         unique = true;
+                    } else if self.eat_kw("autoincrement") || self.eat_kw("auto_increment") {
+                        auto = true;
                     } else if self.eat_kw("default") {
                         default = Some(self.default_literal()?);
                     } else if self.eat_kw("null") {
@@ -654,6 +657,9 @@ impl SqlParser {
                 }
                 if unique {
                     mods.push("unique");
+                }
+                if auto {
+                    mods.push("auto");
                 }
                 let prefix = if mods.is_empty() {
                     String::new()

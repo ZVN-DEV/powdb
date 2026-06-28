@@ -23,6 +23,7 @@ pub enum Token {
     Select,       // select (alias for projection)
     Required,     // required
     Default,      // default (column default value)
+    Auto,         // auto (auto-incrementing column)
     Multi,        // multi
     Link,         // link
     Index,        // index
@@ -177,6 +178,7 @@ impl Token {
             Token::Select => "'select'".into(),
             Token::Required => "'required'".into(),
             Token::Default => "'default'".into(),
+            Token::Auto => "'auto'".into(),
             Token::Multi => "'multi'".into(),
             Token::Link => "'link'".into(),
             Token::Index => "'index'".into(),

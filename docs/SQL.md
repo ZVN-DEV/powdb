@@ -8,7 +8,7 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 - `INSERT INTO T (a, b) VALUES (1, 'x'), (2, 'y') [RETURNING *]`
 - `UPDATE T SET a = ... WHERE ... [RETURNING *]`
 - `DELETE FROM T WHERE ... [RETURNING *]`
-- `CREATE TABLE T (...)`, including `NOT NULL`, `UNIQUE`, and `DEFAULT <literal>` column modifiers
+- `CREATE TABLE T (...)`, including `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, and `AUTOINCREMENT` (alias `AUTO_INCREMENT`) column modifiers
 - `CREATE [UNIQUE] INDEX name ON T (col)`
 - `ALTER TABLE T ADD/DROP COLUMN ...`
 - `DROP TABLE`, `DROP VIEW`
@@ -17,6 +17,8 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 Supported expressions include literals, column references, qualified join references, arithmetic, boolean `AND`/`OR`/`NOT`, comparisons, `IS [NOT] NULL`, `LIKE`, aggregate/scalar function calls that already exist in PowQL, and `count(*)`.
 
 `INSERT`/`UPDATE`/`DELETE` accept an optional trailing `RETURNING *`, which returns the affected rows in the same statement (insert/update return the post-image, delete returns the pre-image) — so an ORM gets its rows back in one round-trip instead of a write followed by a reselect. This lowers to PowQL's `returning` clause.
+
+`AUTOINCREMENT` (on an `INTEGER` column) lowers to PowQL's `auto` modifier: an omitted column is assigned the next value from a per-table sequence, returned via `RETURNING *`. Combine with `INSERT ... RETURNING *` for the canonical *insert-without-the-id, read-it-back* flow.
 
 ## Intentional unsupported errors
 

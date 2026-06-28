@@ -1755,8 +1755,8 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            // Accept `required` and `unique` modifiers in either order.
-            let (mut required, mut unique) = (false, false);
+            // Accept `required`, `unique`, and `auto` modifiers in any order.
+            let (mut required, mut unique, mut auto) = (false, false, false);
             loop {
                 match self.peek() {
                     Token::Required => {
@@ -1766,6 +1766,10 @@ impl Parser {
                     Token::Unique => {
                         self.advance();
                         unique = true;
+                    }
+                    Token::Auto => {
+                        self.advance();
+                        auto = true;
                     }
                     _ => break,
                 }
@@ -1803,6 +1807,7 @@ impl Parser {
                 required,
                 unique,
                 default,
+                auto,
             });
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -1870,6 +1875,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Select => out.push_str("select"),
             Token::Required => out.push_str("required"),
             Token::Default => out.push_str("default"),
+            Token::Auto => out.push_str("auto"),
             Token::Multi => out.push_str("multi"),
             Token::Link => out.push_str("link"),
             Token::Index => out.push_str("index"),

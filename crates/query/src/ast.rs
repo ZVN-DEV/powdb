@@ -220,6 +220,9 @@ pub struct FieldDef {
     /// Literal default applied when an insert omits this column. `None` means
     /// the column has no default (omitting it yields the empty set / null).
     pub default: Option<Literal>,
+    /// `true` when declared `auto` — an integer column whose value is assigned
+    /// from a monotonic per-table sequence when an insert omits it.
+    pub auto: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

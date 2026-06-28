@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes and over the wire (the rows come back on the existing rows path).
   `returning` is opt-in: without it, every existing fast path (byte-patch,
   fused single-pass scan/update/delete) is unchanged.
+- **Auto-increment columns** (write-performance Phase 3, ORM ergonomics) — an
+  integer column may be declared `auto` (PowQL `unique auto id: int`, SQL
+  `id INTEGER AUTOINCREMENT`). When an insert omits it, the engine assigns the
+  next value from a per-table sequence and returns it via `RETURNING *` — the
+  canonical *insert-without-the-id, read-it-back* flow. The sequence resumes
+  above the highest existing id after a restart (recomputed from the recovered
+  data, so a crash never reuses a committed id); an explicit value pushes the
+  sequence past it. `auto` requires an `int` column, can't be combined with a
+  `default`, and applies on `insert` (not `upsert`). Persisted in the catalog
+  (on-disk format bumped to v5 — older catalogs still load). This reverses the
+  former "PowDB does not generate implicit IDs" stance. See `docs/POWQL.md`.
 - **Column `default` values** (write-performance Phase 3, ORM ergonomics) — a
   column may declare a literal default: PowQL `status: str default "active"`,
   SQL `status TEXT DEFAULT 'active'`. When an insert (or upsert-insert) omits the
