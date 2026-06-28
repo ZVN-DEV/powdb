@@ -217,6 +217,9 @@ pub struct FieldDef {
     /// `true` when declared with the `unique` modifier — auto-creates a
     /// unique B+Tree index on this column at table-create time.
     pub unique: bool,
+    /// Literal default applied when an insert omits this column. `None` means
+    /// the column has no default (omitting it yields the empty set / null).
+    pub default: Option<Literal>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -664,6 +664,7 @@ impl Engine {
                     if *returning {
                         returning_columns = schema.columns.iter().map(|c| c.name.clone()).collect();
                     }
+                    let defaults = self.catalog.column_defaults(table).unwrap_or(&[]);
                     let mut all = Vec::with_capacity(rows.len());
                     for assignments in rows {
                         let mut values = vec![Value::Empty; schema.columns.len()];
@@ -676,6 +677,16 @@ impl Engine {
                             })?;
                             let raw = literal_to_value(&a.value)?;
                             values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                        }
+                        // Fill any column left unset by this row from its
+                        // declared default (applied before the required check,
+                        // so a default satisfies a required column).
+                        for (i, slot) in values.iter_mut().enumerate() {
+                            if slot.is_empty() {
+                                if let Some(Some(d)) = defaults.get(i) {
+                                    *slot = d.clone();
+                                }
+                            }
                         }
                         for col in &schema.columns {
                             if col.required && matches!(values[col.position as usize], Value::Empty)
@@ -734,6 +745,16 @@ impl Engine {
                         })?;
                         let raw = literal_to_value(&a.value)?;
                         values[idx] = coerce_value(raw, &schema.columns[idx])?;
+                    }
+                    // Apply column defaults for the insert path, same as a plain
+                    // insert (applied before the required-column check).
+                    let defaults = self.catalog.column_defaults(table).unwrap_or(&[]);
+                    for (i, slot) in values.iter_mut().enumerate() {
+                        if slot.is_empty() {
+                            if let Some(Some(d)) = defaults.get(i) {
+                                *slot = d.clone();
+                            }
+                        }
                     }
                     for col in &schema.columns {
                         if col.required && matches!(values[col.position as usize], Value::Empty) {
@@ -1533,12 +1554,22 @@ impl Engine {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                // Coerce each literal default to its column's type now, so a
+                // type mismatch (`count: int default "x"`) is rejected at DDL
+                // time and the stored default is ready to drop into inserts.
+                let mut defaults: Vec<Option<Value>> = vec![None; columns.len()];
+                for (i, f) in fields.iter().enumerate() {
+                    if let Some(lit) = &f.default {
+                        let raw = literal_value_from(lit);
+                        defaults[i] = Some(coerce_value(raw, &columns[i])?);
+                    }
+                }
                 let schema = Schema {
                     table_name: name.clone(),
                     columns,
                 };
                 self.catalog
-                    .create_table(schema)
+                    .create_table_with_defaults(schema, defaults)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 // Declaring a field `unique` auto-creates a unique B+tree
                 // index, which is where uniqueness is enforced on writes.

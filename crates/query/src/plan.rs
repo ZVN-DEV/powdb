@@ -1,4 +1,4 @@
-use crate::ast::{AggFunc, AlterAction, Assignment, Expr, JoinKind, WindowFunc};
+use crate::ast::{AggFunc, AlterAction, Assignment, Expr, JoinKind, Literal, WindowFunc};
 
 /// A column definition carried by `PlanNode::CreateTable`. Replaces the
 /// old `(name, type_name, required)` tuple so the `unique` modifier can
@@ -9,6 +9,8 @@ pub struct CreateField {
     pub type_name: String,
     pub required: bool,
     pub unique: bool,
+    /// Literal default applied when an insert omits this column.
+    pub default: Option<Literal>,
 }
 
 /// Physical plan nodes — what the executor actually runs.

@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes and over the wire (the rows come back on the existing rows path).
   `returning` is opt-in: without it, every existing fast path (byte-patch,
   fused single-pass scan/update/delete) is unchanged.
+- **Column `default` values** (write-performance Phase 3, ORM ergonomics) — a
+  column may declare a literal default: PowQL `status: str default "active"`,
+  SQL `status TEXT DEFAULT 'active'`. When an insert (or upsert-insert) omits the
+  column, the default is filled in — applied *before* the required-column check,
+  so a `required` column with a default may be omitted. Defaults are scalar
+  literals only (`int`/`float`/`str`/`bool`); a type-mismatched default is
+  rejected at table-creation time. Defaults are persisted in the catalog
+  (on-disk format bumped to v4 — older v1–v3 catalogs still load, with no
+  defaults) and the create-table WAL record. Pairs with `RETURNING` for the
+  insert-without-the-value-then-read-it-back flow. See `docs/POWQL.md`.
 - **SQL `RETURNING *`** (write-performance Phase 3) — the SQL frontend now
   accepts an optional trailing `RETURNING *` on `INSERT`/`UPDATE`/`DELETE`,
   lowering to PowQL's `returning` clause. ORMs hitting the SQL surface (the
