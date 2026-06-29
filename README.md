@@ -148,7 +148,7 @@ User group .city having avg(.age) > 30 { .city, avg_age: avg(.age) }
 User filter .id in (Order filter .total > 100 { .user_id })
 
 -- Set operations
-(User filter .age > 30) union (User filter .city = "NYC")
+User filter .age > 30 union User filter .city = "NYC"
 
 -- Mutations
 User filter .age < 18 delete

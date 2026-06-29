@@ -65,8 +65,8 @@ one-time setup and the reusable standard.
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
 - **npm (`@zvndev/powdb-embedded`)** — published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
-  runner matrix (macOS arm64/x64, Linux x64/arm64, Windows x64), then publishes
-  one fat package bundling all five prebuilt `.node` binaries, token-less with
+  runner matrix (macOS arm64/x64, Linux x64/arm64; Windows deferred), then publishes
+  one fat package bundling all four prebuilt `.node` binaries, token-less with
   provenance. `dry_run=true` (the default) packs every platform without
   publishing. Kept manual because the binary matrix is slow and the package is
   released on demand, not on every `v*` tag.
