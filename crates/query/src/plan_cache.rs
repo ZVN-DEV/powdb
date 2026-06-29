@@ -53,7 +53,25 @@ impl PlanCache {
 
     /// Store a planned query under its canonical hash. The plan can have
     /// any literal values inside it — those will be overwritten on hit.
-    pub fn insert(&mut self, hash: u64, plan: PlanNode) {
+    ///
+    /// `source_literal_count` is the number of literals
+    /// [`crate::canonicalize::canonicalize`] collected from the query text.
+    /// The cache only works because, on a hit, every collected literal maps
+    /// 1:1 to a substitutable slot the [`substitute_plan`] walk can reach.
+    /// If those counts disagree, the plan has literals the walk cannot
+    /// re-bind — the one case today is a subquery (`in (<subquery>)` /
+    /// `exists (...)`), whose inner literals `canonicalize` collects at the
+    /// token level but which live in an un-walked `QueryExpr` AST inside the
+    /// predicate. Caching such a plan would serve the *first* call's inner
+    /// literal to every later same-shape call: silent wrong rows in release,
+    /// a substitution-count assert in debug (issue #137). We refuse to cache
+    /// it; the engine then plans from source on every call, which is always
+    /// correct. This check runs only on the populating miss, so the hot
+    /// hit-path pays nothing.
+    pub fn insert(&mut self, hash: u64, plan: PlanNode, source_literal_count: usize) {
+        if count_literal_slots(&plan) != source_literal_count {
+            return;
+        }
         if self.cache.len() >= self.capacity && !self.cache.contains_key(&hash) {
             // Crude eviction: when full, drop everything. Plan cache is
             // small (capacity ~256) and bench loops only ever fill a
@@ -521,7 +539,7 @@ mod tests {
         let q1 = "User filter .id = 42";
         let (h1, lits1) = canonicalize(q1).unwrap();
         let p1 = planner::plan(q1).unwrap();
-        cache.insert(h1, p1);
+        cache.insert(h1, p1, lits1.len());
 
         // Second call with a different literal — should hit and produce
         // a plan with the new literal substituted in.
@@ -547,6 +565,29 @@ mod tests {
     }
 
     #[test]
+    fn test_subquery_plan_not_cached() {
+        // #137: `canonicalize` collects the inner `100` literal at the token
+        // level, but it lives in an un-walked subquery AST that
+        // `substitute_plan` can't reach (`count_literal_slots` returns 0).
+        // The counts disagree, so the cache must refuse to store the plan —
+        // otherwise a later same-shape call with a different inner literal
+        // would be served this plan's stale `100`.
+        let mut cache = PlanCache::new(100);
+        let q = "User filter .id in (Ord filter .total > 100 { .user_id })";
+        let (h, lits) = canonicalize(q).unwrap();
+        assert_eq!(lits.len(), 1, "canonicalize collects the inner literal");
+        let plan = planner::plan(q).unwrap();
+        assert_eq!(
+            count_literal_slots(&plan),
+            0,
+            "the subquery literal is not a reachable substitution slot"
+        );
+        cache.insert(h, plan, lits.len());
+        assert!(cache.is_empty(), "subquery plans must not be cached (#137)");
+        assert!(cache.get_with_substitution(h, &lits).is_none());
+    }
+
+    #[test]
     fn test_cache_miss_returns_none_and_bumps_counter() {
         let mut cache = PlanCache::new(100);
         assert!(cache.get_with_substitution(99999, &[]).is_none());
@@ -558,8 +599,8 @@ mod tests {
     fn test_multi_literal_filter_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"User filter .age > 30 and .status = "active" { .name }"#;
-        let (h1, _) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap());
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
 
         let q2 = r#"User filter .age > 50 and .status = "pending" { .name }"#;
         let (h2, lits2) = canonicalize(q2).unwrap();
@@ -578,8 +619,8 @@ mod tests {
     fn test_update_by_pk_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = "User filter .id = 1 update { age := 100 }";
-        let (h1, _) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap());
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
 
         let q2 = "User filter .id = 7 update { age := 200 }";
         let (h2, lits2) = canonicalize(q2).unwrap();
@@ -594,8 +635,8 @@ mod tests {
     fn test_insert_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"insert User { id := 1, name := "Alice", age := 20 }"#;
-        let (h1, _) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap());
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
 
         let q2 = r#"insert User { id := 2, name := "Bob", age := 30 }"#;
         let (h2, lits2) = canonicalize(q2).unwrap();
@@ -623,13 +664,13 @@ mod tests {
         // Use a different shape to force eviction.
         let q3_distinct = "User filter .id = 5";
 
-        let (h1, _) = canonicalize(q1).unwrap();
-        let (h2, _) = canonicalize(q2).unwrap();
-        let (h3, _) = canonicalize(q3_distinct).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap());
-        cache.insert(h2, planner::plan(q2).unwrap());
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h3, lits3) = canonicalize(q3_distinct).unwrap();
+        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+        cache.insert(h2, planner::plan(q2).unwrap(), lits2.len());
         // Cache full → inserting a third *new* shape should clear.
-        cache.insert(h3, planner::plan(q3_distinct).unwrap());
+        cache.insert(h3, planner::plan(q3_distinct).unwrap(), lits3.len());
         assert!(cache.cache.contains_key(&h3));
         assert_eq!(cache.cache.len(), 1);
     }

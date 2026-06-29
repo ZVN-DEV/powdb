@@ -129,3 +129,101 @@ fn test_materialized_view_autorefresh() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Returns the single projected integer column, sorted ascending, for a
+/// query that projects exactly one int field.
+fn col_i64(engine: &mut Engine, query: &str) -> Vec<i64> {
+    match exec(engine, query) {
+        QueryResult::Rows { rows, .. } => {
+            let mut out: Vec<i64> = rows
+                .iter()
+                .map(|r| match r.as_slice() {
+                    [Value::Int(n)] => *n,
+                    other => panic!("expected a single int column, got {other:?}"),
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// F4 (#137): a `… in (<subquery>)` filter was cached by plan shape, but the
+/// subquery's inner literal was never re-bound on a cache hit. Two
+/// same-shape `in (<subquery>)` queries differing only in the inner literal
+/// returned the *first* query's rows in release builds (silent stale data),
+/// and tripped the plan-cache substitution assert in debug builds
+/// (`consumed 0 literals but query had 1`). Both are the same defect: the
+/// cache must never serve a stale subquery literal. Affects the shared
+/// executor, so the TCP server path inherits it too.
+#[test]
+fn test_in_subquery_inner_literal_rebinds_across_calls() {
+    let dir = temp_dir("in_subquery_stale_literal");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut engine = Engine::new(&dir).unwrap();
+
+    exec(
+        &mut engine,
+        "type tags { unique auto id: int, required label: str }",
+    );
+    exec(
+        &mut engine,
+        "type user_tags { required user_id: int, required tag_id: int }",
+    );
+    exec(&mut engine, r#"insert tags { label := "red" }"#); // id 1
+    exec(&mut engine, r#"insert tags { label := "blue" }"#); // id 2
+    exec(
+        &mut engine,
+        "insert user_tags { user_id := 1, tag_id := 1 }",
+    ); // u1 -> red
+    exec(
+        &mut engine,
+        "insert user_tags { user_id := 1, tag_id := 2 }",
+    ); // u1 -> blue
+    exec(
+        &mut engine,
+        "insert user_tags { user_id := 2, tag_id := 2 }",
+    ); // u2 -> blue
+
+    // (A) Same-shape IN-subquery, inner literal changes between calls. The
+    // first call is a cache miss (planned fresh → correct); the second is a
+    // cache hit and is where the stale-literal bug bit.
+    assert_eq!(
+        col_i64(
+            &mut engine,
+            r#"user_tags filter .tag_id in (tags filter .label = "red" { .id }) { .user_id }"#,
+        ),
+        vec![1],
+        "only u1 has the red tag",
+    );
+    assert_eq!(
+        col_i64(
+            &mut engine,
+            r#"user_tags filter .tag_id in (tags filter .label = "blue" { .id }) { .user_id }"#,
+        ),
+        vec![1, 2],
+        "u1 AND u2 have the blue tag — must not reuse the prior call's `red` subquery result",
+    );
+
+    // (B) Reverse direction (a distinct shape, so its first call also misses),
+    // then a same-shape second call that must re-evaluate the new inner literal.
+    assert_eq!(
+        col_i64(
+            &mut engine,
+            "tags filter .id in (user_tags filter .user_id = 1 { .tag_id }) { .id }",
+        ),
+        vec![1, 2],
+        "u1 has tags 1 and 2",
+    );
+    assert_eq!(
+        col_i64(
+            &mut engine,
+            "tags filter .id in (user_tags filter .user_id = 2 { .tag_id }) { .id }",
+        ),
+        vec![2],
+        "u2 has only tag 2 — must re-evaluate with the new inner literal",
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
