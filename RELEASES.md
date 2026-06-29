@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.7.1** (write-performance + ORM-ergonomics + embedded mode: opt-in `Normal` WAL durability mode, `RETURNING` on PowQL and SQL, column `default` values, `auto`-increment columns, a Unix domain socket transport, and embedded mode via the `powdb` Rust crate + the `@zvndev/powdb-embedded` Node addon. `Full` durability stays the default; on-disk catalog format moved to v5, older v1–v4 catalogs still load.).
+> **Current release: v0.7.2** (correctness + docs patch: fixes a plan-cache bug where `… in (<subquery>)` returned stale rows across same-shape calls (#137), plus README/docs drift fixes (#71). On-disk catalog format unchanged from v0.7.1 — still v5; older v1–v4 catalogs still load.).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
