@@ -539,7 +539,7 @@ impl Engine {
                             .map_err(|e| {
                                 QueryError::Execution(format!("plan cache lock poisoned: {e}"))
                             })?
-                            .insert(hash, plan.clone());
+                            .insert(hash, plan.clone(), literals.len());
                         let plan = lower_unindexed_scans(&self.catalog, &plan);
                         let result = self.execute_plan(&plan);
                         if !self.in_transaction {
@@ -647,7 +647,7 @@ impl Engine {
                 self.plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .insert(hash, plan.clone());
+                    .insert(hash, plan.clone(), literals.len());
                 let plan = lower_unindexed_scans(&self.catalog, &plan);
                 let result = self.execute_plan(&plan);
                 if !self.in_transaction {
@@ -695,7 +695,7 @@ impl Engine {
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, plan.clone());
+                .insert(hash, plan.clone(), literals.len());
             let plan = lower_unindexed_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
@@ -811,7 +811,7 @@ impl Engine {
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, plan.clone());
+                .insert(hash, plan.clone(), literals.len());
             let plan = lower_unindexed_scans(&self.catalog, &plan);
             return self.execute_plan_readonly(&plan);
         }
