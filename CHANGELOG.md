@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-29
+
+A correctness and documentation patch from the post-v0.7.1 gold-standard audit
+and Turbine ORM issue triage.
+
+### Fixed
+
+- **`in (<subquery>)` no longer returns stale rows across same-shape calls.**
+  The plan cache keys queries by canonical shape and re-binds literals on a hit,
+  but a subquery's inner literal lives in an un-walked `QueryExpr` AST that the
+  substitution pass could not reach. Two same-shape `… in (<subquery>)` queries
+  differing only in the inner literal returned the **first** call's rows in
+  release builds (silent wrong answer) and tripped a substitution-count
+  assertion in debug builds. The cache now refuses to store any plan whose
+  substitutable literal slots don't match the literals collected from the source
+  (the only such case today is a subquery), so those queries plan from source on
+  every call and always return correct rows. The hot cache-hit path is
+  unaffected — the check runs only when populating the cache. Affected the shared
+  executor, so the TCP server path inherited it too. (#137)
+
+### Documentation
+
+- README's PowQL set-operation example used a parenthesised `(A) union (B)` form
+  the parser rejects; corrected to the unparenthesised `A union B` form that the
+  parser and `docs/POWQL.md` use. (#71)
+- `RELEASES.md` described the `@zvndev/powdb-embedded` build matrix as five
+  platforms including Windows; it ships four (macOS arm64/x64, Linux x64/arm64),
+  with Windows deferred until the storage engine is ported off Unix-only APIs.
+- `docs/getting-started.md` example output showed a stale `v0.6.2` REPL banner.
+
 ## [0.7.1] - 2026-06-28
 
 A correctness, safety, and embedded-write-performance patch driven by the Turbine
