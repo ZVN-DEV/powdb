@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.7.2
+## 0.8.0 — EXPERIMENTAL (not published)
+
+> **Status: experimental / beta-gated. NOT published to npm.** This is the
+> Embedded Sync Milestone 0 substrate. `@zvndev/powdb-sync` stays unpublished
+> until the Milestone-1 gates pass (crash matrix RF-04/RF-11/PH-02,
+> concurrent-read-during-apply RA-01/RA-09, version-compat rejection RA-03,
+> handshake SP-01/SP-05, perf PH-05, fuzz PH-07 — see `docs/embedded-sync.md`).
+> The version tracks PowDB workspace v0.8.0 so the package builds and tests in
+> lockstep; it does not imply a public release. Pin matching
+> `@zvndev/powdb-client` and `@zvndev/powdb-embedded` versions.
 
 - Initial experimental `@zvndev/powdb-sync` package.
 - Adds primary-authoritative embedded-replica orchestration around local

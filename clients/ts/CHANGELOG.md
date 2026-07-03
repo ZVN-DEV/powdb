@@ -1,12 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-07-02
 
-- Added experimental low-level authenticated embedded-sync protocol helpers:
+- Released in lockstep with PowDB workspace v0.8.0 (Embedded Sync Milestone 0).
+- Added **experimental** low-level authenticated embedded-sync protocol helpers:
   `client.syncStatus`, `client.syncPull`, and `client.syncAck`.
 - Added TypeScript wire support for the private sync status/pull/ack frames
   (`0x20`-`0x25`), retained-unit payloads, sync repair actions, and the
   `sync` observability event.
+- These sync helpers are experimental and beta-gated: pin matching client/server
+  versions. Plain `query(powql)` / `querySql(sql)` frames are unchanged.
 
 ## 0.5.1 - 2026-06-17
 
@@ -20,7 +23,7 @@ All notable changes to `@zvndev/powdb-client`.
 
 | Client version | Compatible PowDB server | Notes |
 |---|---|---|
-| Unreleased / 0.7.x | Matching sync-enabled 0.7.x server | Adds experimental private authenticated embedded-sync helpers (`syncStatus`, `syncPull`, `syncAck`) over wire frames `0x20`-`0x25`. Pin matching client/server versions for these helpers until the stable `@zvndev/powdb-sync` package boundary exists; plain `query(powql)` and `querySql(sql)` frames remain unchanged. |
+| 0.8.x | Matching sync-enabled 0.8.x server | Adds experimental private authenticated embedded-sync helpers (`syncStatus`, `syncPull`, `syncAck`) over wire frames `0x20`-`0x25`. Pin matching client/server versions for these helpers until the stable `@zvndev/powdb-sync` package boundary exists; plain `query(powql)` and `querySql(sql)` frames remain unchanged. |
 | 0.5.x | 0.4.7+ | Adds `client.query(powql, params)` for `$N` parameter binding. The `QueryWithParams` (`0x04`) wire message is only understood by server ≥0.4.7; parameterized queries against an older server error out. Plain `query(powql)` calls remain compatible with 0.3.x–0.4.x. |
 | 0.4.x | 0.3.x – 0.4.x | Wire protocol v1 plus the optional Connect `username` field. **Multi-user mode requires client ≥0.4.0 AND server ≥0.4.6** (the server enforces roles as of 0.4.6; 0.4.5 accepted the username but did not enforce `readonly`). When `user` is omitted the Connect frame is byte-identical to the 0.3.x shape, so legacy shared-password and no-auth servers work unchanged. |
 | 0.3.x | 0.3.x – 0.4.x | Wire protocol v1. The client warns only on a major-version mismatch, so any `0.x` server connects. Minor server bumps may add new opcodes; the client tolerates unknown response codes by surfacing `PowDBError`. Pin both ends. **Caveat:** the 0.3.x client has no `user` option, so it cannot authenticate to a 0.4.5+ server running in **multi-user mode** (the server requires a username once any named user is defined). Shared-password mode works fine. |

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-02
+
+Embedded Sync **Milestone 0** — the retained replication-unit log substrate for
+primary-authoritative embedded replicas. **The entire sync feature is
+experimental.** It ships so the substrate can bake against the core engine; the
+public `@zvndev/powdb-sync` package is **beta-gated and is NOT published to npm
+until the Milestone-1 gates pass** (crash matrix, concurrent-read-during-apply,
+version-compat rejection, handshake, perf, and fuzz — see below and
+`docs/embedded-sync.md`). Existing PowDB users are unaffected by the sync
+feature itself, but note the additive core-engine changes called out under
+*Changed*.
+
+### Added
+
+- **`powdb-sync` crate (experimental).** Retained replication-unit segment
+  format (magic / version / WAL-format / catalog-format / database-identity /
+  primary-generation / unit-count / LSN-range / footer CRC), atomic no-clobber
+  segment publish (temp write → fsync → hard-link publish → directory fsync),
+  identity-aware range reads by LSN with gap/overlap/corruption rejection,
+  durable sync identity, primary-side replica-cursor metadata with stale-lock
+  recovery, and cursor-based retention GC that fails closed on a corrupt,
+  gapped, or wrong-identity retained tail.
+- **Private authenticated server sync frames** (`0x20`–`0x25`): status / pull /
+  ack, sharing the server transaction gate, with pull output capped by both the
+  authoritative remote LSN and the currently servable retained LSN, and V1
+  transaction-boundary validation so a chunk limit or buggy client cannot strand
+  retained history at a mid-transaction cursor.
+- **Backup-based replica bootstrap** — full/incremental backup manifests carry
+  optional sync fork-safety metadata; default restore strips sync identity for
+  plain-engine safety, with explicit preserve/fork restore modes.
+- **Two new JS packages / bindings (experimental):** `@zvndev/powdb-sync`
+  (embedded-replica orchestration: local readonly reads, primary-authoritative
+  write-forward, retained-unit pull/apply/ack, background sync scheduler) and
+  low-level sync helpers in `@zvndev/powdb-client` (`syncStatus`, `syncPull`,
+  `syncAck`); the `@zvndev/powdb-embedded` addon exposes
+  `applyRetainedUnits(...)`.
+
+### Changed
+
+- **Durable `catalog.lsn` sidecar.** The catalog now persists its durability
+  high-water mark in a `catalog.lsn` file next to `catalog.bin`. **Backward
+  compatible:** a v0.7.2 database predates the sidecar, so on first open under
+  0.8.0 the durable LSN reads as `0` and is recovered from page LSNs exactly as
+  before; the sidecar is (re)written on the next durable mutation. On-disk
+  catalog format is **unchanged — still v5**; v1–v4 catalogs still load.
+- **Sync-aware checkpoint / recovery guards.** Checkpoint, recovery, engine
+  open/drop, and rollback archive WAL records into retained segments *before*
+  truncation when a sync identity exists. Plain checkpoint/recovery **fails
+  closed** for sync-enabled WAL history when no archive hook is provided rather
+  than silently discarding retained history; a failed archive leaves the
+  transaction retryable.
+- **Additive backup manifest fields.** `BackupManifest` gains an optional
+  `sync` metadata block (`#[serde(default)]`); backup `format_version` is
+  unchanged, so a v0.7.2 backup (no `sync` field, no `catalog.lsn` entry)
+  restores unchanged.
+
+### Not in this release (Milestone-1 gates, still experimental)
+
+`@zvndev/powdb-sync` will not be published until these land: crash-injection
+matrix (RF-04 / RF-11 / PH-02), concurrent-read-during-apply (RA-01 / RA-09),
+version-compat rejection (RA-03), handshake (SP-01 / SP-05), perf gates
+(PH-05), and fuzz (PH-07). Also deferred: offline local writes, partial /
+row-level sync, and DDL write-forward.
+
 ## [0.7.2] - 2026-06-29
 
 A correctness and documentation patch from the post-v0.7.1 gold-standard audit
