@@ -10,6 +10,14 @@ const MSG_QUERY: u8 = 0x03;
 const MSG_QUERY_PARAMS: u8 = 0x04;
 /// SQL query frame. Plain Query remains PowQL for backward compatibility.
 const MSG_QUERY_SQL: u8 = 0x05;
+/// Private sync control frames. These are append-only protocol extensions:
+/// legacy query/result frames keep their original tags and shape.
+const MSG_SYNC_STATUS: u8 = 0x20;
+const MSG_SYNC_PULL: u8 = 0x21;
+const MSG_SYNC_ACK: u8 = 0x22;
+const MSG_SYNC_STATUS_RESULT: u8 = 0x23;
+const MSG_SYNC_PULL_RESULT: u8 = 0x24;
+const MSG_SYNC_ACK_RESULT: u8 = 0x25;
 const MSG_RESULT_ROWS: u8 = 0x07;
 const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
@@ -35,6 +43,9 @@ const MAX_ROWS: usize = 10_000_000;
 /// Maximum number of bound parameters in a single QueryWithParams message.
 const MAX_PARAMS: usize = 4096;
 
+/// Maximum retained units accepted in one sync pull frame.
+const MAX_SYNC_UNITS: usize = 4096;
+
 const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
 
 /// A positional parameter value carried by [`Message::QueryWithParams`].
@@ -49,6 +60,53 @@ pub enum WireParam {
     Float(f64),
     Bool(bool),
     Str(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireSyncRepairAction {
+    None,
+    Pull,
+    AwaitArchive,
+    Rebootstrap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSyncStatus {
+    pub replica_id: String,
+    pub active: bool,
+    pub last_applied_lsn: Option<u64>,
+    pub remote_lsn: u64,
+    pub servable_lsn: Option<u64>,
+    pub unarchived_lsn: Option<u64>,
+    pub lag_lsn: Option<u64>,
+    pub lag_bytes: Option<u64>,
+    pub lag_ms: Option<u64>,
+    pub stale: bool,
+    pub repair_action: WireSyncRepairAction,
+    pub last_sync_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRetainedUnit {
+    pub tx_id: u64,
+    pub record_type: u8,
+    pub lsn: u64,
+    pub data: Vec<u8>,
+}
+
+impl WireRetainedUnit {
+    /// Encoded byte length of this retained unit inside a sync pull result
+    /// payload. Keep this next to `encode_retained_unit` so metrics and
+    /// max-byte enforcement evolve with the wire shape.
+    pub fn encoded_len(&self) -> Result<u64, String> {
+        let data_len = u64::try_from(self.data.len())
+            .map_err(|_| "sync retained unit payload too large".to_string())?;
+        8u64.checked_add(1)
+            .and_then(|n| n.checked_add(8))
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(data_len))
+            .ok_or_else(|| "sync retained unit encoded length overflow".to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +137,43 @@ pub enum Message {
     QueryWithParams {
         query: String,
         params: Vec<WireParam>,
+    },
+    /// Request primary-side status for one embedded replica cursor.
+    SyncStatus {
+        replica_id: String,
+    },
+    /// Pull a bounded retained-unit chunk after the server-side replica cursor.
+    SyncPull {
+        replica_id: String,
+        since_lsn: u64,
+        max_units: u32,
+        max_bytes: u64,
+        database_id: [u8; 16],
+        primary_generation: u64,
+        wal_format_version: u16,
+        catalog_version: u16,
+        segment_format_version: u16,
+    },
+    /// Acknowledge that the replica applied retained history through `applied_lsn`.
+    SyncAck {
+        replica_id: String,
+        applied_lsn: u64,
+        remote_lsn: u64,
+    },
+    SyncStatusResult {
+        status: WireSyncStatus,
+    },
+    SyncPullResult {
+        status: WireSyncStatus,
+        units: Vec<WireRetainedUnit>,
+        has_more: bool,
+    },
+    SyncAckResult {
+        previous_applied_lsn: u64,
+        applied_lsn: u64,
+        remote_lsn: u64,
+        advanced: bool,
+        status: WireSyncStatus,
     },
     ResultRows {
         columns: Vec<String>,
@@ -153,6 +248,70 @@ impl Message {
                     }
                 }
                 (MSG_QUERY_PARAMS, buf)
+            }
+            Message::SyncStatus { replica_id } => (MSG_SYNC_STATUS, encode_string(replica_id)),
+            Message::SyncPull {
+                replica_id,
+                since_lsn,
+                max_units,
+                max_bytes,
+                database_id,
+                primary_generation,
+                wal_format_version,
+                catalog_version,
+                segment_format_version,
+            } => {
+                let mut buf = encode_string(replica_id);
+                buf.extend_from_slice(&since_lsn.to_le_bytes());
+                buf.extend_from_slice(&max_units.to_le_bytes());
+                buf.extend_from_slice(&max_bytes.to_le_bytes());
+                buf.extend_from_slice(database_id);
+                buf.extend_from_slice(&primary_generation.to_le_bytes());
+                buf.extend_from_slice(&wal_format_version.to_le_bytes());
+                buf.extend_from_slice(&catalog_version.to_le_bytes());
+                buf.extend_from_slice(&segment_format_version.to_le_bytes());
+                (MSG_SYNC_PULL, buf)
+            }
+            Message::SyncAck {
+                replica_id,
+                applied_lsn,
+                remote_lsn,
+            } => {
+                let mut buf = encode_string(replica_id);
+                buf.extend_from_slice(&applied_lsn.to_le_bytes());
+                buf.extend_from_slice(&remote_lsn.to_le_bytes());
+                (MSG_SYNC_ACK, buf)
+            }
+            Message::SyncStatusResult { status } => {
+                (MSG_SYNC_STATUS_RESULT, encode_sync_status(status))
+            }
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                let mut buf = encode_sync_status(status);
+                buf.extend_from_slice(&(units.len() as u32).to_le_bytes());
+                for unit in units {
+                    encode_retained_unit(&mut buf, unit);
+                }
+                buf.push(u8::from(*has_more));
+                (MSG_SYNC_PULL_RESULT, buf)
+            }
+            Message::SyncAckResult {
+                previous_applied_lsn,
+                applied_lsn,
+                remote_lsn,
+                advanced,
+                status,
+            } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&previous_applied_lsn.to_le_bytes());
+                buf.extend_from_slice(&applied_lsn.to_le_bytes());
+                buf.extend_from_slice(&remote_lsn.to_le_bytes());
+                buf.push(u8::from(*advanced));
+                buf.extend_from_slice(&encode_sync_status(status));
+                (MSG_SYNC_ACK_RESULT, buf)
             }
             Message::ResultRows { columns, rows } => {
                 let mut buf = Vec::new();
@@ -306,6 +465,83 @@ impl Message {
                     params.push(p);
                 }
                 Ok(Message::QueryWithParams { query, params })
+            }
+            MSG_SYNC_STATUS => {
+                let replica_id = decode_string(payload, &mut 0)?;
+                Ok(Message::SyncStatus { replica_id })
+            }
+            MSG_SYNC_PULL => {
+                let mut pos = 0;
+                let replica_id = decode_string(payload, &mut pos)?;
+                let since_lsn = decode_u64(payload, &mut pos, "sync pull since LSN")?;
+                let max_units = decode_u32(payload, &mut pos, "sync pull max units")?;
+                let max_bytes = decode_u64(payload, &mut pos, "sync pull max bytes")?;
+                let database_id = decode_16_bytes(payload, &mut pos, "sync database id")?;
+                let primary_generation = decode_u64(payload, &mut pos, "sync primary generation")?;
+                let wal_format_version = decode_u16(payload, &mut pos, "sync WAL format version")?;
+                let catalog_version = decode_u16(payload, &mut pos, "sync catalog version")?;
+                let segment_format_version =
+                    decode_u16(payload, &mut pos, "sync segment format version")?;
+                Ok(Message::SyncPull {
+                    replica_id,
+                    since_lsn,
+                    max_units,
+                    max_bytes,
+                    database_id,
+                    primary_generation,
+                    wal_format_version,
+                    catalog_version,
+                    segment_format_version,
+                })
+            }
+            MSG_SYNC_ACK => {
+                let mut pos = 0;
+                let replica_id = decode_string(payload, &mut pos)?;
+                let applied_lsn = decode_u64(payload, &mut pos, "sync ack applied LSN")?;
+                let remote_lsn = decode_u64(payload, &mut pos, "sync ack remote LSN")?;
+                Ok(Message::SyncAck {
+                    replica_id,
+                    applied_lsn,
+                    remote_lsn,
+                })
+            }
+            MSG_SYNC_STATUS_RESULT => {
+                let mut pos = 0;
+                let status = decode_sync_status(payload, &mut pos)?;
+                Ok(Message::SyncStatusResult { status })
+            }
+            MSG_SYNC_PULL_RESULT => {
+                let mut pos = 0;
+                let status = decode_sync_status(payload, &mut pos)?;
+                let count = decode_u32(payload, &mut pos, "sync retained unit count")? as usize;
+                if count > MAX_SYNC_UNITS {
+                    return Err("too many retained units".into());
+                }
+                let mut units = Vec::with_capacity(count.min(payload.len().saturating_sub(pos)));
+                for _ in 0..count {
+                    units.push(decode_retained_unit(payload, &mut pos)?);
+                }
+                let has_more = decode_bool(payload, &mut pos, "sync has_more")?;
+                Ok(Message::SyncPullResult {
+                    status,
+                    units,
+                    has_more,
+                })
+            }
+            MSG_SYNC_ACK_RESULT => {
+                let mut pos = 0;
+                let previous_applied_lsn = decode_u64(payload, &mut pos, "previous applied LSN")?;
+                let applied_lsn = decode_u64(payload, &mut pos, "applied LSN")?;
+                let remote_lsn = decode_u64(payload, &mut pos, "remote LSN")?;
+                let advanced = decode_bool(payload, &mut pos, "sync ack advanced")?;
+                let status = decode_sync_status(payload, &mut pos)?;
+                Ok(Message::SyncAckResult {
+                    previous_applied_lsn,
+                    applied_lsn,
+                    remote_lsn,
+                    advanced,
+                    status,
+                })
             }
             MSG_RESULT_ROWS => {
                 let mut pos = 0;
@@ -470,6 +706,200 @@ fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
     let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
     *pos += len;
     Ok(s)
+}
+
+fn encode_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_option_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<Option<u64>, String> {
+    let present = decode_bool(data, pos, label)?;
+    if present {
+        Ok(Some(decode_u64(data, pos, label)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn encode_option_string(out: &mut Vec<u8>, value: Option<&String>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&encode_string(value));
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_option_string(
+    data: &[u8],
+    pos: &mut usize,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let present = decode_bool(data, pos, label)?;
+    if present {
+        Ok(Some(decode_string(data, pos)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn encode_sync_status(status: &WireSyncStatus) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_string(&status.replica_id));
+    out.push(u8::from(status.active));
+    encode_option_u64(&mut out, status.last_applied_lsn);
+    out.extend_from_slice(&status.remote_lsn.to_le_bytes());
+    encode_option_u64(&mut out, status.servable_lsn);
+    encode_option_u64(&mut out, status.unarchived_lsn);
+    encode_option_u64(&mut out, status.lag_lsn);
+    encode_option_u64(&mut out, status.lag_bytes);
+    encode_option_u64(&mut out, status.lag_ms);
+    out.push(u8::from(status.stale));
+    out.push(match status.repair_action {
+        WireSyncRepairAction::None => 0,
+        WireSyncRepairAction::Pull => 1,
+        WireSyncRepairAction::AwaitArchive => 2,
+        WireSyncRepairAction::Rebootstrap => 3,
+    });
+    encode_option_string(&mut out, status.last_sync_error.as_ref());
+    out
+}
+
+fn decode_sync_status(data: &[u8], pos: &mut usize) -> Result<WireSyncStatus, String> {
+    let replica_id = decode_string(data, pos)?;
+    let active = decode_bool(data, pos, "sync status active")?;
+    let last_applied_lsn = decode_option_u64(data, pos, "sync status last applied LSN")?;
+    let remote_lsn = decode_u64(data, pos, "sync status remote LSN")?;
+    let servable_lsn = decode_option_u64(data, pos, "sync status servable LSN")?;
+    let unarchived_lsn = decode_option_u64(data, pos, "sync status unarchived LSN")?;
+    let lag_lsn = decode_option_u64(data, pos, "sync status lag LSN")?;
+    let lag_bytes = decode_option_u64(data, pos, "sync status lag bytes")?;
+    let lag_ms = decode_option_u64(data, pos, "sync status lag milliseconds")?;
+    let stale = decode_bool(data, pos, "sync status stale")?;
+    if *pos >= data.len() {
+        return Err("truncated sync repair action".into());
+    }
+    let repair_action = match data[*pos] {
+        0 => WireSyncRepairAction::None,
+        1 => WireSyncRepairAction::Pull,
+        2 => WireSyncRepairAction::AwaitArchive,
+        3 => WireSyncRepairAction::Rebootstrap,
+        other => return Err(format!("unknown sync repair action: {other}")),
+    };
+    *pos += 1;
+    let last_sync_error = decode_option_string(data, pos, "sync status last error")?;
+    Ok(WireSyncStatus {
+        replica_id,
+        active,
+        last_applied_lsn,
+        remote_lsn,
+        servable_lsn,
+        unarchived_lsn,
+        lag_lsn,
+        lag_bytes,
+        lag_ms,
+        stale,
+        repair_action,
+        last_sync_error,
+    })
+}
+
+fn encode_retained_unit(out: &mut Vec<u8>, unit: &WireRetainedUnit) {
+    out.extend_from_slice(&unit.tx_id.to_le_bytes());
+    out.push(unit.record_type);
+    out.extend_from_slice(&unit.lsn.to_le_bytes());
+    out.extend_from_slice(&(unit.data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&unit.data);
+}
+
+fn decode_retained_unit(data: &[u8], pos: &mut usize) -> Result<WireRetainedUnit, String> {
+    let tx_id = decode_u64(data, pos, "sync retained unit tx id")?;
+    if *pos >= data.len() {
+        return Err("truncated sync retained unit record type".into());
+    }
+    let record_type = data[*pos];
+    *pos += 1;
+    let lsn = decode_u64(data, pos, "sync retained unit LSN")?;
+    let data = decode_bytes(data, pos, "sync retained unit payload")?;
+    Ok(WireRetainedUnit {
+        tx_id,
+        record_type,
+        lsn,
+        data,
+    })
+}
+
+fn decode_bool(data: &[u8], pos: &mut usize, label: &str) -> Result<bool, String> {
+    if *pos >= data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let raw = data[*pos];
+    *pos += 1;
+    match raw {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(format!("invalid boolean for {label}: {other}")),
+    }
+}
+
+fn decode_u16(data: &[u8], pos: &mut usize, label: &str) -> Result<u16, String> {
+    if *pos + 2 > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let bytes: [u8; 2] = data[*pos..*pos + 2]
+        .try_into()
+        .map_err(|_| format!("invalid {label} bytes"))?;
+    *pos += 2;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn decode_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32, String> {
+    if *pos + 4 > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let bytes: [u8; 4] = data[*pos..*pos + 4]
+        .try_into()
+        .map_err(|_| format!("invalid {label} bytes"))?;
+    *pos += 4;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn decode_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64, String> {
+    if *pos + 8 > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let bytes: [u8; 8] = data[*pos..*pos + 8]
+        .try_into()
+        .map_err(|_| format!("invalid {label} bytes"))?;
+    *pos += 8;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn decode_16_bytes(data: &[u8], pos: &mut usize, label: &str) -> Result<[u8; 16], String> {
+    if *pos + 16 > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&data[*pos..*pos + 16]);
+    *pos += 16;
+    Ok(out)
+}
+
+fn decode_bytes(data: &[u8], pos: &mut usize, label: &str) -> Result<Vec<u8>, String> {
+    let len = decode_u32(data, pos, label)? as usize;
+    if *pos + len > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let out = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -677,6 +1107,218 @@ mod tests {
         }
     }
 
+    fn sample_sync_status() -> WireSyncStatus {
+        WireSyncStatus {
+            replica_id: "replica-a".into(),
+            active: true,
+            last_applied_lsn: Some(7),
+            remote_lsn: 10,
+            servable_lsn: Some(10),
+            unarchived_lsn: Some(0),
+            lag_lsn: Some(3),
+            lag_bytes: Some(2048),
+            lag_ms: Some(5000),
+            stale: true,
+            repair_action: WireSyncRepairAction::Pull,
+            last_sync_error: None,
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_sync_requests() {
+        let database_id = *b"sync-protocol!!!";
+        let pull = Message::SyncPull {
+            replica_id: "replica-a".into(),
+            since_lsn: 7,
+            max_units: 128,
+            max_bytes: 4096,
+            database_id,
+            primary_generation: 9,
+            wal_format_version: 1,
+            catalog_version: 2,
+            segment_format_version: 1,
+        };
+        let bytes = pull.encode();
+        assert_eq!(bytes[0], MSG_SYNC_PULL);
+        match Message::decode(&bytes).unwrap() {
+            Message::SyncPull {
+                replica_id,
+                since_lsn,
+                max_units,
+                max_bytes,
+                database_id: decoded_database_id,
+                primary_generation,
+                wal_format_version,
+                catalog_version,
+                segment_format_version,
+            } => {
+                assert_eq!(replica_id, "replica-a");
+                assert_eq!(since_lsn, 7);
+                assert_eq!(max_units, 128);
+                assert_eq!(max_bytes, 4096);
+                assert_eq!(decoded_database_id, database_id);
+                assert_eq!(primary_generation, 9);
+                assert_eq!(wal_format_version, 1);
+                assert_eq!(catalog_version, 2);
+                assert_eq!(segment_format_version, 1);
+            }
+            other => panic!("expected SyncPull, got {other:?}"),
+        }
+
+        let ack = Message::SyncAck {
+            replica_id: "replica-a".into(),
+            applied_lsn: 10,
+            remote_lsn: 10,
+        };
+        match Message::decode(&ack.encode()).unwrap() {
+            Message::SyncAck {
+                replica_id,
+                applied_lsn,
+                remote_lsn,
+            } => {
+                assert_eq!(replica_id, "replica-a");
+                assert_eq!(applied_lsn, 10);
+                assert_eq!(remote_lsn, 10);
+            }
+            other => panic!("expected SyncAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_sync_results() {
+        let status = sample_sync_status();
+        match Message::decode(
+            &Message::SyncStatusResult {
+                status: status.clone(),
+            }
+            .encode(),
+        )
+        .unwrap()
+        {
+            Message::SyncStatusResult { status: decoded } => assert_eq!(decoded, status),
+            other => panic!("expected SyncStatusResult, got {other:?}"),
+        }
+
+        let await_archive_status = WireSyncStatus {
+            servable_lsn: Some(7),
+            unarchived_lsn: Some(3),
+            repair_action: WireSyncRepairAction::AwaitArchive,
+            last_sync_error: Some("primary WAL is not yet archived".into()),
+            ..status.clone()
+        };
+        match Message::decode(
+            &Message::SyncStatusResult {
+                status: await_archive_status.clone(),
+            }
+            .encode(),
+        )
+        .unwrap()
+        {
+            Message::SyncStatusResult { status: decoded } => {
+                assert_eq!(decoded, await_archive_status)
+            }
+            other => panic!("expected AwaitArchive SyncStatusResult, got {other:?}"),
+        }
+
+        let units = vec![
+            WireRetainedUnit {
+                tx_id: 1,
+                record_type: 4,
+                lsn: 8,
+                data: vec![1, 2, 3],
+            },
+            WireRetainedUnit {
+                tx_id: 1,
+                record_type: 4,
+                lsn: 9,
+                data: vec![4, 5],
+            },
+        ];
+        let empty_pull_len = Message::SyncPullResult {
+            status: status.clone(),
+            units: Vec::new(),
+            has_more: true,
+        }
+        .encode()
+        .len();
+        let populated_pull_len = Message::SyncPullResult {
+            status: status.clone(),
+            units: units.clone(),
+            has_more: true,
+        }
+        .encode()
+        .len();
+        let expected_unit_len: u64 = units
+            .iter()
+            .map(WireRetainedUnit::encoded_len)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .sum();
+        assert_eq!(
+            u64::try_from(populated_pull_len - empty_pull_len).unwrap(),
+            expected_unit_len,
+            "retained-unit encoded length must track SyncPullResult wire shape"
+        );
+
+        match Message::decode(
+            &Message::SyncPullResult {
+                status: status.clone(),
+                units: units.clone(),
+                has_more: true,
+            }
+            .encode(),
+        )
+        .unwrap()
+        {
+            Message::SyncPullResult {
+                status: decoded_status,
+                units: decoded_units,
+                has_more,
+            } => {
+                assert_eq!(decoded_status, status);
+                assert_eq!(decoded_units, units);
+                assert!(has_more);
+            }
+            other => panic!("expected SyncPullResult, got {other:?}"),
+        }
+
+        match Message::decode(
+            &Message::SyncAckResult {
+                previous_applied_lsn: 7,
+                applied_lsn: 10,
+                remote_lsn: 10,
+                advanced: true,
+                status: WireSyncStatus {
+                    stale: false,
+                    repair_action: WireSyncRepairAction::None,
+                    lag_lsn: Some(0),
+                    lag_bytes: Some(0),
+                    lag_ms: Some(0),
+                    ..status
+                },
+            }
+            .encode(),
+        )
+        .unwrap()
+        {
+            Message::SyncAckResult {
+                previous_applied_lsn,
+                applied_lsn,
+                remote_lsn,
+                advanced,
+                status,
+            } => {
+                assert_eq!(previous_applied_lsn, 7);
+                assert_eq!(applied_lsn, 10);
+                assert_eq!(remote_lsn, 10);
+                assert!(advanced);
+                assert!(!status.stale);
+            }
+            other => panic!("expected SyncAckResult, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_decode_garbage_never_panics() {
         // Feed a wide range of malformed/truncated byte sequences to the
@@ -689,6 +1331,23 @@ mod tests {
             vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0x00], // unknown message type
             // QUERY with payload_len far exceeding the frame.
             vec![0x03, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
+            // SYNC_PULL with only a replica id and no fixed fields.
+            {
+                let mut payload = encode_string("replica-a");
+                let mut frame = vec![MSG_SYNC_PULL, 0];
+                frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                frame.append(&mut payload);
+                frame
+            },
+            // SYNC_PULL_RESULT with an amplified retained-unit count.
+            {
+                let mut payload = encode_sync_status(&sample_sync_status());
+                payload.extend_from_slice(&((MAX_SYNC_UNITS as u32) + 1).to_le_bytes());
+                let mut frame = vec![MSG_SYNC_PULL_RESULT, 0];
+                frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&payload);
+                frame
+            },
             // CONNECT claiming a string len of 0xFFFFFFFF but no data.
             vec![0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
             // RESULT_ROWS claiming a huge column count with no data.

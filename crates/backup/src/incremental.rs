@@ -1,8 +1,11 @@
-use crate::manifest::{BackupManifest, ChangedFile, IncrementManifest};
-use crate::restore::{
-    ensure_empty_dir, validate_backup_file_name, validate_delta_file_name, verify_and_copy_full,
+use crate::manifest::{
+    current_sync_snapshot_metadata, BackupManifest, ChangedFile, IncrementManifest,
 };
-use powdb_storage::catalog::Catalog;
+use crate::restore::{
+    apply_restore_sync_mode, ensure_empty_dir, validate_backup_file_name, validate_delta_file_name,
+    verify_and_copy_full, RestoreSyncMode,
+};
+use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use powdb_storage::page::{page_lsn, PAGE_SIZE};
 use std::io;
 use std::io::{Seek, SeekFrom, Write};
@@ -17,7 +20,10 @@ fn now_secs() -> u64 {
 }
 
 fn is_durable(name: &str) -> bool {
-    name == "catalog.bin" || name.ends_with(".heap") || name.ends_with(".idx")
+    name == "catalog.bin"
+        || name == CATALOG_LSN_FILE
+        || name.ends_with(".heap")
+        || name.ends_with(".idx")
 }
 
 fn is_paged(name: &str) -> bool {
@@ -33,9 +39,16 @@ pub fn incremental_backup(
     base: &BackupManifest,
     dest: &Path,
 ) -> io::Result<IncrementManifest> {
-    catalog.checkpoint()?;
+    base.validate_version()?;
+    powdb_sync::checkpoint_preserving_retained_segments_if_enabled(catalog)?;
     let source_lsn = catalog.max_lsn();
     let src = catalog.data_dir().to_path_buf();
+    let sync = current_sync_snapshot_metadata(&src, source_lsn)?;
+    if !sync_metadata_builds_on_same_history(base.sync.as_ref(), sync.as_ref()) {
+        return Err(io::Error::other(
+            "sync identity changed between base and incremental backup",
+        ));
+    }
     std::fs::create_dir_all(dest)?;
 
     let mut changed: Vec<ChangedFile> = Vec::new();
@@ -107,6 +120,7 @@ pub fn incremental_backup(
         created_unix_secs: now_secs(),
         base_source_lsn: base.source_lsn,
         source_lsn,
+        sync,
         changed,
     };
     manifest.write(dest)?;
@@ -120,12 +134,29 @@ pub fn incremental_backup(
 ///
 /// Coarse PITR = choosing which prefix of the chain to pass here.
 pub fn restore_chain(full_dir: &Path, increment_dirs: &[&Path], dest: &Path) -> io::Result<()> {
+    restore_chain_with_sync_mode(
+        full_dir,
+        increment_dirs,
+        dest,
+        RestoreSyncMode::StripSyncIdentity,
+    )
+}
+
+/// Rebuild a data dir from a full backup plus an ordered chain of increments
+/// with explicit sync identity semantics.
+pub fn restore_chain_with_sync_mode(
+    full_dir: &Path,
+    increment_dirs: &[&Path],
+    dest: &Path,
+    sync_mode: RestoreSyncMode,
+) -> io::Result<()> {
     ensure_empty_dir(dest)?;
 
     // 1. Lay down the full base.
     let full_manifest = BackupManifest::read(full_dir)?;
     verify_and_copy_full(&full_manifest, full_dir, dest)?;
     let mut running_lsn = full_manifest.source_lsn;
+    let mut running_sync = full_manifest.sync.clone();
 
     // 2. Apply each increment in order.
     for inc_dir in increment_dirs {
@@ -135,6 +166,11 @@ pub fn restore_chain(full_dir: &Path, increment_dirs: &[&Path], dest: &Path) -> 
                 "increment chain broken: expected base lsn {}, increment built on {}",
                 running_lsn, inc.base_source_lsn
             )));
+        }
+        if !sync_metadata_builds_on_same_history(full_manifest.sync.as_ref(), inc.sync.as_ref()) {
+            return Err(io::Error::other(
+                "increment sync identity does not match full backup identity",
+            ));
         }
         for cf in &inc.changed {
             match cf {
@@ -174,12 +210,31 @@ pub fn restore_chain(full_dir: &Path, increment_dirs: &[&Path], dest: &Path) -> 
             }
         }
         running_lsn = inc.source_lsn;
+        running_sync = inc.sync.clone();
     }
+
+    apply_restore_sync_mode(running_sync.as_ref(), dest, sync_mode)?;
 
     // 3. Validate the reconstructed DB opens (LSN invariant).
     let cat = Catalog::open(dest)?;
     drop(cat);
     Ok(())
+}
+
+fn sync_metadata_builds_on_same_history(
+    base: Option<&crate::manifest::SyncSnapshotMetadata>,
+    next: Option<&crate::manifest::SyncSnapshotMetadata>,
+) -> bool {
+    match (base, next) {
+        (None, None) => true,
+        (Some(base), Some(next)) => {
+            base.identity == next.identity
+                && base.wal_format_version == next.wal_format_version
+                && base.catalog_version == next.catalog_version
+                && base.retained_segment_format_version == next.retained_segment_format_version
+        }
+        _ => false,
+    }
 }
 
 /// Open/extend `path` to `total_pages * PAGE_SIZE` bytes, then write each
@@ -192,15 +247,21 @@ fn apply_page_delta(
     delta: &[u8],
 ) -> io::Result<()> {
     let record_len = 4 + PAGE_SIZE;
-    let expected = page_indices.len() * record_len;
+    let expected = page_indices
+        .len()
+        .checked_mul(record_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "delta length overflow"))?;
     if delta.len() != expected {
-        return Err(io::Error::other(format!(
-            "delta for {} has length {} but {} page records expected {}",
-            path.display(),
-            delta.len(),
-            page_indices.len(),
-            expected
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "delta for {} has length {} but {} page records expected {}",
+                path.display(),
+                delta.len(),
+                page_indices.len(),
+                expected
+            ),
+        ));
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -215,8 +276,26 @@ fn apply_page_delta(
     }
 
     let mut off = 0usize;
-    while off < delta.len() {
+    for expected_idx in page_indices {
+        if *expected_idx >= total_pages {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "increment manifest page index {expected_idx} is outside {total_pages} pages for {}",
+                    path.display()
+                ),
+            ));
+        }
         let idx = u32::from_le_bytes([delta[off], delta[off + 1], delta[off + 2], delta[off + 3]]);
+        if idx != *expected_idx {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "delta page index {idx} does not match manifest page index {expected_idx} for {}",
+                    path.display()
+                ),
+            ));
+        }
         let page = &delta[off + 4..off + 4 + PAGE_SIZE];
         file.seek(SeekFrom::Start(idx as u64 * PAGE_SIZE as u64))?;
         file.write_all(page)?;

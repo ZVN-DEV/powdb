@@ -21,8 +21,13 @@ import { EventEmitter } from "node:events";
 import {
   encode,
   tryDecode,
+  MAX_SYNC_PULL_BYTES,
+  MAX_SYNC_PULL_UNITS,
   type Message,
+  type SyncRepairAction,
+  type WireRetainedUnit,
   type WireParam,
+  type WireSyncStatus,
 } from "./protocol.js";
 import { PowDBError } from "./errors.js";
 import {
@@ -32,7 +37,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.7.2";
+export const CLIENT_VERSION = "0.8.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -49,6 +54,47 @@ export type QueryResult =
  * binds as an int; `null` binds PowQL `null`.
  */
 export type QueryParam = string | number | bigint | boolean | null;
+
+/** Unsigned 64-bit sync protocol value. Numbers must be safe non-negative integers. */
+export type SyncU64 = bigint | number;
+
+/**
+ * Database identity carried by the sync protocol. Strings are the 32-hex-char
+ * form stored in `.powdb-sync/identity.json`; byte arrays must be exactly 16B.
+ */
+export type SyncDatabaseId = string | Uint8Array;
+
+export interface SyncPullRequest {
+  replicaId: string;
+  sinceLsn: SyncU64;
+  maxUnits: number;
+  maxBytes: SyncU64;
+  databaseId: SyncDatabaseId;
+  primaryGeneration: SyncU64;
+  walFormatVersion: number;
+  catalogVersion: number;
+  segmentFormatVersion: number;
+}
+
+export interface SyncAckRequest {
+  replicaId: string;
+  appliedLsn: SyncU64;
+  remoteLsn: SyncU64;
+}
+
+export interface SyncPullResult {
+  status: WireSyncStatus;
+  units: WireRetainedUnit[];
+  hasMore: boolean;
+}
+
+export interface SyncAckResult {
+  previousAppliedLsn: bigint;
+  appliedLsn: bigint;
+  remoteLsn: bigint;
+  advanced: boolean;
+  status: WireSyncStatus;
+}
 
 function socketChunkToBuffer(chunk: Buffer | string): Buffer {
   return typeof chunk === "string" ? Buffer.from(chunk) : chunk;
@@ -74,6 +120,74 @@ function toWireParam(p: QueryParam): WireParam {
         "protocol_error",
       );
   }
+}
+
+function toU64(value: SyncU64, label: string): bigint {
+  if (typeof value === "bigint") {
+    if (value < 0n || value > 0xffff_ffff_ffff_ffffn) {
+      throw new PowDBError(`${label} must fit in u64`, "protocol_error");
+    }
+    return value;
+  }
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new PowDBError(
+      `${label} must be a safe non-negative integer or bigint`,
+      "protocol_error",
+    );
+  }
+  return BigInt(value);
+}
+
+function toU16(value: number, label: string): number {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
+    throw new PowDBError(`${label} must fit in u16`, "protocol_error");
+  }
+  return value;
+}
+
+function toSyncMaxUnits(value: number): number {
+  if (
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > MAX_SYNC_PULL_UNITS
+  ) {
+    throw new PowDBError(
+      `maxUnits must be between 1 and ${MAX_SYNC_PULL_UNITS}`,
+      "protocol_error",
+    );
+  }
+  return value;
+}
+
+function toSyncMaxBytes(value: SyncU64): bigint {
+  const bytes = toU64(value, "maxBytes");
+  if (bytes < 1n || bytes > BigInt(MAX_SYNC_PULL_BYTES)) {
+    throw new PowDBError(
+      `maxBytes must be between 1 and ${MAX_SYNC_PULL_BYTES}`,
+      "protocol_error",
+    );
+  }
+  return bytes;
+}
+
+function toDatabaseId(value: SyncDatabaseId): Buffer {
+  if (typeof value === "string") {
+    if (!/^[0-9a-fA-F]{32}$/.test(value)) {
+      throw new PowDBError(
+        "databaseId string must be exactly 32 hex characters",
+        "protocol_error",
+      );
+    }
+    return Buffer.from(value, "hex");
+  }
+  const bytes = Buffer.from(value);
+  if (bytes.length !== 16) {
+    throw new PowDBError(
+      `databaseId must be exactly 16 bytes, got ${bytes.length}`,
+      "protocol_error",
+    );
+  }
+  return bytes;
 }
 
 export interface ClientOptions {
@@ -155,6 +269,20 @@ export interface ClientEvents {
       durationMs: number;
       ok: boolean;
       kind?: "rows" | "scalar" | "ok" | "message";
+      error?: Error;
+    },
+  ];
+  sync: [
+    {
+      operation: "status" | "pull" | "ack";
+      replicaId: string;
+      durationMs: number;
+      ok: boolean;
+      status?: WireSyncStatus;
+      stale?: boolean;
+      repairAction?: SyncRepairAction;
+      units?: number;
+      advanced?: boolean;
       error?: Error;
     },
   ];
@@ -395,6 +523,187 @@ export class Client extends EventEmitter<ClientEvents> {
     } catch (err) {
       this.emit("query", {
         query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Fetch primary-side sync status for one embedded replica cursor.
+   *
+   * This speaks the private authenticated sync frame added for the embedded
+   * replica product. Servers without sync support return a protocol/query
+   * error; unauthenticated or readonly users are rejected server-side.
+   */
+  async syncStatus(
+    replicaId: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WireSyncStatus> {
+    const start = Date.now();
+    try {
+      const reply = await this.send({ type: "SyncStatus", replicaId }, opts);
+      if (reply.type === "Error") {
+        throw new PowDBError(
+          `sync status failed: ${reply.message}`,
+          "query_failed",
+        );
+      }
+      if (reply.type !== "SyncStatusResult") {
+        throw new PowDBError(
+          `unexpected reply: ${reply.type}`,
+          "protocol_error",
+        );
+      }
+      this.emit("sync", {
+        operation: "status",
+        replicaId,
+        durationMs: Date.now() - start,
+        ok: true,
+        status: reply.status,
+        stale: reply.status.stale,
+        repairAction: reply.status.repairAction,
+      });
+      return reply.status;
+    } catch (err) {
+      this.emit("sync", {
+        operation: "status",
+        replicaId,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Pull a bounded retained-unit chunk after this replica's primary-side cursor.
+   *
+   * The caller supplies the database identity and format versions from the
+   * sync bootstrap metadata. The server rejects mismatches and non-applyable
+   * transaction cuts instead of returning ambiguous history.
+   */
+  async syncPull(
+    request: SyncPullRequest,
+    opts?: { signal?: AbortSignal },
+  ): Promise<SyncPullResult> {
+    const start = Date.now();
+    try {
+      const reply = await this.send(
+        {
+          type: "SyncPull",
+          replicaId: request.replicaId,
+          sinceLsn: toU64(request.sinceLsn, "sinceLsn"),
+          maxUnits: toSyncMaxUnits(request.maxUnits),
+          maxBytes: toSyncMaxBytes(request.maxBytes),
+          databaseId: toDatabaseId(request.databaseId),
+          primaryGeneration: toU64(
+            request.primaryGeneration,
+            "primaryGeneration",
+          ),
+          walFormatVersion: toU16(
+            request.walFormatVersion,
+            "walFormatVersion",
+          ),
+          catalogVersion: toU16(request.catalogVersion, "catalogVersion"),
+          segmentFormatVersion: toU16(
+            request.segmentFormatVersion,
+            "segmentFormatVersion",
+          ),
+        },
+        opts,
+      );
+      if (reply.type === "Error") {
+        throw new PowDBError(
+          `sync pull failed: ${reply.message}`,
+          "query_failed",
+        );
+      }
+      if (reply.type !== "SyncPullResult") {
+        throw new PowDBError(
+          `unexpected reply: ${reply.type}`,
+          "protocol_error",
+        );
+      }
+      this.emit("sync", {
+        operation: "pull",
+        replicaId: request.replicaId,
+        durationMs: Date.now() - start,
+        ok: true,
+        status: reply.status,
+        stale: reply.status.stale,
+        repairAction: reply.status.repairAction,
+        units: reply.units.length,
+      });
+      return {
+        status: reply.status,
+        units: reply.units,
+        hasMore: reply.hasMore,
+      };
+    } catch (err) {
+      this.emit("sync", {
+        operation: "pull",
+        replicaId: request.replicaId,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /** Acknowledge that the replica applied retained history through `appliedLsn`. */
+  async syncAck(
+    request: SyncAckRequest,
+    opts?: { signal?: AbortSignal },
+  ): Promise<SyncAckResult> {
+    const start = Date.now();
+    try {
+      const reply = await this.send(
+        {
+          type: "SyncAck",
+          replicaId: request.replicaId,
+          appliedLsn: toU64(request.appliedLsn, "appliedLsn"),
+          remoteLsn: toU64(request.remoteLsn, "remoteLsn"),
+        },
+        opts,
+      );
+      if (reply.type === "Error") {
+        throw new PowDBError(
+          `sync ack failed: ${reply.message}`,
+          "query_failed",
+        );
+      }
+      if (reply.type !== "SyncAckResult") {
+        throw new PowDBError(
+          `unexpected reply: ${reply.type}`,
+          "protocol_error",
+        );
+      }
+      this.emit("sync", {
+        operation: "ack",
+        replicaId: request.replicaId,
+        durationMs: Date.now() - start,
+        ok: true,
+        status: reply.status,
+        stale: reply.status.stale,
+        repairAction: reply.status.repairAction,
+        advanced: reply.advanced,
+      });
+      return {
+        previousAppliedLsn: reply.previousAppliedLsn,
+        appliedLsn: reply.appliedLsn,
+        remoteLsn: reply.remoteLsn,
+        advanced: reply.advanced,
+        status: reply.status,
+      };
+    } catch (err) {
+      this.emit("sync", {
+        operation: "ack",
+        replicaId: request.replicaId,
         durationMs: Date.now() - start,
         ok: false,
         error: err as Error,
@@ -776,12 +1085,21 @@ function openSocket(
 }
 
 export { encode, tryDecode } from "./protocol.js";
-export type { Message, WireParam } from "./protocol.js";
+export type {
+  Message,
+  SyncRepairAction,
+  WireParam,
+  WireRetainedUnit,
+  WireSyncStatus,
+} from "./protocol.js";
 export {
   MAX_PAYLOAD_SIZE,
   MAX_ROWS,
   MAX_COLUMNS,
   MAX_PARAMS,
+  MAX_SYNC_UNITS,
+  MAX_SYNC_PULL_UNITS,
+  MAX_SYNC_PULL_BYTES,
 } from "./protocol.js";
 
 export {

@@ -196,6 +196,54 @@ fn test_rollback_discards_multi_page_dirty_inserts() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn checkpoint_refuses_active_transaction_and_drop_does_not_persist_it() {
+    let dir = temp_dir("checkpoint_active_tx");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(user_schema()).unwrap();
+        cat.checkpoint().unwrap();
+        cat.begin_transaction().unwrap();
+
+        let payload = "x".repeat(900);
+        for i in 0..40i64 {
+            cat.insert(
+                "users",
+                &vec![Value::Int(i), Value::Str(format!("{payload}_{i}"))],
+            )
+            .unwrap();
+        }
+        cat.sync_wal().unwrap();
+
+        let err = cat.checkpoint().unwrap_err();
+        assert!(
+            err.to_string().contains("transaction is active"),
+            "checkpoint must fail closed during an active transaction, got: {err}"
+        );
+        assert_eq!(
+            cat.scan("users").unwrap().count(),
+            40,
+            "uncommitted rows remain visible inside the active transaction"
+        );
+        // Drop runs while the transaction is still active. It must discard
+        // dirty heap state and leave WAL recovery to ignore the uncommitted tx,
+        // not checkpoint the rows into the durable heap.
+    }
+
+    {
+        let cat = Catalog::open(&dir).unwrap();
+        assert_eq!(
+            cat.scan("users").unwrap().count(),
+            0,
+            "active transaction rows must not persist after checkpoint refusal and drop"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Delete recovery: insert some rows cleanly, then delete a few, crash.
 /// Replay should reapply the deletes on the freshly-opened heap. This is
 /// an explicit check that deletes are idempotent on replay — a "double

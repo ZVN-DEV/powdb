@@ -94,6 +94,37 @@ fn incremental_only_stores_changed_pages() {
 }
 
 #[test]
+fn incremental_backup_refuses_active_transaction_without_persisting_uncommitted_rows() {
+    let src = tmp("active_tx_src");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let base_dir = tmp("active_tx_base");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+
+    cat.begin_transaction().unwrap();
+    cat.insert("T", &vec![Value::Int(2)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let inc_dir = tmp("active_tx_inc");
+    let err = powdb_backup::incremental_backup(&mut cat, &base, &inc_dir).unwrap_err();
+    assert!(
+        err.to_string().contains("transaction is active"),
+        "incremental backup must fail closed during an active transaction, got: {err}"
+    );
+    drop(cat);
+
+    let cat = Catalog::open(&src).unwrap();
+    assert_eq!(
+        cat.scan("T").unwrap().count(),
+        1,
+        "failed incremental backup must not persist active transaction rows"
+    );
+}
+
+#[test]
 fn restore_chain_reproduces_full_state() {
     let src = tmp("src");
     let mut cat = Catalog::create(&src).unwrap();
@@ -183,6 +214,7 @@ fn restore_chain_rejects_broken_chain() {
         format_version: powdb_backup::BackupManifest::FORMAT_VERSION,
         created_unix_secs: 0,
         source_lsn: inc_a.source_lsn,
+        sync: inc_a.sync.clone(),
         files: base.files.clone(),
     };
     let inc_b_dir = tmp("incB");
@@ -198,6 +230,168 @@ fn restore_chain_rejects_broken_chain() {
         msg.contains("chain") && msg.contains("broken"),
         "broken chain must be rejected, got: {err}"
     );
+}
+
+#[test]
+fn incremental_backup_and_restore_chain_reject_sync_identity_mismatch() {
+    let src = tmp("syncsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..20 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+    powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let base_dir = tmp("syncbase");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+    let original_identity = base
+        .sync
+        .clone()
+        .expect("base backup should record sync metadata");
+
+    for i in 20..30 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let mut mismatched_base = base.clone();
+    let mut mismatched_sync = original_identity.clone();
+    mismatched_sync.identity.primary_generation += 1;
+    mismatched_base.sync = Some(mismatched_sync);
+
+    let inc_dir = tmp("badinc");
+    let err = powdb_backup::incremental_backup(&mut cat, &mismatched_base, &inc_dir).unwrap_err();
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("sync identity changed"),
+        "incremental backup must reject changed sync identity, got: {err}"
+    );
+
+    let good_inc_dir = tmp("goodinc");
+    let mut good_inc = powdb_backup::incremental_backup(&mut cat, &base, &good_inc_dir).unwrap();
+    let mut wrong_increment_sync = good_inc.sync.clone().expect("increment sync metadata");
+    wrong_increment_sync.identity.primary_generation += 1;
+    good_inc.sync = Some(wrong_increment_sync);
+    good_inc.write(&good_inc_dir).unwrap();
+    drop(cat);
+
+    let restored = tmp("badrestore");
+    let err = powdb_backup::restore_chain(&base_dir, &[&good_inc_dir], &restored).unwrap_err();
+    assert!(
+        format!("{err}")
+            .to_lowercase()
+            .contains("sync identity does not match"),
+        "restore_chain must reject mismatched increment identity, got: {err}"
+    );
+}
+
+#[test]
+fn restore_chain_rejects_stale_sync_catalog_hash() {
+    let src = tmp("synccathashsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..20 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+    powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let base_dir = tmp("synccathashbase");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+
+    for i in 20..30 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let inc_dir = tmp("synccathashinc");
+    let mut inc = powdb_backup::incremental_backup(&mut cat, &base, &inc_dir).unwrap();
+    drop(cat);
+    inc.sync.as_mut().expect("sync metadata").catalog_blake3_hex =
+        "not-the-final-catalog-hash".into();
+    inc.write(&inc_dir).unwrap();
+
+    let restored = tmp("synccathashrestored");
+    let err = powdb_backup::restore_chain(&base_dir, &[&inc_dir], &restored).unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("catalog hash"),
+        "restore_chain must reject stale sync catalog hash, got: {err}"
+    );
+}
+
+#[test]
+fn restore_chain_strips_sync_identity_by_default_and_explicit_modes_preserve_or_fork() {
+    let src = tmp("syncforksrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..20 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+    let source_identity = powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let base_dir = tmp("syncforkbase");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+
+    for i in 20..30 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let inc_dir = tmp("syncforkinc");
+    powdb_backup::incremental_backup(&mut cat, &base, &inc_dir).unwrap();
+    drop(cat);
+
+    let plain = tmp("syncforkplain");
+    powdb_backup::restore_chain(&base_dir, &[&inc_dir], &plain).unwrap();
+    let err = powdb_sync::read_identity(&plain).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    let mut plain_cat = Catalog::open(&plain).unwrap();
+    assert_eq!(plain_cat.scan("T").unwrap().count(), 30);
+    plain_cat.insert("T", &vec![Value::Int(30)]).unwrap();
+    plain_cat.sync_wal().unwrap();
+    drop(plain_cat);
+    let plain_reopened = Catalog::open(&plain).unwrap();
+    assert_eq!(plain_reopened.scan("T").unwrap().count(), 31);
+    drop(plain_reopened);
+
+    let preserved = tmp("syncforkpreserved");
+    powdb_backup::restore_chain_with_sync_mode(
+        &base_dir,
+        &[&inc_dir],
+        &preserved,
+        powdb_backup::RestoreSyncMode::PreserveSyncIdentity,
+    )
+    .unwrap();
+    assert_eq!(
+        powdb_sync::read_identity(&preserved).unwrap(),
+        source_identity
+    );
+    let preserved_cat = Catalog::open(&preserved).unwrap();
+    assert_eq!(preserved_cat.scan("T").unwrap().count(), 30);
+
+    let forked = tmp("syncforkrestored");
+    powdb_backup::restore_chain_with_sync_mode(
+        &base_dir,
+        &[&inc_dir],
+        &forked,
+        powdb_backup::RestoreSyncMode::ForkWithNewSyncIdentity,
+    )
+    .unwrap();
+
+    let forked_identity = powdb_sync::read_identity(&forked).unwrap();
+    assert_ne!(
+        forked_identity, source_identity,
+        "forked chain restores must not reuse the source sync identity"
+    );
+    assert_eq!(
+        forked_identity.primary_generation, 1,
+        "forked chain restores start a fresh primary generation"
+    );
+    let forked_cat = Catalog::open(&forked).unwrap();
+    assert_eq!(forked_cat.scan("T").unwrap().count(), 30);
 }
 
 #[test]
@@ -321,5 +515,69 @@ fn restore_chain_rejects_increment_path_traversal_name() {
     assert!(
         msg.contains("invalid") && msg.contains("manifest"),
         "path traversal increment name must be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn restore_chain_rejects_delta_page_index_mismatch() {
+    let src = tmp("src_delta_idx");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    for i in 0..5000 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let base_dir = tmp("base_delta_idx");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+    for i in 5000..5010 {
+        cat.insert("T", &vec![Value::Int(i)]).unwrap();
+    }
+    cat.sync_wal().unwrap();
+
+    let inc_dir = tmp("inc_delta_idx");
+    let mut inc = powdb_backup::incremental_backup(&mut cat, &base, &inc_dir).unwrap();
+    drop(cat);
+
+    let mut patched = false;
+    for changed in &mut inc.changed {
+        let ChangedFile::Pages {
+            total_pages,
+            page_indices,
+            delta_file,
+            delta_blake3_hex,
+            ..
+        } = changed
+        else {
+            continue;
+        };
+        let expected = *page_indices
+            .first()
+            .expect("paged increment should record at least one page");
+        let replacement = if expected + 1 < *total_pages {
+            expected + 1
+        } else {
+            expected.saturating_sub(1)
+        };
+        if replacement == expected {
+            continue;
+        }
+        let delta_path = inc_dir.join(delta_file);
+        let mut delta = std::fs::read(&delta_path).unwrap();
+        delta[0..4].copy_from_slice(&replacement.to_le_bytes());
+        std::fs::write(&delta_path, &delta).unwrap();
+        *delta_blake3_hex = blake3::hash(&delta).to_hex().to_string();
+        patched = true;
+        break;
+    }
+    assert!(patched, "test must patch a paged delta record");
+    inc.write(&inc_dir).unwrap();
+
+    let restored = tmp("restored_delta_idx");
+    let err = powdb_backup::restore_chain(&base_dir, &[&inc_dir], &restored).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match manifest page index"),
+        "embedded page index mismatch must be rejected, got: {err}"
     );
 }

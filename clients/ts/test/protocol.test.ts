@@ -17,6 +17,9 @@ import {
   MAX_PAYLOAD_SIZE,
   MAX_COLUMNS,
   MAX_ROWS,
+  MAX_SYNC_UNITS,
+  type Message,
+  type WireSyncStatus,
 } from "../src/protocol.js";
 import { Client } from "../src/index.js";
 
@@ -46,6 +49,39 @@ function buildFrame(msgType: number, payloadLen: number): Buffer {
   header.writeUInt8(0, 1);
   header.writeUInt32LE(payloadLen, 2);
   return header;
+}
+
+function sampleSyncStatus(overrides: Partial<WireSyncStatus> = {}): WireSyncStatus {
+  return {
+    replicaId: "replica-a",
+    active: true,
+    lastAppliedLsn: 7n,
+    remoteLsn: 10n,
+    servableLsn: 10n,
+    unarchivedLsn: 0n,
+    lagLsn: 3n,
+    lagBytes: 2048n,
+    lagMs: 5000n,
+    stale: true,
+    repairAction: "pull",
+    lastSyncError: null,
+    ...overrides,
+  };
+}
+
+function collectFrames(
+  scratch: Buffer,
+  chunk: Buffer,
+): { messages: Message[]; rest: Buffer } {
+  let buf = Buffer.concat([scratch, chunk]);
+  const messages: Message[] = [];
+  while (true) {
+    const decoded = tryDecode(buf);
+    if (decoded === null) break;
+    messages.push(decoded.msg);
+    buf = buf.subarray(decoded.consumed);
+  }
+  return { messages, rest: buf };
 }
 
 async function main() {
@@ -88,6 +124,31 @@ async function main() {
     frame.writeUInt32LE(payload.length, 2);
     payload.copy(frame, 6);
     assert.throws(() => tryDecode(frame), /too many rows/);
+  });
+
+  await test("tryDecode rejects nonzero rows with zero columns before allocation", () => {
+    const payload = Buffer.alloc(2 + 4);
+    payload.writeUInt16LE(0, 0);
+    payload.writeUInt32LE(MAX_ROWS, 2);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x07, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /zero columns/);
+  });
+
+  await test("tryDecode rejects impossible row shape before allocation", () => {
+    const payload = Buffer.alloc(2 + 4 + 4);
+    payload.writeUInt16LE(1, 0);
+    payload.writeUInt32LE(0, 2); // empty column name
+    payload.writeUInt32LE(MAX_ROWS, 6);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x07, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /row data too short/);
   });
 
   await test("tryDecode throws intentional error on truncated ResultRows column count", () => {
@@ -250,6 +311,320 @@ async function main() {
     frame.writeUInt32LE(payload.length, 2);
     payload.copy(frame, 6);
     assert.throws(() => tryDecode(frame), /unknown param tag/);
+  });
+
+  console.log("\nEmbedded sync frames — request/result round-trip");
+
+  await test("encode/decode SyncStatus request", () => {
+    const buf = encode({ type: "SyncStatus", replicaId: "replica-a" });
+    assert.equal(buf.readUInt8(0), 0x20);
+    const decoded = tryDecode(buf);
+    assert.ok(decoded, "frame should decode");
+    assert.deepStrictEqual(decoded.msg, {
+      type: "SyncStatus",
+      replicaId: "replica-a",
+    });
+  });
+
+  await test("encode/decode SyncPull request", () => {
+    const databaseId = Buffer.from("sync-protocol!!!");
+    const buf = encode({
+      type: "SyncPull",
+      replicaId: "replica-a",
+      sinceLsn: 7n,
+      maxUnits: 128,
+      maxBytes: 4096n,
+      databaseId,
+      primaryGeneration: 9n,
+      walFormatVersion: 1,
+      catalogVersion: 2,
+      segmentFormatVersion: 1,
+    });
+    assert.equal(buf.readUInt8(0), 0x21);
+    const decoded = tryDecode(buf);
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "SyncPull");
+    if (decoded.msg.type === "SyncPull") {
+      assert.equal(decoded.msg.replicaId, "replica-a");
+      assert.equal(decoded.msg.sinceLsn, 7n);
+      assert.equal(decoded.msg.maxUnits, 128);
+      assert.equal(decoded.msg.maxBytes, 4096n);
+      assert.deepStrictEqual(decoded.msg.databaseId, databaseId);
+      assert.equal(decoded.msg.primaryGeneration, 9n);
+      assert.equal(decoded.msg.walFormatVersion, 1);
+      assert.equal(decoded.msg.catalogVersion, 2);
+      assert.equal(decoded.msg.segmentFormatVersion, 1);
+    }
+  });
+
+  await test("encode/decode SyncAck request", () => {
+    const buf = encode({
+      type: "SyncAck",
+      replicaId: "replica-a",
+      appliedLsn: 10n,
+      remoteLsn: 11n,
+    });
+    assert.equal(buf.readUInt8(0), 0x22);
+    const decoded = tryDecode(buf);
+    assert.ok(decoded, "frame should decode");
+    assert.deepStrictEqual(decoded.msg, {
+      type: "SyncAck",
+      replicaId: "replica-a",
+      appliedLsn: 10n,
+      remoteLsn: 11n,
+    });
+  });
+
+  await test("encode/decode SyncStatusResult preserves lag and repair action", () => {
+    const status = sampleSyncStatus({
+      repairAction: "awaitArchive",
+      lastSyncError: "primary WAL is not yet archived",
+    });
+    const decoded = tryDecode(encode({ type: "SyncStatusResult", status }));
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "SyncStatusResult");
+    if (decoded.msg.type === "SyncStatusResult") {
+      assert.deepStrictEqual(decoded.msg.status, status);
+    }
+  });
+
+  await test("encode/decode SyncPullResult preserves retained units and hasMore", () => {
+    const units = [
+      { txId: 1n, recordType: 4, lsn: 8n, data: Buffer.from([1, 2, 3]) },
+      { txId: 1n, recordType: 4, lsn: 9n, data: Buffer.from([4, 5]) },
+    ];
+    const decoded = tryDecode(
+      encode({
+        type: "SyncPullResult",
+        status: sampleSyncStatus(),
+        units,
+        hasMore: true,
+      }),
+    );
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "SyncPullResult");
+    if (decoded.msg.type === "SyncPullResult") {
+      assert.deepStrictEqual(decoded.msg.units, units);
+      assert.equal(decoded.msg.hasMore, true);
+      assert.equal(decoded.msg.status.repairAction, "pull");
+    }
+  });
+
+  await test("encode rejects retained units with recordType outside u8", () => {
+    assert.throws(
+      () =>
+        encode({
+          type: "SyncPullResult",
+          status: sampleSyncStatus(),
+          units: [
+            {
+              txId: 1n,
+              recordType: 256,
+              lsn: 8n,
+              data: Buffer.from([1]),
+            },
+          ],
+          hasMore: false,
+        }),
+      /record type must fit in u8/,
+    );
+  });
+
+  await test("encode/decode SyncAckResult preserves acknowledgement summary", () => {
+    const decoded = tryDecode(
+      encode({
+        type: "SyncAckResult",
+        previousAppliedLsn: 7n,
+        appliedLsn: 10n,
+        remoteLsn: 10n,
+        advanced: true,
+        status: sampleSyncStatus({
+          stale: false,
+          repairAction: "none",
+          lagLsn: 0n,
+          lagBytes: 0n,
+          lagMs: 0n,
+        }),
+      }),
+    );
+    assert.ok(decoded, "frame should decode");
+    assert.equal(decoded.msg.type, "SyncAckResult");
+    if (decoded.msg.type === "SyncAckResult") {
+      assert.equal(decoded.msg.previousAppliedLsn, 7n);
+      assert.equal(decoded.msg.appliedLsn, 10n);
+      assert.equal(decoded.msg.remoteLsn, 10n);
+      assert.equal(decoded.msg.advanced, true);
+      assert.equal(decoded.msg.status.stale, false);
+    }
+  });
+
+  await test("decode rejects an unknown sync repair action", () => {
+    const frame = encode({
+      type: "SyncStatusResult",
+      status: sampleSyncStatus({ repairAction: "pull" }),
+    });
+    const decoded = tryDecode(frame);
+    assert.ok(decoded, "sanity: frame should decode before mutation");
+    const mutated = Buffer.from(frame);
+    // Payload layout mirrors crates/server/src/protocol.rs:
+    // replica string, active, lastApplied option, remoteLsn, five more u64
+    // options, stale, repairAction, lastSyncError option.
+    const repairActionOffset =
+      6 + 4 + Buffer.byteLength("replica-a") + 1 + 9 + 8 + 9 * 5 + 1;
+    mutated[repairActionOffset] = 0x63;
+    assert.throws(() => tryDecode(mutated), /unknown sync repair action/);
+  });
+
+  await test("decode rejects too many retained units", () => {
+    const statusFrame = encode({
+      type: "SyncStatusResult",
+      status: sampleSyncStatus(),
+    });
+    const statusPayload = statusFrame.subarray(6);
+    const count = Buffer.alloc(4);
+    count.writeUInt32LE(MAX_SYNC_UNITS + 1, 0);
+    const payload = Buffer.concat([statusPayload, count, Buffer.from([0])]);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(0x24, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /too many retained units/);
+  });
+
+  console.log("\nEmbedded sync client helpers — mock server");
+
+  await test("Client syncStatus/syncPull/syncAck send and decode sync frames", async () => {
+    const seen: Message[] = [];
+    const syncEvents: unknown[] = [];
+    const connected = new Promise<{ port: number; server: net.Server }>(
+      (resolveConn) => {
+        const server = net.createServer((sock) => {
+          let scratch = Buffer.alloc(0);
+          sock.on("data", (chunk) => {
+            const collected = collectFrames(scratch, Buffer.from(chunk));
+            scratch = collected.rest;
+            for (const msg of collected.messages) {
+              if (msg.type === "Connect") {
+                sock.write(encode({ type: "ConnectOk", version: "0.7.2" }));
+                continue;
+              }
+              seen.push(msg);
+              if (msg.type === "SyncStatus") {
+                sock.write(
+                  encode({
+                    type: "SyncStatusResult",
+                    status: sampleSyncStatus(),
+                  }),
+                );
+              } else if (msg.type === "SyncPull") {
+                sock.write(
+                  encode({
+                    type: "SyncPullResult",
+                    status: sampleSyncStatus(),
+                    units: [
+                      {
+                        txId: 1n,
+                        recordType: 4,
+                        lsn: 8n,
+                        data: Buffer.from([8]),
+                      },
+                    ],
+                    hasMore: false,
+                  }),
+                );
+              } else if (msg.type === "SyncAck") {
+                sock.write(
+                  encode({
+                    type: "SyncAckResult",
+                    previousAppliedLsn: 7n,
+                    appliedLsn: 8n,
+                    remoteLsn: 10n,
+                    advanced: true,
+                    status: sampleSyncStatus({ lastAppliedLsn: 8n }),
+                  }),
+                );
+              } else if (msg.type === "Disconnect") {
+                sock.end();
+              }
+            }
+          });
+        });
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          if (!addr || typeof addr === "string") {
+            throw new Error("unexpected server address");
+          }
+          resolveConn({ port: addr.port, server });
+        });
+      },
+    );
+    const { port, server } = await connected;
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+    client.on("sync", (event) => syncEvents.push(event));
+
+    const status = await client.syncStatus("replica-a");
+    assert.equal(status.repairAction, "pull");
+
+    const pull = await client.syncPull({
+      replicaId: "replica-a",
+      sinceLsn: 7n,
+      maxUnits: 128,
+      maxBytes: 4096n,
+      databaseId: "73796e632d70726f746f636f6c212121",
+      primaryGeneration: 9n,
+      walFormatVersion: 1,
+      catalogVersion: 2,
+      segmentFormatVersion: 1,
+    });
+    assert.equal(pull.units.length, 1);
+    assert.equal(pull.hasMore, false);
+
+    const ack = await client.syncAck({
+      replicaId: "replica-a",
+      appliedLsn: 8n,
+      remoteLsn: 10n,
+    });
+    assert.equal(ack.advanced, true);
+
+    assert.deepStrictEqual(
+      seen.map((msg) => msg.type),
+      ["SyncStatus", "SyncPull", "SyncAck"],
+    );
+    assert.equal(syncEvents.length, 3);
+    assert.equal((syncEvents[1] as { units?: number }).units, 1);
+    assert.equal(
+      (syncEvents[1] as { status?: { remoteLsn?: bigint } }).status?.remoteLsn,
+      10n,
+    );
+
+    await assert.rejects(
+      () =>
+        client.syncPull({
+          replicaId: "replica-a",
+          sinceLsn: 8n,
+          maxUnits: 0,
+          maxBytes: 4096n,
+          databaseId: "73796e632d70726f746f636f6c212121",
+          primaryGeneration: 9n,
+          walFormatVersion: 1,
+          catalogVersion: 2,
+          segmentFormatVersion: 1,
+        }),
+      /maxUnits must be between 1 and 4096/,
+    );
+    assert.deepStrictEqual(
+      seen.map((msg) => msg.type),
+      ["SyncStatus", "SyncPull", "SyncAck"],
+      "local maxUnits validation must not write an invalid SyncPull frame",
+    );
+
+    await client.close();
+    await new Promise<void>((r) => server.close(() => r()));
   });
 
   console.log("\nCancellation — abort during in-flight query");

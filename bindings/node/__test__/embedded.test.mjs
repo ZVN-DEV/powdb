@@ -3,7 +3,7 @@
 // QueryResult union. No server, no socket.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -14,6 +14,36 @@ const { Database } = require("../index.js");
 
 function freshDir() {
   return mkdtempSync(join(tmpdir(), "powdb-embedded-test-"));
+}
+
+function seedApplyBoundary(dir, databaseId, generation = 1, lsn = 0) {
+  const syncDir = join(dir, ".powdb-sync");
+  mkdirSync(syncDir, { recursive: true });
+  writeFileSync(
+    join(syncDir, "identity.json"),
+    JSON.stringify({
+      format_version: 1,
+      database_id: databaseId,
+      primary_generation: generation,
+      created_unix_secs: 1,
+    }),
+  );
+  writeFileSync(
+    join(syncDir, "apply-state.json"),
+    JSON.stringify({
+      format_version: 1,
+      database_id: databaseId.match(/../g).map((byte) => Number.parseInt(byte, 16)),
+      primary_generation: generation,
+      wal_format_version: 1,
+      catalog_version: 5,
+      from_lsn: lsn,
+      through_lsn: lsn,
+      applied_lsn: lsn,
+      status: "complete",
+      started_unix_secs: 1,
+      updated_unix_secs: 1,
+    }),
+  );
 }
 
 test("open, write, read in-process", () => {
@@ -59,6 +89,96 @@ test("SQL frontend works in-process", () => {
     const r = db.querySql("SELECT name FROM User");
     assert.equal(r.kind, "rows");
     assert.equal(r.rows.length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("applyRetainedUnits exposes the native embedded sync adapter", () => {
+  const dir = freshDir();
+  try {
+    const databaseId = "07070707070707070707070707070707";
+    seedApplyBoundary(dir, databaseId);
+    const db = Database.open(dir);
+    const result = db.applyRetainedUnits({
+      sinceLsn: 0n,
+      databaseId,
+      primaryGeneration: 1n,
+      walFormatVersion: 1,
+      catalogVersion: 5,
+      segmentFormatVersion: 1,
+      units: [],
+    });
+    assert.deepEqual(result, { throughLsn: 0n, unitsApplied: 0 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("applyRetainedUnits accepts byte database identity", () => {
+  const dir = freshDir();
+  try {
+    const databaseId = "09090909090909090909090909090909";
+    seedApplyBoundary(dir, databaseId);
+    const db = Database.open(dir);
+    const result = db.applyRetainedUnits({
+      sinceLsn: 0n,
+      databaseId: Uint8Array.from(databaseId.match(/../g).map((byte) => Number.parseInt(byte, 16))),
+      primaryGeneration: 1n,
+      walFormatVersion: 1,
+      catalogVersion: 5,
+      segmentFormatVersion: 1,
+      units: [],
+    });
+    assert.deepEqual(result, { throughLsn: 0n, unitsApplied: 0 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("applyRetainedUnits applies a non-empty retained unit through native addon", () => {
+  const dir = freshDir();
+  try {
+    const databaseId = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+    seedApplyBoundary(dir, databaseId);
+    const db = Database.open(dir);
+    const result = db.applyRetainedUnits({
+      sinceLsn: 0n,
+      databaseId,
+      primaryGeneration: 1n,
+      walFormatVersion: 1,
+      catalogVersion: 5,
+      segmentFormatVersion: 1,
+      units: [
+        {
+          txId: 0n,
+          recordType: 4,
+          lsn: 1n,
+          data: new Uint8Array(),
+        },
+      ],
+    });
+    assert.deepEqual(result, { throughLsn: 1n, unitsApplied: 1 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("applyRetainedUnits validates database identity shape", () => {
+  const dir = freshDir();
+  try {
+    const db = Database.open(dir);
+    assert.throws(() =>
+      db.applyRetainedUnits({
+        sinceLsn: 0n,
+        databaseId: "not-hex",
+        primaryGeneration: 1n,
+        walFormatVersion: 1,
+        catalogVersion: 5,
+        segmentFormatVersion: 1,
+        units: [],
+      }),
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

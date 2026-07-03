@@ -81,6 +81,54 @@ await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 
 `QueryParam` is `string | number | bigint | boolean | null`. The params form sends the `QueryWithParams` (0x04) wire message and **requires powdb-server >= 0.4.7**. The plain `query(q)` and `query(q, { signal })` forms are unchanged.
 
+## Experimental embedded sync protocol helpers
+
+The client exposes experimental low-level helpers for the private authenticated
+embedded-sync frames used by the in-progress replica product:
+
+```typescript
+client.on("sync", ({ operation, durationMs, ok, stale, repairAction }) => {
+  metrics.histogram("powdb_sync_ms", durationMs, {
+    operation,
+    ok: String(ok),
+    repairAction: repairAction ?? "error",
+  });
+});
+
+const status = await client.syncStatus("replica-a");
+
+if (status.repairAction === "pull" && status.lastAppliedLsn !== null) {
+  const pull = await client.syncPull({
+    replicaId: "replica-a",
+    sinceLsn: status.lastAppliedLsn,
+    maxUnits: 4096,
+    maxBytes: 16n * 1024n * 1024n,
+    databaseId: "0123456789abcdeffedcba9876543210",
+    primaryGeneration: 1n,
+    walFormatVersion: 1,
+    catalogVersion: 1,
+    segmentFormatVersion: 1,
+  });
+
+  // Apply `pull.units` with the embedded replica layer, then acknowledge.
+  const lastUnit = pull.units.at(-1);
+  if (lastUnit) {
+    await client.syncAck({
+      replicaId: "replica-a",
+      appliedLsn: lastUnit.lsn,
+      remoteLsn: pull.status.remoteLsn,
+    });
+  }
+}
+```
+
+These methods are intentionally not a complete or stable
+`@zvndev/powdb-sync` package. They expose the authenticated server
+pull/status/ack protocol so the embedded replica layer can be built and tested
+without hand-rolled frame code. Pin matching client/server versions while using
+them; the stable product boundary will be the sync package. Servers must have
+sync enabled and reject unauthenticated or `readonly` users.
+
 ## Authentication
 
 For servers using the legacy shared password (`POWDB_PASSWORD`), pass
@@ -254,6 +302,7 @@ Events:
 | Event | Payload | Fires when |
 |---|---|---|
 | `query` | `{ query, durationMs, ok, kind?, error? }` | After every query completes (success or failure) |
+| `sync` | `{ operation, replicaId, durationMs, ok, status?, stale?, repairAction?, units?, advanced?, error? }` | After every sync status/pull/ack request completes |
 | `close` | `{ error: Error \| null }` | Exactly once per socket, on normal or error close |
 
 ## Cancellation

@@ -6,8 +6,12 @@ name: publish
 # secret is stored — the job mints a short-lived token from crates.io using the
 # workflow's GitHub OIDC identity. Requires a trusted publisher configured once
 # PER CRATE on crates.io (each crate > Settings > Trusted Publishing): owner
-# ZVN-DEV, repo powdb, workflow publish.yml. All seven publishable crates
-# (storage, auth, query, backup, server, powdb, cli) must be configured. See
+# ZVN-DEV, repo powdb, workflow publish.yml. All eight publishable crates
+# (storage, auth, query, sync, backup, server, powdb, cli) must be configured.
+# NOTE: a brand-new crate (powdb-sync in 0.8.0) cannot use Trusted Publishing
+# for its FIRST publish — crates.io only lets you configure a trusted publisher
+# on an existing crate. Publish the first version with a token
+# (`cargo publish -p powdb-sync`), then configure Trusted Publishing. See
 # docs/ci/trusted-publishing.md.
 #
 # Usage:
@@ -148,7 +152,19 @@ jobs:
             sleep 30
           fi
 
-      # powdb-backup depends on storage+query (both already published above)
+      # powdb-sync (experimental sync substrate) depends only on powdb-storage,
+      # but backup/server/powdb/cli all depend on it, so it must precede them.
+      - name: Publish powdb-sync
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p powdb-sync --dry-run
+          else
+            cargo publish -p powdb-sync
+            echo "Waiting for crates.io to index powdb-sync..."
+            sleep 30
+          fi
+
+      # powdb-backup depends on storage+query+sync (all already published above)
       # and powdb-cli depends on backup, so it must precede the cli.
       - name: Publish powdb-backup
         run: |

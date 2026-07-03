@@ -41,6 +41,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use powdb_query::executor::{Engine, WalSyncMode};
 pub use powdb_query::result::{QueryError, QueryResult};
 pub use powdb_storage::types::Value;
+pub use powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION;
+
+fn archive_wal_records_if_sync_enabled(
+    data_dir: &Path,
+    records: &[powdb_storage::wal::WalRecord],
+) -> std::io::Result<()> {
+    match powdb_sync::read_identity(data_dir) {
+        Ok(identity) => powdb_sync::archive_wal_records_for_identity(data_dir, identity, records),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
 /// An error from the embedded API.
 #[derive(Debug)]
@@ -57,6 +69,8 @@ pub enum Error {
     OpenPanicked,
     /// A caller-supplied argument was invalid (e.g. an unknown sync-mode name).
     InvalidArgument(String),
+    /// Embedded retained-unit sync apply failed.
+    Sync(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -73,6 +87,7 @@ impl std::fmt::Display for Error {
                 "opening the database panicked (data directory may be corrupt); restore from a backup"
             ),
             Error::InvalidArgument(msg) => write!(f, "{msg}"),
+            Error::Sync(e) => write!(f, "sync apply failed: {e}"),
         }
     }
 }
@@ -92,9 +107,44 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Open(e) => Some(e),
+            Error::Sync(e) => Some(e),
             _ => None,
         }
     }
+}
+
+/// Database identity and format metadata required to apply retained sync units.
+#[derive(Debug, Clone)]
+pub struct SyncApplyIdentity {
+    pub database_id: [u8; 16],
+    pub primary_generation: u64,
+    pub wal_format_version: u16,
+    pub catalog_version: u16,
+    pub segment_format_version: u16,
+}
+
+/// One retained replication unit accepted by the embedded sync applier.
+#[derive(Debug, Clone)]
+pub struct RetainedUnitInput {
+    pub tx_id: u64,
+    pub record_type: u8,
+    pub lsn: u64,
+    pub data: Vec<u8>,
+}
+
+/// Request to apply one already-pulled retained-unit chunk.
+#[derive(Debug, Clone)]
+pub struct RetainedApplyRequest {
+    pub since_lsn: u64,
+    pub identity: SyncApplyIdentity,
+    pub units: Vec<RetainedUnitInput>,
+}
+
+/// Summary returned after retained-unit chunk apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedApplyResult {
+    pub through_lsn: u64,
+    pub units_applied: usize,
 }
 
 /// An in-process PowDB database handle.
@@ -113,7 +163,9 @@ impl Database {
     /// Open (or create) a database at `dir`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, Error> {
         let dir = dir.as_ref();
-        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| Engine::new(dir))))
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::new_with_wal_archive(dir, archive_wal_records_if_sync_enabled)
+        })))
     }
 
     /// Open with an explicit per-query memory budget (bytes).
@@ -123,7 +175,11 @@ impl Database {
     ) -> Result<Self, Error> {
         let dir = dir.as_ref();
         Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
-            Engine::with_memory_limit(dir, limit_bytes)
+            Engine::with_memory_limit_and_wal_archive(
+                dir,
+                limit_bytes,
+                archive_wal_records_if_sync_enabled,
+            )
         })))
     }
 
@@ -183,6 +239,52 @@ impl Database {
         self.poisoned.load(Ordering::Acquire)
     }
 
+    /// Apply one retained-unit chunk to this embedded replica.
+    ///
+    /// This is the native adapter behind `@zvndev/powdb-sync`'s
+    /// `LocalReplica.applyRetainedUnits` contract. The request must start at a
+    /// trusted local apply boundary seeded by sync backup bootstrap.
+    pub fn apply_retained_units(
+        &mut self,
+        request: RetainedApplyRequest,
+    ) -> Result<RetainedApplyResult, Error> {
+        if request.identity.segment_format_version != RETAINED_SEGMENT_FORMAT_VERSION {
+            return Err(Error::InvalidArgument(format!(
+                "unsupported retained segment format {}; expected {}",
+                request.identity.segment_format_version, RETAINED_SEGMENT_FORMAT_VERSION
+            )));
+        }
+        let identity = powdb_sync::SegmentIdentity {
+            database_id: request.identity.database_id,
+            primary_generation: request.identity.primary_generation,
+            wal_format_version: request.identity.wal_format_version,
+            catalog_version: request.identity.catalog_version,
+        };
+        let units = request
+            .units
+            .into_iter()
+            .map(|unit| powdb_sync::RetainedUnit {
+                tx_id: unit.tx_id,
+                record_type: unit.record_type,
+                lsn: unit.lsn,
+                data: unit.data,
+            })
+            .collect::<Vec<_>>();
+
+        self.run_sync_mut(|engine| {
+            let summary = powdb_sync::apply_retained_units_chunk(
+                engine.catalog_mut(),
+                identity,
+                request.since_lsn,
+                &units,
+            )?;
+            Ok(RetainedApplyResult {
+                through_lsn: summary.through_lsn,
+                units_applied: summary.units_applied,
+            })
+        })
+    }
+
     /// Close the database, flushing and checkpointing. Equivalent to dropping
     /// the handle, but explicit at the call site.
     pub fn close(self) {
@@ -216,6 +318,23 @@ impl Database {
         let engine = self.engine.as_ref().expect("engine present until drop");
         match catch_unwind(AssertUnwindSafe(|| f(engine))) {
             Ok(inner) => inner.map_err(Error::Query),
+            Err(_) => {
+                self.poisoned.store(true, Ordering::Release);
+                Err(Error::Poisoned)
+            }
+        }
+    }
+
+    fn run_sync_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Engine) -> std::io::Result<T>,
+    ) -> Result<T, Error> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
+        }
+        let engine = self.engine.as_mut().expect("engine present until drop");
+        match catch_unwind(AssertUnwindSafe(|| f(engine))) {
+            Ok(inner) => inner.map_err(Error::Sync),
             Err(_) => {
                 self.poisoned.store(true, Ordering::Release);
                 Err(Error::Poisoned)
@@ -316,6 +435,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn apply_retained_units_noop_uses_seeded_sync_boundary() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_apply_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let database_id = [7u8; 16];
+        seed_apply_boundary(&dir, database_id, 1, 0);
+
+        let mut db = Database::open(&dir).unwrap();
+        let result = db
+            .apply_retained_units(RetainedApplyRequest {
+                since_lsn: 0,
+                identity: SyncApplyIdentity {
+                    database_id,
+                    primary_generation: 1,
+                    wal_format_version: powdb_storage::wal::WAL_FORMAT_VERSION,
+                    catalog_version: powdb_storage::catalog::CATALOG_VERSION,
+                    segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+                },
+                units: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            result,
+            RetainedApplyResult {
+                through_lsn: 0,
+                units_applied: 0
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_retained_units_rejects_wrong_segment_format() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_facade_apply_badfmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        let err = db
+            .apply_retained_units(RetainedApplyRequest {
+                since_lsn: 0,
+                identity: SyncApplyIdentity {
+                    database_id: [7u8; 16],
+                    primary_generation: 1,
+                    wal_format_version: powdb_storage::wal::WAL_FORMAT_VERSION,
+                    catalog_version: powdb_storage::catalog::CATALOG_VERSION,
+                    segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION + 1,
+                },
+                units: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_archives_pending_sync_wal_before_recovery_truncates() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_facade_sync_recovery_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identity = {
+            let mut catalog = powdb_storage::catalog::Catalog::create(&dir).unwrap();
+            catalog
+                .create_table(powdb_storage::types::Schema {
+                    table_name: "T".into(),
+                    columns: vec![powdb_storage::types::ColumnDef {
+                        name: "id".into(),
+                        type_id: powdb_storage::types::TypeId::Int,
+                        required: true,
+                        position: 0,
+                    }],
+                })
+                .unwrap();
+            catalog.insert("T", &vec![Value::Int(1)]).unwrap();
+            catalog.sync_wal().unwrap();
+            powdb_sync::open_or_create_identity(&dir).unwrap()
+        };
+
+        let db = Database::open(&dir).unwrap();
+        drop(db);
+        let units = powdb_sync::read_units_since(
+            &powdb_sync::retained_segments_dir(&dir),
+            identity.segment_identity(),
+            0,
+            100,
+        )
+        .unwrap();
+        assert!(
+            !units.is_empty(),
+            "embedded facade open must preserve replayed sync WAL"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A corrupt data directory must surface as an `Err`, never unwind/abort the
     /// embedded host. A trashed heap header panics deep in the open path; the
     /// facade's `catch_unwind` must convert that into `Error::OpenPanicked`.
@@ -344,5 +556,46 @@ mod tests {
             result.is_err(),
             "corrupt heap must return Err, not panic/abort the host"
         );
+    }
+
+    fn seed_apply_boundary(
+        dir: &std::path::Path,
+        database_id: [u8; 16],
+        generation: u64,
+        lsn: u64,
+    ) {
+        let sync_dir = dir.join(".powdb-sync");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        let database_id_hex = encode_hex_16(database_id);
+        std::fs::write(
+            sync_dir.join("identity.json"),
+            format!(
+                r#"{{"format_version":1,"database_id":"{database_id_hex}","primary_generation":{generation},"created_unix_secs":1}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sync_dir.join("apply-state.json"),
+            format!(
+                r#"{{"format_version":1,"database_id":{},"primary_generation":{generation},"wal_format_version":{},"catalog_version":{},"from_lsn":{lsn},"through_lsn":{lsn},"applied_lsn":{lsn},"status":"complete","started_unix_secs":1,"updated_unix_secs":1}}"#,
+                json_u8_array(database_id),
+                powdb_storage::wal::WAL_FORMAT_VERSION,
+                powdb_storage::catalog::CATALOG_VERSION,
+            ),
+        )
+        .unwrap();
+    }
+
+    fn encode_hex_16(bytes: [u8; 16]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn json_u8_array(bytes: [u8; 16]) -> String {
+        let body = bytes
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{body}]")
     }
 }

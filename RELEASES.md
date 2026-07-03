@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.7.2** (correctness + docs patch: fixes a plan-cache bug where `… in (<subquery>)` returned stale rows across same-shape calls (#137), plus README/docs drift fixes (#71). On-disk catalog format unchanged from v0.7.1 — still v5; older v1–v4 catalogs still load.).
+> **Current release: v0.8.0** (Embedded Sync Milestone 0 substrate, **experimental**: a new `powdb-sync` crate (retained replication-unit log), private authenticated server sync frames, backup-based replica bootstrap, and two new JS packages (`@zvndev/powdb-sync`, plus sync helpers in `@zvndev/powdb-client`). Core-engine changes for existing users: a durable `catalog.lsn` sidecar next to `catalog.bin`, checkpoint guards, and additive backup-manifest fields. On-disk catalog format unchanged — still v5; older v1–v4 catalogs still load, and a v0.7.2 database/backup opens unchanged (the `catalog.lsn` sidecar is absent → durable LSN reads as 0). **`@zvndev/powdb-sync` is beta-gated and NOT published to npm until Milestone-1 gates pass.**).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

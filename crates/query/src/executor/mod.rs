@@ -19,7 +19,7 @@ pub use powdb_storage::wal::WalSyncMode;
 
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, Level};
 
@@ -57,6 +57,8 @@ pub enum QueryDialect {
 /// comfortably in 256. Lookup is O(1), collisions clear the cache (see
 /// `plan_cache::PlanCache::insert`).
 const PLAN_CACHE_CAPACITY: usize = 256;
+type WalArchiveHook =
+    Arc<dyn Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync>;
 
 /// Maximum number of rows a join may produce before the executor aborts.
 /// Prevents Cartesian-product blowups (e.g. `T cross join T` on 10K rows
@@ -325,6 +327,7 @@ pub struct Engine {
     /// Default [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable
     /// via `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
     query_memory_limit: usize,
+    wal_archive_hook: Option<WalArchiveHook>,
 }
 
 impl Engine {
@@ -343,13 +346,35 @@ impl Engine {
     /// // Engine is ready — the directory now contains a catalog.
     /// ```
     pub fn new(data_dir: &Path) -> io::Result<Self> {
+        Self::new_inner(data_dir, None)
+    }
+
+    /// Open or create an engine that archives WAL records before any recovery,
+    /// rollback, or drop checkpoint truncates them. This keeps the query crate
+    /// independent of replication metadata while giving sync-aware callers one
+    /// lifecycle boundary for retained-history preservation.
+    pub fn new_with_wal_archive<F>(data_dir: &Path, archive: F) -> io::Result<Self>
+    where
+        F: Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync + 'static,
+    {
+        Self::new_inner(data_dir, Some(Arc::new(archive)))
+    }
+
+    fn new_inner(data_dir: &Path, wal_archive_hook: Option<WalArchiveHook>) -> io::Result<Self> {
         powdb_storage::create_data_dir_secure(data_dir)?;
         // Refuse to open a directory another live process already holds, before
         // touching any on-disk state (concurrent writers corrupt the heap/WAL).
         let dir_lock = powdb_storage::dir_lock::DirLock::acquire(data_dir)?;
         // Try to reopen an existing database first; only create a fresh
         // catalog when there isn't one already on disk.
-        let catalog = match Catalog::open(data_dir) {
+        let catalog_result = match &wal_archive_hook {
+            Some(hook) => {
+                let hook = Arc::clone(hook);
+                Catalog::open_with_wal_archive(data_dir, move |dir, records| hook(dir, records))
+            }
+            None => Catalog::open(data_dir),
+        };
+        let catalog = match catalog_result {
             Ok(c) => {
                 info!(data_dir = %data_dir.display(), "engine reopened existing database");
                 c
@@ -370,6 +395,7 @@ impl Engine {
             view_registry,
             in_transaction: false,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
+            wal_archive_hook,
         })
     }
 
@@ -378,6 +404,21 @@ impl Engine {
     /// tests that need a tiny limit to exercise the budget guard.
     pub fn with_memory_limit(data_dir: &Path, limit_bytes: usize) -> io::Result<Self> {
         let mut engine = Engine::new(data_dir)?;
+        engine.set_query_memory_limit(limit_bytes);
+        Ok(engine)
+    }
+
+    /// Open or create an archive-aware engine with an explicit per-query memory
+    /// limit.
+    pub fn with_memory_limit_and_wal_archive<F>(
+        data_dir: &Path,
+        limit_bytes: usize,
+        archive: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync + 'static,
+    {
+        let mut engine = Engine::new_with_wal_archive(data_dir, archive)?;
         engine.set_query_memory_limit(limit_bytes);
         Ok(engine)
     }
@@ -398,6 +439,58 @@ impl Engine {
     /// Wired from the server's `POWDB_SYNC_MODE` / `--sync-mode` config.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
         self.catalog.set_wal_sync_mode(mode);
+    }
+
+    /// Roll back the active explicit transaction while archiving any committed
+    /// pre-transaction WAL records that recovery must replay and truncate.
+    /// This is the sync-aware counterpart to the ordinary `rollback` statement;
+    /// callers provide the archive hook so the query crate stays independent of
+    /// replication metadata.
+    pub fn rollback_transaction_with_wal_archive<F>(
+        &mut self,
+        archive: F,
+    ) -> Result<QueryResult, QueryError>
+    where
+        F: FnMut(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()>,
+    {
+        if !self.in_transaction {
+            return Err(QueryError::Execution(
+                "no active transaction to roll back".into(),
+            ));
+        }
+        self.catalog
+            .rollback_to_last_sync_with_wal_archive(archive)
+            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        self.finish_rollback_after_catalog_restore()
+    }
+
+    pub fn rollback_transaction_preserving_wal_archive(
+        &mut self,
+    ) -> Result<QueryResult, QueryError> {
+        let Some(hook) = self.wal_archive_hook.clone() else {
+            if !self.in_transaction {
+                return Err(QueryError::Execution(
+                    "no active transaction to roll back".into(),
+                ));
+            }
+            self.catalog
+                .rollback_to_last_sync()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            return self.finish_rollback_after_catalog_restore();
+        };
+        self.rollback_transaction_with_wal_archive(move |dir, records| hook(dir, records))
+    }
+
+    fn finish_rollback_after_catalog_restore(&mut self) -> Result<QueryResult, QueryError> {
+        self.in_transaction = false;
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.clear();
+        }
+        self.view_registry = ViewRegistry::open(self.catalog.data_dir())
+            .unwrap_or_else(|_| ViewRegistry::new(self.catalog.data_dir()));
+        Ok(QueryResult::Executed {
+            message: "transaction rolled back".to_string(),
+        })
     }
 
     /// Enter a budgeted-statement frame for the current query. The returned
@@ -2046,5 +2139,19 @@ impl Engine {
 
     pub fn catalog_mut(&mut self) -> &mut Catalog {
         &mut self.catalog
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let Some(hook) = self.wal_archive_hook.clone() else {
+            return;
+        };
+        if let Err(err) = self
+            .catalog
+            .checkpoint_with_wal_archive(move |dir, records| hook(dir, records))
+        {
+            error!(error = %err, "sync-aware engine checkpoint on drop failed");
+        }
     }
 }

@@ -9,6 +9,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
 use std::borrow::Cow;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::io::{BufReader, BufWriter};
@@ -20,6 +21,17 @@ use tracing_subscriber::EnvFilter;
 const CLI_COMMANDS: &[&str] = &["exec", "prepare"];
 const DEFAULT_DB_NAME: &str = "default";
 const META_COMMANDS: &[&str] = &[".exit", ".help", ".quit", ".schema", ".tables", ".timing"];
+
+fn archive_wal_records_if_sync_enabled(
+    data_dir: &Path,
+    records: &[powdb_storage::wal::WalRecord],
+) -> io::Result<()> {
+    match powdb_sync::read_identity(data_dir) {
+        Ok(identity) => powdb_sync::archive_wal_records_for_identity(data_dir, identity, records),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
 struct PowqlHelper;
 
@@ -135,7 +147,18 @@ enum Action {
         backup_dir: String,
         dest: String,
         apply: Vec<String>,
+        sync_mode: powdb_backup::RestoreSyncMode,
     },
+    /// Offline sync bootstrap: create this data dir's sync identity.
+    SyncEnable,
+    /// Restore a sync-enabled backup into a replica and publish its cursor.
+    SyncBootstrap {
+        backup_dir: String,
+        replica_dir: String,
+        replica_id: String,
+    },
+    /// Offline/admin: inspect primary-side sync cursor status.
+    SyncStatus { replica_id: Option<String> },
     /// Offline user-admin: create a user in the data dir's UserStore.
     UserAdd { name: String },
     /// Offline user-admin: delete a user from the data dir's UserStore.
@@ -158,6 +181,29 @@ struct CliArgs {
     action: Action,
 }
 
+fn set_restore_sync_mode(
+    current: &mut powdb_backup::RestoreSyncMode,
+    was_set: &mut bool,
+    next: powdb_backup::RestoreSyncMode,
+    flag: &str,
+) {
+    if *was_set && *current != next {
+        eprintln!("conflicting restore sync identity mode flag: {flag}");
+        std::process::exit(2);
+    }
+    *current = next;
+    *was_set = true;
+}
+
+fn restore_sync_mode_for_flag(flag: &str) -> Option<powdb_backup::RestoreSyncMode> {
+    match flag {
+        "--sync-strip" => Some(powdb_backup::RestoreSyncMode::StripSyncIdentity),
+        "--sync-preserve" => Some(powdb_backup::RestoreSyncMode::PreserveSyncIdentity),
+        "--sync-fork" => Some(powdb_backup::RestoreSyncMode::ForkWithNewSyncIdentity),
+        _ => None,
+    }
+}
+
 fn parse_args() -> CliArgs {
     let mut data_dir = "./powdb_data".to_string();
     let mut remote: Option<String> = None;
@@ -173,6 +219,8 @@ fn parse_args() -> CliArgs {
     // the subcommand and its positionals.
     let mut backup_base: Option<String> = None;
     let mut restore_apply: Vec<String> = Vec::new();
+    let mut restore_sync_mode = powdb_backup::RestoreSyncMode::StripSyncIdentity;
+    let mut restore_sync_mode_was_set = false;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -246,8 +294,12 @@ fn parse_args() -> CliArgs {
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
                 println!("    powdb-cli --data-dir <DIR> backup <DEST_DIR> [--base <FULL_DIR>]");
                 println!(
-                    "    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR> [--apply <INC_DIR>]..."
+                    "    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR> [--apply <INC_DIR>]... [--sync-strip|--sync-preserve|--sync-fork]"
                 );
+                println!(
+                    "    powdb-cli --data-dir <PRIMARY_DIR> sync-bootstrap <BACKUP_DIR> <REPLICA_DIR> <REPLICA_ID>"
+                );
+                println!("    powdb-cli --data-dir <PRIMARY_DIR> sync-status [REPLICA_ID]");
                 println!();
                 println!("OPTIONS:");
                 println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
@@ -278,6 +330,22 @@ fn parse_args() -> CliArgs {
                 println!("        Rebuild a data dir from a backup. Pass --apply once per");
                 println!("        increment (in order) to chain-restore a full base plus");
                 println!("        incrementals for coarse point-in-time restore.");
+                println!("        Sync identity modes for sync-enabled backups:");
+                println!("          --sync-strip     Default. Restore data without sync identity.");
+                println!(
+                    "          --sync-preserve  Disaster recovery: keep source sync identity."
+                );
+                println!("          --sync-fork      Clone/fork: mint a fresh sync identity.");
+                println!("    sync-enable");
+                println!("        Offline/admin: create sync identity and checkpoint retained WAL");
+                println!("        for --data-dir so future backups can bootstrap replicas.");
+                println!("    sync-bootstrap <BKP> <REPLICA_DIR> <REPLICA_ID>");
+                println!("        Offline/admin: restore a sync-enabled full backup into");
+                println!("        REPLICA_DIR and publish REPLICA_ID's primary-side cursor.");
+                println!("    sync-status [REPLICA_ID]");
+                println!("        Offline/admin: show primary-side cursor, lag, and repair");
+                println!("        action for one replica or every registered replica.");
+                println!("        Uses sync-aware open and may archive/checkpoint pending WAL.");
                 println!();
                 println!("USER ADMIN (offline — operate on --data-dir's user store):");
                 println!("    useradd <NAME> --role <ROLE> --password <PW>");
@@ -318,23 +386,126 @@ fn parse_args() -> CliArgs {
                 }
                 restore_apply.push(argv[i].clone());
             }
+            "--sync-strip" => {
+                set_restore_sync_mode(
+                    &mut restore_sync_mode,
+                    &mut restore_sync_mode_was_set,
+                    powdb_backup::RestoreSyncMode::StripSyncIdentity,
+                    "--sync-strip",
+                );
+            }
+            "--sync-preserve" => {
+                set_restore_sync_mode(
+                    &mut restore_sync_mode,
+                    &mut restore_sync_mode_was_set,
+                    powdb_backup::RestoreSyncMode::PreserveSyncIdentity,
+                    "--sync-preserve",
+                );
+            }
+            "--sync-fork" => {
+                set_restore_sync_mode(
+                    &mut restore_sync_mode,
+                    &mut restore_sync_mode_was_set,
+                    powdb_backup::RestoreSyncMode::ForkWithNewSyncIdentity,
+                    "--sync-fork",
+                );
+            }
             "restore" => {
                 i += 1;
-                if i >= argv.len() {
+                let mut backup_dir: Option<String> = None;
+                let mut dest: Option<String> = None;
+                while i < argv.len() {
+                    let arg = argv[i].as_str();
+                    if arg == "--apply" {
+                        i += 1;
+                        if i >= argv.len() {
+                            eprintln!("--apply requires an increment dir");
+                            std::process::exit(2);
+                        }
+                        restore_apply.push(argv[i].clone());
+                    } else if let Some(next) = restore_sync_mode_for_flag(arg) {
+                        set_restore_sync_mode(
+                            &mut restore_sync_mode,
+                            &mut restore_sync_mode_was_set,
+                            next,
+                            arg,
+                        );
+                    } else if arg.starts_with('-') {
+                        eprintln!("unknown restore argument: {arg}");
+                        eprintln!("try --help");
+                        std::process::exit(2);
+                    } else if backup_dir.is_none() {
+                        backup_dir = Some(argv[i].clone());
+                    } else if dest.is_none() {
+                        dest = Some(argv[i].clone());
+                    } else {
+                        eprintln!("unexpected restore argument: {arg}");
+                        eprintln!("try --help");
+                        std::process::exit(2);
+                    }
+                    i += 1;
+                }
+                let Some(backup_dir) = backup_dir else {
                     eprintln!("restore requires a backup dir and a destination data dir");
+                    std::process::exit(2);
+                };
+                let Some(dest) = dest else {
+                    eprintln!("restore requires a destination data dir");
+                    std::process::exit(2);
+                };
+                action = Action::Restore {
+                    backup_dir,
+                    dest,
+                    apply: Vec::new(),
+                    sync_mode: powdb_backup::RestoreSyncMode::StripSyncIdentity,
+                };
+            }
+            "sync-enable" => {
+                action = Action::SyncEnable;
+            }
+            "sync-bootstrap" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("sync-bootstrap requires a backup dir");
                     std::process::exit(2);
                 }
                 let backup_dir = argv[i].clone();
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("restore requires a destination data dir");
+                    eprintln!("sync-bootstrap requires a replica data dir");
                     std::process::exit(2);
                 }
-                action = Action::Restore {
+                let replica_dir = argv[i].clone();
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("sync-bootstrap requires a replica id");
+                    std::process::exit(2);
+                }
+                action = Action::SyncBootstrap {
                     backup_dir,
-                    dest: argv[i].clone(),
-                    apply: Vec::new(),
+                    replica_dir,
+                    replica_id: argv[i].clone(),
                 };
+            }
+            "sync-status" => {
+                i += 1;
+                let mut replica_id: Option<String> = None;
+                while i < argv.len() {
+                    let arg = argv[i].as_str();
+                    if arg.starts_with('-') {
+                        eprintln!("unknown sync-status argument: {arg}");
+                        eprintln!("try --help");
+                        std::process::exit(2);
+                    } else if replica_id.is_none() {
+                        replica_id = Some(argv[i].clone());
+                    } else {
+                        eprintln!("unexpected sync-status argument: {arg}");
+                        eprintln!("try --help");
+                        std::process::exit(2);
+                    }
+                    i += 1;
+                }
+                action = Action::SyncStatus { replica_id };
             }
             "useradd" => {
                 i += 1;
@@ -385,10 +556,25 @@ fn parse_args() -> CliArgs {
     // Fold the modifier flags into their subcommand actions.
     match &mut action {
         Action::Backup { base, .. } => {
+            if !restore_apply.is_empty() {
+                eprintln!("--apply is only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
+            if restore_sync_mode_was_set {
+                eprintln!("--sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
             *base = backup_base;
         }
-        Action::Restore { apply, .. } => {
+        Action::Restore {
+            apply, sync_mode, ..
+        } => {
+            if backup_base.is_some() {
+                eprintln!("--base is only valid with the `backup` subcommand");
+                std::process::exit(2);
+            }
             *apply = restore_apply;
+            *sync_mode = restore_sync_mode;
         }
         _ => {
             if backup_base.is_some() {
@@ -397,6 +583,10 @@ fn parse_args() -> CliArgs {
             }
             if !restore_apply.is_empty() {
                 eprintln!("--apply is only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
+            if restore_sync_mode_was_set {
+                eprintln!("--sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
                 std::process::exit(2);
             }
         }
@@ -433,8 +623,27 @@ fn main() {
             backup_dir,
             dest,
             apply,
+            sync_mode,
         } => {
-            std::process::exit(run_restore(backup_dir, dest, apply));
+            std::process::exit(run_restore(backup_dir, dest, apply, *sync_mode));
+        }
+        Action::SyncEnable => {
+            std::process::exit(run_sync_enable(&args.data_dir));
+        }
+        Action::SyncBootstrap {
+            backup_dir,
+            replica_dir,
+            replica_id,
+        } => {
+            std::process::exit(run_sync_bootstrap(
+                &args.data_dir,
+                backup_dir,
+                replica_dir,
+                replica_id,
+            ));
+        }
+        Action::SyncStatus { replica_id } => {
+            std::process::exit(run_sync_status(&args.data_dir, replica_id.as_deref()));
         }
         Action::UserAdd { name } => {
             std::process::exit(run_useradd(
@@ -487,7 +696,7 @@ fn main() {
 // ─── Backup / restore ───────────────────────────────────────────────────────
 
 fn run_backup(data_dir: &str, dest: &str, base: Option<&str>) -> i32 {
-    let mut catalog = match powdb_storage::catalog::Catalog::open(Path::new(data_dir)) {
+    let mut catalog = match powdb_sync::open_preserving_retained_segments(Path::new(data_dir)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: failed to open data dir {data_dir}: {e}");
@@ -555,10 +764,19 @@ fn run_backup(data_dir: &str, dest: &str, base: Option<&str>) -> i32 {
     }
 }
 
-fn run_restore(backup_dir: &str, dest: &str, apply: &[String]) -> i32 {
+fn run_restore(
+    backup_dir: &str,
+    dest: &str,
+    apply: &[String],
+    sync_mode: powdb_backup::RestoreSyncMode,
+) -> i32 {
     if apply.is_empty() {
         // Full restore.
-        return match powdb_backup::restore(Path::new(backup_dir), Path::new(dest)) {
+        return match powdb_backup::restore_with_sync_mode(
+            Path::new(backup_dir),
+            Path::new(dest),
+            sync_mode,
+        ) {
             Ok(()) => {
                 println!("restored backup {backup_dir} -> {dest}");
                 0
@@ -572,7 +790,12 @@ fn run_restore(backup_dir: &str, dest: &str, apply: &[String]) -> i32 {
 
     // Chain restore: full base + ordered increments.
     let increments: Vec<&Path> = apply.iter().map(|s| Path::new(s.as_str())).collect();
-    match powdb_backup::restore_chain(Path::new(backup_dir), &increments, Path::new(dest)) {
+    match powdb_backup::restore_chain_with_sync_mode(
+        Path::new(backup_dir),
+        &increments,
+        Path::new(dest),
+        sync_mode,
+    ) {
         Ok(()) => {
             println!(
                 "restored backup {backup_dir} + {} increment(s) -> {dest}",
@@ -587,6 +810,186 @@ fn run_restore(backup_dir: &str, dest: &str, apply: &[String]) -> i32 {
             eprintln!("Error: chain restore failed: {e}");
             1
         }
+    }
+}
+
+fn run_sync_enable(data_dir: &str) -> i32 {
+    let mut catalog = match powdb_sync::open_preserving_retained_segments(Path::new(data_dir)) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("Error: failed to open data dir {data_dir}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = powdb_sync::checkpoint_with_retained_segments(&mut catalog) {
+        eprintln!("Error: sync enable failed: {e}");
+        return 1;
+    }
+    match powdb_sync::read_identity_snapshot(Path::new(data_dir)) {
+        Ok(Some(snapshot)) => {
+            println!(
+                "sync enabled: database {} generation {} at lsn {}",
+                snapshot.database_id,
+                snapshot.primary_generation,
+                catalog.max_lsn()
+            );
+            0
+        }
+        Ok(None) => {
+            eprintln!("Error: sync enable did not create identity metadata");
+            1
+        }
+        Err(e) => {
+            eprintln!("Error: failed to read sync identity: {e}");
+            1
+        }
+    }
+}
+
+fn run_sync_bootstrap(
+    primary_dir: &str,
+    backup_dir: &str,
+    replica_dir: &str,
+    replica_id: &str,
+) -> i32 {
+    let mut primary = match powdb_sync::open_preserving_retained_segments(Path::new(primary_dir)) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("Error: failed to open primary data dir {primary_dir}: {e}");
+            return 1;
+        }
+    };
+    match powdb_backup::bootstrap_replica_from_full_backup(
+        &mut primary,
+        Path::new(backup_dir),
+        Path::new(replica_dir),
+        replica_id,
+    ) {
+        Ok(summary) => {
+            println!(
+                "sync replica bootstrapped: {} snapshot lsn {} remote lsn {} retained units {} -> {}",
+                summary.replica_id,
+                summary.snapshot_lsn,
+                summary.remote_lsn,
+                summary.retained_units_available,
+                replica_dir
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: sync bootstrap failed: {e}");
+            1
+        }
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
+fn format_sync_repair_action(action: powdb_sync::SyncRepairAction) -> &'static str {
+    match action {
+        powdb_sync::SyncRepairAction::None => "none",
+        powdb_sync::SyncRepairAction::Pull => "pull",
+        powdb_sync::SyncRepairAction::AwaitArchive => "awaitArchive",
+        powdb_sync::SyncRepairAction::Rebootstrap => "rebootstrap",
+    }
+}
+
+fn print_replica_sync_status(status: &powdb_sync::ReplicaSyncStatus) {
+    println!("replica {}", status.replica_id);
+    println!("  active: {}", status.active);
+    println!(
+        "  lastAppliedLsn: {}",
+        format_optional_u64(status.last_applied_lsn)
+    );
+    println!("  remoteLsn: {}", status.remote_lsn);
+    println!(
+        "  servableLsn: {}",
+        format_optional_u64(status.servable_lsn)
+    );
+    println!(
+        "  unarchivedLsn: {}",
+        format_optional_u64(status.unarchived_lsn)
+    );
+    println!("  lagLsn: {}", format_optional_u64(status.lag_lsn));
+    println!("  lagBytes: {}", format_optional_u64(status.lag_bytes));
+    println!("  lagMs: {}", format_optional_u64(status.lag_ms));
+    println!("  stale: {}", status.stale);
+    println!(
+        "  repairAction: {}",
+        format_sync_repair_action(status.repair_action)
+    );
+    if let Some(err) = &status.last_sync_error {
+        println!("  lastSyncError: {err}");
+    }
+}
+
+fn run_sync_status(data_dir: &str, replica_id: Option<&str>) -> i32 {
+    let catalog = match powdb_sync::open_preserving_retained_segments(Path::new(data_dir)) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("Error: failed to open data dir {data_dir}: {e}");
+            return 1;
+        }
+    };
+    let remote_lsn = catalog.max_lsn();
+
+    let identity = match powdb_sync::read_identity_snapshot_if_exists(Path::new(data_dir)) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            eprintln!("Error: sync-status requires a sync-enabled data dir; run sync-enable first");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("Error: failed to read sync identity: {e}");
+            return 1;
+        }
+    };
+
+    println!(
+        "sync status: database {} generation {} remoteLsn {}",
+        identity.database_id, identity.primary_generation, remote_lsn
+    );
+
+    if let Some(replica_id) = replica_id {
+        match powdb_sync::replica_sync_status(Path::new(data_dir), replica_id, remote_lsn) {
+            Ok(status) => {
+                print_replica_sync_status(&status);
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: failed to read sync status for {replica_id}: {e}");
+                1
+            }
+        }
+    } else {
+        let mut cursors = match powdb_sync::read_replica_cursors(Path::new(data_dir)) {
+            Ok(cursors) => cursors,
+            Err(e) => {
+                eprintln!("Error: failed to read replica cursors: {e}");
+                return 1;
+            }
+        };
+        cursors.sort_by(|a, b| a.replica_id.cmp(&b.replica_id));
+        println!("replicas: {}", cursors.len());
+        for cursor in cursors {
+            match powdb_sync::replica_sync_status(
+                Path::new(data_dir),
+                &cursor.replica_id,
+                remote_lsn,
+            ) {
+                Ok(status) => print_replica_sync_status(&status),
+                Err(e) => {
+                    eprintln!(
+                        "Error: failed to read sync status for {}: {e}",
+                        cursor.replica_id
+                    );
+                    return 1;
+                }
+            }
+        }
+        0
     }
 }
 
@@ -711,7 +1114,10 @@ fn run_users(data_dir: &str) -> i32 {
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
 
 fn exec_embedded(data_dir: &str, query: &str) -> i32 {
-    let mut engine = match Engine::new(Path::new(data_dir)) {
+    let mut engine = match Engine::new_with_wal_archive(
+        Path::new(data_dir),
+        archive_wal_records_if_sync_enabled,
+    ) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Error: failed to initialize engine: {e}");
@@ -872,7 +1278,9 @@ fn run_embedded(data_dir: &str) {
     eprintln!("Data directory: {data_dir}");
     eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
 
-    let mut engine = Engine::new(Path::new(data_dir)).expect("failed to initialize engine");
+    let mut engine =
+        Engine::new_with_wal_archive(Path::new(data_dir), archive_wal_records_if_sync_enabled)
+            .expect("failed to initialize engine");
 
     let mut rl = Editor::new().expect("failed to init readline");
     rl.set_helper(Some(PowqlHelper));
