@@ -16,7 +16,7 @@ log "workspace version: $workspace_version"
 
 # Publishable crates inherit the workspace version. Non-publishable benchmarking
 # crates may also inherit it, but they are not part of the release metadata gate.
-for manifest in crates/{auth,backup,cli,powdb,query,server,storage}/Cargo.toml; do
+for manifest in crates/{auth,backup,cli,powdb,query,server,storage,sync}/Cargo.toml; do
   grep -q '^version\.workspace = true$' "$manifest" \
     || fail "$manifest must use version.workspace = true"
 done
@@ -24,7 +24,7 @@ done
 # Path dependencies between publishable PowDB crates must match the workspace
 # version because crates.io cannot resolve path-only specs. Path-only references
 # in publish=false helper crates are deliberately ignored.
-version_refs="$(grep -RInE '^powdb-[a-z-]+ = \{[^}]*version = "[^"]+"[^}]*path = '   crates/{auth,backup,cli,powdb,query,server,storage}/Cargo.toml || true)"
+version_refs="$(grep -RInE '^powdb-[a-z-]+ = \{[^}]*version = "[^"]+"[^}]*path = '   crates/{auth,backup,cli,powdb,query,server,storage,sync}/Cargo.toml || true)"
 while IFS=: read -r manifest line text; do
   [[ -n "${manifest:-}" ]] || continue
   dep_version="$(printf '%s\n' "$text" | sed -n 's/.*version = "\([^"]*\)".*/\1/p')"

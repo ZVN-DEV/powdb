@@ -76,7 +76,7 @@ syncLoop.stop();
 
 ## Status
 
-This package is experimental and version-locked to PowDB `0.7.2`. Pin matching
+This package is experimental and version-locked to PowDB `0.8.0`. Pin matching
 `@zvndev/powdb-client`, `@zvndev/powdb-embedded`, and server versions while
 dogfooding.
 
