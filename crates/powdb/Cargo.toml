@@ -16,6 +16,7 @@ documentation = "https://docs.rs/powdb"
 powdb-query = { version = "0.7.2", path = "../query" }
 # Re-exported for `Value`, which appears in the public `QueryResult` API.
 powdb-storage = { version = "0.7.2", path = "../storage" }
+powdb-sync = { version = "0.7.2", path = "../sync" }
 
 [dev-dependencies]
 tempfile = "3"

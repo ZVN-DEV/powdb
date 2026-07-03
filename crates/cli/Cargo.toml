@@ -17,6 +17,7 @@ powdb-query = { version = "0.7.2", path = "../query" }
 powdb-server = { version = "0.7.2", path = "../server" }
 powdb-backup = { version = "0.7.2", path = "../backup" }
 powdb-auth = { version = "0.7.2", path = "../auth" }
+powdb-sync = { version = "0.7.2", path = "../sync" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tracing.workspace = true

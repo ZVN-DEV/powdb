@@ -18,6 +18,13 @@ export const MSG_QUERY = 0x03;
 export const MSG_QUERY_PARAMS = 0x04;
 /** SQL query frame. Plain Query remains PowQL for backward compatibility. */
 export const MSG_QUERY_SQL = 0x05;
+/** Private embedded-sync control frames. Requires authenticated server support. */
+export const MSG_SYNC_STATUS = 0x20;
+export const MSG_SYNC_PULL = 0x21;
+export const MSG_SYNC_ACK = 0x22;
+export const MSG_SYNC_STATUS_RESULT = 0x23;
+export const MSG_SYNC_PULL_RESULT = 0x24;
+export const MSG_SYNC_ACK_RESULT = 0x25;
 export const MSG_RESULT_ROWS = 0x07;
 export const MSG_RESULT_SCALAR = 0x08;
 export const MSG_RESULT_OK = 0x09;
@@ -41,6 +48,15 @@ export const MAX_COLUMNS = 4096;
 /** Maximum number of bound parameters in a QueryWithParams message. */
 export const MAX_PARAMS = 4096;
 
+/** Maximum retained units accepted in one sync pull result. */
+export const MAX_SYNC_UNITS = 4096;
+
+/** Maximum retained units accepted by the server for one sync pull request. */
+export const MAX_SYNC_PULL_UNITS = 4096;
+
+/** Maximum retained-unit payload budget accepted by the server for one sync pull. */
+export const MAX_SYNC_PULL_BYTES = 16 * 1024 * 1024;
+
 /**
  * A positional parameter value for {@link MSG_QUERY_PARAMS}. Wire encoding
  * per param: a 1-byte tag followed by the body —
@@ -56,6 +72,34 @@ export type WireParam =
   | { tag: "float"; value: number }
   | { tag: "bool"; value: boolean }
   | { tag: "str"; value: string };
+
+export type SyncRepairAction =
+  | "none"
+  | "pull"
+  | "awaitArchive"
+  | "rebootstrap";
+
+export interface WireSyncStatus {
+  replicaId: string;
+  active: boolean;
+  lastAppliedLsn: bigint | null;
+  remoteLsn: bigint;
+  servableLsn: bigint | null;
+  unarchivedLsn: bigint | null;
+  lagLsn: bigint | null;
+  lagBytes: bigint | null;
+  lagMs: bigint | null;
+  stale: boolean;
+  repairAction: SyncRepairAction;
+  lastSyncError: string | null;
+}
+
+export interface WireRetainedUnit {
+  txId: bigint;
+  recordType: number;
+  lsn: bigint;
+  data: Buffer;
+}
 
 export type Message =
   | {
@@ -75,6 +119,40 @@ export type Message =
   | { type: "Query"; query: string }
   | { type: "QuerySql"; query: string }
   | { type: "QueryWithParams"; query: string; params: WireParam[] }
+  | { type: "SyncStatus"; replicaId: string }
+  | {
+      type: "SyncPull";
+      replicaId: string;
+      sinceLsn: bigint;
+      maxUnits: number;
+      maxBytes: bigint;
+      databaseId: Buffer;
+      primaryGeneration: bigint;
+      walFormatVersion: number;
+      catalogVersion: number;
+      segmentFormatVersion: number;
+    }
+  | {
+      type: "SyncAck";
+      replicaId: string;
+      appliedLsn: bigint;
+      remoteLsn: bigint;
+    }
+  | { type: "SyncStatusResult"; status: WireSyncStatus }
+  | {
+      type: "SyncPullResult";
+      status: WireSyncStatus;
+      units: WireRetainedUnit[];
+      hasMore: boolean;
+    }
+  | {
+      type: "SyncAckResult";
+      previousAppliedLsn: bigint;
+      appliedLsn: bigint;
+      remoteLsn: bigint;
+      advanced: boolean;
+      status: WireSyncStatus;
+    }
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
   | { type: "ResultScalar"; value: string }
   | { type: "ResultOk"; affected: bigint }
@@ -155,6 +233,65 @@ export function encode(msg: Message): Buffer {
       msgType = MSG_QUERY_PARAMS;
       break;
     }
+    case "SyncStatus":
+      payload = encodeString(msg.replicaId);
+      msgType = MSG_SYNC_STATUS;
+      break;
+    case "SyncPull": {
+      if (msg.databaseId.length !== 16) {
+        throw new Error(
+          `sync databaseId must be exactly 16 bytes, got ${msg.databaseId.length}`,
+        );
+      }
+      payload = Buffer.concat([
+        encodeString(msg.replicaId),
+        u64LE(msg.sinceLsn),
+        u32LE(msg.maxUnits),
+        u64LE(msg.maxBytes),
+        msg.databaseId,
+        u64LE(msg.primaryGeneration),
+        u16LE(msg.walFormatVersion),
+        u16LE(msg.catalogVersion),
+        u16LE(msg.segmentFormatVersion),
+      ]);
+      msgType = MSG_SYNC_PULL;
+      break;
+    }
+    case "SyncAck":
+      payload = Buffer.concat([
+        encodeString(msg.replicaId),
+        u64LE(msg.appliedLsn),
+        u64LE(msg.remoteLsn),
+      ]);
+      msgType = MSG_SYNC_ACK;
+      break;
+    case "SyncStatusResult":
+      payload = encodeSyncStatus(msg.status);
+      msgType = MSG_SYNC_STATUS_RESULT;
+      break;
+    case "SyncPullResult": {
+      const parts: Buffer[] = [
+        encodeSyncStatus(msg.status),
+        u32LE(msg.units.length),
+      ];
+      for (const unit of msg.units) {
+        parts.push(encodeRetainedUnit(unit));
+      }
+      parts.push(Buffer.from([msg.hasMore ? 1 : 0]));
+      payload = Buffer.concat(parts);
+      msgType = MSG_SYNC_PULL_RESULT;
+      break;
+    }
+    case "SyncAckResult":
+      payload = Buffer.concat([
+        u64LE(msg.previousAppliedLsn),
+        u64LE(msg.appliedLsn),
+        u64LE(msg.remoteLsn),
+        Buffer.from([msg.advanced ? 1 : 0]),
+        encodeSyncStatus(msg.status),
+      ]);
+      msgType = MSG_SYNC_ACK_RESULT;
+      break;
     case "ResultRows": {
       const parts: Buffer[] = [];
       const colCount = Buffer.alloc(2);
@@ -292,6 +429,92 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       }
       return { type: "QueryWithParams", query, params };
     }
+    case MSG_SYNC_STATUS:
+      return { type: "SyncStatus", replicaId: decodeString(payload, cursor) };
+    case MSG_SYNC_PULL: {
+      const replicaId = decodeString(payload, cursor);
+      const sinceLsn = readU64(payload, cursor, "sync pull since LSN");
+      const maxUnits = readU32(payload, cursor, "sync pull max units");
+      const maxBytes = readU64(payload, cursor, "sync pull max bytes");
+      const databaseId = readFixedBytes(payload, cursor, 16, "sync database id");
+      const primaryGeneration = readU64(
+        payload,
+        cursor,
+        "sync primary generation",
+      );
+      const walFormatVersion = readU16(
+        payload,
+        cursor,
+        "sync WAL format version",
+      );
+      const catalogVersion = readU16(
+        payload,
+        cursor,
+        "sync catalog version",
+      );
+      const segmentFormatVersion = readU16(
+        payload,
+        cursor,
+        "sync segment format version",
+      );
+      return {
+        type: "SyncPull",
+        replicaId,
+        sinceLsn,
+        maxUnits,
+        maxBytes,
+        databaseId,
+        primaryGeneration,
+        walFormatVersion,
+        catalogVersion,
+        segmentFormatVersion,
+      };
+    }
+    case MSG_SYNC_ACK: {
+      const replicaId = decodeString(payload, cursor);
+      const appliedLsn = readU64(payload, cursor, "sync ack applied LSN");
+      const remoteLsn = readU64(payload, cursor, "sync ack remote LSN");
+      return { type: "SyncAck", replicaId, appliedLsn, remoteLsn };
+    }
+    case MSG_SYNC_STATUS_RESULT:
+      return {
+        type: "SyncStatusResult",
+        status: decodeSyncStatus(payload, cursor),
+      };
+    case MSG_SYNC_PULL_RESULT: {
+      const status = decodeSyncStatus(payload, cursor);
+      const count = readU32(payload, cursor, "sync retained unit count");
+      if (count > MAX_SYNC_UNITS) {
+        throw new Error(
+          `too many retained units: ${count} (max ${MAX_SYNC_UNITS})`,
+        );
+      }
+      const units: WireRetainedUnit[] = [];
+      for (let i = 0; i < count; i++) {
+        units.push(decodeRetainedUnit(payload, cursor));
+      }
+      const hasMore = readBool(payload, cursor, "sync has_more");
+      return { type: "SyncPullResult", status, units, hasMore };
+    }
+    case MSG_SYNC_ACK_RESULT: {
+      const previousAppliedLsn = readU64(
+        payload,
+        cursor,
+        "previous applied LSN",
+      );
+      const appliedLsn = readU64(payload, cursor, "applied LSN");
+      const remoteLsn = readU64(payload, cursor, "remote LSN");
+      const advanced = readBool(payload, cursor, "sync ack advanced");
+      const status = decodeSyncStatus(payload, cursor);
+      return {
+        type: "SyncAckResult",
+        previousAppliedLsn,
+        appliedLsn,
+        remoteLsn,
+        advanced,
+        status,
+      };
+    }
     case MSG_RESULT_ROWS: {
       const colCount = readU16(payload, cursor, "column count");
       if (colCount > MAX_COLUMNS) {
@@ -307,6 +530,16 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       if (rowCount > MAX_ROWS) {
         throw new Error(
           `too many rows: ${rowCount} (max ${MAX_ROWS})`,
+        );
+      }
+      if (colCount === 0 && rowCount > 0) {
+        throw new Error("nonzero row count with zero columns");
+      }
+      const remaining = BigInt(payload.length - cursor.pos);
+      const minRowBytes = BigInt(rowCount) * BigInt(colCount) * 4n;
+      if (remaining < minRowBytes) {
+        throw new Error(
+          `row data too short for declared shape: ${rowCount} rows x ${colCount} columns`,
         );
       }
       const rows: string[][] = [];
@@ -340,6 +573,152 @@ function decodePayload(msgType: number, payload: Buffer): Message {
   }
 }
 
+function encodeSyncStatus(status: WireSyncStatus): Buffer {
+  return Buffer.concat([
+    encodeString(status.replicaId),
+    Buffer.from([status.active ? 1 : 0]),
+    encodeOptionalU64(status.lastAppliedLsn),
+    u64LE(status.remoteLsn),
+    encodeOptionalU64(status.servableLsn),
+    encodeOptionalU64(status.unarchivedLsn),
+    encodeOptionalU64(status.lagLsn),
+    encodeOptionalU64(status.lagBytes),
+    encodeOptionalU64(status.lagMs),
+    Buffer.from([
+      status.stale ? 1 : 0,
+      encodeRepairAction(status.repairAction),
+    ]),
+    encodeOptionalString(status.lastSyncError),
+  ]);
+}
+
+function decodeSyncStatus(buf: Buffer, cursor: { pos: number }): WireSyncStatus {
+  const replicaId = decodeString(buf, cursor);
+  const active = readBool(buf, cursor, "sync status active");
+  const lastAppliedLsn = readOptionalU64(
+    buf,
+    cursor,
+    "sync status last applied LSN",
+  );
+  const remoteLsn = readU64(buf, cursor, "sync status remote LSN");
+  const servableLsn = readOptionalU64(buf, cursor, "sync status servable LSN");
+  const unarchivedLsn = readOptionalU64(
+    buf,
+    cursor,
+    "sync status unarchived LSN",
+  );
+  const lagLsn = readOptionalU64(buf, cursor, "sync status lag LSN");
+  const lagBytes = readOptionalU64(buf, cursor, "sync status lag bytes");
+  const lagMs = readOptionalU64(
+    buf,
+    cursor,
+    "sync status lag milliseconds",
+  );
+  const stale = readBool(buf, cursor, "sync status stale");
+  const repairAction = decodeRepairAction(
+    readU8(buf, cursor, "sync repair action"),
+  );
+  const lastSyncError = readOptionalString(
+    buf,
+    cursor,
+    "sync status last error",
+  );
+  return {
+    replicaId,
+    active,
+    lastAppliedLsn,
+    remoteLsn,
+    servableLsn,
+    unarchivedLsn,
+    lagLsn,
+    lagBytes,
+    lagMs,
+    stale,
+    repairAction,
+    lastSyncError,
+  };
+}
+
+function encodeRetainedUnit(unit: WireRetainedUnit): Buffer {
+  return Buffer.concat([
+    u64LE(unit.txId),
+    Buffer.from([u8(unit.recordType, "sync retained unit record type")]),
+    u64LE(unit.lsn),
+    encodeBytes(unit.data),
+  ]);
+}
+
+function decodeRetainedUnit(
+  buf: Buffer,
+  cursor: { pos: number },
+): WireRetainedUnit {
+  const txId = readU64(buf, cursor, "sync retained unit tx id");
+  const recordType = readU8(buf, cursor, "sync retained unit record type");
+  const lsn = readU64(buf, cursor, "sync retained unit LSN");
+  const data = readBytes(buf, cursor, "sync retained unit payload");
+  return { txId, recordType, lsn, data };
+}
+
+function encodeRepairAction(action: SyncRepairAction): number {
+  switch (action) {
+    case "none":
+      return 0;
+    case "pull":
+      return 1;
+    case "awaitArchive":
+      return 2;
+    case "rebootstrap":
+      return 3;
+  }
+}
+
+function decodeRepairAction(raw: number): SyncRepairAction {
+  switch (raw) {
+    case 0:
+      return "none";
+    case 1:
+      return "pull";
+    case 2:
+      return "awaitArchive";
+    case 3:
+      return "rebootstrap";
+    default:
+      throw new Error(`unknown sync repair action: ${raw}`);
+  }
+}
+
+function encodeOptionalU64(value: bigint | null): Buffer {
+  return value === null
+    ? Buffer.from([0])
+    : Buffer.concat([Buffer.from([1]), u64LE(value)]);
+}
+
+function readOptionalU64(
+  buf: Buffer,
+  cursor: { pos: number },
+  label: string,
+): bigint | null {
+  return readBool(buf, cursor, label) ? readU64(buf, cursor, label) : null;
+}
+
+function encodeOptionalString(value: string | null): Buffer {
+  return value === null
+    ? Buffer.from([0])
+    : Buffer.concat([Buffer.from([1]), encodeString(value)]);
+}
+
+function readOptionalString(
+  buf: Buffer,
+  cursor: { pos: number },
+  label: string,
+): string | null {
+  return readBool(buf, cursor, label) ? decodeString(buf, cursor) : null;
+}
+
+function encodeBytes(bytes: Buffer): Buffer {
+  return Buffer.concat([u32LE(bytes.length), bytes]);
+}
+
 // ───── String helpers ──────────────────────────────────────────────────────
 
 function encodeString(s: string): Buffer {
@@ -370,6 +749,13 @@ function readU8(buf: Buffer, cursor: { pos: number }, label: string): number {
   const value = buf.readUInt8(cursor.pos);
   cursor.pos += 1;
   return value;
+}
+
+function readBool(buf: Buffer, cursor: { pos: number }, label: string): boolean {
+  const raw = readU8(buf, cursor, label);
+  if (raw === 0) return false;
+  if (raw === 1) return true;
+  throw new Error(`invalid boolean for ${label}: ${raw}`);
 }
 
 function readI64(buf: Buffer, cursor: { pos: number }, label: string): bigint {
@@ -417,8 +803,49 @@ function readU64(buf: Buffer, cursor: { pos: number }, label: string): bigint {
   return value;
 }
 
+function readFixedBytes(
+  buf: Buffer,
+  cursor: { pos: number },
+  len: number,
+  label: string,
+): Buffer {
+  if (cursor.pos + len > buf.length) {
+    throw new Error(`truncated ${label}`);
+  }
+  const value = Buffer.from(buf.subarray(cursor.pos, cursor.pos + len));
+  cursor.pos += len;
+  return value;
+}
+
+function readBytes(buf: Buffer, cursor: { pos: number }, label: string): Buffer {
+  const len = readU32(buf, cursor, label);
+  return readFixedBytes(buf, cursor, len, label);
+}
+
+function u16LE(n: number): Buffer {
+  const b = Buffer.alloc(2);
+  b.writeUInt16LE(n, 0);
+  return b;
+}
+
+function u8(n: number, label: string): number {
+  if (!Number.isInteger(n) || n < 0 || n > 0xff) {
+    throw new Error(`${label} must fit in u8`);
+  }
+  return n;
+}
+
 function u32LE(n: number): Buffer {
   const b = Buffer.alloc(4);
   b.writeUInt32LE(n, 0);
+  return b;
+}
+
+function u64LE(n: bigint): Buffer {
+  if (n < 0n || n > 0xffff_ffff_ffff_ffffn) {
+    throw new Error(`u64 value out of range: ${n}`);
+  }
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64LE(n, 0);
   return b;
 }

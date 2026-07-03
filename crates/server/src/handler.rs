@@ -1,13 +1,19 @@
-use crate::metrics::{Metrics, QueryOutcome};
-use crate::protocol::{Message, WireParam};
+use crate::metrics::{Metrics, QueryOutcome, SyncOperation, SyncOutcome, SyncRepairLabel};
+use crate::protocol::{Message, WireParam, WireRetainedUnit, WireSyncRepairAction, WireSyncStatus};
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine};
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
 use powdb_query::sql;
 use powdb_storage::types::Value;
+use powdb_sync::{
+    acknowledge_replica_apply, read_identity, read_units_through, replica_sync_status,
+    retained_segments_dir, validate_retained_tail_available, validate_v1_retained_units_applyable,
+    ReplicaSyncStatus, RetainedUnit, SyncRepairAction, RETAINED_SEGMENT_FORMAT_VERSION,
+};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -31,6 +37,12 @@ pub fn new_tx_gate() -> TxGate {
 
 /// Maximum query text length accepted from the wire (1 MB).
 const MAX_QUERY_LENGTH: usize = 1024 * 1024;
+
+/// Server-side cap for private sync pull batches.
+const MAX_SYNC_PULL_UNITS: u32 = 4096;
+
+/// Server-side cap for retained-unit payload bytes in a private sync pull.
+const MAX_SYNC_PULL_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Maximum encoded response payload size (64 MB). The wire format is still a
 /// single frame today, so oversized result sets must fail cleanly instead of
@@ -369,6 +381,12 @@ fn dispatch_query(
     let mut eng = engine
         .write()
         .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+    if matches!(
+        parsed_transaction_control(&stmt_result),
+        Some(TransactionControl::Rollback)
+    ) {
+        return execute_rollback_preserving_sync_if_needed(&mut eng);
+    }
     eng.execute_powql(query)
 }
 
@@ -401,6 +419,12 @@ fn dispatch_sql_query(
     let mut eng = engine
         .write()
         .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+    if matches!(
+        parsed_transaction_control(&stmt_result),
+        Some(TransactionControl::Rollback)
+    ) {
+        return execute_rollback_preserving_sync_if_needed(&mut eng);
+    }
     eng.execute_sql(query)
 }
 
@@ -461,6 +485,18 @@ fn classify_params_transaction_control(
         .and_then(|stmt| transaction_control(&stmt))
 }
 
+fn parsed_transaction_control(
+    stmt_result: &Result<powdb_query::ast::Statement, String>,
+) -> Option<TransactionControl> {
+    stmt_result.as_ref().ok().and_then(transaction_control)
+}
+
+fn execute_rollback_preserving_sync_if_needed(
+    engine: &mut Engine,
+) -> Result<QueryResult, QueryError> {
+    engine.rollback_transaction_preserving_wal_archive()
+}
+
 fn dispatch_query_with_params(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
@@ -497,7 +533,878 @@ fn dispatch_query_with_params(
     let mut eng = engine
         .write()
         .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+    if matches!(
+        parsed_transaction_control(&stmt_result),
+        Some(TransactionControl::Rollback)
+    ) {
+        return execute_rollback_preserving_sync_if_needed(&mut eng);
+    }
     eng.execute_powql_with_params(query, &bound)
+}
+
+#[derive(Debug, Clone)]
+struct SyncPullRequest {
+    replica_id: String,
+    since_lsn: u64,
+    max_units: u32,
+    max_bytes: u64,
+    database_id: [u8; 16],
+    primary_generation: u64,
+    wal_format_version: u16,
+    catalog_version: u16,
+    segment_format_version: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncErrorClass {
+    AuthRequired,
+    PermissionDenied,
+    InvalidReplicaId,
+    ActiveTransaction,
+    QueryExecution,
+    InvalidMaxUnits,
+    InvalidMaxBytes,
+    SyncContext,
+    StatusRead,
+    CursorLsnMismatch,
+    IdentityRead,
+    IdentityOrFormatMismatch,
+    RetainedRead,
+    RetainedUnitEncoding,
+    RetainedChunkNotApplyable,
+    LsnAheadOfRemote,
+    AckValidation,
+    AckUpdate,
+    Internal,
+}
+
+impl SyncErrorClass {
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::AuthRequired => "auth_required",
+            Self::PermissionDenied => "permission_denied",
+            Self::InvalidReplicaId => "invalid_replica_id",
+            Self::ActiveTransaction => "active_transaction",
+            Self::QueryExecution => "query_execution",
+            Self::InvalidMaxUnits => "invalid_max_units",
+            Self::InvalidMaxBytes => "invalid_max_bytes",
+            Self::SyncContext => "sync_context",
+            Self::StatusRead => "status_read",
+            Self::CursorLsnMismatch => "cursor_lsn_mismatch",
+            Self::IdentityRead => "identity_read",
+            Self::IdentityOrFormatMismatch => "identity_or_format_mismatch",
+            Self::RetainedRead => "retained_read",
+            Self::RetainedUnitEncoding => "retained_unit_encoding",
+            Self::RetainedChunkNotApplyable => "retained_chunk_not_applyable",
+            Self::LsnAheadOfRemote => "lsn_ahead_of_remote",
+            Self::AckValidation => "ack_validation",
+            Self::AckUpdate => "ack_update",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncDecision {
+    message: Message,
+    error_class: Option<SyncErrorClass>,
+}
+
+impl SyncDecision {
+    fn ok(message: Message) -> Self {
+        Self {
+            message,
+            error_class: None,
+        }
+    }
+
+    fn error(class: SyncErrorClass, message: impl Into<String>) -> Self {
+        Self {
+            message: Message::Error {
+                message: message.into(),
+            },
+            error_class: Some(class),
+        }
+    }
+}
+
+fn check_sync_protocol_permitted(
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> Result<(), (SyncErrorClass, String)> {
+    if !credential_authenticated {
+        return Err((
+            SyncErrorClass::AuthRequired,
+            "sync protocol requires authentication".to_string(),
+        ));
+    }
+    if let Some(principal) = principal {
+        let allowed =
+            Role::builtin(&principal.role).is_some_and(|role| role.allows(Permission::Write));
+        if !allowed {
+            return Err((
+                SyncErrorClass::PermissionDenied,
+                format!(
+                    "permission denied: role '{}' cannot use sync protocol",
+                    principal.role
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_wire_replica_id(replica_id: &str) -> Result<(), String> {
+    if replica_id.is_empty() {
+        return Err("replica id must be non-empty".to_string());
+    }
+    if replica_id.len() > 128 {
+        return Err("replica id must be at most 128 bytes".to_string());
+    }
+    if !replica_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err("replica id contains unsupported characters".to_string());
+    }
+    Ok(())
+}
+
+fn sync_context(engine: &Arc<RwLock<Engine>>) -> Result<(PathBuf, u64), String> {
+    let engine = engine
+        .read()
+        .map_err(|e| format!("lock poisoned while reading sync context: {e}"))?;
+    let catalog = engine.catalog();
+    Ok((catalog.data_dir().to_path_buf(), catalog.max_lsn()))
+}
+
+fn wire_repair_action(action: SyncRepairAction) -> WireSyncRepairAction {
+    match action {
+        SyncRepairAction::None => WireSyncRepairAction::None,
+        SyncRepairAction::Pull => WireSyncRepairAction::Pull,
+        SyncRepairAction::AwaitArchive => WireSyncRepairAction::AwaitArchive,
+        SyncRepairAction::Rebootstrap => WireSyncRepairAction::Rebootstrap,
+    }
+}
+
+fn wire_sync_status(status: ReplicaSyncStatus) -> WireSyncStatus {
+    WireSyncStatus {
+        replica_id: status.replica_id,
+        active: status.active,
+        last_applied_lsn: status.last_applied_lsn,
+        remote_lsn: status.remote_lsn,
+        servable_lsn: status.servable_lsn,
+        unarchived_lsn: status.unarchived_lsn,
+        lag_lsn: status.lag_lsn,
+        lag_bytes: status.lag_bytes,
+        lag_ms: status.lag_ms,
+        stale: status.stale,
+        repair_action: wire_repair_action(status.repair_action),
+        last_sync_error: status.last_sync_error,
+    }
+}
+
+fn wire_retained_unit(unit: RetainedUnit) -> WireRetainedUnit {
+    WireRetainedUnit {
+        tx_id: unit.tx_id,
+        record_type: unit.record_type,
+        lsn: unit.lsn,
+        data: unit.data,
+    }
+}
+
+fn sync_operation_outcome(message: &Message) -> SyncOutcome {
+    match message {
+        Message::SyncStatusResult { .. }
+        | Message::SyncPullResult { .. }
+        | Message::SyncAckResult { .. } => SyncOutcome::Ok,
+        _ => SyncOutcome::Error,
+    }
+}
+
+fn sync_operation_label(operation: SyncOperation) -> &'static str {
+    match operation {
+        SyncOperation::Status => "status",
+        SyncOperation::Pull => "pull",
+        SyncOperation::Ack => "ack",
+    }
+}
+
+fn sync_pull_payload_bytes(units: &[WireRetainedUnit]) -> u64 {
+    units.iter().fold(0, |total, unit| {
+        total.saturating_add(unit.encoded_len().unwrap_or(0))
+    })
+}
+
+fn sync_repair_label(action: WireSyncRepairAction) -> SyncRepairLabel {
+    match action {
+        WireSyncRepairAction::None => SyncRepairLabel::None,
+        WireSyncRepairAction::Pull => SyncRepairLabel::Pull,
+        WireSyncRepairAction::AwaitArchive => SyncRepairLabel::AwaitArchive,
+        WireSyncRepairAction::Rebootstrap => SyncRepairLabel::Rebootstrap,
+    }
+}
+
+fn wire_repair_action_label(action: WireSyncRepairAction) -> &'static str {
+    match action {
+        WireSyncRepairAction::None => "none",
+        WireSyncRepairAction::Pull => "pull",
+        WireSyncRepairAction::AwaitArchive => "await_archive",
+        WireSyncRepairAction::Rebootstrap => "rebootstrap",
+    }
+}
+
+const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
+const INVALID_REPLICA_FINGERPRINT: &str = "invalid";
+
+fn replica_fingerprint(replica_id: &str) -> String {
+    let mut hash = FNV1A64_OFFSET;
+    for byte in replica_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+fn log_replica_fingerprint(replica_id: &str) -> String {
+    if validate_wire_replica_id(replica_id).is_ok() {
+        replica_fingerprint(replica_id)
+    } else {
+        INVALID_REPLICA_FINGERPRINT.to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncLogContext {
+    replica_fingerprint: String,
+    since_lsn: Option<u64>,
+    applied_lsn: Option<u64>,
+    observed_remote_lsn: Option<u64>,
+    max_units: Option<u32>,
+    max_bytes: Option<u64>,
+}
+
+impl SyncLogContext {
+    fn status(replica_id: &str) -> Self {
+        Self::base(replica_id)
+    }
+
+    fn pull(request: &SyncPullRequest) -> Self {
+        Self {
+            replica_fingerprint: log_replica_fingerprint(&request.replica_id),
+            since_lsn: Some(request.since_lsn),
+            applied_lsn: None,
+            observed_remote_lsn: None,
+            max_units: Some(request.max_units),
+            max_bytes: Some(request.max_bytes),
+        }
+    }
+
+    fn ack(replica_id: &str, applied_lsn: u64, observed_remote_lsn: u64) -> Self {
+        Self {
+            replica_fingerprint: log_replica_fingerprint(replica_id),
+            since_lsn: None,
+            applied_lsn: Some(applied_lsn),
+            observed_remote_lsn: Some(observed_remote_lsn),
+            max_units: None,
+            max_bytes: None,
+        }
+    }
+
+    fn base(replica_id: &str) -> Self {
+        Self {
+            replica_fingerprint: log_replica_fingerprint(replica_id),
+            since_lsn: None,
+            applied_lsn: None,
+            observed_remote_lsn: None,
+            max_units: None,
+            max_bytes: None,
+        }
+    }
+}
+
+struct SyncExecutionContext<'a> {
+    tx_gate: TxGate,
+    connection_has_transaction: bool,
+    operation: SyncOperation,
+    log_context: SyncLogContext,
+    metrics: &'a Arc<Metrics>,
+    query_timeout: Duration,
+}
+
+fn log_sync_decision(
+    operation: SyncOperation,
+    context: &SyncLogContext,
+    elapsed: Duration,
+    decision: &SyncDecision,
+) {
+    let operation = sync_operation_label(operation);
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+    match &decision.message {
+        Message::SyncStatusResult { status } => {
+            let repair_action = wire_repair_action_label(status.repair_action);
+            if status.stale || status.repair_action != WireSyncRepairAction::None {
+                info!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    remote_lsn = status.remote_lsn,
+                    last_applied_lsn = ?status.last_applied_lsn,
+                    servable_lsn = ?status.servable_lsn,
+                    unarchived_lsn = ?status.unarchived_lsn,
+                    lag_lsn = ?status.lag_lsn,
+                    lag_bytes = ?status.lag_bytes,
+                    lag_ms = ?status.lag_ms,
+                    stale = status.stale,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            } else {
+                debug!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    remote_lsn = status.remote_lsn,
+                    last_applied_lsn = ?status.last_applied_lsn,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            }
+        }
+        Message::SyncPullResult {
+            status,
+            units,
+            has_more,
+        } => {
+            let repair_action = wire_repair_action_label(status.repair_action);
+            let units_len = units.len();
+            let payload_bytes = sync_pull_payload_bytes(units);
+            if *has_more || status.stale || status.repair_action != WireSyncRepairAction::None {
+                info!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    since_lsn = ?context.since_lsn,
+                    max_units = ?context.max_units,
+                    max_bytes = ?context.max_bytes,
+                    units = units_len,
+                    payload_bytes,
+                    has_more = *has_more,
+                    remote_lsn = status.remote_lsn,
+                    last_applied_lsn = ?status.last_applied_lsn,
+                    servable_lsn = ?status.servable_lsn,
+                    unarchived_lsn = ?status.unarchived_lsn,
+                    lag_lsn = ?status.lag_lsn,
+                    stale = status.stale,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            } else {
+                debug!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    since_lsn = ?context.since_lsn,
+                    units = units_len,
+                    payload_bytes,
+                    has_more = *has_more,
+                    remote_lsn = status.remote_lsn,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            }
+        }
+        Message::SyncAckResult {
+            previous_applied_lsn,
+            applied_lsn,
+            remote_lsn,
+            advanced,
+            status,
+        } => {
+            let repair_action = wire_repair_action_label(status.repair_action);
+            if *advanced || status.stale || status.repair_action != WireSyncRepairAction::None {
+                info!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    requested_applied_lsn = ?context.applied_lsn,
+                    observed_remote_lsn = ?context.observed_remote_lsn,
+                    previous_applied_lsn = *previous_applied_lsn,
+                    applied_lsn = *applied_lsn,
+                    remote_lsn = *remote_lsn,
+                    advanced = *advanced,
+                    stale = status.stale,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            } else {
+                debug!(
+                    operation = operation,
+                    replica_fingerprint = %context.replica_fingerprint,
+                    requested_applied_lsn = ?context.applied_lsn,
+                    previous_applied_lsn = *previous_applied_lsn,
+                    applied_lsn = *applied_lsn,
+                    remote_lsn = *remote_lsn,
+                    advanced = *advanced,
+                    repair_action,
+                    elapsed_ms,
+                    "sync decision"
+                );
+            }
+        }
+        Message::Error { .. } => {
+            warn!(
+                operation = operation,
+                replica_fingerprint = %context.replica_fingerprint,
+                since_lsn = ?context.since_lsn,
+                applied_lsn = ?context.applied_lsn,
+                observed_remote_lsn = ?context.observed_remote_lsn,
+                max_units = ?context.max_units,
+                max_bytes = ?context.max_bytes,
+                error_class = decision
+                    .error_class
+                    .unwrap_or(SyncErrorClass::Internal)
+                    .as_label(),
+                elapsed_ms,
+                "sync decision rejected"
+            );
+        }
+        _ => {
+            debug!(
+                operation = operation,
+                replica_fingerprint = %context.replica_fingerprint,
+                elapsed_ms,
+                "unexpected sync decision response"
+            );
+        }
+    }
+}
+
+fn trim_to_applyable_v1_prefix(
+    raw_units: &mut Vec<RetainedUnit>,
+    wire_units: &mut Vec<WireRetainedUnit>,
+) -> Result<(), String> {
+    let mut last_error = None;
+    while !raw_units.is_empty() {
+        match validate_v1_retained_units_applyable(raw_units) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err.to_string());
+                raw_units.pop();
+                wire_units.pop();
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(format!(
+            "sync pull cannot serve an applyable V1 retained chunk with current limits: {error}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sync_ack_applyable_boundary(
+    data_dir: &Path,
+    replica_id: &str,
+    applied_lsn: u64,
+    remote_lsn: u64,
+) -> Result<(), String> {
+    let status =
+        replica_sync_status(data_dir, replica_id, remote_lsn).map_err(|err| err.to_string())?;
+    let Some(previous_lsn) = status.last_applied_lsn else {
+        return Ok(());
+    };
+    if applied_lsn <= previous_lsn {
+        return Ok(());
+    }
+    let range_len = applied_lsn - previous_lsn;
+    if range_len > u64::from(MAX_SYNC_PULL_UNITS) {
+        return Err(format!(
+            "sync ack range contains {range_len} units; acknowledge ranges no larger than {MAX_SYNC_PULL_UNITS}"
+        ));
+    }
+    let max_units =
+        usize::try_from(range_len).map_err(|_| "sync ack range is too large to validate")?;
+    let identity = read_identity(data_dir).map_err(|err| err.to_string())?;
+    let segment_dir = retained_segments_dir(data_dir);
+    let units = read_units_through(
+        &segment_dir,
+        identity.segment_identity(),
+        previous_lsn,
+        applied_lsn,
+        max_units,
+    )
+    .map_err(|err| err.to_string())?;
+    if units.len() != max_units || units.last().map(|unit| unit.lsn) != Some(applied_lsn) {
+        return Err(
+            "sync ack does not cover a complete retained-unit range; rebootstrap required".into(),
+        );
+    }
+    validate_v1_retained_units_applyable(&units).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+fn dispatch_sync_status(
+    engine: &Arc<RwLock<Engine>>,
+    replica_id: String,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> Message {
+    dispatch_sync_status_decision(engine, replica_id, credential_authenticated, principal).message
+}
+
+fn dispatch_sync_status_decision(
+    engine: &Arc<RwLock<Engine>>,
+    replica_id: String,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> SyncDecision {
+    if let Err((class, message)) =
+        check_sync_protocol_permitted(credential_authenticated, principal)
+    {
+        return SyncDecision::error(class, message);
+    }
+    if let Err(message) = validate_wire_replica_id(&replica_id) {
+        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
+    }
+    let (data_dir, remote_lsn) = match sync_context(engine) {
+        Ok(context) => context,
+        Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
+    };
+    match replica_sync_status(&data_dir, &replica_id, remote_lsn) {
+        Ok(status) => SyncDecision::ok(Message::SyncStatusResult {
+            status: wire_sync_status(status),
+        }),
+        Err(err) => SyncDecision::error(SyncErrorClass::StatusRead, err.to_string()),
+    }
+}
+
+#[cfg(test)]
+fn dispatch_sync_pull(
+    engine: &Arc<RwLock<Engine>>,
+    request: SyncPullRequest,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> Message {
+    dispatch_sync_pull_decision(engine, request, credential_authenticated, principal).message
+}
+
+fn dispatch_sync_pull_decision(
+    engine: &Arc<RwLock<Engine>>,
+    request: SyncPullRequest,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> SyncDecision {
+    if let Err((class, message)) =
+        check_sync_protocol_permitted(credential_authenticated, principal)
+    {
+        return SyncDecision::error(class, message);
+    }
+    if let Err(message) = validate_wire_replica_id(&request.replica_id) {
+        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
+    }
+    if request.max_units == 0 || request.max_units > MAX_SYNC_PULL_UNITS {
+        return SyncDecision::error(
+            SyncErrorClass::InvalidMaxUnits,
+            format!("sync pull maxUnits must be between 1 and {MAX_SYNC_PULL_UNITS}"),
+        );
+    }
+    if request.max_bytes == 0 || request.max_bytes > MAX_SYNC_PULL_BYTES {
+        return SyncDecision::error(
+            SyncErrorClass::InvalidMaxBytes,
+            format!("sync pull maxBytes must be between 1 and {MAX_SYNC_PULL_BYTES}"),
+        );
+    }
+
+    let (data_dir, remote_lsn) = match sync_context(engine) {
+        Ok(context) => context,
+        Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
+    };
+    let status = match replica_sync_status(&data_dir, &request.replica_id, remote_lsn) {
+        Ok(status) => status,
+        Err(err) => {
+            return SyncDecision::error(SyncErrorClass::StatusRead, err.to_string());
+        }
+    };
+    let Some(cursor_lsn) = status.last_applied_lsn else {
+        return SyncDecision::ok(Message::SyncPullResult {
+            status: wire_sync_status(status),
+            units: Vec::new(),
+            has_more: false,
+        });
+    };
+    if status.repair_action != SyncRepairAction::Pull {
+        return SyncDecision::ok(Message::SyncPullResult {
+            status: wire_sync_status(status),
+            units: Vec::new(),
+            has_more: false,
+        });
+    }
+    if request.since_lsn != cursor_lsn {
+        return SyncDecision::error(
+            SyncErrorClass::CursorLsnMismatch,
+            format!(
+                "sync pull sinceLsn {} does not match primary cursor LSN {cursor_lsn}",
+                request.since_lsn
+            ),
+        );
+    }
+
+    let identity = match read_identity(&data_dir) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return SyncDecision::error(SyncErrorClass::IdentityRead, err.to_string());
+        }
+    };
+    let expected = identity.segment_identity();
+    if request.database_id != expected.database_id
+        || request.primary_generation != expected.primary_generation
+        || request.wal_format_version != expected.wal_format_version
+        || request.catalog_version != expected.catalog_version
+        || request.segment_format_version != RETAINED_SEGMENT_FORMAT_VERSION
+    {
+        return SyncDecision::error(
+            SyncErrorClass::IdentityOrFormatMismatch,
+            "sync pull identity or format version mismatch; rebootstrap required",
+        );
+    }
+
+    let effective_max_units = request.max_units.min(MAX_SYNC_PULL_UNITS) as usize;
+    let requested_through_lsn = request
+        .since_lsn
+        .saturating_add(request.max_units as u64)
+        .min(remote_lsn)
+        .min(status.servable_lsn.unwrap_or(request.since_lsn));
+    let segment_dir = retained_segments_dir(&data_dir);
+    if requested_through_lsn > request.since_lsn {
+        if let Err(err) = validate_retained_tail_available(
+            &segment_dir,
+            expected,
+            request.since_lsn,
+            requested_through_lsn,
+        ) {
+            let mut rebootstrap_status = status;
+            rebootstrap_status.stale = true;
+            rebootstrap_status.repair_action = SyncRepairAction::Rebootstrap;
+            rebootstrap_status.last_sync_error = Some(format!(
+                "retained history is unavailable; rebootstrap required: {err}"
+            ));
+            return SyncDecision::ok(Message::SyncPullResult {
+                status: wire_sync_status(rebootstrap_status),
+                units: Vec::new(),
+                has_more: false,
+            });
+        }
+    }
+
+    let raw_units = match read_units_through(
+        &segment_dir,
+        expected,
+        request.since_lsn,
+        requested_through_lsn,
+        effective_max_units,
+    ) {
+        Ok(units) => units,
+        Err(err) => {
+            return SyncDecision::error(SyncErrorClass::RetainedRead, err.to_string());
+        }
+    };
+
+    let mut selected_raw = Vec::new();
+    let mut selected = Vec::new();
+    let mut selected_bytes = 0u64;
+    for unit in raw_units {
+        let wire_unit = wire_retained_unit(unit.clone());
+        let unit_bytes = match wire_unit.encoded_len() {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                return SyncDecision::error(SyncErrorClass::RetainedUnitEncoding, message);
+            }
+        };
+        if selected_bytes.saturating_add(unit_bytes) > request.max_bytes {
+            if selected.is_empty() {
+                return SyncDecision::error(
+                    SyncErrorClass::InvalidMaxBytes,
+                    "sync pull maxBytes is too small for the next retained unit",
+                );
+            }
+            break;
+        }
+        selected_bytes += unit_bytes;
+        selected_raw.push(unit);
+        selected.push(wire_unit);
+    }
+    if let Err(message) = trim_to_applyable_v1_prefix(&mut selected_raw, &mut selected) {
+        return SyncDecision::error(SyncErrorClass::RetainedChunkNotApplyable, message);
+    }
+
+    let fetchable_through_lsn = status.servable_lsn.unwrap_or(remote_lsn).min(remote_lsn);
+    let has_more = selected
+        .last()
+        .is_some_and(|unit| unit.lsn < fetchable_through_lsn);
+    SyncDecision::ok(Message::SyncPullResult {
+        status: wire_sync_status(status),
+        units: selected,
+        has_more,
+    })
+}
+
+#[cfg(test)]
+fn dispatch_sync_ack(
+    engine: &Arc<RwLock<Engine>>,
+    replica_id: String,
+    applied_lsn: u64,
+    observed_remote_lsn: u64,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> Message {
+    dispatch_sync_ack_decision(
+        engine,
+        replica_id,
+        applied_lsn,
+        observed_remote_lsn,
+        credential_authenticated,
+        principal,
+    )
+    .message
+}
+
+fn dispatch_sync_ack_decision(
+    engine: &Arc<RwLock<Engine>>,
+    replica_id: String,
+    applied_lsn: u64,
+    observed_remote_lsn: u64,
+    credential_authenticated: bool,
+    principal: Option<&Principal>,
+) -> SyncDecision {
+    if let Err((class, message)) =
+        check_sync_protocol_permitted(credential_authenticated, principal)
+    {
+        return SyncDecision::error(class, message);
+    }
+    if let Err(message) = validate_wire_replica_id(&replica_id) {
+        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
+    }
+    if applied_lsn > observed_remote_lsn {
+        return SyncDecision::error(
+            SyncErrorClass::LsnAheadOfRemote,
+            format!(
+                "sync ack appliedLsn {applied_lsn} is ahead of observed remoteLsn {observed_remote_lsn}"
+            ),
+        );
+    }
+    let (data_dir, remote_lsn) = match sync_context(engine) {
+        Ok(context) => context,
+        Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
+    };
+    if observed_remote_lsn > remote_lsn {
+        return SyncDecision::error(
+            SyncErrorClass::LsnAheadOfRemote,
+            format!(
+                "sync ack remoteLsn {observed_remote_lsn} is ahead of primary LSN {remote_lsn}"
+            ),
+        );
+    }
+    if let Err(message) =
+        validate_sync_ack_applyable_boundary(&data_dir, &replica_id, applied_lsn, remote_lsn)
+    {
+        return SyncDecision::error(SyncErrorClass::AckValidation, message);
+    }
+    match acknowledge_replica_apply(&data_dir, &replica_id, applied_lsn, remote_lsn) {
+        Ok(summary) => SyncDecision::ok(Message::SyncAckResult {
+            previous_applied_lsn: summary.previous_applied_lsn,
+            applied_lsn: summary.applied_lsn,
+            remote_lsn: summary.remote_lsn,
+            advanced: summary.advanced,
+            status: wire_sync_status(summary.status),
+        }),
+        Err(err) => SyncDecision::error(SyncErrorClass::AckUpdate, err.to_string()),
+    }
+}
+
+async fn run_blocking_sync<T, F>(input: T, query_timeout: Duration, f: F) -> SyncDecision
+where
+    T: Send + 'static,
+    F: FnOnce(T) -> SyncDecision + Send + 'static,
+{
+    let mut handle = tokio::task::spawn_blocking(move || f(input));
+    tokio::select! {
+        result = &mut handle => match result {
+            Ok(decision) => decision,
+            Err(err) => SyncDecision::error(SyncErrorClass::Internal, format!("internal error: {err}")),
+        },
+        _ = tokio::time::sleep(query_timeout) => match handle.await {
+            Ok(decision) => decision,
+            Err(err) => SyncDecision::error(SyncErrorClass::Internal, format!("internal error: {err}")),
+        },
+    }
+}
+
+async fn execute_gated_sync<T, F>(context: SyncExecutionContext<'_>, input: T, f: F) -> Message
+where
+    T: Send + 'static,
+    F: FnOnce(T) -> SyncDecision + Send + 'static,
+{
+    let SyncExecutionContext {
+        tx_gate,
+        connection_has_transaction,
+        operation,
+        log_context,
+        metrics,
+        query_timeout,
+    } = context;
+    let start = Instant::now();
+    if connection_has_transaction {
+        let decision = SyncDecision::error(
+            SyncErrorClass::ActiveTransaction,
+            "sync protocol is unavailable inside an active transaction",
+        );
+        let elapsed = start.elapsed();
+        log_sync_decision(operation, &log_context, elapsed, &decision);
+        metrics.record_sync_operation(operation, elapsed, SyncOutcome::Error);
+        return decision.message;
+    }
+
+    let permit = match tx_gate.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            let decision =
+                SyncDecision::error(SyncErrorClass::QueryExecution, "query execution error");
+            let elapsed = start.elapsed();
+            log_sync_decision(operation, &log_context, elapsed, &decision);
+            metrics.record_sync_operation(operation, elapsed, SyncOutcome::Error);
+            return decision.message;
+        }
+    };
+    let decision = run_blocking_sync(input, query_timeout, f).await;
+    drop(permit);
+    match &decision.message {
+        Message::SyncStatusResult { status } => {
+            metrics.record_sync_repair_action(operation, sync_repair_label(status.repair_action));
+        }
+        Message::SyncPullResult { status, units, .. } => {
+            metrics.record_sync_repair_action(operation, sync_repair_label(status.repair_action));
+            metrics.record_sync_pull_payload(units.len() as u64, sync_pull_payload_bytes(units));
+        }
+        Message::SyncAckResult {
+            advanced, status, ..
+        } => {
+            metrics.record_sync_repair_action(operation, sync_repair_label(status.repair_action));
+            if *advanced {
+                metrics.inc_sync_ack_advanced();
+            }
+        }
+        _ => {}
+    }
+    let elapsed = start.elapsed();
+    log_sync_decision(operation, &log_context, elapsed, &decision);
+    metrics.record_sync_operation(
+        operation,
+        elapsed,
+        sync_operation_outcome(&decision.message),
+    );
+    decision.message
 }
 
 async fn execute_wire_query(
@@ -917,6 +1824,7 @@ where
     // The authenticated identity for this connection. Bound at connect time
     // and enforced on every query by `dispatch_query`.
     let principal: Option<Principal>;
+    let credential_auth_configured = !users.is_empty() || expected_password.is_some();
     match connect_msg {
         Message::Connect {
             db_name,
@@ -1104,6 +2012,122 @@ where
                     response
                 }
             }
+            Message::SyncStatus { replica_id } => {
+                let engine = engine.clone();
+                let principal = principal.clone();
+                let log_context = SyncLogContext::status(&replica_id);
+                execute_gated_sync(
+                    SyncExecutionContext {
+                        tx_gate: tx_gate.clone(),
+                        connection_has_transaction: tx_permit.is_some(),
+                        operation: SyncOperation::Status,
+                        log_context,
+                        metrics: &metrics,
+                        query_timeout,
+                    },
+                    (engine, replica_id, credential_auth_configured, principal),
+                    |(engine, replica_id, credential_authenticated, principal)| {
+                        dispatch_sync_status_decision(
+                            &engine,
+                            replica_id,
+                            credential_authenticated,
+                            principal.as_ref(),
+                        )
+                    },
+                )
+                .await
+            }
+            Message::SyncPull {
+                replica_id,
+                since_lsn,
+                max_units,
+                max_bytes,
+                database_id,
+                primary_generation,
+                wal_format_version,
+                catalog_version,
+                segment_format_version,
+            } => {
+                let engine = engine.clone();
+                let principal = principal.clone();
+                let request = SyncPullRequest {
+                    replica_id,
+                    since_lsn,
+                    max_units,
+                    max_bytes,
+                    database_id,
+                    primary_generation,
+                    wal_format_version,
+                    catalog_version,
+                    segment_format_version,
+                };
+                let log_context = SyncLogContext::pull(&request);
+                execute_gated_sync(
+                    SyncExecutionContext {
+                        tx_gate: tx_gate.clone(),
+                        connection_has_transaction: tx_permit.is_some(),
+                        operation: SyncOperation::Pull,
+                        log_context,
+                        metrics: &metrics,
+                        query_timeout,
+                    },
+                    (engine, request, credential_auth_configured, principal),
+                    |(engine, request, credential_authenticated, principal)| {
+                        dispatch_sync_pull_decision(
+                            &engine,
+                            request,
+                            credential_authenticated,
+                            principal.as_ref(),
+                        )
+                    },
+                )
+                .await
+            }
+            Message::SyncAck {
+                replica_id,
+                applied_lsn,
+                remote_lsn,
+            } => {
+                let engine = engine.clone();
+                let principal = principal.clone();
+                let log_context = SyncLogContext::ack(&replica_id, applied_lsn, remote_lsn);
+                execute_gated_sync(
+                    SyncExecutionContext {
+                        tx_gate: tx_gate.clone(),
+                        connection_has_transaction: tx_permit.is_some(),
+                        operation: SyncOperation::Ack,
+                        log_context,
+                        metrics: &metrics,
+                        query_timeout,
+                    },
+                    (
+                        engine,
+                        replica_id,
+                        applied_lsn,
+                        remote_lsn,
+                        credential_auth_configured,
+                        principal,
+                    ),
+                    |(
+                        engine,
+                        replica_id,
+                        applied_lsn,
+                        observed_remote_lsn,
+                        credential_authenticated,
+                        principal,
+                    )| {
+                        dispatch_sync_ack_decision(
+                            &engine,
+                            replica_id,
+                            applied_lsn,
+                            observed_remote_lsn,
+                            credential_authenticated,
+                            principal.as_ref(),
+                        )
+                    },
+                )
+                .await
+            }
             Message::Disconnect => {
                 debug!(peer = %peer, "received DISCONNECT");
                 break;
@@ -1193,6 +2217,11 @@ fn value_to_display(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use powdb_storage::wal::WalRecordType;
+    use powdb_sync::{
+        write_identity_snapshot, write_segment_atomic, DatabaseIdentity, IdentitySnapshot,
+        ReplicaCursor, RetainedSegment, RetainedUnit,
+    };
 
     // ---- Wire NULL rendering (Fix: remote protocol rendered NULL as `{}`) ----
 
@@ -1444,5 +2473,585 @@ mod tests {
             authenticate_connect(&s, Some("shared"), None, Some("shared")),
             AuthOutcome::Rejected
         );
+    }
+
+    #[test]
+    fn replica_fingerprint_is_stable_and_redacted() {
+        let replica_id = "customer-prod-replica-a";
+        let fingerprint = replica_fingerprint(replica_id);
+        assert_eq!(fingerprint, replica_fingerprint(replica_id));
+        assert_eq!(fingerprint, log_replica_fingerprint(replica_id));
+        assert_ne!(fingerprint, replica_fingerprint("customer-prod-replica-b"));
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!fingerprint.contains("customer"));
+        assert!(!fingerprint.contains("replica"));
+        assert!(!fingerprint.contains(replica_id));
+    }
+
+    #[test]
+    fn invalid_replica_ids_use_fixed_log_fingerprint() {
+        assert_eq!(log_replica_fingerprint(""), INVALID_REPLICA_FINGERPRINT);
+        assert_eq!(
+            log_replica_fingerprint("customer/prod/replica"),
+            INVALID_REPLICA_FINGERPRINT
+        );
+        assert_eq!(
+            log_replica_fingerprint(&"a".repeat(4096)),
+            INVALID_REPLICA_FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn sync_error_classes_use_bounded_labels() {
+        assert_eq!(SyncErrorClass::AuthRequired.as_label(), "auth_required");
+        assert_eq!(
+            SyncErrorClass::PermissionDenied.as_label(),
+            "permission_denied"
+        );
+        assert_eq!(
+            SyncErrorClass::IdentityOrFormatMismatch.as_label(),
+            "identity_or_format_mismatch"
+        );
+        assert_eq!(SyncErrorClass::AckValidation.as_label(), "ack_validation");
+        assert_eq!(SyncErrorClass::Internal.as_label(), "internal");
+    }
+
+    fn sync_identity() -> DatabaseIdentity {
+        DatabaseIdentity {
+            database_id: *b"server-sync-test",
+            primary_generation: 1,
+        }
+    }
+
+    fn retained_unit(lsn: u64) -> RetainedUnit {
+        RetainedUnit {
+            tx_id: 1,
+            record_type: 4,
+            lsn,
+            data: lsn.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn retained_unit_with(tx_id: u64, record_type: WalRecordType, lsn: u64) -> RetainedUnit {
+        RetainedUnit {
+            tx_id,
+            record_type: record_type as u8,
+            lsn,
+            data: lsn.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn write_sync_identity_and_tail(data_dir: &std::path::Path, through_lsn: u64) {
+        let identity = sync_identity();
+        write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
+        let units = (1..=through_lsn).map(retained_unit).collect();
+        let segment = RetainedSegment::new(identity.segment_identity(), units).unwrap();
+        write_segment_atomic(&retained_segments_dir(data_dir), &segment).unwrap();
+    }
+
+    fn write_sync_identity_and_units(data_dir: &std::path::Path, units: Vec<RetainedUnit>) {
+        let identity = sync_identity();
+        write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
+        let segment = RetainedSegment::new(identity.segment_identity(), units).unwrap();
+        write_segment_atomic(&retained_segments_dir(data_dir), &segment).unwrap();
+    }
+
+    fn write_sync_identity_only(data_dir: &std::path::Path) {
+        let identity = sync_identity();
+        write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
+    }
+
+    fn admin_principal() -> Principal {
+        Principal {
+            name: "admin".into(),
+            role: "admin".into(),
+        }
+    }
+
+    #[test]
+    fn sync_protocol_requires_credential_auth_and_rejects_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(RwLock::new(Engine::new(dir.path()).unwrap()));
+
+        match dispatch_sync_status(&engine, "replica-a".into(), false, None) {
+            Message::Error { message } => {
+                assert!(message.contains("requires authentication"));
+            }
+            other => panic!("expected auth error, got {other:?}"),
+        }
+
+        let readonly = Principal {
+            name: "reader".into(),
+            role: "readonly".into(),
+        };
+        match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&readonly)) {
+            Message::Error { message } => {
+                assert!(message.contains("permission denied"));
+            }
+            other => panic!("expected permission error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_status_pull_and_ack_use_server_remote_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int, v: str }")
+            .unwrap();
+        engine
+            .execute_powql(r#"insert SyncT { id := 1, v := "one" }"#)
+            .unwrap();
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn > 0);
+        write_sync_identity_and_tail(dir.path(), remote_lsn);
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let status = match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal))
+        {
+            Message::SyncStatusResult { status } => status,
+            other => panic!("expected sync status, got {other:?}"),
+        };
+        assert_eq!(status.remote_lsn, remote_lsn);
+        assert_eq!(status.servable_lsn, Some(remote_lsn));
+        assert_eq!(status.unarchived_lsn, Some(0));
+        assert_eq!(status.last_applied_lsn, Some(0));
+        assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+        assert!(status.stale);
+
+        let identity = sync_identity().segment_identity();
+        let pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: MAX_SYNC_PULL_UNITS,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        let units = match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+                assert!(!has_more);
+                units
+            }
+            other => panic!("expected sync pull result, got {other:?}"),
+        };
+        assert_eq!(units.len() as u64, remote_lsn);
+        assert_eq!(units.last().unwrap().lsn, remote_lsn);
+
+        let ack = match dispatch_sync_ack(
+            &engine,
+            "replica-a".into(),
+            remote_lsn,
+            remote_lsn,
+            true,
+            Some(&principal),
+        ) {
+            Message::SyncAckResult {
+                previous_applied_lsn,
+                applied_lsn,
+                remote_lsn: ack_remote_lsn,
+                advanced,
+                status,
+            } => {
+                assert_eq!(previous_applied_lsn, 0);
+                assert_eq!(applied_lsn, remote_lsn);
+                assert_eq!(ack_remote_lsn, remote_lsn);
+                assert!(advanced);
+                status
+            }
+            other => panic!("expected sync ack result, got {other:?}"),
+        };
+        assert_eq!(ack.repair_action, WireSyncRepairAction::None);
+        assert!(!ack.stale);
+        assert_eq!(ack.lag_lsn, Some(0));
+    }
+
+    #[test]
+    fn sync_pull_and_ack_reject_transaction_cut_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        for id in 1..=3 {
+            engine
+                .execute_powql(&format!("insert SyncT {{ id := {id} }}"))
+                .unwrap();
+        }
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn >= 3);
+        write_sync_identity_and_units(
+            dir.path(),
+            vec![
+                retained_unit_with(77, WalRecordType::Begin, 1),
+                retained_unit_with(77, WalRecordType::Insert, 2),
+                retained_unit_with(77, WalRecordType::Commit, 3),
+            ],
+        );
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+        let cut_pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: 2,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        match dispatch_sync_pull(&engine, cut_pull, true, Some(&principal)) {
+            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            other => panic!("expected transaction-cut pull error, got {other:?}"),
+        }
+
+        let cut_bytes_pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: 3,
+            max_bytes: 58,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        match dispatch_sync_pull(&engine, cut_bytes_pull, true, Some(&principal)) {
+            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            other => panic!("expected byte-capped transaction-cut pull error, got {other:?}"),
+        }
+
+        let full_pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: 3,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        match dispatch_sync_pull(&engine, full_pull, true, Some(&principal)) {
+            Message::SyncPullResult { units, .. } => {
+                assert_eq!(units.len(), 3);
+                assert_eq!(units.last().unwrap().lsn, 3);
+            }
+            other => panic!("expected complete transaction pull, got {other:?}"),
+        }
+
+        match dispatch_sync_ack(
+            &engine,
+            "replica-a".into(),
+            2,
+            remote_lsn,
+            true,
+            Some(&principal),
+        ) {
+            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            other => panic!("expected transaction-cut ack error, got {other:?}"),
+        }
+        let cursor = powdb_sync::read_replica_cursors(dir.path()).unwrap();
+        assert_eq!(cursor[0].applied_lsn, 0);
+
+        match dispatch_sync_ack(
+            &engine,
+            "replica-a".into(),
+            3,
+            remote_lsn,
+            true,
+            Some(&principal),
+        ) {
+            Message::SyncAckResult {
+                previous_applied_lsn,
+                applied_lsn,
+                advanced,
+                ..
+            } => {
+                assert_eq!(previous_applied_lsn, 0);
+                assert_eq!(applied_lsn, 3);
+                assert!(advanced);
+            }
+            other => panic!("expected complete transaction ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pull_byte_cap_returns_applyable_prefix_with_reused_tx_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        for id in 1..=6 {
+            engine
+                .execute_powql(&format!("insert SyncT {{ id := {id} }}"))
+                .unwrap();
+        }
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn >= 6);
+        write_sync_identity_and_units(
+            dir.path(),
+            vec![
+                retained_unit_with(1, WalRecordType::Begin, 1),
+                retained_unit_with(1, WalRecordType::Insert, 2),
+                retained_unit_with(1, WalRecordType::Commit, 3),
+                retained_unit_with(1, WalRecordType::Begin, 4),
+                retained_unit_with(1, WalRecordType::Insert, 5),
+                retained_unit_with(1, WalRecordType::Commit, 6),
+            ],
+        );
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+        let pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: 6,
+            max_bytes: 100,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+                assert_eq!(units.len(), 3);
+                assert_eq!(units.last().unwrap().lsn, 3);
+                assert!(has_more);
+            }
+            other => panic!("expected byte-capped applyable prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pull_never_serves_units_beyond_server_remote_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert SyncT { id := 1 }").unwrap();
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn > 0);
+        write_sync_identity_and_tail(dir.path(), remote_lsn + 2);
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+        let pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: MAX_SYNC_PULL_UNITS,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                assert_eq!(status.remote_lsn, remote_lsn);
+                assert_eq!(status.servable_lsn, Some(remote_lsn));
+                assert_eq!(status.unarchived_lsn, Some(0));
+                assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+                assert!(!has_more);
+                assert_eq!(units.len() as u64, remote_lsn);
+                assert_eq!(units.last().unwrap().lsn, remote_lsn);
+                assert!(units.iter().all(|unit| unit.lsn <= remote_lsn));
+            }
+            other => panic!("expected capped sync pull result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_status_reports_await_archive_when_primary_outruns_retained_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert SyncT { id := 1 }").unwrap();
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn > 0);
+        write_sync_identity_only(dir.path());
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+        let status = match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal))
+        {
+            Message::SyncStatusResult { status } => status,
+            other => panic!("expected sync status, got {other:?}"),
+        };
+        assert_eq!(status.remote_lsn, remote_lsn);
+        assert_eq!(status.servable_lsn, Some(0));
+        assert_eq!(status.unarchived_lsn, Some(remote_lsn));
+        assert_eq!(status.repair_action, WireSyncRepairAction::AwaitArchive);
+        assert!(status
+            .last_sync_error
+            .as_deref()
+            .unwrap()
+            .contains("not yet archived"));
+
+        let pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: MAX_SYNC_PULL_UNITS,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                assert_eq!(status.repair_action, WireSyncRepairAction::AwaitArchive);
+                assert!(units.is_empty());
+                assert!(!has_more);
+            }
+            other => panic!("expected await-archive sync pull result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pull_serves_partial_retained_prefix_when_archive_lags_remote_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert SyncT { id := 1 }").unwrap();
+        engine.execute_powql("insert SyncT { id := 2 }").unwrap();
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn > 1);
+        let servable_lsn = remote_lsn - 1;
+        write_sync_identity_and_tail(dir.path(), servable_lsn);
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+        let pull = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: MAX_SYNC_PULL_UNITS,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult {
+                status,
+                units,
+                has_more,
+            } => {
+                assert_eq!(status.remote_lsn, remote_lsn);
+                assert_eq!(status.servable_lsn, Some(servable_lsn));
+                assert_eq!(status.unarchived_lsn, Some(1));
+                assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+                assert!(!has_more);
+                assert_eq!(units.len() as u64, servable_lsn);
+                assert_eq!(units.last().unwrap().lsn, servable_lsn);
+                assert!(units.iter().all(|unit| unit.lsn <= servable_lsn));
+            }
+            other => panic!("expected partial sync pull result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_pull_rejects_cursor_or_format_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type SyncT { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert SyncT { id := 1 }").unwrap();
+        let remote_lsn = engine.catalog().max_lsn();
+        write_sync_identity_and_tail(dir.path(), remote_lsn);
+        powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+        let identity = sync_identity().segment_identity();
+
+        let wrong_cursor = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 1,
+            max_units: 10,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        };
+        match dispatch_sync_pull(&engine, wrong_cursor, true, Some(&principal)) {
+            Message::Error { message } => assert!(message.contains("does not match")),
+            other => panic!("expected cursor mismatch error, got {other:?}"),
+        }
+
+        let wrong_format = SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: 10,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION + 1,
+        };
+        match dispatch_sync_pull(&engine, wrong_format, true, Some(&principal)) {
+            Message::Error { message } => assert!(message.contains("rebootstrap required")),
+            other => panic!("expected format mismatch error, got {other:?}"),
+        }
     }
 }

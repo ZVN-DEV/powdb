@@ -15,6 +15,7 @@ documentation = "https://docs.rs/powdb-server"
 powdb-storage = { version = "0.7.2", path = "../storage" }
 powdb-query = { version = "0.7.2", path = "../query" }
 powdb-auth = { version = "0.7.2", path = "../auth" }
+powdb-sync = { version = "0.7.2", path = "../sync" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"

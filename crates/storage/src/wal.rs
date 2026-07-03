@@ -23,7 +23,7 @@ pub enum WalRecordType {
 }
 
 impl WalRecordType {
-    fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(WalRecordType::Insert),
             2 => Some(WalRecordType::Update),
@@ -514,8 +514,13 @@ impl Wal {
 
     /// Read all valid records from the WAL file.
     pub fn read_all(&self) -> io::Result<Vec<WalRecord>> {
+        self.read_through_len(u64::MAX)
+    }
+
+    /// Read valid records up to a byte length boundary in the WAL file.
+    pub fn read_through_len(&self, max_len: u64) -> io::Result<Vec<WalRecord>> {
         let mut file = File::open(&self.path)?;
-        let file_len = file.metadata()?.len();
+        let file_len = file.metadata()?.len().min(max_len);
         let mut file_for_header = File::open(&self.path)?;
         let mut pos = wal_records_start(&mut file_for_header)?;
         let mut records = Vec::new();

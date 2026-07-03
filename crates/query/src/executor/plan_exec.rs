@@ -13,7 +13,7 @@ use super::compiled::*;
 use super::eval::*;
 use super::row_body_base;
 use super::{check_join_limit, Engine, MAX_SORT_ROWS};
-use powdb_storage::view::{ViewDef, ViewRegistry};
+use powdb_storage::view::ViewDef;
 
 impl Engine {
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
@@ -1839,18 +1839,7 @@ impl Engine {
                         "no active transaction to roll back".into(),
                     ));
                 }
-                self.in_transaction = false;
-                self.catalog
-                    .rollback_to_last_sync()
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                if let Ok(mut cache) = self.plan_cache.lock() {
-                    cache.clear();
-                }
-                self.view_registry = ViewRegistry::open(self.catalog.data_dir())
-                    .unwrap_or_else(|_| ViewRegistry::new(self.catalog.data_dir()));
-                Ok(QueryResult::Executed {
-                    message: "transaction rolled back".to_string(),
-                })
+                self.rollback_transaction_preserving_wal_archive()
             }
 
             PlanNode::IndexScan { table, column, key } => {

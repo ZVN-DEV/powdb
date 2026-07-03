@@ -1,9 +1,8 @@
 use crate::row::encode_row_into;
 use crate::table::Table;
 use crate::types::*;
-use crate::wal::{Wal, WalRecordType, WalSyncMode};
+use crate::wal::{Wal, WalRecord, WalRecordType, WalSyncMode};
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +74,7 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// indexed columns, and the next `create_index` (or implicit rebuild on
 /// first open, depending on the caller) will populate the list.
 const CATALOG_FILE: &str = "catalog.bin";
+pub const CATALOG_LSN_FILE: &str = "catalog.lsn";
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// Version 4 appends a per-table column-defaults section after the indexed
 /// column list; version 5 appends an auto-increment column section after that.
@@ -84,11 +84,59 @@ pub const CATALOG_VERSION: u16 = 5;
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
 const WAL_FILE: &str = "wal.log";
+const SYNC_STATE_DIR: &str = ".powdb-sync";
+const SYNC_IDENTITY_FILE: &str = "identity.json";
 
 /// WAL batch size: flush auto-triggers after this many records, in addition
 /// to the explicit `wal.flush()` each top-level mutation does. Kept small so
 /// the tests see a predictable amount of buffering.
 const WAL_BATCH_SIZE: usize = 64;
+type WalArchiveCallback<'a> = &'a mut dyn FnMut(&Path, &[WalRecord]) -> io::Result<()>;
+
+fn read_durable_lsn(data_dir: &Path) -> io::Result<u64> {
+    let path = data_dir.join(CATALOG_LSN_FILE);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    if bytes.len() != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalog LSN sidecar has invalid length",
+        ));
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes);
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn write_durable_lsn(data_dir: &Path, lsn: u64) -> io::Result<()> {
+    let path = data_dir.join(CATALOG_LSN_FILE);
+    let tmp_path = data_dir.join(format!("{CATALOG_LSN_FILE}.tmp"));
+    let mut file = fs::File::create(&tmp_path)?;
+    file.write_all(&lsn.to_le_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp_path, &path)?;
+    sync_directory(data_dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let _ = path;
+    Ok(())
+}
+
+fn max_record_lsn(records: &[WalRecord]) -> Option<u64> {
+    records.iter().map(|record| record.lsn).max()
+}
 
 /// System catalog: registry of all tables.
 ///
@@ -133,6 +181,9 @@ pub struct Catalog {
     /// was opened? Used by `Drop` to decide whether to treat its own flush
     /// as fatal (it isn't — we still try best-effort).
     checkpointed: bool,
+    /// Catalog-level durable LSN. Heap page LSNs cover row mutations, but
+    /// DDL-only changes can advance the WAL without touching a data page.
+    durable_lsn: u64,
 }
 
 impl Catalog {
@@ -170,6 +221,7 @@ impl Catalog {
             tx_start_len: None,
             pending_autocommit_tx_ids: Vec::new(),
             checkpointed: false,
+            durable_lsn: 0,
         };
         cat.persist()?;
         Ok(cat)
@@ -184,11 +236,32 @@ impl Catalog {
     /// WAL is then truncated once the replay lands cleanly on disk — that
     /// re-establishes the "empty WAL = last shutdown was clean" invariant.
     pub fn open(data_dir: &Path) -> io::Result<Self> {
+        Self::open_inner(data_dir, None)
+    }
+
+    /// Open an existing catalog and archive any replayed WAL records before
+    /// recovery truncates the WAL. This is for sync-aware callers that must
+    /// retain history needed by replicas.
+    ///
+    /// Replication boundary: this hook exists so `powdb-sync` can preserve WAL
+    /// history before storage recovery truncates it. Ordinary embedded/server
+    /// callers should use `open`; do not build application-level recovery flows
+    /// directly on this hook.
+    pub fn open_with_wal_archive<F>(data_dir: &Path, mut archive: F) -> io::Result<Self>
+    where
+        F: FnMut(&Path, &[WalRecord]) -> io::Result<()>,
+    {
+        let archive: WalArchiveCallback<'_> = &mut archive;
+        Self::open_inner(data_dir, Some(archive))
+    }
+
+    fn open_inner(data_dir: &Path, archive: Option<WalArchiveCallback<'_>>) -> io::Result<Self> {
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
         let entries = read_catalog_file(&cat_path)?;
+        let durable_lsn = read_durable_lsn(data_dir)?;
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
         let mut name_to_slot =
             FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
@@ -223,8 +296,9 @@ impl Catalog {
             tx_start_len: None,
             pending_autocommit_tx_ids: Vec::new(),
             checkpointed: false,
+            durable_lsn,
         };
-        cat.replay_wal()?;
+        cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
         // LSNs stamped by replay (catalog.rs set_page_lsn) and by DDL
         // rewrites (stamp_all_pages_min_lsn), but `Wal::open` reset the
@@ -240,7 +314,8 @@ impl Catalog {
             .map(|t| t.heap.max_page_lsn())
             .max()
             .unwrap_or(0);
-        cat.wal.set_next_lsn_at_least(max_page_lsn + 1);
+        let max_known_lsn = max_page_lsn.max(cat.durable_lsn);
+        cat.wal.set_next_lsn_at_least(max_known_lsn + 1);
         Ok(cat)
     }
 
@@ -269,12 +344,53 @@ impl Catalog {
     ///
     /// After a successful replay we truncate the WAL so the next shutdown
     /// (crash or otherwise) replays only the NEW records.
-    fn replay_wal(&mut self) -> io::Result<()> {
+    fn replay_wal(&mut self, mut archive: Option<WalArchiveCallback<'_>>) -> io::Result<()> {
         let records = self.wal.read_all()?;
         if records.is_empty() {
             return Ok(());
         }
-        info!(count = records.len(), "replaying WAL records");
+        if archive.is_none() {
+            self.ensure_plain_wal_truncate_allowed(&records)?;
+        }
+        self.replay_records(&records)?;
+        if let Some(archive) = archive.as_mut() {
+            archive(&self.data_dir, &records)?;
+        }
+        self.wal.truncate()?;
+        Ok(())
+    }
+
+    /// Apply an LSN-preserving WAL record stream without appending it to the
+    /// local WAL. Sync callers must validate lineage and contiguity before
+    /// calling this method.
+    ///
+    /// Replication boundary: this is a storage adapter for `powdb-sync`, not a
+    /// general mutation API. Callers must reject unsupported record classes,
+    /// hold their own replica progress state, and pass only contiguous,
+    /// transaction-complete ranges or chunks.
+    pub fn apply_wal_records(&mut self, records: &[WalRecord]) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_checkpoint()?;
+        self.ensure_no_pending_wal_records()?;
+        self.replay_records(records)
+    }
+
+    /// Sync callers use this before deciding an apply is a no-op. A replica with
+    /// local WAL history is divergent until a higher layer explicitly repairs it.
+    pub fn ensure_no_pending_wal_records(&self) -> io::Result<()> {
+        if self.wal.has_pending() || !self.wal.read_all()?.is_empty() {
+            return Err(io::Error::other(
+                "cannot apply replicated WAL records while local WAL records are pending",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replay_records(&mut self, records: &[WalRecord]) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        info!(count = records.len(), "applying WAL records");
 
         // Per-page LSN redo (ARIES-style). A record is already durable iff
         // its *target page* carries an LSN >= the record's LSN. The previous
@@ -290,17 +406,50 @@ impl Catalog {
                 WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback
             )
         });
-        let mut committed_tx_ids = HashSet::new();
+        let mut committed_row_records = vec![true; records.len()];
         if has_boundaries {
-            for rec in &records {
+            committed_row_records.fill(false);
+            let mut pending_tx_spans: Vec<(u64, Vec<usize>)> = Vec::new();
+            for (index, rec) in records.iter().enumerate() {
                 match rec.record_type {
-                    WalRecordType::Commit => {
-                        committed_tx_ids.insert(rec.tx_id);
+                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
+                        if rec.tx_id == 0 =>
+                    {
+                        committed_row_records[index] = true;
                     }
-                    WalRecordType::Rollback => {
-                        committed_tx_ids.remove(&rec.tx_id);
+                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete => {
+                        if let Some((_, rows)) = pending_tx_spans
+                            .iter_mut()
+                            .rev()
+                            .find(|(tx_id, _)| *tx_id == rec.tx_id)
+                        {
+                            rows.push(index);
+                        } else {
+                            pending_tx_spans.push((rec.tx_id, vec![index]));
+                        }
                     }
-                    WalRecordType::Begin => {}
+                    WalRecordType::Begin if rec.tx_id != 0 => {
+                        pending_tx_spans.push((rec.tx_id, Vec::new()));
+                    }
+                    WalRecordType::Commit if rec.tx_id != 0 => {
+                        if let Some(span_index) = pending_tx_spans
+                            .iter()
+                            .rposition(|(tx_id, _)| *tx_id == rec.tx_id)
+                        {
+                            let (_, rows) = pending_tx_spans.remove(span_index);
+                            for row_index in rows {
+                                committed_row_records[row_index] = true;
+                            }
+                        }
+                    }
+                    WalRecordType::Rollback if rec.tx_id != 0 => {
+                        if let Some(span_index) = pending_tx_spans
+                            .iter()
+                            .rposition(|(tx_id, _)| *tx_id == rec.tx_id)
+                        {
+                            pending_tx_spans.remove(span_index);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -311,10 +460,10 @@ impl Catalog {
         let mut replayed_deletes = 0usize;
         let mut skipped = 0usize;
         let mut skipped_uncommitted = 0usize;
-        for rec in records {
-            let tx_committed =
-                rec.tx_id == 0 || !has_boundaries || committed_tx_ids.contains(&rec.tx_id);
-            if !tx_committed
+        let mut saw_ddl = false;
+        for (index, rec) in records.iter().enumerate() {
+            if has_boundaries
+                && !committed_row_records[index]
                 && matches!(
                     rec.record_type,
                     WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
@@ -379,6 +528,7 @@ impl Catalog {
                     // Boundary records were consumed in the first pass.
                 }
                 WalRecordType::DdlCreateTable => {
+                    saw_ddl = true;
                     if let Some((schema, defaults, auto_cols)) = decode_ddl_create_table(&rec.data)
                     {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
@@ -394,6 +544,7 @@ impl Catalog {
                     }
                 }
                 WalRecordType::DdlDropTable => {
+                    saw_ddl = true;
                     if let Some((table_name, _)) = decode_ddl_table_name(&rec.data) {
                         if let Some(&slot) = self.name_to_slot.get(&table_name) {
                             let heap_path = self.data_dir.join(format!("{table_name}.heap"));
@@ -419,6 +570,7 @@ impl Catalog {
                     }
                 }
                 WalRecordType::DdlAddColumn => {
+                    saw_ddl = true;
                     if let Some((table_name, col)) = decode_ddl_alter_add_column(&rec.data) {
                         if let Some(&slot) = self.name_to_slot.get(&table_name) {
                             let tbl = &mut self.tables[slot];
@@ -450,6 +602,7 @@ impl Catalog {
                     }
                 }
                 WalRecordType::DdlDropColumn => {
+                    saw_ddl = true;
                     if let Some((table_name, col_name)) = decode_ddl_alter_drop_column(&rec.data) {
                         if let Some(&slot) = self.name_to_slot.get(&table_name) {
                             let tbl = &mut self.tables[slot];
@@ -487,8 +640,11 @@ impl Catalog {
             deletes = replayed_deletes,
             skipped = skipped,
             skipped_uncommitted = skipped_uncommitted,
-            "WAL replay complete (commit-boundary + LSN idempotent)"
+            "WAL record apply complete (commit-boundary + LSN idempotent)"
         );
+        if saw_ddl {
+            self.persist()?;
+        }
         // Persist the replayed changes to disk before truncating the WAL,
         // otherwise a crash between here and the next checkpoint would lose
         // the replayed records. `flush_all_dirty` on every heap moves every
@@ -512,7 +668,10 @@ impl Catalog {
             // insert could leave us back where we started.
             tbl.save_dirty_indexes()?;
         }
-        self.wal.truncate()?;
+        if let Some(max_lsn) = max_record_lsn(records) {
+            self.record_durable_lsn_at_least(max_lsn)?;
+            self.wal.set_next_lsn_at_least(max_lsn.saturating_add(1));
+        }
         Ok(())
     }
 
@@ -525,6 +684,54 @@ impl Catalog {
     /// performed zero mutations since the last checkpoint (in which case
     /// the flushes are no-ops and the truncate is a bounded syscall).
     pub fn checkpoint(&mut self) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_checkpoint()?;
+        self.ensure_plain_checkpoint_allowed_before_flush()?;
+        self.flush_checkpoint_state()?;
+        self.wal.flush()?;
+        self.record_durable_lsn_at_least(self.wal.last_appended_lsn())?;
+        self.wal.truncate()?;
+        self.checkpointed = true;
+        Ok(())
+    }
+
+    /// Flush every dirty heap page, archive retained WAL records, then
+    /// truncate the WAL. Sync-aware callers use this to make archive-before-
+    /// truncate explicit without making storage depend on the sync crate.
+    ///
+    /// Replication boundary: this hook is for retained-history publication.
+    /// It should stay behind sync-aware lifecycle helpers rather than becoming
+    /// an ordinary checkpoint surface for application code.
+    pub fn checkpoint_with_wal_archive<F>(&mut self, mut archive: F) -> io::Result<()>
+    where
+        F: FnMut(&Path, &[WalRecord]) -> io::Result<()>,
+    {
+        self.ensure_no_active_transaction_for_checkpoint()?;
+        self.commit_autocommit()?;
+        self.flush_checkpoint_state()?;
+        self.wal.flush()?;
+        let records = self.wal.read_all()?;
+        let archive: WalArchiveCallback<'_> = &mut archive;
+        archive(&self.data_dir, &records)?;
+        if let Some(max_lsn) = max_record_lsn(&records) {
+            self.record_durable_lsn_at_least(max_lsn)?;
+        } else {
+            self.record_durable_lsn_at_least(self.wal.last_appended_lsn())?;
+        }
+        self.wal.truncate()?;
+        self.checkpointed = true;
+        Ok(())
+    }
+
+    fn ensure_no_active_transaction_for_checkpoint(&self) -> io::Result<()> {
+        if self.active_tx_id.is_some() {
+            return Err(io::Error::other(
+                "cannot checkpoint while an explicit transaction is active",
+            ));
+        }
+        Ok(())
+    }
+
+    fn flush_checkpoint_state(&mut self) -> io::Result<()> {
         for tbl in &mut self.tables {
             tbl.heap.flush_all_dirty()?;
             tbl.heap.flush()?;
@@ -534,10 +741,47 @@ impl Catalog {
             // actually hit disk. Clean (non-dirty) indexes are free.
             tbl.save_dirty_indexes()?;
         }
-        self.wal.flush()?;
-        self.wal.truncate()?;
-        self.checkpointed = true;
         Ok(())
+    }
+
+    fn ensure_plain_checkpoint_allowed_before_flush(&self) -> io::Result<()> {
+        if !self.sync_identity_file_exists() {
+            return Ok(());
+        }
+        if self.wal.has_pending() {
+            return Err(io::Error::other(
+                "sync identity exists but checkpoint/recovery was called without a WAL archive hook; refusing to truncate retained history",
+            ));
+        }
+        let records = self.wal.read_all()?;
+        self.ensure_plain_wal_truncate_allowed(&records)
+    }
+
+    fn ensure_plain_wal_truncate_allowed(&self, records: &[WalRecord]) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if self.sync_identity_file_exists() {
+            return Err(io::Error::other(
+                "sync identity exists but checkpoint/recovery was called without a WAL archive hook; refusing to truncate retained history",
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync_identity_file_exists(&self) -> bool {
+        self.data_dir
+            .join(SYNC_STATE_DIR)
+            .join(SYNC_IDENTITY_FILE)
+            .exists()
+    }
+
+    fn record_durable_lsn_at_least(&mut self, lsn: u64) -> io::Result<()> {
+        if lsn <= self.durable_lsn {
+            return Ok(());
+        }
+        self.durable_lsn = lsn;
+        write_durable_lsn(&self.data_dir, lsn)
     }
 
     /// Allocate or return the transaction id for the current mutation.
@@ -553,6 +797,12 @@ impl Catalog {
 
     /// Begin a connection/session-scoped explicit transaction.
     pub fn begin_transaction(&mut self) -> io::Result<()> {
+        if self.active_tx_id.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "explicit transaction is already active",
+            ));
+        }
         let start_len = self.wal.synced_len()?;
         let id = self.next_tx_id;
         self.next_tx_id = self.next_tx_id.wrapping_add(1);
@@ -668,6 +918,36 @@ impl Catalog {
     /// would then read the flushed (uncommitted) rows back, defeating
     /// the entire rollback.
     pub fn rollback_to_last_sync(&mut self) -> io::Result<()> {
+        self.rollback_to_last_sync_inner(None)
+    }
+
+    /// Roll back the active transaction, then reopen/replay any remaining WAL
+    /// through an archive hook before recovery truncates it. Sync-aware callers
+    /// use this when committed pre-transaction records must remain available to
+    /// replicas after rollback.
+    pub fn rollback_to_last_sync_with_wal_archive<F>(&mut self, mut archive: F) -> io::Result<()>
+    where
+        F: FnMut(&Path, &[WalRecord]) -> io::Result<()>,
+    {
+        let archive: WalArchiveCallback<'_> = &mut archive;
+        self.rollback_to_last_sync_inner(Some(archive))
+    }
+
+    fn rollback_to_last_sync_inner(
+        &mut self,
+        mut archive: Option<WalArchiveCallback<'_>>,
+    ) -> io::Result<()> {
+        let start_len = self.tx_start_len.unwrap_or(0);
+        let prearchived = if let Some(archive) = archive.as_mut() {
+            let records = self.wal.read_through_len(start_len)?;
+            if !records.is_empty() {
+                archive(&self.data_dir, &records)?;
+            }
+            true
+        } else {
+            false
+        };
+
         let start_len = self.tx_start_len.take().unwrap_or(0);
         if let Some(id) = self.active_tx_id.take() {
             if !self.wal.is_off() {
@@ -692,10 +972,29 @@ impl Catalog {
         // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
         let sync_mode = self.wal.sync_mode();
-        let restored = Self::open(&data_dir)?;
+        let restored = if prearchived {
+            let mut already_archived = |_dir: &Path, _records: &[WalRecord]| Ok(());
+            let archive: WalArchiveCallback<'_> = &mut already_archived;
+            Self::open_inner(&data_dir, Some(archive))?
+        } else {
+            Self::open_inner(&data_dir, archive)?
+        };
         *self = restored;
         self.wal.set_sync_mode(sync_mode);
         Ok(())
+    }
+
+    fn abandon_active_transaction_for_drop(&mut self) -> io::Result<()> {
+        for tbl in &mut self.tables {
+            tbl.heap.discard_dirty();
+        }
+        self.pending_autocommit_tx_ids.clear();
+        let truncate_result = match self.tx_start_len.take() {
+            Some(start_len) => self.wal.discard_and_truncate_to(start_len),
+            None => self.wal.discard_pending(),
+        };
+        self.active_tx_id = None;
+        truncate_result
     }
 
     /// Returns a reference to the data directory.
@@ -708,11 +1007,15 @@ impl Catalog {
     /// corresponds to, and the value `Catalog::open` uses to restore
     /// `next_lsn` after a reopen/restore.
     pub fn max_lsn(&self) -> u64 {
-        self.tables
+        let max_page_lsn = self
+            .tables
             .iter()
             .map(|t| t.heap.max_page_lsn())
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        max_page_lsn
+            .max(self.durable_lsn)
+            .max(self.wal.last_appended_lsn())
     }
 
     pub fn create_table(&mut self, schema: Schema) -> io::Result<()> {
@@ -1629,6 +1932,12 @@ impl Catalog {
 
 impl Drop for Catalog {
     fn drop(&mut self) {
+        if self.active_tx_id.is_some() {
+            if let Err(e) = self.abandon_active_transaction_for_drop() {
+                warn!(error = %e, "catalog drop active transaction cleanup failed");
+            }
+            return;
+        }
         // Mission 2: best-effort clean shutdown. `checkpoint` flushes
         // every heap and truncates the WAL, which is what
         // [`Catalog::open`] relies on to know that no replay is needed.
@@ -2403,6 +2712,80 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn replay_records_treats_reused_tx_ids_as_ordered_spans() {
+        let mut cat = temp_catalog("reused_tx_ids");
+        let schema = schema_two_cols();
+        cat.create_table(schema.clone()).unwrap();
+        cat.checkpoint().unwrap();
+
+        let mut committed_row = Vec::new();
+        encode_row_into(
+            &schema,
+            &[Value::Int(1), Value::Str("committed".into())],
+            &mut committed_row,
+        );
+        let mut incomplete_row = Vec::new();
+        encode_row_into(
+            &schema,
+            &[Value::Int(2), Value::Str("incomplete".into())],
+            &mut incomplete_row,
+        );
+
+        let records = vec![
+            WalRecord {
+                tx_id: 1,
+                record_type: WalRecordType::Begin,
+                lsn: 1,
+                data: Vec::new(),
+            },
+            WalRecord {
+                tx_id: 1,
+                record_type: WalRecordType::Insert,
+                lsn: 2,
+                data: encode_wal_payload(
+                    "T",
+                    RowId {
+                        page_id: 1,
+                        slot_index: 0,
+                    },
+                    &committed_row,
+                ),
+            },
+            WalRecord {
+                tx_id: 1,
+                record_type: WalRecordType::Commit,
+                lsn: 3,
+                data: Vec::new(),
+            },
+            WalRecord {
+                tx_id: 1,
+                record_type: WalRecordType::Begin,
+                lsn: 4,
+                data: Vec::new(),
+            },
+            WalRecord {
+                tx_id: 1,
+                record_type: WalRecordType::Insert,
+                lsn: 5,
+                data: encode_wal_payload(
+                    "T",
+                    RowId {
+                        page_id: 1,
+                        slot_index: 1,
+                    },
+                    &incomplete_row,
+                ),
+            },
+        ];
+
+        cat.apply_wal_records(&records).unwrap();
+        let rows: Vec<_> = cat.scan("T").unwrap().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1[0], Value::Int(1));
+        assert_eq!(rows[0].1[1], Value::Str("committed".into()));
     }
 
     #[test]

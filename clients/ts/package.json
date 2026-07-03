@@ -51,6 +51,7 @@
     "test": "tsx test/run-with-server.ts test/client.test.ts",
     "test:escape": "tsx test/escape.test.ts",
     "test:protocol": "tsx test/protocol.test.ts",
+    "test:sync-live": "tsx test/sync-live.test.ts",
     "test:auth": "tsx test/auth.test.ts",
     "test:pool": "tsx test/run-with-server.ts test/pool.test.ts",
     "test:typed": "tsx test/typed.test.ts",

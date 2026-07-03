@@ -4043,6 +4043,43 @@ fn test_rollback_discards_auto_flushed_transaction_wal_records() {
 }
 
 #[test]
+fn rollback_wal_archive_failure_keeps_transaction_retryable() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "powdb_tx_rollback_archive_failure_{}_{}",
+        std::process::id(),
+        id
+    ));
+
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Item { required id: int, required name: str }")
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Item { id := 1, name := "committed" }"#)
+        .unwrap();
+    engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql(r#"insert Item { id := 2, name := "pending" }"#)
+        .unwrap();
+
+    let err = engine
+        .rollback_transaction_with_wal_archive(|_, _| Err(std::io::Error::other("archive failed")))
+        .unwrap_err();
+    assert!(err.to_string().contains("archive failed"));
+
+    engine.execute_powql("rollback").unwrap();
+    let count = engine.execute_powql("count(Item)").unwrap();
+    assert!(
+        matches!(count, QueryResult::Scalar(Value::Int(1))),
+        "failed archive rollback must leave the transaction retryable, got {count:?}"
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn test_rollback_undoes_inserts_no_trace() {
     // Verify the rolled-back row is completely gone, not just from count
     // but also invisible to a filter query.

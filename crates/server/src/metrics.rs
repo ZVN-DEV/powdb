@@ -23,6 +23,9 @@ use tracing::debug;
 /// Upper bounds (seconds) for the query-latency histogram, ascending. The
 /// implicit final bucket is `le="+Inf"`.
 const LATENCY_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
+const SYNC_OPERATION_COUNT: usize = 3;
+const SYNC_OUTCOME_COUNT: usize = 2;
+const SYNC_REPAIR_ACTION_COUNT: usize = 4;
 
 /// Cap on bytes read from a metrics client before bailing. A scrape request
 /// line + headers is tiny; anything larger is junk or hostile.
@@ -38,6 +41,96 @@ pub enum QueryOutcome {
     Error,
     Timeout,
     MemoryLimit,
+}
+
+/// Private sync protocol operation names. Keep this enum small and
+/// low-cardinality: replica ids belong in authenticated responses, not labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOperation {
+    Status,
+    Pull,
+    Ack,
+}
+
+impl SyncOperation {
+    const ALL: [Self; SYNC_OPERATION_COUNT] = [Self::Status, Self::Pull, Self::Ack];
+
+    const fn idx(self) -> usize {
+        match self {
+            Self::Status => 0,
+            Self::Pull => 1,
+            Self::Ack => 2,
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Pull => "pull",
+            Self::Ack => "ack",
+        }
+    }
+}
+
+/// How a finished sync protocol frame is classified for metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Ok,
+    Error,
+}
+
+impl SyncOutcome {
+    const ALL: [Self; SYNC_OUTCOME_COUNT] = [Self::Ok, Self::Error];
+
+    const fn idx(self) -> usize {
+        match self {
+            Self::Ok => 0,
+            Self::Error => 1,
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Low-cardinality repair actions returned inside sync status payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRepairLabel {
+    None,
+    Pull,
+    AwaitArchive,
+    Rebootstrap,
+}
+
+impl SyncRepairLabel {
+    const ALL: [Self; SYNC_REPAIR_ACTION_COUNT] = [
+        Self::None,
+        Self::Pull,
+        Self::AwaitArchive,
+        Self::Rebootstrap,
+    ];
+
+    const fn idx(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Pull => 1,
+            Self::AwaitArchive => 2,
+            Self::Rebootstrap => 3,
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pull => "pull",
+            Self::AwaitArchive => "await_archive",
+            Self::Rebootstrap => "rebootstrap",
+        }
+    }
 }
 
 /// All server metrics. Cheap to update (uncontended atomic add), lock-free to
@@ -62,6 +155,14 @@ pub struct Metrics {
     // bucket for observations greater than the last bound.
     latency_buckets: [AtomicU64; LATENCY_BUCKETS.len() + 1],
     latency_sum_nanos: AtomicU64,
+
+    sync_operations_total: [[AtomicU64; SYNC_OUTCOME_COUNT]; SYNC_OPERATION_COUNT],
+    sync_repair_actions_total: [[AtomicU64; SYNC_REPAIR_ACTION_COUNT]; SYNC_OPERATION_COUNT],
+    sync_latency_buckets: [[AtomicU64; LATENCY_BUCKETS.len() + 1]; SYNC_OPERATION_COUNT],
+    sync_latency_sum_nanos: [AtomicU64; SYNC_OPERATION_COUNT],
+    sync_pull_units_total: AtomicU64,
+    sync_pull_bytes_total: AtomicU64,
+    sync_ack_advanced_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -86,6 +187,19 @@ impl Metrics {
             auth_failures_total: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_sum_nanos: AtomicU64::new(0),
+            sync_operations_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            sync_latency_buckets: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            sync_latency_sum_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_pull_units_total: AtomicU64::new(0),
+            sync_pull_bytes_total: AtomicU64::new(0),
+            sync_repair_actions_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            sync_ack_advanced_total: AtomicU64::new(0),
         }
     }
 
@@ -115,6 +229,38 @@ impl Metrics {
         self.latency_buckets[idx].fetch_add(1, Relaxed);
         self.latency_sum_nanos
             .fetch_add(elapsed.as_nanos() as u64, Relaxed);
+    }
+
+    /// Record a completed private sync protocol operation.
+    pub fn record_sync_operation(
+        &self,
+        operation: SyncOperation,
+        elapsed: Duration,
+        outcome: SyncOutcome,
+    ) {
+        let op_idx = operation.idx();
+        self.sync_operations_total[op_idx][outcome.idx()].fetch_add(1, Relaxed);
+
+        let secs = elapsed.as_secs_f64();
+        let bucket_idx = LATENCY_BUCKETS
+            .iter()
+            .position(|&b| secs <= b)
+            .unwrap_or(LATENCY_BUCKETS.len());
+        self.sync_latency_buckets[op_idx][bucket_idx].fetch_add(1, Relaxed);
+        self.sync_latency_sum_nanos[op_idx].fetch_add(elapsed.as_nanos() as u64, Relaxed);
+    }
+
+    pub fn record_sync_pull_payload(&self, units: u64, bytes: u64) {
+        self.sync_pull_units_total.fetch_add(units, Relaxed);
+        self.sync_pull_bytes_total.fetch_add(bytes, Relaxed);
+    }
+
+    pub fn record_sync_repair_action(&self, operation: SyncOperation, repair: SyncRepairLabel) {
+        self.sync_repair_actions_total[operation.idx()][repair.idx()].fetch_add(1, Relaxed);
+    }
+
+    pub fn inc_sync_ack_advanced(&self) {
+        self.sync_ack_advanced_total.fetch_add(1, Relaxed);
     }
 
     pub fn inc_connection_accepted(&self) {
@@ -239,6 +385,85 @@ impl Metrics {
         let sum_secs = self.latency_sum_nanos.load(Relaxed) as f64 / 1e9;
         let _ = writeln!(out, "powdb_query_duration_seconds_sum {sum_secs}");
         let _ = writeln!(out, "powdb_query_duration_seconds_count {cumulative}");
+
+        out.push_str("# HELP powdb_sync_operations_total Total private sync protocol operations, by operation and result.\n");
+        out.push_str("# TYPE powdb_sync_operations_total counter\n");
+        for operation in SyncOperation::ALL {
+            for outcome in SyncOutcome::ALL {
+                let _ = writeln!(
+                    out,
+                    "powdb_sync_operations_total{{operation=\"{}\",result=\"{}\"}} {}",
+                    operation.as_label(),
+                    outcome.as_label(),
+                    self.sync_operations_total[operation.idx()][outcome.idx()].load(Relaxed)
+                );
+            }
+        }
+
+        counter(
+            &mut out,
+            "powdb_sync_pull_units_total",
+            "Total retained units served by private sync pull responses.",
+            self.sync_pull_units_total.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "powdb_sync_pull_bytes_total",
+            "Total retained-unit wire payload bytes served by private sync pull responses.",
+            self.sync_pull_bytes_total.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "powdb_sync_ack_advanced_total",
+            "Total sync acknowledgements that advanced a replica cursor.",
+            self.sync_ack_advanced_total.load(Relaxed),
+        );
+
+        out.push_str("# HELP powdb_sync_repair_actions_total Total sync status repair actions returned by operation.\n");
+        out.push_str("# TYPE powdb_sync_repair_actions_total counter\n");
+        for operation in SyncOperation::ALL {
+            for repair in SyncRepairLabel::ALL {
+                let _ = writeln!(
+                    out,
+                    "powdb_sync_repair_actions_total{{operation=\"{}\",repair_action=\"{}\"}} {}",
+                    operation.as_label(),
+                    repair.as_label(),
+                    self.sync_repair_actions_total[operation.idx()][repair.idx()].load(Relaxed)
+                );
+            }
+        }
+
+        out.push_str("# HELP powdb_sync_operation_duration_seconds Private sync protocol operation time in seconds.\n");
+        out.push_str("# TYPE powdb_sync_operation_duration_seconds histogram\n");
+        for operation in SyncOperation::ALL {
+            let mut cumulative = 0u64;
+            for (i, &bound) in LATENCY_BUCKETS.iter().enumerate() {
+                cumulative += self.sync_latency_buckets[operation.idx()][i].load(Relaxed);
+                let _ = writeln!(
+                    out,
+                    "powdb_sync_operation_duration_seconds_bucket{{operation=\"{}\",le=\"{bound}\"}} {cumulative}",
+                    operation.as_label()
+                );
+            }
+            cumulative +=
+                self.sync_latency_buckets[operation.idx()][LATENCY_BUCKETS.len()].load(Relaxed);
+            let _ = writeln!(
+                out,
+                "powdb_sync_operation_duration_seconds_bucket{{operation=\"{}\",le=\"+Inf\"}} {cumulative}",
+                operation.as_label()
+            );
+            let sum_secs = self.sync_latency_sum_nanos[operation.idx()].load(Relaxed) as f64 / 1e9;
+            let _ = writeln!(
+                out,
+                "powdb_sync_operation_duration_seconds_sum{{operation=\"{}\"}} {sum_secs}",
+                operation.as_label()
+            );
+            let _ = writeln!(
+                out,
+                "powdb_sync_operation_duration_seconds_count{{operation=\"{}\"}} {cumulative}",
+                operation.as_label()
+            );
+        }
 
         out
     }
@@ -417,6 +642,12 @@ mod tests {
             "powdb_query_memory_limit_exceeded_total",
             "powdb_auth_failures_total",
             "powdb_query_duration_seconds",
+            "powdb_sync_operations_total",
+            "powdb_sync_pull_units_total",
+            "powdb_sync_pull_bytes_total",
+            "powdb_sync_ack_advanced_total",
+            "powdb_sync_repair_actions_total",
+            "powdb_sync_operation_duration_seconds",
         ] {
             assert!(
                 out.contains(&format!("# HELP {name}")),
@@ -430,6 +661,15 @@ mod tests {
         // Both label values always present.
         assert!(out.contains("powdb_queries_total{result=\"ok\"} 0"));
         assert!(out.contains("powdb_queries_total{result=\"error\"} 0"));
+        assert!(out.contains("powdb_sync_operations_total{operation=\"status\",result=\"ok\"} 0"));
+        assert!(out.contains("powdb_sync_operations_total{operation=\"pull\",result=\"error\"} 0"));
+        assert!(out.contains("powdb_sync_operations_total{operation=\"ack\",result=\"ok\"} 0"));
+        assert!(out.contains(
+            "powdb_sync_repair_actions_total{operation=\"status\",repair_action=\"pull\"} 0"
+        ));
+        assert!(out.contains(
+            "powdb_sync_repair_actions_total{operation=\"pull\",repair_action=\"rebootstrap\"} 0"
+        ));
         assert!(out.contains("powdb_build_info{version=\""));
     }
 
@@ -461,6 +701,51 @@ mod tests {
         assert!(out.contains("powdb_queries_total{result=\"error\"} 2"));
         assert!(out.contains("powdb_query_timeouts_total 1"));
         assert!(out.contains("powdb_query_memory_limit_exceeded_total 1"));
+    }
+
+    #[test]
+    fn sync_operation_metrics_route_and_bucket_correctly() {
+        let m = Metrics::new();
+        m.record_sync_operation(
+            SyncOperation::Status,
+            Duration::from_micros(400),
+            SyncOutcome::Ok,
+        );
+        m.record_sync_operation(
+            SyncOperation::Pull,
+            Duration::from_millis(2),
+            SyncOutcome::Ok,
+        );
+        m.record_sync_operation(
+            SyncOperation::Ack,
+            Duration::from_secs(7),
+            SyncOutcome::Error,
+        );
+        m.record_sync_pull_payload(3, 1234);
+        m.record_sync_repair_action(SyncOperation::Status, SyncRepairLabel::Pull);
+        m.record_sync_repair_action(SyncOperation::Pull, SyncRepairLabel::Rebootstrap);
+        m.inc_sync_ack_advanced();
+
+        let out = m.render();
+        assert!(out.contains("powdb_sync_operations_total{operation=\"status\",result=\"ok\"} 1"));
+        assert!(out.contains("powdb_sync_operations_total{operation=\"pull\",result=\"ok\"} 1"));
+        assert!(out.contains("powdb_sync_operations_total{operation=\"ack\",result=\"error\"} 1"));
+        assert!(out.contains("powdb_sync_pull_units_total 3"));
+        assert!(out.contains("powdb_sync_pull_bytes_total 1234"));
+        assert!(out.contains("powdb_sync_ack_advanced_total 1"));
+        assert!(out.contains(
+            "powdb_sync_repair_actions_total{operation=\"status\",repair_action=\"pull\"} 1"
+        ));
+        assert!(out.contains(
+            "powdb_sync_repair_actions_total{operation=\"pull\",repair_action=\"rebootstrap\"} 1"
+        ));
+        assert!(out.contains(
+            "powdb_sync_operation_duration_seconds_bucket{operation=\"status\",le=\"0.0005\"} 1"
+        ));
+        assert!(out.contains(
+            "powdb_sync_operation_duration_seconds_bucket{operation=\"ack\",le=\"+Inf\"} 1"
+        ));
+        assert!(out.contains("powdb_sync_operation_duration_seconds_count{operation=\"pull\"} 1"));
     }
 
     #[test]

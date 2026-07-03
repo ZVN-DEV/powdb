@@ -1,6 +1,6 @@
 use powdb_query::executor::Engine;
 use powdb_query::result::QueryResult;
-use powdb_storage::catalog::Catalog;
+use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
@@ -66,6 +66,31 @@ fn full_backup_copies_files_and_records_lsn() {
 }
 
 #[test]
+fn full_backup_records_ddl_only_lsn() {
+    let src = tmp("ddl_lsn_src");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+
+    let backup = tmp("ddl_lsn_backup");
+    let manifest = powdb_backup::full_backup(&mut cat, &backup).unwrap();
+
+    assert!(
+        manifest.source_lsn > 0,
+        "DDL-only snapshots must advance the durable LSN"
+    );
+    assert!(
+        manifest.files.iter().any(|f| f.name == CATALOG_LSN_FILE),
+        "full backups must preserve the catalog LSN sidecar"
+    );
+
+    let restored = tmp("ddl_lsn_restored");
+    powdb_backup::restore(&backup, &restored).unwrap();
+    let restored_cat = Catalog::open(&restored).unwrap();
+    assert_eq!(restored_cat.list_tables(), vec!["T"]);
+    assert_eq!(restored_cat.max_lsn(), manifest.source_lsn);
+}
+
+#[test]
 fn restore_rebuilds_a_usable_database() {
     let src = tmp("rsrc");
     let mut cat = Catalog::create(&src).unwrap();
@@ -85,6 +110,232 @@ fn restore_rebuilds_a_usable_database() {
     // Reopen the restored dir and confirm every row is present.
     let cat2 = Catalog::open(&restored).unwrap();
     assert_eq!(cat2.scan("T").unwrap().count(), 50);
+}
+
+#[test]
+fn full_backup_refuses_active_transaction_without_persisting_uncommitted_rows() {
+    let src = tmp("active_tx_src");
+    {
+        let mut cat = Catalog::create(&src).unwrap();
+        cat.create_table(schema_t()).unwrap();
+        cat.checkpoint().unwrap();
+        cat.begin_transaction().unwrap();
+        cat.insert("T", &vec![Value::Int(1)]).unwrap();
+        cat.sync_wal().unwrap();
+
+        let backup = tmp("active_tx_bkp");
+        let err = powdb_backup::full_backup(&mut cat, &backup).unwrap_err();
+        assert!(
+            err.to_string().contains("transaction is active"),
+            "full backup must fail closed during an active transaction, got: {err}"
+        );
+    }
+
+    let cat = Catalog::open(&src).unwrap();
+    assert_eq!(
+        cat.scan("T").unwrap().count(),
+        0,
+        "failed backup must not leak active transaction rows through drop/checkpoint"
+    );
+}
+
+#[test]
+fn full_backup_records_sync_metadata_plain_restore_strips_identity_explicit_preserve_keeps_it() {
+    let src = tmp("syncsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+    let identity = powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let backup = tmp("syncbkp");
+    let manifest = powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+
+    let sync = manifest
+        .sync
+        .clone()
+        .expect("sync-enabled backup must record fork-safety metadata");
+    assert_eq!(sync.identity.identity().unwrap(), identity);
+    assert_eq!(sync.source_lsn, manifest.source_lsn);
+    assert_eq!(
+        sync.wal_format_version,
+        powdb_storage::wal::WAL_FORMAT_VERSION
+    );
+    assert_eq!(
+        sync.catalog_version,
+        powdb_storage::catalog::CATALOG_VERSION
+    );
+    assert_eq!(
+        sync.retained_segment_format_version,
+        powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION
+    );
+    assert!(
+        !backup.join(powdb_sync::SYNC_STATE_DIR).exists(),
+        "backup must not copy mutable sync state wholesale"
+    );
+    let retained_units = powdb_sync::read_units_since(
+        &powdb_sync::retained_segments_dir(&src),
+        identity.segment_identity(),
+        0,
+        100,
+    )
+    .unwrap();
+    assert!(
+        !retained_units.is_empty(),
+        "sync-enabled backup checkpoint must archive retained WAL records before truncation"
+    );
+
+    let restored = tmp("syncrestored");
+    powdb_backup::restore(&backup, &restored).unwrap();
+
+    let err = powdb_sync::read_identity(&restored).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    let mut plain_cat = Catalog::open(&restored).unwrap();
+    plain_cat.insert("T", &vec![Value::Int(2)]).unwrap();
+    plain_cat.sync_wal().unwrap();
+    drop(plain_cat);
+    let plain_reopened = Catalog::open(&restored).unwrap();
+    assert_eq!(plain_reopened.scan("T").unwrap().count(), 2);
+    drop(plain_reopened);
+
+    let preserved = tmp("syncpreserved");
+    powdb_backup::restore_with_sync_mode(
+        &backup,
+        &preserved,
+        powdb_backup::RestoreSyncMode::PreserveSyncIdentity,
+    )
+    .unwrap();
+    assert_eq!(powdb_sync::read_identity(&preserved).unwrap(), identity);
+    assert!(
+        !preserved
+            .join(powdb_sync::SYNC_STATE_DIR)
+            .join(powdb_sync::REPLICA_CURSORS_FILE)
+            .exists(),
+        "preserve restore must not synthesize stale replica cursors"
+    );
+    let cat2 = Catalog::open(&preserved).unwrap();
+    assert_eq!(cat2.scan("T").unwrap().count(), 1);
+}
+
+#[test]
+fn full_backup_fork_restore_mints_new_sync_identity() {
+    let src = tmp("syncforksrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+    let source_identity = powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let backup = tmp("syncforkbkp");
+    let manifest = powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+    assert!(
+        manifest.sync.is_some(),
+        "sync-enabled backup must include sync metadata"
+    );
+
+    let restored = tmp("syncforkrestored");
+    powdb_backup::restore_with_sync_mode(
+        &backup,
+        &restored,
+        powdb_backup::RestoreSyncMode::ForkWithNewSyncIdentity,
+    )
+    .unwrap();
+
+    let restored_identity = powdb_sync::read_identity(&restored).unwrap();
+    assert_ne!(
+        restored_identity, source_identity,
+        "fork restores must not reuse the source sync identity"
+    );
+    assert_eq!(
+        restored_identity.primary_generation, 1,
+        "fork restores start a fresh primary generation"
+    );
+    let cat2 = Catalog::open(&restored).unwrap();
+    assert_eq!(cat2.scan("T").unwrap().count(), 1);
+}
+
+#[test]
+fn restore_rejects_tampered_sync_snapshot_metadata() {
+    let src = tmp("syncbadsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+    powdb_sync::open_or_create_identity(&src).unwrap();
+
+    let backup = tmp("syncbadbkp");
+    let mut manifest = powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+    manifest
+        .sync
+        .as_mut()
+        .expect("sync metadata")
+        .catalog_blake3_hex = "not-the-catalog-hash".into();
+    manifest.write(&backup).unwrap();
+
+    let restored = tmp("syncbadrestored");
+    let err = powdb_backup::restore(&backup, &restored).unwrap_err();
+    assert!(
+        format!("{err}").to_lowercase().contains("catalog hash"),
+        "tampered sync catalog hash must be rejected, got: {err}"
+    );
+}
+
+#[test]
+fn legacy_manifest_without_sync_identity_still_restores() {
+    let src = tmp("legsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let backup = tmp("legbkp");
+    powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+
+    let manifest_path = backup.join(powdb_backup::BackupManifest::FILE_NAME);
+    let raw = std::fs::read_to_string(&manifest_path).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    json.as_object_mut().unwrap().remove("sync");
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+    let restored = tmp("legrestored");
+    powdb_backup::restore(&backup, &restored).unwrap();
+
+    assert_eq!(
+        powdb_sync::read_identity(&restored).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let cat2 = Catalog::open(&restored).unwrap();
+    assert_eq!(cat2.scan("T").unwrap().count(), 1);
+}
+
+#[test]
+fn preserve_restore_requires_sync_metadata() {
+    let src = tmp("preserve_legacy_src");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let backup = tmp("preserve_legacy_bkp");
+    powdb_backup::full_backup(&mut cat, &backup).unwrap();
+    drop(cat);
+
+    let restored = tmp("preserve_legacy_restored");
+    let err = powdb_backup::restore_with_sync_mode(
+        &backup,
+        &restored,
+        powdb_backup::RestoreSyncMode::PreserveSyncIdentity,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("requires sync snapshot metadata"),
+        "preserve restore without sync metadata must be explicit, got: {err}"
+    );
 }
 
 // Same count-extraction shape as restore_durability.rs::count.

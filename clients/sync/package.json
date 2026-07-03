@@ -1,0 +1,63 @@
+{
+  "name": "@zvndev/powdb-sync",
+  "version": "0.7.2",
+  "description": "Embedded PowDB sync orchestration for local reads and primary-authoritative write-forward.",
+  "type": "module",
+  "packageManager": "pnpm@10.29.3",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZVN-DEV/powdb.git",
+    "directory": "clients/sync"
+  },
+  "homepage": "https://github.com/ZVN-DEV/powdb#readme",
+  "bugs": {
+    "url": "https://github.com/ZVN-DEV/powdb/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "powdb",
+    "powql",
+    "database",
+    "embedded-database",
+    "local-first",
+    "sync",
+    "replica",
+    "typescript"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@zvndev/powdb-client": "0.7.2",
+    "@zvndev/powdb-embedded": "0.7.2"
+  },
+  "peerDependenciesMeta": {
+    "@zvndev/powdb-client": { "optional": true },
+    "@zvndev/powdb-embedded": { "optional": true }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx test/sync.test.ts",
+    "test:native": "tsx test/native-adapter.test.ts",
+    "test:e2e": "tsx test/bootstrap-e2e.test.ts",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^25",
+    "tsx": "^4",
+    "typescript": "^6.0"
+  }
+}

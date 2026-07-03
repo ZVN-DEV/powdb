@@ -13,6 +13,7 @@ documentation = "https://docs.rs/powdb-backup"
 
 [dependencies]
 powdb-storage = { version = "0.7.2", path = "../storage" }
+powdb-sync = { version = "0.7.2", path = "../sync" }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true

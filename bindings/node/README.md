@@ -11,7 +11,7 @@ const db = Database.open("./data");
 
 db.query("type User { required name: str, age: int }");
 const inserted = db.query(`insert User { name := "Ada", age := 36 } returning`);
-const rows = db.query("User { name, age } filter .age > 18");
+const rows = db.query("User filter .age > 18 { .name, .age }");
 const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
 ```
 
@@ -23,8 +23,31 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
 - `db.query(powql)` — run a PowQL statement.
 - `db.querySql(sql)` — run a SQL statement (lowered to PowQL).
 - `db.queryReadonly(powql)` — run a read-only statement.
+- `db.applyRetainedUnits(request)` — apply one sync retained-unit chunk from
+  `@zvndev/powdb-client` to a bootstrapped embedded replica.
 - `db.setSyncMode(mode)` — set WAL durability: `"full"` | `"normal"` | `"off"`.
 - `db.isPoisoned()` — `true` if a previous call panicked (reopen the database).
+
+`applyRetainedUnits` is the native adapter used by `@zvndev/powdb-sync` after a
+replica has been restored from a sync bootstrap. It expects the database
+identity and format metadata from the primary plus the contiguous retained
+units returned by `syncPull(...)`. `databaseId` can be either a 32-character
+hex string or a 16-byte `Uint8Array`, matching the `@zvndev/powdb-sync`
+adapter contract. Retained unit `data` accepts `Uint8Array` or `Buffer` bytes:
+
+```js
+const result = db.applyRetainedUnits({
+  sinceLsn: 42n,
+  databaseId: "00112233445566778899aabbccddeeff",
+  primaryGeneration: 1n,
+  walFormatVersion: 1,
+  catalogVersion: 5,
+  segmentFormatVersion: 1,
+  units: pull.units,
+});
+
+console.log(result.throughLsn, result.unitsApplied);
+```
 
 ## Write performance / durability
 

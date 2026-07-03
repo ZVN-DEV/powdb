@@ -1,6 +1,8 @@
 use powdb_query::executor::{Engine, WalSyncMode};
 use powdb_server::handler;
 use powdb_server::metrics::{serve_metrics, Metrics};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
@@ -35,6 +37,17 @@ struct Args {
 /// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
 /// unset or unparseable. Mirrors the query crate's default (256 MB).
 const DEFAULT_QUERY_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+
+fn archive_wal_records_if_sync_enabled(
+    data_dir: &Path,
+    records: &[powdb_storage::wal::WalRecord],
+) -> io::Result<()> {
+    match powdb_sync::read_identity(data_dir) {
+        Ok(identity) => powdb_sync::archive_wal_records_for_identity(data_dir, identity, records),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
 /// Parse the per-query memory limit from the `POWDB_QUERY_MEMORY_LIMIT`
 /// environment value. Accepts a plain byte count; falls back to the default
@@ -413,9 +426,10 @@ async fn main() {
 
     let args = parse_args();
 
-    let mut engine = match Engine::with_memory_limit(
-        std::path::Path::new(&args.data_dir),
+    let mut engine = match Engine::with_memory_limit_and_wal_archive(
+        Path::new(&args.data_dir),
         args.query_memory_limit,
+        archive_wal_records_if_sync_enabled,
     ) {
         Ok(e) => e,
         Err(e) => {

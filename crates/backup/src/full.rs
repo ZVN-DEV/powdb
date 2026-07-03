@@ -1,19 +1,21 @@
-use crate::manifest::{BackupManifest, FileEntry};
-use powdb_storage::catalog::Catalog;
+use crate::manifest::{current_sync_snapshot_metadata, BackupManifest, FileEntry};
+use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Take a consistent full snapshot of `catalog`'s data dir into `dest`.
 ///
-/// Consistency model: `checkpoint()` flushes every dirty heap page + index
-/// and truncates the WAL, producing a clean-shutdown image. We then copy the
-/// durable files. The brief write-quiesce is the duration of the checkpoint,
-/// held by the caller's `&mut` borrow.
+/// Consistency model: checkpoint flushes every dirty heap page + index and
+/// truncates the WAL, producing a clean-shutdown image. If sync identity exists,
+/// the checkpoint first archives retained WAL records into `powdb-sync`
+/// segments. We then copy the durable files. The brief write-quiesce is the
+/// duration of the checkpoint, held by the caller's `&mut` borrow.
 pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManifest> {
-    catalog.checkpoint()?;
+    powdb_sync::checkpoint_preserving_retained_segments_if_enabled(catalog)?;
     let source_lsn = catalog.max_lsn();
     let src = catalog.data_dir().to_path_buf();
+    let sync = current_sync_snapshot_metadata(&src, source_lsn)?;
     std::fs::create_dir_all(dest)?;
 
     let mut files = Vec::new();
@@ -22,7 +24,10 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
         let name = entry.file_name().to_string_lossy().to_string();
         // Durable state only: catalog + heaps + indexes. wal.log was just
         // truncated; manifest.json is ours.
-        let is_durable = name == "catalog.bin" || name.ends_with(".heap") || name.ends_with(".idx");
+        let is_durable = name == "catalog.bin"
+            || name == CATALOG_LSN_FILE
+            || name.ends_with(".heap")
+            || name.ends_with(".idx");
         if !is_durable {
             continue;
         }
@@ -44,6 +49,7 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
             .map(|d| d.as_secs())
             .unwrap_or(0),
         source_lsn,
+        sync,
         files,
     };
     manifest.write(dest)?;

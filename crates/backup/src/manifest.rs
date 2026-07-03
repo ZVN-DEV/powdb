@@ -1,3 +1,7 @@
+use powdb_storage::catalog::CATALOG_VERSION;
+use powdb_storage::wal::WAL_FORMAT_VERSION;
+use powdb_sync::IdentitySnapshot;
+use powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::Path;
@@ -15,6 +19,8 @@ pub struct BackupManifest {
     pub created_unix_secs: u64,
     /// The page-LSN high-water mark this backup is consistent at.
     pub source_lsn: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncSnapshotMetadata>,
     pub files: Vec<FileEntry>,
 }
 
@@ -30,6 +36,7 @@ impl BackupManifest {
                 Self::FORMAT_VERSION
             )));
         }
+        validate_sync_metadata(&self.sync, self.source_lsn)?;
         Ok(())
     }
 
@@ -71,6 +78,80 @@ pub enum ChangedFile {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncSnapshotMetadata {
+    pub identity: IdentitySnapshot,
+    pub source_lsn: u64,
+    pub catalog_blake3_hex: String,
+    pub wal_format_version: u16,
+    pub catalog_version: u16,
+    pub retained_segment_format_version: u16,
+}
+
+impl SyncSnapshotMetadata {
+    pub fn current(
+        identity: IdentitySnapshot,
+        source_lsn: u64,
+        catalog_blake3_hex: String,
+    ) -> Self {
+        Self {
+            identity,
+            source_lsn,
+            catalog_blake3_hex,
+            wal_format_version: WAL_FORMAT_VERSION,
+            catalog_version: CATALOG_VERSION,
+            retained_segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        }
+    }
+
+    pub fn validate_against_source_lsn(&self, source_lsn: u64) -> io::Result<()> {
+        self.identity.validate()?;
+        if self.source_lsn != source_lsn {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sync snapshot source_lsn {} does not match manifest source_lsn {}",
+                    self.source_lsn, source_lsn
+                ),
+            ));
+        }
+        if self.catalog_blake3_hex.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sync snapshot catalog hash must be non-empty",
+            ));
+        }
+        if self.wal_format_version != WAL_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported sync snapshot WAL format {}",
+                    self.wal_format_version
+                ),
+            ));
+        }
+        if self.catalog_version != CATALOG_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported sync snapshot catalog format {}",
+                    self.catalog_version
+                ),
+            ));
+        }
+        if self.retained_segment_format_version != RETAINED_SEGMENT_FORMAT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported retained segment format {}",
+                    self.retained_segment_format_version
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Manifest for an incremental (page-LSN diff) backup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncrementManifest {
@@ -81,6 +162,8 @@ pub struct IncrementManifest {
     pub base_source_lsn: u64,
     /// high-water mark after this increment (== catalog.max_lsn())
     pub source_lsn: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncSnapshotMetadata>,
     pub changed: Vec<ChangedFile>,
 }
 
@@ -96,6 +179,7 @@ impl IncrementManifest {
                 Self::FORMAT_VERSION
             )));
         }
+        validate_sync_metadata(&self.sync, self.source_lsn)?;
         Ok(())
     }
 
@@ -112,6 +196,32 @@ impl IncrementManifest {
     }
 }
 
+pub(crate) fn current_sync_snapshot_metadata(
+    data_dir: &Path,
+    source_lsn: u64,
+) -> io::Result<Option<SyncSnapshotMetadata>> {
+    let Some(identity) = powdb_sync::read_identity_snapshot_if_exists(data_dir)? else {
+        return Ok(None);
+    };
+    let catalog_bytes = std::fs::read(data_dir.join("catalog.bin"))?;
+    let catalog_blake3_hex = blake3::hash(&catalog_bytes).to_hex().to_string();
+    Ok(Some(SyncSnapshotMetadata::current(
+        identity,
+        source_lsn,
+        catalog_blake3_hex,
+    )))
+}
+
+fn validate_sync_metadata(
+    metadata: &Option<SyncSnapshotMetadata>,
+    source_lsn: u64,
+) -> io::Result<()> {
+    if let Some(metadata) = metadata {
+        metadata.validate_against_source_lsn(source_lsn)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +231,7 @@ mod tests {
             format_version: BackupManifest::FORMAT_VERSION,
             created_unix_secs: 1_700_000_000,
             source_lsn: 42,
+            sync: None,
             files: vec![FileEntry {
                 name: "catalog.bin".into(),
                 len: 10,

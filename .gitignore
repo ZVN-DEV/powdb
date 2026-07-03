@@ -7,6 +7,7 @@
 **/powdb_data/
 node_modules/
 clients/ts/dist/
+clients/sync/dist/
 
 # Worker worktrees and tooling state
 .claude/

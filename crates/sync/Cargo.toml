@@ -1,0 +1,28 @@
+[package]
+name = "powdb-sync"
+description = "Retained replication-unit substrate for PowDB embedded replicas and read replicas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["database", "powdb", "sync", "replication", "embedded"]
+categories = ["database", "database-implementations"]
+documentation = "https://docs.rs/powdb-sync"
+
+[dependencies]
+powdb-storage = { version = "0.7.2", path = "../storage" }
+crc32fast.workspace = true
+getrandom = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
