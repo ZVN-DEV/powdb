@@ -144,8 +144,8 @@ jobs:
           count="$(ls -1 ./*.node 2>/dev/null | wc -l | tr -d ' ')"
           echo "Found $count platform binaries:"
           ls -1 ./*.node
-          if [ "$count" -ne 4 ]; then
-            echo "::error::expected 4 platform .node binaries (macOS arm64/x64, Linux x64/arm64; Windows deferred), found $count — refusing to publish a partial set"
+          if [ "$count" -ne 3 ]; then
+            echo "::error::expected 3 platform .node binaries (macOS arm64, Linux x64/arm64; Intel mac + Windows deferred), found $count — refusing to publish a partial set"
             exit 1
           fi
           test -f index.js || { echo "::error::index.js (napi loader) missing"; exit 1; }
@@ -164,8 +164,8 @@ jobs:
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "## Dry run complete" >> "$GITHUB_STEP_SUMMARY"
-            echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 4 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 3 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Published @zvndev/powdb-embedded v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "Single package with prebuilt binaries for macOS (arm64/x64), Linux (x64/arm64). Windows deferred (Unix-only engine)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Single package with prebuilt binaries for macOS (arm64), Linux (x64/arm64). Intel mac builds from source (retired runners); Windows deferred (Unix-only engine)." >> "$GITHUB_STEP_SUMMARY"
           fi
