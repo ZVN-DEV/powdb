@@ -115,7 +115,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// An authenticated connection's identity. Bound at connect time and consulted
-/// on every query by [`dispatch_query`] to enforce the user's role: a
+/// on every query by `dispatch_query` to enforce the user's role: a
 /// `readonly` principal may only execute read statements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {

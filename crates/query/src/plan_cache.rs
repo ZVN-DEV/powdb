@@ -57,7 +57,7 @@ impl PlanCache {
     /// `source_literal_count` is the number of literals
     /// [`crate::canonicalize::canonicalize`] collected from the query text.
     /// The cache only works because, on a hit, every collected literal maps
-    /// 1:1 to a substitutable slot the [`substitute_plan`] walk can reach.
+    /// 1:1 to a substitutable slot the `substitute_plan` walk can reach.
     /// If those counts disagree, the plan has literals the walk cannot
     /// re-bind — the one case today is a subquery (`in (<subquery>)` /
     /// `exists (...)`), whose inner literals `canonicalize` collects at the
@@ -652,6 +652,64 @@ mod tests {
                 Literal::Int(30),
             ]
         );
+    }
+
+    /// #151/#140-class: `uuid("…")` const-fold sugar plans as
+    /// `Cast(Literal::String, Uuid)` — one substitutable slot. It must cache
+    /// AND rebind the inner string on a same-shape second call (a bulk load).
+    #[test]
+    fn test_insert_uuid_sugar_cacheable_and_substitutes() {
+        let mut cache = PlanCache::new(100);
+        let q1 = r#"insert User { id := uuid("00000000-0000-0000-0000-000000000001") }"#;
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        assert_eq!(lits1.len(), 1, "the inner string is the only literal");
+        let plan = planner::plan(q1).unwrap();
+        assert_eq!(
+            count_literal_slots(&plan),
+            1,
+            "Cast wrapping a Literal is a reachable substitution slot"
+        );
+        cache.insert(h1, plan, lits1.len());
+        assert!(!cache.is_empty(), "uuid() insert must be cacheable");
+
+        let q2 = r#"insert User { id := uuid("00000000-0000-0000-0000-000000000002") }"#;
+        let (h2, lits2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2, "same shape hashes identically");
+        let subst = cache.get_with_substitution(h2, &lits2).expect("hit");
+
+        let mut found = Vec::new();
+        collect_literals_for_test(&subst, &mut found);
+        assert_eq!(
+            found,
+            vec![Literal::String(
+                "00000000-0000-0000-0000-000000000002".into()
+            )],
+            "the second call's uuid must be substituted in, not the cached one"
+        );
+    }
+
+    /// Two-arg `cast(.x, "uuid")` bakes the target into the AST but leaves the
+    /// `"uuid"` string as a collected literal with no matching plan slot, so
+    /// the count-mismatch guard refuses to cache it (pre-existing behavior,
+    /// now confirmed for the uuid target).
+    #[test]
+    fn test_two_arg_cast_uuid_not_cached() {
+        let mut cache = PlanCache::new(100);
+        let q = r#"User filter .id = cast(.other, "uuid")"#;
+        let (h, lits) = canonicalize(q).unwrap();
+        assert_eq!(
+            lits.len(),
+            1,
+            "canonicalize collects the cast-target string"
+        );
+        let plan = planner::plan(q).unwrap();
+        assert_eq!(
+            count_literal_slots(&plan),
+            0,
+            "the cast target is baked into the AST, not a slot"
+        );
+        cache.insert(h, plan, lits.len());
+        assert!(cache.is_empty(), "cast(x, \"uuid\") must not be cached");
     }
 
     #[test]

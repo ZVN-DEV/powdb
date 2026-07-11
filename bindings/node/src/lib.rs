@@ -8,6 +8,10 @@
 //! `catch_unwind` actually catches: an engine panic poisons the handle and
 //! returns a JS error instead of aborting the host process.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
 use napi::bindgen_prelude::{BigInt, Buffer, Either, Uint8Array};
 use napi_derive::napi;
 
@@ -18,6 +22,51 @@ use powdb::{
 
 fn to_napi_err(e: PowdbError) -> napi::Error {
     napi::Error::from_reason(e.to_string())
+}
+
+/// The `DirLock` in the storage engine deliberately allows a *same-process*
+/// reopen (the crash-recovery suite relies on it), so two `Database.open()`
+/// calls for one directory in a single Node process would each get a live
+/// engine over the same heap/WAL — the exact concurrent-writer corruption the
+/// lock exists to prevent. This process-wide registry of canonicalized open
+/// paths closes that user-facing hole; `close()` (or GC) clears the entry.
+fn open_registry() -> &'static Mutex<HashSet<PathBuf>> {
+    static REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Best-effort canonical key for a data dir that may not exist yet. Falls back
+/// to canonicalizing the parent (then re-appending the leaf) or the raw path.
+fn canonical_key(dir: &str) -> PathBuf {
+    let path = Path::new(dir);
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => match parent.canonicalize()
+        {
+            Ok(canon) => canon.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Reserve `key` in the process registry, or fail if it is already open here.
+fn register_open(key: &Path) -> napi::Result<()> {
+    let mut set = open_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if !set.insert(key.to_path_buf()) {
+        return Err(napi::Error::from_reason(format!(
+            "data directory {} is already open in this process; close that handle first",
+            key.display()
+        )));
+    }
+    Ok(())
+}
+
+fn unregister_open(key: &Path) {
+    let mut set = open_registry().lock().unwrap_or_else(|e| e.into_inner());
+    set.remove(key);
 }
 
 /// A query result, shaped to match the `@zvndev/powdb-client` `QueryResult`
@@ -214,28 +263,65 @@ fn apply_result_to_js(result: RetainedApplyResult) -> napi::Result<ApplyRetained
 /// An in-process PowDB database. Open it once and reuse the handle.
 #[napi(js_name = "Database")]
 pub struct Database {
-    inner: Inner,
+    // `None` after `close()`. Every method rejects a closed handle instead of
+    // operating on a dropped engine.
+    inner: Option<Inner>,
+    key: PathBuf,
 }
+
+const CLOSED: &str = "database is closed";
 
 #[napi]
 impl Database {
-    /// Open (or create) a database at `dir`. No server is started.
+    /// Open (or create) a database at `dir`. No server is started. Throws if
+    /// the same directory is already open elsewhere in this process.
     #[napi(factory)]
     pub fn open(dir: String) -> napi::Result<Database> {
-        Inner::open(&dir)
-            .map(|inner| Database { inner })
-            .map_err(to_napi_err)
+        let key = canonical_key(&dir);
+        register_open(&key)?;
+        match Inner::open(&dir) {
+            Ok(inner) => Ok(Database {
+                inner: Some(inner),
+                key,
+            }),
+            Err(e) => {
+                unregister_open(&key);
+                Err(to_napi_err(e))
+            }
+        }
     }
 
     /// Open (or create) a database at `dir` with an explicit per-query memory
-    /// budget in bytes (caps sort/join/GROUP BY materialization).
+    /// budget in bytes (caps sort/join/GROUP BY materialization). Throws if the
+    /// same directory is already open elsewhere in this process.
     #[napi(factory)]
     pub fn open_with_memory_limit(dir: String, limit_bytes: i64) -> napi::Result<Database> {
         let limit = usize::try_from(limit_bytes)
             .map_err(|_| napi::Error::from_reason("limit_bytes must be a non-negative integer"))?;
-        Inner::open_with_memory_limit(&dir, limit)
-            .map(|inner| Database { inner })
-            .map_err(to_napi_err)
+        let key = canonical_key(&dir);
+        register_open(&key)?;
+        match Inner::open_with_memory_limit(&dir, limit) {
+            Ok(inner) => Ok(Database {
+                inner: Some(inner),
+                key,
+            }),
+            Err(e) => {
+                unregister_open(&key);
+                Err(to_napi_err(e))
+            }
+        }
+    }
+
+    fn inner_mut(&mut self) -> napi::Result<&mut Inner> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| napi::Error::from_reason(CLOSED))
+    }
+
+    fn inner_ref(&self) -> napi::Result<&Inner> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason(CLOSED))
     }
 
     /// Set the WAL durability mode: `"full"` (default — one fsync per commit,
@@ -244,25 +330,33 @@ impl Database {
     /// only). `"normal"` is what closes the embedded write gap vs SQLite.
     #[napi]
     pub fn set_sync_mode(&mut self, mode: String) -> napi::Result<()> {
-        self.inner.set_sync_mode_str(&mode).map_err(to_napi_err)
+        self.inner_mut()?
+            .set_sync_mode_str(&mode)
+            .map_err(to_napi_err)
     }
 
     /// Run a PowQL statement.
     #[napi]
     pub fn query(&mut self, powql: String) -> napi::Result<QueryResultJs> {
-        self.inner.query(&powql).map(to_js).map_err(to_napi_err)
+        self.inner_mut()?
+            .query(&powql)
+            .map(to_js)
+            .map_err(to_napi_err)
     }
 
     /// Run a SQL statement (lowered to PowQL by the SQL frontend).
     #[napi]
     pub fn query_sql(&mut self, sql: String) -> napi::Result<QueryResultJs> {
-        self.inner.query_sql(&sql).map(to_js).map_err(to_napi_err)
+        self.inner_mut()?
+            .query_sql(&sql)
+            .map(to_js)
+            .map_err(to_napi_err)
     }
 
     /// Run a read-only PowQL statement. Errors if it would mutate.
     #[napi]
     pub fn query_readonly(&self, powql: String) -> napi::Result<QueryResultJs> {
-        self.inner
+        self.inner_ref()?
             .query_readonly(&powql)
             .map(to_js)
             .map_err(to_napi_err)
@@ -275,15 +369,42 @@ impl Database {
         request: ApplyRetainedUnitsRequestJs,
     ) -> napi::Result<ApplyRetainedUnitsResultJs> {
         let request = to_apply_request(request)?;
-        self.inner
+        self.inner_mut()?
             .apply_retained_units(request)
             .map_err(to_napi_err)
             .and_then(apply_result_to_js)
     }
 
     /// Whether a previous call panicked and poisoned the handle (reopen needed).
+    /// A closed handle reports `false`.
     #[napi]
     pub fn is_poisoned(&self) -> bool {
-        self.inner.is_poisoned()
+        self.inner.as_ref().is_some_and(Inner::is_poisoned)
+    }
+
+    /// Close the database: flush and checkpoint (unless poisoned), then release
+    /// the data-directory lock so another process — or another handle in this
+    /// one — can open it. Every later call throws `database is closed`. Calling
+    /// `close()` on an already-closed handle throws the same error.
+    #[napi]
+    pub fn close(&mut self) -> napi::Result<()> {
+        match self.inner.take() {
+            Some(inner) => {
+                inner.close();
+                unregister_open(&self.key);
+                Ok(())
+            }
+            None => Err(napi::Error::from_reason(CLOSED)),
+        }
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // GC finalizer path: if the handle was never explicitly closed, release
+        // the registry slot (the engine's own Drop handles the checkpoint/lock).
+        if self.inner.is_some() {
+            unregister_open(&self.key);
+        }
     }
 }

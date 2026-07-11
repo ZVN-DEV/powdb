@@ -55,7 +55,7 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 /// values in source order.
 ///
 /// Returns `(canonical_hash, literals)`. The hash is the cache key; on a
-/// hit, [`crate::plan_cache::PlanCache::substitute_literals`] re-binds the
+/// hit, [`crate::plan_cache::PlanCache::get_with_substitution`] re-binds the
 /// new literals into the cached plan.
 pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
     let tokens = lex(input)?;

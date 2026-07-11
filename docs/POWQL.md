@@ -805,11 +805,20 @@ User { .name, squared: pow(.score, 2) }
 
 #### now
 
-Return the current timestamp as a datetime value:
+Return the current timestamp, for use in filters, projections, and update assignments:
 
 ```
-insert Event { name := "login", ts := now() }
+Event filter .ts < now() { .name }
+Event { .name, checked_at: now() }
+Event filter .name = "login" update { ts := now() }
 ```
+
+`now()` is a runtime function, so it can only appear where expressions are
+evaluated (filters, projections, `having`, `update` assignments). **Insert**
+assignments accept literal values only — `insert Event { ts := now() }` fails
+with `expected literal value`. A `datetime` column is stored as an integer
+timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
+stamp them afterwards with `update { ts := now() }` if needed.
 
 #### extract
 
@@ -1073,9 +1082,15 @@ Add or drop columns on an existing table.
 
 ```
 alter User add column status: str
-alter User add required active: bool
+alter User add required active: bool       -- only on an empty table (see note)
 alter User add status: str                 -- "column" keyword is optional
 ```
+
+> A `required` column can only be added to an **empty** table — there is no
+> default clause to backfill existing rows, so on a non-empty table it fails with
+> `cannot add required column '…' to non-empty table '…': no default value to
+> backfill existing rows with`. Add the column nullable, populate it, then tighten
+> the constraint if needed.
 
 #### Drop Column
 
@@ -1216,6 +1231,9 @@ The key column (specified after `on`) is used to detect conflicts. If a row with
 > **Breaking change (since 0.4.7):** the `on` column must be **unique** — declare it with the `unique` modifier (`unique email: str`) or `alter <Table> add unique .<col>`. Upserting on a non-unique column is rejected with an error. This closes a prior bug where `upsert` on a non-unique column could silently create duplicate-key rows.
 
 ### Examples
+
+These examples assume `email` is declared `unique` (`unique email: str`) — the
+`on` column must be unique, per the note above, or the upsert is rejected.
 
 Basic upsert (insert or replace all fields on conflict):
 

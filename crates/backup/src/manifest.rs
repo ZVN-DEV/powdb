@@ -71,7 +71,7 @@ pub enum ChangedFile {
         total_pages: u32,
         /// which pages are in the delta (ascending)
         page_indices: Vec<u32>,
-        /// "<name>.delta"
+        /// `<name>.delta`
         delta_file: String,
         delta_len: u64,
         delta_blake3_hex: String,

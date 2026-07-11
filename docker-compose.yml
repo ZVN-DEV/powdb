@@ -1,4 +1,4 @@
-version: "3.8"
+# Benchmark comparison databases for powdb-compare — not a PowDB deployment.
 services:
   postgres:
     image: postgres:16

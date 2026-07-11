@@ -845,6 +845,8 @@ impl Parser {
                 "str" | "Str" | "STR" | "string" | "String" => Ok(CastType::Str),
                 "bool" | "Bool" | "BOOL" | "boolean" => Ok(CastType::Bool),
                 "datetime" | "DateTime" | "DATETIME" => Ok(CastType::DateTime),
+                "uuid" | "Uuid" | "UUID" => Ok(CastType::Uuid),
+                "bytes" | "Bytes" | "BYTES" | "bytea" => Ok(CastType::Bytes),
                 other => Err(ParseError::Syntax {
                     message: format!("invalid cast type: \"{other}\""),
                 }),
@@ -1333,6 +1335,23 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.advance();
+                // `uuid("…")` / `bytes("…")` cast sugar. `uuid`/`bytes` are not
+                // lexer keywords (so `type T { id: uuid }` and identifiers named
+                // `uuid` are untouched); an `Ident` immediately followed by `(`
+                // with a matching name is single-argument cast sugar.
+                if *self.peek() == Token::LParen {
+                    let cast_type = match name.as_str() {
+                        "uuid" => Some(CastType::Uuid),
+                        "bytes" => Some(CastType::Bytes),
+                        _ => None,
+                    };
+                    if let Some(cast_type) = cast_type {
+                        self.advance(); // consume `(`
+                        let inner = self.parse_expr()?;
+                        self.expect(&Token::RParen)?;
+                        return Ok(Expr::Cast(Box::new(inner), cast_type));
+                    }
+                }
                 // `alias.field` → QualifiedField. The lexer emits `t1.name` as
                 // `Ident("t1")` + `DotIdent("name")` (see lexer.rs line 30),
                 // so a trailing DotIdent here means a qualified reference.

@@ -2,7 +2,7 @@
 //!
 //! Run the PowDB engine **in-process** — no server, no socket. This is the
 //! SQLite-shaped front door to the same storage engine, indexes, WAL durability,
-//! and PowQL/SQL frontends that the [`powdb-server`] exposes over the wire.
+//! and PowQL/SQL frontends that the `powdb-server` crate exposes over the wire.
 //! Because there is no network round-trip, single-op latency is the engine's
 //! own cost (~µs), and the database works fully offline — the foundation for
 //! local-first apps.
@@ -77,7 +77,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Open(e) => write!(f, "failed to open database: {e}"),
-            Error::Query(e) => write!(f, "query failed: {e:?}"),
+            Error::Query(e) => write!(f, "query failed: {e}"),
             Error::Poisoned => write!(
                 f,
                 "database handle is poisoned (a previous call panicked); reopen the database"
@@ -114,29 +114,48 @@ impl std::error::Error for Error {
 }
 
 /// Database identity and format metadata required to apply retained sync units.
+///
+/// Every field comes from the primary's sync identity (see `powdb-sync`); the
+/// applier refuses a chunk whose identity does not match this replica's, so a
+/// mismatched value is rejected rather than silently corrupting state.
 #[derive(Debug, Clone)]
 pub struct SyncApplyIdentity {
+    /// The primary's 16-byte database id. Must equal this replica's.
     pub database_id: [u8; 16],
+    /// The primary's generation counter, bumped each time it forks a new
+    /// sync lineage. Guards against applying units from a diverged primary.
     pub primary_generation: u64,
+    /// WAL record format version the units were written with.
     pub wal_format_version: u16,
+    /// Catalog format version the units were written with.
     pub catalog_version: u16,
+    /// Retained-segment container format version. Must equal
+    /// [`RETAINED_SEGMENT_FORMAT_VERSION`] or the apply is rejected.
     pub segment_format_version: u16,
 }
 
 /// One retained replication unit accepted by the embedded sync applier.
 #[derive(Debug, Clone)]
 pub struct RetainedUnitInput {
+    /// Transaction id the unit belongs to (units are applied atomically per tx).
     pub tx_id: u64,
+    /// WAL record type discriminant for the unit's payload.
     pub record_type: u8,
+    /// Log sequence number of the unit; units apply in ascending `lsn` order.
     pub lsn: u64,
+    /// Raw serialized WAL record payload.
     pub data: Vec<u8>,
 }
 
 /// Request to apply one already-pulled retained-unit chunk.
 #[derive(Debug, Clone)]
 pub struct RetainedApplyRequest {
+    /// The replica's current apply boundary; units at or below this lsn are
+    /// skipped. Must match the seeded boundary from the sync bootstrap.
     pub since_lsn: u64,
+    /// Primary identity and format metadata the units were produced under.
     pub identity: SyncApplyIdentity,
+    /// The contiguous retained units to apply, in ascending `lsn` order.
     pub units: Vec<RetainedUnitInput>,
 }
 
@@ -211,7 +230,16 @@ impl Database {
     /// Run a read-only PowQL statement under a shared borrow. Errors if the
     /// statement would mutate.
     pub fn query_readonly(&self, powql: &str) -> Result<QueryResult, Error> {
-        self.run_ref(|e| e.execute_powql_readonly(powql))
+        match self.run_ref(|e| e.execute_powql_readonly(powql)) {
+            // The read-only path signals "this statement writes" with an
+            // internal sentinel; translate it into an actionable message
+            // rather than leaking the sentinel to embedded callers.
+            Err(Error::Query(QueryError::ReadonlyNeedsWrite)) => Err(Error::InvalidArgument(
+                "statement would mutate the database; use query() instead of query_readonly()"
+                    .to_string(),
+            )),
+            other => other,
+        }
     }
 
     /// Set the WAL durability mode (`Full` default | `Normal` | `Off`).
@@ -408,6 +436,41 @@ mod tests {
             QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
             other => panic!("expected 1 row after poisoned-drop reopen, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_error_displays_human_message_not_debug() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_disp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        let err = db.query("Missing filter .x > 1").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("table 'Missing' not found"),
+            "expected human Display, got {msg:?}"
+        );
+        assert!(!msg.contains("TableNotFound"), "leaked Debug: {msg:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_readonly_rejects_mutation_with_actionable_message() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_ro_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type T { required id: int }").unwrap();
+        let err = db.query_readonly("insert T { id := 1 }").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use query()"),
+            "expected actionable hint, got {msg:?}"
+        );
+        assert!(
+            !msg.contains("__POWDB_READONLY_NEEDS_WRITE__"),
+            "internal sentinel leaked to caller: {msg:?}"
+        );
+        assert!(matches!(err, Error::InvalidArgument(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

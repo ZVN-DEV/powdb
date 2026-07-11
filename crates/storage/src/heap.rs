@@ -806,7 +806,7 @@ impl HeapFile {
     }
 
     /// Apply a borrowed read to a row's raw bytes. Like
-    /// [`with_row_bytes_mut`] but without the mutable-access path — the
+    /// `with_row_bytes_mut` but without the mutable-access path — the
     /// closure sees the row slice, runs, and returns. No `Vec<u8>` is
     /// allocated, so callers that only want to decode a few columns
     /// (e.g. the index-maintenance side of `Table::delete`) can skip the
@@ -1605,7 +1605,7 @@ impl HeapFile {
     ///
     /// * The **write path** stamps a CRC on every flushed page
     ///   ([`Page::stamp_checksum`]).
-    /// * **Cold reads** (the `disk.read_page` fallback in [`Self::ensure_hot`])
+    /// * **Cold reads** (the `disk.read_page` fallback in `Self::ensure_hot`)
     ///   verify via [`Page::from_bytes_verified`].
     /// * The **hot mmap read path** trades per-read verification for speed.
     ///   On-disk bit-rot in a page that is only ever read through the mmap

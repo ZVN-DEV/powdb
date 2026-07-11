@@ -134,10 +134,10 @@ fn parse_args() -> Args {
         .filter(|s| !s.is_empty());
     // Optional Unix-domain-socket path. Off unless set.
     let mut socket: Option<String> = std::env::var("POWDB_SOCKET").ok().filter(|s| !s.is_empty());
-    // WS2: per-query memory budget. Env-only (no CLI flag) for now.
+    // Per-query memory budget; env-only (no CLI flag).
     let query_memory_limit =
         parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
-    // WS4: when set, refuse to start with a password but no TLS. Default off.
+    // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
 
     let argv: Vec<String> = std::env::args().collect();
@@ -521,7 +521,7 @@ async fn main() {
 
     let auth_configured = args.password.is_some() || !users.is_empty();
 
-    // WS4: enforce TLS when required. Refuse to start (rather than silently
+    // Enforce TLS when required. Refuse to start (rather than silently
     // transmitting credentials in cleartext) if any auth mode is enabled without
     // TLS. This covers shared-password auth, persisted named users, and
     // just-bootstrapped admins.

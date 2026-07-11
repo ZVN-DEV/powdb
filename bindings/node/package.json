@@ -1,29 +1,41 @@
 {
   "name": "@zvndev/powdb-embedded",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Embedded PowDB — the in-process database engine for Node (no server, no socket). The SQLite-shaped front door to PowDB.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zvndev/powdb.git",
+    "url": "git+https://github.com/ZVN-DEV/powdb.git",
     "directory": "bindings/node"
   },
-  "homepage": "https://zvn-dev.github.io/powdb/",
-  "keywords": ["database", "powdb", "embedded", "sqlite", "local-first", "napi"],
+  "homepage": "https://github.com/ZVN-DEV/powdb#readme",
+  "keywords": [
+    "database",
+    "powdb",
+    "embedded",
+    "sqlite",
+    "local-first",
+    "napi"
+  ],
   "main": "index.js",
   "types": "index.d.ts",
-  "files": ["index.js", "index.d.ts", "*.node"],
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">= 18"
   },
   "napi": {
     "binaryName": "powdb-embedded",
     "targets": [
-      "x86_64-apple-darwin",
       "aarch64-apple-darwin",
       "x86_64-unknown-linux-gnu",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc"
+      "aarch64-unknown-linux-gnu"
     ]
   },
   "scripts": {

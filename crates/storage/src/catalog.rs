@@ -886,7 +886,7 @@ impl Catalog {
     /// at the end of every mutating statement so the group-commit
     /// window is exactly one statement.
     ///
-    /// See [`Self::wal_log`] for the durability contract.
+    /// See `Self::wal_log` for the durability contract.
     #[inline]
     pub fn sync_wal(&mut self) -> io::Result<()> {
         self.wal.flush()
@@ -1291,11 +1291,11 @@ impl Catalog {
         self.by_name_mut(table)?.delete_many(rids)
     }
 
-    /// Mission C Phase 16: single-pass scan-and-delete driven by a
-    /// raw-bytes predicate. See [`Table::scan_delete_matching`] and
-    /// [`HeapFile::scan_delete_matching`] for the fusion rationale.
+    /// Single-pass scan-and-delete driven by a raw-bytes predicate. See
+    /// [`Table::scan_delete_matching`] and `HeapFile::scan_delete_matching`
+    /// for the fusion rationale.
     ///
-    /// Mission B2: prefer [`Self::scan_delete_matching_logged`] from any
+    /// Prefer [`Self::scan_delete_matching_logged`] from any
     /// caller that needs crash durability. This variant writes no WAL
     /// records, so a crash between the scan and the next checkpoint
     /// would lose the deletes. Kept here for internal paths (e.g.
@@ -1307,7 +1307,7 @@ impl Catalog {
         self.by_name_mut(table)?.scan_delete_matching(pred)
     }
 
-    /// Mission B2: WAL-logged variant of [`Self::scan_delete_matching`].
+    /// WAL-logged variant of [`Self::scan_delete_matching`].
     /// Every matched row emits one `WalRecordType::Delete` record in the
     /// same single-pass scan (via the table's `_with_hook` variant), so
     /// crash recovery sees every deletion. Used by the executor's
@@ -1477,7 +1477,7 @@ impl Catalog {
     /// preserves the row length and touches no indexed column. Returns
     /// `Ok(true)` if the patch landed, `Ok(false)` if the row is gone.
     ///
-    /// Mission B2: this primitive does NOT log to the WAL. Executor
+    /// This primitive does NOT log to the WAL. Executor
     /// callers must route through [`Self::update_row_bytes_logged`] (or
     /// [`Self::update_row_bytes_logged_by_slot`]) so crash recovery
     /// sees the patched bytes. This raw form is retained for replay
@@ -1491,7 +1491,7 @@ impl Catalog {
         self.by_name_mut(table)?.with_row_bytes_mut(rid, f)
     }
 
-    /// Mission B2: WAL-logged variant of [`Self::with_row_bytes_mut`].
+    /// WAL-logged variant of [`Self::with_row_bytes_mut`].
     /// Applies `f` to the live row bytes on the hot page, then reads
     /// the mutated bytes back and emits a `WalRecordType::Update`
     /// record so replay will re-apply the same patch after a crash.
@@ -1569,7 +1569,7 @@ impl Catalog {
     /// Caller guarantees no indexed column is touched — indexes are NOT
     /// maintained by this primitive.
     ///
-    /// Mission B2: not WAL-logged. Executor callers should use
+    /// Not WAL-logged. Executor callers should use
     /// [`Self::patch_var_col_logged`] instead.
     #[inline]
     pub fn patch_var_col_in_place(
@@ -1583,7 +1583,7 @@ impl Catalog {
             .patch_var_col_in_place(rid, col_idx, new_value)
     }
 
-    /// Mission B2: WAL-logged variant of [`Self::patch_var_col_in_place`].
+    /// WAL-logged variant of [`Self::patch_var_col_in_place`].
     /// Runs the in-place shrink on the hot page, then reads the mutated
     /// row bytes back and logs a `WalRecordType::Update` record. On a
     /// `false` return (grow-case bail) nothing is logged — the caller's
@@ -1764,7 +1764,7 @@ impl Catalog {
     /// an ALTER ADD COLUMN.
     ///
     /// The fix: rewrite every existing row through
-    /// [`Table::rewrite_rows_for_schema_change`] so the on-disk
+    /// `Table::rewrite_rows_for_schema_change` so the on-disk
     /// encoding matches the new schema layout. Existing rows get
     /// `Value::Empty` for the new column.
     ///
@@ -1861,7 +1861,7 @@ impl Catalog {
     ///
     /// The fix mirrors `alter_table_add_column`: snapshot the old
     /// schema, mutate to the new schema, then rewrite every row
-    /// through [`Table::rewrite_rows_for_schema_change`]. Dropping a
+    /// through `Table::rewrite_rows_for_schema_change`. Dropping a
     /// column from an empty table skips the rewrite.
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
         let data_dir = self.data_dir.clone();

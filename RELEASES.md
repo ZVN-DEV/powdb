@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.8.0** (Embedded Sync Milestone 0 substrate, **experimental**: a new `powdb-sync` crate (retained replication-unit log), private authenticated server sync frames, backup-based replica bootstrap, and two new JS packages (`@zvndev/powdb-sync`, plus sync helpers in `@zvndev/powdb-client`). Core-engine changes for existing users: a durable `catalog.lsn` sidecar next to `catalog.bin`, checkpoint guards, and additive backup-manifest fields. On-disk catalog format unchanged — still v5; older v1–v4 catalogs still load, and a v0.7.2 database/backup opens unchanged (the `catalog.lsn` sidecar is absent → durable LSN reads as 0). **`@zvndev/powdb-sync` is beta-gated and NOT published to npm until Milestone-1 gates pass.**).
+> **Current release: v0.8.1** (Embedded Sync Milestone 0 substrate, **experimental**: a new `powdb-sync` crate (retained replication-unit log), private authenticated server sync frames, backup-based replica bootstrap, and two new JS packages (`@zvndev/powdb-sync`, plus sync helpers in `@zvndev/powdb-client`). Core-engine changes for existing users: a durable `catalog.lsn` sidecar next to `catalog.bin`, checkpoint guards, and additive backup-manifest fields. On-disk catalog format unchanged — still v5; older v1–v4 catalogs still load, and a v0.7.2 database/backup opens unchanged (the `catalog.lsn` sidecar is absent → durable LSN reads as 0). **`@zvndev/powdb-sync` is beta-gated and NOT published to npm until Milestone-1 gates pass.**).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
@@ -19,8 +19,9 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
 | **crates.io** | `powdb` (embedded facade — in-process Rust API) | https://crates.io/crates/powdb |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
+| **crates.io** | `powdb-sync` (experimental — embedded-sync substrate; the companion npm package `@zvndev/powdb-sync` is **not yet published**) | https://crates.io/crates/powdb-sync |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
-| **npm** | `@zvndev/powdb-embedded` (in-process Node addon, prebuilt binaries for all platforms) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
+| **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu — no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
 | **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
 ## GitHub Releases
@@ -32,6 +33,9 @@ When cutting a release, follow the checklist at the bottom.
 | `powdb-cli-macos-aarch64` | macOS ARM64 |
 | `powdb-server-macos-aarch64` | macOS ARM64 |
 
+These two platforms (Linux x86_64, macOS ARM64) are the **only** prebuilt
+`powdb-cli` / `powdb-server` binaries. All other targets — Windows, Intel macOS,
+Linux ARM64 — build from source (`cargo install` / `cargo build --release`).
 Binary artifacts are built automatically by `.github/workflows/release.yml`
 when a `v*` tag is pushed.
 
@@ -42,10 +46,11 @@ Inter-crate dependencies require publishing in this order:
 1. `powdb-storage` (no inter-crate deps)
 2. `powdb-auth` (no inter-crate deps)
 3. `powdb-query` (depends on storage)
-4. `powdb-backup` (depends on storage + query)
-5. `powdb-server` (depends on storage + query + auth)
-6. `powdb` (embedded facade — depends on storage + query)
-7. `powdb-cli` (depends on storage + query + server + backup + auth)
+4. `powdb-sync` (experimental — depends on storage)
+5. `powdb-backup` (depends on storage + sync; query is dev-only)
+6. `powdb-server` (depends on storage + query + auth + sync)
+7. `powdb` (embedded facade — depends on storage + query + sync)
+8. `powdb-cli` (depends on storage + query + server + backup + auth + sync)
 
 Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
 
@@ -65,17 +70,18 @@ one-time setup and the reusable standard.
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
 - **npm (`@zvndev/powdb-embedded`)** — published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
-  runner matrix (macOS arm64/x64, Linux x64/arm64; Windows deferred), then publishes
-  one fat package bundling all four prebuilt `.node` binaries, token-less with
-  provenance. `dry_run=true` (the default) packs every platform without
-  publishing. Kept manual because the binary matrix is slow and the package is
-  released on demand, not on every `v*` tag.
+  runner matrix (macOS arm64, Linux x64/arm64; Intel macOS builds from source and
+  Windows is deferred, both since the macos-13 runner retired in #149), then
+  publishes one fat package bundling all three prebuilt `.node` binaries,
+  token-less with provenance. `dry_run=true` (the default) packs every platform
+  without publishing. Kept manual because the binary matrix is slow and the
+  package is released on demand, not on every `v*` tag.
 
 ## Release Checklist
 
 ```
 [ ] Update workspace version in root Cargo.toml
-[ ] Update inter-crate dep versions in query/backup/server/cli Cargo.toml
+[ ] Update inter-crate dep versions in query/sync/backup/server/powdb/cli Cargo.toml
 [ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
 [ ] Update bindings/node/package.json version (@zvndev/powdb-embedded, lockstep)
 [ ] Update CHANGELOG.md and the Current release line in RELEASES.md
@@ -85,9 +91,10 @@ one-time setup and the reusable standard.
 [ ] cargo publish -p powdb-storage
 [ ] cargo publish -p powdb-auth
 [ ] cargo publish -p powdb-query
+[ ] cargo publish -p powdb-sync   # experimental (depends on storage)
 [ ] cargo publish -p powdb-backup
 [ ] cargo publish -p powdb-server
-[ ] cargo publish -p powdb       # embedded facade (depends on storage + query)
+[ ] cargo publish -p powdb       # embedded facade (depends on storage + query + sync)
 [ ] cargo publish -p powdb-cli
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
 [ ] Verify GitHub Release workflow creates binaries AND auto-publishes npm

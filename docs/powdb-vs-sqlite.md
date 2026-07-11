@@ -32,18 +32,21 @@ between the two.
 
 ## When to choose SQLite
 
-- **SQL compatibility matters.** Every ORM, DB browser, analytics tool,
-  notebook, language client, and BI dashboard speaks SQL. PowDB does not.
-  If you need to point Metabase, DBeaver, or a JDBC driver at your data,
-  SQLite is the answer.
+- **SQL tool / driver compatibility matters.** PowDB accepts a supported
+  subset of SQL through a frontend (since v0.5.0 — see [SQL.md](SQL.md)), but
+  it speaks its own binary wire protocol, not the Postgres/MySQL wire or a
+  JDBC/ODBC surface. Every ORM, DB browser, analytics tool, notebook, and BI
+  dashboard talks to SQLite out of the box; none of them can point at PowDB.
+  If you need Metabase, DBeaver, or a JDBC driver on your data, SQLite is the
+  answer.
 - **Battle-testing matters more than peak performance.** SQLite has 25+
   years of production deployment, decades of OSS-Fuzz coverage, and a test
   suite that is famously larger than the codebase itself. PowDB ships
-  property tests + 3 fuzz targets (`crates/query/fuzz/`), but is pre-1.0
+  property tests + 4 fuzz targets (`crates/query/fuzz/`), but is pre-1.0
   and the on-disk format may shift.
 - **You need broad tool / language ecosystem support.** Bindings exist for
-  essentially every language. PowDB has a TypeScript client and a Rust
-  client today.
+  essentially every language. PowDB has a TypeScript client, an in-process
+  Node addon (`@zvndev/powdb-embedded`), and a Rust API today.
 - **You're already shipping the C toolchain.** If your build already
   compiles `aws-lc`, `openssl`, or any other C dep, the
   `libsqlite3-sys` cost is zero.
@@ -59,7 +62,7 @@ between the two.
 |---------------------------|------------------------------------------------------|-------------------------------------------------------|
 | Implementation language   | 100% Rust core                                       | C                                                     |
 | Build dependencies        | Cargo only (TLS optional `aws-lc-sys`)               | C toolchain                                           |
-| Query language            | PowQL (pipeline; left-to-right)                      | SQL (industry standard)                               |
+| Query language            | PowQL (pipeline) + supported SQL subset via frontend | SQL (industry standard)                               |
 | Storage model             | Slotted-page heap + B+tree indexes                   | B-tree of B-trees                                     |
 | Memory-mapped reads       | Yes (zero-syscall scan path)                         | Optional (`PRAGMA mmap_size`)                         |
 | Write-ahead log           | Yes (statement-boundary group commit)                | Yes (WAL mode)                                        |
@@ -68,7 +71,7 @@ between the two.
 | Joins                     | Nested-loop + hash (equi-join)                       | Nested-loop + merge + hash                            |
 | Window functions          | ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/MIN/MAX OVER   | Full set                                              |
 | Server mode               | Yes (binary wire protocol, TLS, auth)                | Not in core (extensions exist)                        |
-| Fuzz testing              | 3 cargo-fuzz targets (lexer, parser, roundtrip)      | OSS-Fuzz, decades of corpora                          |
+| Fuzz testing              | 4 cargo-fuzz targets (lexer, parser, roundtrip, SQL) | OSS-Fuzz, decades of corpora                          |
 | Crash recovery            | WAL replay + page-zero recovery + index rebuild      | WAL/rollback journal                                  |
 | Backup                    | Offline full/incremental + coarse PITR (0.4.5)       | Online backup API, `.backup`, VACUUM INTO             |
 | On-disk format stability  | Pre-1.0, may shift                                   | Stable for decades                                    |
@@ -138,7 +141,7 @@ Results land in `crates/compare/results.csv`.
 ## Caveats and roadmap
 
 - **PowDB is pre-1.0.** The on-disk format may shift across minor versions.
-  Pin a version (`cargo install powdb-cli --version 0.6.1 --locked`) and
+  Pin a version (`cargo install powdb-cli --version 0.8.0 --locked`) and
   expect to re-bench / re-import on upgrades until 1.0.
 - **SQLite is the safe default.** Decades of production exposure, an
   enormous test suite, and tools everywhere. If you're not sure, you

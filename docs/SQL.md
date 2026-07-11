@@ -2,6 +2,11 @@
 
 PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a frontend only: the SQL parser lowers supported statements to the existing PowDB AST and records canonical PowQL text for the plan cache. The default wire `Query` message remains PowQL for backward compatibility; SQL uses `Engine::execute_sql(...)` in embedded Rust or the wire/client SQL query path.
 
+> **No SQL mode in `powdb-cli`.** The CLI REPL is PowQL-only. Run SQL through the
+> embedded API (`Engine::execute_sql`, or `db.querySql(...)` in the
+> `@zvndev/powdb-embedded` Node addon) or the `QuerySql` wire path (e.g. the
+> TypeScript client's `querySql`).
+
 ## Supported production subset
 
 - `SELECT [DISTINCT] ... FROM ... [JOIN ... ON ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...] [OFFSET ...]`
@@ -23,6 +28,15 @@ Supported expressions include literals, column references, qualified join refere
 ## Intentional unsupported errors
 
 The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, SQL `BETWEEN`, and column-projected `RETURNING a, b` (only `RETURNING *` is supported, because PowQL's `returning` is all-columns). Use native PowQL for those shapes until the SQL subset is expanded.
+
+> **Where you see the explicit message.** These detailed messages reach
+> **embedded** callers — the Rust `Engine::execute_sql` / `execute_sql_readonly`
+> API and the in-process `@zvndev/powdb-embedded` Node addon, which propagate the
+> `QueryError` verbatim. Over the **binary wire protocol**, the server sanitizes
+> any error text it doesn't recognize as safe down to a generic
+> `query execution error`, so a remote client (`QuerySql` / the TypeScript
+> client) sees the generic message rather than the specific unsupported-feature
+> text. Prototype SQL against the embedded API to read the exact reason.
 
 ## Plan-cache parity
 

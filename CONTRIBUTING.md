@@ -31,11 +31,15 @@ crates/storage   # slotted pages, B+ tree, WAL, buffer pool, catalog
 crates/query     # lexer, parser, planner, executor (Engine)
 crates/auth      # user store, roles, argon2id password hashing
 crates/backup    # offline backup/restore (full, incremental, PITR)
+crates/sync      # embedded-sync substrate (retained replication-unit log; experimental)
 crates/server    # Tokio TCP server + binary wire protocol
+crates/powdb     # embedded facade — in-process Rust API over the engine
 crates/cli       # rustyline REPL (embedded + remote mode)
 crates/bench     # criterion benchmarks + regression gate
 crates/compare   # wide benchmark comparisons vs other databases
+bindings/node    # @zvndev/powdb-embedded — in-process Node addon (napi-rs)
 clients/ts       # TypeScript client + demo
+clients/sync     # sync client helpers (experimental)
 ```
 
 ## Development Workflow

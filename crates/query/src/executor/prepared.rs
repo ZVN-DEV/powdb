@@ -139,11 +139,23 @@ impl Engine {
                             })
                     })
                     .collect();
-                Some(InsertFast {
-                    table_slot,
-                    col_indices: indices?,
-                    n_cols,
-                })
+                let indices = indices?;
+                // The fast path writes each literal verbatim with no
+                // `coerce_value`, so a plain string into a uuid/bytes column
+                // would store a raw `Value::Str` — silent typed corruption.
+                // Fall back to the generic (coercing) path for those columns.
+                if indices
+                    .iter()
+                    .any(|&i| matches!(schema.columns[i].type_id, TypeId::Uuid | TypeId::Bytes))
+                {
+                    None
+                } else {
+                    Some(InsertFast {
+                        table_slot,
+                        col_indices: indices,
+                        n_cols,
+                    })
+                }
             }
             _ => None,
         };

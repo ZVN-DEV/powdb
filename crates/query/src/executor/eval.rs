@@ -188,12 +188,30 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
         (Value::Float(_), Float) => Ok(val),
         (Value::Bool(_), Bool) => Ok(val),
         (Value::Str(_), Str) => Ok(val),
+        (Value::DateTime(_), DateTime) => Ok(val),
+        (Value::Uuid(_), Uuid) => Ok(val),
+        (Value::Bytes(_), Bytes) => Ok(val),
         (Value::Int(v), Float) => Ok(Value::Float(*v as f64)),
         (Value::Int(v), DateTime) => Ok(Value::Int(*v)),
         (Value::Str(s), DateTime) => Err(format!(
             "column '{}' is datetime — use an integer timestamp, not a string (\"{}\")",
             col.name, s
         )),
+        // A plain string literal into a uuid/bytes column is coerced (and
+        // validated) per row at execution time — so a bulk-load insert keeps
+        // one cached plan and each row's value is checked independently.
+        (Value::Str(s), Uuid) => parse_uuid_str(s).map(Value::Uuid).ok_or_else(|| {
+            format!(
+                "column '{}' is uuid — expected canonical 8-4-4-4-12 hex, got \"{}\"",
+                col.name, s
+            )
+        }),
+        (Value::Str(s), Bytes) => parse_hex_bytes(s).map(Value::Bytes).ok_or_else(|| {
+            format!(
+                "column '{}' is bytes — expected Postgres bytea hex (\\x-prefixed, even length), got \"{}\"",
+                col.name, s
+            )
+        }),
         (Value::Float(v), Int) => Ok(Value::Int(*v as i64)),
         _ => Err(format!(
             "type mismatch for column '{}': expected {:?}, got {}",
@@ -218,7 +236,74 @@ pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
         Expr::Literal(Literal::String(v)) => Ok(Value::Str(v.clone())),
         Expr::Literal(Literal::Bool(v)) => Ok(Value::Bool(*v)),
         Expr::Null => Ok(Value::Empty),
+        // Const-fold cast sugar in value position: `uuid("…")`, `bytes("…")`,
+        // `cast(1718000000, "datetime")`. A failed cast errors (the whole
+        // statement aborts before any write) rather than silently inserting
+        // null.
+        Expr::Cast(inner, cast_type) => {
+            let v = literal_to_value(inner)?;
+            match eval_cast(v, *cast_type) {
+                Value::Empty => Err(format!("cast to {cast_type:?} produced no value")),
+                out => Ok(out),
+            }
+        }
         _ => Err("expected literal value".into()),
+    }
+}
+
+/// Parse a canonical hyphenated `8-4-4-4-12` UUID string (case-insensitive)
+/// into its 16 raw bytes. Returns `None` on any deviation from the canonical
+/// form (wrong length, misplaced hyphens, non-hex digit).
+fn parse_uuid_str(s: &str) -> Option<[u8; 16]> {
+    let b = s.as_bytes();
+    if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let mut oi = 0usize;
+    let mut hi: Option<u8> = None;
+    for (pos, &c) in b.iter().enumerate() {
+        if matches!(pos, 8 | 13 | 18 | 23) {
+            continue;
+        }
+        let nib = hex_nibble(c)?;
+        match hi {
+            None => hi = Some(nib),
+            Some(h) => {
+                out[oi] = (h << 4) | nib;
+                oi += 1;
+                hi = None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Parse Postgres bytea text encoding — a `\x` prefix followed by an
+/// even-length run of hex digits — into raw bytes. Returns `None` if the
+/// prefix is missing, the length is odd, or a non-hex digit appears. PowQL
+/// source spells the prefix `"\\x…"` (the lexer collapses `\\` to one `\`).
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let rest = s.strip_prefix("\\x")?;
+    let b = rest.as_bytes();
+    if b.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0usize;
+    while i < b.len() {
+        out.push((hex_nibble(b[i])? << 4) | hex_nibble(b[i + 1])?);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -624,6 +709,18 @@ fn eval_cast(val: Value, target: CastType) -> Value {
         CastType::DateTime => match val {
             Value::DateTime(m) => Value::DateTime(m),
             Value::Int(m) => Value::DateTime(m),
+            _ => Value::Empty,
+        },
+        CastType::Uuid => match val {
+            Value::Uuid(u) => Value::Uuid(u),
+            Value::Str(s) => parse_uuid_str(&s).map(Value::Uuid).unwrap_or(Value::Empty),
+            _ => Value::Empty,
+        },
+        CastType::Bytes => match val {
+            Value::Bytes(b) => Value::Bytes(b),
+            Value::Str(s) => parse_hex_bytes(&s)
+                .map(Value::Bytes)
+                .unwrap_or(Value::Empty),
             _ => Value::Empty,
         },
     }
