@@ -35,8 +35,8 @@
   <div class="container">
     <h1>A database engine that's<br><span class="highlight">3-10x faster</span> than SQLite</h1>
     <p class="subtitle">
-      From-scratch Rust database with PowQL -- a pipeline query language that reads left to right.
-      No SQL parsing overhead. Compiled predicates. Pure-Rust core.
+      From-scratch Rust database with PowQL -- a pipeline query language that reads left to right --
+      plus a SQL frontend on the same engine. One engine, two languages. Compiled predicates. Pure-Rust core.
     </p>
     <div class="hero-actions">
       <a href="getting-started.html" class="btn btn-primary">Get Started</a>
@@ -52,7 +52,7 @@
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows. Both engines in memory-mode. All 14 workloads — real numbers, no cherry-picking.</p>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows (M1), both engines in memory-mode — real numbers, no cherry-picking. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
     <table>
       <thead>
         <tr>
@@ -238,6 +238,41 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
   </div>
 </section>
 
+<!-- Embedded in Node -->
+<section class="compare-section" id="embedded">
+  <div class="container">
+    <h2>Embedded in Node — no server</h2>
+    <p class="section-subtitle">The same engine, in-process. <code>@zvndev/powdb-embedded</code> is a native Node addon: open a database, run PowQL or SQL, no TCP, no daemon. It beats SQLite on writes once you pick a durability mode.</p>
+
+    <div class="install-block" style="margin-bottom: 24px;">
+      <span class="prompt">$</span> npm install @zvndev/powdb-embedded
+    </div>
+
+    <div class="compare-example">
+      <div class="compare-card">
+        <div class="compare-card-header powql">index.mjs</div>
+        <pre><code class="language-typescript">import { Database } from "@zvndev/powdb-embedded";
+
+const db = Database.open("./data");
+
+// "normal" = off-lock background fsync: much faster writes,
+// a bounded crash-loss window. This closes the write gap vs SQLite.
+db.setSyncMode("normal");
+
+db.query('type User { required name: str, required email: str, age: int }');
+db.query('insert User { name := "Alice", email := "alice@example.com", age := 30 }');
+
+// PowQL
+db.query('User filter .age > 25 { .name, .age }');
+
+// ...or SQL, on the same handle — lowered to PowQL by the SQL frontend
+db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</code></pre>
+      </div>
+    </div>
+    <p class="section-subtitle" style="margin-top: 20px;">Durability is a knob, not a fork: <code>"full"</code> fsyncs every commit (safest, the default), <code>"normal"</code> moves the fsync off the write lock for a bounded crash-loss window, and batching writes in a <code>begin</code>/<code>commit</code> transaction collapses a whole bulk load into a single fsync. That is how single-row insert throughput stops being fsync-bound.</p>
+  </div>
+</section>
+
 <!-- Features -->
 <section class="features-section">
   <div class="container">
@@ -262,12 +297,20 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
         <p>FNV-1a hashed plan cache with literal substitution. Parse and plan once, execute thousands of times. Prepared queries skip the entire front-end pipeline.</p>
       </div>
       <div class="feature-card">
+        <h3>SQL Frontend</h3>
+        <p>A SQL parser lowers a supported subset — <code>SELECT</code>/<code>JOIN</code>/<code>GROUP BY</code>, <code>INSERT ... RETURNING</code>, <code>AUTOINCREMENT</code>, DDL, transactions — to the same PowQL AST and plan cache. One engine, two languages, no second execution path.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Embedded in Node</h3>
+        <p>Native in-process addon (<code>@zvndev/powdb-embedded</code>): <code>Database.open</code>, then PowQL or SQL with no server. <code>setSyncMode("normal")</code> is what beats SQLite on writes.</p>
+      </div>
+      <div class="feature-card">
         <h3>TypeScript Client</h3>
         <p>First-class TypeScript client (<code>@zvndev/powdb-client</code>) with a clean async API. Connect to PowDB server over TCP with full type safety.</p>
       </div>
       <div class="feature-card">
         <h3>TLS + Authentication</h3>
-        <p>TLS encryption plus two auth modes: a shared password (<code>POWDB_PASSWORD</code>) or named users with roles (admin / readwrite / readonly, argon2id-hashed) shipped in v0.4.5.</p>
+        <p>TLS encryption plus two auth modes: a shared password (<code>POWDB_PASSWORD</code>) or named users with roles (admin / readwrite / readonly, argon2id-hashed).</p>
       </div>
       <div class="feature-card">
         <h3>Zero C Dependencies</h3>
@@ -288,8 +331,8 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
     <p class="section-subtitle">PowDB is pre-1.0 and deliberately scoped. Be honest with yourself before adopting it:</p>
     <ul style="max-width: 720px; margin: 0 auto; padding-left: 24px; line-height: 1.8;">
       <li><strong>Pre-1.0 format stability</strong> -- the on-disk format may shift across minor versions. Pin versions and expect to re-import on upgrades until 1.0.</li>
-      <li><strong>No SQL compatibility</strong> -- PowQL is a different language by design. No ORMs, BI dashboards, JDBC drivers, or DB browsers will speak to it.</li>
-      <li><strong>Single-node only</strong> -- no replication, sharding, or consensus.</li>
+      <li><strong>No wire-protocol compatibility</strong> -- PowDB speaks a SQL subset (<a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md" target="_blank" rel="noopener">docs/SQL.md</a>) through its own binary protocol and embedded API, not the Postgres or MySQL wire format. Off-the-shelf ORMs, BI dashboards, JDBC drivers, and DB browsers won't connect over the wire.</li>
+      <li><strong>Effectively single-node</strong> -- no sharding or consensus. Embedded replica sync is <strong>experimental</strong> (milestone 0): a retained-unit log substrate with offline <code>sync-bootstrap</code> / <code>sync-status</code> tooling, not production replication yet.</li>
       <li><strong>No MVCC, no online backup</strong> -- single writer with parallel readers; backups (full, incremental, PITR) are offline-only today.</li>
     </ul>
     <p class="section-subtitle" style="margin-top: 24px;">If any of those are dealbreakers, use SQLite -- and we say so plainly in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/powdb-vs-sqlite.md" target="_blank" rel="noopener">PowDB vs SQLite: when to use which</a>.</p>
@@ -305,5 +348,6 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
 </body>
 </html>

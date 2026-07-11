@@ -11,7 +11,7 @@ cargo bench -p powdb-bench         # criterion benchmarks (~60s)
 
 ## Architecture
 
-PowDB is a from-scratch database engine. Its native query language is **PowQL** — a left-to-right pipeline syntax whose parser AST is already a plan tree, so there is no cost-based rewriting tier. Since v0.5.0 PowDB also ships a **SQL frontend**: a SQL parser that lowers a supported subset (`crates/query/src/sql`) to the same PowQL AST and shares the plan cache. Both languages run on one planner/executor. The default wire `Query` message stays PowQL for backward compatibility; SQL goes through `Engine::execute_sql(...)` (embedded Rust) or the `QuerySql` wire path. See `docs/SQL.md` for the supported subset.
+PowDB is a from-scratch database engine. Its native query language is **PowQL** — a left-to-right pipeline syntax whose parser AST is already a plan tree, so there is no cost-based rewriting tier. Since v0.5.0 PowDB also ships a **SQL frontend**: a SQL parser that lowers a supported subset (`crates/query/src/sql.rs`) to the same PowQL AST and shares the plan cache. Both languages run on one planner/executor. The default wire `Query` message stays PowQL for backward compatibility; SQL goes through `Engine::execute_sql(...)` (embedded Rust) or the `QuerySql` wire path. See `docs/SQL.md` for the supported subset.
 
 ### Crate Dependency Graph
 
@@ -20,15 +20,17 @@ powdb-cli ──→ powdb-server ──→ powdb-query ──→ powdb-storage
                                     ↑                ↑
                               powdb-bench      powdb-compare
 
+powdb        ──→ powdb-storage + powdb-query + powdb-sync   (embedded facade crate)
+powdb-sync   ──→ powdb-storage                              (retained-unit sync substrate)
 powdb-auth   ←── powdb-server, powdb-cli   (user store + roles; no inter-crate deps)
-powdb-backup ←── powdb-cli                 (depends on powdb-storage + powdb-query)
+powdb-backup ←── powdb-cli                 (depends on powdb-storage + powdb-sync; powdb-query is dev-only)
 ```
 
 ### Query Pipeline
 
 ```
 PowQL text → Lexer (token stream) → Parser (AST) → Planner (PlanNode tree) → Executor (results)
-SQL text   → SQL frontend (crates/query/src/sql) ──→ same PowQL AST ──↗
+SQL text   → SQL frontend (crates/query/src/sql.rs) ──→ same PowQL AST ──↗
 ```
 
 - **Lexer** (`crates/query/src/lexer.rs`): Tokenizes PowQL input
@@ -49,7 +51,7 @@ SQL text   → SQL frontend (crates/query/src/sql) ──→ same PowQL AST ─�
 
 1. **Planner is pure** — no catalog access. This means `RangeScan` is emitted speculatively; the executor does plan lowering at runtime based on actual index availability
 2. **Compiled predicates** — `Filter(SeqScan)` fast paths compile filter expressions into byte-level operations that skip full row decoding
-3. **PowQL-native, SQL-as-frontend** — PowQL is the native language and its AST *is* the plan tree. SQL is supported only as a frontend that lowers a subset to the PowQL AST (`crates/query/src/sql`, see `docs/SQL.md`); it adds no second execution path. PowDB uses its own binary wire protocol — do not add a Postgres/MySQL wire-protocol compatibility layer
+3. **PowQL-native, SQL-as-frontend** — PowQL is the native language and its AST *is* the plan tree. SQL is supported only as a frontend that lowers a subset to the PowQL AST (`crates/query/src/sql.rs`, see `docs/SQL.md`); it adds no second execution path. PowDB uses its own binary wire protocol — do not add a Postgres/MySQL wire-protocol compatibility layer
 4. **Zero-copy scanning** — mmap-based heap scans with `try_for_each_row_raw` for early termination
 
 ## Test Commands

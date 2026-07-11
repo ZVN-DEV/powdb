@@ -47,6 +47,9 @@ cargo install powdb-server
 # TypeScript client (Node 18+) — version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
+# In-process Node addon — embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu; other targets build from source)
+npm install @zvndev/powdb-embedded
+
 # Prebuilt binaries (linux x86_64, macos aarch64)
 # https://github.com/zvndev/powdb/releases/latest
 
@@ -115,20 +118,25 @@ On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) a
 PowQL reads left to right. You name the table, apply operations, and project fields -- all in one pipeline.
 
 ```
--- Define a schema
+-- Define a schema (auto-increment id, a default, a required field)
 type User {
+  unique auto id: int,
   required name: str,
   required email: str,
+  status: str default "active",
   age: int
 }
 
 -- Insert (single row)
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
--- Insert many rows in one statement (one fsync, one round trip, all-or-nothing)
-insert User
-  { name := "Bob",   email := "bob@example.com",   age := 22 },
-  { name := "Carol", email := "carol@example.com", age := 41 }
+-- Insert many rows in one statement (one fsync, one round trip, all-or-nothing).
+-- Keep the whole statement on one line in the CLI REPL, which buffers input
+-- across lines only while braces/parens stay open.
+insert User { name := "Bob", email := "bob@example.com", age := 22 }, { name := "Carol", email := "carol@example.com", age := 41 }
+
+-- returning: get the affected rows back in the same statement (here the auto id)
+insert User { name := "Dave", email := "dave@example.com", age := 33 } returning
 
 -- Query pipeline: source -> filter -> order -> limit -> projection
 User filter .age > 25 order .age desc limit 10 { .name, .age }
@@ -153,6 +161,7 @@ User filter .age > 30 union User filter .city = "NYC"
 -- Mutations
 User filter .age < 18 delete
 User filter .id = 1 update { age := 31 }
+User filter .id = 1 update { age := 32 } returning   -- post-update rows back
 
 -- DDL
 alter User add column score: int
@@ -223,7 +232,7 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network — it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.6.1 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+- [ ] Pin the version (`cargo install powdb-server --version 0.8.0 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
 - [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 
@@ -256,6 +265,8 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Scalar functions: UPPER, LOWER, LENGTH, TRIM, SUBSTRING, CONCAT, ABS, ROUND, CEIL, FLOOR, SQRT, POW, NOW, EXTRACT, DATE_ADD, DATE_DIFF
 - Materialized views with automatic dirty tracking
 - UPSERT with ON CONFLICT
+- `returning` on insert / update / delete (affected rows back in one round trip)
+- `default` column values and `auto` (auto-increment) integer columns
 - Prepared queries with literal substitution
 - EXPLAIN for query plan inspection
 
