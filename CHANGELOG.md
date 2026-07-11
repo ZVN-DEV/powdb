@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-07-11
+
+Production-readiness patch from a full-product audit: a critical TS-client fix,
+statement-aware loading + uuid/bytes fidelity for bulk imports (#150, #151),
+embedded-lifecycle hardening, a CI fix, and a truth pass over every doc and the
+marketing site.
+
+### Fixed
+
+- **TS client: aborting an in-flight query no longer corrupts the connection.**
+  `onData` consumed settled (aborted) pending entries incorrectly, delivering
+  the aborted query's reply to the *next* query — silently wrong results for
+  the rest of the connection — or tearing the connection down with
+  `protocol_error` and hanging `close()`. Replies are now matched one frame to
+  one pending entry and discarded when that entry is settled; `close()` after
+  an errored teardown releases the socket.
+- **TS client: plain `AbortController.abort()` now rejects with
+  `PowDBError` code `"aborted"`** instead of a raw `DOMException`; custom
+  abort reasons still pass through as documented.
+- **`powdb-cli --exec` splits statements with string-literal and `#`-comment
+  awareness** (previously a naive `';'` split), so text values containing `;`
+  or newlines load intact — embedded and remote (#150).
+- **CLI: the interactive REPL no longer panics** with a raw Rust panic on
+  engine-open failure; it prints the same clean error as the one-shot path.
+  All CLI stderr failures now use a uniform `Error:` prefix.
+- **CI: `examples-smoke` SIGILL fixed** (red `ci-success` on main since #148):
+  the job was the only builder missing the portable
+  `RUSTFLAGS: -C target-cpu=x86-64-v2` override, so `target-cpu=native` from
+  `.cargo/config.toml` crashed on heterogeneous shared runners.
+- Embedded (Rust facade): query errors render their human `Display` message
+  (was `Debug`); `query_readonly` rejects mutations with an actionable
+  message instead of leaking an internal sentinel.
+- `clients/ts/pnpm-workspace.yaml` contained committed placeholder text that
+  broke `pnpm install`.
+
+### Added
+
+- **`powdb-cli --exec-file <PATH>`** (or `-` for stdin) loads a whole PowQL
+  file, removing the shell ARG_MAX ceiling on large loads.
+- **`uuid` and `bytes` columns accept validated string literals directly**,
+  plus `uuid("…")` / `bytes("…")` cast sugar in insert and filter positions;
+  plan-cache and prepared-insert paths store real typed values (#151). SQL
+  `CREATE TABLE` now accepts `bytea` (maps to `bytes`; spell hex with a
+  doubled backslash in SQL string literals, e.g. `'\\xdeadbeef'`).
+- **Embedded Node addon: `Database.close()`** for deterministic
+  flush/checkpoint and data-dir lock release; opening the same directory twice
+  in one process now throws instead of silently creating two live engines.
+  The README documents the lifecycle and the 3 supported prebuild platforms.
+
+### Changed
+
+- `scripts/check-version-consistency.sh` now also gates
+  `clients/sync/package.json` (version + exact peer pins), every
+  `ghcr.io/zvn-dev/powdb` image tag under `examples/`, and version strings in
+  `site/` — the marketing site can no longer freeze on an old release.
+- Deploy examples bumped from the stale `v0.6.1` image pin; root
+  `docker-compose.yml` dropped the obsolete `version` key.
+- rustdoc warnings 23 → 0 across 5 crates; `powdb-server`'s crates.io
+  description no longer claims "no SQL parsing layer"; `bindings/node`
+  package metadata corrected (repo URL, `napi.targets`); internal sprint
+  jargon stripped from public code comments.
+
+### Docs & site
+
+- Marketing site unfroze from v0.4.8: corrected the false "No SQL
+  compatibility" positioning (PowQL-native + SQL frontend, one engine, two
+  languages), added the embedded Node package, SQL frontend, and experimental
+  sync to the story, fixed two broken PowQL snippets, and made the benchmark
+  copy accurate. Every snippet on the site now executes against the real CLI.
+- Docs truth pass: `powdb-vs-sqlite.md` SQL reality, README v0.7.x features
+  (`returning` / `default` / `auto`) + embedded install, `FORMAT.md` catalog
+  v5 + `catalog.lsn` sidecar + retained-segment formats, `POWQL.md`
+  `now()` / `alter … required` / upsert caveats, `SQL.md` wire-error notes,
+  `RELEASES.md` platform matrices and `powdb-sync` publish order,
+  `CONTRIBUTING.md` project structure, TS client `querySql()` docs.
+
 ## [0.8.0] - 2026-07-02
 
 Embedded Sync **Milestone 0** — the retained replication-unit log substrate for
