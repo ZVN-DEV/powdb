@@ -37,7 +37,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.8.0";
+export const CLIENT_VERSION = "0.8.1";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -238,15 +238,22 @@ function majorOf(version: string): string {
 }
 
 /**
- * Build an AbortError. Prefers the caller-supplied `signal.reason` if it is
- * itself an `Error` (matches DOM semantics); otherwise wraps it in a
- * `PowDBError` with code `"aborted"` so catch-blocks can branch uniformly.
+ * Build an AbortError. A caller-supplied custom `Error` reason
+ * (`ctrl.abort(myError)`) passes through as-is to match DOM semantics. The
+ * default abort reason — Node's `DOMException` named `"AbortError"` — and any
+ * non-Error reason are wrapped in a `PowDBError` with code `"aborted"` so the
+ * common `ctrl.abort()` case branches uniformly on `err.code === "aborted"`.
  */
 function abortError(signal?: AbortSignal): Error {
   if (signal && signal.reason !== undefined) {
     const r = signal.reason;
-    if (r instanceof Error) return r;
-    return new PowDBError(String(r), "aborted");
+    const isDefaultAbort =
+      r instanceof DOMException && r.name === "AbortError";
+    if (r instanceof Error && !isDefaultAbort) return r;
+    return new PowDBError(
+      isDefaultAbort ? "query was aborted" : String(r),
+      "aborted",
+    );
   }
   return new PowDBError("query was aborted", "aborted");
 }
@@ -803,7 +810,17 @@ export class Client extends EventEmitter<ClientEvents> {
    * timeout so an unresponsive peer cannot make `close()` hang forever.
    */
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) {
+      // Already torn down (e.g. an error in onData/onClose closed the client
+      // without destroying the socket). Ensure the socket is released so a
+      // post-teardown close() resolves instead of keeping the event loop
+      // alive. `writableEnded` distinguishes that case from a concurrent
+      // close() mid-graceful-shutdown, which must not be force-destroyed.
+      if (!this.socket.destroyed && !this.socket.writableEnded) {
+        this.socket.destroy();
+      }
+      return;
+    }
     try {
       this.socket.write(encode({ type: "Disconnect" }));
     } catch {
@@ -961,21 +978,19 @@ export class Client extends EventEmitter<ClientEvents> {
         continue;
       }
 
-      // Find the next non-settled pending entry and hand it the reply.
-      // Settled entries at the head were aborted by the caller but their
-      // reply is arriving now — drop it silently.
-      let entry = this.pending.shift();
-      while (entry && entry.settled) {
-        entry = this.pending.shift();
-      }
-      if (!entry) {
-        // Server sent an unsolicited frame (or we got extra after aborts
-        // with no replacement). Treat as protocol error.
+      // Replies are strictly FIFO: this frame belongs to exactly one pending
+      // entry — the head. Consume one entry per frame. If it was aborted
+      // (settled), its reply is arriving now; drop the frame and keep decoding
+      // rather than delivering it to a later, live query.
+      const entry = this.pending.shift();
+      if (entry === undefined) {
+        // No pending entry at all — the server sent an unsolicited frame.
         this.onClose(
           new PowDBError("received unexpected frame from server", "protocol_error"),
         );
         return;
       }
+      if (entry.settled) continue;
       entry.resolve(decoded.msg);
     }
   }

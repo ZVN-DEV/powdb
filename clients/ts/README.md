@@ -322,11 +322,12 @@ try {
 }
 ```
 
-If you abort with a custom reason (`ctrl.abort(myError)`) and that reason is
-an `Error`, it is thrown as-is instead. Otherwise the client throws a
-`PowDBError` with `code === "aborted"`.
+A plain `ctrl.abort()` throws a `PowDBError` with `code === "aborted"`. If you
+abort with a custom `Error` reason (`ctrl.abort(myError)`), that error is thrown
+as-is; any non-`Error` reason is wrapped in a `PowDBError` (`code === "aborted"`).
 
-The socket stays open — the server's reply is silently discarded so other in-flight queries keep working.
+The socket stays open — the aborted query's reply is silently discarded when it
+arrives, and every other in-flight query still receives its own result.
 
 ## API
 
@@ -360,6 +361,19 @@ Sends a PowQL query and returns a `Promise<QueryResult>`:
 `opts.signal?: AbortSignal` — aborts the returned promise (see Cancellation above).
 
 Throws a `PowDBError` (see Structured errors above) on any failure.
+
+### `client.querySql(query, opts?)`
+
+Runs a statement through the server's **SQL frontend** and returns a
+`Promise<QueryResult>` — the same result shape as `query()`. The plain
+`query()` method stays PowQL for wire compatibility; `querySql()` sends the
+dedicated `QuerySql` wire message. Requires server ≥0.5.0 (the SQL frontend was
+added in 0.5.0); see `docs/SQL.md` for the supported subset. `opts.signal?:
+AbortSignal` cancels the query (see Cancellation above).
+
+```typescript
+const result = await client.querySql("SELECT name, age FROM User WHERE age > 27");
+```
 
 ### `client.queryTyped(query, schema, opts?)`
 

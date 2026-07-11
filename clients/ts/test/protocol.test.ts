@@ -21,7 +21,7 @@ import {
   type Message,
   type WireSyncStatus,
 } from "../src/protocol.js";
-import { Client } from "../src/index.js";
+import { Client, PowDBError, isPowDBError } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -82,6 +82,57 @@ function collectFrames(
     buf = buf.subarray(decoded.consumed);
   }
   return { messages, rest: buf };
+}
+
+function listen(server: net.Server): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        reject(new Error("unexpected server address"));
+        return;
+      }
+      resolve(addr.port);
+    });
+  });
+}
+
+/** Handshakes, then replies to each Query after `delayMs` with a scalar equal
+ *  to the query text — so a caller can tell replies apart and abort in the gap. */
+function echoServer(delayMs = 20): net.Server {
+  return net.createServer((sock) => {
+    let scratch = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      const collected = collectFrames(scratch, Buffer.from(chunk));
+      scratch = collected.rest;
+      for (const msg of collected.messages) {
+        if (msg.type === "Connect") {
+          sock.write(encode({ type: "ConnectOk", version: "0.8.0" }));
+        } else if (msg.type === "Query") {
+          const value = msg.query;
+          setTimeout(() => {
+            if (!sock.destroyed) {
+              sock.write(encode({ type: "ResultScalar", value }));
+            }
+          }, delayMs);
+        } else if (msg.type === "Disconnect") {
+          sock.end();
+        }
+      }
+    });
+    sock.on("error", () => {});
+  });
+}
+
+/** Handshakes, then stays silent — any Query hangs until aborted. */
+function silentServer(): net.Server {
+  return net.createServer((sock) => {
+    sock.once("data", () =>
+      sock.write(encode({ type: "ConnectOk", version: "0.8.0" })),
+    );
+    sock.on("error", () => {});
+  });
 }
 
 async function main() {
@@ -731,6 +782,156 @@ async function main() {
     assert.ok(rejected, "pre-aborted signal should reject immediately");
 
     await client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("abort of in-flight query does not desync — next query gets its own reply", async () => {
+    const server = echoServer(20);
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+
+    const controller = new AbortController();
+    const aborted = client.query("count(User)", { signal: controller.signal });
+    queueMicrotask(() => controller.abort());
+    await assert.rejects(aborted, /abort/i);
+
+    // The aborted query's reply is still in flight. The next query must get
+    // ITS OWN result, not the aborted one's.
+    const result = await client.query("User { .name }");
+    assert.equal(result.kind, "scalar");
+    if (result.kind === "scalar") {
+      assert.equal(result.value, "User { .name }");
+    }
+
+    // Connection is still usable for a third query.
+    const again = await client.query("count(User)");
+    assert.equal(again.kind === "scalar" && again.value, "count(User)");
+
+    await client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("abort with nothing else pending keeps the connection open (no protocol_error)", async () => {
+    const server = echoServer(20);
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+
+    const controller = new AbortController();
+    const aborted = client.query("count(User)", { signal: controller.signal });
+    queueMicrotask(() => controller.abort());
+    await assert.rejects(aborted, /abort/i);
+
+    // Let the orphaned reply arrive and be dropped. If it were treated as an
+    // unsolicited frame, the client would tear the connection down.
+    await new Promise((r) => setTimeout(r, 40));
+
+    const result = await client.query("User { .name }");
+    assert.equal(result.kind, "scalar");
+
+    // close() must resolve, not hang.
+    await Promise.race([
+      client.close(),
+      new Promise<void>((_, rej) =>
+        setTimeout(() => rej(new Error("close() hung")), 2000),
+      ),
+    ]);
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("plain abort() rejects with PowDBError code 'aborted'", async () => {
+    const server = silentServer();
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+
+    const controller = new AbortController();
+    queueMicrotask(() => controller.abort());
+    let caught: unknown;
+    try {
+      await client.query("anything", { signal: controller.signal });
+    } catch (err) {
+      caught = err;
+    }
+    assert.ok(isPowDBError(caught), "expected a PowDBError, got " + String(caught));
+    assert.equal((caught as PowDBError).code, "aborted");
+
+    await client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("custom abort reason passes through unchanged", async () => {
+    const server = silentServer();
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+
+    const controller = new AbortController();
+    const custom = new Error("my custom reason");
+    queueMicrotask(() => controller.abort(custom));
+    let caught: unknown;
+    try {
+      await client.query("anything", { signal: controller.signal });
+    } catch (err) {
+      caught = err;
+    }
+    assert.equal(caught, custom);
+
+    await client.close();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("close() after an errored teardown releases the socket", async () => {
+    let serverSock: net.Socket | undefined;
+    const server = net.createServer((sock) => {
+      serverSock = sock;
+      sock.once("data", () =>
+        sock.write(encode({ type: "ConnectOk", version: "0.8.0" })),
+      );
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      connectTimeoutMs: 1000,
+    });
+
+    const tornDown = new Promise<Error | null>((r) =>
+      client.once("close", (e) => r(e.error)),
+    );
+    // An unsolicited frame with nothing pending tears the client down
+    // (protocol_error) without destroying the socket.
+    serverSock!.write(encode({ type: "ResultScalar", value: "unsolicited" }));
+    const err = await tornDown;
+    assert.ok(isPowDBError(err) && err.code === "protocol_error");
+
+    // close() must release the socket — observed as the server seeing the
+    // connection close — rather than leaving it holding the event loop open.
+    await client.close();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("server never saw the socket close")),
+        2000,
+      );
+      serverSock!.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
     await new Promise<void>((r) => server.close(() => r()));
   });
 
