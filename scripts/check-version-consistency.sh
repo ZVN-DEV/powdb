@@ -51,6 +51,37 @@ addon_version="$($node_bin -p "require('./bindings/node/package.json').version")
 [[ "$addon_version" == "$workspace_version" ]] \
   || fail "bindings/node/package.json version $addon_version != workspace $workspace_version"
 
+# @zvndev/powdb-sync ships in lockstep with the workspace, and its
+# peerDependencies pin the client/embedded versions exactly, so both pins must
+# be bumped every release or published sync will demand stale peers.
+sync_version="$($node_bin -p "require('./clients/sync/package.json').version")"
+[[ "$sync_version" == "$workspace_version" ]] \
+  || fail "clients/sync/package.json version $sync_version != workspace $workspace_version"
+for peer in @zvndev/powdb-client @zvndev/powdb-embedded; do
+  peer_pin="$($node_bin -p "require('./clients/sync/package.json').peerDependencies['$peer']")"
+  [[ "$peer_pin" == "$workspace_version" ]] \
+    || fail "clients/sync/package.json peerDependency $peer pins $peer_pin, expected $workspace_version"
+done
+
+# Deploy examples pin a published ghcr image tag; every such pin must track the
+# workspace version so following the examples never deploys a stale release.
+example_tags="$(grep -RhoE 'ghcr\.io/zvn-dev/powdb:v[0-9]+\.[0-9]+\.[0-9]+' examples/ | sort -u || true)"
+while IFS= read -r ref; do
+  [[ -n "$ref" ]] || continue
+  ref_version="${ref##*:v}"
+  [[ "$ref_version" == "$workspace_version" ]] \
+    || fail "examples pin $ref, expected ghcr.io/zvn-dev/powdb:v$workspace_version"
+done <<< "$example_tags"
+
+# The marketing site quotes versioned banners/output; any vX.Y.Z it mentions
+# must be the shipping release so the site can't freeze on an old version again.
+site_versions="$(grep -RhoE 'v[0-9]+\.[0-9]+\.[0-9]+' site/*.html | sort -u || true)"
+while IFS= read -r ref; do
+  [[ -n "$ref" ]] || continue
+  [[ "$ref" == "v$workspace_version" ]] \
+    || fail "site/ mentions $ref, expected v$workspace_version"
+done <<< "$site_versions"
+
 grep -qE "^## \[$workspace_version\]" CHANGELOG.md \
   || fail "CHANGELOG.md is missing a top-level entry for [$workspace_version]"
 grep -q "Current release: v$workspace_version" RELEASES.md \
@@ -62,4 +93,4 @@ minor_series="${workspace_version%.*}.x"
 grep -F ':white_check_mark:' SECURITY.md | grep -qF "$minor_series" \
   || fail "SECURITY.md does not list $minor_series as a supported version (workspace is $workspace_version)"
 
-log "Rust crate versions, TS client version, changelog, release docs, and SECURITY.md supported versions agree."
+log "Rust crate versions, TS client version, sync package + peer pins, deploy example image tags, site version strings, changelog, release docs, and SECURITY.md supported versions agree."
