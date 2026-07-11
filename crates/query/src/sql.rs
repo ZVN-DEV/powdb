@@ -480,7 +480,7 @@ impl SqlParser {
                         feature: "multiple aggregates, or an aggregate mixed with plain columns, without GROUP BY are not supported; aggregate a single expression or add GROUP BY".into(),
                     });
                 }
-                // SAFETY: len == 1 and the item is an aggregate (any() above).
+                // Invariant: len == 1 and the item is an aggregate (any() above).
                 let agg = items.into_iter().next().unwrap().agg.unwrap();
                 return build_ungrouped_aggregate(&agg, &out);
             }
@@ -892,7 +892,7 @@ impl SqlParser {
             "bool" | "boolean" => "bool",
             "datetime" | "timestamp" => "datetime",
             "uuid" => "uuid",
-            "blob" | "bytes" => "bytes",
+            "blob" | "bytes" | "bytea" => "bytes",
             other => {
                 return Err(ParseError::Unsupported {
                     feature: format!("unsupported SQL type `{other}`"),

@@ -285,6 +285,8 @@ pub enum CastType {
     Str,
     Bool,
     DateTime,
+    Uuid,
+    Bytes,
 }
 
 /// Expressions.

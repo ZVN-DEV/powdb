@@ -160,7 +160,7 @@ pub enum PlanNode {
         input: Box<PlanNode>,
         windows: Vec<WindowDef>,
     },
-    /// UNION [ALL]: execute both sides, concatenate (ALL) or deduplicate.
+    /// `UNION [ALL]`: execute both sides, concatenate (ALL) or deduplicate.
     Union {
         left: Box<PlanNode>,
         right: Box<PlanNode>,

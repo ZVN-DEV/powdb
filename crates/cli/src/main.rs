@@ -1,5 +1,5 @@
 use powdb_query::executor::Engine;
-use powdb_query::lexer::POWQL_KEYWORDS;
+use powdb_query::lexer::{split_statements, POWQL_KEYWORDS};
 use powdb_query::result::QueryResult;
 use powdb_server::protocol::Message;
 use powdb_storage::types::Value;
@@ -62,42 +62,51 @@ impl Completer for PowqlHelper {
                 }
             }
         } else if start == 0 && !word.is_empty() {
-            for kw in POWQL_KEYWORDS.iter().chain(CLI_COMMANDS.iter()) {
-                if kw.starts_with(&lower) {
-                    let replacement = if word.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        let mut s = kw.to_string();
-                        s[..1].make_ascii_uppercase();
-                        s
-                    } else {
-                        kw.to_string()
-                    };
-                    matches.push(Pair {
-                        display: kw.to_string(),
-                        replacement,
-                    });
-                }
-            }
+            push_keyword_matches(
+                POWQL_KEYWORDS.iter().chain(CLI_COMMANDS.iter()),
+                &lower,
+                first_char_uppercase(word),
+                &mut matches,
+            );
         } else if !word.is_empty() {
-            // Complete PowQL keywords
-            for kw in POWQL_KEYWORDS {
-                if kw.starts_with(&lower) {
-                    // Preserve the case style of what the user typed
-                    let replacement = if word.chars().next().is_some_and(|c| c.is_uppercase()) {
-                        let mut s = kw.to_string();
-                        s[..1].make_ascii_uppercase();
-                        s
-                    } else {
-                        kw.to_string()
-                    };
-                    matches.push(Pair {
-                        display: kw.to_string(),
-                        replacement,
-                    });
-                }
-            }
+            push_keyword_matches(
+                POWQL_KEYWORDS.iter(),
+                &lower,
+                first_char_uppercase(word),
+                &mut matches,
+            );
         }
 
         Ok((start, matches))
+    }
+}
+
+fn first_char_uppercase(word: &str) -> bool {
+    word.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Push completion candidates for every keyword that prefix-matches `lower`,
+/// preserving the case style the user typed (leading uppercase is echoed back).
+fn push_keyword_matches<'a>(
+    keywords: impl Iterator<Item = &'a &'a str>,
+    lower: &str,
+    uppercase_first: bool,
+    matches: &mut Vec<Pair>,
+) {
+    for kw in keywords {
+        if kw.starts_with(lower) {
+            let replacement = if uppercase_first {
+                let mut s = kw.to_string();
+                s[..1].make_ascii_uppercase();
+                s
+            } else {
+                kw.to_string()
+            };
+            matches.push(Pair {
+                display: kw.to_string(),
+                replacement,
+            });
+        }
     }
 }
 
@@ -188,7 +197,7 @@ fn set_restore_sync_mode(
     flag: &str,
 ) {
     if *was_set && *current != next {
-        eprintln!("conflicting restore sync identity mode flag: {flag}");
+        eprintln!("Error: conflicting restore sync identity mode flag: {flag}");
         std::process::exit(2);
     }
     *current = next;
@@ -214,6 +223,7 @@ fn parse_args() -> CliArgs {
     let mut user: Option<String> = None;
     let mut role: Option<String> = None;
     let mut exec: Option<String> = None;
+    let mut exec_file: Option<String> = None;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
     // the subcommand and its positionals.
@@ -230,15 +240,23 @@ fn parse_args() -> CliArgs {
             "--exec" | "-c" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--exec requires a PowQL query");
+                    eprintln!("Error: --exec requires a PowQL query");
                     std::process::exit(2);
                 }
                 exec = Some(argv[i].clone());
             }
+            "--exec-file" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --exec-file requires a path ('-' for stdin)");
+                    std::process::exit(2);
+                }
+                exec_file = Some(argv[i].clone());
+            }
             "--remote" | "-r" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--remote requires host:port");
+                    eprintln!("Error: --remote requires host:port");
                     std::process::exit(2);
                 }
                 remote = Some(argv[i].clone());
@@ -246,7 +264,7 @@ fn parse_args() -> CliArgs {
             "--db" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--db requires a name");
+                    eprintln!("Error: --db requires a name");
                     std::process::exit(2);
                 }
                 db = argv[i].clone();
@@ -254,7 +272,7 @@ fn parse_args() -> CliArgs {
             "--password" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--password requires a value");
+                    eprintln!("Error: --password requires a value");
                     std::process::exit(2);
                 }
                 password = Some(argv[i].clone());
@@ -262,7 +280,7 @@ fn parse_args() -> CliArgs {
             "--user" | "-u" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--user requires a name");
+                    eprintln!("Error: --user requires a name");
                     std::process::exit(2);
                 }
                 user = Some(argv[i].clone());
@@ -270,7 +288,7 @@ fn parse_args() -> CliArgs {
             "--role" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--role requires a value");
+                    eprintln!("Error: --role requires a value");
                     std::process::exit(2);
                 }
                 role = Some(argv[i].clone());
@@ -278,7 +296,7 @@ fn parse_args() -> CliArgs {
             "--data-dir" | "-d" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--data-dir requires a path");
+                    eprintln!("Error: --data-dir requires a path");
                     std::process::exit(2);
                 }
                 data_dir = argv[i].clone();
@@ -302,7 +320,8 @@ fn parse_args() -> CliArgs {
                 println!("    powdb-cli --data-dir <PRIMARY_DIR> sync-status [REPLICA_ID]");
                 println!();
                 println!("OPTIONS:");
-                println!("    -c, --exec <QUERY>         Run one PowQL query and exit");
+                println!("    -c, --exec <QUERY>         Run one or more `;`-separated PowQL statements and exit");
+                println!("        --exec-file <PATH>     Run PowQL read from a file ('-' for stdin) and exit");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: default)");
                 println!("        --password <PW>        Password for remote auth");
@@ -319,6 +338,7 @@ fn parse_args() -> CliArgs {
                     "    Remote REPL:         powdb-cli --remote 127.0.0.1:5433 --password secret"
                 );
                 println!("    One-shot:            powdb-cli --exec 'count(User)'");
+                println!("    Load a file:         powdb-cli --data-dir ./sandbox --exec-file dump.powql");
                 println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 limit 5'");
                 println!();
                 println!("SUBCOMMANDS:");
@@ -362,7 +382,7 @@ fn parse_args() -> CliArgs {
             "backup" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("backup requires a destination dir");
+                    eprintln!("Error: backup requires a destination dir");
                     std::process::exit(2);
                 }
                 action = Action::Backup {
@@ -373,7 +393,7 @@ fn parse_args() -> CliArgs {
             "--base" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--base requires a full backup dir");
+                    eprintln!("Error: --base requires a full backup dir");
                     std::process::exit(2);
                 }
                 backup_base = Some(argv[i].clone());
@@ -381,7 +401,7 @@ fn parse_args() -> CliArgs {
             "--apply" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("--apply requires an increment dir");
+                    eprintln!("Error: --apply requires an increment dir");
                     std::process::exit(2);
                 }
                 restore_apply.push(argv[i].clone());
@@ -419,7 +439,7 @@ fn parse_args() -> CliArgs {
                     if arg == "--apply" {
                         i += 1;
                         if i >= argv.len() {
-                            eprintln!("--apply requires an increment dir");
+                            eprintln!("Error: --apply requires an increment dir");
                             std::process::exit(2);
                         }
                         restore_apply.push(argv[i].clone());
@@ -431,7 +451,7 @@ fn parse_args() -> CliArgs {
                             arg,
                         );
                     } else if arg.starts_with('-') {
-                        eprintln!("unknown restore argument: {arg}");
+                        eprintln!("Error: unknown restore argument: {arg}");
                         eprintln!("try --help");
                         std::process::exit(2);
                     } else if backup_dir.is_none() {
@@ -439,18 +459,18 @@ fn parse_args() -> CliArgs {
                     } else if dest.is_none() {
                         dest = Some(argv[i].clone());
                     } else {
-                        eprintln!("unexpected restore argument: {arg}");
+                        eprintln!("Error: unexpected restore argument: {arg}");
                         eprintln!("try --help");
                         std::process::exit(2);
                     }
                     i += 1;
                 }
                 let Some(backup_dir) = backup_dir else {
-                    eprintln!("restore requires a backup dir and a destination data dir");
+                    eprintln!("Error: restore requires a backup dir and a destination data dir");
                     std::process::exit(2);
                 };
                 let Some(dest) = dest else {
-                    eprintln!("restore requires a destination data dir");
+                    eprintln!("Error: restore requires a destination data dir");
                     std::process::exit(2);
                 };
                 action = Action::Restore {
@@ -466,19 +486,19 @@ fn parse_args() -> CliArgs {
             "sync-bootstrap" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("sync-bootstrap requires a backup dir");
+                    eprintln!("Error: sync-bootstrap requires a backup dir");
                     std::process::exit(2);
                 }
                 let backup_dir = argv[i].clone();
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("sync-bootstrap requires a replica data dir");
+                    eprintln!("Error: sync-bootstrap requires a replica data dir");
                     std::process::exit(2);
                 }
                 let replica_dir = argv[i].clone();
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("sync-bootstrap requires a replica id");
+                    eprintln!("Error: sync-bootstrap requires a replica id");
                     std::process::exit(2);
                 }
                 action = Action::SyncBootstrap {
@@ -493,13 +513,13 @@ fn parse_args() -> CliArgs {
                 while i < argv.len() {
                     let arg = argv[i].as_str();
                     if arg.starts_with('-') {
-                        eprintln!("unknown sync-status argument: {arg}");
+                        eprintln!("Error: unknown sync-status argument: {arg}");
                         eprintln!("try --help");
                         std::process::exit(2);
                     } else if replica_id.is_none() {
                         replica_id = Some(argv[i].clone());
                     } else {
-                        eprintln!("unexpected sync-status argument: {arg}");
+                        eprintln!("Error: unexpected sync-status argument: {arg}");
                         eprintln!("try --help");
                         std::process::exit(2);
                     }
@@ -510,7 +530,7 @@ fn parse_args() -> CliArgs {
             "useradd" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("useradd requires a user name");
+                    eprintln!("Error: useradd requires a user name");
                     std::process::exit(2);
                 }
                 action = Action::UserAdd {
@@ -520,7 +540,7 @@ fn parse_args() -> CliArgs {
             "userdel" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("userdel requires a user name");
+                    eprintln!("Error: userdel requires a user name");
                     std::process::exit(2);
                 }
                 action = Action::UserDel {
@@ -530,7 +550,7 @@ fn parse_args() -> CliArgs {
             "passwd" => {
                 i += 1;
                 if i >= argv.len() {
-                    eprintln!("passwd requires a user name");
+                    eprintln!("Error: passwd requires a user name");
                     std::process::exit(2);
                 }
                 action = Action::Passwd {
@@ -545,7 +565,7 @@ fn parse_args() -> CliArgs {
                 saw_positional = true;
             }
             other => {
-                eprintln!("unknown argument: {other}");
+                eprintln!("Error: unknown argument: {other}");
                 eprintln!("try --help");
                 std::process::exit(2);
             }
@@ -557,11 +577,11 @@ fn parse_args() -> CliArgs {
     match &mut action {
         Action::Backup { base, .. } => {
             if !restore_apply.is_empty() {
-                eprintln!("--apply is only valid with the `restore` subcommand");
+                eprintln!("Error: --apply is only valid with the `restore` subcommand");
                 std::process::exit(2);
             }
             if restore_sync_mode_was_set {
-                eprintln!("--sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
+                eprintln!("Error: --sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
                 std::process::exit(2);
             }
             *base = backup_base;
@@ -570,7 +590,7 @@ fn parse_args() -> CliArgs {
             apply, sync_mode, ..
         } => {
             if backup_base.is_some() {
-                eprintln!("--base is only valid with the `backup` subcommand");
+                eprintln!("Error: --base is only valid with the `backup` subcommand");
                 std::process::exit(2);
             }
             *apply = restore_apply;
@@ -578,18 +598,45 @@ fn parse_args() -> CliArgs {
         }
         _ => {
             if backup_base.is_some() {
-                eprintln!("--base is only valid with the `backup` subcommand");
+                eprintln!("Error: --base is only valid with the `backup` subcommand");
                 std::process::exit(2);
             }
             if !restore_apply.is_empty() {
-                eprintln!("--apply is only valid with the `restore` subcommand");
+                eprintln!("Error: --apply is only valid with the `restore` subcommand");
                 std::process::exit(2);
             }
             if restore_sync_mode_was_set {
-                eprintln!("--sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
+                eprintln!("Error: --sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
                 std::process::exit(2);
             }
         }
+    }
+
+    // `--exec-file <PATH>` reads a whole PowQL file (or stdin for `-`) and
+    // feeds it through the same one-shot path as `--exec`, sidestepping the
+    // ARG_MAX ceiling on large loads. The two flags are mutually exclusive.
+    if let Some(path) = exec_file {
+        if exec.is_some() {
+            eprintln!("Error: --exec and --exec-file are mutually exclusive");
+            std::process::exit(2);
+        }
+        let contents = if path == "-" {
+            let mut buf = String::new();
+            if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut buf) {
+                eprintln!("Error: failed to read PowQL from stdin: {e}");
+                std::process::exit(1);
+            }
+            buf
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: failed to read {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        };
+        exec = Some(contents);
     }
 
     CliArgs {
@@ -666,10 +713,16 @@ fn main() {
     }
 
     if let Some(remote_addr) = &args.remote {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to build tokio runtime");
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("Error: failed to build tokio runtime: {e}");
+                std::process::exit(1);
+            }
+        };
         if let Some(query) = args.exec.clone() {
             let code = rt.block_on(exec_remote(
                 remote_addr.clone(),
@@ -1124,16 +1177,14 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
             return 1;
         }
     };
-    let statements: Vec<&str> = query
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Statement-aware splitting (#150): a `;` inside a string literal or a
+    // `#` comment is not a boundary, so text-heavy rows load intact.
+    let statements = split_statements(query);
     for stmt in &statements {
         if stmt.starts_with('.') {
             let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
             eprintln!(
-                "error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
+                "Error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
                 cmd
             );
             return 1;
@@ -1163,7 +1214,7 @@ async fn exec_remote(
     let stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("connection failed: {e}");
+            eprintln!("Error: connection failed: {e}");
             return 1;
         }
     };
@@ -1179,65 +1230,67 @@ async fn exec_remote(
     if connect.write_to(&mut writer).await.is_err()
         || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
     {
-        eprintln!("failed to send CONNECT");
+        eprintln!("Error: failed to send CONNECT");
         return 1;
     }
     match Message::read_from(&mut reader).await {
         Ok(Some(Message::ConnectOk { .. })) => {}
         Ok(Some(Message::Error { message })) => {
-            eprintln!("server rejected connection: {message}");
+            eprintln!("Error: server rejected connection: {message}");
             return 1;
         }
         _ => {
-            eprintln!("handshake failed");
+            eprintln!("Error: handshake failed");
             return 1;
         }
     }
 
-    let trimmed_query = query.trim();
-    if trimmed_query.starts_with('.') {
-        let cmd = trimmed_query
-            .split_whitespace()
-            .next()
-            .unwrap_or(trimmed_query);
-        eprintln!(
-            "error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
-            cmd
-        );
-        let _ = Message::Disconnect.write_to(&mut writer).await;
-        let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
-        return 1;
-    }
+    // The wire protocol carries one statement per `Query` message, so split
+    // client-side (#150) and send each in turn, stopping on the first error.
+    let mut code = 0;
+    for stmt in split_statements(&query) {
+        if stmt.starts_with('.') {
+            let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
+            eprintln!(
+                "Error: '{}' is a REPL-only command \u{2014} start the interactive REPL without -c to use it",
+                cmd
+            );
+            code = 1;
+            break;
+        }
 
-    let q = Message::Query {
-        query: trimmed_query.to_string(),
-    };
-    if q.write_to(&mut writer).await.is_err()
-        || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
-    {
-        eprintln!("write error");
-        return 1;
-    }
+        let q = Message::Query {
+            query: stmt.to_string(),
+        };
+        if q.write_to(&mut writer).await.is_err()
+            || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
+        {
+            eprintln!("Error: write failed");
+            code = 1;
+            break;
+        }
 
-    let code = match Message::read_from(&mut reader).await {
-        Ok(Some(msg)) => {
-            let is_error = matches!(msg, Message::Error { .. });
-            print_remote_result(&msg);
-            if is_error {
-                1
-            } else {
-                0
+        match Message::read_from(&mut reader).await {
+            Ok(Some(msg)) => {
+                let is_error = matches!(msg, Message::Error { .. });
+                print_remote_result(&msg);
+                if is_error {
+                    code = 1;
+                    break;
+                }
+            }
+            Ok(None) => {
+                eprintln!("Error: server closed connection");
+                code = 1;
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: read failed: {e}");
+                code = 1;
+                break;
             }
         }
-        Ok(None) => {
-            eprintln!("server closed connection");
-            1
-        }
-        Err(e) => {
-            eprintln!("read error: {e}");
-            1
-        }
-    };
+    }
 
     let _ = Message::Disconnect.write_to(&mut writer).await;
     let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
@@ -1278,11 +1331,24 @@ fn run_embedded(data_dir: &str) {
     eprintln!("Data directory: {data_dir}");
     eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
 
-    let mut engine =
-        Engine::new_with_wal_archive(Path::new(data_dir), archive_wal_records_if_sync_enabled)
-            .expect("failed to initialize engine");
+    let mut engine = match Engine::new_with_wal_archive(
+        Path::new(data_dir),
+        archive_wal_records_if_sync_enabled,
+    ) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("Error: failed to initialize engine: {e}");
+            std::process::exit(1);
+        }
+    };
 
-    let mut rl = Editor::new().expect("failed to init readline");
+    let mut rl = match Editor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("Error: failed to initialize readline: {e}");
+            std::process::exit(1);
+        }
+    };
     rl.set_helper(Some(PowqlHelper));
 
     let hist = history_path();
@@ -1432,7 +1498,7 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
     let stream = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("connection failed: {e}");
+            eprintln!("Error: connection failed: {e}");
             std::process::exit(1);
         }
     };
@@ -1448,11 +1514,11 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
         username,
     };
     if let Err(e) = connect.write_to(&mut writer).await {
-        eprintln!("failed to send CONNECT: {e}");
+        eprintln!("Error: failed to send CONNECT: {e}");
         std::process::exit(1);
     }
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut writer).await {
-        eprintln!("flush error: {e}");
+        eprintln!("Error: flush failed: {e}");
         std::process::exit(1);
     }
 
@@ -1463,24 +1529,30 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
             eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
         }
         Ok(Some(Message::Error { message })) => {
-            eprintln!("server rejected connection: {message}");
+            eprintln!("Error: server rejected connection: {message}");
             std::process::exit(1);
         }
         Ok(Some(other)) => {
-            eprintln!("unexpected handshake reply: {other:?}");
+            eprintln!("Error: unexpected handshake reply: {other:?}");
             std::process::exit(1);
         }
         Ok(None) => {
-            eprintln!("server closed connection during handshake");
+            eprintln!("Error: server closed connection during handshake");
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("handshake read error: {e}");
+            eprintln!("Error: handshake read failed: {e}");
             std::process::exit(1);
         }
     }
 
-    let mut rl = Editor::new().expect("failed to init readline");
+    let mut rl = match Editor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            eprintln!("Error: failed to initialize readline: {e}");
+            std::process::exit(1);
+        }
+    };
     rl.set_helper(Some(PowqlHelper));
 
     let hist = history_path();
@@ -1558,11 +1630,11 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
 
         let q = Message::Query { query: statement };
         if q.write_to(&mut writer).await.is_err() {
-            eprintln!("write error — disconnected");
+            eprintln!("Error: write failed — disconnected");
             break;
         }
         if tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err() {
-            eprintln!("flush error — disconnected");
+            eprintln!("Error: flush failed — disconnected");
             break;
         }
 
@@ -1580,11 +1652,11 @@ async fn run_remote(addr: String, db: String, password: Option<String>, username
                 }
             }
             Ok(None) => {
-                eprintln!("server closed connection");
+                eprintln!("Error: server closed connection");
                 break;
             }
             Err(e) => {
-                eprintln!("read error: {e}");
+                eprintln!("Error: read failed: {e}");
                 break;
             }
         }
@@ -1670,7 +1742,7 @@ fn print_remote_result(msg: &Message) {
             eprintln!("Error: {message}");
         }
         other => {
-            eprintln!("unexpected response: {other:?}");
+            eprintln!("Error: unexpected response: {other:?}");
         }
     }
 }

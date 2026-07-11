@@ -440,6 +440,66 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
     Ok(tokens)
 }
 
+/// Split a PowQL source string into individual statements on top-level `;`,
+/// mirroring the lexer's string- and comment-scanning rules so a `;` inside a
+/// `"..."` literal or a `#` comment is never a boundary. Segments are trimmed
+/// and empty ones dropped, so leading/trailing/doubled `;` and blank lines are
+/// harmless.
+///
+/// Infallible by design: an unterminated string leaves its remainder as the
+/// final segment, so the "unterminated string" error surfaces once, at
+/// execution time, from [`lex`] — this function never reports it.
+pub fn split_statements(input: &str) -> Vec<&str> {
+    #[derive(PartialEq)]
+    enum State {
+        Normal,
+        InString,
+        InComment,
+    }
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut state = State::Normal;
+    let mut chars = input.char_indices();
+
+    while let Some((i, c)) = chars.next() {
+        match state {
+            State::Normal => match c {
+                ';' => {
+                    let seg = input[start..i].trim();
+                    if !seg.is_empty() {
+                        out.push(seg);
+                    }
+                    start = i + 1; // `;` is one byte
+                }
+                '"' => state = State::InString,
+                '#' => state = State::InComment,
+                _ => {}
+            },
+            State::InString => match c {
+                // Mirror the lexer: a backslash consumes the next char
+                // unconditionally, so `\"` and `\;` stay inside the string.
+                '\\' => {
+                    chars.next();
+                }
+                '"' => state = State::Normal,
+                _ => {}
+            },
+            State::InComment => {
+                if c == '\n' {
+                    state = State::Normal;
+                }
+            }
+        }
+    }
+
+    let seg = input[start..].trim();
+    if !seg.is_empty() {
+        out.push(seg);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +623,95 @@ mod tests {
         let input = "as\t\t\t\t\t\t\t\t\t\t\t\t\t44444444411111114444\t\t\t\t\t\t";
         let err = lex(input).expect_err("fuzz reproducer must now error, not panic");
         assert!(err.message.contains("integer literal"));
+    }
+
+    // ── split_statements (issue #150) ──────────────────────────────────
+
+    #[test]
+    fn test_split_top_level_semicolons() {
+        assert_eq!(
+            split_statements("insert A { a := 1 }; insert B { b := 2 }"),
+            vec!["insert A { a := 1 }", "insert B { b := 2 }"]
+        );
+    }
+
+    #[test]
+    fn test_split_semicolon_in_string_not_split() {
+        // The core #150 repro: a `;` inside a string literal must not split.
+        assert_eq!(
+            split_statements(r#"insert Note { body := "hello; world" }"#),
+            vec![r#"insert Note { body := "hello; world" }"#]
+        );
+    }
+
+    #[test]
+    fn test_split_escaped_quote_then_semicolon() {
+        // `\"` keeps us inside the string, so the following `;` does not
+        // split; the string closes at the final unescaped `"`, then the
+        // top-level `;` splits.
+        let input = r#"insert A { v := "a\"; b" }; insert B { c := 1 }"#;
+        assert_eq!(
+            split_statements(input),
+            vec![r#"insert A { v := "a\"; b" }"#, "insert B { c := 1 }"]
+        );
+    }
+
+    #[test]
+    fn test_split_backslash_consumes_any_char() {
+        // `"\\"` is a single-backslash string (the `\` escapes the `\`); the
+        // string closes at the second `"`, so the trailing `;` splits.
+        let input = r#"insert A { v := "\\" }; x"#;
+        assert_eq!(
+            split_statements(input),
+            vec![r#"insert A { v := "\\" }"#, "x"]
+        );
+    }
+
+    #[test]
+    fn test_split_semicolon_in_comment_not_split() {
+        let input = "insert A { a := 1 } # trailing; comment\n; insert B { b := 2 }";
+        assert_eq!(
+            split_statements(input),
+            vec![
+                "insert A { a := 1 } # trailing; comment",
+                "insert B { b := 2 }"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_drops_empty_segments() {
+        // Leading, doubled, and trailing `;` plus blank lines all drop.
+        assert_eq!(split_statements("; A ;; B ;\n\n"), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_split_no_semicolon_backcompat() {
+        // Byte-identical to the old `split(';').map(trim).filter(non-empty)`
+        // single-statement behavior.
+        assert_eq!(split_statements("count(User)"), vec!["count(User)"]);
+        assert!(split_statements("   ").is_empty());
+    }
+
+    #[test]
+    fn test_split_unterminated_string_tail() {
+        // Never errors: the unterminated string becomes the final segment.
+        let input = r#"insert A { a := 1 }; insert B { b := "oops"#;
+        assert_eq!(
+            split_statements(input),
+            vec!["insert A { a := 1 }", r#"insert B { b := "oops"#]
+        );
+    }
+
+    #[test]
+    fn test_split_multiline_string_with_semicolon() {
+        let input = "insert A { body := \"line1;\nline2\" }; insert B { b := 2 }";
+        assert_eq!(
+            split_statements(input),
+            vec![
+                "insert A { body := \"line1;\nline2\" }",
+                "insert B { b := 2 }"
+            ]
+        );
     }
 }
