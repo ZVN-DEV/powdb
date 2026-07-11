@@ -1,6 +1,12 @@
-//! Backup / restore / PITR for PowDB. See
-//! docs/design/2026-06-05-backup-pitr-sync-migrations-plan.md and
-//! docs/superpowers/plans/2026-06-05-backup-pitr-sync-migrations.md.
+//! Physical backup, restore, and point-in-time recovery for PowDB.
+//!
+//! Supports full snapshots ([`full_backup`]) and page-level incremental
+//! (differential) backups against a full base ([`incremental_backup`]).
+//! Restore rebuilds a data directory from a full backup ([`restore()`]), or
+//! chains a full base plus ordered increments for coarse point-in-time
+//! recovery ([`restore_chain`]). [`RestoreSyncMode`] controls whether a
+//! restored copy strips, preserves, or forks the source's sync identity, and
+//! [`bootstrap_replica_from_full_backup`] seeds a sync replica from a backup.
 pub mod bootstrap;
 pub mod full;
 pub mod incremental;

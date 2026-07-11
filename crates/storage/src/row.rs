@@ -53,9 +53,9 @@ fn prepend_row_prefix(out: &mut Vec<u8>) {
 
 /// Encode a row of values into the compact binary format.
 ///
-/// Layout: ["PROW": 4 bytes] [version: u16] [body]. The body keeps the
-/// legacy layout: [length: u16] [null_bitmap] [fixed columns packed]
-/// [var offset table] [var data]. Legacy rows without the prefix still decode
+/// Layout: `["PROW": 4 bytes] [version: u16] [body]`. The body keeps the
+/// legacy layout: `[length: u16] [null_bitmap] [fixed columns packed]
+/// [var offset table] [var data]`. Legacy rows without the prefix still decode
 /// as row format version 0.
 ///
 /// Fixed columns are written in schema order, with placeholder zeros for Empty values.

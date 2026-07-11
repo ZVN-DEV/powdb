@@ -119,7 +119,7 @@ pub enum WalSyncMode {
     /// `Normal` — every commit buffers its record through to the OS
     /// (`BufWriter::flush`, so the bytes are file-visible) and returns
     /// WITHOUT an fsync; a background flusher fsyncs on a fixed interval
-    /// ([`NORMAL_FSYNC_INTERVAL`]). A *process* crash loses nothing (replay
+    /// (`NORMAL_FSYNC_INTERVAL`). A *process* crash loses nothing (replay
     /// reads the bytes already in the OS page cache); an *OS* crash / power
     /// loss can lose only the unsynced tail (≤ one interval of writes). This
     /// is SQLite `synchronous=NORMAL` / Postgres `synchronous_commit=off`

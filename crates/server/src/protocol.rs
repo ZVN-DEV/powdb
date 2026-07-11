@@ -198,7 +198,7 @@ pub enum Message {
 }
 
 impl Message {
-    /// Encode message into wire format: [type(1)][flags(1)][len(4)][payload]
+    /// Encode message into wire format: `[type(1)][flags(1)][len(4)][payload]`
     pub fn encode(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
             Message::Connect {

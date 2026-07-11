@@ -587,11 +587,10 @@ impl BTree {
 
     /// Delete a key from the tree. Returns true if the key was found and removed.
     pub fn delete(&mut self, key: &Value) -> bool {
-        // Blocker B3: mark dirty; see `delete_int` for the optimistic
-        // marking rationale.
+        // Mark dirty; see `delete_int` for the optimistic marking rationale.
         self.dirty = true;
-        // Simple deletion: find leaf and remove (no rebalancing for now — acceptable
-        // for initial implementation, tree stays valid just potentially underfull)
+        // Deletion does not rebalance: leaves may become underfull but the tree
+        // stays valid; lookups and range scans are unaffected.
         let mut node_id = self.root;
         loop {
             let is_leaf = matches!(self.nodes[node_id], Node::Leaf { .. });

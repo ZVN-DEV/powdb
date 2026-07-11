@@ -1,6 +1,6 @@
 # @zvndev/powdb-embedded
 
-Embedded [PowDB](https://github.com/zvndev/powdb) for Node — run the database
+Embedded [PowDB](https://github.com/ZVN-DEV/powdb) for Node — run the database
 engine **in-process**, no server and no socket. The SQLite-shaped front door to
 PowDB: a single function call, no network round-trip, works offline.
 
@@ -27,6 +27,31 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
   `@zvndev/powdb-client` to a bootstrapped embedded replica.
 - `db.setSyncMode(mode)` — set WAL durability: `"full"` | `"normal"` | `"off"`.
 - `db.isPoisoned()` — `true` if a previous call panicked (reopen the database).
+- `db.close()` — flush, checkpoint, and release the data-directory lock. See
+  below.
+
+Opening the same directory twice in one process throws — a single process must
+share one handle, not two engines over the same files.
+
+## Closing
+
+`db.close()` flushes and checkpoints the database (unless the handle is
+poisoned), then releases the data-directory lock so another process — or
+another handle in this one — can open it. Any call after `close()` throws
+`database is closed`; closing twice throws the same error.
+
+```js
+const db = Database.open("./data");
+db.query("type T { required id: int }");
+db.close(); // deterministic flush + lock release
+
+Database.open("./data"); // now free to reopen (same or another process)
+```
+
+Closing is optional — dropping the last reference lets the garbage collector
+run the same cleanup — but Node does not guarantee *when* a finalizer runs, so
+call `close()` when you need the lock or the final `"normal"`-mode commits
+flushed at a known point.
 
 `applyRetainedUnits` is the native adapter used by `@zvndev/powdb-sync` after a
 replica has been restored from a sync bootstrap. It expects the database
@@ -85,6 +110,20 @@ type QueryResult =
   database. Like Postgres.
 
 Same engine, two front doors.
+
+## Supported platforms
+
+Prebuilt native binaries ship for:
+
+| Platform | Target triple |
+| --- | --- |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| Linux x64 (glibc) | `x86_64-unknown-linux-gnu` |
+| Linux arm64 (glibc) | `aarch64-unknown-linux-gnu` |
+
+There is no source fallback, so `require()` throws a load error on any other
+platform (Windows, Intel macOS, musl/Alpine). Use the networked
+[`@zvndev/powdb-client`](https://github.com/ZVN-DEV/powdb) there instead.
 
 ## Safety
 

@@ -1,8 +1,8 @@
 pub const PAGE_SIZE: usize = 4096;
 /// Page header layout (20 bytes):
 ///   [0..4]   page_id (u32)
-///   [4]      page_type (u8)
-///   [5]      flags (u8) — bit 0 (`FLAG_HAS_CHECKSUM`) marks a page written
+///   `[4]`      page_type (u8)
+///   `[5]`      flags (u8) — bit 0 (`FLAG_HAS_CHECKSUM`) marks a page written
 ///                         in the checksummed format. Pages written by older
 ///                         builds have this bit clear and are read without
 ///                         CRC verification (validate-if-present).
@@ -91,8 +91,8 @@ impl PageType {
 ///
 /// Layout:
 ///   [0..4]         page_id (u32)
-///   [4]            page_type (u8)
-///   [5]            flags (u8)
+///   `[4]`            page_type (u8)
+///   `[5]`            flags (u8)
 ///   [6..8]         free_start (u16)
 ///   [8..16]        lsn (u64)
 ///   [16..free_start] Row data (grows downward from header)
@@ -125,7 +125,7 @@ impl Page {
     /// for callers on paths that have already validated (or intentionally
     /// skip) the checksum — e.g. WAL replay reconstructing pages, or the
     /// zero-copy mmap scan which slices `iter_page_slots` directly. Disk
-    /// reads on the heap go through [`from_bytes_verified`] instead.
+    /// reads on the heap go through `from_bytes_verified` instead.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() != PAGE_SIZE {
             return None;
@@ -381,8 +381,8 @@ impl Page {
     /// resize it. Used by fixed-size column update fast paths that patch a
     /// field in place without re-encoding the whole row.
     ///
-    /// Mission C Phase 4: the old update path went through decode_row +
-    /// Vec<Value> allocation + encode_row_into + page.update, even when the
+    /// The old update path went through decode_row +
+    /// `Vec<Value>` allocation + encode_row_into + page.update, even when the
     /// change was a single 8-byte int. This primitive lets the executor skip
     /// all of that by writing the new bytes directly into the page.
     #[inline]

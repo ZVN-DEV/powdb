@@ -13,7 +13,7 @@
 //! reject the old `Mutex<Engine>` behaviour — which would show a
 //! threaded-to-sequential ratio of ~1.0, not ~0.25).
 //!
-//! Blocker B1 — concurrent read *correctness* test (not just liveness).
+//! Concurrent read *correctness* test (not just liveness).
 //! `concurrent_readers_correctness` scans a table big enough to overflow
 //! the single-slot hot-page cache, so every scan hammers
 //! `DiskManager::read_page` on a shared `&File`. Each row carries a
@@ -151,7 +151,7 @@ fn concurrent_readers_make_progress_in_parallel() {
     );
 }
 
-/// Blocker B1 regression test — byte-level correctness of the concurrent
+/// Regression test — byte-level correctness of the concurrent
 /// `heap.get(rid)` path (point lookups by indexed key).
 ///
 /// Before the pread/pwrite fix, `DiskManager::read_page` did

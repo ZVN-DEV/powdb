@@ -187,15 +187,57 @@ test("applyRetainedUnits validates database identity shape", () => {
 test("reopen recovers committed data", () => {
   const dir = freshDir();
   try {
-    let db = Database.open(dir);
+    const db = Database.open(dir);
     db.query("type T { required id: int }");
     db.query("insert T { id := 1 }");
-    db = null; // drop handle (GC closes it)
-    global.gc?.();
+    db.close(); // deterministic flush + lock release
 
     const db2 = Database.open(dir);
     const count = db2.query("count(T)");
     assert.equal(count.value, "1");
+    db2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("close() releases the handle and reopen works", () => {
+  const dir = freshDir();
+  try {
+    const db = Database.open(dir);
+    db.query("type T { required id: int }");
+    db.query("insert T { id := 1 }");
+    db.close();
+    // Reopen in the same process now that the lock is released.
+    const db2 = Database.open(dir);
+    assert.equal(db2.query("count(T)").value, "1");
+    db2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("calls after close() throw, and close() is not silently idempotent", () => {
+  const dir = freshDir();
+  try {
+    const db = Database.open(dir);
+    db.close();
+    assert.throws(() => db.query("count(T)"), /database is closed/);
+    assert.throws(() => db.close(), /database is closed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("opening the same dir twice in one process throws", () => {
+  const dir = freshDir();
+  try {
+    const db = Database.open(dir);
+    assert.throws(() => Database.open(dir), /already open in this process/);
+    // After close, the second open succeeds.
+    db.close();
+    const db2 = Database.open(dir);
+    db2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
