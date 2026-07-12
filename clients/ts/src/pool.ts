@@ -319,14 +319,18 @@ export class Pool {
   /**
    * Run a multi-statement PowQL script on ONE pooled connection, pipelined.
    *
-   * Checks out a single client for the whole script (statement order and
-   * any `begin`/`commit` in the script therefore hold), delegates to
+   * Checks out a single client for the whole script (statement order —
+   * and `transactional: true` — therefore holds), delegates to
    * {@link Client.execScript}, and releases the client on success or
    * destroys it on error — same lifecycle as {@link withClient}.
    */
   async execScript(
     script: string,
-    opts?: { continueOnError?: false; signal?: AbortSignal },
+    opts?: {
+      continueOnError?: false;
+      transactional?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<QueryResult[]>;
   async execScript(
     script: string,
@@ -334,21 +338,30 @@ export class Pool {
   ): Promise<ScriptStatementOutcome[]>;
   async execScript(
     script: string,
-    opts?: { continueOnError?: boolean; signal?: AbortSignal },
+    opts?: {
+      continueOnError?: boolean;
+      transactional?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<QueryResult[] | ScriptStatementOutcome[]> {
     if (opts?.continueOnError === true) {
       return this.withClient((c) =>
         c.execScript(script, {
           continueOnError: true,
+          ...(opts.transactional !== undefined
+            ? { transactional: opts.transactional }
+            : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
-        }),
+        } as { continueOnError: true; signal?: AbortSignal }),
       );
     }
     return this.withClient((c) =>
-      c.execScript(
-        script,
-        opts?.signal ? { signal: opts.signal } : undefined,
-      ),
+      c.execScript(script, {
+        ...(opts?.transactional !== undefined
+          ? { transactional: opts.transactional }
+          : {}),
+        ...(opts?.signal ? { signal: opts.signal } : {}),
+      }),
     );
   }
 

@@ -105,8 +105,23 @@ By default execution is **fail-fast**: the first failed statement rejects the
 promise with a `PowDBScriptError` carrying `statementIndex`, the failing
 `statement` text, and the successful `results` so far. Because dispatch is
 pipelined, statements already on the wire when the error reply arrives
-(typically the whole script) still execute server-side — wrap the script in
-`begin`/`commit` if you need all-or-nothing behavior.
+(typically the whole script) still execute server-side — use
+`transactional: true` if you need all-or-nothing behavior. Do **not** embed
+`begin`/`commit` in the script yourself: the trailing `commit` is already on
+the wire when an error reply arrives, so it commits the partial work.
+
+With `transactional: true`, `execScript` opens the transaction itself, waits
+for every statement's reply, and only then sends `commit` — or `rollback` if
+any statement failed — so no statement's effect survives a failure.
+Transactional scripts may not contain their own `begin`/`commit`/`rollback`,
+and the option is mutually exclusive with `continueOnError`. On failure the
+`PowDBScriptError`'s `results` are the replies received before rollback —
+their effects are not persisted.
+
+```typescript
+// Either every statement commits, or none do.
+await client.execScript(seedScript, { transactional: true });
+```
 
 ```typescript
 import { isPowDBScriptError } from "@zvndev/powdb-client";
@@ -133,8 +148,8 @@ for (const o of outcomes) {
 ```
 
 `Pool.execScript(script, opts?)` does the same through a pool, checking out a
-single connection for the whole script (so statement order — and any
-`begin`/`commit` inside the script — holds).
+single connection for the whole script (so statement order — and
+`transactional: true` — holds).
 
 ## Eager (pipelined) connect
 
@@ -472,7 +487,10 @@ Splits `script` into statements (statement-aware — see Multi-statement
 scripts above) and executes them all down this connection, pipelined.
 Returns `Promise<QueryResult[]>` in statement order; rejects with a
 `PowDBScriptError` on the first failed statement. With
-`opts.continueOnError: true`, returns
+`opts.transactional: true`, runs the whole script atomically (commit only
+after every reply; rollback on any failure; embedded
+`begin`/`commit`/`rollback` rejected; mutually exclusive with
+`continueOnError`). With `opts.continueOnError: true`, returns
 `Promise<ScriptStatementOutcome[]>` (`{ statement, ok: true, result }` or
 `{ statement, ok: false, error }`) and never rejects for statement failures.
 `opts.signal?: AbortSignal` aborts the remaining statements.

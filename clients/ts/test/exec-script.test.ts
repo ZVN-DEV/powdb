@@ -241,6 +241,107 @@ async function main() {
   });
 
   // ──────────────────────────────────────────────────────────
+  console.log("\nexecScript — transactional");
+  // ──────────────────────────────────────────────────────────
+
+  const tx = tbl("TX");
+  await client.query(`type ${tx} { required name: str }`);
+
+  await test("transactional script commits atomically on success", async () => {
+    const results = await client.execScript(
+      `
+        insert ${tx} { name := "a" };
+        insert ${tx} { name := "b" };
+        count(${tx})
+      `,
+      { transactional: true },
+    );
+    // begin/commit replies are not part of the returned results.
+    assert.equal(results.length, 3);
+    assert.equal(scalar(results[2]!), "2");
+    assert.equal(scalar(await client.query(`count(${tx})`)), "2");
+  });
+
+  await test("transactional script rolls back on failure — no partial work survives", async () => {
+    const tr = tbl("TR");
+    await client.query(`type ${tr} { required name: str }`);
+    try {
+      await client.execScript(
+        `
+          insert ${tr} { name := "first" };
+          this is not valid powql;
+          insert ${tr} { name := "second" }
+        `,
+        { transactional: true },
+      );
+      assert.fail("should have rejected");
+    } catch (err) {
+      assert.ok(isPowDBScriptError(err), `expected PowDBScriptError, got ${err}`);
+      assert.equal(err.statementIndex, 1);
+      assert.equal(err.results.length, 1);
+    }
+    // The insert before the failure (and the pipelined one after it) must
+    // NOT survive — this is exactly the partial-commit hazard of embedding
+    // begin/commit in a pipelined script yourself.
+    assert.equal(scalar(await client.query(`count(${tr})`)), "0");
+    // The connection is out of the transaction and healthy afterwards.
+    assert.equal(scalar(await client.query(`count(${items})`)), "10");
+  });
+
+  await test("transactional rejects scripts containing their own transaction control", async () => {
+    // "# note\ncommit" would slip past a naive check but the server's lexer
+    // skips the comment and executes the commit — the guard must catch it.
+    for (const stmt of ["begin", "COMMIT", "Rollback", "# note\ncommit", "  # a\n# b\n begin"]) {
+      try {
+        await client.execScript(`${stmt}; count(${items})`, {
+          transactional: true,
+        });
+        assert.fail("should have rejected");
+      } catch (err: any) {
+        assert.equal(err.code, "protocol_error");
+        assert.ok(err.message.includes("transaction control"));
+      }
+    }
+    // Nothing was dispatched — the connection is still healthy.
+    assert.equal(scalar(await client.query(`count(${items})`)), "10");
+  });
+
+  await test("transactional and continueOnError are mutually exclusive", async () => {
+    try {
+      await client.execScript(`count(${items})`, {
+        transactional: true,
+        continueOnError: true,
+      } as never);
+      assert.fail("should have rejected");
+    } catch (err: any) {
+      assert.equal(err.code, "protocol_error");
+      assert.ok(err.message.includes("mutually exclusive"));
+    }
+  });
+
+  await test("pre-aborted signal in transactional mode leaves no open transaction", async () => {
+    const ta = tbl("TA");
+    await client.query(`type ${ta} { required name: str }`);
+    const ctrl = new AbortController();
+    ctrl.abort();
+    try {
+      await client.execScript(`insert ${ta} { name := "x" }`, {
+        transactional: true,
+        signal: ctrl.signal,
+      });
+      assert.fail("should have rejected");
+    } catch (err) {
+      assert.ok(isPowDBScriptError(err), `expected PowDBScriptError, got ${err}`);
+      assert.equal(err.code, "aborted");
+    }
+    assert.equal(scalar(await client.query(`count(${ta})`)), "0");
+    // A follow-up write commits normally — proof no transaction was left
+    // open by the aborted script.
+    await client.query(`insert ${ta} { name := "after" }`);
+    assert.equal(scalar(await client.query(`count(${ta})`)), "1");
+  });
+
+  // ──────────────────────────────────────────────────────────
   console.log("\nPool.execScript");
   // ──────────────────────────────────────────────────────────
 
@@ -291,6 +392,29 @@ async function main() {
     }
   });
 
+  await test("transactional works through the pool (rollback on failure)", async () => {
+    const pool = new Pool({ host: HOST, port: PORT, max: 1 });
+    try {
+      const tp = tbl("TP");
+      await pool.withClient((c) => c.query(`type ${tp} { required name: str }`));
+      try {
+        await pool.execScript(
+          `insert ${tp} { name := "a" }; this is not valid powql`,
+          { transactional: true },
+        );
+        assert.fail("should have rejected");
+      } catch (err) {
+        assert.ok(isPowDBScriptError(err));
+      }
+      const [count] = await pool.execScript(`count(${tp})`, {
+        transactional: true,
+      });
+      assert.equal(scalar(count!), "0", "rolled-back insert must not survive");
+    } finally {
+      await pool.close();
+    }
+  });
+
   // ──────────────────────────────────────────────────────────
   console.log("\neager connect + execScript");
   // ──────────────────────────────────────────────────────────
@@ -318,7 +442,7 @@ async function main() {
   // Cleanup
   // ──────────────────────────────────────────────────────────
 
-  for (const t of ["Items", "Seq", "Notes", "FF", "CE", "PL"]) {
+  for (const t of ["Items", "Seq", "Notes", "FF", "CE", "PL", "TX", "TR", "TA", "TP"]) {
     await client.query(`drop ${tbl(t)}`).catch(() => {});
   }
   await client.close();

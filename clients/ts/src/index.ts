@@ -65,9 +65,32 @@ export interface ExecScriptOptions {
    * carrying the failing statement's index and the results so far).
    */
   continueOnError?: boolean;
+  /**
+   * When `true`, run the whole script atomically: `execScript` opens a
+   * transaction before dispatching and sends `commit` only after EVERY
+   * statement's reply has arrived successfully — on any failure it sends
+   * `rollback` instead, so no statement's effect survives. This is the only
+   * all-or-nothing mode: embedding your own `begin`/`commit` in a pipelined
+   * script is NOT safe (a trailing `commit` is already on the wire when an
+   * earlier error reply arrives, so partial work would commit), and a
+   * transactional script containing its own transaction-control statements
+   * is rejected up front. Mutually exclusive with `continueOnError`.
+   */
+  transactional?: boolean;
   /** Abort the remaining statements (see {@link Client.query}). */
   signal?: AbortSignal;
 }
+
+/** Transaction-control statements a `transactional` script may not contain. */
+const TX_CONTROL_RE = /^(begin|commit|rollback)\b/i;
+
+/**
+ * Leading trivia (whitespace and `#` line comments) that may precede a
+ * statement's first real token. Must be stripped before matching
+ * {@link TX_CONTROL_RE}: the server's lexer skips comments, so
+ * `"# note\ncommit"` executes a commit — the guard has to see it too.
+ */
+const LEADING_TRIVIA_RE = /^(?:\s+|#[^\n]*)+/;
 
 /**
  * Per-statement outcome from `execScript(script, { continueOnError: true })`.
@@ -822,8 +845,16 @@ export class Client extends EventEmitter<ClientEvents> {
    *     failing `statementIndex`, the `statement` text, and the successful
    *     `results` so far. NOTE: because dispatch is pipelined, statements
    *     already written when the error reply arrives (typically the whole
-   *     script) still execute server-side; wrap the script in
-   *     `begin`/`commit` if you need all-or-nothing behavior.
+   *     script) still execute server-side. If you need all-or-nothing
+   *     behavior use `transactional: true` — do NOT embed `begin`/`commit`
+   *     in the script yourself: the trailing `commit` is already on the
+   *     wire when an error reply arrives, so it commits the partial work.
+   *   - `transactional: true`: `execScript` opens the transaction itself,
+   *     waits for every statement's reply, and only then sends `commit`
+   *     (or `rollback` if any statement failed), so no statement's effect
+   *     survives a failure. On failure the {@link PowDBScriptError}'s
+   *     `results` are the replies received before rollback — their effects
+   *     are NOT persisted.
    *   - `continueOnError: true`: dispatch every statement regardless of
    *     failures and resolve with a dense {@link ScriptStatementOutcome}
    *     array recording each statement's result or error.
@@ -832,7 +863,11 @@ export class Client extends EventEmitter<ClientEvents> {
    */
   async execScript(
     script: string,
-    opts?: { continueOnError?: false; signal?: AbortSignal },
+    opts?: {
+      continueOnError?: false;
+      transactional?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<QueryResult[]>;
   async execScript(
     script: string,
@@ -844,7 +879,32 @@ export class Client extends EventEmitter<ClientEvents> {
   ): Promise<QueryResult[] | ScriptStatementOutcome[]> {
     const statements = splitStatements(script);
     const continueOnError = opts?.continueOnError === true;
+    const transactional = opts?.transactional === true;
     const signal = opts?.signal;
+
+    if (transactional && continueOnError) {
+      throw new PowDBError(
+        "execScript: `transactional` and `continueOnError` are mutually exclusive",
+        "protocol_error",
+      );
+    }
+    if (transactional) {
+      for (let i = 0; i < statements.length; i++) {
+        if (TX_CONTROL_RE.test(statements[i]!.replace(LEADING_TRIVIA_RE, ""))) {
+          throw new PowDBError(
+            `execScript: a transactional script may not contain its own transaction control (statement ${i + 1}: ${statements[i]!})`,
+            "protocol_error",
+          );
+        }
+      }
+      // Open the transaction and WAIT for its reply before dispatching
+      // anything: if `begin` fails there must be nothing else on the wire.
+      // Deliberately no signal — an abort after `begin` is on the wire
+      // would leave the transaction open with no rollback; an
+      // already-aborted signal stops the loop below at statement 0 and
+      // takes the rollback path.
+      await this.query("begin");
+    }
 
     const outcomes: (ScriptStatementOutcome | undefined)[] = new Array(
       statements.length,
@@ -905,6 +965,17 @@ export class Client extends EventEmitter<ClientEvents> {
           : (this.closeError ?? new PowDBError("client is closed", "closed"));
       }
       if (firstFailureIndex !== -1) {
+        if (transactional) {
+          // Every dispatched reply has settled, so the connection is quiet
+          // and the transaction is still open. Best-effort rollback — the
+          // throw below is what callers act on either way, and if the
+          // connection died the server aborts the transaction itself.
+          try {
+            await this.query("rollback");
+          } catch {
+            /* connection may already be gone */
+          }
+        }
         const cause = firstFailureError!;
         const results: QueryResult[] = [];
         for (let i = 0; i < firstFailureIndex; i++) {
@@ -921,6 +992,22 @@ export class Client extends EventEmitter<ClientEvents> {
             cause,
           },
         );
+      }
+      if (transactional) {
+        // Commit only after every statement's reply settled successfully —
+        // this is the all-or-nothing guarantee. The commit reply is not
+        // part of the returned results. No signal here either: aborting a
+        // commit already on the wire buys nothing but ambiguity.
+        try {
+          await this.query("commit");
+        } catch (err) {
+          try {
+            await this.query("rollback");
+          } catch {
+            /* connection may already be gone */
+          }
+          throw err;
+        }
       }
       return outcomes.map(
         (o) => (o as Extract<ScriptStatementOutcome, { ok: true }>).result,
