@@ -15,7 +15,7 @@ use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{decode_column, decode_row, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 use powdb_storage::view::ViewRegistry;
-pub use powdb_storage::wal::WalSyncMode;
+pub use powdb_storage::wal::{WalDurabilityTicket, WalSyncMode};
 
 use std::io;
 use std::path::Path;
@@ -439,6 +439,37 @@ impl Engine {
     /// Wired from the server's `POWDB_SYNC_MODE` / `--sync-mode` config.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
         self.catalog.set_wal_sync_mode(mode);
+    }
+
+    /// Run `f` with commit durability deferred — the WAL group-commit entry
+    /// point for callers that serialize writers behind an exclusive lock.
+    ///
+    /// Inside `f`, Full-mode commit points register the WAL generation they
+    /// need durable instead of fsyncing inline. The returned ticket (if any)
+    /// must be waited on before the statement's result is acknowledged; the
+    /// caller should release its exclusive engine lock first, so other
+    /// committers can append while the fsync runs. That overlap is what lets
+    /// one fsync cover many commits. A lone committer's wait performs the
+    /// fsync immediately — group commit never introduces a delay.
+    ///
+    /// `Normal`/`Off` sync modes return no ticket; their durability
+    /// contracts are unchanged. If `f` panics the engine must not be reused
+    /// (the deferral flag may still be set); lock poisoning enforces this
+    /// for callers that share the engine behind a lock.
+    pub fn run_with_deferred_durability<T>(
+        &mut self,
+        f: impl FnOnce(&mut Engine) -> T,
+    ) -> (T, Option<WalDurabilityTicket>) {
+        self.catalog.set_wal_sync_deferred(true);
+        let out = f(self);
+        self.catalog.set_wal_sync_deferred(false);
+        let ticket = self.catalog.take_wal_durability_ticket();
+        (out, ticket)
+    }
+
+    /// Number of fsyncs issued against the WAL (test/metrics hook).
+    pub fn wal_fsync_count(&self) -> u64 {
+        self.catalog.wal_fsync_count()
     }
 
     /// Roll back the active explicit transaction while archiving any committed

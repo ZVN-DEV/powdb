@@ -1,7 +1,7 @@
 use crate::metrics::{Metrics, QueryOutcome, SyncOperation, SyncOutcome, SyncRepairLabel};
 use crate::protocol::{Message, WireParam, WireRetainedUnit, WireSyncRepairAction, WireSyncStatus};
 use powdb_auth::{Permission, Role, UserStore};
-use powdb_query::executor::{is_read_only_statement, Engine};
+use powdb_query::executor::{is_read_only_statement, Engine, WalDurabilityTicket};
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
 use powdb_query::sql;
@@ -289,6 +289,11 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "join result exceeds",
     "query exceeded memory budget",
     "result too large",
+    // A failed covering fsync means the statement executed in memory but was
+    // never made durable — the client MUST be able to distinguish this from
+    // an ordinary failed query (the statement may still be visible until the
+    // server restarts). The io::Error detail leaks no internal state.
+    "wal durability sync failed",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -347,85 +352,141 @@ pub struct ConnOpts<'a> {
 /// without the `Write` permission (i.e. `readonly`) gets a clean
 /// "permission denied" error for any non-read statement, before any lock
 /// is taken or any engine state is touched.
+/// A statement's execution result plus its (not-yet-waited) WAL durability
+/// obligation. The ticket is settled by [`finalize_durability`] AFTER the
+/// TxGate permit is dropped, so overlapping committers on other connections
+/// can share a single fsync (group commit).
+type DispatchOutcome = (Result<QueryResult, QueryError>, Option<WalDurabilityTicket>);
+
+/// Execute a mutating statement under the engine write lock with WAL group
+/// commit: the commit's fsync obligation is registered (not performed) while
+/// the lock is held, then the lock is dropped and the un-waited ticket is
+/// returned. The caller must settle the ticket (via [`finalize_durability`])
+/// before acknowledging the statement — and must do so with the TxGate
+/// permit already released, or committers can never overlap.
+fn execute_write_deferred(
+    engine: &Arc<RwLock<Engine>>,
+    f: impl FnOnce(&mut Engine) -> Result<QueryResult, QueryError>,
+) -> DispatchOutcome {
+    let mut eng = match engine.write() {
+        Ok(eng) => eng,
+        Err(e) => {
+            return (
+                Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                None,
+            )
+        }
+    };
+    eng.run_with_deferred_durability(f)
+}
+
 fn dispatch_query(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
     principal: Option<&Principal>,
-) -> Result<QueryResult, QueryError> {
+) -> DispatchOutcome {
     let stmt_result = parser::parse(query).map_err(|e| e.to_string());
 
     // Role enforcement happens on the parsed AST. Statements that fail to
     // parse fall through — the engine returns the parse error itself and
     // can never execute anything for them.
     if let Ok(stmt) = &stmt_result {
-        check_statement_permitted(principal, stmt)?;
+        if let Err(e) = check_statement_permitted(principal, stmt) {
+            return (Err(e), None);
+        }
     }
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine
-                .read()
-                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+            let eng = match engine.read() {
+                Ok(eng) => eng,
+                Err(e) => {
+                    return (
+                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                        None,
+                    )
+                }
+            };
             eng.execute_powql_readonly(query)
         };
         match res {
-            Ok(r) => return Ok(r),
+            Ok(r) => return (Ok(r), None),
             Err(QueryError::ReadonlyNeedsWrite) => {
                 // Escalate: fall through to the write path below.
             }
-            Err(e) => return Err(e),
+            Err(e) => return (Err(e), None),
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
-        return execute_rollback_preserving_sync_if_needed(&mut eng);
+        let mut eng = match engine.write() {
+            Ok(eng) => eng,
+            Err(e) => {
+                return (
+                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                    None,
+                )
+            }
+        };
+        return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
-    eng.execute_powql(query)
+    execute_write_deferred(engine, |eng| eng.execute_powql(query))
 }
 
 fn dispatch_sql_query(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
     principal: Option<&Principal>,
-) -> Result<QueryResult, QueryError> {
+) -> DispatchOutcome {
     let stmt_result = sql::parse_sql(query).map_err(|e| e.to_string());
 
     if let Ok(stmt) = &stmt_result {
-        check_statement_permitted(principal, stmt)?;
+        if let Err(e) = check_statement_permitted(principal, stmt) {
+            return (Err(e), None);
+        }
     }
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine
-                .read()
-                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+            let eng = match engine.read() {
+                Ok(eng) => eng,
+                Err(e) => {
+                    return (
+                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                        None,
+                    )
+                }
+            };
             eng.execute_sql_readonly(query)
         };
         match res {
-            Ok(r) => return Ok(r),
+            Ok(r) => return (Ok(r), None),
             Err(QueryError::ReadonlyNeedsWrite) => {}
-            Err(e) => return Err(e),
+            Err(e) => return (Err(e), None),
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
-        return execute_rollback_preserving_sync_if_needed(&mut eng);
+        let mut eng = match engine.write() {
+            Ok(eng) => eng,
+            Err(e) => {
+                return (
+                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                    None,
+                )
+            }
+        };
+        return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
-    eng.execute_sql(query)
+    execute_write_deferred(engine, |eng| eng.execute_sql(query))
 }
 
 /// Convert a wire parameter into the query-crate [`ParamValue`] used for
@@ -502,7 +563,7 @@ fn dispatch_query_with_params(
     query: &str,
     params: &[WireParam],
     principal: Option<&Principal>,
-) -> Result<QueryResult, QueryError> {
+) -> DispatchOutcome {
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
 
     // Parse once (with params bound) so role enforcement and read/write
@@ -510,36 +571,50 @@ fn dispatch_query_with_params(
     let stmt_result = parser::parse_with_params(query, &bound).map_err(|e| e.to_string());
 
     if let Ok(stmt) = &stmt_result {
-        check_statement_permitted(principal, stmt)?;
+        if let Err(e) = check_statement_permitted(principal, stmt) {
+            return (Err(e), None);
+        }
     }
 
     let can_try_read = matches!(&stmt_result, Ok(s) if is_read_only_statement(s));
     if can_try_read {
         let res = {
-            let eng = engine
-                .read()
-                .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+            let eng = match engine.read() {
+                Ok(eng) => eng,
+                Err(e) => {
+                    return (
+                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                        None,
+                    )
+                }
+            };
             eng.execute_powql_readonly_with_params(query, &bound)
         };
         match res {
-            Ok(r) => return Ok(r),
+            Ok(r) => return (Ok(r), None),
             Err(QueryError::ReadonlyNeedsWrite) => {
                 // Escalate to the write path below.
             }
-            Err(e) => return Err(e),
+            Err(e) => return (Err(e), None),
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
-        return execute_rollback_preserving_sync_if_needed(&mut eng);
+        let mut eng = match engine.write() {
+            Ok(eng) => eng,
+            Err(e) => {
+                return (
+                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
+                    None,
+                )
+            }
+        };
+        return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
-    eng.execute_powql_with_params(query, &bound)
+    execute_write_deferred(engine, |eng| eng.execute_powql_with_params(query, &bound))
 }
 
 #[derive(Debug, Clone)]
@@ -1407,6 +1482,11 @@ where
     decision.message
 }
 
+/// Execute one wire query frame and return the response plus its un-waited
+/// WAL durability ticket. The TxGate permit is managed here and — crucially —
+/// is already released (bare statements, commit/rollback) by the time this
+/// returns, so the caller's `finalize_durability` wait happens OUTSIDE the
+/// gate and overlapping committers can share an fsync.
 async fn execute_wire_query(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
@@ -1415,23 +1495,29 @@ async fn execute_wire_query(
     principal: Option<Principal>,
     query_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> Message {
+) -> (Message, Option<PendingDurability>) {
     match classify_query_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
-                return Message::Error {
-                    message: sanitize_error("transaction already active"),
-                };
+                return (
+                    Message::Error {
+                        message: sanitize_error("transaction already active"),
+                    },
+                    None,
+                );
             }
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1443,10 +1529,10 @@ async fn execute_wire_query(
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            response
+            (response, ticket)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1456,9 +1542,13 @@ async fn execute_wire_query(
             )
             .await;
             if is_success_response(&response) {
+                // Release the gate BEFORE the caller waits on the commit's
+                // ticket: the engine work is done and WAL order is fixed, so
+                // another connection's commit can start (and share the fsync)
+                // while this one waits.
                 tx_permit.take();
             }
-            response
+            (response, ticket)
         }
         None if tx_permit.is_some() => {
             run_blocking_query(
@@ -1475,12 +1565,15 @@ async fn execute_wire_query(
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let out = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1490,7 +1583,7 @@ async fn execute_wire_query(
             )
             .await;
             drop(permit);
-            response
+            out
         }
     }
 }
@@ -1503,23 +1596,29 @@ async fn execute_wire_query_sql(
     principal: Option<Principal>,
     query_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> Message {
+) -> (Message, Option<PendingDurability>) {
     match classify_sql_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
-                return Message::Error {
-                    message: sanitize_error("transaction already active"),
-                };
+                return (
+                    Message::Error {
+                        message: sanitize_error("transaction already active"),
+                    },
+                    None,
+                );
             }
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1531,10 +1630,10 @@ async fn execute_wire_query_sql(
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            response
+            (response, ticket)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1544,9 +1643,11 @@ async fn execute_wire_query_sql(
             )
             .await;
             if is_success_response(&response) {
+                // See execute_wire_query: release the gate before the
+                // caller's durability wait so commits can coalesce.
                 tx_permit.take();
             }
-            response
+            (response, ticket)
         }
         None if tx_permit.is_some() => {
             run_blocking_query(
@@ -1563,12 +1664,15 @@ async fn execute_wire_query_sql(
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let out = run_blocking_query(
                 engine,
                 query,
                 principal,
@@ -1578,7 +1682,7 @@ async fn execute_wire_query_sql(
             )
             .await;
             drop(permit);
-            response
+            out
         }
     }
 }
@@ -1596,23 +1700,29 @@ async fn execute_wire_query_with_params(
     principal: Option<Principal>,
     query_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> Message {
+) -> (Message, Option<PendingDurability>) {
     match classify_params_transaction_control(&query, &params) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
-                return Message::Error {
-                    message: sanitize_error("transaction already active"),
-                };
+                return (
+                    Message::Error {
+                        message: sanitize_error("transaction already active"),
+                    },
+                    None,
+                );
             }
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 (query, params),
                 principal,
@@ -1626,10 +1736,10 @@ async fn execute_wire_query_with_params(
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            response
+            (response, ticket)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let response = run_blocking_query(
+            let (response, ticket) = run_blocking_query(
                 engine,
                 (query, params),
                 principal,
@@ -1641,9 +1751,11 @@ async fn execute_wire_query_with_params(
             )
             .await;
             if is_success_response(&response) {
+                // See execute_wire_query: release the gate before the
+                // caller's durability wait so commits can coalesce.
                 tx_permit.take();
             }
-            response
+            (response, ticket)
         }
         None if tx_permit.is_some() => {
             run_blocking_query(
@@ -1662,12 +1774,15 @@ async fn execute_wire_query_with_params(
             let permit = match tx_gate.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    return Message::Error {
-                        message: "query execution error".into(),
-                    }
+                    return (
+                        Message::Error {
+                            message: "query execution error".into(),
+                        },
+                        None,
+                    )
                 }
             };
-            let response = run_blocking_query(
+            let out = run_blocking_query(
                 engine,
                 (query, params),
                 principal,
@@ -1679,10 +1794,23 @@ async fn execute_wire_query_with_params(
             )
             .await;
             drop(permit);
-            response
+            out
         }
     }
 }
+
+/// A statement's metric sample whose recording is deferred until its WAL
+/// durability obligation settles: a Full-mode fsync failure downgrades the
+/// client's success reply to an error, and the metrics must tell the same
+/// story (and the latency must include the wait the client observed).
+struct DeferredQueryMetric {
+    start: Instant,
+    outcome: QueryOutcome,
+    exceeded_timeout: bool,
+}
+
+/// Durability ticket + the deferred metric of the statement that produced it.
+type PendingDurability = (WalDurabilityTicket, DeferredQueryMetric);
 
 async fn run_blocking_query<T, F>(
     engine: Arc<RwLock<Engine>>,
@@ -1691,12 +1819,10 @@ async fn run_blocking_query<T, F>(
     query_timeout: Duration,
     metrics: &Arc<Metrics>,
     f: F,
-) -> Message
+) -> (Message, Option<PendingDurability>)
 where
     T: Send + 'static,
-    F: FnOnce(Arc<RwLock<Engine>>, T, Option<Principal>) -> Result<QueryResult, QueryError>
-        + Send
-        + 'static,
+    F: FnOnce(Arc<RwLock<Engine>>, T, Option<Principal>) -> DispatchOutcome + Send + 'static,
 {
     let _in_flight = metrics.in_flight_guard();
     let start = Instant::now();
@@ -1714,17 +1840,18 @@ where
         }
     };
 
-    let (message, outcome) = match join_result {
-        Ok(Ok(result)) => match query_result_to_message(result) {
-            Ok(message) => (message, QueryOutcome::Ok),
+    let (message, ticket, outcome) = match join_result {
+        Ok((Ok(result), ticket)) => match query_result_to_message(result) {
+            Ok(message) => (message, ticket, QueryOutcome::Ok),
             Err(e) => (
                 Message::Error {
                     message: sanitize_error(&e.to_string()),
                 },
+                ticket,
                 QueryOutcome::Error,
             ),
         },
-        Ok(Err(e)) => {
+        Ok((Err(e), ticket)) => {
             let outcome = if matches!(e, QueryError::MemoryLimitExceeded { .. }) {
                 QueryOutcome::MemoryLimit
             } else {
@@ -1734,6 +1861,7 @@ where
                 Message::Error {
                     message: sanitize_error(&e.to_string()),
                 },
+                ticket,
                 outcome,
             )
         }
@@ -1741,15 +1869,50 @@ where
             Message::Error {
                 message: format!("internal error: {e}"),
             },
+            None,
             QueryOutcome::Error,
         ),
     };
-    if exceeded_timeout {
-        metrics.record_query(start.elapsed(), QueryOutcome::Timeout);
-    } else {
-        metrics.record_query(start.elapsed(), outcome);
+    match ticket {
+        // The statement's durability (and thus its true outcome and the
+        // latency the client observes) settles at batch end — defer the
+        // metric to the settlement site instead of recording a success that
+        // a failed fsync would falsify.
+        Some(ticket) => (
+            message,
+            Some((
+                ticket,
+                DeferredQueryMetric {
+                    start,
+                    outcome,
+                    exceeded_timeout,
+                },
+            )),
+        ),
+        None => {
+            if exceeded_timeout {
+                metrics.record_query(start.elapsed(), QueryOutcome::Timeout);
+            } else {
+                metrics.record_query(start.elapsed(), outcome);
+            }
+            (message, None)
+        }
     }
-    message
+}
+
+/// Settle a WAL durability ticket off the async path, AFTER the TxGate
+/// permit has been dropped — that ordering is what lets committers on other
+/// connections append (and share the fsync) while this one waits.
+///
+/// Returns `None` when the covering fsync succeeded, or `Some(client-facing
+/// error message)` when it failed — in which case no statement the ticket
+/// covers may be acknowledged as durable (it executed in memory only).
+async fn settle_durability_ticket(ticket: WalDurabilityTicket) -> Option<String> {
+    match tokio::task::spawn_blocking(move || ticket.wait()).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(sanitize_error(&format!("WAL durability sync failed: {e}"))),
+        Err(e) => Some(format!("internal error: {e}")),
+    }
 }
 
 fn is_success_response(msg: &Message) -> bool {
@@ -1763,7 +1926,13 @@ fn is_success_response(msg: &Message) -> bool {
 }
 
 fn rollback_open_transaction(engine: Arc<RwLock<Engine>>, principal: Option<Principal>) {
-    let _ = dispatch_query(&engine, "rollback", principal.as_ref());
+    let (res, ticket) = dispatch_query(&engine, "rollback", principal.as_ref());
+    let _ = res;
+    // Rollback takes the sync-preserving path (no ticket), but settle one
+    // defensively if it ever appears so the durability watermark stays honest.
+    if let Some(ticket) = ticket {
+        let _ = ticket.wait();
+    }
 }
 
 pub async fn handle_connection<S>(stream: S, opts: ConnOpts<'_>)
@@ -1901,116 +2070,305 @@ where
     }
 
     let mut tx_permit: Option<OwnedSemaphorePermit> = None;
+    // A non-query frame decoded during read-ahead batching, carried over to
+    // the next iteration of the main loop.
+    let mut carry: Option<Message> = None;
 
     // Main query loop with idle timeout and shutdown awareness.
-    loop {
-        let msg = tokio::select! {
-            // Read next message with idle timeout.
-            result = tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)) => {
-                match result {
-                    Ok(Ok(Some(msg))) => msg,
-                    Ok(Ok(None)) => break,
-                    Ok(Err(e)) => {
-                        error!(peer = %peer, error = %e, "read error");
-                        break;
+    'conn: loop {
+        let msg = if let Some(m) = carry.take() {
+            m
+        } else {
+            tokio::select! {
+                // Read next message with idle timeout.
+                result = tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)) => {
+                    match result {
+                        Ok(Ok(Some(msg))) => msg,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
+                            error!(peer = %peer, error = %e, "read error");
+                            break;
+                        }
+                        Err(_) => {
+                            info!(peer = %peer, "idle timeout, closing connection");
+                            let err = Message::Error { message: "idle timeout".into() };
+                            write_msg(&mut writer, &err).await;
+                            break;
+                        }
                     }
-                    Err(_) => {
-                        info!(peer = %peer, "idle timeout, closing connection");
-                        let err = Message::Error { message: "idle timeout".into() };
+                }
+                // If server is shutting down, notify client and close.
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!(peer = %peer, "server shutting down, closing connection");
+                        let err = Message::Error { message: "server shutting down".into() };
                         write_msg(&mut writer, &err).await;
                         break;
                     }
+                    continue;
                 }
-            }
-            // If server is shutting down, notify client and close.
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!(peer = %peer, "server shutting down, closing connection");
-                    let err = Message::Error { message: "server shutting down".into() };
-                    write_msg(&mut writer, &err).await;
-                    break;
-                }
-                continue;
             }
         };
+
+        // Plain query frames take the batched path: a pipelining client's
+        // whole burst is executed with ONE durability wait at the end
+        // (durability generations are cumulative, so the newest statement's
+        // ticket covers every earlier one). Everything else is handled one
+        // frame at a time exactly as before.
+        if matches!(
+            msg,
+            Message::Query { .. } | Message::QuerySql { .. } | Message::QueryWithParams { .. }
+        ) {
+            /// Read-ahead cap per batch: bounds unflushed responses and keeps
+            /// the reply latency of the first statement bounded.
+            const MAX_PIPELINE_BATCH: usize = 128;
+            /// Byte cap on retained (unflushed) response payloads per batch:
+            /// large row results stop read-ahead, so one connection can never
+            /// hold gigabytes of replies hostage to the batch's durability
+            /// wait.
+            const MAX_PIPELINE_BATCH_BYTES: usize = 4 << 20;
+
+            /// How the read-ahead loop stopped, when it stopped the whole
+            /// connection rather than just the batch.
+            enum BatchFatal {
+                Closed,
+                ReadError,
+            }
+
+            /// Approximate encoded size of a response, for the batch byte
+            /// cap. Counts the dominant string payloads; exact per-frame
+            /// overhead is irrelevant at the 4 MiB cap.
+            fn approx_response_bytes(msg: &Message) -> usize {
+                match msg {
+                    Message::ResultRows { columns, rows } => {
+                        columns.iter().map(|c| c.len() + 4).sum::<usize>()
+                            + rows
+                                .iter()
+                                .map(|r| r.iter().map(|v| v.len() + 4).sum::<usize>())
+                                .sum::<usize>()
+                    }
+                    Message::ResultScalar { value } => value.len(),
+                    Message::ResultMessage { message } | Message::Error { message } => {
+                        message.len()
+                    }
+                    _ => 16,
+                }
+            }
+
+            /// Whether the reader's buffered bytes hold at least one COMPLETE
+            /// frame (6-byte header + payload). Read-ahead must never await
+            /// the socket: blocking on a partial frame would hold the batch's
+            /// durability settlement and unflushed replies hostage to a slow
+            /// (or malicious) client, up to the idle timeout.
+            fn complete_frame_buffered(buf: &[u8]) -> bool {
+                buf.len() >= 6 && {
+                    let payload_len =
+                        u32::from_le_bytes(buf[2..6].try_into().expect("4-byte slice")) as usize;
+                    buf.len() - 6 >= payload_len
+                }
+            }
+
+            let mut responses: Vec<Message> = Vec::new();
+            let mut response_bytes: usize = 0;
+            let mut last_ticket: Option<WalDurabilityTicket> = None;
+            let mut deferred_metrics: Vec<DeferredQueryMetric> = Vec::new();
+            let mut fatal: Option<BatchFatal> = None;
+            let mut current = msg;
+            loop {
+                let (response, ticket) = match current {
+                    Message::Query { query } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, "received query");
+                            execute_wire_query(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                principal.clone(),
+                                query_timeout,
+                                &metrics,
+                            )
+                            .await
+                        }
+                    }
+                    Message::QuerySql { query } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, "received SQL query");
+                            execute_wire_query_sql(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                principal.clone(),
+                                query_timeout,
+                                &metrics,
+                            )
+                            .await
+                        }
+                    }
+                    Message::QueryWithParams { query, params } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
+                            execute_wire_query_with_params(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                params,
+                                principal.clone(),
+                                query_timeout,
+                                &metrics,
+                            )
+                            .await
+                        }
+                    }
+                    _ => unreachable!("batch loop only receives plain query frames"),
+                };
+                if let Some((t, m)) = ticket {
+                    // Later tickets cover earlier generations — keep only the
+                    // newest; the batch-end wait settles them all. Every
+                    // deferred metric is kept: each records after settlement.
+                    last_ticket = Some(t);
+                    deferred_metrics.push(m);
+                }
+                response_bytes += approx_response_bytes(&response);
+                responses.push(response);
+
+                // Read ahead only when a COMPLETE next frame is already
+                // buffered (never await the socket mid-batch) and the
+                // retained replies stay small. While an explicit transaction
+                // is open the connection holds the TxGate, so batching would
+                // only extend the exclusive window — flush instead.
+                if tx_permit.is_some()
+                    || responses.len() >= MAX_PIPELINE_BATCH
+                    || response_bytes >= MAX_PIPELINE_BATCH_BYTES
+                    || !complete_frame_buffered(reader.buffer())
+                {
+                    break;
+                }
+                // The full frame is buffered, so this returns without socket
+                // I/O; the timeout is a defensive backstop only.
+                match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
+                    Ok(Ok(Some(
+                        next @ (Message::Query { .. }
+                        | Message::QuerySql { .. }
+                        | Message::QueryWithParams { .. }),
+                    ))) => {
+                        // If another connection currently holds the TxGate,
+                        // the next statement would block on the gate with
+                        // this batch's replies still unflushed (pre-batching,
+                        // they'd already have been written). Flush first and
+                        // handle the frame on the next main-loop iteration.
+                        // Benign TOCTOU: worst case is one early flush or one
+                        // gate wait with an empty reply queue.
+                        if tx_gate.available_permits() == 0 {
+                            carry = Some(next);
+                            break;
+                        }
+                        current = next;
+                    }
+                    Ok(Ok(Some(other))) => {
+                        // Not a plain query — flush this batch, then handle
+                        // the frame on the next main-loop iteration.
+                        carry = Some(other);
+                        break;
+                    }
+                    Ok(Ok(None)) => {
+                        fatal = Some(BatchFatal::Closed);
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        error!(peer = %peer, error = %e, "read error");
+                        fatal = Some(BatchFatal::ReadError);
+                        break;
+                    }
+                    Err(_) => {
+                        // Unreachable in practice: the frame was fully
+                        // buffered, so read_from needs no socket I/O.
+                        error!(peer = %peer, "timeout decoding fully-buffered frame");
+                        fatal = Some(BatchFatal::ReadError);
+                        break;
+                    }
+                }
+            }
+
+            // ONE durability wait for the whole batch, then the deferred
+            // metrics: a durability failure records Ok statements as errors,
+            // and latency includes the settlement wait the client observed.
+            let mut durability_failed = false;
+            if let Some(ticket) = last_ticket {
+                if let Some(message) = settle_durability_ticket(ticket).await {
+                    // The covering fsync failed: nothing in this batch may be
+                    // acknowledged as durable.
+                    durability_failed = true;
+                    for r in responses.iter_mut() {
+                        if is_success_response(r) {
+                            *r = Message::Error {
+                                message: message.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+            for m in deferred_metrics.drain(..) {
+                let outcome = if m.exceeded_timeout {
+                    QueryOutcome::Timeout
+                } else if durability_failed && matches!(m.outcome, QueryOutcome::Ok) {
+                    QueryOutcome::Error
+                } else {
+                    m.outcome
+                };
+                metrics.record_query(m.start.elapsed(), outcome);
+            }
+
+            for r in &responses {
+                if !write_msg(&mut writer, r).await {
+                    break 'conn;
+                }
+            }
+            match fatal {
+                None => continue,
+                Some(BatchFatal::Closed | BatchFatal::ReadError) => break,
+            }
+        }
 
         let response = match msg {
             Message::Ping => {
                 debug!(peer = %peer, "ping");
                 Message::Pong
-            }
-            Message::Query { query } => {
-                if query.len() > MAX_QUERY_LENGTH {
-                    Message::Error {
-                        message: format!(
-                            "query too large: {} bytes (max {})",
-                            query.len(),
-                            MAX_QUERY_LENGTH
-                        ),
-                    }
-                } else {
-                    debug!(peer = %peer, query = %query, "received query");
-                    let response = execute_wire_query(
-                        engine.clone(),
-                        tx_gate.clone(),
-                        &mut tx_permit,
-                        query.clone(),
-                        principal.clone(),
-                        query_timeout,
-                        &metrics,
-                    )
-                    .await;
-                    response
-                }
-            }
-            Message::QuerySql { query } => {
-                if query.len() > MAX_QUERY_LENGTH {
-                    Message::Error {
-                        message: format!(
-                            "query too large: {} bytes (max {})",
-                            query.len(),
-                            MAX_QUERY_LENGTH
-                        ),
-                    }
-                } else {
-                    debug!(peer = %peer, query = %query, "received SQL query");
-                    let response = execute_wire_query_sql(
-                        engine.clone(),
-                        tx_gate.clone(),
-                        &mut tx_permit,
-                        query.clone(),
-                        principal.clone(),
-                        query_timeout,
-                        &metrics,
-                    )
-                    .await;
-                    response
-                }
-            }
-            Message::QueryWithParams { query, params } => {
-                if query.len() > MAX_QUERY_LENGTH {
-                    Message::Error {
-                        message: format!(
-                            "query too large: {} bytes (max {})",
-                            query.len(),
-                            MAX_QUERY_LENGTH
-                        ),
-                    }
-                } else {
-                    debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
-                    let response = execute_wire_query_with_params(
-                        engine.clone(),
-                        tx_gate.clone(),
-                        &mut tx_permit,
-                        query.clone(),
-                        params.clone(),
-                        principal.clone(),
-                        query_timeout,
-                        &metrics,
-                    )
-                    .await;
-                    response
-                }
             }
             Message::SyncStatus { replica_id } => {
                 let engine = engine.clone();
