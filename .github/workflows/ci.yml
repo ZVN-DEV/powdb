@@ -334,6 +334,7 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:protocol
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:typed
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:errors
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:script
 
       - name: Build release powdb-server for server-backed TypeScript tests
         run: cargo build --release -p powdb-server
@@ -345,6 +346,8 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:auth
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:pool
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:sync-live
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:eager
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:exec-script
 
   node-addon:
     name: Node embedded addon (build + tests)
