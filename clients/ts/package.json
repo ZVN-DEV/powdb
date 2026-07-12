@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-client",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "packageManager": "pnpm@10.29.3",

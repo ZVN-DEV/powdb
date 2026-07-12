@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-12
+
+Throughput release: WAL **group commit** + server **read-ahead batching** +
+TS-client **pipelined scripts and eager connect**. Durable (Full-mode) write
+throughput goes from one-fsync-per-statement to fsync-sharing across
+in-flight work — measured locally at ~250/s → ~16,000/s for a pipelined
+500-insert burst and ~250/s → ~1,000/s aggregate for 8 concurrent
+connections — with Full durability semantics unchanged.
+
+### Added
+
+- **WAL group commit (Full sync mode).** Overlapping committers now share a
+  single covering fsync (leader/follower over the WAL's shared sync fd)
+  instead of paying one each. Full mode's promise is untouched: no statement
+  is acknowledged before an fsync covering its WAL records has returned; if
+  that fsync fails the statement is not acknowledged. A lone sequential
+  committer still fsyncs exactly once per commit — no timers, no added
+  latency. New engine-level contract suite (`crates/query/tests/group_commit.rs`)
+  pins lone-committer no-regression, fsync sharing, and crash recovery of a
+  coalesced batch; the standing durability suite is unchanged and green.
+- **Server read-ahead batching for pipelining clients.** When a client's
+  next query frames are already buffered, the connection loop executes them
+  back-to-back (cap 128) and settles ONE durability ticket for the burst
+  (durability generations are cumulative). Replies keep frame order; a
+  non-query frame flushes the batch and is handled normally; batching is
+  disabled while an explicit transaction is open; if the covering fsync
+  fails, every success reply in the batch is downgraded to a durability
+  error. New wire-level suite (`crates/server/tests/pipelined_batching.rs`).
+- **TS client: `client.execScript(script, opts?)` / `pool.execScript(...)`** —
+  statement-aware multi-statement script execution (same `;`-in-strings and
+  `#`-comment splitting as the CLI), pipelined down one connection: N
+  statements cost ~1 round trip instead of N. Fail-fast by default
+  (rejects with the new `PowDBScriptError` carrying `statementIndex`,
+  `statement`, and prior `results`); `continueOnError: true` returns a dense
+  per-statement outcome array.
+- **TS client: `execScript(..., { transactional: true })`** — all-or-nothing
+  scripts done safely: the client opens the transaction, waits for every
+  statement's reply, and only then sends `commit` (or `rollback` on any
+  failure). Embedding your own `begin`/`commit` in a pipelined script is
+  rejected — the trailing `commit` would already be on the wire when an
+  error reply arrives, silently committing partial work.
+- **TS client: eager connect** — `Client.connect({ eager: true })` returns
+  after the socket opens and the Connect frame is written; queries issued
+  immediately are pipelined right behind the handshake (−1 RTT on every
+  fresh connection). `client.ready()` exposes the handshake outcome.
+- **TS client: `splitStatements()`** exported for callers that want the
+  script splitter without execution.
+
+### Changed
+
+- **Durability-failure errors are now explicit on the wire.** A statement
+  whose covering fsync failed replies `WAL durability sync failed: …`
+  (previously masked to the generic `query execution error`). Clients must
+  be able to distinguish "your write was rejected" from "your write executed
+  in memory but was never made durable".
+- Wire-protocol server: back-to-back `Connect`+`Query` (frames written
+  before the handshake reply is read) is now pinned by an integration test
+  as a supported client behavior.
+
 ## [0.8.1] - 2026-07-11
 
 Production-readiness patch from a full-product audit: a critical TS-client fix,
