@@ -1,7 +1,7 @@
 use crate::row::encode_row_into;
 use crate::table::Table;
 use crate::types::*;
-use crate::wal::{Wal, WalRecord, WalRecordType, WalSyncMode};
+use crate::wal::{Wal, WalDurabilityTicket, WalRecord, WalRecordType, WalSyncMode};
 use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -901,6 +901,28 @@ impl Catalog {
     /// can lose any record written since the last `sync_wal` returned.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
         self.wal.set_sync_mode(mode);
+    }
+
+    /// Defer Full-mode commit fsyncs (WAL group commit). While enabled, the
+    /// commit paths register the WAL generation they need durable instead of
+    /// fsyncing inline; the pending claim is retrieved with
+    /// [`Self::take_wal_durability_ticket`] and the caller must wait on it
+    /// before acknowledging the statement. This lets the fsync leave the
+    /// engine's exclusive-lock hold so overlapping committers can share one
+    /// fsync. `Normal`/`Off` modes are unaffected.
+    pub fn set_wal_sync_deferred(&mut self, defer: bool) {
+        self.wal.set_defer_sync(defer);
+    }
+
+    /// Take the durability claim registered by deferred commit flushes since
+    /// the last take, if any. See [`Self::set_wal_sync_deferred`].
+    pub fn take_wal_durability_ticket(&mut self) -> Option<WalDurabilityTicket> {
+        self.wal.take_durability_ticket()
+    }
+
+    /// Number of fsyncs issued against the WAL (test/metrics hook).
+    pub fn wal_fsync_count(&self) -> u64 {
+        self.wal.fsync_count()
     }
 
     /// Discard in-memory mutations made since the last `sync_wal()` and

@@ -133,6 +133,117 @@ pub enum WalSyncMode {
 /// the upper bound on the crash-loss window (OS-crash / power-loss only).
 const NORMAL_FSYNC_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Fsync-coordination state shared between the `Wal`, the Normal-mode
+/// background flusher, and any outstanding [`WalDurabilityTicket`]s.
+///
+/// This is the heart of Full-mode group commit: `dirty_gen` counts
+/// flush-to-OS generations, `synced_gen` tracks the highest generation an
+/// fsync has covered, and `sync_file` is both the fd fsyncs go through and
+/// the leader election — whoever holds the mutex fsyncs on behalf of every
+/// generation registered before the fsync started.
+#[derive(Debug)]
+struct WalSyncShared {
+    /// Monotonic counter bumped on every durable-intent flush-to-OS (non-Off).
+    /// A generation is only registered after its bytes reached the OS file
+    /// (`BufWriter::flush`), so an fsync issued afterwards always covers it.
+    dirty_gen: AtomicU64,
+    /// Highest `dirty_gen` value known to be fsync-durable. Advanced by
+    /// group-commit leaders and by the Normal background flusher.
+    synced_gen: AtomicU64,
+    /// Number of `sync_data` calls issued on the WAL file. Test/metrics hook:
+    /// group-commit coalescing shows up as fewer fsyncs than commits.
+    fsync_count: AtomicU64,
+    /// The fd used for fsyncs, doubling as the group-commit leader lock.
+    /// `None` only if cloning the writer's fd failed on (re)open.
+    sync_file: Mutex<Option<File>>,
+}
+
+impl WalSyncShared {
+    fn new(sync_file: Option<File>) -> Self {
+        WalSyncShared {
+            dirty_gen: AtomicU64::new(0),
+            synced_gen: AtomicU64::new(0),
+            fsync_count: AtomicU64::new(0),
+            sync_file: Mutex::new(sync_file),
+        }
+    }
+
+    /// Block until an fsync covering `gen` has completed (leader/follower
+    /// group commit). The first caller to take the lock fsyncs once for every
+    /// generation registered so far; callers queued behind it wake up already
+    /// covered and return without an fsync of their own. A lone caller finds
+    /// the lock free and fsyncs immediately — group commit never introduces a
+    /// wait for company.
+    fn sync_until(&self, gen: u64) -> io::Result<()> {
+        if self.synced_gen.load(Ordering::Acquire) >= gen {
+            return Ok(());
+        }
+        let guard = self
+            .sync_file
+            .lock()
+            .map_err(|_| io::Error::other("WAL sync lock poisoned"))?;
+        // A leader that ran while we were queued may already have covered us.
+        if self.synced_gen.load(Ordering::Acquire) >= gen {
+            return Ok(());
+        }
+        let file = guard
+            .as_ref()
+            .ok_or_else(|| io::Error::other("WAL sync fd unavailable"))?;
+        // Snapshot BEFORE the fsync: every generation registered by now has
+        // its bytes in the OS file already, so this one fsync covers them all.
+        let cover = self.dirty_gen.load(Ordering::Acquire);
+        file.sync_data()?;
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        self.synced_gen.fetch_max(cover, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Swap the fsync fd and mark every generation registered so far as
+    /// settled. Called when the WAL file is truncated or recreated: the bytes
+    /// those generations covered are gone from the log — either already
+    /// durable elsewhere (checkpoint flushed the heaps; the discard paths
+    /// `sync_data` the truncated file) or intentionally discarded by rollback
+    /// — so no ticket must ever block on them again.
+    fn replace_file(&self, file: Option<File>) {
+        // Take the leader lock so an in-flight fsync on the old fd finishes
+        // before the swap. Poisoning is impossible in practice (the critical
+        // section cannot panic) but recover anyway rather than propagate.
+        let mut guard = match self.sync_file.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let d = self.dirty_gen.load(Ordering::Acquire);
+        self.synced_gen.fetch_max(d, Ordering::AcqRel);
+        *guard = file;
+    }
+}
+
+/// A claim on WAL durability handed out by a deferred Full-mode flush: the
+/// commit's records have reached the OS file but are not yet guaranteed on
+/// stable storage. [`Self::wait`] blocks until an fsync covering them has
+/// completed — the caller must not acknowledge the commit before `wait`
+/// returns `Ok(())`.
+///
+/// Tickets are cumulative: generations are registered in order, so waiting on
+/// a later ticket also makes every earlier generation durable. Waiting takes
+/// no `Wal` lock, which is what lets a committer release the engine's write
+/// lock first and other committers append while the fsync runs — the overlap
+/// that lets one fsync cover many commits.
+#[derive(Debug)]
+#[must_use = "a commit must not be acknowledged until wait() returns Ok"]
+pub struct WalDurabilityTicket {
+    gen: u64,
+    shared: Arc<WalSyncShared>,
+}
+
+impl WalDurabilityTicket {
+    /// Block until an fsync covering this ticket's WAL records has completed.
+    /// See [`WalSyncShared::sync_until`] for the leader/follower scheme.
+    pub fn wait(self) -> io::Result<()> {
+        self.shared.sync_until(self.gen)
+    }
+}
+
 pub struct Wal {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
@@ -150,12 +261,17 @@ pub struct Wal {
     /// a same-process reopen cannot replay uncommitted records.
     records_start: u64,
     synced_len: u64,
-    /// Monotonic counter bumped on every durable-intent `flush()` (non-Off).
-    /// The Normal background flusher fsyncs whenever `dirty_gen > synced_gen`.
-    dirty_gen: Arc<AtomicU64>,
-    /// Highest `dirty_gen` value known to be fsync-durable. Advanced by Full's
-    /// inline fsync and by the Normal background flusher.
-    synced_gen: Arc<AtomicU64>,
+    /// Group-commit fsync coordination (see [`WalSyncShared`]).
+    shared: Arc<WalSyncShared>,
+    /// When `true`, a Full-mode `flush()` registers the generation it needs
+    /// durable instead of fsyncing inline; [`Self::take_durability_ticket`]
+    /// hands the claim to the caller, who must wait on it before
+    /// acknowledging the commit. See [`Self::set_defer_sync`].
+    defer_sync: bool,
+    /// Highest generation registered by deferred flushes since the last
+    /// `take_durability_ticket`. Cumulative — a later generation covers all
+    /// earlier ones, so overwriting never loses coverage.
+    deferred_gen: Option<u64>,
     /// Background fsync thread; present only while in `Normal` mode.
     flusher: Option<Flusher>,
 }
@@ -171,12 +287,7 @@ struct Flusher {
 }
 
 impl Flusher {
-    fn spawn(
-        file: File,
-        dirty_gen: Arc<AtomicU64>,
-        synced_gen: Arc<AtomicU64>,
-        interval: Duration,
-    ) -> Flusher {
+    fn spawn(file: File, shared: Arc<WalSyncShared>, interval: Duration) -> Flusher {
         let ctl: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
         let ctl_thread = Arc::clone(&ctl);
         let handle = std::thread::Builder::new()
@@ -195,10 +306,16 @@ impl Flusher {
                         }
                     };
                     // fsync if the writer has buffered new bytes since last sync.
-                    let d = dirty_gen.load(Ordering::Acquire);
-                    if d > synced_gen.load(Ordering::Acquire) {
+                    let d = shared.dirty_gen.load(Ordering::Acquire);
+                    if d > shared.synced_gen.load(Ordering::Acquire) {
                         match file.sync_data() {
-                            Ok(()) => synced_gen.store(d, Ordering::Release),
+                            Ok(()) => {
+                                shared.fsync_count.fetch_add(1, Ordering::Relaxed);
+                                // fetch_max, not store: a Full-mode group
+                                // commit may have advanced past `d` between
+                                // the load and the fsync (mode switches).
+                                shared.synced_gen.fetch_max(d, Ordering::AcqRel);
+                            }
                             // In Normal mode this background fsync is the ONLY
                             // durability point. Swallowing the error (the old
                             // `&& .is_ok()`) meant an ENOSPC/EIO would keep the
@@ -252,6 +369,7 @@ impl Wal {
             .truncate(true)
             .open(path)?;
         write_wal_file_header(&mut file)?;
+        let sync_fd = file.try_clone()?;
         Ok(Wal {
             path: path.to_path_buf(),
             writer: Some(BufWriter::new(file)),
@@ -261,8 +379,9 @@ impl Wal {
             next_lsn: 1,
             records_start: WAL_FILE_HEADER_SIZE,
             synced_len: WAL_FILE_HEADER_SIZE,
-            dirty_gen: Arc::new(AtomicU64::new(0)),
-            synced_gen: Arc::new(AtomicU64::new(0)),
+            shared: Arc::new(WalSyncShared::new(Some(sync_fd))),
+            defer_sync: false,
+            deferred_gen: None,
             flusher: None,
         })
     }
@@ -275,6 +394,7 @@ impl Wal {
             .open(path)?;
         let records_start = wal_records_start(&mut file)?;
         let synced_len = file.metadata()?.len();
+        let sync_fd = file.try_clone()?;
         Ok(Wal {
             path: path.to_path_buf(),
             writer: Some(BufWriter::new(file)),
@@ -284,8 +404,9 @@ impl Wal {
             next_lsn: 1,
             records_start,
             synced_len,
-            dirty_gen: Arc::new(AtomicU64::new(0)),
-            synced_gen: Arc::new(AtomicU64::new(0)),
+            shared: Arc::new(WalSyncShared::new(Some(sync_fd))),
+            defer_sync: false,
+            deferred_gen: None,
             flusher: None,
         })
     }
@@ -315,8 +436,7 @@ impl Wal {
             if let Ok(file) = writer.get_ref().try_clone() {
                 self.flusher = Some(Flusher::spawn(
                     file,
-                    Arc::clone(&self.dirty_gen),
-                    Arc::clone(&self.synced_gen),
+                    Arc::clone(&self.shared),
                     NORMAL_FSYNC_INTERVAL,
                 ));
             }
@@ -334,7 +454,37 @@ impl Wal {
     /// every Full commit and on each Normal background-flusher cycle. Exposed
     /// for tests and (future) metrics.
     pub fn synced_generation(&self) -> u64 {
-        self.synced_gen.load(Ordering::Acquire)
+        self.shared.synced_gen.load(Ordering::Acquire)
+    }
+
+    /// Number of fsyncs issued against the WAL file (group-commit leaders,
+    /// inline Full-mode flushes, and the Normal background flusher). Exposed
+    /// for tests and (future) metrics: group-commit coalescing shows up as
+    /// fewer fsyncs than commits.
+    pub fn fsync_count(&self) -> u64 {
+        self.shared.fsync_count.load(Ordering::Relaxed)
+    }
+
+    /// Defer Full-mode commit fsyncs. While enabled, [`Self::flush`]
+    /// registers the generation it needs durable instead of fsyncing inline;
+    /// the pending claim is retrieved with [`Self::take_durability_ticket`]
+    /// and the caller must wait on it before acknowledging the commit. This
+    /// is how group commit lets the fsync leave the engine's exclusive-lock
+    /// hold: append + register under the lock, wait after releasing it.
+    ///
+    /// `Normal` and `Off` modes are unaffected (they never fsync inline).
+    pub fn set_defer_sync(&mut self, defer: bool) {
+        self.defer_sync = defer;
+    }
+
+    /// Take the durability claim registered by deferred flushes since the
+    /// last take, if any. Generations are cumulative, so one ticket covers
+    /// every deferred flush that happened before it was taken.
+    pub fn take_durability_ticket(&mut self) -> Option<WalDurabilityTicket> {
+        self.deferred_gen.take().map(|gen| WalDurabilityTicket {
+            gen,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
     /// Returns the current sync mode (used by tests + introspection).
@@ -428,18 +578,50 @@ impl Wal {
         Ok(())
     }
 
-    /// Flush buffered records to disk with fsync (the group commit point).
+    /// Flush buffered records to disk (the group commit point).
+    ///
+    /// In `Full` mode the commit is durable when this returns: the buffered
+    /// bytes are pushed to the OS and an fsync covering them completes before
+    /// the call returns — unless durability deferral is active (see
+    /// [`Self::set_defer_sync`]), in which case the fsync obligation is
+    /// registered and handed to the caller via
+    /// [`Self::take_durability_ticket`]. Either way, concurrent committers'
+    /// fsyncs coalesce: one fsync covers every generation registered before
+    /// it started, and a lone committer fsyncs immediately (no batching
+    /// delay).
     ///
     /// No-op if nothing has been appended since the last flush. This makes
     /// it safe for the executor to unconditionally call `sync_wal` at the
     /// end of every statement — read queries pay zero fsync cost.
     pub fn flush(&mut self) -> io::Result<()> {
+        let Some(gen) = self.flush_to_os()? else {
+            return Ok(());
+        };
+        // SQLite-style synchronous knob: only the fsync is gated on the mode.
+        // The flush-to-OS above always runs so a process crash still recovers
+        // cleanly via `read_all`. In `Full` the fsync happens here (or via
+        // the deferred ticket); in `Normal` the background flusher fsyncs off
+        // this path.
+        if matches!(self.sync_mode, WalSyncMode::Full) {
+            if self.defer_sync {
+                // Cumulative: the newest generation covers all earlier ones,
+                // so overwriting an untaken claim never loses coverage.
+                self.deferred_gen = Some(gen);
+            } else {
+                self.shared.sync_until(gen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push buffered records through to the OS file (no fsync) and register
+    /// the resulting dirty generation. Returns `Ok(None)` when there was
+    /// nothing pending or the WAL is `Off`.
+    fn flush_to_os(&mut self) -> io::Result<Option<u64>> {
         let batch = self.pending;
         if batch == 0 {
-            return Ok(());
+            return Ok(None);
         }
-        let is_full = matches!(self.sync_mode, WalSyncMode::Full);
-        let is_off = matches!(self.sync_mode, WalSyncMode::Off);
         // Borrow the writer only for the I/O, then drop it before touching the
         // generation counters (which borrow `self`).
         let new_len = {
@@ -448,25 +630,18 @@ impl Wal {
                 .as_mut()
                 .ok_or_else(|| io::Error::other("WAL writer unavailable"))?;
             writer.flush()?;
-            // SQLite-style synchronous knob: only the explicit fsync is gated.
-            // The BufWriter::flush above always runs so a process crash still
-            // recovers cleanly via `read_all`. In `Full` we fsync inline here;
-            // in `Normal` the background flusher fsyncs off this path.
-            if is_full {
-                writer.get_ref().sync_data()?;
-            }
             writer.get_ref().metadata()?.len()
         };
-        if !is_off {
-            let gen = self.dirty_gen.fetch_add(1, Ordering::Release) + 1;
-            if is_full {
-                self.synced_gen.store(gen, Ordering::Release);
-            }
-        }
         self.synced_len = new_len;
         self.pending = 0;
+        if matches!(self.sync_mode, WalSyncMode::Off) {
+            return Ok(None);
+        }
+        // Registered only after the bytes are OS-visible, so any fsync issued
+        // from here on covers this generation.
+        let gen = self.shared.dirty_gen.fetch_add(1, Ordering::Release) + 1;
         debug!(records = batch, "wal group commit");
-        Ok(())
+        Ok(Some(gen))
     }
 
     /// True when records have been appended to the in-memory WAL buffer
@@ -506,7 +681,13 @@ impl Wal {
         file.set_len(len)?;
         file.seek(SeekFrom::End(0))?;
         file.sync_data()?;
+        let sync_fd = file.try_clone()?;
         self.writer = Some(BufWriter::new(file));
+        // Everything that survived the truncation was just `sync_data`ed
+        // above, and everything past `len` is intentionally discarded; settle
+        // all registered generations and drop any deferred claim.
+        self.deferred_gen = None;
+        self.shared.replace_file(Some(sync_fd));
         self.pending = 0;
         self.synced_len = len;
         Ok(())
@@ -612,13 +793,24 @@ impl Wal {
 
     /// Truncate the WAL (after checkpoint).
     pub fn truncate(&mut self) -> io::Result<()> {
+        // Settle any deferred durability claim before destroying the records
+        // it covers: this keeps the "WAL records are durable before truncate"
+        // ordering airtight even if a caller checkpoints while deferral is
+        // active.
+        if let Some(gen) = self.deferred_gen.take() {
+            self.shared.sync_until(gen)?;
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .truncate(true)
             .open(&self.path)?;
         write_wal_file_header(&mut file)?;
+        let sync_fd = file.try_clone()?;
         self.writer = Some(BufWriter::new(file));
+        // The old records are gone; settle their generations and swap the
+        // fsync fd so outstanding tickets can never block on them.
+        self.shared.replace_file(Some(sync_fd));
         self.records_start = WAL_FILE_HEADER_SIZE;
         self.pending = 0;
         self.synced_len = WAL_FILE_HEADER_SIZE;
@@ -651,7 +843,12 @@ impl Wal {
             .open(&self.path)?;
         file.set_len(self.synced_len)?;
         file.sync_data()?;
+        let sync_fd = file.try_clone()?;
         self.writer = Some(BufWriter::new(file));
+        // The surviving prefix was just `sync_data`ed; settle all registered
+        // generations and drop any deferred claim over discarded bytes.
+        self.deferred_gen = None;
+        self.shared.replace_file(Some(sync_fd));
         self.pending = 0;
         self.synced_len = self.records_start;
         Ok(())
@@ -759,6 +956,115 @@ mod tests {
             "background flusher did not sync (synced_generation = {})",
             wal.synced_generation()
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_lone_committer_fsyncs_immediately_per_commit() {
+        // Group commit must never delay a lone committer: with no other
+        // waiters, every flush fsyncs immediately — exactly one fsync per
+        // commit, no timers, no batching window.
+        let (mut wal, path) = temp_wal("lone_committer");
+        let base = wal.fsync_count();
+        for i in 0..10u32 {
+            wal.append(1, WalRecordType::Insert, format!("c{i}").as_bytes())
+                .unwrap();
+            wal.flush().unwrap();
+        }
+        assert_eq!(
+            wal.fsync_count() - base,
+            10,
+            "a lone sequential committer must fsync exactly once per commit"
+        );
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_deferred_tickets_coalesce_one_fsync_for_two_commits() {
+        // Two commits registered before either waits: the first wait's fsync
+        // covers both generations, the second wait returns without an fsync.
+        let path = std::env::temp_dir().join(format!(
+            "powdb_wal_gc_coalesce2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut wal = Wal::create(&path, 1024).unwrap();
+        wal.set_defer_sync(true);
+
+        wal.append(1, WalRecordType::Insert, b"a").unwrap();
+        wal.flush().unwrap();
+        let t1 = wal.take_durability_ticket().expect("ticket for commit 1");
+
+        wal.append(2, WalRecordType::Insert, b"b").unwrap();
+        wal.flush().unwrap();
+        let t2 = wal.take_durability_ticket().expect("ticket for commit 2");
+
+        let base = wal.fsync_count();
+        t2.wait().unwrap(); // leader — its fsync covers generation 1 too
+        t1.wait().unwrap(); // already covered, no second fsync
+        assert_eq!(
+            wal.fsync_count() - base,
+            1,
+            "one fsync must cover both queued commits"
+        );
+        assert_eq!(wal.read_all().unwrap().len(), 2);
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_concurrent_committers_share_one_fsync() {
+        // Classic group commit: N committers append + register (serialized by
+        // the writer lock), all reach the barrier before any of them waits,
+        // then the first waiter's fsync covers every registered generation.
+        use std::sync::Barrier;
+
+        let path = std::env::temp_dir().join(format!(
+            "powdb_wal_gc_concurrent_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wal = Arc::new(Mutex::new(Wal::create(&path, 1024).unwrap()));
+        wal.lock().unwrap().set_defer_sync(true);
+
+        let n = 8;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+        for t in 0..n {
+            let wal = Arc::clone(&wal);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let ticket = {
+                    let mut w = wal.lock().unwrap();
+                    w.append(t as u64 + 1, WalRecordType::Insert, b"row")
+                        .unwrap();
+                    w.flush().unwrap();
+                    w.take_durability_ticket().expect("deferred ticket")
+                };
+                barrier.wait();
+                ticket.wait().unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let w = wal.lock().unwrap();
+        assert_eq!(w.read_all().unwrap().len(), n);
+        assert_eq!(
+            w.fsync_count(),
+            1,
+            "all {n} overlapping commits must be covered by a single fsync"
+        );
+        drop(w);
+        drop(wal);
         std::fs::remove_file(&path).ok();
     }
 

@@ -347,6 +347,40 @@ pub struct ConnOpts<'a> {
 /// without the `Write` permission (i.e. `readonly`) gets a clean
 /// "permission denied" error for any non-read statement, before any lock
 /// is taken or any engine state is touched.
+/// Execute a mutating statement under the engine write lock with WAL group
+/// commit: the commit's fsync obligation is registered (not performed) while
+/// the lock is held, the lock is dropped, and only then do we wait for a
+/// covering fsync before acknowledging. Committers on other connections can
+/// append while this one's fsync runs, so overlapping commits share a single
+/// fsync; a lone committer's wait fsyncs immediately (no added latency).
+///
+/// Full-mode semantics are preserved: `Ok` is returned only after an fsync
+/// covering the statement's WAL records has completed. If the fsync fails,
+/// the statement is NOT acknowledged even though it executed in memory.
+fn execute_write_durably(
+    engine: &Arc<RwLock<Engine>>,
+    f: impl FnOnce(&mut Engine) -> Result<QueryResult, QueryError>,
+) -> Result<QueryResult, QueryError> {
+    let (res, ticket) = {
+        let mut eng = engine
+            .write()
+            .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
+        eng.run_with_deferred_durability(f)
+    };
+    if let Some(ticket) = ticket {
+        // Wait even when the statement errored: the ticket may cover WAL
+        // records flushed before the failure, and settling it keeps the
+        // durability high-water mark honest.
+        let waited = ticket.wait();
+        if res.is_ok() {
+            waited.map_err(|e| {
+                QueryError::StorageError(format!("WAL durability sync failed: {e}"))
+            })?;
+        }
+    }
+    res
+}
+
 fn dispatch_query(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
@@ -378,16 +412,16 @@ fn dispatch_query(
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
+        let mut eng = engine
+            .write()
+            .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
         return execute_rollback_preserving_sync_if_needed(&mut eng);
     }
-    eng.execute_powql(query)
+    execute_write_durably(engine, |eng| eng.execute_powql(query))
 }
 
 fn dispatch_sql_query(
@@ -416,16 +450,16 @@ fn dispatch_sql_query(
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
+        let mut eng = engine
+            .write()
+            .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
         return execute_rollback_preserving_sync_if_needed(&mut eng);
     }
-    eng.execute_sql(query)
+    execute_write_durably(engine, |eng| eng.execute_sql(query))
 }
 
 /// Convert a wire parameter into the query-crate [`ParamValue`] used for
@@ -530,16 +564,16 @@ fn dispatch_query_with_params(
         }
     }
 
-    let mut eng = engine
-        .write()
-        .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
     if matches!(
         parsed_transaction_control(&stmt_result),
         Some(TransactionControl::Rollback)
     ) {
+        let mut eng = engine
+            .write()
+            .map_err(|e| QueryError::Execution(format!("lock poisoned: {e}")))?;
         return execute_rollback_preserving_sync_if_needed(&mut eng);
     }
-    eng.execute_powql_with_params(query, &bound)
+    execute_write_durably(engine, |eng| eng.execute_powql_with_params(query, &bound))
 }
 
 #[derive(Debug, Clone)]
