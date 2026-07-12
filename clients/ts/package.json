@@ -56,6 +56,9 @@
     "test:pool": "tsx test/run-with-server.ts test/pool.test.ts",
     "test:typed": "tsx test/typed.test.ts",
     "test:errors": "tsx test/errors.test.ts",
+    "test:script": "tsx test/script.test.ts",
+    "test:eager": "tsx test/run-with-server.ts test/eager.test.ts",
+    "test:exec-script": "tsx test/run-with-server.ts test/exec-script.test.ts",
     "demo": "tsx demo/demo.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"

@@ -29,7 +29,8 @@ import {
   type WireParam,
   type WireSyncStatus,
 } from "./protocol.js";
-import { PowDBError } from "./errors.js";
+import { PowDBError, PowDBScriptError, isPowDBError } from "./errors.js";
+import { splitStatements } from "./script.js";
 import {
   coerceRows,
   type TypedRow,
@@ -54,6 +55,27 @@ export type QueryResult =
  * binds as an int; `null` binds PowQL `null`.
  */
 export type QueryParam = string | number | bigint | boolean | null;
+
+/** Options for {@link Client.execScript} / {@link Pool.execScript}. */
+export interface ExecScriptOptions {
+  /**
+   * When `true`, keep dispatching statements after one fails and return a
+   * per-statement outcome array instead of throwing. Defaults to `false`
+   * (fail-fast: stop dispatching and reject with a {@link PowDBScriptError}
+   * carrying the failing statement's index and the results so far).
+   */
+  continueOnError?: boolean;
+  /** Abort the remaining statements (see {@link Client.query}). */
+  signal?: AbortSignal;
+}
+
+/**
+ * Per-statement outcome from `execScript(script, { continueOnError: true })`.
+ * Array order matches statement order in the script.
+ */
+export type ScriptStatementOutcome =
+  | { statement: string; ok: true; result: QueryResult }
+  | { statement: string; ok: false; error: Error };
 
 /** Unsigned 64-bit sync protocol value. Numbers must be safe non-negative integers. */
 export type SyncU64 = bigint | number;
@@ -219,6 +241,21 @@ export interface ClientOptions {
    * `tls.connect(port, host, options)`. Defaults to plain TCP.
    */
   tls?: boolean | tls.ConnectionOptions;
+  /**
+   * Pipelined ("eager") connect. When `true`, {@link Client.connect}
+   * resolves as soon as the socket is open and the Connect frame has been
+   * written — it does NOT wait for the server's ConnectOk. Queries issued
+   * immediately are queued and written right behind the Connect frame (the
+   * server reads frames sequentially, so this is valid on the wire), saving
+   * a full round trip on every fresh connection.
+   *
+   * If the handshake then fails (bad password, protocol mismatch), every
+   * queued query rejects with the handshake error and the client closes.
+   * `serverVersion` is `""` until the ConnectOk arrives; await
+   * {@link Client.ready} if you need the handshake settled. Defaults to
+   * `false` (connect blocks until ConnectOk, exactly as before).
+   */
+  eager?: boolean;
 }
 
 type Pending = {
@@ -305,20 +342,37 @@ export class Client extends EventEmitter<ClientEvents> {
   private readonly pending: Pending[] = [];
   private closed = false;
   private closeError: Error | null = null;
+  /** Settled once the Connect→ConnectOk handshake completes (or fails). */
+  private handshake: Promise<void> = Promise.resolve();
+  /** True once ConnectOk has been received. */
+  private handshakeComplete = false;
+  private _serverVersion = "";
 
-  readonly serverVersion: string;
+  /**
+   * Server version from the ConnectOk frame. For a client opened with
+   * `eager: true` this is `""` until the handshake reply arrives (await
+   * {@link ready} to guarantee it is populated).
+   */
+  get serverVersion(): string {
+    return this._serverVersion;
+  }
 
-  private constructor(socket: net.Socket, serverVersion: string) {
+  private constructor(socket: net.Socket) {
     super();
     this.socket = socket;
-    this.serverVersion = serverVersion;
 
     this.socket.on("data", (chunk) => this.onData(socketChunkToBuffer(chunk)));
     this.socket.on("error", (err) => this.onClose(err));
     this.socket.on("close", () => this.onClose(null));
   }
 
-  /** Open a connection, send Connect, wait for ConnectOk. */
+  /**
+   * Open a connection, send Connect, and wait for ConnectOk.
+   *
+   * With `eager: true`, resolve as soon as the Connect frame is written
+   * instead — queries may be issued immediately and are pipelined behind
+   * the handshake (see {@link ClientOptions.eager} and {@link ready}).
+   */
   static async connect(opts: ClientOptions): Promise<Client> {
     const {
       host,
@@ -329,6 +383,7 @@ export class Client extends EventEmitter<ClientEvents> {
       user,
       connectTimeoutMs = 5000,
       tls: tlsOpt = false,
+      eager = false,
     } = opts;
 
     if (path === undefined && (host === undefined || port === undefined)) {
@@ -344,82 +399,88 @@ export class Client extends EventEmitter<ClientEvents> {
       tlsOpt,
     );
 
-    // We need to read the initial ConnectOk before wiring up the normal
-    // pending-queue machinery, so we do a one-shot handshake here.
-    const handshake = new Promise<Message>((resolve, reject) => {
-      let scratch = Buffer.alloc(0);
-      const cleanup = () => {
-        socket.removeListener("data", onData);
-        socket.removeListener("error", onError);
-        socket.removeListener("close", onClose);
-      };
-      const onData = (chunk: Buffer | string) => {
-        scratch = Buffer.concat([scratch, socketChunkToBuffer(chunk)]);
-        let decoded: { msg: Message; consumed: number } | null;
-        try {
-          decoded = tryDecode(scratch);
-        } catch (err) {
-          cleanup();
-          reject(err as Error);
-          return;
-        }
-        if (decoded !== null) {
-          cleanup();
-          // Any bytes past the handshake frame belong to later responses.
-          // This should not happen in practice, but handle it defensively.
-          const leftover = scratch.subarray(decoded.consumed);
-          if (leftover.length > 0) {
-            socket.unshift(leftover);
-          }
-          resolve(decoded.msg);
-        }
-      };
-      const onError = (err: Error) => {
-        cleanup();
-        reject(err);
-      };
-      // Without this, a peer that FINs the connection mid-handshake (no
-      // explicit error event) would leave this promise pending forever.
-      const onClose = () => {
-        cleanup();
-        reject(new PowDBError("connection closed during handshake", "connect_failed"));
-      };
-      socket.on("data", onData);
-      socket.on("error", onError);
-      socket.on("close", onClose);
-    });
-
-    socket.write(
-      encode({ type: "Connect", dbName, password, username: user ?? null }),
+    const client = new Client(socket);
+    client.startHandshake(
+      { type: "Connect", dbName, password, username: user ?? null },
+      path ?? `${host}:${port}`,
     );
-    const reply = await handshake;
-
-    if (reply.type === "Error") {
-      socket.destroy();
-      throw new PowDBError(`connect failed: ${reply.message}`, "auth_failed");
+    if (!eager) {
+      await client.ready();
     }
-    if (reply.type !== "ConnectOk") {
-      socket.destroy();
-      throw new PowDBError(`expected ConnectOk, got ${reply.type}`, "protocol_error");
-    }
+    return client;
+  }
 
-    // Advisory: warn once per host:port if the server's major differs
-    // from the client's. Do not throw or close — this is best-effort.
-    const serverMajor = majorOf(reply.version);
-    const clientMajor = majorOf(CLIENT_VERSION);
-    if (serverMajor !== clientMajor) {
-      const key = path ?? `${host}:${port}`;
-      if (!versionWarnings.has(key)) {
-        versionWarnings.add(key);
-        console.warn(
-          `[powdb] server version ${reply.version} major (${serverMajor}) ` +
-            `differs from client ${CLIENT_VERSION} major (${clientMajor}); ` +
-            `behaviour may be inconsistent.`,
-        );
-      }
-    }
+  /**
+   * Resolves once the Connect→ConnectOk handshake has completed; rejects
+   * with the handshake error if it failed. For non-eager clients this has
+   * already settled by the time {@link connect} returns. Eager callers can
+   * await it to learn the handshake outcome without issuing a query.
+   */
+  ready(): Promise<void> {
+    return this.handshake;
+  }
 
-    return new Client(socket, reply.version);
+  /**
+   * Write the Connect frame and register the handshake as the first entry
+   * in the pending queue. The reply-matching machinery is strictly FIFO, so
+   * the ConnectOk (or Error) frame is matched to the handshake before any
+   * pipelined query sees a reply. On failure, every queued query is
+   * rejected with the handshake error and the socket is torn down.
+   */
+  private startHandshake(connect: Message, versionWarnKey: string): void {
+    this.handshake = this.send(connect).then(
+      (reply) => {
+        if (reply.type === "Error") {
+          throw new PowDBError(
+            `connect failed: ${reply.message}`,
+            "auth_failed",
+          );
+        }
+        if (reply.type !== "ConnectOk") {
+          throw new PowDBError(
+            `expected ConnectOk, got ${reply.type}`,
+            "protocol_error",
+          );
+        }
+        this.handshakeComplete = true;
+        this._serverVersion = reply.version;
+
+        // Advisory: warn once per host:port if the server's major differs
+        // from the client's. Do not throw or close — this is best-effort.
+        const serverMajor = majorOf(reply.version);
+        const clientMajor = majorOf(CLIENT_VERSION);
+        if (serverMajor !== clientMajor) {
+          if (!versionWarnings.has(versionWarnKey)) {
+            versionWarnings.add(versionWarnKey);
+            console.warn(
+              `[powdb] server version ${reply.version} major (${serverMajor}) ` +
+                `differs from client ${CLIENT_VERSION} major (${clientMajor}); ` +
+                `behaviour may be inconsistent.`,
+            );
+          }
+        }
+      },
+      (err) => {
+        // The connection dropped before a handshake reply — surface it as a
+        // connect failure (transient, retryable) rather than a bare close.
+        if (isPowDBError(err) && err.code === "closed") {
+          throw new PowDBError(
+            "connection closed during handshake",
+            "connect_failed",
+            { cause: err },
+          );
+        }
+        throw err;
+      },
+    );
+
+    // On handshake failure, reject everything queued behind it and tear the
+    // socket down. The extra no-op catch keeps an eager caller that never
+    // awaits ready() from tripping an unhandled-rejection crash.
+    this.handshake.catch((err: Error) => {
+      this.onClose(err);
+      this.socket.destroy();
+    });
   }
 
   /**
@@ -744,6 +805,142 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 
   /**
+   * Execute a multi-statement PowQL script on this connection, pipelined.
+   *
+   * The script is split with the same statement-aware semantics as the CLI
+   * (see {@link splitStatements}: `;` inside string literals and `#`
+   * comments never splits; empty statements are dropped). All statements
+   * are then written down the single connection back-to-back WITHOUT
+   * waiting for each reply — the server reads frames sequentially, so an
+   * N-statement script costs one round trip instead of N. Results are
+   * collected in statement order.
+   *
+   * Error handling:
+   *   - Default (fail-fast): resolve with `QueryResult[]` (one entry per
+   *     statement). On the first failed statement, stop dispatching further
+   *     statements and reject with a {@link PowDBScriptError} carrying the
+   *     failing `statementIndex`, the `statement` text, and the successful
+   *     `results` so far. NOTE: because dispatch is pipelined, statements
+   *     already written when the error reply arrives (typically the whole
+   *     script) still execute server-side; wrap the script in
+   *     `begin`/`commit` if you need all-or-nothing behavior.
+   *   - `continueOnError: true`: dispatch every statement regardless of
+   *     failures and resolve with a dense {@link ScriptStatementOutcome}
+   *     array recording each statement's result or error.
+   *
+   * Each statement emits the usual `"query"` event.
+   */
+  async execScript(
+    script: string,
+    opts?: { continueOnError?: false; signal?: AbortSignal },
+  ): Promise<QueryResult[]>;
+  async execScript(
+    script: string,
+    opts: { continueOnError: true; signal?: AbortSignal },
+  ): Promise<ScriptStatementOutcome[]>;
+  async execScript(
+    script: string,
+    opts?: ExecScriptOptions,
+  ): Promise<QueryResult[] | ScriptStatementOutcome[]> {
+    const statements = splitStatements(script);
+    const continueOnError = opts?.continueOnError === true;
+    const signal = opts?.signal;
+
+    const outcomes: (ScriptStatementOutcome | undefined)[] = new Array(
+      statements.length,
+    );
+    const inFlight: Promise<void>[] = [];
+    let firstFailureIndex = -1;
+    let firstFailureError: Error | null = null;
+    let dispatched = 0;
+
+    for (let i = 0; i < statements.length; i++) {
+      // Stop dispatching when the script is already doomed: fail-fast saw
+      // an error, the caller aborted, or the connection is gone.
+      if (this.closed || signal?.aborted) break;
+      if (!continueOnError && firstFailureIndex !== -1) break;
+
+      const statement = statements[i]!;
+      const idx = i;
+      dispatched++;
+      // query() writes the frame synchronously before its first await, so
+      // this loop puts every statement on the wire without waiting for any
+      // reply; the FIFO pending queue matches replies back in order.
+      inFlight.push(
+        this.query(statement, signal ? { signal } : undefined).then(
+          (result) => {
+            outcomes[idx] = { statement, ok: true, result };
+          },
+          (error: unknown) => {
+            const err =
+              error instanceof Error ? error : new Error(String(error));
+            outcomes[idx] = { statement, ok: false, error: err };
+            // Replies are FIFO so failures normally arrive in statement
+            // order; keep the earliest defensively regardless.
+            if (firstFailureIndex === -1 || idx < firstFailureIndex) {
+              firstFailureIndex = idx;
+              firstFailureError = err;
+            }
+          },
+        ),
+      );
+      // Backpressure: only yield when the kernel buffer is full. These
+      // yields are also the windows in which an already-arrived error reply
+      // or abort can stop further dispatch (the checks at the loop head).
+      if (this.socket.writableNeedDrain) await this.drained();
+    }
+
+    // Every dispatched statement has a handler attached, so this never
+    // rejects; it resolves once all in-flight replies have settled.
+    await Promise.all(inFlight);
+
+    if (!continueOnError) {
+      if (firstFailureIndex === -1 && dispatched < statements.length) {
+        // Dispatch stopped without any statement failing — e.g. a signal
+        // that was already aborted before the first write. Treat the first
+        // undispatched statement as the failure point.
+        firstFailureIndex = dispatched;
+        firstFailureError = signal?.aborted
+          ? abortError(signal)
+          : (this.closeError ?? new PowDBError("client is closed", "closed"));
+      }
+      if (firstFailureIndex !== -1) {
+        const cause = firstFailureError!;
+        const results: QueryResult[] = [];
+        for (let i = 0; i < firstFailureIndex; i++) {
+          const o = outcomes[i];
+          if (o !== undefined && o.ok) results.push(o.result);
+        }
+        throw new PowDBScriptError(
+          `script failed at statement ${firstFailureIndex + 1}/${statements.length}: ${cause.message}`,
+          isPowDBError(cause) ? cause.code : "query_failed",
+          {
+            statementIndex: firstFailureIndex,
+            statement: statements[firstFailureIndex]!,
+            results,
+            cause,
+          },
+        );
+      }
+      return outcomes.map(
+        (o) => (o as Extract<ScriptStatementOutcome, { ok: true }>).result,
+      );
+    }
+
+    // continueOnError: synthesize outcomes for statements that were never
+    // dispatched (abort or connection loss) so the array stays dense.
+    if (dispatched < statements.length) {
+      const reason: Error = signal?.aborted
+        ? abortError(signal)
+        : (this.closeError ?? new PowDBError("client is closed", "closed"));
+      for (let i = dispatched; i < statements.length; i++) {
+        outcomes[i] = { statement: statements[i]!, ok: false, error: reason };
+      }
+    }
+    return outcomes as ScriptStatementOutcome[];
+  }
+
+  /**
    * Poll a query on an interval and invoke `onRows` for every successful
    * run. Returns an unsubscribe function. Does NOT deduplicate results —
    * `onRows` fires every interval, even if the rows are unchanged.
@@ -921,6 +1118,27 @@ export class Client extends EventEmitter<ClientEvents> {
     });
   }
 
+  /**
+   * Resolve once the socket's write buffer has drained. Also resolves if
+   * the client closes while waiting, so a dead peer cannot hang a
+   * backpressured `execScript` dispatch loop forever.
+   */
+  private drained(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.socket.writableNeedDrain || this.closed) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        this.socket.removeListener("drain", done);
+        this.removeListener("close", done);
+        resolve();
+      };
+      this.socket.on("drain", done);
+      this.on("close", done);
+    });
+  }
+
   private onData(chunk: Buffer): void {
     // Append to the chunk queue — O(1) — and lazily concat only when
     // we actually need contiguous bytes to decode.
@@ -1024,8 +1242,25 @@ export class Client extends EventEmitter<ClientEvents> {
     const firstClose = !this.closed;
     if (this.closed && err === null) return;
     this.closed = true;
-    this.closeError = err;
-    const error = err ?? new PowDBError("connection closed", "closed");
+    let error = err ?? new PowDBError("connection closed", "closed");
+    // A teardown before ConnectOk is a handshake failure: everything queued
+    // (the handshake entry and any eagerly pipelined queries) rejects with
+    // the handshake error. Auth/protocol errors already carry the precise
+    // cause; anything else becomes a retryable connect failure.
+    if (
+      !this.handshakeComplete &&
+      !(
+        isPowDBError(error) &&
+        (error.code === "auth_failed" || error.code === "protocol_error")
+      )
+    ) {
+      error = new PowDBError(
+        "connection closed during handshake",
+        "connect_failed",
+        { cause: err ?? undefined },
+      );
+    }
+    this.closeError = error;
     while (this.pending.length > 0) {
       const entry = this.pending.shift()!;
       if (!entry.settled) {
@@ -1128,7 +1363,14 @@ export {
 export { Pool } from "./pool.js";
 export type { PoolOptions } from "./pool.js";
 
-export { PowDBError, isPowDBError } from "./errors.js";
+export { splitStatements } from "./script.js";
+
+export {
+  PowDBError,
+  isPowDBError,
+  PowDBScriptError,
+  isPowDBScriptError,
+} from "./errors.js";
 export type { PowDBErrorCode } from "./errors.js";
 
 export {

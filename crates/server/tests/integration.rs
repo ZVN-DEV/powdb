@@ -175,6 +175,110 @@ async fn test_full_lifecycle() {
     std::fs::remove_dir_all(&data_dir).ok();
 }
 
+/// Pipelined connect: a client may write CONNECT and one or more QUERY frames
+/// back-to-back in a SINGLE TCP write, without waiting for CONNECT_OK in
+/// between. The server reads frames sequentially off one buffered reader, so
+/// it must answer every frame, in order. Eager clients rely on this wire
+/// contract to shave a full round trip off fresh connections — if this test
+/// breaks, pipelined connects break with it.
+#[tokio::test]
+async fn test_connect_and_queries_pipelined_in_single_write() {
+    use std::sync::{Arc, RwLock};
+
+    let unique = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let data_dir = std::env::temp_dir().join(format!("powdb_pipelined_{unique}"));
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let data_dir_str = data_dir.to_str().unwrap().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        let engine =
+            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let tx_gate = powdb_server::handler::new_tx_gate();
+        loop {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let eng = engine.clone();
+            let tx_gate = tx_gate.clone();
+            let (_, mut rx) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                powdb_server::handler::handle_connection(
+                    stream,
+                    powdb_server::handler::ConnOpts {
+                        engine: eng,
+                        tx_gate,
+                        expected_password: None,
+                        users: Arc::new(powdb_auth::UserStore::new()),
+                        shutdown_rx: &mut rx,
+                        idle_timeout: Duration::from_secs(300),
+                        query_timeout: Duration::from_secs(30),
+                        rate_limiter: None,
+                        peer_addr: Some(peer),
+                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
+                    },
+                )
+                .await;
+            });
+        }
+    });
+
+    // CONNECT + DDL QUERY in one write: the handshake reply must come first,
+    // then the query result.
+    {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut burst = encode_connect("testdb");
+        burst.extend_from_slice(&encode_query("type Pipelined { required name: str }"));
+        stream.write_all(&burst).await.unwrap();
+
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "first reply must be CONNECT_OK");
+        let resp = read_response(&mut stream).await;
+        assert!(
+            resp[0] == 0x09 || resp[0] == 0x0B,
+            "second reply must answer the pipelined DDL, got 0x{:02X}",
+            resp[0]
+        );
+    }
+
+    // A fresh connection pipelining CONNECT + three queries in one write gets
+    // four replies, in request order.
+    {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut burst = encode_connect("testdb");
+        burst.extend_from_slice(&encode_query(r#"insert Pipelined { name := "Alice" }"#));
+        burst.extend_from_slice(&encode_query(r#"insert Pipelined { name := "Bob" }"#));
+        burst.extend_from_slice(&encode_query("count(Pipelined)"));
+        stream.write_all(&burst).await.unwrap();
+
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x02, "first reply must be CONNECT_OK");
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x09, "first insert must return RESULT_OK");
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x09, "second insert must return RESULT_OK");
+        let resp = read_response(&mut stream).await;
+        assert_eq!(resp[0], 0x08, "count must return RESULT_SCALAR");
+        match powdb_server::protocol::Message::decode(&resp).unwrap() {
+            powdb_server::protocol::Message::ResultScalar { value } => {
+                assert_eq!(value, "2", "both pipelined inserts must have applied")
+            }
+            other => panic!("expected count scalar, got {other:?}"),
+        }
+    }
+
+    handle.abort();
+    std::fs::remove_dir_all(&data_dir).ok();
+}
+
 #[tokio::test]
 async fn explicit_transaction_blocks_other_connections_until_closed() {
     use powdb_server::protocol::Message;

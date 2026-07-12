@@ -7,6 +7,9 @@
  * legitimate reason to handle them differently.
  */
 
+// Type-only import — erased at compile time, so no runtime cycle with index.
+import type { QueryResult } from "./index.js";
+
 export type PowDBErrorCode =
   /** TCP/TLS connect, DNS, connect timeout. Transient — safe to retry. */
   | "connect_failed"
@@ -51,4 +54,46 @@ export class PowDBError extends Error {
  */
 export function isPowDBError(err: unknown): err is PowDBError {
   return err instanceof PowDBError;
+}
+
+/**
+ * Failure of one statement inside `client.execScript(...)` (fail-fast mode).
+ *
+ * `code` mirrors the failing statement's error code (`"query_failed"` for a
+ * server Error frame, `"aborted"` for a fired AbortSignal, ...), so the usual
+ * `.code` branching keeps working; `cause` carries the underlying error.
+ * `statementIndex`/`statement` identify the failing statement within the
+ * split script, and `results` holds the successful results of every
+ * statement before it, in order.
+ */
+export class PowDBScriptError extends PowDBError {
+  /** Zero-based index of the failing statement within the split script. */
+  readonly statementIndex: number;
+  /** Text of the failing statement (as split, trimmed). */
+  readonly statement: string;
+  /** Results of the statements before the failing one, in order. */
+  readonly results: QueryResult[];
+
+  constructor(
+    message: string,
+    code: PowDBErrorCode,
+    details: {
+      statementIndex: number;
+      statement: string;
+      results: QueryResult[];
+      cause?: unknown;
+    },
+  ) {
+    super(message, code, { cause: details.cause });
+    this.name = "PowDBScriptError";
+    this.statementIndex = details.statementIndex;
+    this.statement = details.statement;
+    this.results = details.results;
+    Object.setPrototypeOf(this, PowDBScriptError.prototype);
+  }
+}
+
+/** Narrow `unknown` to a PowDBScriptError. */
+export function isPowDBScriptError(err: unknown): err is PowDBScriptError {
+  return err instanceof PowDBScriptError;
 }

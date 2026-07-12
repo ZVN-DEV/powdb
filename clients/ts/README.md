@@ -81,6 +81,86 @@ await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 
 `QueryParam` is `string | number | bigint | boolean | null`. The params form sends the `QueryWithParams` (0x04) wire message and **requires powdb-server >= 0.4.7**. The plain `query(q)` and `query(q, { signal })` forms are unchanged.
 
+## Multi-statement scripts (`execScript`)
+
+`execScript` runs a whole `;`-separated PowQL script down one connection,
+**pipelined**: every statement is written back-to-back without waiting for
+the previous reply, so an N-statement script costs one round trip instead of
+N. Splitting is statement-aware with the exact semantics of the CLI's script
+path — `;` inside `"..."` string literals or `#` comments never splits, and
+empty statements are dropped. (The splitter is exported as
+`splitStatements(script)` if you need it standalone.)
+
+```typescript
+const results = await client.execScript(`
+  type User { required name: str, age: int };
+  insert User { name := "Alice", age := 30 };  # seed; more to come
+  insert User { name := "Bob;Bobby", age := 25 };
+  count(User)
+`);
+// results: QueryResult[] in statement order — results[3].value === "2"
+```
+
+By default execution is **fail-fast**: the first failed statement rejects the
+promise with a `PowDBScriptError` carrying `statementIndex`, the failing
+`statement` text, and the successful `results` so far. Because dispatch is
+pipelined, statements already on the wire when the error reply arrives
+(typically the whole script) still execute server-side — wrap the script in
+`begin`/`commit` if you need all-or-nothing behavior.
+
+```typescript
+import { isPowDBScriptError } from "@zvndev/powdb-client";
+
+try {
+  await client.execScript(script);
+} catch (err) {
+  if (isPowDBScriptError(err)) {
+    console.error(`statement ${err.statementIndex} failed: ${err.statement}`);
+    console.error(`${err.results.length} statements succeeded before it`);
+  }
+}
+```
+
+With `continueOnError: true`, every statement runs regardless of failures and
+you get a dense per-statement outcome array instead of a throw:
+
+```typescript
+const outcomes = await client.execScript(script, { continueOnError: true });
+for (const o of outcomes) {
+  if (o.ok) console.log(o.result.kind);
+  else console.warn(`failed: ${o.statement} — ${o.error.message}`);
+}
+```
+
+`Pool.execScript(script, opts?)` does the same through a pool, checking out a
+single connection for the whole script (so statement order — and any
+`begin`/`commit` inside the script — holds).
+
+## Eager (pipelined) connect
+
+`Client.connect` normally performs a blocking Connect→ConnectOk handshake, so
+every fresh connection pays a protocol round trip before its first query.
+With `eager: true` the promise resolves as soon as the socket is open and the
+Connect frame is written; queries issued immediately are queued right behind
+the Connect frame on the wire, and the server answers everything in order.
+For connection-per-request callers this removes the handshake round trip
+entirely:
+
+```typescript
+const client = await Client.connect({ host, port, eager: true });
+// No extra round trip — this query rides directly behind the Connect frame.
+const result = await client.query("count(User)");
+```
+
+If the handshake then fails (bad password, protocol mismatch), every queued
+query rejects with the handshake error (`code: "auth_failed"`, etc.) and the
+client closes. Two things to know:
+
+- `client.serverVersion` is `""` until the ConnectOk arrives.
+- `await client.ready()` waits for the handshake outcome explicitly — it
+  resolves on ConnectOk and rejects with the handshake error. (For non-eager
+  clients it has already settled by the time `connect` returns.)
+
 ## Experimental embedded sync protocol helpers
 
 The client exposes experimental low-level helpers for the private authenticated
@@ -255,6 +335,11 @@ The full taxonomy: `connect_failed`, `auth_failed`, `query_failed`,
 `aborted`, `size_exceeded`, `protocol_error`, `closed`, `timeout`,
 `type_coercion_failed`.
 
+`execScript` failures throw `PowDBScriptError`, a `PowDBError` subclass whose
+`code` mirrors the failing statement's error and which adds
+`statementIndex`, `statement`, and `results` (see Multi-statement scripts
+above). Narrow with `isPowDBScriptError(err)`.
+
 ## Polling watch
 
 For simple change-polling (the server doesn't ship a subscription
@@ -344,6 +429,7 @@ Returns a `Promise<Client>`. Options:
 | `user` | `string` | *(omitted)* | User name for multi-user servers (see Authentication above). Omit for shared-password / no-auth servers |
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
+| `eager` | `boolean` | `false` | Resolve as soon as the Connect frame is written instead of waiting for ConnectOk; queries pipeline behind the handshake (see Eager connect above) |
 
 > **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
 > ≥0.4.6 (enforced roles). See the version matrix under Authentication.
@@ -380,6 +466,23 @@ const result = await client.querySql("SELECT name, age FROM User WHERE age > 27"
 Like `query()`, but coerces each row's string values to JS types using the
 supplied schema and returns `Promise<TypedRow[]>`. See Typed rows above.
 
+### `client.execScript(script, opts?)`
+
+Splits `script` into statements (statement-aware — see Multi-statement
+scripts above) and executes them all down this connection, pipelined.
+Returns `Promise<QueryResult[]>` in statement order; rejects with a
+`PowDBScriptError` on the first failed statement. With
+`opts.continueOnError: true`, returns
+`Promise<ScriptStatementOutcome[]>` (`{ statement, ok: true, result }` or
+`{ statement, ok: false, error }`) and never rejects for statement failures.
+`opts.signal?: AbortSignal` aborts the remaining statements.
+
+### `client.ready()`
+
+Resolves once the Connect→ConnectOk handshake has completed; rejects with
+the handshake error if it failed. Only interesting for eager connects — for
+default connects it has settled before `Client.connect` returns.
+
 ### `client.watch(query, options)`
 
 Re-runs `query` every `intervalMs` and passes each `QueryResult` to
@@ -395,7 +498,7 @@ Sends a disconnect message and closes the TCP socket.
 
 ### `client.serverVersion`
 
-The PowDB server version string (e.g., `"0.4.4"`). On connect, the client warns once per `host:port` if the server's major version differs from the client's.
+The PowDB server version string (e.g., `"0.4.4"`). On connect, the client warns once per `host:port` if the server's major version differs from the client's. For an eager connect this is `""` until the ConnectOk arrives (await `client.ready()` to guarantee it is populated).
 
 ### `Pool` (class)
 
@@ -409,7 +512,7 @@ Constructor options extend `ClientOptions` with:
 | `connectBackoffMs` | `number` | `100` | Initial delay between connect retries; doubles each attempt |
 | `connectMaxBackoffMs` | `number` | `2000` | Cap on the exponential backoff |
 
-Methods: `acquire()`, `release(client)`, `destroy(client)`, `withClient(fn)`, `close()`.
+Methods: `acquire()`, `release(client)`, `destroy(client)`, `withClient(fn)`, `execScript(script, opts?)`, `close()`.
 Getters: `size`, `idle`, `closed`.
 
 ### Safety helpers
@@ -418,6 +521,7 @@ Getters: `size`, `idle`, `closed`.
 - `ident(name)` — wrap a string so `powql` treats it as an identifier
 - `escapeLiteral(value)` — render a JS value as a PowQL literal
 - `escapeIdent(name)` — validate an identifier (throws `TypeError` on invalid)
+- `splitStatements(script)` — the statement-aware script splitter used by `execScript`
 
 ## Limits
 
