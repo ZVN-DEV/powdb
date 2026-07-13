@@ -1,6 +1,7 @@
 # Document-Store Design: Overflow Pages, JSON Type, Grouped Aggregates
 
-Date: 2026-07-13. Status: PROPOSED, awaiting sign-off on two flagged forks (F1, F2).
+Date: 2026-07-13. Status: APPROVED 2026-07-13 (Kirby): F1 = PJ1 binary, F2 = symmetric
+by default, phasing as specified.
 Scope: Capa dogfood findings P-2, P-3, P-5 (the "primary store" capability gaps).
 
 Provenance: synthesized from two independent design lanes (pragmatic vs destination-first)
@@ -477,9 +478,8 @@ Benchmarks (powdb-bench + powdb-compare, Depot-only baselines per standing polic
 
 ## 11. Sign-off checklist
 
-- [ ] F1: JSON storage encoding = PJ1 binary (recommended) vs minified text
-- [ ] F2: PowQL grouped-join aggregates symmetric by default in v0.13 (recommended) vs
-      SQL semantics + opt-in wedge later
-- [ ] Phasing and release mapping (v0.11 overflow + P-5 fixes, v0.12 JSON, v0.13
-      indexes + symmetric + fast paths)
-- [ ] Everything else in the door register ships as specified
+- [x] F1: JSON storage encoding = PJ1 binary (APPROVED 2026-07-13)
+- [x] F2: PowQL grouped-join aggregates symmetric by default in v0.13 (APPROVED 2026-07-13)
+- [x] Phasing and release mapping (v0.11 overflow + P-5 fixes, v0.12 JSON, v0.13
+      indexes + symmetric + fast paths) (APPROVED 2026-07-13)
+- [x] Everything else in the door register ships as specified (APPROVED 2026-07-13)
