@@ -249,33 +249,44 @@ fn test_value_size_cap_rejected() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Sweep reclaims the orphan chains a delete leaves behind, does not touch a
-/// live row's chains, and is idempotent.
+/// Sweep reclaims a genuinely orphaned chain (the kind a crashed transaction
+/// leaves: pages flushed to disk that no committed row references), does not
+/// touch a live row's chains, is idempotent, and the reclaimed pages are reused
+/// by a subsequent spill.
+///
+/// NOTE: a committed `delete` now frees its chain eagerly at commit (design 3.6,
+/// see `test_delete_frees_chain_eagerly`), so it leaves NO orphan for sweep.
+/// Sweep's real job is crash/rollback orphans, which this test synthesizes via
+/// the low-level overflow-page API (the same shape a crash-flushed chain has).
 #[test]
 fn test_sweep_reclaims_orphan_chains() {
+    use powdb_storage::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
     let dir = temp_dir("sweep");
     std::fs::create_dir_all(&dir).unwrap();
     let mut cat = Catalog::create(&dir).unwrap();
     cat.create_table(docs_schema()).unwrap();
 
-    // A live big row and a soon-to-be-deleted big row.
+    // A live big row whose chain must NEVER be swept.
     let keep = cat
         .insert("docs", &vec![Value::Int(1), Value::Str("K".repeat(40_000))])
         .unwrap();
-    let drop_rid = cat
-        .insert("docs", &vec![Value::Int(2), Value::Str("D".repeat(40_000))])
-        .unwrap();
     cat.sync_wal().unwrap();
 
-    // Delete leaves the deleted row's chain as an orphan (reclaimed by sweep).
-    cat.delete("docs", drop_rid).unwrap();
-    cat.sync_wal().unwrap();
+    // Synthesize an orphan chain: allocate + write two overflow pages that no
+    // row's stub references (exactly what a crashed spill leaves behind).
+    {
+        let tbl = cat.get_table_mut("docs").unwrap();
+        let p0 = tbl.heap.allocate_overflow_page().unwrap();
+        let p1 = tbl.heap.allocate_overflow_page().unwrap();
+        let chunk = vec![b'Z'; OVERFLOW_PAYLOAD_CAP];
+        tbl.heap.write_overflow_page(p0, p1, &chunk, 0).unwrap();
+        tbl.heap
+            .write_overflow_page(p1, OVERFLOW_CHAIN_END, &chunk, 0)
+            .unwrap();
+    }
 
     let reclaimed = cat.sweep("docs").unwrap();
-    assert!(
-        reclaimed > 0,
-        "sweep must reclaim the deleted row's chain pages"
-    );
+    assert_eq!(reclaimed, 2, "sweep must reclaim exactly the orphan chain");
 
     // The live row's value is intact (its chain was NOT swept).
     let row = cat.get("docs", keep).unwrap();
@@ -284,6 +295,69 @@ fn test_sweep_reclaims_orphan_chains() {
 
     // Sweep is idempotent: a second pass reclaims nothing.
     assert_eq!(cat.sweep("docs").unwrap(), 0);
+
+    // Reuse: the reclaimed pages are on the free list, so a fresh spill of the
+    // same size does not extend the file.
+    let before = cat.get_table("docs").unwrap().heap.num_pages();
+    cat.insert("docs", &vec![Value::Int(3), Value::Str("R".repeat(8_000))])
+        .unwrap();
+    cat.sync_wal().unwrap();
+    let after = cat.get_table("docs").unwrap().heap.num_pages();
+    assert_eq!(
+        after, before,
+        "reclaimed pages must be reused, not re-grown"
+    );
+
+    drop(cat);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A committed delete of a spilled row frees its overflow chain at commit
+/// (design 3.6): the pages return to the free list and are reused by the next
+/// spill, so a delete/insert churn does not leak, and no orphan is left for
+/// sweep. The surviving rows stay byte-exact throughout.
+#[test]
+fn test_delete_frees_chain_eagerly() {
+    let dir = temp_dir("delete_frees");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cat = Catalog::create(&dir).unwrap();
+    cat.create_table(docs_schema()).unwrap();
+
+    let keep = cat
+        .insert("docs", &vec![Value::Int(1), Value::Str("K".repeat(40_000))])
+        .unwrap();
+    let drop_rid = cat
+        .insert("docs", &vec![Value::Int(2), Value::Str("D".repeat(40_000))])
+        .unwrap();
+    cat.sync_wal().unwrap();
+    let baseline = cat.get_table("docs").unwrap().heap.num_pages();
+
+    // Delete the second row: its chain is freed immediately.
+    cat.delete("docs", drop_rid).unwrap();
+    cat.sync_wal().unwrap();
+
+    // Nothing to reclaim -- the delete already freed the chain.
+    assert_eq!(
+        cat.sweep("docs").unwrap(),
+        0,
+        "committed delete frees eagerly, leaving no orphan"
+    );
+
+    // A fresh 40K insert reuses the freed pages instead of extending the file.
+    cat.insert("docs", &vec![Value::Int(3), Value::Str("N".repeat(40_000))])
+        .unwrap();
+    cat.sync_wal().unwrap();
+    let after = cat.get_table("docs").unwrap().heap.num_pages();
+    assert!(
+        after <= baseline,
+        "freed pages must be reused (after={after}, baseline={baseline})"
+    );
+
+    // The untouched row is byte-exact.
+    let row = cat.get("docs", keep).unwrap();
+    assert_eq!(body_of(&row).len(), 40_000);
+    assert!(body_of(&row).bytes().all(|b| b == b'K'));
+
     drop(cat);
     std::fs::remove_dir_all(&dir).ok();
 }

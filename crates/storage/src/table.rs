@@ -160,10 +160,12 @@ impl Table {
                 BTree::load(&idx_path)?
             } else {
                 // Missing file: rebuild from the heap and save so we
-                // take the fast path next time.
+                // take the fast path next time. Reassemble via `table.scan()`
+                // so a spilled (v2) indexed column contributes its true key -- a
+                // v1-only `decode_row` would read it as `Empty` and build a
+                // btree missing that row's key (P2).
                 let mut bt = BTree::create(&idx_path)?;
-                for (rid, row) in table.heap.scan() {
-                    let row = crate::row::decode_row(&table.schema, &row);
+                for (rid, row) in table.scan() {
                     if !row[col_idx].is_empty() {
                         if unique {
                             bt.insert(row[col_idx].clone(), rid);
@@ -352,28 +354,74 @@ impl Table {
             .map(|c| self.schema.column_index(&c.name))
             .collect();
 
-        for (rid, old_bytes) in snapshot {
-            let old_row = decode_row(old_schema, &old_bytes);
-            // Start from the caller-supplied defaults for the new
-            // shape, then overwrite with whatever the old row had.
-            // Dropped columns are simply skipped (their value has
-            // nowhere to go in the new row).
+        // Phase 1 (immutable reads): reassemble each old row to its logical
+        // values, mapping columns into the new shape, and gather any overflow
+        // chain it referenced. A v2 (spilled) old row MUST be reassembled via
+        // `decode_row_v2` -- a v1-only `decode_row` reads its spilled columns as
+        // `Empty` and the ALTER would silently drop the out-of-line value (P1).
+        // We use the OLD schema's layout because `self.row_layout` already
+        // reflects the NEW schema.
+        let old_layout = RowLayout::new(old_schema);
+        let mut rewritten: Vec<(RowId, Vec<Value>, Vec<u32>)> = Vec::with_capacity(snapshot.len());
+        for (rid, old_bytes) in &snapshot {
+            let old_row = if crate::row::row_is_v2(old_bytes) {
+                crate::row::decode_row_v2(old_schema, &old_layout, old_bytes, |stub| {
+                    self.heap.read_overflow_value(stub).map_err(io::Error::from)
+                })?
+            } else {
+                decode_row(old_schema, old_bytes)
+            };
+            // Chain pages the old row referenced (empty for inline rows). Freed
+            // after the rewrite so the ALTER does not leak the old out-of-line
+            // values.
+            let mut old_pages: Vec<u32> = Vec::new();
+            if crate::row::row_is_v2(old_bytes) {
+                let mut heads: Vec<u32> = Vec::new();
+                crate::row::for_each_stub(old_schema, &old_layout, old_bytes, |_c, stub| {
+                    heads.push(stub.first_page);
+                });
+                for h in heads {
+                    old_pages.extend(self.heap.overflow_chain_pages(h)?);
+                }
+            }
+            // Start from the caller-supplied defaults for the new shape, then
+            // overwrite with whatever the old row had. Dropped columns are
+            // skipped (their value has nowhere to go in the new row).
             let mut new_row: Vec<Value> = fill_values.to_vec();
             for (old_idx, val) in old_row.into_iter().enumerate() {
                 if let Some(new_idx) = old_to_new[old_idx] {
                     new_row[new_idx] = val;
                 }
             }
+            rewritten.push((*rid, new_row, old_pages));
+        }
 
-            encode_row_into_with_layout(
-                &self.schema,
-                &self.row_layout,
-                &new_row,
-                &mut self.encode_scratch,
-            );
-            // We don't care about the new RowId here: any secondary
-            // index is rebuilt from scratch below.
-            self.heap.update(rid, &self.encode_scratch)?;
+        // Phase 2 (mutations): re-encode each row into the new shape and write
+        // it back. A row whose surviving values still exceed the inline cap
+        // re-spills through `encode_row_spilling` (writing fresh chains), so a
+        // large value survives ALTER; then the old chain is freed.
+        for (rid, new_row, old_pages) in rewritten {
+            if crate::row::v1_encoded_len(&self.row_layout, &new_row)
+                <= crate::page::MAX_ROW_DATA_SIZE
+            {
+                encode_row_into_with_layout(
+                    &self.schema,
+                    &self.row_layout,
+                    &new_row,
+                    &mut self.encode_scratch,
+                );
+                let encoded = std::mem::take(&mut self.encode_scratch);
+                self.heap.update(rid, &encoded)?;
+                self.encode_scratch = encoded;
+            } else {
+                let encoded = self.encode_row_spilling(&new_row)?;
+                self.heap.update(rid, &encoded)?;
+            }
+            // Free the old chain now that the row has been rewritten. Fresh
+            // chains for later rows may reuse these pages.
+            if !old_pages.is_empty() {
+                self.heap.release_overflow_pages(&old_pages);
+            }
         }
 
         // Rebuild every secondary index from the rewritten heap. The
@@ -393,6 +441,12 @@ impl Table {
             // `self.indexed_cols` is clear before we start scanning.
             self.indexed_cols.clear();
 
+            // Snapshot the rewritten heap once. The rewrite above may have
+            // re-spilled a surviving large indexed value, so rows can be v2 and
+            // must be reassembled (`self.scan()`) -- a v1-only `decode_row`
+            // would read a spilled indexed column as `Empty` and build a btree
+            // missing that key (P2).
+            let rebuilt_rows: Vec<(RowId, Vec<Value>)> = self.scan().collect();
             for (col_idx, col_name, is_int, unique) in existing {
                 // Mission 3: write the freshly rebuilt index back to its
                 // canonical `{table}_{col}.idx` file so a subsequent
@@ -402,9 +456,8 @@ impl Table {
                 let idx_path =
                     data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
                 let mut btree = crate::btree::BTree::create(&idx_path)?;
-                for (rid, row) in self.heap.scan() {
-                    let row = decode_row(&self.schema, &row);
-                    let v = &row[col_idx];
+                for (rid, row) in &rebuilt_rows {
+                    let (rid, v) = (*rid, &row[col_idx]);
                     if v.is_empty() {
                         continue;
                     }
@@ -539,6 +592,43 @@ impl Table {
         }
         // Sweep: reclaim unreferenced overflow pages below the watermark.
         self.heap.sweep_unreferenced_overflow(&referenced)
+    }
+
+    /// Collect every overflow-chain page id referenced by the row at `rid`, or
+    /// an empty vec when the table has never spilled, the row is gone, or the
+    /// row is inline (v1). Used by the catalog to free a row's old chain when an
+    /// update replaces/removes its spilled value or the row is deleted (design
+    /// 3.6), so steady-state churn reclaims pages instead of leaking them.
+    ///
+    /// Does not touch the free list itself: the caller decides when it is safe
+    /// to release (immediately for autocommit, at commit for an explicit tx).
+    pub(crate) fn overflow_chain_pages_at(&self, rid: RowId) -> io::Result<Vec<u32>> {
+        if !self.has_overflow_rows() {
+            return Ok(Vec::new());
+        }
+        let data = match self.heap.get(rid) {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        if !crate::row::row_is_v2(&data) {
+            return Ok(Vec::new());
+        }
+        let mut heads: Vec<u32> = Vec::new();
+        crate::row::for_each_stub(&self.schema, &self.row_layout, &data, |_col, stub| {
+            heads.push(stub.first_page);
+        });
+        let mut pages = Vec::new();
+        for head in heads {
+            pages.extend(self.heap.overflow_chain_pages(head)?);
+        }
+        Ok(pages)
+    }
+
+    /// Return a set of overflow-chain pages to this table's in-memory free list
+    /// for reuse by the next spill. The catalog calls this once it is safe to
+    /// reclaim (see [`Self::overflow_chain_pages_at`]).
+    pub(crate) fn release_overflow_pages(&mut self, pages: &[u32]) {
+        self.heap.release_overflow_pages(pages);
     }
 
     /// Build the v2 stub-row encoding for `values`, writing each spilled
@@ -1241,6 +1331,31 @@ impl Table {
         }
 
         let new_rid = self.heap.update(rid, encoded)?;
+
+        // P0 (overflow relocation): a spill/unspill (or any grow) update turns
+        // into heap delete+insert and hands back a NEW rid. When no indexed
+        // column changed, `touches_index` is false and the block below is
+        // skipped -- but every index entry still points at the OLD rid, so a
+        // relocated row vanishes from all keyed access (point lookup, filtered
+        // update/delete) and only an unfiltered scan finds it. Repoint every
+        // index from `rid` -> `new_rid` using the (unchanged) current values,
+        // which for an unchanged column equal the old key. The `touches_index`
+        // path already handles relocation via its `new_rid == rid` guards.
+        if !touches_index && new_rid != rid && !self.indexed_cols.is_empty() {
+            for entry in self.indexed_cols.iter_mut() {
+                let val = &values[entry.col_idx];
+                if val.is_empty() {
+                    continue;
+                }
+                if entry.unique {
+                    entry.btree.delete(val);
+                    entry.btree.insert(val.clone(), new_rid);
+                } else {
+                    entry.btree.delete_non_unique(val, rid);
+                    entry.btree.insert_non_unique(val.clone(), new_rid);
+                }
+            }
+        }
 
         if touches_index {
             // Mission C Phase 17: walk the Vec<IndexedCol> directly.

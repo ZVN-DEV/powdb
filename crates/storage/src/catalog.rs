@@ -187,6 +187,15 @@ pub struct Catalog {
     /// Catalog-level durable LSN. Heap page LSNs cover row mutations, but
     /// DDL-only changes can advance the WAL without touching a data page.
     durable_lsn: u64,
+    /// Overflow-chain pages to return to their table's free list once the
+    /// current EXPLICIT transaction commits (design 3.6 pending-free list).
+    /// Populated only while `active_tx_id.is_some()`: a chain-replacing update
+    /// or a delete inside a transaction cannot free its old chain immediately,
+    /// because ROLLBACK resurrects the old row and its stub must still address a
+    /// live chain. Autocommit mutations free immediately (no rollback window).
+    /// Drained by `commit_transaction`; discarded (via reopen) by ROLLBACK.
+    /// Entries are `(table_slot, chain_pages)`.
+    pending_free_overflow: Vec<(usize, Vec<u32>)>,
 }
 
 impl Catalog {
@@ -223,6 +232,7 @@ impl Catalog {
             active_tx_id: None,
             tx_start_len: None,
             pending_autocommit_tx_ids: Vec::new(),
+            pending_free_overflow: Vec::new(),
             checkpointed: false,
             durable_lsn: 0,
         };
@@ -298,6 +308,7 @@ impl Catalog {
             active_tx_id: None,
             tx_start_len: None,
             pending_autocommit_tx_ids: Vec::new(),
+            pending_free_overflow: Vec::new(),
             checkpointed: false,
             durable_lsn,
         };
@@ -838,6 +849,27 @@ impl Catalog {
 
     /// Allocate or return the transaction id for the current mutation.
     #[inline]
+    /// Free (or defer freeing) the overflow-chain pages a mutation just
+    /// orphaned. In autocommit there is no rollback window, so the pages return
+    /// to the table's free list immediately and the next spill reuses them
+    /// (bounding steady-state churn). Inside an explicit transaction the free is
+    /// held on `pending_free_overflow` until COMMIT: a ROLLBACK reopens the
+    /// catalog from disk, discarding this list, so the resurrected old row still
+    /// points at a live chain. Reuse is crash-safe without an `OverflowFree`
+    /// record because a later spill that overwrites a reused page logs its own
+    /// per-page `OverflowWrite` (LSN-idempotent), and post-recovery `sweep`
+    /// reclaims anything the in-memory list lost.
+    fn free_overflow_chain(&mut self, slot: usize, pages: Vec<u32>) {
+        if pages.is_empty() {
+            return;
+        }
+        if self.active_tx_id.is_some() {
+            self.pending_free_overflow.push((slot, pages));
+        } else {
+            self.tables[slot].release_overflow_pages(&pages);
+        }
+    }
+
     fn next_tx(&mut self) -> u64 {
         if let Some(id) = self.active_tx_id {
             return id;
@@ -878,6 +910,12 @@ impl Catalog {
             }
         }
         self.tx_start_len = None;
+        // The transaction committed: its rows are durable and can no longer be
+        // resurrected by ROLLBACK, so the old chains they replaced/removed are
+        // safe to reclaim. (Populated only while a tx was active.)
+        for (slot, pages) in std::mem::take(&mut self.pending_free_overflow) {
+            self.tables[slot].release_overflow_pages(&pages);
+        }
         Ok(())
     }
 
@@ -1371,15 +1409,24 @@ impl Catalog {
     }
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
+        let slot = self.slot_of(table)?;
+        // Capture the deleted row's overflow chain BEFORE the heap slot is
+        // cleared, so it can be freed once safe (design 3.6). Empty for
+        // inline-only tables (cheap `has_overflow_rows` check).
+        let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
         // Mission B (post-review, second pass): WAL Off → no payload
         // construction.
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.delete(rid);
+            self.tables[slot].delete(rid)?;
+            self.free_overflow_chain(slot, old_pages);
+            return Ok(());
         }
         let tx_id = self.next_tx();
         // Delete records carry only the rid — no row payload.
         self.wal_log(tx_id, WalRecordType::Delete, table, rid, &[])?;
-        self.by_name_mut(table)?.delete(rid)
+        self.tables[slot].delete(rid)?;
+        self.free_overflow_chain(slot, old_pages);
+        Ok(())
     }
 
     /// Mission C Phase 12: bulk delete a list of rids, batching btree
@@ -1393,8 +1440,14 @@ impl Catalog {
         // Mission B (post-review, second pass): in Off mode skip the
         // entire per-row payload loop — `wal.append` would no-op every
         // call but the `encode_wal_payload` Vec alloc would still run.
+        let slot = self.slot_of(table)?;
+        // Gather every deleted row's overflow chain up front (empty and cheap
+        // for inline-only tables) so the pages can be freed once safe.
+        let old_pages = self.collect_overflow_pages(slot, rids)?;
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.delete_many(rids);
+            let count = self.tables[slot].delete_many(rids)?;
+            self.free_overflow_chain(slot, old_pages);
+            return Ok(count);
         }
         let tx_id = self.next_tx();
         for &rid in rids {
@@ -1404,7 +1457,22 @@ impl Catalog {
         if self.active_tx_id.is_none() && !rids.is_empty() {
             self.pending_autocommit_tx_ids.push(tx_id);
         }
-        self.by_name_mut(table)?.delete_many(rids)
+        let count = self.tables[slot].delete_many(rids)?;
+        self.free_overflow_chain(slot, old_pages);
+        Ok(count)
+    }
+
+    /// Collect all overflow-chain pages referenced by `rids` in one table.
+    /// Returns empty for inline-only tables without touching any row.
+    fn collect_overflow_pages(&self, slot: usize, rids: &[RowId]) -> io::Result<Vec<u32>> {
+        if !self.tables[slot].has_overflow_rows() {
+            return Ok(Vec::new());
+        }
+        let mut pages = Vec::new();
+        for &rid in rids {
+            pages.extend(self.tables[slot].overflow_chain_pages_at(rid)?);
+        }
+        Ok(pages)
     }
 
     /// Single-pass scan-and-delete driven by a raw-bytes predicate. See
@@ -1546,10 +1614,18 @@ impl Catalog {
         // Mission B (post-review, second pass): WAL Off → no payload
         // construction.
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.update(rid, values);
+            let slot = self.slot_of(table)?;
+            let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
+            let new_rid = self.tables[slot].update(rid, values)?;
+            self.free_overflow_chain(slot, old_pages);
+            return Ok(new_rid);
         }
         let tx_id = self.next_tx();
         let slot = self.slot_of(table)?;
+        // Capture the old row's overflow chain (empty for inline-only tables)
+        // BEFORE the update replaces it, so it can be freed once safe (design
+        // 3.6). A chain-replacing update always orphans the old chain.
+        let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
         // Spill-aware encode: logs any overflow chains under `tx_id` (before
         // the Update record) and returns the v1/v2 row bytes. An overflow
         // transition relocates the row via heap delete+insert inside
@@ -1563,7 +1639,9 @@ impl Catalog {
         // stub row is always small; only a non-spilled v1 row can trip this.)
         check_encoded_row_size(&row_bytes)?;
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
-        self.tables[slot].update_encoded(rid, values, &row_bytes, None)
+        let new_rid = self.tables[slot].update_encoded(rid, values, &row_bytes, None)?;
+        self.free_overflow_chain(slot, old_pages);
+        Ok(new_rid)
     }
 
     /// Mission C Phase 2: update with a hint about which columns actually
@@ -1580,12 +1658,15 @@ impl Catalog {
         // construction. The `update_by_filter` powql bench drives this
         // path tens of thousands of times per iteration.
         if self.wal.is_off() {
-            return self
-                .by_name_mut(table)?
-                .update_hinted(rid, values, changed_col_indices);
+            let slot = self.slot_of(table)?;
+            let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
+            let new_rid = self.tables[slot].update_hinted(rid, values, changed_col_indices)?;
+            self.free_overflow_chain(slot, old_pages);
+            return Ok(new_rid);
         }
         let tx_id = self.next_tx();
         let slot = self.slot_of(table)?;
+        let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
         let row_bytes = {
             let Catalog { tables, wal, .. } = self;
             encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
@@ -1593,7 +1674,10 @@ impl Catalog {
         // Same pre-WAL size gate as [`Self::update`].
         check_encoded_row_size(&row_bytes)?;
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
-        self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)
+        let new_rid =
+            self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)?;
+        self.free_overflow_chain(slot, old_pages);
+        Ok(new_rid)
     }
 
     /// Mission C Phase 4: fast-path update that patches a row's raw bytes
