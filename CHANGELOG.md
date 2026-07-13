@@ -287,7 +287,7 @@ row-level sync, and DDL write-forward.
 ## [0.7.2] - 2026-06-29
 
 A correctness and documentation patch from the post-v0.7.1 gold-standard audit
-and Turbine ORM issue triage.
+and ORM integration issue triage.
 
 ### Fixed
 
@@ -316,8 +316,8 @@ and Turbine ORM issue triage.
 
 ## [0.7.1] - 2026-06-28
 
-A correctness, safety, and embedded-write-performance patch driven by the Turbine
-ORM team's v0.7.0 adoption review plus a PowDB-side audit.
+A correctness, safety, and embedded-write-performance patch driven by an ORM
+integration's v0.7.0 adoption review plus a PowDB-side audit.
 
 ### Fixed
 
@@ -365,7 +365,7 @@ catalogs (v1–v4) still load.
   `.queryReadonly(...)`. Results match the `@zvndev/powdb-client` `QueryResult`
   shape exactly (rows as `string[][]`, `affected` as `bigint`) so embedded and
   networked code paths are interchangeable — the foundation for local-first
-  apps (e.g. `turbinePowDB({ embedded })`). Built as a standalone
+  apps (e.g. `powdbEmbedded({ embedded })`). Built as a standalone
   `panic = "unwind"` workspace so a query panic is caught and surfaced as a JS
   error rather than aborting the host process.
 - **Embedded mode — `powdb` crate** (the SQLite-shaped front door). Run the
@@ -434,8 +434,8 @@ catalogs (v1–v4) still load.
   SQLite `synchronous=NORMAL` / Postgres `synchronous_commit=off` semantics and
   removes the per-write fsync from the latency path (~15–40× faster single-row
   writes). Select it with `POWDB_SYNC_MODE=full|normal|off` (default `full` —
-  no durability change unless opted in). Addresses the turbine-orm write-latency
-  finding; see `docs/design/2026-06-27-write-performance-*`.
+  no durability change unless opted in). Addresses an ORM integration's
+  write-latency finding; see `docs/design/2026-06-27-write-performance-*`.
 
 ### Security
 - **Fixed a remotely-triggerable denial-of-service in the in-place `UPDATE`
@@ -445,7 +445,7 @@ catalogs (v1–v4) still load.
   `panic = "abort"` profile, took the whole server process down for every
   connection. The fast path now coerces each assignment to the column's
   declared type before writing bytes and returns a typed `TypeError` on a
-  genuine mismatch. Reported by the turbine-orm integration.
+  genuine mismatch. Reported by an ORM integration test.
 
 ### Fixed
 - **The on-disk catalog now loads every format version from 1 up to the
@@ -472,7 +472,7 @@ catalogs (v1–v4) still load.
   denormal such as `5e-323`) — silent numeric corruption on the in-place
   update fast path. `INSERT` already coerced correctly; the byte-patch
   `UPDATE` path bypassed it. Fix covers both the indexed and the fused
-  `Filter(SeqScan)` update paths. Reported by the turbine-orm integration.
+  `Filter(SeqScan)` update paths. Reported by an ORM integration test.
 - **Completed that coercion fix across the remaining write paths** (#117/#118).
   The previous fix only covered literal assignments; a *computed* assignment
   (any non-literal RHS, e.g. `balance := .tag + 9`) took the per-row
@@ -484,7 +484,7 @@ catalogs (v1–v4) still load.
   — a remotely-triggerable DoS (#117). All write paths (`INSERT`, literal and
   expression `UPDATE` including `RETURNING`, and `UPSERT`) now coerce each
   assignment to the target column's declared type and return a typed error on
-  a genuine mismatch. Reported by the turbine-orm integration.
+  a genuine mismatch. Reported by an ORM integration test.
 
 ## [0.6.2] - 2026-06-26
 
@@ -567,9 +567,7 @@ catalogs (v1–v4) still load.
 
 ### Known limitations
 - Full cooperative query cancellation is still planned work rather than part of
-  this hardening patch. See
-  `docs/strategy/2026-06-19-query-cancellation-hardening.md` for the scoped
-  implementation plan.
+  this hardening patch. A scoped implementation plan is tracked separately.
 
 ## [0.6.0] - 2026-06-19
 
@@ -918,7 +916,7 @@ Phase 1 (perf + security hardening) + Phase 2 (deployment + DX), shipped togethe
 - **Deployment examples** — AWS ECS Fargate + EFS Terraform module, Cloudflare Tunnel docker-compose, Railway `railway.toml`, plus a refreshed Fly.io example with the new env vars and properly sized memory budget vs concurrency.
 - **CI `examples-smoke` job** — Terraform validate + docker compose config + `dev.sh up/down` lifecycle on every PR.
 - **`docs/powdb-vs-sqlite.md`** — honest when-to-use-which guide with side-by-side feature and benchmark tables.
-- **Phase 3 risky-research dossier** — `docs/superpowers/specs/2026-05-30-phase3-risky-research-plan.md` with per-subsystem go/no-go verdicts (Windows file I/O port, disk-spill external sort, cost-based optimizer plumbing — multi-writer MVCC explicitly no-go).
+- **Phase 3 risky-research dossier** with per-subsystem go/no-go verdicts (Windows file I/O port, disk-spill external sort, cost-based optimizer plumbing; multi-writer MVCC explicitly no-go).
 
 ### Fixed
 - **`BufferPool::ensure_loaded` panicked on a corrupt page** and skipped CRC verification — now uses `from_bytes_verified` and returns `PageCorrupt`. The four `BufferPool` write paths now stamp CRCs.

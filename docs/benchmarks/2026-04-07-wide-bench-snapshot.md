@@ -97,15 +97,15 @@ hot path". Measured against SQLite:
 
 ## Next-step missions
 
-- **Mission B** (docs/superpowers/specs/2026-04-08-mission-b-durability-and-concurrency.md):
+- **Mission B**:
   WAL wiring + concurrency + index persistence. Correctness first.
-- **Mission C** (docs/superpowers/specs/2026-04-08-mission-c-write-path-perf.md):
+- **Mission C**:
   Attack the write-side gap. update_by_filter O(N²) → O(1) indexed. Batch
   commit with group fsync. Insert hot path allocation audit.
-- **Mission D** (docs/superpowers/specs/2026-04-08-mission-d-read-path-perf.md):
+- **Mission D**:
   Close the remaining 4 read losses. Point-lookup profiling. Projection
   streaming.
-- **Mission E** (docs/superpowers/specs/2026-04-08-mission-e-language-features.md):
+- **Mission E**:
   Language gaps (joins, group by, EXPLAIN, prepared statements) planned with
   a perf-first lens so they don't add planner overhead to the already-tight
   hot paths.

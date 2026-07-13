@@ -2,18 +2,18 @@
 
 - **Date:** 2026-06-27
 - **Status:** Approved 2026-06-27 — executing. §7 decisions locked.
-- **Companion to:** [`2026-06-27-write-performance-design.md`](./2026-06-27-write-performance-design.md) (turbine-orm cross-engine findings)
+- **Companion to:** [`2026-06-27-write-performance-design.md`](./2026-06-27-write-performance-design.md) (cross-engine ORM findings)
 - **Scope:** Turn the verified write-path diagnosis into a sequenced, testable implementation. Reads are competitive and out of scope except §Phase 4.
 
 ---
 
 ## 1. TL;DR
 
-The turbine-orm benchmark found PowDB writes ~40× slower than Postgres (~4 ms/write, ~250 ops/s) while reads are competitive. I **independently verified the root cause in the source** (§2): every autocommit statement does a real `fsync`, and that `fsync` runs **inside the exclusive engine write lock**, so all writers serialize on it. Durability is also hardcoded binary (`Full`/`Off`) with no safe middle mode, and the existing `set_sync_mode` knob is never wired to config.
+The ORM integration's benchmark found PowDB writes ~40× slower than Postgres (~4 ms/write, ~250 ops/s) while reads are competitive. I **independently verified the root cause in the source** (§2): every autocommit statement does a real `fsync`, and that `fsync` runs **inside the exclusive engine write lock**, so all writers serialize on it. Durability is also hardcoded binary (`Full`/`Off`) with no safe middle mode, and the existing `set_sync_mode` knob is never wired to config.
 
 The plan is three composable P0 changes — (1) a config-wired async/`NORMAL` durability mode, (2) real group commit, (3) move fsync out of the write lock — landing single-write latency at ~0.1–0.3 ms and making durable throughput scale with concurrency, **while keeping `Full` the default**. P1/P2 add `RETURNING`, server-generated IDs, a bulk path, and server-side nested reads.
 
-**Recommended delivery:** ship the already-merged #117/#118 correctness fixes as **v0.6.3** now; do the perf work as **v0.7.0** in phases, each gated by the durability suite + the Depot bench + a re-run of the Turbine harness.
+**Recommended delivery:** ship the already-merged #117/#118 correctness fixes as **v0.6.3** now; do the perf work as **v0.7.0** in phases, each gated by the durability suite + the Depot bench + a re-run of the ORM integration's harness.
 
 ---
 
@@ -46,7 +46,7 @@ Phase 1 is the single-client latency win; Phase 2 is the concurrency/throughput 
 
 ## 4. Phased implementation
 
-Every phase is **TDD (RED→GREEN)**, keeps `Full` the default, preserves the deliberate `panic = "abort"` crash-only design, and is validated by the durability suite + a crash/restart smoke + the Turbine re-run before it's called done.
+Every phase is **TDD (RED→GREEN)**, keeps `Full` the default, preserves the deliberate `panic = "abort"` crash-only design, and is validated by the durability suite + a crash/restart smoke + the ORM integration re-run before it's called done.
 
 ### Phase 0 — Measurement & guardrails (S, do first)
 **Goal:** make the win measurable and the risk visible before touching the commit path.
@@ -75,7 +75,7 @@ Every phase is **TDD (RED→GREEN)**, keeps `Full` the default, preserves the de
 - **Risk:** Medium-High — changes the locking/commit/visibility contract. Define the visibility model explicitly (a reader must not observe a not-yet-durable write in Full, or document the chosen model). This is the phase to be most careful with.
 
 ### Phase 3 — ORM ergonomics (M each) **[P1]**
-- **`RETURNING`** on insert/update/upsert/delete — executor already has the affected rows in hand; this is mostly PowQL surface + wire. Removes Turbine's mandatory reselect (−1 RTT/write; big over a network).
+- **`RETURNING`** on insert/update/upsert/delete; executor already has the affected rows in hand; this is mostly PowQL surface + wire. Removes the ORM integration's mandatory reselect (−1 RTT/write; big over a network).
 - **Server-generated IDs / column `DEFAULT`s** — identity/sequence + `DEFAULT` exprs (e.g. `uuid()`); allocation must be crash-safe + WAL-logged. Pairs with `RETURNING` for "insert, get id back."
 - **Bulk-ingest path** — make `createMany` first-class (one WAL batch, deferred/bulk index maintenance, optional COPY-style stream); resolve the `insert_single` regression in **#57** (77 µs vs 3.6 µs).
 
@@ -90,7 +90,7 @@ Every phase is **TDD (RED→GREEN)**, keeps `Full` the default, preserves the de
 2. **v0.7.0 (perf):** Phase 0 → Phase 1 → Phase 2, each its own PR, each behind the durability gate. This is the headline "writes are now competitive" release.
 3. **v0.7.x / v0.8.0:** Phase 3 (RETURNING first — highest ORM value), then Phase 4.
 
-Each perf PR re-runs the Turbine cross-engine harness and the Depot bench; no perf claim ships without a before/after from CI-grade hardware.
+Each perf PR re-runs the cross-engine ORM harness and the Depot bench; no perf claim ships without a before/after from CI-grade hardware.
 
 ---
 
@@ -109,7 +109,7 @@ Each perf PR re-runs the Turbine cross-engine harness and the Depot bench; no pe
 1. **Mode name & control surface → `Normal`, with both config and per-session control.** Completes the recognizable `Full` / `Normal` / `Off` triad (SQLite vocabulary → least surprise, best docs). Wire it to server config (flag + env) in Phase 1, and add a per-session `PRAGMA sync_mode = full|normal|off` as a Phase 1 follow-on — the mode is designed for per-connection override from the start so an app can run most writes `Normal` and force `Full` on the few that must be durable-now.
 2. **Default loss window → hybrid, whichever comes first: fsync every 10 ms OR every 64 records.** Both tunable via config. Bounds the crash-loss window to ~10 ms of writes — aggressive enough for the throughput target, small enough to be a respectable production default for the opt-in mode. (`Full` = fsync every commit; `Off` = never.)
 3. **Release grouping → v0.6.3 now (correctness), perf as v0.7.0 in phases.** Each perf phase is its own PR behind the durability gate.
-4. **`RETURNING` pulled forward → developed in parallel with the P0 perf work** (disjoint code areas: PowQL surface + executor vs WAL/lock), shipping in v0.7.0. It's the highest-value ORM ergonomic and unblocks Turbine's reselect removal.
+4. **`RETURNING` pulled forward → developed in parallel with the P0 perf work** (disjoint code areas: PowQL surface + executor vs WAL/lock), shipping in v0.7.0. It's the highest-value ORM ergonomic and unblocks the ORM integration's reselect removal.
 5. **MVCC / row-level locking → confirmed non-goal** for this effort. Group commit + finer-grained fsync first; revisit MVCC only if a concrete need survives these wins.
 
 ### Rationale (the "best DB possible" lens)

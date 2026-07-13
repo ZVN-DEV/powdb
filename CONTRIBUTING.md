@@ -42,6 +42,22 @@ clients/ts       # TypeScript client + demo
 clients/sync     # sync client helpers (experimental)
 ```
 
+## What belongs in this repo
+
+This is a public repository. Internal planning, strategy, roadmaps, sprint and
+mission plans, audits, session notes, and agent-orchestration output are kept
+private and are git-ignored (see the "Internal-only docs and agent tooling"
+block in `.gitignore`); do not commit them here.
+
+Public materials (README, CHANGELOG, docs, commit messages, PR descriptions)
+describe changes on their own technical merit. They must never name or imply an
+internal product, customer, or dogfood project as the source of a change.
+Instead of "product X asked for this" or "reported by the X integration", write
+it neutrally: "an ORM integration", "a cross-engine benchmark", "reported by an
+integration test". A CI job (`internal-content-guard`) enforces both rules and
+fails the build if an internal-only path gets re-tracked or an internal codename
+appears in a public file.
+
 ## Development Workflow
 
 **Never push directly to `main`.** Every change — docs, CI tweaks, version bumps, "trivial" fixes, all of it — goes through a pull request.

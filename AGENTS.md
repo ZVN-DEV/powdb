@@ -235,6 +235,5 @@ Internal docs:
 - `CONTRIBUTING.md` — contribution workflow
 - `SECURITY.md` — vulnerability reporting + threat model
 - `docs/design/` — long-form language / engine design docs
-- `docs/superpowers/specs/` — implementation specs for shipped features
 
 When in doubt about what the parser accepts, **run it** against `cargo run --release -p powdb-cli`. This file is the 5-minute version; `docs/POWQL.md` is the reference; the parser is the truth.

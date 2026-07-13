@@ -44,3 +44,11 @@ PRODUCT-REVIEW.md
 *.p12
 *.pfx
 credentials.json
+
+# Internal-only docs and agent tooling: never publish to the open-source repo.
+# Keep these locally / in a private location; they are intentionally untracked.
+docs/strategy/
+docs/superpowers/
+docs/audits/
+docs/gtm-strategy.md
+.omx/

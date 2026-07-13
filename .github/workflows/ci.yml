@@ -520,6 +520,49 @@ jobs:
           #   RUSTSEC-2026-0178  tokio-postgres DataRow DoS   (→ powdb-compare)
           ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178
 
+  # Governance gate: this is a public repo. Fail the build if internal-only
+  # planning/agent artifacts get re-tracked, or if any public doc/source names
+  # an internal product codename. Pure git + grep, no cargo build, so it is fast.
+  internal-content-guard:
+    name: internal-content-guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history for git grep / ls-files)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Fail on tracked internal-only content
+        run: |
+          set -uo pipefail
+          fail=0
+
+          # (1) No tracked file may live under an internal-only path.
+          paths="$(git ls-files | grep -E '^(docs/strategy/|docs/superpowers/|docs/audits/|docs/gtm-strategy\.md|\.omx/)' || true)"
+          if [ -n "$paths" ]; then
+            echo "::error::Internal-only paths are tracked in this public repo (see .gitignore):"
+            echo "$paths"
+            fail=1
+          fi
+
+          # (2) No tracked doc/source may name an internal product codename.
+          # NOTE: git grep -P (PCRE) is required here. The ERE engine (-E)
+          # silently ignores \b word boundaries and would never match, giving a
+          # false pass. The trailing grep -v drops legitimate look-alikes
+          # (capability, capacity, capture, escape, toaster, coast).
+          names="$(git grep -niP '\b(capa|batadb|batadata|turbine|turbodb|casa[ -]?design|parcelle|bevrly)\b' -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' | grep -vEi 'capabilit|capacit|capture|escape|toaster|coast' || true)"
+          if [ -n "$names" ]; then
+            echo "::error::Internal codename(s) found in public files. De-identify to neutral wording:"
+            echo "$names"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "internal-content-guard: clean."
+
   # Single aggregator gate. Make THIS the only required status check on `main`
   # (Settings → Branches → branch protection → require "ci-success"). It depends
   # on every other CI job and fails if any of them did not succeed, so the full
@@ -544,6 +587,7 @@ jobs:
       - embedded-sync-js
       - secret-scan
       - audit
+      - internal-content-guard
     steps:
       - name: Verify every required job succeeded
         env:

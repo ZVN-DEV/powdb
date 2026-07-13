@@ -116,10 +116,10 @@ fn multi_statement_with_comment_and_trailing_semicolon() {
     assert_eq!(out_str(&got).trim(), "2");
 }
 
-/// A BataDB-shaped dump loaded through `--exec-file`: uuid PK, prose with
+/// A document-shaped dump loaded through `--exec-file`: uuid PK, prose with
 /// `;`/newlines, JSON-in-text, `\x` bytes, `# WARN:` comments, trailing `;`.
 #[test]
-fn exec_file_batadb_shaped_dump() {
+fn exec_file_document_shaped_dump() {
     let data = tmp("file");
     let data_s = data.to_str().unwrap();
 

@@ -2,7 +2,7 @@
 
 - **Date:** 2026-06-27
 - **Status:** Proposed (follow-up to the write-performance spec, after #121 landed)
-- **Author:** Turbine ORM cross-engine benchmark findings
+- **Author:** the ORM integration cross-engine benchmark findings
 - **Goal under test:** *PowDB should be faster than SQLite.* This spec measures how far off that is after the write-perf work, finds why, and proposes what closes it.
 
 ---
@@ -69,7 +69,7 @@ There are four latency regimes. Be explicit about which one the goal means:
 **What.** Expose the engine to run *inside the application process*, no socket:
 - a clean **Rust library API** over `Engine` (it already exists behind the server's `RwLock`);
 - a **C ABI / `cdylib`** for FFI;
-- a **Node native addon** (`napi-rs`/`neon`) so JS apps (and Turbine) call the engine directly.
+- a **Node native addon** (`napi-rs`/`neon`) so JS apps (and the ORM integration) call the engine directly.
 
 **Why.** This is the *only* way to beat SQLite on single-op latency — it deletes the ~0.04 ms wire floor. With the round-trip gone, single-op latency drops to roughly the measured engine work (~0.005–0.01 ms), i.e. **parity with or better than SQLite's 0.006 ms**, while keeping PowDB's real storage engine, indexes, and (with Phase 2) concurrency.
 
@@ -77,18 +77,18 @@ There are four latency regimes. Be explicit about which one the goal means:
 
 **Effort/risk.** Medium-High but mostly *surface*, not engine: the `Engine` is already encapsulated; the work is a safe public API, a binding layer (napi), lifecycle/threading (the `RwLock` model maps fine to an in-proc single handle), and packaging. Biggest care: panic-safety across the FFI boundary (the engine is `panic = "abort"` crash-only — an embedded host can't abort the whole app), so wrap calls and return errors, never unwind/abort across FFI.
 
-**Turbine fit.** Turbine already abstracts the driver behind `PgCompatPool`; a `PowdbEmbeddedPool` over the native addon drops in with no API change — same `turbinePowDB(...)`, just an in-process handle instead of a host/port.
+**ORM fit.** The ORM integration already abstracts the driver behind `PgCompatPool`; a `PowdbEmbeddedPool` over the native addon drops in with no API change, same `powdbEmbedded(...)`, just an in-process handle instead of a host/port.
 
 ### 4.2 [P0/P1] If/while networked: attack the round-trip
 
 - **Unix domain sockets** for same-host clients. No TCP/IP stack, no loopback checksums — typically ~2× lower RTT than TCP loopback, dropping the floor from ~0.04 ms to ~0.02 ms. Low effort (tokio `UnixListener`; client gets a `path` option). The common "embedded-ish" deployment is same-host, so this helps the majority case.
-- **Pipelining / request batching.** Let a client send N queries in one flush and receive N replies (the Postgres extended-protocol pipeline model — which Turbine *already* implements in `pipeline.ts`/`pipeline-submittable.ts`). Amortizes the round-trip across many ops: an N+1 nested read collapses from N round-trips to ~1; bulk ops stop paying per-statement RTT. High leverage for §4.5 and createMany.
+- **Pipelining / request batching.** Let a client send N queries in one flush and receive N replies (the Postgres extended-protocol pipeline model, which the ORM integration *already* implements in `pipeline.ts`/`pipeline-submittable.ts`). Amortizes the round-trip across many ops: an N+1 nested read collapses from N round-trips to ~1; bulk ops stop paying per-statement RTT. High leverage for §4.5 and createMany.
 - **Binary wire protocol.** Replace `string[][]` with a typed/columnar binary encoding so ints/floats/bools/dates aren't stringified+reparsed. Cuts CPU on both ends; the win scales with result size (big for bulk reads / wide rows).
 
 ### 4.3 [P1] createMany — beat SQLite's weak spot
 
 createMany is SQLite's **weakest** op (1.067 ms, row-by-row) — the easiest place to actually pass it. Today PowDB is 4.4× *slower*. Causes and fixes:
-- **Turbine reselect** (no `RETURNING`) adds a whole second round-trip + an `IN (100)` scan. → **`RETURNING`** (already in flight on `feat/returning-insert`) removes it.
+- **ORM reselect** (no `RETURNING`) adds a whole second round-trip + an `IN (100)` scan. → **`RETURNING`** (already in flight on `feat/returning-insert`) removes it.
 - **Per-row insert cost** is ~0.047 ms/row (4.68 ms / 100) — ~13× the 3.6 µs target in **#57**. → fix the `insert_single` regression and add a **bulk/COPY ingest path** (one WAL batch — already coalesced in Normal mode — plus deferred/bulk index maintenance).
 - **Projected:** 3.6 µs/row × 100 = 0.36 ms + no reselect ⇒ **~0.4 ms, beating SQLite's 1.067 ms.** A concrete, winnable target.
 
@@ -120,5 +120,5 @@ Don't benchmark a TCP server's single-op latency against an in-process SQLite an
 
 ## Appendix — measurement
 
-- Cross-engine harness: `turbine-orm/benchmarks/cross-engine.ts`, 6,105-row seed, single connection, p50 over 150–200 iters, Apple-Silicon mac, local loopback. SQLite = `node:sqlite` (in-process). PowDB = #121 binary, `POWDB_SYNC_MODE=normal`.
+- Cross-engine harness: a cross-engine ORM benchmark, 6,105-row seed, single connection, p50 over 150-200 iters, Apple-Silicon mac, local loopback. SQLite = `node:sqlite` (in-process). PowDB = #121 binary, `POWDB_SYNC_MODE=normal`.
 - Transport floor: raw `@zvndev/powdb-client`, 2,000 iters, 1-row table — `count` and PK-select both ≈ 0.04 ms ⇒ floor is the round-trip, not the engine.

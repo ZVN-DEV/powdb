@@ -34,9 +34,9 @@ Three products form the stack:
 - **TurboLang integration** — optional first-class client with compile-time query planning
 
 Existing product context:
-- **TurbineORM** (turbineorm.dev) — Postgres ORM for TypeScript, already in production
+- an existing TypeScript ORM (Postgres, already in production)
 - **TurboLang** (turbolang.dev) — new general-purpose programming language, in development
-- PowDB must support PostgreSQL wire protocol so TurbineORM users can migrate incrementally
+- PowDB must support PostgreSQL wire protocol so existing ORM users can migrate incrementally
 
 The core thesis, validated by benchmarks: SQL translation layers (parsing, planning,
 type marshaling) account for 20-42x of query latency. Removing them while keeping
@@ -559,7 +559,7 @@ binding and execution happen. This is the 42x path.
 ### 5.6 Mode 3: PostgreSQL wire protocol (compatibility)
 
 Standard PostgreSQL v3 wire protocol on a separate port. Enables psql,
-pgAdmin, Grafana, Metabase, existing ORMs (including TurbineORM).
+pgAdmin, Grafana, Metabase, existing ORMs.
 
 Translation path: SQL → PG parser → SQL AST → PowQL AST → compile → execute
 
