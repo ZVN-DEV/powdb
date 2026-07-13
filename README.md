@@ -66,7 +66,7 @@ Requires Rust 1.93+. This builds all crates: the storage engine, query engine, T
 
 ### Apple silicon / arm64
 
-The published `ghcr.io/zvn-dev/powdb:latest` image is currently `linux/amd64`-only; a `linux/arm64` manifest ships with the next release. On Apple silicon or ARM servers (e.g. Graviton), install the native binary directly — it builds in under a minute:
+As of **v0.10.0**, the published `ghcr.io/zvn-dev/powdb` image is multi-arch (`linux/amd64` + `linux/arm64`), so it runs natively on Apple silicon and ARM servers (e.g. Graviton). Alternatively, install the native binary directly — it builds in under a minute:
 
 ```bash
 cargo install powdb-server

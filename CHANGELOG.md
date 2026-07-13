@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-13
+
+Dogfood-hardening release from the Capa v3x experiment: a **bounded
+transaction-gate wait** that turns concurrent `begin` hangs into a clear,
+metered error — fixing a ~54% concurrent-create failure mode — plus PowQL
+developer-experience work (reserved-word errors + backtick quoting, `if
+(not) exists` DDL idempotency, and `schema`/`describe` introspection),
+opt-in `--db-name` connect enforcement, a dual ESM+CJS TS client, a
+multi-arch (`linux/amd64` + `linux/arm64`) Docker image, and a fix for a
+pre-existing rollback bug that could poison a unique index on disk. On-disk
+formats unchanged — 0.9.x databases/backups open as-is.
+
+**Breaking change:** `schema` and `describe` are now PowQL keywords. Existing
+schemas that use either word as a column, type, or index name must backtick-
+quote it (e.g. `` `schema` ``); the same backtick quoting now works for every
+reserved word in identifier position.
+
+### Added
+
+- **Bounded transaction-gate wait.** An explicit `begin` now waits on the
+  transaction gate with a configurable bound (`--tx-wait-timeout-ms` /
+  `POWDB_TX_WAIT_TIMEOUT_MS`, default 5000ms) instead of hanging up to the
+  300s idle timeout. On elapse the client gets a clear `transaction gate
+  timeout` error and the new `powdb_tx_gate_timeouts_total` metric is
+  incremented. Fixes the ~54% concurrent-create failure mode from the Capa
+  dogfood run, where pooled clients saw `begin` hang past their own
+  timeouts. New wire-level e2e tests including the 10-writer repro (0
+  failures) and disconnect-mid-transaction gate release.
+- **Opt-in `--db-name` / `POWDB_DB_NAME` connect enforcement.** When set,
+  `Connect` frames naming a different database are rejected after auth with a
+  clear error. Unset keeps the 0.9.x accept-anything behavior (warns once per
+  process).
+- **PowQL reserved-word quoting.** Reserved words in identifier positions now
+  error with an actionable message and can be used as column names via
+  backtick quoting, which round-trips lexer → parser → planner → executor
+  across DDL, insert, filter, project, order, and index DDL. New "Reserved
+  Words and Quoting" section in `docs/POWQL.md` with the complete keyword
+  list derived from `POWQL_KEYWORDS`.
+- **DDL idempotency.** `if not exists` on create type / add index / add
+  unique, and `if exists` on drop / drop view / drop column. No-clause
+  semantics are unchanged; a duplicate `create` now names the type in its
+  error.
+- **Schema introspection.** `schema` lists types; `describe <Type>` (alias
+  `schema <Type>`) returns columns, types, nullability, and indexes as normal
+  result rows. Plan-cache-safe — reflects live catalog state.
+- **TS client: dual ESM + CJS build.** `@zvndev/powdb-client` now ships a CJS
+  build with a proper `require` export condition, fixing
+  `ERR_PACKAGE_PATH_NOT_EXPORTED` for CommonJS consumers.
+- **Multi-arch Docker image.** `ghcr.io/zvn-dev/powdb` now builds
+  `linux/amd64` + `linux/arm64` via buildx. The Rust compile stays native on
+  `$BUILDPLATFORM` and cross-compiles (no QEMU-emulated cargo build), and the
+  portable `target-cpu` is preserved (no SIGILL).
+- New `powdb_tx_gate_timeouts_total` metric on the server metrics endpoint.
+
+### Changed
+
+- **DX error messages now survive wire sanitization.** The new reserved-word
+  and duplicate-type errors — and pre-existing `table 'X' not found`,
+  `type 'X' …`, and backtick lexer diagnostics — were masked to the generic
+  `query execution error` by the server's `SAFE_ERROR_PREFIXES` allowlist.
+  They are now allowlisted (all derived from the client's own query text,
+  leaking no internal state) and covered by a wire-level regression test.
+
+### Fixed
+
+- **Rollback no longer flushes rolled-back index writes to disk.** A
+  pre-existing bug (affects ≤0.9.0): rolling back a transaction replaced the
+  catalog with a fresh one, but the discarded catalog's Drop-time checkpoint
+  still flushed its dirty (rolled-back) btree state to the on-disk `.idx`
+  files. Rolling back the same reused auto-id twice reloaded the poisoned
+  file: a permanent phantom unique-index entry, wrong-row lookups, and
+  spurious unique-constraint violations that survived restart. Fixed by
+  discarding dirty index state (`BTree::discard_dirty`, mirroring
+  `Heap::discard_dirty`) on the outgoing catalog before it drops. No WAL
+  format, on-disk format, or group-commit change.
+- **`powdb-cli` rejects non-UTF-8 argv** with a clean exit-2 error instead of
+  panicking in `std::env::args()`.
+
 ## [0.9.0] - 2026-07-12
 
 Throughput release: WAL **group commit** + server **read-ahead batching** +
