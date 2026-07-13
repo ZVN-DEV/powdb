@@ -290,7 +290,15 @@ fn check_db_name(configured: Option<&str>, requested: &str) -> Result<(), String
 /// Error messages that are safe to forward to the client verbatim.
 const SAFE_ERROR_PREFIXES: &[&str] = &[
     "table not found",
+    // The executor's actual phrasing is `table 'X' not found`, which the
+    // bare prefix above never matches — keep both so the real message
+    // reaches clients.
+    "table '",
+    "type '",
     "column not found",
+    // Lexer diagnostics (`at position N: unterminated quoted identifier`)
+    // are derived purely from the client's own query text.
+    "at position",
     "parse error",
     "type mismatch",
     "unknown table",

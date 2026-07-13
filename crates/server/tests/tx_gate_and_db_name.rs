@@ -364,3 +364,31 @@ async fn dx_error_messages_survive_wire_sanitization() {
     let rollback = query(&mut s, "rollback").await;
     assert!(!is_error(&rollback), "rollback failed: {rollback:?}");
 }
+
+/// Lexer diagnostics and not-found errors must also reach remote clients
+/// verbatim — the bug-hunt found `table 'X' not found` and backtick lexer
+/// errors were masked because the allowlist prefixes didn't match the real
+/// message shapes.
+#[tokio::test]
+async fn lookup_and_lexer_errors_survive_wire_sanitization() {
+    let addr = start_server(ServerConfig::default()).await;
+    let mut s = connect(addr, "default").await;
+
+    let missing = query(&mut s, "count(Nope)").await;
+    match missing {
+        Message::Error { message } => assert!(
+            message.contains("Nope"),
+            "table-not-found message was sanitized away: {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let unterminated = query(&mut s, "type Post { `oops: str }").await;
+    match unterminated {
+        Message::Error { message } => assert!(
+            message.contains("unterminated quoted identifier"),
+            "lexer diagnostic was sanitized away: {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
