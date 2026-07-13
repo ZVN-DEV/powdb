@@ -1,7 +1,10 @@
 use crate::btree::BTree;
+use crate::error::StorageError;
 use crate::heap::HeapFile;
+use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
 use crate::row::{
-    decode_column, decode_row, encode_row_into_with_layout, patch_var_column_in_place, RowLayout,
+    decode_column, decode_row, encode_row_into_with_layout, encode_row_v2_into,
+    patch_var_column_in_place, plan_spill, OverflowStub, RowLayout, MAX_VALUE_SIZE,
 };
 use crate::types::*;
 use std::io;
@@ -480,11 +483,137 @@ impl Table {
     /// straight through `BTree::insert_int` to skip the generic
     /// `Value::Ord` dispatch on every binary-search comparison.
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
-        // Unique constraint pre-check: reject the insert BEFORE touching
-        // the heap if any unique column already holds the incoming value.
-        // Every write path that can change an indexed column (plain,
-        // prepared, upsert) funnels through here or `update_hinted`; the
-        // byte-patch fast paths are guarded to never touch indexed columns.
+        self.check_unique_on_insert(values)?;
+        // Common case: the row fits inline (v1) — encode straight into scratch,
+        // byte-identical to pre-v0.11. Size it first WITHOUT encoding so a huge
+        // value (which the debug v1 encoder would panic on) routes to spill.
+        if crate::row::v1_encoded_len(&self.row_layout, values) <= crate::page::MAX_ROW_DATA_SIZE {
+            encode_row_into_with_layout(
+                &self.schema,
+                &self.row_layout,
+                values,
+                &mut self.encode_scratch,
+            );
+            let rid = self.heap.insert(&self.encode_scratch)?;
+            self.maintain_indexes_on_insert(values, rid);
+            return Ok(rid);
+        }
+        // Otherwise spill the largest var values out of line and store a v2
+        // stub row. This self-contained path (no WAL) backs the WAL-off and
+        // direct-`Table` callers; the WAL path in `Catalog` writes the same
+        // chains but logs each chunk for crash recovery.
+        let encoded = self.encode_row_spilling(values)?;
+        let rid = self.heap.insert(&encoded)?;
+        self.maintain_indexes_on_insert(values, rid);
+        Ok(rid)
+    }
+
+    /// Mark-and-sweep this table's overflow pages (design 3.6). Reclaims every
+    /// Overflow-typed page not referenced by a live row's stub — i.e. orphans
+    /// left by crashed transactions or by delete/chain-replacing updates whose
+    /// pages were never returned to the free list. Returns the reclaimed page
+    /// ids; the caller (catalog) logs them as one `OverflowFree` record.
+    ///
+    /// Runs against an on-disk-consistent view (flushes dirty pages first) and
+    /// reads only version words, bitmaps, and stubs — never a full decode.
+    pub(crate) fn sweep_overflow(&mut self) -> io::Result<Vec<u32>> {
+        self.heap.flush_all_dirty()?;
+        // Mark: collect every referenced chain head from live v2 rows, then
+        // walk each chain into the referenced set. Stubs are gathered first so
+        // the row scan's `&heap` borrow is released before the chain walks.
+        let schema = &self.schema;
+        let layout = &self.row_layout;
+        let mut heads: Vec<u32> = Vec::new();
+        self.heap.for_each_row(|_rid, bytes| {
+            if crate::row::row_is_v2(bytes) {
+                crate::row::for_each_stub(schema, layout, bytes, |_col, stub| {
+                    heads.push(stub.first_page);
+                });
+            }
+        });
+        let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for head in heads {
+            for pid in self.heap.overflow_chain_pages(head)? {
+                referenced.insert(pid);
+            }
+        }
+        // Sweep: reclaim unreferenced overflow pages below the watermark.
+        self.heap.sweep_unreferenced_overflow(&referenced)
+    }
+
+    /// Build the v2 stub-row encoding for `values`, writing each spilled
+    /// value's overflow chain directly to the heap (no WAL — the WAL path
+    /// lives in `Catalog`). Enforces `MAX_VALUE_SIZE` per value.
+    fn encode_row_spilling(&mut self, values: &Row) -> io::Result<Vec<u8>> {
+        let v1_len = crate::row::v1_encoded_len(&self.row_layout, values);
+        let chosen = plan_spill(&self.row_layout, values, v1_len);
+        let n_var = self.row_layout.n_var();
+        let mut spilled: Vec<Option<OverflowStub>> = vec![None; n_var];
+        for col_idx in chosen {
+            let var_idx = self
+                .row_layout
+                .var_index(col_idx)
+                .expect("plan_spill only returns var columns");
+            let bytes: Vec<u8> = match &values[col_idx] {
+                Value::Str(s) => s.as_bytes().to_vec(),
+                Value::Bytes(b) => b.clone(),
+                _ => continue,
+            };
+            if bytes.len() > MAX_VALUE_SIZE {
+                return Err(StorageError::ValueTooLarge {
+                    size: bytes.len(),
+                    max: MAX_VALUE_SIZE,
+                }
+                .into());
+            }
+            spilled[var_idx] = Some(self.write_value_chain(&bytes)?);
+        }
+        let mut out = Vec::new();
+        encode_row_v2_into(&self.schema, &self.row_layout, values, &spilled, &mut out);
+        Ok(out)
+    }
+
+    /// Allocate and write an overflow chain for `value` directly to the heap
+    /// (LSN 0, no WAL). Head-first, singly linked. Returns the stub.
+    fn write_value_chain(&mut self, value: &[u8]) -> io::Result<OverflowStub> {
+        let n = value.len().div_ceil(OVERFLOW_PAYLOAD_CAP).max(1);
+        let mut pages = Vec::with_capacity(n);
+        for _ in 0..n {
+            pages.push(self.heap.allocate_overflow_page()?);
+        }
+        for i in 0..n {
+            let start = i * OVERFLOW_PAYLOAD_CAP;
+            let end = (start + OVERFLOW_PAYLOAD_CAP).min(value.len());
+            let next = if i + 1 < n {
+                pages[i + 1]
+            } else {
+                OVERFLOW_CHAIN_END
+            };
+            self.heap
+                .write_overflow_page(pages[i], next, &value[start..end], 0)?;
+        }
+        Ok(OverflowStub::new(
+            value.len() as u64,
+            pages[0],
+            crc32fast::hash(value),
+        ))
+    }
+
+    /// Insert a row whose bytes were encoded by the caller (used by the
+    /// overflow spill path, which builds a v2 stub row and writes the
+    /// out-of-line chains before calling here). Index maintenance still uses
+    /// the LOGICAL `values` — extraction happens on the full value before
+    /// spill, so indexes never see a stub.
+    pub(crate) fn insert_encoded(&mut self, values: &Row, encoded: &[u8]) -> io::Result<RowId> {
+        self.check_unique_on_insert(values)?;
+        let rid = self.heap.insert(encoded)?;
+        self.maintain_indexes_on_insert(values, rid);
+        Ok(rid)
+    }
+
+    /// Unique-constraint pre-check: reject BEFORE touching the heap if any
+    /// unique column already holds the incoming value.
+    fn check_unique_on_insert(&self, values: &Row) -> io::Result<()> {
         for entry in &self.indexed_cols {
             if !entry.unique {
                 continue;
@@ -500,39 +629,22 @@ impl Table {
                 ));
             }
         }
+        Ok(())
+    }
 
-        encode_row_into_with_layout(
-            &self.schema,
-            &self.row_layout,
-            values,
-            &mut self.encode_scratch,
-        );
-        let rid = self.heap.insert(&self.encode_scratch)?;
-
-        // Fast path: no indexes — skip the whole loop entirely.
+    /// Insert the row's indexed columns into every b-tree from the logical
+    /// values. Blocker B3: marks trees dirty in memory; the save is deferred
+    /// to the next checkpoint.
+    fn maintain_indexes_on_insert(&mut self, values: &Row, rid: RowId) {
         if self.indexed_cols.is_empty() {
-            return Ok(rid);
+            return;
         }
-
-        // Mission C Phase 17: the btree lives inline in IndexedCol now,
-        // so this loop does zero hash lookups. For a 1-index table
-        // (bench's `User.id` case) the body compiles down to one
-        // bounds-checked vec access + one `insert_int` call, no
-        // FxHash(col_name) / HashMap probe at all.
-        //
-        // Blocker B3: each `insert` / `insert_int` flips the btree's
-        // dirty flag in memory; the actual `save` (serialize + fsync
-        // + rename) is deferred to the next `Catalog::checkpoint` /
-        // `Catalog::drop`. Mission 3 used to do one fsync per row
-        // here, which cost `insert_batch_1k` ~1000 fsyncs per
-        // iteration and wiped out the D10/D11 wins.
         for entry in &mut self.indexed_cols {
             let val = &values[entry.col_idx];
             if val.is_empty() {
                 continue;
             }
             if entry.unique {
-                // Unique index: duplicate key overwrites (correct for PKs).
                 if entry.is_int {
                     if let Value::Int(i) = val {
                         entry.btree.insert_int(*i, rid);
@@ -541,12 +653,9 @@ impl Table {
                 }
                 entry.btree.insert(val.clone(), rid);
             } else {
-                // Non-unique index: composite key (col_val, rid) so
-                // duplicate column values coexist.
                 entry.btree.insert_non_unique(val.clone(), rid);
             }
         }
-        Ok(rid)
     }
 
     /// Blocker B3: flush every dirty btree index to disk. Wired into
@@ -622,6 +731,13 @@ impl Table {
 
     pub fn get(&self, rid: RowId) -> Option<Row> {
         let data = self.heap.get(rid)?;
+        if crate::row::row_is_v2(&data) {
+            // v2 row: reassemble each spilled column from its overflow chain.
+            return crate::row::decode_row_v2(&self.schema, &self.row_layout, &data, |stub| {
+                self.heap.read_overflow_value(stub).map_err(io::Error::from)
+            })
+            .ok();
+        }
         Some(decode_row(&self.schema, &data))
     }
 
@@ -957,6 +1073,51 @@ impl Table {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
+        // Size the new row first: if it exceeds the inline cap, an overflow
+        // transition takes delete+insert of a v2 stub row (self-contained,
+        // no WAL — the WAL path lives in `Catalog::update`). In-place patch
+        // fast paths stay v1/inline-only (they never reach here for big rows).
+        if crate::row::v1_encoded_len(&self.row_layout, values) > crate::page::MAX_ROW_DATA_SIZE {
+            let encoded = self.encode_row_spilling(values)?;
+            return self.apply_update(rid, values, &encoded, changed_col_indices);
+        }
+        encode_row_into_with_layout(
+            &self.schema,
+            &self.row_layout,
+            values,
+            &mut self.encode_scratch,
+        );
+        // Move the scratch out so `apply_update` can borrow `self` mutably for
+        // the heap update without aliasing the scratch buffer.
+        let encoded = std::mem::take(&mut self.encode_scratch);
+        let result = self.apply_update(rid, values, &encoded, changed_col_indices);
+        self.encode_scratch = encoded;
+        result
+    }
+
+    /// Update a row with caller-supplied pre-encoded bytes (used by the
+    /// catalog WAL path, which builds the v2 stub row and logs the overflow
+    /// chains itself). Index maintenance uses the logical `values`.
+    pub(crate) fn update_encoded(
+        &mut self,
+        rid: RowId,
+        values: &Row,
+        encoded: &[u8],
+        changed_col_indices: Option<&[usize]>,
+    ) -> io::Result<RowId> {
+        self.apply_update(rid, values, encoded, changed_col_indices)
+    }
+
+    /// Shared core of the update paths: unique pre-check, heap update with the
+    /// already-encoded bytes, and secondary-index maintenance from the logical
+    /// `values`.
+    fn apply_update(
+        &mut self,
+        rid: RowId,
+        values: &Row,
+        encoded: &[u8],
+        changed_col_indices: Option<&[usize]>,
+    ) -> io::Result<RowId> {
         let touches_index = if self.indexed_cols.is_empty() {
             false
         } else if let Some(changed) = changed_col_indices {
@@ -1002,13 +1163,7 @@ impl Table {
             }
         }
 
-        encode_row_into_with_layout(
-            &self.schema,
-            &self.row_layout,
-            values,
-            &mut self.encode_scratch,
-        );
-        let new_rid = self.heap.update(rid, &self.encode_scratch)?;
+        let new_rid = self.heap.update(rid, encoded)?;
 
         if touches_index {
             // Mission C Phase 17: walk the Vec<IndexedCol> directly.
@@ -1107,28 +1262,73 @@ impl Table {
     }
 
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
-        self.heap
-            .scan()
-            .map(|(rid, data)| (rid, decode_row(&self.schema, &data)))
+        self.heap.scan().map(|(rid, data)| {
+            if crate::row::row_is_v2(&data) {
+                let row =
+                    crate::row::decode_row_v2(&self.schema, &self.row_layout, &data, |stub| {
+                        self.heap.read_overflow_value(stub).map_err(io::Error::from)
+                    })
+                    // A corrupt chain during a scan degrades to Empty cells rather
+                    // than aborting the whole scan; `get` surfaces the typed error.
+                    .unwrap_or_else(|_| vec![Value::Empty; self.schema.columns.len()]);
+                (rid, row)
+            } else {
+                (rid, decode_row(&self.schema, &data))
+            }
+        })
     }
 
-    /// Zero-copy scan that passes raw row bytes to the callback without
-    /// decoding or allocating per-row. The caller is responsible for
-    /// decoding only the columns it needs via `decode_column`.
-    pub fn for_each_row_raw<F>(&self, f: F)
+    /// Zero-copy scan that passes raw row bytes to the callback. v1/v0 rows
+    /// are handed through untouched (zero copy). A v2 row is reassembled into
+    /// an equivalent v1 (fully inline) row first — its spilled columns are
+    /// fetched from the overflow chains — so every downstream consumer
+    /// (`decode_row`, `decode_column`, compiled predicates) sees a v1 layout
+    /// and needs no v2 awareness. Only the rare v2 rows pay the reassembly;
+    /// v1 rows stay on the mmap zero-copy path. A row whose chain is corrupt
+    /// is skipped (its typed error surfaces via `get`).
+    pub fn for_each_row_raw<F>(&self, mut f: F)
     where
         F: FnMut(RowId, &[u8]),
     {
-        self.heap.for_each_row(f);
+        let schema = &self.schema;
+        let layout = &self.row_layout;
+        let heap = &self.heap;
+        heap.for_each_row(|rid, data| {
+            if crate::row::row_is_v2(data) {
+                if let Ok(v1) = crate::row::rehydrate_v2_to_v1(schema, layout, data, |stub| {
+                    heap.read_overflow_value(stub).map_err(io::Error::from)
+                }) {
+                    f(rid, &v1);
+                }
+            } else {
+                f(rid, data);
+            }
+        });
     }
 
     /// Zero-copy scan with early termination. The callback returns
-    /// `ControlFlow::Break(())` to stop. Used by `Limit` fast paths.
-    pub fn try_for_each_row_raw<F>(&self, f: F)
+    /// `ControlFlow::Break(())` to stop. Used by `Limit` fast paths. v2 rows
+    /// are reassembled to v1 first (see [`Self::for_each_row_raw`]).
+    pub fn try_for_each_row_raw<F>(&self, mut f: F)
     where
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
-        self.heap.try_for_each_row(f);
+        use std::ops::ControlFlow;
+        let schema = &self.schema;
+        let layout = &self.row_layout;
+        let heap = &self.heap;
+        heap.try_for_each_row(|rid, data| {
+            if crate::row::row_is_v2(data) {
+                match crate::row::rehydrate_v2_to_v1(schema, layout, data, |stub| {
+                    heap.read_overflow_value(stub).map_err(io::Error::from)
+                }) {
+                    Ok(v1) => f(rid, &v1),
+                    Err(_) => ControlFlow::Continue(()),
+                }
+            } else {
+                f(rid, data)
+            }
+        });
     }
 
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {

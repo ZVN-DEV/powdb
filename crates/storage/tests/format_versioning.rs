@@ -1,7 +1,14 @@
-use powdb_storage::heap::{HeapFile, HEAP_MAGIC};
-use powdb_storage::page::{Page, PageType, PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE};
-use powdb_storage::row::{encode_row, validate_row_format, ROW_MAGIC, ROW_PREFIX_SIZE};
-use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
+use powdb_storage::heap::{
+    HeapFile, HEAP_FORMAT_VERSION, HEAP_FORMAT_VERSION_WITH_OVERFLOW, HEAP_MAGIC,
+};
+use powdb_storage::page::{
+    Page, PageType, OVERFLOW_CHAIN_END, PAGE_FORMAT_VERSION, PAGE_HEADER_SIZE,
+};
+use powdb_storage::row::{
+    encode_row, encode_row_v2_into, row_format_version, validate_row_format, RowLayout, ROW_MAGIC,
+    ROW_PREFIX_SIZE,
+};
+use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 use powdb_storage::wal::{Wal, WAL_FORMAT_VERSION, WAL_MAGIC};
 
 fn temp_path(name: &str) -> std::path::PathBuf {
@@ -153,6 +160,110 @@ fn legacy_heap_without_superblock_and_legacy_rows_still_opens() {
         powdb_storage::row::decode_row(&sch, &bytes)[0],
         Value::Str("legacy".into())
     );
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn row_gate_accepts_v2_and_rejects_v3() {
+    // A v2 row (overflow bitmap + no actual spill) passes the gate.
+    let sch = schema();
+    let layout = RowLayout::new(&sch);
+    let mut v2 = Vec::new();
+    encode_row_v2_into(
+        &sch,
+        &layout,
+        &[Value::Str("alice".into())],
+        &vec![None; layout.n_var()],
+        &mut v2,
+    );
+    assert_eq!(&v2[0..4], ROW_MAGIC);
+    assert_eq!(row_format_version(&v2).unwrap(), 2);
+    validate_row_format(&v2).expect("v2 row must be accepted");
+
+    // Bumping the version byte to 3 (a future format) is refused by this
+    // build's gate — the "old gate refuses a newer row" back-compat contract.
+    let mut v3 = v2;
+    v3[4..6].copy_from_slice(&3u16.to_le_bytes());
+    assert!(validate_row_format(&v3).is_err());
+}
+
+#[test]
+fn heap_stays_v2_until_first_chain_then_bumps_to_v3() {
+    let path = temp_path("heap_lazy_v3");
+    let value = vec![0xABu8; 9000]; // 3 chunks
+    {
+        let mut heap = HeapFile::create(&path).unwrap();
+        // A never-spilling insert keeps the heap at v2.
+        heap.insert(&encode_row(&schema(), &[Value::Str("small".into())]))
+            .unwrap();
+        assert_eq!(heap.format_version(), HEAP_FORMAT_VERSION);
+        heap.flush_hot_page().unwrap();
+    }
+    // On-disk version byte is still 2.
+    let bytes = std::fs::read(&path).unwrap();
+    let voff = PAGE_HEADER_SIZE + HEAP_MAGIC.len();
+    assert_eq!(
+        u16::from_le_bytes(bytes[voff..voff + 2].try_into().unwrap()),
+        HEAP_FORMAT_VERSION
+    );
+
+    // Writing a chain lazily bumps the superblock to v3, on disk.
+    {
+        let mut heap = HeapFile::open(&path).unwrap();
+        let n = value.len().div_ceil(4068).max(1);
+        let mut pages = Vec::new();
+        for _ in 0..n {
+            pages.push(heap.allocate_overflow_page().unwrap());
+        }
+        for i in 0..n {
+            let start = i * 4068;
+            let end = (start + 4068).min(value.len());
+            let next = if i + 1 < n {
+                pages[i + 1]
+            } else {
+                OVERFLOW_CHAIN_END
+            };
+            heap.write_overflow_page(pages[i], next, &value[start..end], 0)
+                .unwrap();
+        }
+        assert_eq!(heap.format_version(), HEAP_FORMAT_VERSION_WITH_OVERFLOW);
+        heap.flush_hot_page().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(bytes[voff..voff + 2].try_into().unwrap()),
+        HEAP_FORMAT_VERSION_WITH_OVERFLOW,
+        "first chain write must persist a v3 superblock"
+    );
+
+    // Reopening a v3 heap works (new code accepts 2 and 3).
+    let heap = HeapFile::open(&path).unwrap();
+    assert_eq!(heap.format_version(), HEAP_FORMAT_VERSION_WITH_OVERFLOW);
+    let _ = RowId {
+        page_id: 1,
+        slot_index: 0,
+    };
+    drop(heap);
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn old_gate_refuses_heap_v3() {
+    // Simulate a pre-v0.11 binary whose heap gate only knew v2: patch a v3
+    // superblock down-check by asserting the gate rejects an unknown (here,
+    // a future v4) version, mirroring how v3 looks to an old build.
+    let path = temp_path("heap_v3_oldgate");
+    {
+        let mut heap = HeapFile::create(&path).unwrap();
+        heap.flush_hot_page().unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    let voff = PAGE_HEADER_SIZE + HEAP_MAGIC.len();
+    // A version this build does not know (v4) must be refused — the same
+    // failure an old v2-only build produces when handed a v3 file.
+    bytes[voff..voff + 2].copy_from_slice(&4u16.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    assert!(HeapFile::open(&path).is_err());
     std::fs::remove_file(path).ok();
 }
 

@@ -1,4 +1,7 @@
-use crate::row::encode_row_into;
+use crate::error::StorageError;
+use crate::heap::HeapFile;
+use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
+use crate::row::{encode_row_into, encode_row_v2_into, plan_spill, OverflowStub, MAX_VALUE_SIZE};
 use crate::table::Table;
 use crate::types::*;
 use crate::wal::{Wal, WalDurabilityTicket, WalRecord, WalRecordType, WalSyncMode};
@@ -316,6 +319,13 @@ impl Catalog {
             .unwrap_or(0);
         let max_known_lsn = max_page_lsn.max(cat.durable_lsn);
         cat.wal.set_next_lsn_at_least(max_known_lsn + 1);
+        // Auto-sweep overflow orphans after recovery: a crash is exactly when
+        // a chain page can end up flushed but referenced by no committed row
+        // (its Insert was uncommitted, or its Delete committed). Reclaim them
+        // now (design 3.6). Best-effort — a sweep failure must not block open.
+        if let Err(e) = cat.sweep_all() {
+            warn!(error = %e, "post-recovery overflow sweep failed (non-fatal)");
+        }
         Ok(cat)
     }
 
@@ -412,12 +422,20 @@ impl Catalog {
             let mut pending_tx_spans: Vec<(u64, Vec<usize>)> = Vec::new();
             for (index, rec) in records.iter().enumerate() {
                 match rec.record_type {
-                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
+                    WalRecordType::Insert
+                    | WalRecordType::Update
+                    | WalRecordType::Delete
+                    | WalRecordType::OverflowWrite
+                    | WalRecordType::OverflowFree
                         if rec.tx_id == 0 =>
                     {
                         committed_row_records[index] = true;
                     }
-                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete => {
+                    WalRecordType::Insert
+                    | WalRecordType::Update
+                    | WalRecordType::Delete
+                    | WalRecordType::OverflowWrite
+                    | WalRecordType::OverflowFree => {
                         if let Some((_, rows)) = pending_tx_spans
                             .iter_mut()
                             .rev()
@@ -466,7 +484,11 @@ impl Catalog {
                 && !committed_row_records[index]
                 && matches!(
                     rec.record_type,
-                    WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
+                    WalRecordType::Insert
+                        | WalRecordType::Update
+                        | WalRecordType::Delete
+                        | WalRecordType::OverflowWrite
+                        | WalRecordType::OverflowFree
                 )
             {
                 skipped_uncommitted += 1;
@@ -521,6 +543,36 @@ impl Catalog {
                             let _ = tbl.heap.delete(rid);
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_deletes += 1;
+                        }
+                    }
+                }
+                WalRecordType::OverflowWrite => {
+                    // Physical redo of one chain chunk. Applied by page id
+                    // under the per-page LSN skip, so double replay is a
+                    // no-op. Ordered before its Insert/Update in the log, so
+                    // the stub the row carries always points at live pages.
+                    if let Some((table_name, page_id, next_page, chunk)) =
+                        decode_overflow_write_payload(&rec.data)
+                    {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            let tbl = &mut self.tables[slot];
+                            if rec.lsn > 0 && tbl.heap.overflow_page_lsn(page_id) >= rec.lsn {
+                                skipped += 1;
+                                continue;
+                            }
+                            tbl.heap
+                                .write_overflow_page(page_id, next_page, &chunk, rec.lsn)?;
+                        }
+                    }
+                }
+                WalRecordType::OverflowFree => {
+                    // Return a freed chain's pages to the in-memory free list.
+                    // Only reached for committed records (uncommitted frees
+                    // are skipped above), so a live row can never lose its
+                    // chain to a rolled-back free.
+                    if let Some((table_name, pages)) = decode_overflow_free_payload(&rec.data) {
+                        if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            self.tables[slot].heap.release_overflow_pages(&pages);
                         }
                     }
                 }
@@ -1195,13 +1247,46 @@ impl Catalog {
     /// Mutable counterpart to [`Self::by_name`].
     #[inline]
     fn by_name_mut(&mut self, table: &str) -> io::Result<&mut Table> {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
+        let slot = self.slot_of(table)?;
+        Ok(&mut self.tables[slot])
+    }
+
+    /// Mark-and-sweep one table's overflow pages, returning the number of pages
+    /// reclaimed (design 3.6, door D12). Reclaimed pages are logged as a single
+    /// `OverflowFree` record so the reclamation is crash-safe, then returned to
+    /// the free list for reuse. Intended to run under the table write lock.
+    pub fn sweep(&mut self, table: &str) -> io::Result<usize> {
+        let slot = self.slot_of(table)?;
+        let reclaimed = self.tables[slot].sweep_overflow()?;
+        if !reclaimed.is_empty() && !self.wal.is_off() {
+            let payload = encode_overflow_free_payload(table, &reclaimed);
+            self.wal.append(0, WalRecordType::OverflowFree, &payload)?;
+            self.wal.flush()?;
+        }
+        Ok(reclaimed.len())
+    }
+
+    /// Sweep overflow pages across every table. Returns the total reclaimed.
+    pub fn sweep_all(&mut self) -> io::Result<usize> {
+        let names: Vec<String> = self
+            .tables
+            .iter()
+            .map(|t| t.schema.table_name.clone())
+            .collect();
+        let mut total = 0;
+        for name in names {
+            total += self.sweep(&name)?;
+        }
+        Ok(total)
+    }
+
+    fn slot_of(&self, table: &str) -> io::Result<usize> {
+        self.name_to_slot.get(table).copied().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("table '{table}' not found"),
             )
-        })?;
-        Ok(&mut self.tables[slot])
+        })
     }
 
     pub fn insert(&mut self, table: &str, values: &Row) -> io::Result<RowId> {
@@ -1216,34 +1301,24 @@ impl Catalog {
         if self.wal.is_off() {
             return self.by_name_mut(table)?.insert(values);
         }
-        let tbl = self.by_name_mut(table)?;
-        let mut wal_bytes: Vec<u8> = Vec::new();
-        encode_row_into(&tbl.schema, values, &mut wal_bytes);
-        // Insert into the heap FIRST so we can log the record with the real
-        // RowId. Replay needs the true (page, slot) to (a) know which page
-        // an Insert targets — for the per-page LSN durability check in
-        // `replay_wal` — and (b) reproduce the exact slot assignment, which
-        // makes Insert replay idempotent (no duplicate rows after a
-        // partial-flush crash, the v0.4.x data-loss bug).
-        //
-        // Ordering note: mutating the heap before appending+fsyncing the WAL
-        // is safe. A crash between the heap insert and the WAL append leaves
-        // the row only in an un-fsynced hot page (not durable) and the
-        // statement has not returned `Ok` (the executor's end-of-statement
-        // `sync_wal` hasn't run), so the write was never acknowledged.
-        // Durability is still gated on the WAL fsync at statement end.
-        let new_rid = tbl.insert(values)?;
+        // Allocate the tx id up front: any overflow chains for a spilled row
+        // must be logged under the SAME tx (and before the Insert record) so
+        // an uncommitted big row's chain writes are skipped on replay.
         let tx_id = self.next_tx();
-        self.wal_log(tx_id, WalRecordType::Insert, table, new_rid, &wal_bytes)?;
-        // Stamp the landing page with this record's LSN so a future replay
-        // recognises the row as already persisted (per-page idempotency).
-        // The page is hot (just inserted into), so this is an in-memory
-        // header write — no extra I/O on the insert hot path.
+        let slot = self.slot_of(table)?;
+        let row_bytes = {
+            let Catalog { tables, wal, .. } = self;
+            encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
+        };
+        // Insert the (v1 or v2) row bytes into the heap FIRST so the Insert
+        // record carries the real RowId. Index maintenance uses the logical
+        // `values`, so a spilled column is indexed by its full value, never
+        // the stub. See the v0.4.x idempotency rationale in the git history.
+        let new_rid = self.tables[slot].insert_encoded(values, &row_bytes)?;
+        self.wal_log(tx_id, WalRecordType::Insert, table, new_rid, &row_bytes)?;
         let lsn = self.wal.last_appended_lsn();
         if lsn > 0 {
-            self.by_name_mut(table)?
-                .heap
-                .set_page_lsn(new_rid.page_id, lsn)?;
+            self.tables[slot].heap.set_page_lsn(new_rid.page_id, lsn)?;
         }
         Ok(new_rid)
     }
@@ -1263,12 +1338,13 @@ impl Catalog {
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
         let tbl = &mut tables[slot];
-        let mut wal_bytes: Vec<u8> = Vec::new();
-        encode_row_into(&tbl.schema, values, &mut wal_bytes);
+        // Spill-aware encode (logs any overflow chains under `tx_id`, before
+        // the Insert record). Returns v1 bytes for rows that fit inline.
+        let row_bytes = encode_row_with_spill_logged(tbl, wal, tx_id, values)?;
         // Insert first so the WAL record carries the real RowId (see
         // `insert` for the ordering/durability argument).
-        let new_rid = tbl.insert(values)?;
-        let payload = encode_wal_payload(&tbl.schema.table_name, new_rid, &wal_bytes);
+        let new_rid = tbl.insert_encoded(values, &row_bytes)?;
+        let payload = encode_wal_payload(&tbl.schema.table_name, new_rid, &row_bytes);
         wal.append(tx_id, WalRecordType::Insert, &payload)?;
         if autocommit {
             self.pending_autocommit_tx_ids.push(tx_id);
@@ -1462,15 +1538,22 @@ impl Catalog {
         if self.wal.is_off() {
             return self.by_name_mut(table)?.update(rid, values);
         }
-        let tbl = self.by_name_mut(table)?;
-        let mut wal_bytes: Vec<u8> = Vec::new();
-        encode_row_into(&tbl.schema, values, &mut wal_bytes);
-        // Reject oversized rows BEFORE appending the WAL record: a logged
-        // Update that the heap then rejects would poison the next replay.
-        check_encoded_row_size(&wal_bytes)?;
         let tx_id = self.next_tx();
-        self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
-        self.by_name_mut(table)?.update(rid, values)
+        let slot = self.slot_of(table)?;
+        // Spill-aware encode: logs any overflow chains under `tx_id` (before
+        // the Update record) and returns the v1/v2 row bytes. An overflow
+        // transition relocates the row via heap delete+insert inside
+        // `update_encoded`; the old row's chain (if any) is left for `sweep`.
+        let row_bytes = {
+            let Catalog { tables, wal, .. } = self;
+            encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
+        };
+        // Reject oversized rows BEFORE appending the Update record: a logged
+        // Update the heap then rejects would poison the next replay. (A v2
+        // stub row is always small; only a non-spilled v1 row can trip this.)
+        check_encoded_row_size(&row_bytes)?;
+        self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
+        self.tables[slot].update_encoded(rid, values, &row_bytes, None)
     }
 
     /// Mission C Phase 2: update with a hint about which columns actually
@@ -1491,15 +1574,16 @@ impl Catalog {
                 .by_name_mut(table)?
                 .update_hinted(rid, values, changed_col_indices);
         }
-        let tbl = self.by_name_mut(table)?;
-        let mut wal_bytes: Vec<u8> = Vec::new();
-        encode_row_into(&tbl.schema, values, &mut wal_bytes);
-        // Same pre-WAL size gate as [`Self::update`].
-        check_encoded_row_size(&wal_bytes)?;
         let tx_id = self.next_tx();
-        self.wal_log(tx_id, WalRecordType::Update, table, rid, &wal_bytes)?;
-        self.by_name_mut(table)?
-            .update_hinted(rid, values, changed_col_indices)
+        let slot = self.slot_of(table)?;
+        let row_bytes = {
+            let Catalog { tables, wal, .. } = self;
+            encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
+        };
+        // Same pre-WAL size gate as [`Self::update`].
+        check_encoded_row_size(&row_bytes)?;
+        self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
+        self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)
     }
 
     /// Mission C Phase 4: fast-path update that patches a row's raw bytes
@@ -2046,6 +2130,189 @@ fn decode_wal_payload(data: &[u8]) -> Option<(String, RowId, Vec<u8>)> {
         },
         row_bytes,
     ))
+}
+
+/// Write one out-of-line value's overflow chain to the heap (head-first,
+/// singly linked) and log each chunk as a `WalRecordType::OverflowWrite`
+/// record under `tx_id`, ordered BEFORE the row's Insert/Update record so the
+/// stub the row carries always points at logged, replayable pages. Returns the
+/// stub (u64 length, head page, whole-value CRC32). Enforces `MAX_VALUE_SIZE`.
+fn write_overflow_chain_logged(
+    heap: &mut HeapFile,
+    wal: &mut Wal,
+    table: &str,
+    tx_id: u64,
+    value: &[u8],
+) -> io::Result<OverflowStub> {
+    if value.len() > MAX_VALUE_SIZE {
+        return Err(StorageError::ValueTooLarge {
+            size: value.len(),
+            max: MAX_VALUE_SIZE,
+        }
+        .into());
+    }
+    let n = value.len().div_ceil(OVERFLOW_PAYLOAD_CAP).max(1);
+    let mut pages = Vec::with_capacity(n);
+    for _ in 0..n {
+        pages.push(heap.allocate_overflow_page()?);
+    }
+    for i in 0..n {
+        let start = i * OVERFLOW_PAYLOAD_CAP;
+        let end = (start + OVERFLOW_PAYLOAD_CAP).min(value.len());
+        let chunk = &value[start..end];
+        let next = if i + 1 < n {
+            pages[i + 1]
+        } else {
+            OVERFLOW_CHAIN_END
+        };
+        let payload = encode_overflow_write_payload(table, pages[i], next, chunk);
+        wal.append(tx_id, WalRecordType::OverflowWrite, &payload)?;
+        let lsn = wal.last_appended_lsn();
+        heap.write_overflow_page(pages[i], next, chunk, lsn)?;
+    }
+    Ok(OverflowStub::new(
+        value.len() as u64,
+        pages[0],
+        crc32fast::hash(value),
+    ))
+}
+
+/// Spill-aware encode for the WAL path. If the row fits inline, returns its v1
+/// bytes untouched. Otherwise writes each spilled value's chain (with WAL
+/// logging under `tx_id`) and returns the v2 stub-row bytes to be inserted and
+/// logged in the row's Insert/Update record.
+fn encode_row_with_spill_logged(
+    tbl: &mut Table,
+    wal: &mut Wal,
+    tx_id: u64,
+    values: &Row,
+) -> io::Result<Vec<u8>> {
+    // Size the v1 encoding WITHOUT encoding it (a >64KB value would panic the
+    // debug-mode v1 encoder). Only actually encode v1 when the row fits inline.
+    let v1_len = crate::row::v1_encoded_len(tbl.row_layout(), values);
+    let chosen = plan_spill(tbl.row_layout(), values, v1_len);
+    if chosen.is_empty() {
+        let mut v1 = Vec::new();
+        encode_row_into(&tbl.schema, values, &mut v1);
+        return Ok(v1);
+    }
+    let table_name = tbl.schema.table_name.clone();
+    let n_var = tbl.row_layout().n_var();
+    let mut spilled: Vec<Option<OverflowStub>> = vec![None; n_var];
+    for col_idx in chosen {
+        let var_idx = tbl
+            .row_layout()
+            .var_index(col_idx)
+            .expect("plan_spill only returns var columns");
+        let bytes: Vec<u8> = match &values[col_idx] {
+            Value::Str(s) => s.as_bytes().to_vec(),
+            Value::Bytes(b) => b.clone(),
+            _ => continue,
+        };
+        let stub = write_overflow_chain_logged(&mut tbl.heap, wal, &table_name, tx_id, &bytes)?;
+        spilled[var_idx] = Some(stub);
+    }
+    let mut out = Vec::new();
+    encode_row_v2_into(&tbl.schema, tbl.row_layout(), values, &spilled, &mut out);
+    Ok(out)
+}
+
+/// `OverflowWrite` payload: `table_len u16 | table | page_id u32 |
+/// next_page u32 | chunk_len u16 | chunk bytes`.
+///
+/// NOTE (deviation from design 3.5): the design lists the payload as
+/// `page_id | next_page | chunk_len | chunk`, but overflow pages live in
+/// per-table heap files with independent page-id spaces, so replay needs the
+/// table identity to route the write. The table name is length-prefixed
+/// exactly like [`encode_wal_payload`]. The chunk-level fields are unchanged.
+fn encode_overflow_write_payload(
+    table: &str,
+    page_id: u32,
+    next_page: u32,
+    chunk: &[u8],
+) -> Vec<u8> {
+    let name = table.as_bytes();
+    let mut out = Vec::with_capacity(2 + name.len() + 4 + 4 + 2 + chunk.len());
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&page_id.to_le_bytes());
+    out.extend_from_slice(&next_page.to_le_bytes());
+    out.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+    out.extend_from_slice(chunk);
+    out
+}
+
+fn decode_overflow_write_payload(data: &[u8]) -> Option<(String, u32, u32, Vec<u8>)> {
+    let mut pos = 0usize;
+    if data.len() < 2 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    if pos + name_len + 4 + 4 + 2 > data.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(&data[pos..pos + name_len])
+        .ok()?
+        .to_string();
+    pos += name_len;
+    let page_id = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+    let next_page = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    pos += 4;
+    let chunk_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    if pos + chunk_len > data.len() {
+        return None;
+    }
+    Some((
+        name,
+        page_id,
+        next_page,
+        data[pos..pos + chunk_len].to_vec(),
+    ))
+}
+
+/// `OverflowFree` payload: `table_len u16 | table | count u32 |
+/// page_id u32 x count`. Table name added for the same routing reason as
+/// [`encode_overflow_write_payload`].
+fn encode_overflow_free_payload(table: &str, pages: &[u32]) -> Vec<u8> {
+    let name = table.as_bytes();
+    let mut out = Vec::with_capacity(2 + name.len() + 4 + pages.len() * 4);
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    for p in pages {
+        out.extend_from_slice(&p.to_le_bytes());
+    }
+    out
+}
+
+fn decode_overflow_free_payload(data: &[u8]) -> Option<(String, Vec<u32>)> {
+    let mut pos = 0usize;
+    if data.len() < 2 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    if pos + name_len + 4 > data.len() {
+        return None;
+    }
+    let name = std::str::from_utf8(&data[pos..pos + name_len])
+        .ok()?
+        .to_string();
+    pos += name_len;
+    let count = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + count * 4 > data.len() {
+        return None;
+    }
+    let mut pages = Vec::with_capacity(count);
+    for _ in 0..count {
+        pages.push(u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?));
+        pos += 4;
+    }
+    Some((name, pages))
 }
 
 // ─── DDL WAL payload codecs ─────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 //! Compiled predicates and fast-path layout utilities.
 
 use crate::ast::*;
-use powdb_storage::row::{decode_column, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
+use powdb_storage::row::{decode_column, row_is_v2, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
 
 /// Mission C Phase 4: precomputed byte-patch for the in-place update fast
@@ -357,15 +357,45 @@ pub(super) fn compile_predicate(
     if leaves.is_empty() {
         return None;
     }
+    // Per-row v2 routing (design 3.7): the compiled leaves read fixed columns
+    // at v1 byte offsets, which are wrong for a v2 row (its overflow bitmap
+    // shifts every downstream offset). v2 rows are rare, so each one falls back
+    // to a generic decode-based evaluation; v0/v1 rows keep the zero-copy
+    // compiled path. One `row_is_v2` compare per row gates it. NOTE (v0.11
+    // limitation): the fallback decodes via `decode_column`, which reports a
+    // SPILLED var column as Empty (it cannot reach the heap to reassemble the
+    // value). Predicates over out-of-line values therefore evaluate against
+    // Empty until the v0.12 RowCtx/overflow-fetch leaf lands — reads via
+    // `Table::get`/`scan` are unaffected (they reassemble).
+    let fb_expr = expr.clone();
+    let fb_columns = columns.to_vec();
+    let fb_schema = schema.clone();
+    let fb_layout = RowLayout::new(schema);
+    let fallback = move |data: &[u8]| -> bool {
+        let row: Vec<Value> = (0..fb_schema.columns.len())
+            .map(|ci| decode_column(&fb_schema, &fb_layout, data, ci))
+            .collect();
+        super::eval::eval_predicate(&fb_expr, &row, &fb_columns)
+    };
+
     if leaves.len() == 1 {
         // Single-leaf fast path: skip the Vec iteration entirely.
         let leaf = leaves
             .into_iter()
             .next()
             .expect("leaves.len() == 1 checked above");
-        return Some(Box::new(move |data: &[u8]| leaf.eval(data)));
+        return Some(Box::new(move |data: &[u8]| {
+            if row_is_v2(data) {
+                fallback(data)
+            } else {
+                leaf.eval(data)
+            }
+        }));
     }
     Some(Box::new(move |data: &[u8]| {
+        if row_is_v2(data) {
+            return fallback(data);
+        }
         // Tight short-circuit AND loop. With CompiledLeaf::eval marked
         // #[inline], LTO can fold the match arms into this loop body.
         for leaf in &leaves {
