@@ -162,6 +162,127 @@ fn auto_on_non_int_column_is_rejected() {
     );
 }
 
+/// Regression (BUG 1): rolling back the *same* reused auto-id twice must not
+/// leave a phantom entry in the unique index. The first rollback used to flush
+/// the uncommitted index mutation to the on-disk `.idx` (via the dropped
+/// catalog's Drop→checkpoint), and the second rollback of the same reused id
+/// reloaded that poisoned `.idx` back into the live tree — permanently
+/// poisoning the id. See rollback_to_last_sync_inner.
+#[test]
+fn double_rollback_of_reused_auto_id_does_not_poison_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type D { unique auto id: int, required v: int }")
+        .unwrap();
+
+    // id=1 committed
+    engine.execute_powql("insert D { v := 1 }").unwrap();
+
+    // begin/insert(id=2)/rollback — id 2 goes back to the sequence
+    engine.execute_powql("begin").unwrap();
+    engine.execute_powql("insert D { v := 2 }").unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // reuse id=2, committed (must succeed)
+    engine.execute_powql("insert D { v := 3 }").unwrap();
+
+    // begin/insert(id=3)/rollback — first rollback of id 3
+    engine.execute_powql("begin").unwrap();
+    engine.execute_powql("insert D { v := 4 }").unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // begin/insert(id=3)/rollback — SECOND rollback of the same reused id 3
+    engine.execute_powql("begin").unwrap();
+    engine.execute_powql("insert D { v := 5 }").unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // reuse id=3, committed — this used to fail with a phantom unique violation
+    engine
+        .execute_powql("insert D { v := 6 }")
+        .expect("reusing rolled-back auto id 3 must not hit a phantom unique violation");
+
+    // The live table holds exactly ids {1, 2, 3}, all with the committed values.
+    match engine.execute_powql("D order .id { .id, .v }").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            let got: Vec<(i64, i64)> = rows
+                .iter()
+                .map(|r| match (&r[0], &r[1]) {
+                    (Value::Int(id), Value::Int(v)) => (*id, *v),
+                    other => panic!("expected (int,int), got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![(1, 1), (2, 3), (3, 6)],
+                "unexpected surviving rows"
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+
+    // The unique index on .id must point at the committed row, not a phantom.
+    let looked_up = one_int(engine.execute_powql("D filter .id = 3 { .v }").unwrap());
+    assert_eq!(looked_up, 6, "index lookup on .id returned the wrong row");
+}
+
+/// Regression (BUG 1): the poison must not survive a reopen either — the
+/// on-disk `.idx` file itself must be clean after the fix.
+#[test]
+fn double_rollback_poison_absent_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type D { unique auto id: int, required v: int }")
+            .unwrap();
+        engine.execute_powql("insert D { v := 1 }").unwrap();
+        engine.execute_powql("begin").unwrap();
+        engine.execute_powql("insert D { v := 2 }").unwrap();
+        engine.execute_powql("rollback").unwrap();
+        engine.execute_powql("insert D { v := 3 }").unwrap();
+        engine.execute_powql("begin").unwrap();
+        engine.execute_powql("insert D { v := 4 }").unwrap();
+        engine.execute_powql("rollback").unwrap();
+        engine.execute_powql("begin").unwrap();
+        engine.execute_powql("insert D { v := 5 }").unwrap();
+        engine.execute_powql("rollback").unwrap();
+    }
+    // Reopen: the .idx on disk must not carry a phantom key 3.
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("insert D { v := 6 }")
+        .expect("phantom unique entry survived reopen");
+    let looked_up = one_int(engine.execute_powql("D filter .id = 3 { .v }").unwrap());
+    assert_eq!(
+        looked_up, 6,
+        "index lookup after reopen returned the wrong row"
+    );
+}
+
+/// A single rollback of a fresh auto-id must still cleanly remove its index
+/// entry (guards against an over-broad fix that leaks the id forward).
+#[test]
+fn single_rollback_cleanly_removes_index_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type D { unique auto id: int, required v: int }")
+        .unwrap();
+    engine.execute_powql("insert D { v := 1 }").unwrap();
+
+    engine.execute_powql("begin").unwrap();
+    engine.execute_powql("insert D { v := 2 }").unwrap();
+    engine.execute_powql("rollback").unwrap();
+
+    // Reused id=2 must insert cleanly and the index must find only it.
+    engine
+        .execute_powql("insert D { v := 3 }")
+        .expect("single rollback left a phantom index entry");
+    let looked_up = one_int(engine.execute_powql("D filter .id = 2 { .v }").unwrap());
+    assert_eq!(looked_up, 3);
+}
+
 /// A column cannot be both `auto` and declare a literal `default`.
 #[test]
 fn auto_with_default_is_rejected() {

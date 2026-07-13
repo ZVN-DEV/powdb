@@ -561,6 +561,18 @@ impl Table {
         Ok(())
     }
 
+    /// Discard uncommitted, in-memory index mutations so they never reach
+    /// disk. Called by ROLLBACK on the catalog it is about to drop: without
+    /// this, the drop-time checkpoint's `save_dirty_indexes` would flush the
+    /// rolled-back index writes to the `.idx` files, poisoning the unique
+    /// index (see `Catalog::rollback_to_last_sync_inner`). Mirrors
+    /// `Heap::discard_dirty` for the heap side.
+    pub(crate) fn discard_dirty_indexes(&mut self) {
+        for entry in self.indexed_cols.iter_mut() {
+            entry.btree.discard_dirty();
+        }
+    }
+
     /// Blocker B3: rebuild every secondary index from the heap.
     ///
     /// Used by the crash-recovery path in `Catalog::open`: after WAL

@@ -979,9 +979,17 @@ impl Catalog {
         self.wal.discard_and_truncate_to(start_len)?;
 
         // Step 1: throw away every uncommitted in-memory write so the
-        // upcoming Drop of `*self` has nothing dirty to flush.
+        // upcoming Drop of `*self` has nothing dirty to flush. This covers
+        // both the heap pages AND the btree index mutations: the Drop below
+        // runs `checkpoint()` (active_tx_id was already taken above), whose
+        // `save_dirty_indexes` would otherwise flush the rolled-back index
+        // writes to the `.idx` files — poisoning the unique index. The
+        // freshly-opened replacement catalog reloads clean trees from the
+        // untouched on-disk `.idx`, so discarding the dirty flags here is
+        // what actually reverts the transaction's index writes.
         for tbl in &mut self.tables {
             tbl.heap.discard_dirty();
+            tbl.discard_dirty_indexes();
         }
         // Step 2: discard WAL records appended since the last explicit
         // sync point. Large pending records can spill through BufWriter and
