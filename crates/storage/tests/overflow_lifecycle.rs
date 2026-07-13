@@ -497,3 +497,62 @@ fn crash_recovery_preserves_heap_v3_and_spilled_row() {
     drop(cat);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// P1: the raw byte-patch primitive must REFUSE a v2 row, and callers must not
+// drop the update when it does.
+// ---------------------------------------------------------------------------
+
+/// The `update` fixed-column fast path byte-patches rows in place assuming v1
+/// layout, gated on `has_overflow_rows()`. On a legacy pre-superblock heap that
+/// flag can under-report (no version word to advertise v3), so the fast path
+/// can be handed a v2 row. This locks the two-part contract that makes that
+/// safe: (1) `update_row_bytes_logged` REFUSES a v2 row with `Ok(false)` and
+/// never runs the corrupting closure, and (2) the caller therefore has a signal
+/// to fall back rather than silently drop the write. Pre-guard, the closure ran
+/// v1 offsets over v2 bytes and corrupted the spilled row; without the fast
+/// path's fallback branch the update was silently lost and the count
+/// under-reported.
+#[test]
+fn p1_byte_patch_primitive_refuses_v2_row() {
+    let dir = temp_dir("p1_refuse_v2");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cat = Catalog::create(&dir).unwrap();
+    cat.create_table(t_schema()).unwrap();
+
+    let rid = cat
+        .insert("t", &vec![Value::Int(7), Value::Str("z".repeat(5000))])
+        .unwrap();
+    cat.sync_wal().unwrap();
+    assert!(
+        cat.get_table("t").unwrap().has_overflow_rows(),
+        "a 5000-byte value must spill (v2 row present)"
+    );
+
+    // A closure that WOULD corrupt the row if it ever ran: smear 0xFF over the
+    // body. The primitive must refuse before invoking it.
+    let mut closure_ran = false;
+    let ok = cat
+        .update_row_bytes_logged("t", rid, |row| {
+            closure_ran = true;
+            for b in row.iter_mut() {
+                *b = 0xFF;
+            }
+        })
+        .unwrap();
+    assert!(!ok, "primitive must refuse to byte-patch a v2 row");
+    assert!(
+        !closure_ran,
+        "the corrupting closure must never run on a v2 row"
+    );
+
+    // The refusal is a no-op: the spilled value is byte-intact.
+    let row = cat
+        .get("t", rid)
+        .expect("row still present after refused patch");
+    assert_eq!(str_len(&row), 5000);
+    assert!(matches!(&row[1], Value::Str(s) if s.chars().all(|c| c == 'z')));
+
+    drop(cat);
+    std::fs::remove_dir_all(&dir).ok();
+}

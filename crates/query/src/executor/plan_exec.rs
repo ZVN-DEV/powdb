@@ -1166,14 +1166,25 @@ impl Engine {
 
                     if let Some(patches) = fast_patch {
                         let mut count = 0u64;
-                        for rid in matching_rids {
+                        let mut fallback_rids: Vec<RowId> = Vec::new();
+                        for rid in &matching_rids {
                             // Mission B2: WAL-log every patch so crash
                             // recovery replays the update. Same mutation
                             // closure as before — the wrapper just sandwiches
                             // it between a hot-page read and a WAL append.
+                            //
+                            // A false return means the byte-patch was refused
+                            // (e.g. a v2/overflow row whose in-place layout the
+                            // fast path cannot compute, reachable on a legacy
+                            // heap where has_overflow_rows() under-reports). Do
+                            // NOT drop the row: push it to `fallback_rids` and
+                            // let the reassembling get + update_hinted path
+                            // apply it, mirroring the var-column fast path
+                            // below. The fast path is thus a pure optimization
+                            // that can never silently lose an update.
                             let ok = self
                                 .catalog
-                                .update_row_bytes_logged(table, rid, |row| {
+                                .update_row_bytes_logged(table, *rid, |row| {
                                     let base = row_body_base(row);
                                     for p in &patches {
                                         row[base + p.bitmap_byte_off] &= !p.bit_mask;
@@ -1186,7 +1197,22 @@ impl Engine {
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             if ok {
                                 count += 1;
+                            } else {
+                                fallback_rids.push(*rid);
                             }
+                        }
+                        for rid in fallback_rids {
+                            let mut row = match self.catalog.get(table, rid) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            for (idx, val) in resolved_assignments.iter() {
+                                row[*idx] = val.clone();
+                            }
+                            self.catalog
+                                .update_hinted(table, rid, &row, Some(&changed_cols))
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            count += 1;
                         }
                         self.view_registry.mark_dependents_dirty(table);
                         return Ok(QueryResult::Modified(count));
