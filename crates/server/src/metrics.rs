@@ -148,6 +148,7 @@ pub struct Metrics {
     queries_in_flight: AtomicU64,
     query_timeouts_total: AtomicU64,
     query_memory_limit_exceeded_total: AtomicU64,
+    tx_gate_timeouts_total: AtomicU64,
 
     auth_failures_total: AtomicU64,
 
@@ -184,6 +185,7 @@ impl Metrics {
             queries_in_flight: AtomicU64::new(0),
             query_timeouts_total: AtomicU64::new(0),
             query_memory_limit_exceeded_total: AtomicU64::new(0),
+            tx_gate_timeouts_total: AtomicU64::new(0),
             auth_failures_total: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_sum_nanos: AtomicU64::new(0),
@@ -269,6 +271,14 @@ impl Metrics {
 
     pub fn inc_auth_failure(&self) {
         self.auth_failures_total.fetch_add(1, Relaxed);
+    }
+
+    /// Record an explicit `begin` that timed out waiting on the transaction
+    /// gate. Also counts as a failed query so `powdb_queries_total{result=
+    /// "error"}` stays truthful — the client saw the statement fail.
+    pub fn inc_tx_gate_timeout(&self) {
+        self.tx_gate_timeouts_total.fetch_add(1, Relaxed);
+        self.queries_error_total.fetch_add(1, Relaxed);
     }
 
     pub fn inc_tls_failure(&self) {
@@ -357,6 +367,12 @@ impl Metrics {
             "powdb_query_memory_limit_exceeded_total",
             "Total queries rejected by the per-query memory budget.",
             self.query_memory_limit_exceeded_total.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "powdb_tx_gate_timeouts_total",
+            "Total explicit BEGINs that timed out waiting for a concurrent transaction.",
+            self.tx_gate_timeouts_total.load(Relaxed),
         );
         counter(
             &mut out,
@@ -640,6 +656,7 @@ mod tests {
             "powdb_queries_in_flight",
             "powdb_query_timeouts_total",
             "powdb_query_memory_limit_exceeded_total",
+            "powdb_tx_gate_timeouts_total",
             "powdb_auth_failures_total",
             "powdb_query_duration_seconds",
             "powdb_sync_operations_total",
@@ -701,6 +718,17 @@ mod tests {
         assert!(out.contains("powdb_queries_total{result=\"error\"} 2"));
         assert!(out.contains("powdb_query_timeouts_total 1"));
         assert!(out.contains("powdb_query_memory_limit_exceeded_total 1"));
+    }
+
+    #[test]
+    fn tx_gate_timeout_counts_as_error_and_dedicated_counter() {
+        let m = Metrics::new();
+        m.inc_tx_gate_timeout();
+        m.inc_tx_gate_timeout();
+        let out = m.render();
+        assert!(out.contains("powdb_tx_gate_timeouts_total 2"));
+        // Each timed-out begin is also a failed query.
+        assert!(out.contains("powdb_queries_total{result=\"error\"} 2"));
     }
 
     #[test]

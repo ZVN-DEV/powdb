@@ -133,6 +133,8 @@ async fn start_tls_server(
                     powdb_server::handler::handle_connection(
                         tls_stream,
                         powdb_server::handler::ConnOpts {
+                            tx_wait_timeout: std::time::Duration::from_secs(5),
+                            db_name: None,
                             engine: eng,
                             tx_gate,
                             expected_password: None,

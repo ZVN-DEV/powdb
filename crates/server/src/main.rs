@@ -22,6 +22,9 @@ struct Args {
     password: Option<Zeroizing<String>>,
     idle_timeout_secs: u64,
     query_timeout_secs: u64,
+    /// How long an explicit `begin` waits for a concurrent explicit transaction
+    /// on another connection before failing with a clear timeout error.
+    tx_wait_timeout_ms: u64,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     query_memory_limit: usize,
@@ -32,7 +35,17 @@ struct Args {
     /// off. Additive: the TCP listener always runs. UDS removes the TCP/IP
     /// stack from the same-host path (~2× lower round-trip latency).
     socket: Option<String>,
+    /// When `Some`, the single database name this server serves. A CONNECT that
+    /// explicitly names a different database is rejected. `None` = accept any
+    /// name (0.9.x behavior).
+    db_name: Option<String>,
 }
+
+/// Default explicit-transaction gate wait (ms) when `POWDB_TX_WAIT_TIMEOUT_MS`
+/// is unset or unparseable. A `begin` that waits longer than this for a
+/// concurrent explicit transaction fails with a clear timeout error instead of
+/// queueing indefinitely.
+const DEFAULT_TX_WAIT_TIMEOUT_MS: u64 = 5000;
 
 /// Default per-query memory budget (bytes) when `POWDB_QUERY_MEMORY_LIMIT` is
 /// unset or unparseable. Mirrors the query crate's default (256 MB).
@@ -122,6 +135,12 @@ fn parse_args() -> Args {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30); // 30s default
+    let mut tx_wait_timeout_ms: u64 = std::env::var("POWDB_TX_WAIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TX_WAIT_TIMEOUT_MS);
+    let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME").ok().filter(|s| !s.is_empty());
     let mut tls_cert: Option<String> = std::env::var("POWDB_TLS_CERT")
         .ok()
         .filter(|s| !s.is_empty());
@@ -193,6 +212,29 @@ fn parse_args() -> Args {
                     std::process::exit(2);
                 });
             }
+            "--tx-wait-timeout-ms" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--tx-wait-timeout-ms requires a value");
+                    std::process::exit(2);
+                }
+                tx_wait_timeout_ms = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("invalid tx-wait-timeout-ms: {}", argv[i]);
+                    std::process::exit(2);
+                });
+                if tx_wait_timeout_ms == 0 {
+                    eprintln!("--tx-wait-timeout-ms must be greater than 0");
+                    std::process::exit(2);
+                }
+            }
+            "--db-name" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--db-name requires a value");
+                    std::process::exit(2);
+                }
+                db_name = Some(argv[i].clone());
+            }
             "--tls-cert" => {
                 i += 1;
                 if i >= argv.len() {
@@ -246,6 +288,8 @@ fn parse_args() -> Args {
                 println!(
                     "        --query-timeout <SECS> Per-query timeout threshold metric (default: 30)"
                 );
+                println!("        --tx-wait-timeout-ms <MS>  Max wait for a concurrent explicit transaction before BEGIN fails (default: 5000)");
+                println!("        --db-name <NAME>       Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
@@ -256,6 +300,8 @@ fn parse_args() -> Args {
                 println!("    POWDB_TLS_CERT, POWDB_TLS_KEY");
                 println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
+                println!("    POWDB_TX_WAIT_TIMEOUT_MS   Max ms a BEGIN waits for a concurrent explicit transaction (default: 5000)");
+                println!("    POWDB_DB_NAME              Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
@@ -279,12 +325,14 @@ fn parse_args() -> Args {
         password,
         idle_timeout_secs,
         query_timeout_secs,
+        tx_wait_timeout_ms,
         tls_cert,
         tls_key,
         query_memory_limit,
         require_tls,
         metrics_addr,
         socket,
+        db_name,
     }
 }
 
@@ -302,8 +350,10 @@ async fn run_connection<S>(
     mut shutdown_rx: watch::Receiver<bool>,
     idle_timeout: std::time::Duration,
     query_timeout: std::time::Duration,
+    tx_wait_timeout: std::time::Duration,
     rate_limiter: handler::AuthRateLimiter,
     metrics: Arc<Metrics>,
+    db_name: Option<String>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -320,6 +370,8 @@ async fn run_connection<S>(
             rate_limiter: Some(&rate_limiter),
             peer_addr,
             metrics,
+            tx_wait_timeout,
+            db_name,
         },
     )
     .await;
@@ -605,6 +657,10 @@ async fn main() {
 
     let idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     let query_timeout = std::time::Duration::from_secs(args.query_timeout_secs);
+    let tx_wait_timeout = std::time::Duration::from_millis(args.tx_wait_timeout_ms);
+    if let Some(name) = args.db_name.as_deref() {
+        info!(db_name = %name, "serving a single named database; foreign CONNECT db names will be rejected");
+    }
 
     // Shared auth rate limiter.
     let rate_limiter = handler::new_rate_limiter();
@@ -627,9 +683,11 @@ async fn main() {
                         let rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
+                        let txwait = tx_wait_timeout;
                         let rl = rate_limiter.clone();
                         let tls = tls_acceptor.clone();
                         let m = metrics.clone();
+                        let dbn = args.db_name.clone();
                         tokio::spawn(async move {
                             let peer_addr = Some(peer);
                             m.inc_connection_accepted();
@@ -641,7 +699,7 @@ async fn main() {
                                     Ok(tls_stream) => {
                                         run_connection(
                                             tls_stream, peer_addr, eng, tx_gate, pw, users, rx,
-                                            idle, qtimeout, rl, m.clone(),
+                                            idle, qtimeout, txwait, rl, m.clone(), dbn,
                                         ).await;
                                     }
                                     Err(e) => {
@@ -652,7 +710,7 @@ async fn main() {
                             } else {
                                 run_connection(
                                     stream, peer_addr, eng, tx_gate, pw, users, rx, idle,
-                                    qtimeout, rl, m.clone(),
+                                    qtimeout, txwait, rl, m.clone(), dbn,
                                 ).await;
                             }
                             drop(permit);
@@ -688,14 +746,16 @@ async fn main() {
                         let rx = shutdown_rx.clone();
                         let idle = idle_timeout;
                         let qtimeout = query_timeout;
+                        let txwait = tx_wait_timeout;
                         let rl = rate_limiter.clone();
                         let m = metrics.clone();
+                        let dbn = args.db_name.clone();
                         tokio::spawn(async move {
                             m.inc_connection_accepted();
                             let _active = m.active_guard();
                             run_connection(
-                                stream, None, eng, tx_gate, pw, users, rx, idle, qtimeout, rl,
-                                m.clone(),
+                                stream, None, eng, tx_gate, pw, users, rx, idle, qtimeout, txwait,
+                                rl, m.clone(), dbn,
                             ).await;
                             drop(permit);
                         });
