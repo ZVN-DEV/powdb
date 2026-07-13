@@ -77,6 +77,12 @@ impl Engine {
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        // Refuse any plan whose evaluable expressions still carry an aggregate
+        // FunctionCall the grouped-aggregate planner could not lower. Without
+        // this, such an aggregate would reach eval_expr and silently evaluate
+        // to Empty (a wrong answer). The outermost call validates the whole
+        // tree before any row is produced.
+        validate_no_stray_aggregates(plan)?;
         match plan {
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
@@ -1557,82 +1563,7 @@ impl Engine {
                         // WS2: byte-budget guard on the GROUP BY input buffer
                         // (the hash table is bounded by the input it groups).
                         self.charge_rows(&rows)?;
-                        // Resolve key column indices.
-                        let key_indices: Vec<usize> = keys
-                            .iter()
-                            .map(|k| {
-                                columns
-                                    .iter()
-                                    .position(|c| c == k)
-                                    .ok_or_else(|| format!("group-by column '{k}' not found"))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        // Resolve aggregate field indices. count(*) uses
-                        // sentinel usize::MAX — compute_group_aggregate
-                        // treats it as "count all rows in the group".
-                        let agg_field_indices: Vec<usize> = aggregates
-                            .iter()
-                            .map(|a| {
-                                if a.field == "*" {
-                                    Ok(usize::MAX)
-                                } else {
-                                    columns.iter().position(|c| c == &a.field).ok_or_else(|| {
-                                        format!("aggregate column '{}' not found", a.field)
-                                    })
-                                }
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        // Group rows by key values (preserving insertion order).
-                        let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
-                            rustc_hash::FxHashMap::default();
-                        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-                        for (ri, row) in rows.iter().enumerate() {
-                            let key: Vec<Value> =
-                                key_indices.iter().map(|&i| row[i].clone()).collect();
-                            match group_map.get(&key) {
-                                Some(&idx) => groups[idx].1.push(ri),
-                                None => {
-                                    let idx = groups.len();
-                                    group_map.insert(key.clone(), idx);
-                                    groups.push((key, vec![ri]));
-                                }
-                            }
-                        }
-
-                        // Build output column names: keys ++ aggregate output names.
-                        let mut out_columns: Vec<String> = keys.clone();
-                        for agg in aggregates.iter() {
-                            out_columns.push(agg.output_name.clone());
-                        }
-
-                        // Compute aggregates per group.
-                        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-                        for (key_vals, row_indices) in &groups {
-                            let mut row = key_vals.clone();
-                            for (ai, agg) in aggregates.iter().enumerate() {
-                                let col_idx = agg_field_indices[ai];
-                                let val = compute_group_aggregate(
-                                    agg.function,
-                                    &rows,
-                                    row_indices,
-                                    col_idx,
-                                );
-                                row.push(val);
-                            }
-                            out_rows.push(row);
-                        }
-
-                        // Apply HAVING filter.
-                        if let Some(having_expr) = having {
-                            out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
-                        }
-
-                        Ok(QueryResult::Rows {
-                            columns: out_columns,
-                            rows: out_rows,
-                        })
+                        exec_group_by(columns, rows, keys, aggregates, having)
                     }
                     _ => Err("group by requires row input".into()),
                 }
@@ -3563,6 +3494,231 @@ pub(super) fn execute_window(
     Ok(QueryResult::Rows { columns, rows })
 }
 
+/// Resolve a group-by key or aggregate argument name against the input
+/// columns of a `GroupBy` node.
+///
+/// Single-table inputs have bare column names (`status`); join inputs have
+/// `alias.field` names. Resolution rules:
+///   1. Exact match first. Single-table keys and fully qualified
+///      `alias.field` references hit here, preserving existing behavior.
+///   2. A qualified reference (one containing `.`) only ever matches exactly;
+///      if the exact column is absent it is genuinely missing.
+///   3. An unqualified name falls back to a unique `.field` suffix match over
+///      the join output columns. Zero matches is a column-not-found error;
+///      more than one is an ambiguity error naming the candidates.
+pub(super) fn resolve_group_column(
+    name: &str,
+    columns: &[String],
+) -> Result<usize, QueryError> {
+    if let Some(i) = columns.iter().position(|c| c == name) {
+        return Ok(i);
+    }
+    if name.contains('.') {
+        return Err(QueryError::ColumnNotFound {
+            table: String::new(),
+            column: name.to_string(),
+        });
+    }
+    let suffix = format!(".{name}");
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.ends_with(&suffix));
+    match matches.next() {
+        None => Err(QueryError::ColumnNotFound {
+            table: String::new(),
+            column: name.to_string(),
+        }),
+        Some((first_idx, _)) => {
+            let rest: Vec<&str> = matches.map(|(_, c)| c.as_str()).collect();
+            if rest.is_empty() {
+                Ok(first_idx)
+            } else {
+                // Rebuild the full candidate list (the consumed first match
+                // plus the rest) so the message names every ambiguous column.
+                let candidates: Vec<&str> = columns
+                    .iter()
+                    .filter(|c| c.ends_with(&suffix))
+                    .map(|c| c.as_str())
+                    .collect();
+                Err(QueryError::Execution(format!(
+                    "cannot group by ambiguous column '{name}'; candidates: {}",
+                    candidates.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// Mission E2b: execute a `GroupBy` plan node over already-materialized input
+/// rows. Shared by the mutable (`execute_plan`) and read-only
+/// (`execute_plan_readonly`) executors so key/argument resolution and the
+/// output-column naming stay identical on both paths.
+pub(super) fn exec_group_by(
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    keys: &[GroupKey],
+    aggregates: &[GroupAgg],
+    having: &Option<Expr>,
+) -> Result<QueryResult, QueryError> {
+    // Resolve key column indices. Qualified keys resolve exactly to
+    // `alias.field`; unqualified keys resolve by exact-then-suffix match.
+    let key_indices: Vec<usize> = keys
+        .iter()
+        .map(|k| resolve_group_column(&k.output_name(), &columns))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve aggregate field indices. count(*) uses the usize::MAX sentinel;
+    // every other argument gets the same resolution as keys.
+    let agg_field_indices: Vec<usize> = aggregates
+        .iter()
+        .map(|a| {
+            if a.field == "*" {
+                Ok(usize::MAX)
+            } else {
+                resolve_group_column(&a.field, &columns)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Group rows by key values (preserving insertion order).
+    let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
+        rustc_hash::FxHashMap::default();
+    let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = key_indices.iter().map(|&i| row[i].clone()).collect();
+        match group_map.get(&key) {
+            Some(&idx) => groups[idx].1.push(ri),
+            None => {
+                let idx = groups.len();
+                group_map.insert(key.clone(), idx);
+                groups.push((key, vec![ri]));
+            }
+        }
+    }
+
+    // Output columns: key display names ++ aggregate output names. Qualified
+    // keys are emitted as `alias.field` so a qualified HAVING reference and
+    // downstream projections resolve against them.
+    let mut out_columns: Vec<String> = keys.iter().map(|k| k.output_name()).collect();
+    for agg in aggregates.iter() {
+        out_columns.push(agg.output_name.clone());
+    }
+
+    // Compute aggregates per group.
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    for (key_vals, row_indices) in &groups {
+        let mut row = key_vals.clone();
+        for (ai, agg) in aggregates.iter().enumerate() {
+            let col_idx = agg_field_indices[ai];
+            let val = compute_group_aggregate(agg.function, &rows, row_indices, col_idx);
+            row.push(val);
+        }
+        out_rows.push(row);
+    }
+
+    // Apply HAVING filter.
+    if let Some(having_expr) = having {
+        out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
+    }
+
+    Ok(QueryResult::Rows {
+        columns: out_columns,
+        rows: out_rows,
+    })
+}
+
+/// Reject any aggregate `FunctionCall` that survives planning into an
+/// evaluable position (a projection field, a filter predicate, or a HAVING
+/// clause). The grouped-aggregate planner rewrites every supported aggregate
+/// into a `Field` reference to a computed column, so a surviving
+/// `FunctionCall` means the aggregate sits somewhere the engine cannot
+/// evaluate it. `eval_expr` would otherwise silently produce `Empty` there (a
+/// wrong answer); this turns that into a typed error before any row is
+/// evaluated. Walks the whole plan so fused fast paths cannot bypass it.
+pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::Project { input, fields } => {
+            for f in fields {
+                check_expr_no_aggregate(&f.expr)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::Filter { input, predicate } => {
+            check_expr_no_aggregate(predicate)?;
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::GroupBy { input, having, .. } => {
+            if let Some(h) = having {
+                check_expr_no_aggregate(h)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::NestedLoopJoin { left, right, .. } => {
+            validate_no_stray_aggregates(left)?;
+            validate_no_stray_aggregates(right)?;
+        }
+        PlanNode::Union { left, right, .. } => {
+            validate_no_stray_aggregates(left)?;
+            validate_no_stray_aggregates(right)?;
+        }
+        PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => {
+            validate_no_stray_aggregates(input)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Recurse an expression tree, rejecting any aggregate `FunctionCall`. Does
+/// not descend into subquery `QueryExpr`s (they are materialized and
+/// evaluated on their own path), only their outer operand expression.
+fn check_expr_no_aggregate(expr: &Expr) -> Result<(), QueryError> {
+    match expr {
+        Expr::FunctionCall(_, _) => Err(QueryError::Execution(
+            "invalid query: aggregate function in an unsupported position".to_string(),
+        )),
+        Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+            check_expr_no_aggregate(l)?;
+            check_expr_no_aggregate(r)
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => check_expr_no_aggregate(inner),
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                check_expr_no_aggregate(a)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr: e, list, .. } => {
+            check_expr_no_aggregate(e)?;
+            for item in list {
+                check_expr_no_aggregate(item)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery { expr: e, .. } => check_expr_no_aggregate(e),
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                check_expr_no_aggregate(c)?;
+                check_expr_no_aggregate(r)?;
+            }
+            if let Some(e) = else_expr {
+                check_expr_no_aggregate(e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Mission E2b: compute one aggregate over a set of rows in a group.
 pub(super) fn compute_group_aggregate(
     func: AggFunc,
@@ -4115,10 +4271,11 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                 Some(h) => format!(" having={h:?}"),
                 None => String::new(),
             };
+            let key_strs: Vec<String> = keys.iter().map(|k| k.output_name()).collect();
             let child = format_plan_tree(input, depth + 1);
             format!(
                 "{indent}GroupBy keys=[{}] aggs=[{}]{having_str}\n{child}",
-                keys.join(", "),
+                key_strs.join(", "),
                 agg_strs.join(", "),
             )
         }

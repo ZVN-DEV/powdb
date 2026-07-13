@@ -715,8 +715,25 @@ fn extract_aggregates(
 fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usize) {
     match expr {
         Expr::FunctionCall(func, inner) => {
-            if let Expr::Field(name) = inner.as_ref() {
-                let output = find_or_insert_agg(aggs, *func, name, counter);
+            // Extract the aggregate's source column. Both the single-table
+            // form `count(.total)` (a `Field`) and the join form
+            // `count(o.total)` (a `QualifiedField`) must be lowered here; a
+            // qualified inner is folded to `Field("alias.field")` so it lines
+            // up with the join output columns named `alias.field`. Anything
+            // else (a nested expression, another aggregate) is left as a
+            // `FunctionCall`, which the executor's validation guard rejects as
+            // an unsupported position rather than silently evaluating it to
+            // Empty (a wrong answer). JsonPath inners land here too once the
+            // v0.12 grammar exists; they will be added alongside that feature.
+            let field_name = match inner.as_ref() {
+                Expr::Field(name) => Some(name.clone()),
+                Expr::QualifiedField { qualifier, field } => {
+                    Some(format!("{qualifier}.{field}"))
+                }
+                _ => None,
+            };
+            if let Some(name) = field_name {
+                let output = find_or_insert_agg(aggs, *func, &name, counter);
                 *expr = Expr::Field(output);
             }
         }
@@ -994,7 +1011,7 @@ mod tests {
                         having,
                     } => {
                         assert!(matches!(*inner, PlanNode::SeqScan { .. }));
-                        assert_eq!(keys, vec!["status"]);
+                        assert_eq!(keys, vec![GroupKey::Unqualified("status".into())]);
                         assert_eq!(aggregates.len(), 1);
                         assert_eq!(aggregates[0].function, AggFunc::Count);
                         assert_eq!(aggregates[0].field, "name");

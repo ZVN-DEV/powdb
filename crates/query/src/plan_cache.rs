@@ -618,6 +618,43 @@ mod tests {
     }
 
     #[test]
+    fn test_grouped_join_query_shares_plan_across_literals() {
+        // P-5: a qualified-key grouped-join query with a HAVING literal must
+        // canonicalize identically regardless of that literal, cache cleanly
+        // (#137 slot-count invariant holds: group keys and aggregate args are
+        // structural identifiers, never literal slots), and substitute the new
+        // HAVING literal on a hit.
+        let mut cache = PlanCache::new(100);
+        let q1 = "User as u join Order as o on u.id = o.user_id \
+                  group u.status having count(o.total) > 1 { u.status, n: count(o.total) }";
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        let p1 = planner::plan(q1).unwrap();
+
+        // Only the HAVING `1` is a substitutable literal; the qualified keys
+        // and aggregate arguments are identifiers, so the slot count matches
+        // the canonical literal count and the plan is cacheable.
+        assert_eq!(lits1.len(), 1, "only the HAVING literal is collected");
+        assert_eq!(
+            count_literal_slots(&p1),
+            lits1.len(),
+            "group keys/args are structural, so slots == literals (#137)"
+        );
+        cache.insert(h1, p1, lits1.len());
+        assert_eq!(cache.len(), 1, "grouped-join plan must cache");
+
+        let q2 = "User as u join Order as o on u.id = o.user_id \
+                  group u.status having count(o.total) > 5 { u.status, n: count(o.total) }";
+        let (h2, lits2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2, "different HAVING literal must hash the same");
+
+        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(5)], "new HAVING literal substituted");
+        assert_eq!(cache.hits, 1);
+    }
+
+    #[test]
     fn test_update_by_pk_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = "User filter .id = 1 update { age := 100 }";

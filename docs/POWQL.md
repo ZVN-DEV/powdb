@@ -524,6 +524,72 @@ SQL equivalent:
 SELECT name, COUNT(name) AS n FROM User WHERE age >= 30 GROUP BY name
 ```
 
+### Qualified Group Keys and Aggregate Arguments
+
+Over a join, group keys and aggregate arguments may be qualified with a source
+alias (`alias.field`), exactly like projections and filters:
+
+```
+User as u join Order as o on u.id = o.user_id
+  group u.status { u.status, orders: count(o.total), revenue: sum(o.total) }
+```
+
+A qualified group key is emitted as an `alias.field` output column, so a
+qualified HAVING reference and downstream projections line up with it:
+
+```
+User as u join Order as o on u.id = o.user_id
+  group u.status having u.status = "active" { u.status, n: count(*) }
+```
+
+Unqualified keys and arguments still work over a join as long as the bare name
+is unambiguous. `group .status` resolves to `u.status` when only one joined
+column ends in `.status`. A name that matches no column is an error, and a name
+that matches more than one (for example `.id`, present on both sides) is an
+ambiguity error that names the candidate columns; qualify the key to resolve it.
+
+### Grouped Aggregates over Joins: fan-out semantics
+
+A one-to-many join repeats each row of the "one" side once per matching row on
+the "many" side. In v0.11, PowQL aggregates follow SQL-standard semantics: they
+aggregate the joined (fanned-out) rows directly, so `sum` and `avg` over a
+column from the "one" side double-count under fan-out.
+
+Toy example. Three accounts in one tier, joined one-to-many to their orders:
+
+```
+type Account { required id: int, required tier: str, required balance: float }
+type Ord     { required id: int, required account_id: int }
+
+-- tier "gold" holds all three accounts
+-- balances: A = 10.0, B = 10.0, C = 40.0    (true average balance = 20.0)
+-- orders:   A has 4, B has 1, C has 1        (6 joined rows in total)
+
+Account as a join Ord as o on a.id = o.account_id
+  group a.tier { a.tier, avg_bal: avg(a.balance) }
+```
+
+Because account A appears in four joined rows, `avg(a.balance)` over the joined
+rows in the "gold" group is `(10*4 + 10 + 40) / 6 = 15.0`, not the true `20.0`.
+The real Capa S6 workload shows the same effect at scale: a true average of
+`12.92` collapses to `8.67` once the join fans out the rows.
+
+Until symmetric aggregates ship (see below), use `count(distinct ...)` as the
+fan-out-safe count. It counts distinct values within each group regardless of
+how many times the join repeats them:
+
+```
+-- distinct accounts per group, unaffected by order counts
+Account as a join Ord as o on a.id = o.account_id
+  group a.balance { a.balance, accounts: count(distinct a.id) }
+```
+
+Note: correct-by-default (symmetric) aggregates over joins, where an aggregate
+of a column from source `A` aggregates the distinct rows of `A` and fan-out
+cannot inflate it, ship in v0.13 with a `raw` opt-out that restores the
+SQL-standard behavior above. The SQL frontend keeps SQL semantics. See the
+document-store design doc (section 5.2) for details.
+
 ---
 
 ## Joins

@@ -263,8 +263,9 @@ mod tests;
 pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
-    compute_group_aggregate, execute_window, format_plan_tree, hash_join, lower_unindexed_scans,
+    exec_group_by, execute_window, format_plan_tree, hash_join, lower_unindexed_scans,
     range_matches, synthesize_range_predicate, try_extract_equi_join_keys,
+    validate_no_stray_aggregates,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -959,6 +960,9 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        // Mirror the mutable path: reject a stray aggregate FunctionCall before
+        // evaluating any row (see execute_plan for the rationale).
+        validate_no_stray_aggregates(plan)?;
         match plan {
             PlanNode::SeqScan { table } => {
                 // Dirty view means we'd need to refresh it — can't do that
@@ -1758,79 +1762,7 @@ impl Engine {
                         // WS2: byte-budget guard on the GROUP BY input buffer
                         // (the hash table is bounded by the input it groups).
                         self.charge_rows(&rows)?;
-                        let key_indices: Vec<usize> = keys
-                            .iter()
-                            .map(|k| {
-                                columns.iter().position(|c| c == k).ok_or_else(|| {
-                                    QueryError::ColumnNotFound {
-                                        table: String::new(),
-                                        column: k.clone(),
-                                    }
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        let agg_field_indices: Vec<usize> = aggregates
-                            .iter()
-                            .map(|a| {
-                                if a.field == "*" {
-                                    Ok(usize::MAX)
-                                } else {
-                                    columns.iter().position(|c| c == &a.field).ok_or_else(|| {
-                                        QueryError::ColumnNotFound {
-                                            table: String::new(),
-                                            column: a.field.clone(),
-                                        }
-                                    })
-                                }
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
-                            rustc_hash::FxHashMap::default();
-                        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-                        for (ri, row) in rows.iter().enumerate() {
-                            let key: Vec<Value> =
-                                key_indices.iter().map(|&i| row[i].clone()).collect();
-                            match group_map.get(&key) {
-                                Some(&idx) => groups[idx].1.push(ri),
-                                None => {
-                                    let idx = groups.len();
-                                    group_map.insert(key.clone(), idx);
-                                    groups.push((key, vec![ri]));
-                                }
-                            }
-                        }
-
-                        let mut out_columns: Vec<String> = keys.clone();
-                        for agg in aggregates.iter() {
-                            out_columns.push(agg.output_name.clone());
-                        }
-
-                        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-                        for (key_vals, row_indices) in &groups {
-                            let mut row = key_vals.clone();
-                            for (ai, agg) in aggregates.iter().enumerate() {
-                                let col_idx = agg_field_indices[ai];
-                                let val = compute_group_aggregate(
-                                    agg.function,
-                                    &rows,
-                                    row_indices,
-                                    col_idx,
-                                );
-                                row.push(val);
-                            }
-                            out_rows.push(row);
-                        }
-
-                        if let Some(having_expr) = having {
-                            out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
-                        }
-
-                        Ok(QueryResult::Rows {
-                            columns: out_columns,
-                            rows: out_rows,
-                        })
+                        exec_group_by(columns, rows, keys, aggregates, having)
                     }
                     _ => Err("group by requires row input".into()),
                 }

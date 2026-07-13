@@ -125,11 +125,38 @@ pub struct QueryExpr {
     pub group_by: Option<GroupByClause>,
 }
 
-/// GROUP BY clause: `group .field1, .field2 [having <expr>]`.
+/// GROUP BY clause: `group .field1, alias.field2 [having <expr>]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupByClause {
-    pub keys: Vec<String>,
+    pub keys: Vec<GroupKey>,
     pub having: Option<Expr>,
+}
+
+/// A single GROUP BY key.
+///
+/// `Unqualified` covers the classic single-table form `group .status`, whose
+/// field name is resolved against the input columns by an exact match first
+/// and a unique `.field` suffix match second (so it also works over a join
+/// whose output columns are named `alias.field`).
+///
+/// `Qualified` covers the join form `group u.status`; it resolves exactly to
+/// the `alias.field` output column and never suffix-matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupKey {
+    Unqualified(String),
+    Qualified { alias: String, field: String },
+}
+
+impl GroupKey {
+    /// Name of the output column this key produces. Unqualified keys keep
+    /// their bare field name; qualified keys are emitted as `alias.field` so
+    /// HAVING and downstream projections can reference them consistently.
+    pub fn output_name(&self) -> String {
+        match self {
+            GroupKey::Unqualified(field) => field.clone(),
+            GroupKey::Qualified { alias, field } => format!("{alias}.{field}"),
+        }
+    }
 }
 
 /// A join clause appended to a query's primary source.

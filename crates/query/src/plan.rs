@@ -1,4 +1,4 @@
-use crate::ast::{AggFunc, AlterAction, Assignment, Expr, JoinKind, Literal, WindowFunc};
+use crate::ast::{AggFunc, AlterAction, Assignment, Expr, GroupKey, JoinKind, Literal, WindowFunc};
 
 /// A column definition carried by `PlanNode::CreateTable`. Replaces the
 /// old `(name, type_name, required)` tuple so the `unique` modifier can
@@ -97,7 +97,7 @@ pub enum PlanNode {
     /// HAVING expression into `Field("__agg_N")` references).
     GroupBy {
         input: Box<PlanNode>,
-        keys: Vec<String>,
+        keys: Vec<GroupKey>,
         aggregates: Vec<GroupAgg>,
         having: Option<Expr>,
     },
