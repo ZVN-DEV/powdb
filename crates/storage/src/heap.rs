@@ -1,7 +1,7 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
 use crate::page::{iter_page_slots, Page, PageType, MAX_ROW_DATA_SIZE, PAGE_SIZE};
-use crate::row::validate_row_format;
+use crate::row::{row_is_v2, validate_row_format};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
@@ -987,6 +987,13 @@ impl HeapFile {
         self.ensure_hot(rid.page_id)?;
         let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
         if let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) {
+            // v0.11 overflow safety: byte-patch closures assume v1 layout math.
+            // Refuse v2 rows so a caller can never corrupt a spilled row's
+            // bytes through this primitive; the executor routes v2-capable
+            // tables to the reassembling update path instead.
+            if row_is_v2(bytes) {
+                return Ok(false);
+            }
             f(bytes);
             hot.dirty = true;
             return Ok(true);
@@ -1019,6 +1026,12 @@ impl HeapFile {
         let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) else {
             return Ok(false);
         };
+        // v0.11 overflow safety: refuse v2 rows (defence in depth — the patch
+        // closure's `patch_var_column_in_place` also refuses them). A v2 row
+        // patched with v1 offset math would corrupt.
+        if row_is_v2(bytes) {
+            return Ok(false);
+        }
         let old_len = bytes.len();
         let Some(new_len) = f(bytes) else {
             return Ok(false);
@@ -1190,6 +1203,15 @@ impl HeapFile {
                         page_id,
                         slot_index: slot,
                     };
+                    // v0.11 overflow safety: never byte-patch a v2 row here —
+                    // `try_mutate` closures assume v1 layout and would corrupt a
+                    // spilled row (and Path-1 fixed patches write unconditionally).
+                    // Route it to the fallback list so the caller re-applies the
+                    // mutation through the reassembling update path.
+                    if hot.page.get(slot).map(row_is_v2).unwrap_or(false) {
+                        fallback.push(rid);
+                        continue;
+                    }
                     if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
                         let old_len = bytes.len() as u16;
                         if let Some(new_len) = try_mutate(bytes) {

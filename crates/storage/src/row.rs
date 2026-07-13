@@ -732,6 +732,15 @@ pub fn patch_var_column_in_place(
     col_idx: usize,
     new_value: Option<&[u8]>,
 ) -> Option<u16> {
+    // v0.11 overflow safety: this primitive computes v1 offsets
+    // (`2 + bitmap_size + fixed_region_size`) and is structurally incapable
+    // of patching a v2 row — a v2 row inserts an overflow bitmap before the
+    // fixed region, so every offset here would be wrong and the patch would
+    // corrupt the row (and the corruption is WAL-logged). Refuse v2 rows so
+    // the caller falls back to the reassembling re-encode path.
+    if row_is_v2(bytes) {
+        return None;
+    }
     let base = row_body_offset(bytes).ok()?;
     let var_idx = layout.var_index[col_idx].expect("not a var column");
     let n_var = layout.n_var;
@@ -813,17 +822,40 @@ pub fn patch_var_column_in_place(
 ///
 /// Mission F: `#[inline]` (not `always` — function is large) so LTO can fold
 /// it into Filter+SeqScan when the inliner decides it's worth it.
+///
+/// v0.11 overflow safety: this decoder is v2-aware. A v2 row carries an extra
+/// overflow bitmap between the null bitmap and the fixed region (shifting every
+/// downstream offset), and a spilled var column holds a 24-byte stub, not its
+/// value. Without this awareness a v1-only decoder misreads the overflow bitmap
+/// as the var-offset table and either returns garbage or panics with an
+/// out-of-range slice index (the WAL-replay brick bug). Here a spilled column
+/// decodes to `Value::Empty` (this pure decoder cannot reach the heap to
+/// reassemble the chain); callers needing the real value use the heap-backed
+/// [`decode_row_v2`] / `Table::get`.
 #[inline]
 pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
+    let is_v2 = row_is_v2(data);
     let data = row_body(data);
     let n_cols = schema.columns.len();
     let bitmap_size = n_cols.div_ceil(8);
+    let n_var = schema
+        .columns
+        .iter()
+        .filter(|c| !is_fixed_size(c.type_id))
+        .count();
+    let ovf_bitmap_size = if is_v2 { n_var.div_ceil(8) } else { 0 };
 
     let mut pos = 2; // skip length prefix
 
     // Read null bitmap
     let null_bitmap = &data[pos..pos + bitmap_size];
     pos += bitmap_size;
+
+    // v2 only: the overflow bitmap sits between the null bitmap and the fixed
+    // region. One bit per var column (declaration order); a set bit means that
+    // column's var-data slot holds an overflow stub, not the inline value.
+    let ovf_bitmap = &data[pos..pos + ovf_bitmap_size];
+    pos += ovf_bitmap_size;
 
     // We'll build the result in two passes: fixed first, then merge in variable
     let mut values = vec![Value::Empty; n_cols];
@@ -907,6 +939,12 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
         let is_null = (null_bitmap[col_idx / 8] >> (col_idx % 8)) & 1 == 1;
         if is_null {
             // values[col_idx] is already Empty
+            continue;
+        }
+        // v2: a spilled var column holds a stub, not the value. This pure
+        // decoder cannot reassemble the chain, so it reports Empty (matching
+        // `decode_column`). Callers wanting the value use `decode_row_v2`.
+        if is_v2 && (ovf_bitmap[vi >> 3] >> (vi & 7)) & 1 == 1 {
             continue;
         }
         let start = var_data_start + var_offsets[vi];
@@ -1213,7 +1251,14 @@ where
     }
     let values = decode_row_v2(schema, layout, data, fetch)?;
     let mut out = Vec::new();
-    encode_row_into_with_layout(schema, layout, &values, &mut out);
+    // A v2 row can hold values far larger than the u16 inline cap (that is the
+    // entire point of overflow). The v1 encoding's var-offset table and length
+    // prefix are u16, so re-inlining a value >= 64KB would silently WRAP the
+    // offsets mod 65536 in release builds and truncate/corrupt the value. Use
+    // the fallible encoder so this is a loud, typed error instead — callers on
+    // the scan boundary must route such rows through a value-returning decode
+    // (`decode_row_v2` / `Table::get`), never through v1 re-encode.
+    try_encode_row_into_with_layout(schema, layout, &values, &mut out)?;
     Ok(out)
 }
 
@@ -1248,7 +1293,20 @@ pub fn v1_encoded_len(layout: &RowLayout, values: &[Value]) -> usize {
     ROW_PREFIX_SIZE + 2 + layout.bitmap_size + layout.fixed_region_size + n_offsets * 2 + var_data
 }
 
-pub fn plan_spill(layout: &RowLayout, values: &[Value], v1_len: usize) -> Vec<usize> {
+/// `is_indexed[col_idx]` marks columns that back a b-tree index. Indexed
+/// columns are index lookup keys, so they are kept INLINE whenever possible:
+/// a spilled indexed value would force delete/rebuild-time key extraction to
+/// reassemble the chain (and a v1-only extraction silently yields `Empty`,
+/// leaving a dangling index entry). They are only spilled as a last resort,
+/// when evicting every non-indexed value still cannot make the row fit; the
+/// delete/rebuild paths reassemble such keys correctly, so correctness holds
+/// either way (this is purely a "keep keys cheap" preference).
+pub fn plan_spill(
+    layout: &RowLayout,
+    values: &[Value],
+    v1_len: usize,
+    is_indexed: &[bool],
+) -> Vec<usize> {
     if v1_len <= crate::page::MAX_ROW_DATA_SIZE {
         return Vec::new();
     }
@@ -1270,11 +1328,17 @@ pub fn plan_spill(layout: &RowLayout, values: &[Value], v1_len: usize) -> Vec<us
             }
         })
         .collect();
-    // Prefer big values (>= OVERFLOW_MIN) first, then by descending length.
+    // Sort order (first key wins): non-indexed before indexed (keep index keys
+    // inline), then big values (>= OVERFLOW_MIN) first, then descending length.
     cands.sort_by(|a, b| {
+        let a_indexed = is_indexed.get(a.0).copied().unwrap_or(false);
+        let b_indexed = is_indexed.get(b.0).copied().unwrap_or(false);
         let a_big = a.1 >= OVERFLOW_MIN;
         let b_big = b.1 >= OVERFLOW_MIN;
-        b_big.cmp(&a_big).then_with(|| b.1.cmp(&a.1))
+        a_indexed
+            .cmp(&b_indexed)
+            .then_with(|| b_big.cmp(&a_big))
+            .then_with(|| b.1.cmp(&a.1))
     });
 
     // Spilling a value shrinks the row by (len - stub) and the row gains a

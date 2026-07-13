@@ -546,7 +546,8 @@ impl Table {
     /// lives in `Catalog`). Enforces `MAX_VALUE_SIZE` per value.
     fn encode_row_spilling(&mut self, values: &Row) -> io::Result<Vec<u8>> {
         let v1_len = crate::row::v1_encoded_len(&self.row_layout, values);
-        let chosen = plan_spill(&self.row_layout, values, v1_len);
+        let is_indexed = self.indexed_col_mask();
+        let chosen = plan_spill(&self.row_layout, values, v1_len, &is_indexed);
         let n_var = self.row_layout.n_var();
         let mut spilled: Vec<Option<OverflowStub>> = vec![None; n_var];
         for col_idx in chosen {
@@ -699,12 +700,36 @@ impl Table {
             return Ok(());
         }
 
+        // Snapshot raw rows once so the reassembly below can take a second
+        // shared borrow of the heap (read_overflow_value) without conflicting
+        // with a live scan iterator. Rebuild is a cold recovery path, so the
+        // owned snapshot is fine.
+        let raw_rows: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect();
         let schema = &self.schema;
+        let layout = &self.row_layout;
+        let heap = &self.heap;
         for entry in self.indexed_cols.iter_mut() {
             let mut fresh = BTree::create(entry.btree.file_path())?;
-            for (rid, row) in self.heap.scan() {
-                let row = crate::row::decode_row(schema, &row);
-                let v = &row[entry.col_idx];
+            for (rid, raw) in &raw_rows {
+                let (rid, raw) = (*rid, raw.as_slice());
+                // v2 rows must be reassembled so a spilled indexed column
+                // produces its true key, not Empty (P2: create-index /
+                // rebuild-after-spill must not build a btree of missing keys).
+                let owned;
+                let v: &Value = if crate::row::row_is_v2(raw) {
+                    match crate::row::decode_row_v2(schema, layout, raw, |stub| {
+                        heap.read_overflow_value(stub).map_err(io::Error::from)
+                    }) {
+                        Ok(row) => {
+                            owned = row[entry.col_idx].clone();
+                            &owned
+                        }
+                        Err(_) => continue,
+                    }
+                } else {
+                    owned = decode_column(schema, layout, raw, entry.col_idx);
+                    &owned
+                };
                 if v.is_empty() {
                     continue;
                 }
@@ -770,8 +795,19 @@ impl Table {
             ..
         } = self;
 
+        // A spilled indexed column holds only a stub inline, so its key must be
+        // reassembled from the overflow chain — a v1-only `decode_column`
+        // yields `Empty` and leaves the btree entry dangling (P2). Collect such
+        // columns under the pinned borrow, reassemble after it closes. The v1
+        // fast path is unchanged (no v2 row ⇒ `raw_stub` is always None ⇒ no
+        // allocation, no deferral).
+        let mut deferred: Vec<(usize, crate::row::OverflowStub)> = Vec::new();
         heap.with_row_bytes(rid, |data| {
-            for entry in indexed_cols.iter_mut() {
+            for (slot, entry) in indexed_cols.iter_mut().enumerate() {
+                if let Some(stub) = crate::row::raw_stub(schema, layout, data, entry.col_idx) {
+                    deferred.push((slot, stub));
+                    continue;
+                }
                 let val = decode_column(schema, layout, data, entry.col_idx);
                 if val.is_empty() {
                     continue;
@@ -792,6 +828,26 @@ impl Table {
                 }
             }
         })?;
+
+        // Reassemble + delete keys for any spilled indexed columns (rare:
+        // `plan_spill` keeps indexed columns inline, so this only fires for
+        // legacy rows or a column indexed AFTER its values spilled). The chain
+        // pages are still intact here — `heap.delete` below only clears the
+        // stub row's slot, never the overflow chain.
+        for (slot, stub) in deferred {
+            let bytes = heap.read_overflow_value(&stub).map_err(io::Error::from)?;
+            let entry = &mut indexed_cols[slot];
+            let val = match schema.columns[entry.col_idx].type_id {
+                TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
+                TypeId::Bytes => Value::Bytes(bytes),
+                _ => continue,
+            };
+            if entry.unique {
+                entry.btree.delete(&val);
+            } else {
+                entry.btree.delete_non_unique(&val, rid);
+            }
+        }
 
         self.heap.delete(rid)?;
         // Blocker B3: btree mutations above marked the indexes dirty.
@@ -985,9 +1041,17 @@ impl Table {
         // pairs so non-unique indexes can delete the correct composite key.
         let mut entries_per_index: Vec<Vec<(Value, RowId)>> =
             (0..n_indexed).map(|_| Vec::with_capacity(256)).collect();
+        // Spilled indexed columns (v2 rows) can't be decoded inline — collect
+        // their stubs and reassemble after the scan releases the heap borrow
+        // (P2: a v1-only decode_column would yield Empty ⇒ dangling entry).
+        let mut deferred: Vec<(usize, crate::row::OverflowStub, RowId)> = Vec::new();
 
         let count = heap.scan_delete_matching(pred, |rid, data| {
             for (slot_i, entry) in indexed_cols.iter().enumerate() {
+                if let Some(stub) = crate::row::raw_stub(schema, layout, data, entry.col_idx) {
+                    deferred.push((slot_i, stub, rid));
+                    continue;
+                }
                 let v = decode_column(schema, layout, data, entry.col_idx);
                 if !v.is_empty() {
                     entries_per_index[slot_i].push((v, rid));
@@ -995,6 +1059,19 @@ impl Table {
             }
             user_hook(rid, data);
         })?;
+
+        // Reassemble spilled indexed keys now that the scan's heap borrow is
+        // released (the deleted rows' overflow chains are still intact — the
+        // scan clears slots only, not chains).
+        for (slot_i, stub, rid) in deferred {
+            let bytes = heap.read_overflow_value(&stub).map_err(io::Error::from)?;
+            let v = match schema.columns[indexed_cols[slot_i].col_idx].type_id {
+                TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
+                TypeId::Bytes => Value::Bytes(bytes),
+                _ => continue,
+            };
+            entries_per_index[slot_i].push((v, rid));
+        }
 
         for (slot_i, entry) in indexed_cols.iter_mut().enumerate() {
             for (v, rid) in &entries_per_index[slot_i] {
@@ -1259,6 +1336,40 @@ impl Table {
     #[inline]
     pub fn has_indexed_col(&self, col_idx: usize) -> bool {
         self.indexed_cols.iter().any(|c| c.col_idx == col_idx)
+    }
+
+    /// A `is_indexed[col_idx]` mask over all schema columns, for
+    /// [`crate::row::plan_spill`] so indexed columns are kept inline (see the
+    /// P2 dangling-index-entry fix). Cheap: one bool vec, a handful of index
+    /// entries walked.
+    pub(crate) fn indexed_col_mask(&self) -> Vec<bool> {
+        let mut mask = vec![false; self.schema.columns.len()];
+        for entry in &self.indexed_cols {
+            if entry.col_idx < mask.len() {
+                mask[entry.col_idx] = true;
+            }
+        }
+        mask
+    }
+
+    /// Heap on-disk format version. `>= HEAP_FORMAT_VERSION_WITH_OVERFLOW` (3)
+    /// means the table has used overflow pages at least once, so it may hold
+    /// v2 (spilled) rows. The executor uses this to route such tables away from
+    /// the v1-only raw-byte fast paths (which cannot correctly read or patch a
+    /// v2 row) and onto the reassembling decode paths.
+    #[inline]
+    pub fn format_version(&self) -> u16 {
+        self.heap.format_version()
+    }
+
+    /// Whether this table may hold v2 (spilled) rows: true once its heap has
+    /// ever written an overflow chain. The executor gates the v1-only raw-byte
+    /// read/patch fast paths on this — a spilled table takes the reassembling
+    /// decode paths instead (correct for values of any size, including the
+    /// `>= 64KB` values that cannot be re-inlined into a u16 v1 row).
+    #[inline]
+    pub fn has_overflow_rows(&self) -> bool {
+        self.heap.format_version() >= crate::heap::HEAP_FORMAT_VERSION_WITH_OVERFLOW
     }
 
     pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {

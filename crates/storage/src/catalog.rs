@@ -1229,6 +1229,16 @@ impl Catalog {
         Some(&mut self.tables[slot])
     }
 
+    /// Whether `table` may hold v2 (spilled) rows (see
+    /// [`Table::has_overflow_rows`]). Unknown table ⇒ false. The executor gates
+    /// its v1-only raw-byte fast paths on this.
+    #[inline]
+    pub fn table_has_overflow(&self, table: &str) -> bool {
+        self.get_table(table)
+            .map(|t| t.has_overflow_rows())
+            .unwrap_or(false)
+    }
+
     /// Private helper: resolve a table name to `&Table`, or return an
     /// `io::Error` with the same "table '<name>' not found" message the
     /// older `get_mut().ok_or_else(...)` callers produced. Phase 18
@@ -2190,7 +2200,8 @@ fn encode_row_with_spill_logged(
     // Size the v1 encoding WITHOUT encoding it (a >64KB value would panic the
     // debug-mode v1 encoder). Only actually encode v1 when the row fits inline.
     let v1_len = crate::row::v1_encoded_len(tbl.row_layout(), values);
-    let chosen = plan_spill(tbl.row_layout(), values, v1_len);
+    let is_indexed = tbl.indexed_col_mask();
+    let chosen = plan_spill(tbl.row_layout(), values, v1_len, &is_indexed);
     if chosen.is_empty() {
         let mut v1 = Vec::new();
         encode_row_into(&tbl.schema, values, &mut v1);
