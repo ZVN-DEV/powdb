@@ -19,6 +19,11 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// `schema` — introspection: list every type (table) in the catalog.
+    ListTypes,
+    /// `describe <Type>` / `schema <Type>` — introspection: the columns and
+    /// indexes of one type.
+    Describe(String),
 }
 
 /// `alter User add column status: str` / `alter User drop column status`
@@ -38,25 +43,35 @@ pub enum AlterAction {
     },
     DropColumn {
         name: String,
+        /// `drop column if exists` — a missing column is a no-op instead of
+        /// an error.
+        if_exists: bool,
     },
-    /// `alter <Table> add index .<column>` — creates a B+Tree index on
-    /// `column`. No-op if the index already exists.
+    /// `alter <Table> add index [if not exists] .<column>` — creates a
+    /// B+Tree index on `column`. No-op if the index already exists.
     AddIndex {
         column: String,
+        /// Parsed for symmetry with the other DDL; `add index` is already
+        /// idempotent, so this does not change behavior.
+        if_not_exists: bool,
     },
-    /// `alter <Table> add unique .<column>` — creates a UNIQUE B+Tree
-    /// index on `column`. Scans existing data first and fails if any
-    /// duplicate (non-null) value is present. Errors if the column is
-    /// already indexed (no in-place upgrade).
+    /// `alter <Table> add unique [if not exists] .<column>` — creates a
+    /// UNIQUE B+Tree index on `column`. Scans existing data first and fails
+    /// if any duplicate (non-null) value is present. Without `if not exists`
+    /// it errors when the column is already indexed (no in-place upgrade);
+    /// with it, an existing index is a no-op.
     AddUnique {
         column: String,
+        if_not_exists: bool,
     },
 }
 
-/// `drop User`
+/// `drop [if exists] User`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTableExpr {
     pub table: String,
+    /// `drop if exists` — a missing table is a no-op instead of an error.
+    pub if_exists: bool,
 }
 
 /// `create [materialized] view ActiveUsers as User filter .active = true`
@@ -74,10 +89,12 @@ pub struct RefreshViewExpr {
     pub name: String,
 }
 
-/// `drop view ActiveUsers`
+/// `drop view [if exists] ActiveUsers`
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropViewExpr {
     pub name: String,
+    /// `drop view if exists` — a missing view is a no-op instead of an error.
+    pub if_exists: bool,
 }
 
 /// `User filter .age > 30 union User filter .status = "vip"`
@@ -207,6 +224,9 @@ pub struct UpsertExpr {
 pub struct CreateTypeExpr {
     pub name: String,
     pub fields: Vec<FieldDef>,
+    /// `type X if not exists { ... }` — re-declaring an existing type is a
+    /// no-op instead of an error.
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

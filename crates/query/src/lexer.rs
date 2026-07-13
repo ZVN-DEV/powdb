@@ -29,6 +29,7 @@ pub const POWQL_KEYWORDS: &[&str] = &[
     "delete",
     "dense_rank",
     "desc",
+    "describe",
     "distinct",
     "drop",
     "else",
@@ -79,6 +80,7 @@ pub const POWQL_KEYWORDS: &[&str] = &[
     "rollback",
     "round",
     "row_number",
+    "schema",
     "select",
     "sqrt",
     "substring",
@@ -145,6 +147,58 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             while pos < chars.len() && chars[pos] != '\n' {
                 pos += 1;
             }
+            continue;
+        }
+
+        // Backtick-quoted dot-ident: .`field name` — lets a reserved word be
+        // used as a field reference in filter/order/project positions.
+        if chars[pos] == '.' && pos + 1 < chars.len() && chars[pos + 1] == '`' {
+            pos += 2; // skip `.` and opening backtick
+            let start = pos;
+            while pos < chars.len() && chars[pos] != '`' {
+                pos += 1;
+            }
+            if pos >= chars.len() {
+                return Err(LexError {
+                    message: "unterminated quoted identifier".into(),
+                    position: pos,
+                });
+            }
+            let name: String = chars[start..pos].iter().collect();
+            if name.is_empty() {
+                return Err(LexError {
+                    message: "empty quoted identifier".into(),
+                    position: start,
+                });
+            }
+            pos += 1; // closing backtick
+            tokens.push(Token::DotIdent(name));
+            continue;
+        }
+
+        // Backtick-quoted identifier: `column name` — always an identifier,
+        // never a keyword, so reserved words can be used as column/type names.
+        if chars[pos] == '`' {
+            pos += 1; // opening backtick
+            let start = pos;
+            while pos < chars.len() && chars[pos] != '`' {
+                pos += 1;
+            }
+            if pos >= chars.len() {
+                return Err(LexError {
+                    message: "unterminated quoted identifier".into(),
+                    position: pos,
+                });
+            }
+            let name: String = chars[start..pos].iter().collect();
+            if name.is_empty() {
+                return Err(LexError {
+                    message: "empty quoted identifier".into(),
+                    position: start,
+                });
+            }
+            pos += 1; // closing backtick
+            tokens.push(Token::Ident(name));
             continue;
         }
 
@@ -362,6 +416,8 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 "add" => Token::Add,
                 "column" => Token::Column,
                 "explain" => Token::Explain,
+                "schema" => Token::Schema,
+                "describe" => Token::Describe,
                 "true" => Token::BoolLit(true),
                 "false" => Token::BoolLit(false),
                 _ => Token::Ident(word),
@@ -603,6 +659,69 @@ mod tests {
     /// Regression for issue #24: an integer literal with more digits than
     /// i64 can hold previously reached `s.parse::<i64>().unwrap()` and
     /// panicked. It must return a `LexError` instead.
+    #[test]
+    fn test_lex_backtick_identifier() {
+        // A reserved word inside backticks lexes as a plain identifier.
+        let tokens = lex("type Post { `type`: str }").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Type,
+                Token::Ident("Post".into()),
+                Token::LBrace,
+                Token::Ident("type".into()),
+                Token::Colon,
+                Token::Ident("str".into()),
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lex_backtick_dot_identifier() {
+        // `.`type`` is a field reference to a column named `type`.
+        let tokens = lex("Post filter .`type` = \"x\"").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("Post".into()),
+                Token::Filter,
+                Token::DotIdent("type".into()),
+                Token::Eq,
+                Token::StringLit("x".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lex_backtick_allows_spaces_in_identifier() {
+        let tokens = lex("`full name`").unwrap();
+        assert_eq!(tokens, vec![Token::Ident("full name".into()), Token::Eof]);
+    }
+
+    #[test]
+    fn test_lex_unterminated_backtick_errors() {
+        let err = lex("`type").expect_err("must error");
+        assert!(err.message.contains("unterminated quoted identifier"));
+    }
+
+    #[test]
+    fn test_lex_empty_backtick_errors() {
+        let err = lex("``").expect_err("must error");
+        assert!(err.message.contains("empty quoted identifier"));
+    }
+
+    #[test]
+    fn test_lex_schema_and_describe_keywords() {
+        assert_eq!(lex("schema").unwrap(), vec![Token::Schema, Token::Eof]);
+        assert_eq!(
+            lex("describe Post").unwrap(),
+            vec![Token::Describe, Token::Ident("Post".into()), Token::Eof]
+        );
+    }
+
     #[test]
     fn test_lex_intlit_overflow_returns_err() {
         // 22 digits — well past i64::MAX (19 digits).

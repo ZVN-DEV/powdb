@@ -241,6 +241,8 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Having => hash_byte(h, 0x3B),
         Token::Is => hash_byte(h, 0x3C),
         Token::Null => hash_byte(h, 0x3D),
+        Token::Schema => hash_byte(h, 0x3E),
+        Token::Describe => hash_byte(h, 0x3F),
         Token::Upper => hash_byte(h, 0x50),
         Token::Lower => hash_byte(h, 0x51),
         Token::Length => hash_byte(h, 0x52),

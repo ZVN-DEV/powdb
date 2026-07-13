@@ -107,11 +107,13 @@ pub enum Token {
     DenseRank, // dense_rank
 
     // DDL
-    Alter,   // alter
-    Drop,    // drop
-    Add,     // add
-    Column,  // column
-    Explain, // explain
+    Alter,    // alter
+    Drop,     // drop
+    Add,      // add
+    Column,   // column
+    Explain,  // explain
+    Schema,   // schema   (introspection: list types / describe one)
+    Describe, // describe (introspection: describe one type)
 
     // Operators
     Eq,       // =
@@ -259,6 +261,8 @@ impl Token {
             Token::Add => "'add'".into(),
             Token::Column => "'column'".into(),
             Token::Explain => "'explain'".into(),
+            Token::Schema => "'schema'".into(),
+            Token::Describe => "'describe'".into(),
 
             // Operators
             Token::Eq => "'='".into(),
@@ -287,5 +291,106 @@ impl Token {
 
             Token::Eof => "end of input".into(),
         }
+    }
+
+    /// The lowercase source spelling of this token when it is a reserved
+    /// keyword (or built-in literal word), or `None` for identifiers,
+    /// literals, operators, and delimiters. Inverts the lexer's word→token
+    /// table so the parser can tell a caller *which* reserved word collided
+    /// with an identifier position and how to quote it (`` `type` ``).
+    pub fn keyword_str(&self) -> Option<&'static str> {
+        Some(match self {
+            Token::Type => "type",
+            Token::Filter => "filter",
+            Token::Order => "order",
+            Token::Limit => "limit",
+            Token::Offset => "offset",
+            Token::Insert => "insert",
+            Token::Update => "update",
+            Token::Delete => "delete",
+            Token::Upsert => "upsert",
+            Token::Returning => "returning",
+            Token::Select => "select",
+            Token::Required => "required",
+            Token::Default => "default",
+            Token::Auto => "auto",
+            Token::Multi => "multi",
+            Token::Link => "link",
+            Token::Index => "index",
+            Token::Unique => "unique",
+            Token::On => "on",
+            Token::Conflict => "conflict",
+            Token::Asc => "asc",
+            Token::Desc => "desc",
+            Token::And => "and",
+            Token::Or => "or",
+            Token::Not => "not",
+            Token::Exists => "exists",
+            Token::Let => "let",
+            Token::As => "as",
+            Token::Match => "match",
+            Token::Group => "group",
+            Token::Join => "join",
+            Token::Inner => "inner",
+            Token::LeftKw => "left",
+            Token::RightKw => "right",
+            Token::Outer => "outer",
+            Token::Cross => "cross",
+            Token::Transaction => "transaction",
+            Token::Begin => "begin",
+            Token::Commit => "commit",
+            Token::Rollback => "rollback",
+            Token::View => "view",
+            Token::Materialized => "materialized",
+            Token::Refresh => "refresh",
+            Token::Union => "union",
+            Token::Having => "having",
+            Token::Distinct => "distinct",
+            Token::In => "in",
+            Token::Between => "between",
+            Token::Like => "like",
+            Token::Count => "count",
+            Token::Avg => "avg",
+            Token::Sum => "sum",
+            Token::Min => "min",
+            Token::Max => "max",
+            Token::Is => "is",
+            Token::Null => "null",
+            Token::Upper => "upper",
+            Token::Lower => "lower",
+            Token::Length => "length",
+            Token::Trim => "trim",
+            Token::Substring => "substring",
+            Token::Concat => "concat",
+            Token::Abs => "abs",
+            Token::Round => "round",
+            Token::Ceil => "ceil",
+            Token::Floor => "floor",
+            Token::Sqrt => "sqrt",
+            Token::Pow => "pow",
+            Token::Now => "now",
+            Token::Extract => "extract",
+            Token::DateAdd => "date_add",
+            Token::DateDiff => "date_diff",
+            Token::Cast => "cast",
+            Token::Case => "case",
+            Token::When => "when",
+            Token::Then => "then",
+            Token::Else => "else",
+            Token::End => "end",
+            Token::Over => "over",
+            Token::Partition => "partition",
+            Token::RowNumber => "row_number",
+            Token::Rank => "rank",
+            Token::DenseRank => "dense_rank",
+            Token::Alter => "alter",
+            Token::Drop => "drop",
+            Token::Add => "add",
+            Token::Column => "column",
+            Token::Explain => "explain",
+            Token::Schema => "schema",
+            Token::Describe => "describe",
+            _ => return None,
+        })
     }
 }

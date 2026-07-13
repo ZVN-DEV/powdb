@@ -55,6 +55,21 @@ pub(super) fn type_name_to_id(name: &str) -> Result<TypeId, String> {
     }
 }
 
+/// The canonical PowQL spelling of a `TypeId`, for schema introspection
+/// output. Inverse of [`type_name_to_id`].
+pub(super) fn type_id_to_name(type_id: TypeId) -> &'static str {
+    match type_id {
+        TypeId::Int => "int",
+        TypeId::Float => "float",
+        TypeId::Bool => "bool",
+        TypeId::Str => "str",
+        TypeId::DateTime => "datetime",
+        TypeId::Uuid => "uuid",
+        TypeId::Bytes => "bytes",
+        TypeId::Empty => "empty",
+    }
+}
+
 /// The row format is:
 ///   [length: u16][null_bitmap][fixed cols packed][var offset table: (n_var+1) u16s][var data]
 pub(super) struct FastLayout {

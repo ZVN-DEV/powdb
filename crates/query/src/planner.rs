@@ -57,13 +57,21 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
             table: at.table,
             action: at.action,
         }),
-        Statement::DropTable(dt) => Ok(PlanNode::DropTable { name: dt.table }),
+        Statement::DropTable(dt) => Ok(PlanNode::DropTable {
+            name: dt.table,
+            if_exists: dt.if_exists,
+        }),
         Statement::CreateView(cv) => Ok(PlanNode::CreateView {
             name: cv.name,
             query_text: cv.query_text,
         }),
         Statement::RefreshView(rv) => Ok(PlanNode::RefreshView { name: rv.name }),
-        Statement::DropView(dv) => Ok(PlanNode::DropView { name: dv.name }),
+        Statement::DropView(dv) => Ok(PlanNode::DropView {
+            name: dv.name,
+            if_exists: dv.if_exists,
+        }),
+        Statement::ListTypes => Ok(PlanNode::ListTypes),
+        Statement::Describe(table) => Ok(PlanNode::Describe { table }),
         Statement::Union(u) => {
             let left = plan_statement(*u.left)?;
             let right = plan_statement(*u.right)?;
@@ -524,6 +532,7 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
     Ok(PlanNode::CreateTable {
         name: ct.name,
         fields,
+        if_not_exists: ct.if_not_exists,
     })
 }
 
