@@ -727,9 +727,7 @@ fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usi
             // v0.12 grammar exists; they will be added alongside that feature.
             let field_name = match inner.as_ref() {
                 Expr::Field(name) => Some(name.clone()),
-                Expr::QualifiedField { qualifier, field } => {
-                    Some(format!("{qualifier}.{field}"))
-                }
+                Expr::QualifiedField { qualifier, field } => Some(format!("{qualifier}.{field}")),
                 _ => None,
             };
             if let Some(name) = field_name {

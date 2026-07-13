@@ -650,7 +650,11 @@ mod tests {
         let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
-        assert_eq!(found, vec![Literal::Int(5)], "new HAVING literal substituted");
+        assert_eq!(
+            found,
+            vec![Literal::Int(5)],
+            "new HAVING literal substituted"
+        );
         assert_eq!(cache.hits, 1);
     }
 

@@ -5810,9 +5810,7 @@ fn test_aggregate_in_unsupported_position_errors_not_empty() {
     // An aggregate in a projection with no GROUP BY has no computed column to
     // reference; it must be a typed error, never a silent Empty cell.
     let mut engine = group_join_engine();
-    let err = engine
-        .execute_powql("User { c: count(.id) }")
-        .unwrap_err();
+    let err = engine.execute_powql("User { c: count(.id) }").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("aggregate"),
@@ -5847,7 +5845,9 @@ fn test_group_fanout_avg_matches_docs_example() {
     // A(1) has 4 orders, B(2) has 1, C(3) has 1 => 6 joined rows.
     for (oid, aid) in [(10, 1), (11, 1), (12, 1), (13, 1), (14, 2), (15, 3)] {
         engine
-            .execute_powql(&format!("insert Ord {{ id := {oid}, account_id := {aid} }}"))
+            .execute_powql(&format!(
+                "insert Ord {{ id := {oid}, account_id := {aid} }}"
+            ))
             .unwrap();
     }
     let (_, rows) = cols_rows(
@@ -5860,7 +5860,10 @@ fn test_group_fanout_avg_matches_docs_example() {
     );
     assert_eq!(rows.len(), 1);
     match rows[0][1] {
-        Value::Float(v) => assert!((v - 15.0).abs() < 1e-9, "fan-out avg was {v}, expected 15.0"),
+        Value::Float(v) => assert!(
+            (v - 15.0).abs() < 1e-9,
+            "fan-out avg was {v}, expected 15.0"
+        ),
         ref other => panic!("expected Float avg, got {other:?}"),
     }
     assert_eq!(rows[0][2], Value::Int(3), "count(distinct) is fan-out-safe");

@@ -1237,10 +1237,9 @@ impl Parser {
     /// Parse `group .field1, alias.field2 [having <expr>]`.
     ///
     /// Two key forms are accepted:
-    ///   - `.field`        is a bare `DotIdent`, an `Unqualified` key.
-    ///   - `alias.field`   is an `Ident` followed by a `DotIdent`, a
-    ///                     `Qualified` key (the lexer splits `u.status`
-    ///                     into `Ident("u")` + `DotIdent("status")`).
+    ///   - `.field` is a bare `DotIdent`, an `Unqualified` key.
+    ///   - `alias.field` is an `Ident` followed by a `DotIdent`, a `Qualified`
+    ///     key (the lexer splits `u.status` into `Ident("u")` + `DotIdent("status")`).
     fn parse_group_by(&mut self) -> Result<GroupByClause, ParseError> {
         let mut keys = Vec::new();
         loop {

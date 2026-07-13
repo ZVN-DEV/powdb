@@ -3506,10 +3506,7 @@ pub(super) fn execute_window(
 ///   3. An unqualified name falls back to a unique `.field` suffix match over
 ///      the join output columns. Zero matches is a column-not-found error;
 ///      more than one is an ambiguity error naming the candidates.
-pub(super) fn resolve_group_column(
-    name: &str,
-    columns: &[String],
-) -> Result<usize, QueryError> {
+pub(super) fn resolve_group_column(name: &str, columns: &[String]) -> Result<usize, QueryError> {
     if let Some(i) = columns.iter().position(|c| c == name) {
         return Ok(i);
     }
@@ -3582,8 +3579,7 @@ pub(super) fn exec_group_by(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Group rows by key values (preserving insertion order).
-    let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
-        rustc_hash::FxHashMap::default();
+    let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> = rustc_hash::FxHashMap::default();
     let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     for (ri, row) in rows.iter().enumerate() {
         let key: Vec<Value> = key_indices.iter().map(|&i| row[i].clone()).collect();
