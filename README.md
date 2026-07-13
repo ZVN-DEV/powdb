@@ -64,6 +64,14 @@ cargo build --release
 
 Requires Rust 1.93+. This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks. TLS support in `powdb-server` pulls `aws-lc-sys`, which requires a C toolchain (`cmake`); disable the default `tls` feature for a fully-Rust build.
 
+### Apple silicon / arm64
+
+The published `ghcr.io/zvn-dev/powdb:latest` image is currently `linux/amd64`-only; a `linux/arm64` manifest ships with the next release. On Apple silicon or ARM servers (e.g. Graviton), install the native binary directly — it builds in under a minute:
+
+```bash
+cargo install powdb-server
+```
+
 ## Benchmark: PowDB vs SQLite (100K rows, M1)
 
 PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. For durable write throughput, batch writes in a transaction — see [Write throughput & durability](#write-throughput--durability).
