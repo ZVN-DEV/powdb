@@ -1,4 +1,4 @@
-//! End-to-end tests for two Capa-dogfood fixes:
+//! End-to-end tests for two internal dogfood fixes:
 //!
 //!   P-4  — overlapping explicit transactions QUEUE behind the transaction gate
 //!          (they no longer fail fast), bounded by a configurable wait timeout
@@ -154,7 +154,7 @@ fn is_error(msg: &Message) -> bool {
 
 // ---- P-4: transaction gate queuing + timeout ----------------------------
 
-/// The Capa repro: 10 concurrent connections each running begin/insert/commit
+/// The dogfood repro: 10 concurrent connections each running begin/insert/commit
 /// must ALL succeed. Before queuing, the second overlapping `begin` failed fast
 /// (~54% failure under 10-way concurrency); now they serialize through the gate.
 #[tokio::test]
@@ -280,11 +280,11 @@ async fn same_connection_double_begin_errors_without_hanging() {
     );
 }
 
-// ---- Capa #4: bare autocommit writes are bounded by the same gate --------
+// ---- Dogfood #4: bare autocommit writes are bounded by the same gate --------
 
-/// The Capa dogfood repro: connection A holds an explicit transaction open and
+/// The dogfood repro: connection A holds an explicit transaction open and
 /// never commits; connection B issues a BARE autocommit insert (no `begin`).
-/// Before this fix B waited on the gate UNBOUNDED (Capa measured ~7.7s behind
+/// Before this fix B waited on the gate UNBOUNDED (the dogfood run measured ~7.7s behind
 /// an 8s holder, and a wedged holder wedged writers forever). Now B fails fast
 /// with the clear, typed timeout error. After A commits, a retry from B works.
 #[tokio::test]

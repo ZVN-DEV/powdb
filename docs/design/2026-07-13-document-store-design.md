@@ -2,7 +2,7 @@
 
 Date: 2026-07-13. Status: APPROVED 2026-07-13 (Kirby): F1 = PJ1 binary, F2 = symmetric
 by default, phasing as specified.
-Scope: Capa dogfood findings P-2, P-3, P-5 (the "primary store" capability gaps).
+Scope: internal dogfood findings P-2, P-3, P-5 (the "primary store" capability gaps).
 
 Provenance: synthesized from two independent design lanes (pragmatic vs destination-first)
 over a code-verified recon of the storage and query engines at v0.10.0. Every claim about
@@ -10,7 +10,7 @@ current code was verified against the repo; file:line references are to v0.10.0.
 
 ## 1. Context and goals
 
-The Capa CMS dogfood run (July 2026, powdb 0.9.0) proved correctness parity with
+An internal CMS dogfood run (July 2026, powdb 0.9.0) proved correctness parity with
 Prisma/Postgres (21/21) but found PowDB unviable as a primary document-shaped store:
 
 - P-2: the ~4070 byte row cap forced app-side chunking (14,228 chunk rows, 8-chunk max,
@@ -198,7 +198,7 @@ from the first release.
 
 - Lane A argued validated minified UTF-8 text: reversible later behind a tag byte,
   ~300 LoC validator, zero wire cost, and path indexes (not per-value structure) as the
-  perf answer. Fallback scans land ~300ms on the Capa shape: 5x better than their EAV,
+  perf answer. Fallback scans land ~300ms on the dogfood workload shape: 5x better than their EAV,
   but 7x behind PG's 45ms.
 - Lane B argued a binary order-defined encoding (PJ1): sorted-key directories make a
   path probe an O(depth x log fanout) pointer walk over raw mmap bytes with zero parse
@@ -391,7 +391,7 @@ v0.11/v0.12 benchmarks miss the 37ms-class target, per measure-first practice.
 
 ## 7. Phasing
 
-Neither lane's phasing survives contact: JSON before overflow is half a feature (Capa's
+Neither lane's phasing survives contact: JSON before overflow is half a feature (the dogfood
 documents exceed 4070B, so a JSON type they cannot store does not dechunk anything), and
 everything-in-one-release is too heavy. Overflow and the P-5 fixes are disjoint crates
 and parallelize as lanes.
@@ -441,7 +441,7 @@ Benchmarks (powdb-bench + powdb-compare, Depot-only baselines per standing polic
 
 | Bench | Shape | Baseline | Target |
 |---|---|---|---|
-| B1 | Capa 14,228-doc ingest UNCHUNKED + point reads | app-side chunking | point read < 100us; ingest >= chunked baseline |
+| B1 | Internal 14,228-doc ingest UNCHUNKED + point reads | app-side chunking | point read < 100us; ingest >= chunked baseline |
 | B2 | JSON-field filter, 77K docs | 1.7s EAV / PG 45ms | v0.12 compiled scan: inline beats 45ms, out-of-line within 1.5x; v0.13 indexed < 5ms |
 | B3 | grouped agg over one-to-many join (S6) | 518ms app-side / PG 37ms | v0.11 in-engine < 100ms; v0.13 37ms-class |
 | B4 | existing 20-workload suite | baseline/main.json | zero regression; v2 row branch budget < 2% on scan-heavy |

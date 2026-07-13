@@ -5279,12 +5279,12 @@ fn test_delete_without_returning_still_modified() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Capa dogfood quick-wins (P-6 reserved words, P-7 idempotency, P-8 intro)
+// Dogfood quick-wins (P-6 reserved words, P-7 idempotency, P-8 intro)
 // ════════════════════════════════════════════════════════════════════════
 
 fn fresh_engine() -> Engine {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("powdb_capa_{}_{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("powdb_dogfood_{}_{}", std::process::id(), id));
     let _ = std::fs::remove_dir_all(&dir);
     Engine::new(&dir).unwrap()
 }

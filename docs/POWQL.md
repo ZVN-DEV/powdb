@@ -571,7 +571,7 @@ Account as a join Ord as o on a.id = o.account_id
 
 Because account A appears in four joined rows, `avg(a.balance)` over the joined
 rows in the "gold" group is `(10*4 + 10 + 40) / 6 = 15.0`, not the true `20.0`.
-The real Capa S6 workload shows the same effect at scale: a true average of
+A real document-heavy CMS workload shows the same effect at scale: a true average of
 `12.92` collapses to `8.67` once the join fans out the rows.
 
 Until symmetric aggregates ship (see below), use `count(distinct ...)` as the

@@ -3583,7 +3583,7 @@ mod cleanup_parser_dx_tests {
 }
 
 #[cfg(test)]
-mod capa_dx_tests {
+mod dogfood_dx_tests {
     use super::*;
 
     // ── P-6: reserved words as column names ────────────────────────────

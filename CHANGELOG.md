@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0] - 2026-07-13
 
-Dogfood-hardening release from the Capa v3x experiment: a **bounded
+Dogfood-hardening release from an internal dogfood workload: a **bounded
 transaction-gate wait** that turns concurrent `begin` hangs into a clear,
 metered error — fixing a ~54% concurrent-create failure mode — plus PowQL
 developer-experience work (reserved-word errors + backtick quoting, `if
@@ -31,8 +31,8 @@ reserved word in identifier position.
   `POWDB_TX_WAIT_TIMEOUT_MS`, default 5000ms) instead of hanging up to the
   300s idle timeout. On elapse the client gets a clear `transaction gate
   timeout` error and the new `powdb_tx_gate_timeouts_total` metric is
-  incremented. Fixes the ~54% concurrent-create failure mode from the Capa
-  dogfood run, where pooled clients saw `begin` hang past their own
+  incremented. Fixes the ~54% concurrent-create failure mode from an
+  internal dogfood run, where pooled clients saw `begin` hang past their own
   timeouts. New wire-level e2e tests including the 10-writer repro (0
   failures) and disconnect-mid-transaction gate release.
 - **Opt-in `--db-name` / `POWDB_DB_NAME` connect enforcement.** When set,
