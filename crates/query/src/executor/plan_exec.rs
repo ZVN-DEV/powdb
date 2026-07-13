@@ -1652,8 +1652,10 @@ impl Engine {
                             message: format!("type '{name}' already exists (skipped)"),
                         });
                     }
+                    // "cannot" prefix keeps this on the server's
+                    // safe-to-forward allowlist (SAFE_ERROR_PREFIXES).
                     return Err(QueryError::Execution(format!(
-                        "type '{name}' already exists"
+                        "cannot create type '{name}': it already exists"
                     )));
                 }
                 let columns: Vec<ColumnDef> = fields

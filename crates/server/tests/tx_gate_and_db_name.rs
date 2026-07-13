@@ -319,3 +319,48 @@ async fn unpinned_server_accepts_any_db_name() {
         );
     }
 }
+
+// ---- P-6/P-7: DX error messages must survive wire sanitization -----------
+
+/// The reserved-word and duplicate-type guidance is only useful if it reaches
+/// wire clients. These messages must stay on the server's safe-to-forward
+/// allowlist (SAFE_ERROR_PREFIXES) — a prefix drift here silently masks them
+/// back to "query execution error", which is exactly the dogfood complaint.
+#[tokio::test]
+async fn dx_error_messages_survive_wire_sanitization() {
+    let addr = start_server(ServerConfig::default()).await;
+    let mut s = connect(addr, "default").await;
+
+    let reserved = query(&mut s, "type Post { type: str }").await;
+    match reserved {
+        Message::Error { message } => assert!(
+            message.contains("reserved word") && message.contains("`type`"),
+            "reserved-word guidance was sanitized away: {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let created = query(&mut s, "type Post { title: str }").await;
+    assert!(!is_error(&created), "setup create failed: {created:?}");
+    let duplicate = query(&mut s, "type Post { title: str }").await;
+    match duplicate {
+        Message::Error { message } => assert!(
+            message.contains("cannot create type 'Post'"),
+            "duplicate-type message was sanitized away: {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    let begin = query(&mut s, "begin").await;
+    assert!(!is_error(&begin), "begin failed: {begin:?}");
+    let double_begin = query(&mut s, "begin").await;
+    match double_begin {
+        Message::Error { message } => assert!(
+            message.contains("transaction is already active"),
+            "double-begin message was sanitized away: {message:?}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let rollback = query(&mut s, "rollback").await;
+    assert!(!is_error(&rollback), "rollback failed: {rollback:?}");
+}

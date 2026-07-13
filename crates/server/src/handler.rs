@@ -1566,7 +1566,9 @@ async fn execute_wire_query(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
@@ -1662,7 +1664,9 @@ async fn execute_wire_query_sql(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
@@ -1760,7 +1764,9 @@ async fn execute_wire_query_with_params(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
@@ -2104,16 +2110,21 @@ where
             // One process serves one database. When pinned to a name, reject a
             // CONNECT that explicitly asks for a different one (checked after
             // auth so db existence never leaks to unauthenticated clients).
-            // When unpinned, accept anything but warn once so the silent
-            // one-db-per-process mismatch is at least visible.
+            // When unpinned, accept anything but warn once per process so the
+            // silent one-db-per-process mismatch is visible without spamming
+            // the log on every pooled connection.
             match check_db_name(server_db_name.as_deref(), &db_name) {
                 Ok(()) => {
                     if server_db_name.is_none() && !db_name.is_empty() && db_name != DEFAULT_DB_NAME
                     {
-                        warn!(
-                            peer = %peer, db = %db_name,
-                            "client requested a named database but this server serves a single global database; name ignored"
-                        );
+                        static NAMED_DB_WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !NAMED_DB_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            warn!(
+                                peer = %peer, db = %db_name,
+                                "client requested a named database but this server serves a single global database; name ignored"
+                            );
+                        }
                     }
                 }
                 Err(msg) => {

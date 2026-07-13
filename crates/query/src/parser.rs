@@ -307,8 +307,11 @@ impl Parser {
     fn named_ident_error(&self, context: &str, got: &Token) -> ParseError {
         if let Some(kw) = got.keyword_str() {
             ParseError::Syntax {
+                // "syntax error" prefix keeps the message on the server's
+                // safe-to-forward allowlist (SAFE_ERROR_PREFIXES) so wire
+                // clients see the guidance instead of the generic mask.
                 message: format!(
-                    "'{kw}' is a reserved word and cannot be used as a {context}; \
+                    "syntax error: '{kw}' is a reserved word and cannot be used as a {context}; \
                      rename it or quote it as `{kw}`"
                 ),
             }

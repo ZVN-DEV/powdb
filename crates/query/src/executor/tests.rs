@@ -5378,7 +5378,7 @@ fn test_duplicate_create_type_names_the_type() {
     let err = engine.execute_powql("type Post { id: int }").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("type 'Post' already exists"),
+        msg.contains("cannot create type 'Post'"),
         "expected a type-named error, got: {msg}"
     );
 }

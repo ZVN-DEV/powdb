@@ -1206,9 +1206,15 @@ PowQL keywords cannot be used **bare** as type or column names. For example,
 `type Post { type: str }` fails with:
 
 ```
-'type' is a reserved word and cannot be used as a field name;
+syntax error: 'type' is a reserved word and cannot be used as a field name;
 rename it or quote it as `type`
 ```
+
+> **Breaking change (v0.10):** `schema` and `describe` are now keywords.
+> A lowercase bare identifier named `schema` or `describe` that parsed in
+> earlier releases must now be backtick-quoted (`` `schema` ``). Keyword
+> matching is case-sensitive, so capitalized names like `type Schema { … }`
+> are unaffected.
 
 To use a reserved word as an identifier anyway, wrap it in **backticks**. A
 backtick-quoted identifier is always a plain name, never a keyword, and works
