@@ -16,6 +16,66 @@ use super::{check_join_limit, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::ViewDef;
 
 impl Engine {
+    /// `schema` — one result row per type: name + column count. Read-only;
+    /// reads live catalog state, so a cached plan can never serve a stale list.
+    pub(super) fn introspect_list_types(&self) -> Result<QueryResult, QueryError> {
+        let rows: Vec<Vec<Value>> = self
+            .catalog
+            .list_tables()
+            .iter()
+            .map(|name| {
+                let cols = self
+                    .catalog
+                    .schema(name)
+                    .map(|s| s.columns.len())
+                    .unwrap_or(0) as i64;
+                vec![Value::Str((*name).to_string()), Value::Int(cols)]
+            })
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec!["name".to_string(), "columns".to_string()],
+            rows,
+        })
+    }
+
+    /// `describe <Type>` — one result row per column: name, type, nullability,
+    /// and index kind (`unique` / `index` / empty). Read-only.
+    pub(super) fn introspect_describe(&self, table: &str) -> Result<QueryResult, QueryError> {
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+        let rows: Vec<Vec<Value>> = schema
+            .columns
+            .iter()
+            .map(|c| {
+                let index = if self.catalog.has_index(table, &c.name) {
+                    match self.catalog.is_index_unique(table, &c.name) {
+                        Some(true) => "unique",
+                        _ => "index",
+                    }
+                } else {
+                    ""
+                };
+                vec![
+                    Value::Str(c.name.clone()),
+                    Value::Str(type_id_to_name(c.type_id).to_string()),
+                    Value::Bool(!c.required),
+                    Value::Str(index.to_string()),
+                ]
+            })
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "column".to_string(),
+                "type".to_string(),
+                "nullable".to_string(),
+                "index".to_string(),
+            ],
+            rows,
+        })
+    }
+
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
         match plan {
             PlanNode::SeqScan { table } => {
@@ -1578,7 +1638,26 @@ impl Engine {
                 }
             }
 
-            PlanNode::CreateTable { name, fields } => {
+            PlanNode::CreateTable {
+                name,
+                fields,
+                if_not_exists,
+            } => {
+                // Idempotency: a re-declared type is a clean no-op under
+                // `if not exists`, and otherwise a PowQL-flavored error that
+                // names the type (not the storage layer's generic "table").
+                if self.catalog.schema(name).is_some() {
+                    if *if_not_exists {
+                        return Ok(QueryResult::Executed {
+                            message: format!("type '{name}' already exists (skipped)"),
+                        });
+                    }
+                    // "cannot" prefix keeps this on the server's
+                    // safe-to-forward allowlist (SAFE_ERROR_PREFIXES).
+                    return Err(QueryError::Execution(format!(
+                        "cannot create type '{name}': it already exists"
+                    )));
+                }
                 let columns: Vec<ColumnDef> = fields
                     .iter()
                     .enumerate()
@@ -1663,7 +1742,23 @@ impl Engine {
                         message: format!("column '{name}' added to '{table}'"),
                     })
                 }
-                AlterAction::DropColumn { name } => {
+                AlterAction::DropColumn { name, if_exists } => {
+                    // `if exists`: a missing column (or missing table) is a
+                    // no-op instead of an error.
+                    if *if_exists {
+                        let present = self
+                            .catalog
+                            .schema(table)
+                            .map(|s| s.column_index(name).is_some())
+                            .unwrap_or(false);
+                        if !present {
+                            return Ok(QueryResult::Executed {
+                                message: format!(
+                                    "column '{name}' does not exist on '{table}' (skipped)"
+                                ),
+                            });
+                        }
+                    }
                     self.catalog
                         .alter_table_drop_column(table, name)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -1671,7 +1766,13 @@ impl Engine {
                         message: format!("column '{name}' dropped from '{table}'"),
                     })
                 }
-                AlterAction::AddIndex { column } => {
+                AlterAction::AddIndex {
+                    column,
+                    if_not_exists: _,
+                } => {
+                    // `add index` is already idempotent (no-op if the index
+                    // exists), so `if not exists` is accepted for symmetry but
+                    // does not change behavior.
                     self.catalog
                         .create_index(table, column)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -1679,10 +1780,22 @@ impl Engine {
                         message: format!("index on '{table}.{column}' created"),
                     })
                 }
-                AlterAction::AddUnique { column } => {
-                    // No DropIndex exists, so we cannot upgrade an existing
-                    // non-unique index in place — reject it cleanly.
+                AlterAction::AddUnique {
+                    column,
+                    if_not_exists,
+                } => {
+                    // `if not exists`: an already-indexed column is a no-op
+                    // rather than the (default) "already indexed" error.
                     if self.catalog.has_index(table, column) {
+                        if *if_not_exists {
+                            return Ok(QueryResult::Executed {
+                                message: format!(
+                                    "index on '{table}.{column}' already exists (skipped)"
+                                ),
+                            });
+                        }
+                        // No DropIndex exists, so we cannot upgrade an existing
+                        // non-unique index in place — reject it cleanly.
                         return Err(QueryError::Execution(format!(
                             "cannot add unique on {table}.{column}: column already indexed"
                         )));
@@ -1723,7 +1836,12 @@ impl Engine {
                 }
             },
 
-            PlanNode::DropTable { name } => {
+            PlanNode::DropTable { name, if_exists } => {
+                if *if_exists && self.catalog.schema(name).is_none() {
+                    return Ok(QueryResult::Executed {
+                        message: format!("type '{name}' does not exist (skipped)"),
+                    });
+                }
                 self.catalog
                     .drop_table(name)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -1731,6 +1849,10 @@ impl Engine {
                     message: format!("table '{name}' dropped"),
                 })
             }
+
+            PlanNode::ListTypes => self.introspect_list_types(),
+
+            PlanNode::Describe { table } => self.introspect_describe(table),
 
             PlanNode::CreateView { name, query_text } => {
                 self.create_view(name, query_text)?;
@@ -1746,7 +1868,12 @@ impl Engine {
                 })
             }
 
-            PlanNode::DropView { name } => {
+            PlanNode::DropView { name, if_exists } => {
+                if *if_exists && !self.view_registry.is_view(name) {
+                    return Ok(QueryResult::Executed {
+                        message: format!("view '{name}' does not exist (skipped)"),
+                    });
+                }
                 self.drop_view(name)?;
                 Ok(QueryResult::Executed {
                     message: format!("materialized view '{name}' dropped"),
@@ -4050,7 +4177,7 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             let ret = if *returning { " returning" } else { "" };
             format!("{indent}Delete table={table}{ret}\n{child}")
         }
-        PlanNode::CreateTable { name, fields } => {
+        PlanNode::CreateTable { name, fields, .. } => {
             let fs: Vec<String> = fields
                 .iter()
                 .map(|f| {
@@ -4069,10 +4196,12 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         PlanNode::AlterTable { table, action } => {
             format!("{indent}AlterTable table={table} action={action:?}")
         }
-        PlanNode::DropTable { name } => format!("{indent}DropTable name={name}"),
+        PlanNode::DropTable { name, .. } => format!("{indent}DropTable name={name}"),
         PlanNode::CreateView { name, .. } => format!("{indent}CreateView name={name}"),
         PlanNode::RefreshView { name } => format!("{indent}RefreshView name={name}"),
-        PlanNode::DropView { name } => format!("{indent}DropView name={name}"),
+        PlanNode::DropView { name, .. } => format!("{indent}DropView name={name}"),
+        PlanNode::ListTypes => format!("{indent}ListTypes"),
+        PlanNode::Describe { table } => format!("{indent}Describe table={table}"),
         PlanNode::Window { input, windows } => {
             let ws: Vec<String> = windows
                 .iter()

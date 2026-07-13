@@ -107,6 +107,8 @@ pub enum PlanNode {
     },
     DropTable {
         name: String,
+        /// `drop if exists` — a missing table is a no-op instead of an error.
+        if_exists: bool,
     },
     Insert {
         table: String,
@@ -141,6 +143,16 @@ pub enum PlanNode {
     CreateTable {
         name: String,
         fields: Vec<CreateField>,
+        /// `type X if not exists { ... }` — re-declaring an existing type is
+        /// a no-op instead of an error.
+        if_not_exists: bool,
+    },
+    /// `schema` — list every type (table) in the catalog. Read-only; reads
+    /// live catalog state at execution time, so a cached plan is never stale.
+    ListTypes,
+    /// `describe <Type>` — the columns and indexes of one type. Read-only.
+    Describe {
+        table: String,
     },
     /// Create a materialized view: execute query, store results, register.
     CreateView {
@@ -154,6 +166,8 @@ pub enum PlanNode {
     /// Drop a materialized view (backing table + registry entry).
     DropView {
         name: String,
+        /// `drop view if exists` — a missing view is a no-op instead of an error.
+        if_exists: bool,
     },
     /// Window function computation layer.
     Window {

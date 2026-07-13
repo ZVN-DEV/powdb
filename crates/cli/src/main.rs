@@ -232,7 +232,22 @@ fn parse_args() -> CliArgs {
     let mut restore_sync_mode = powdb_backup::RestoreSyncMode::StripSyncIdentity;
     let mut restore_sync_mode_was_set = false;
 
-    let argv: Vec<String> = std::env::args().collect();
+    // `std::env::args()` panics on a non-UTF-8 argument (it unwraps the
+    // OsString→String conversion internally). Use `args_os` and reject
+    // invalid UTF-8 with a clean error + exit code instead of a panic.
+    let argv: Vec<String> = match std::env::args_os()
+        .map(|a| a.into_string())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(v) => v,
+        Err(bad) => {
+            eprintln!(
+                "Error: argument is not valid UTF-8: {}",
+                bad.to_string_lossy()
+            );
+            std::process::exit(2);
+        }
+    };
     let mut i = 1;
     let mut saw_positional = false;
     while i < argv.len() {

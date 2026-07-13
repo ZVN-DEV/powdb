@@ -5277,3 +5277,230 @@ fn test_delete_without_returning_still_modified() {
         other => panic!("expected Modified, got {other:?}"),
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Capa dogfood quick-wins (P-6 reserved words, P-7 idempotency, P-8 intro)
+// ════════════════════════════════════════════════════════════════════════
+
+fn fresh_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_capa_{}_{}", std::process::id(), id));
+    let _ = std::fs::remove_dir_all(&dir);
+    Engine::new(&dir).unwrap()
+}
+
+fn rows_of(result: QueryResult) -> Vec<Vec<Value>> {
+    match result {
+        QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+// ── P-6: reserved words usable as columns via backtick quoting ──────────
+
+#[test]
+fn test_reserved_word_column_roundtrips_end_to_end() {
+    let mut engine = fresh_engine();
+    // DDL with reserved-word columns quoted.
+    engine
+        .execute_powql("type Post { required `type`: str, `order`: int }")
+        .unwrap();
+    // Insert quoting the reserved-word field names.
+    engine
+        .execute_powql(r#"insert Post { `type` := "news", `order` := 3 }"#)
+        .unwrap();
+    engine
+        .execute_powql(r#"insert Post { `type` := "blog", `order` := 1 }"#)
+        .unwrap();
+    // Filter, project and order over the reserved-word columns.
+    let result = engine
+        .execute_powql("Post filter .`type` = \"news\" { .`type`, .`order` }")
+        .unwrap();
+    let rows = rows_of(result);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Str("news".into()));
+    assert_eq!(rows[0][1], Value::Int(3));
+
+    // Order by the reserved-word column (plain `.type` also works — dot refs
+    // bypass keywords — but exercise the quoted form for round-trip).
+    let ordered = rows_of(
+        engine
+            .execute_powql("Post order .`order` asc { .`type` }")
+            .unwrap(),
+    );
+    assert_eq!(ordered[0][0], Value::Str("blog".into()));
+    assert_eq!(ordered[1][0], Value::Str("news".into()));
+
+    // Index DDL on a reserved-word column.
+    engine
+        .execute_powql("alter Post add index .`order`")
+        .unwrap();
+    // Index-backed lookup returns the right row.
+    let looked = rows_of(
+        engine
+            .execute_powql("Post filter .`order` = 1 { .`type` }")
+            .unwrap(),
+    );
+    assert_eq!(looked.len(), 1);
+    assert_eq!(looked[0][0], Value::Str("blog".into()));
+}
+
+#[test]
+fn test_reserved_word_ddl_without_quote_still_errors_clearly() {
+    let mut engine = fresh_engine();
+    let err = engine.execute_powql("type Post { type: str }").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("reserved word") && msg.contains("`type`"),
+        "{msg}"
+    );
+}
+
+// ── P-7: DDL idempotency ────────────────────────────────────────────────
+
+#[test]
+fn test_create_type_if_not_exists_is_noop() {
+    let mut engine = fresh_engine();
+    engine.execute_powql("type Post { id: int }").unwrap();
+    // Re-declare with if-not-exists — must succeed as a no-op.
+    engine
+        .execute_powql("type Post if not exists { id: int, extra: str }")
+        .unwrap();
+    // The original schema is untouched (one column).
+    let cols = rows_of(engine.execute_powql("describe Post").unwrap());
+    assert_eq!(cols.len(), 1, "if-not-exists must not redefine the type");
+}
+
+#[test]
+fn test_duplicate_create_type_names_the_type() {
+    let mut engine = fresh_engine();
+    engine.execute_powql("type Post { id: int }").unwrap();
+    let err = engine.execute_powql("type Post { id: int }").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot create type 'Post'"),
+        "expected a type-named error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_drop_if_exists_is_noop_on_missing_type() {
+    let mut engine = fresh_engine();
+    // No such type — plain drop errors, `if exists` is a clean no-op.
+    assert!(engine.execute_powql("drop Ghost").is_err());
+    engine.execute_powql("drop if exists Ghost").unwrap();
+}
+
+#[test]
+fn test_alter_drop_column_if_exists_is_noop() {
+    let mut engine = fresh_engine();
+    engine
+        .execute_powql("type Post { id: int, tag: str }")
+        .unwrap();
+    engine
+        .execute_powql("alter Post drop column if exists nonexistent")
+        .unwrap();
+    // Sanity: the real column is still droppable.
+    engine.execute_powql("alter Post drop column tag").unwrap();
+}
+
+#[test]
+fn test_add_unique_if_not_exists_is_noop_when_indexed() {
+    let mut engine = fresh_engine();
+    engine
+        .execute_powql("type Post { id: int, slug: str }")
+        .unwrap();
+    engine.execute_powql("alter Post add index .slug").unwrap();
+    // Already indexed — plain `add unique` errors, `if not exists` no-ops.
+    assert!(engine.execute_powql("alter Post add unique .slug").is_err());
+    engine
+        .execute_powql("alter Post add unique if not exists .slug")
+        .unwrap();
+}
+
+// ── P-8: introspection ──────────────────────────────────────────────────
+
+#[test]
+fn test_schema_lists_types_with_column_counts() {
+    let mut engine = fresh_engine();
+    engine
+        .execute_powql("type Post { id: int, body: str }")
+        .unwrap();
+    engine.execute_powql("type Tag { name: str }").unwrap();
+    let rows = rows_of(engine.execute_powql("schema").unwrap());
+    // One row per type; find Post and check its column count.
+    let post = rows
+        .iter()
+        .find(|r| r[0] == Value::Str("Post".into()))
+        .expect("Post listed");
+    assert_eq!(post[1], Value::Int(2));
+    let tag = rows
+        .iter()
+        .find(|r| r[0] == Value::Str("Tag".into()))
+        .expect("Tag listed");
+    assert_eq!(tag[1], Value::Int(1));
+}
+
+#[test]
+fn test_describe_reports_columns_types_nullability_and_indexes() {
+    let mut engine = fresh_engine();
+    engine
+        .execute_powql("type Post { required id: int, body: str, unique slug: str }")
+        .unwrap();
+    engine.execute_powql("alter Post add index .body").unwrap();
+    let rows = rows_of(engine.execute_powql("describe Post").unwrap());
+    assert_eq!(rows.len(), 3);
+
+    // id: int, required → not nullable, no index.
+    assert_eq!(rows[0][0], Value::Str("id".into()));
+    assert_eq!(rows[0][1], Value::Str("int".into()));
+    assert_eq!(rows[0][2], Value::Bool(false)); // nullable = !required
+    assert_eq!(rows[0][3], Value::Str("".into()));
+
+    // body: str, optional, non-unique index.
+    assert_eq!(rows[1][0], Value::Str("body".into()));
+    assert_eq!(rows[1][2], Value::Bool(true));
+    assert_eq!(rows[1][3], Value::Str("index".into()));
+
+    // slug: unique index.
+    assert_eq!(rows[2][0], Value::Str("slug".into()));
+    assert_eq!(rows[2][3], Value::Str("unique".into()));
+}
+
+#[test]
+fn test_describe_unknown_type_errors() {
+    let mut engine = fresh_engine();
+    let err = engine.execute_powql("describe Ghost").unwrap_err();
+    assert!(err.to_string().contains("Ghost"), "{err}");
+}
+
+#[test]
+fn test_describe_reflects_live_schema_after_alter() {
+    // Plan-cache safety: a cached `describe` plan must still reflect the
+    // current schema after a DDL change, not a stale snapshot.
+    let mut engine = fresh_engine();
+    engine.execute_powql("type Post { id: int }").unwrap();
+    assert_eq!(
+        rows_of(engine.execute_powql("describe Post").unwrap()).len(),
+        1
+    );
+    engine
+        .execute_powql("alter Post add column body: str")
+        .unwrap();
+    // Same query text — would hit the plan cache — must now show 2 columns.
+    assert_eq!(
+        rows_of(engine.execute_powql("describe Post").unwrap()).len(),
+        2
+    );
+}
+
+#[test]
+fn test_schema_readonly_path() {
+    // Introspection must work over the read-only executor (server reader side).
+    let mut engine = fresh_engine();
+    engine.execute_powql("type Post { id: int }").unwrap();
+    let rows = rows_of(engine.execute_powql_readonly("schema").unwrap());
+    assert!(rows.iter().any(|r| r[0] == Value::Str("Post".into())));
+    let desc = rows_of(engine.execute_powql_readonly("describe Post").unwrap());
+    assert_eq!(desc.len(), 1);
+}

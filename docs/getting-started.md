@@ -527,6 +527,43 @@ POWDB_ADMIN_USER=root POWDB_ADMIN_PASSWORD=changeme powdb-server --data-dir ./po
 After the admin exists, use `passwd` / `useradd` to manage the rest, and stop
 relying on the bootstrap env vars.
 
+### Concurrent transactions
+
+Explicit transactions (`begin` ... `commit`) are **serialized across
+connections**: one process runs one explicit transaction at a time. When a
+connection issues `begin` while another connection's transaction is still open,
+it **queues** rather than failing — so a burst of concurrent writers all commit
+instead of erroring out.
+
+The wait is bounded. If a `begin` waits longer than the configured window for
+the other transaction to finish, it fails with a clear error
+(`transaction gate timeout after 5000ms waiting for concurrent transaction to
+complete`) instead of hanging indefinitely. Tune the window with
+`--tx-wait-timeout-ms` (or `POWDB_TX_WAIT_TIMEOUT_MS`; default `5000`):
+
+```bash
+powdb-server --tx-wait-timeout-ms 2000
+```
+
+The `powdb_tx_gate_timeouts_total` metric counts these timeouts (see
+`--metrics-addr`).
+
+### Serving a named database
+
+One server process serves a single database. By default it accepts any
+`db_name` a client sends (the name is informational). To pin the process to a
+name and **reject** a client that explicitly asks for a different database, set
+`--db-name` (or `POWDB_DB_NAME`):
+
+```bash
+powdb-server --db-name prod
+```
+
+A `CONNECT` for `prod` (or the client default `default`, or an empty name) is
+accepted; a `CONNECT` explicitly naming another database is rejected with
+`unknown database '<name>'; this server serves 'prod'`. Leaving `--db-name`
+unset preserves the existing accept-anything behavior.
+
 ---
 
 ## What's Next

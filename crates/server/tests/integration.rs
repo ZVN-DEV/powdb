@@ -83,6 +83,8 @@ async fn test_full_lifecycle() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,
@@ -214,6 +216,8 @@ async fn test_connect_and_queries_pipelined_in_single_write() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,
@@ -313,6 +317,8 @@ async fn explicit_transaction_blocks_other_connections_until_closed() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,
@@ -425,6 +431,8 @@ async fn dropped_connection_mid_transaction_rolls_back_and_frees_gate() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,
@@ -537,6 +545,8 @@ async fn test_user_auth_handshake() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,
@@ -641,6 +651,8 @@ async fn test_empty_store_shared_password_fallback() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: Some(zeroize::Zeroizing::new("sekret".into())),
@@ -753,6 +765,8 @@ async fn test_readonly_role_enforced_over_tcp() {
                 powdb_server::handler::handle_connection(
                     stream,
                     powdb_server::handler::ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: None,

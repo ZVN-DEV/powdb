@@ -1034,6 +1034,18 @@ impl BTree {
         self.dirty = true;
     }
 
+    /// Clear the dirty flag *without* persisting, so the next
+    /// `save_if_dirty` becomes a no-op. Used by ROLLBACK: the catalog
+    /// about to be dropped holds uncommitted, in-memory index mutations
+    /// that must NOT reach disk via the drop-time checkpoint. The live
+    /// tree is re-loaded from the (clean) on-disk `.idx` by the freshly
+    /// opened replacement catalog, so discarding the flag here is exactly
+    /// what reverts the rolled-back index writes.
+    #[inline]
+    pub fn discard_dirty(&mut self) {
+        self.dirty = false;
+    }
+
     /// Persist the tree to an arbitrary path. Primarily used by tests
     /// and by the create-index rebuild path, which wants to write the
     /// file at a location supplied by the caller. Does NOT update

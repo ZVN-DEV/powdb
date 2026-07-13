@@ -90,6 +90,8 @@ async fn start_single_conn_server(
         handle_connection(
             stream,
             ConnOpts {
+                tx_wait_timeout: std::time::Duration::from_secs(5),
+                db_name: None,
                 engine,
                 tx_gate,
                 expected_password: expected_password.map(zeroize::Zeroizing::new),
@@ -136,6 +138,8 @@ async fn start_multi_conn_server(
                 handle_connection(
                     stream,
                     ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng,
                         tx_gate,
                         expected_password: pw.map(zeroize::Zeroizing::new),
@@ -337,6 +341,8 @@ async fn test_max_connections_backpressure() {
                 handle_connection(
                     stream,
                     ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine: eng2,
                         tx_gate,
                         expected_password: None,

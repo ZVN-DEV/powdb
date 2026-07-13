@@ -21,13 +21,15 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 11. [Mutations](#mutations)
 12. [Transactions](#transactions)
 13. [DDL](#ddl)
-14. [Materialized Views](#materialized-views)
-15. [Window Functions](#window-functions)
-16. [UPSERT](#upsert)
-17. [EXPLAIN](#explain)
-18. [Prepared Queries](#prepared-queries)
-19. [Type System](#type-system)
-20. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+14. [Introspection](#introspection)
+15. [Reserved Words and Quoting](#reserved-words-and-quoting)
+16. [Materialized Views](#materialized-views)
+17. [Window Functions](#window-functions)
+18. [UPSERT](#upsert)
+19. [EXPLAIN](#explain)
+20. [Prepared Queries](#prepared-queries)
+21. [Type System](#type-system)
+22. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -1074,6 +1076,20 @@ type User {
 }
 ```
 
+Re-declaring an existing type is an error (`type 'User' already exists`). Add
+`if not exists` after the type name to make it a no-op instead — useful for
+idempotent migrations:
+
+```
+type User if not exists {
+  required name: str,
+  age: int
+}
+```
+
+`if not exists` never redefines an existing type; the original schema is left
+untouched.
+
 ### ALTER TABLE
 
 Add or drop columns on an existing table.
@@ -1097,7 +1113,11 @@ alter User add status: str                 -- "column" keyword is optional
 ```
 alter User drop column email
 alter User drop email                      -- "column" keyword is optional
+alter User drop column if exists email     -- no-op if the column is absent
 ```
+
+Dropping a column that does not exist is an error unless you add `if exists`,
+in which case it is a clean no-op.
 
 #### Add Index
 
@@ -1106,9 +1126,10 @@ Create a B+tree index on a column. Point lookups and range scans use indexes aut
 ```
 alter User add index .email
 alter User add index .age
+alter User add index if not exists .email  -- accepted for symmetry
 ```
 
-Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is a no-op.
+Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is already a no-op, so `if not exists` is accepted but does not change behavior.
 
 #### Add Unique
 
@@ -1116,9 +1137,10 @@ Create a unique B+tree index on a column, enforcing that no two non-null rows sh
 
 ```
 alter User add unique .email
+alter User add unique if not exists .email  -- no-op if already indexed
 ```
 
-The command first scans the existing data — if any duplicate (non-null) value is already present, it fails and the index is not created. It also fails if the column already has a (non-unique) index, since there is no in-place index upgrade; drop and recreate the table to change an existing index's uniqueness. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
+The command first scans the existing data — if any duplicate (non-null) value is already present, it fails and the index is not created. Without `if not exists` it also fails if the column already has an index, since there is no in-place index upgrade (drop and recreate the table to change an existing index's uniqueness); with `if not exists` an already-indexed column is a no-op. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
 
 ### DROP TABLE
 
@@ -1126,6 +1148,110 @@ Remove a table entirely:
 
 ```
 drop User
+drop if exists User                        -- no-op if the type is absent
+```
+
+Dropping a type that does not exist is an error unless you add `if exists`.
+
+---
+
+## Introspection
+
+Discover what exists in the database without any protocol extensions — the
+commands below return ordinary result rows, so any client consumes them like a
+normal query.
+
+### schema
+
+List every type (table). One row per type: its name and its column count.
+
+```
+schema
+```
+
+| name | columns |
+|------|---------|
+| User | 3       |
+| Post | 2       |
+
+### describe
+
+Describe one type: its columns with type and nullability, plus which columns are
+indexed. `describe <Type>` and `schema <Type>` are equivalent.
+
+```
+describe User
+schema User        -- alias for `describe User`
+```
+
+| column | type | nullable | index  |
+|--------|------|----------|--------|
+| id     | int  | false    | unique |
+| name   | str  | false    |        |
+| email  | str  | true     | index  |
+
+- **nullable** is `false` for `required` columns, `true` otherwise.
+- **index** is `unique` for a unique index, `index` for a plain index, empty
+  when the column is not indexed.
+
+Describing a type that does not exist is an error (`table 'Ghost' not found`).
+Introspection always reflects the **current** schema — it is never served from a
+stale cached plan.
+
+---
+
+## Reserved Words and Quoting
+
+PowQL keywords cannot be used **bare** as type or column names. For example,
+`type Post { type: str }` fails with:
+
+```
+syntax error: 'type' is a reserved word and cannot be used as a field name;
+rename it or quote it as `type`
+```
+
+> **Breaking change (v0.10):** `schema` and `describe` are now keywords.
+> A lowercase bare identifier named `schema` or `describe` that parsed in
+> earlier releases must now be backtick-quoted (`` `schema` ``). Keyword
+> matching is case-sensitive, so capitalized names like `type Schema { … }`
+> are unaffected.
+
+To use a reserved word as an identifier anyway, wrap it in **backticks**. A
+backtick-quoted identifier is always a plain name, never a keyword, and works
+everywhere an identifier is accepted — DDL field lists, `insert`/`update`/
+`upsert` assignments, filters, projections, ordering, and index DDL:
+
+```
+type Post { required `type`: str, `order`: int }
+insert Post { `type` := "news", `order` := 1 }
+Post filter .`type` = "news" { .`type`, .`order` }
+Post order .`order` asc
+alter Post add index .`order`
+```
+
+Backticks may also contain characters that are not otherwise legal in an
+identifier, such as spaces: `` `full name` ``.
+
+> In filter/projection/order positions, a plain dotted reference like `.type`
+> also works, because dotted field references bypass keyword lookup. Backtick
+> quoting is required in bare-identifier positions (DDL field names, assignment
+> targets) and is accepted everywhere for consistency.
+
+### Complete keyword list
+
+The following words are reserved (derived from the lexer's keyword table). This
+includes the boolean literal words `true` and `false`:
+
+```
+abs, add, alter, and, as, asc, auto, avg, begin, between, case, cast, ceil,
+column, commit, concat, conflict, count, cross, date_add, date_diff, default,
+delete, dense_rank, desc, describe, distinct, drop, else, end, exists, explain,
+extract, false, filter, floor, group, having, in, index, inner, insert, is,
+join, left, length, let, like, limit, link, lower, match, materialize,
+materialized, max, min, multi, not, now, null, offset, on, or, order, outer,
+over, partition, pow, rank, refresh, required, returning, right, rollback,
+round, row_number, schema, select, sqrt, substring, sum, then, transaction,
+trim, true, type, union, unique, update, upper, upsert, view, when
 ```
 
 ---
@@ -1172,9 +1298,10 @@ Remove a materialized view:
 
 ```
 drop view OldUsers
+drop view if exists OldUsers               -- no-op if the view is absent
 ```
 
-Note: `drop view` removes the view. Plain `drop` (without `view`) drops a table.
+Note: `drop view` removes the view. Plain `drop` (without `view`) drops a table. As with `drop table`, `if exists` turns a missing view into a no-op instead of an error.
 
 ---
 

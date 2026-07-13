@@ -4,12 +4,19 @@
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
     }
   },
   "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
@@ -47,7 +54,9 @@
     "@types/node": { "optional": true }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run build:esm && npm run build:cjs",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist/cjs/package.json', JSON.stringify({ type: 'commonjs' }) + '\\n')\"",
     "test": "tsx test/run-with-server.ts test/client.test.ts",
     "test:escape": "tsx test/escape.test.ts",
     "test:protocol": "tsx test/protocol.test.ts",

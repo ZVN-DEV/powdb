@@ -83,6 +83,8 @@ async fn start_single_conn_server_with_metrics(
         handle_connection(
             stream,
             ConnOpts {
+                tx_wait_timeout: std::time::Duration::from_secs(5),
+                db_name: None,
                 engine,
                 tx_gate,
                 expected_password: expected_password.map(zeroize::Zeroizing::new),
@@ -135,6 +137,8 @@ async fn start_multi_conn_server_with_users(
                 handle_connection(
                     stream,
                     ConnOpts {
+                        tx_wait_timeout: std::time::Duration::from_secs(5),
+                        db_name: None,
                         engine,
                         tx_gate,
                         expected_password: expected_password.map(zeroize::Zeroizing::new),

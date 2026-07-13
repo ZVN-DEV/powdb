@@ -260,10 +260,45 @@ pub fn authenticate_connect(
     }
 }
 
+/// The sentinel database name clients send when the user selected none. Both
+/// the CLI and the TS client default to this, so it means "no specific
+/// database" and is always accepted — even when the server is pinned to a name.
+const DEFAULT_DB_NAME: &str = "default";
+
+/// Decide whether a CONNECT's requested `db_name` is served by this process.
+///
+/// One server process serves exactly one global database. When it is pinned to
+/// a name (`configured = Some`), a request that *explicitly* names a different
+/// database is rejected so a client can never silently read/write the wrong
+/// store. An empty name or the client default sentinel (`"default"`) means "no
+/// specific database selected" and is always accepted. When unpinned (`None`)
+/// every name is accepted (0.9.x back-compat); the caller warns on a non-default
+/// name so the silent-mismatch footgun is at least visible in the logs.
+fn check_db_name(configured: Option<&str>, requested: &str) -> Result<(), String> {
+    if requested.is_empty() || requested == DEFAULT_DB_NAME {
+        return Ok(());
+    }
+    match configured {
+        None => Ok(()),
+        Some(name) if requested == name => Ok(()),
+        Some(name) => Err(format!(
+            "unknown database '{requested}'; this server serves '{name}'"
+        )),
+    }
+}
+
 /// Error messages that are safe to forward to the client verbatim.
 const SAFE_ERROR_PREFIXES: &[&str] = &[
     "table not found",
+    // The executor's actual phrasing is `table 'X' not found`, which the
+    // bare prefix above never matches — keep both so the real message
+    // reaches clients.
+    "table '",
+    "type '",
     "column not found",
+    // Lexer diagnostics (`at position N: unterminated quoted identifier`)
+    // are derived purely from the client's own query text.
+    "at position",
     "parse error",
     "type mismatch",
     "unknown table",
@@ -342,6 +377,14 @@ pub struct ConnOpts<'a> {
     pub peer_addr: Option<std::net::SocketAddr>,
     /// Shared server metrics. Always present; tests pass `Arc::new(Metrics::new())`.
     pub metrics: Arc<Metrics>,
+    /// How long an explicit `begin` waits to acquire the transaction gate while
+    /// another connection holds an open explicit transaction, before giving up
+    /// with a clear timeout error instead of queueing indefinitely.
+    pub tx_wait_timeout: Duration,
+    /// When `Some`, the single database name this server serves. A CONNECT that
+    /// explicitly names a *different* database is rejected at connect time.
+    /// `None` accepts any name (0.9.x behavior) and only warns.
+    pub db_name: Option<String>,
 }
 
 /// Execute a query against the engine under the RwLock. Read-only
@@ -1482,11 +1525,40 @@ where
     decision.message
 }
 
+/// Acquire the TxGate for an explicit `begin`, bounded by `tx_wait_timeout`.
+/// Overlapping explicit transactions queue behind the permit rather than being
+/// rejected, but a connection gives up with a clear, client-facing error once
+/// the wait elapses — so a transaction stalled (or held open) on another
+/// connection can never block this one indefinitely. A timeout is recorded so
+/// `powdb_tx_gate_timeouts_total` (and the error total) stay truthful.
+async fn acquire_begin_permit(
+    tx_gate: &TxGate,
+    tx_wait_timeout: Duration,
+    metrics: &Arc<Metrics>,
+) -> Result<OwnedSemaphorePermit, Message> {
+    match tokio::time::timeout(tx_wait_timeout, tx_gate.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Message::Error {
+            message: "query execution error".into(),
+        }),
+        Err(_) => {
+            metrics.inc_tx_gate_timeout();
+            Err(Message::Error {
+                message: format!(
+                    "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
+                    tx_wait_timeout.as_millis()
+                ),
+            })
+        }
+    }
+}
+
 /// Execute one wire query frame and return the response plus its un-waited
 /// WAL durability ticket. The TxGate permit is managed here and — crucially —
 /// is already released (bare statements, commit/rollback) by the time this
 /// returns, so the caller's `finalize_durability` wait happens OUTSIDE the
 /// gate and overlapping committers can share an fsync.
+#[allow(clippy::too_many_arguments)]
 async fn execute_wire_query(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
@@ -1494,6 +1566,7 @@ async fn execute_wire_query(
     query: String,
     principal: Option<Principal>,
     query_timeout: Duration,
+    tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> (Message, Option<PendingDurability>) {
     match classify_query_transaction_control(&query) {
@@ -1501,21 +1574,16 @@ async fn execute_wire_query(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
             }
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let (response, ticket) = run_blocking_query(
                 engine,
@@ -1588,6 +1656,7 @@ async fn execute_wire_query(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_wire_query_sql(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
@@ -1595,6 +1664,7 @@ async fn execute_wire_query_sql(
     query: String,
     principal: Option<Principal>,
     query_timeout: Duration,
+    tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> (Message, Option<PendingDurability>) {
     match classify_sql_transaction_control(&query) {
@@ -1602,21 +1672,16 @@ async fn execute_wire_query_sql(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
             }
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let (response, ticket) = run_blocking_query(
                 engine,
@@ -1699,6 +1764,7 @@ async fn execute_wire_query_with_params(
     params: Vec<WireParam>,
     principal: Option<Principal>,
     query_timeout: Duration,
+    tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> (Message, Option<PendingDurability>) {
     match classify_params_transaction_control(&query, &params) {
@@ -1706,21 +1772,16 @@ async fn execute_wire_query_with_params(
             if tx_permit.is_some() {
                 return (
                     Message::Error {
-                        message: sanitize_error("transaction already active"),
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
                     },
                     None,
                 );
             }
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let (response, ticket) = run_blocking_query(
                 engine,
@@ -1950,6 +2011,8 @@ where
         rate_limiter,
         peer_addr,
         metrics,
+        tx_wait_timeout,
+        db_name: server_db_name,
     } = opts;
 
     let peer = peer_addr
@@ -2049,6 +2112,34 @@ where
                         }
                     }
                     principal = auth_principal;
+                }
+            }
+
+            // One process serves one database. When pinned to a name, reject a
+            // CONNECT that explicitly asks for a different one (checked after
+            // auth so db existence never leaks to unauthenticated clients).
+            // When unpinned, accept anything but warn once per process so the
+            // silent one-db-per-process mismatch is visible without spamming
+            // the log on every pooled connection.
+            match check_db_name(server_db_name.as_deref(), &db_name) {
+                Ok(()) => {
+                    if server_db_name.is_none() && !db_name.is_empty() && db_name != DEFAULT_DB_NAME
+                    {
+                        static NAMED_DB_WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !NAMED_DB_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            warn!(
+                                peer = %peer, db = %db_name,
+                                "client requested a named database but this server serves a single global database; name ignored"
+                            );
+                        }
+                    }
+                }
+                Err(msg) => {
+                    warn!(peer = %peer, db = %db_name, "rejected: unknown database");
+                    let err = Message::Error { message: msg };
+                    write_msg(&mut writer, &err).await;
+                    return;
                 }
             }
 
@@ -2197,6 +2288,7 @@ where
                                 query,
                                 principal.clone(),
                                 query_timeout,
+                                tx_wait_timeout,
                                 &metrics,
                             )
                             .await
@@ -2223,6 +2315,7 @@ where
                                 query,
                                 principal.clone(),
                                 query_timeout,
+                                tx_wait_timeout,
                                 &metrics,
                             )
                             .await
@@ -2250,6 +2343,7 @@ where
                                 params,
                                 principal.clone(),
                                 query_timeout,
+                                tx_wait_timeout,
                                 &metrics,
                             )
                             .await
@@ -2606,6 +2700,75 @@ mod tests {
             sanitize_error("some internal io panic detail"),
             "query execution error"
         );
+    }
+
+    // ---- Named-database gate (P-10) ----
+
+    #[test]
+    fn db_name_unpinned_accepts_any_name() {
+        for requested in ["", "default", "prod", "anything"] {
+            assert!(
+                check_db_name(None, requested).is_ok(),
+                "rejected {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_name_pinned_accepts_match_empty_and_default_sentinel() {
+        // The configured name, the empty name, and the client default sentinel
+        // are all "no foreign database explicitly requested".
+        assert!(check_db_name(Some("prod"), "prod").is_ok());
+        assert!(check_db_name(Some("prod"), "").is_ok());
+        assert!(check_db_name(Some("prod"), DEFAULT_DB_NAME).is_ok());
+    }
+
+    #[test]
+    fn db_name_pinned_rejects_foreign_with_clear_message() {
+        let err = check_db_name(Some("prod"), "staging").unwrap_err();
+        assert_eq!(err, "unknown database 'staging'; this server serves 'prod'");
+    }
+
+    // ---- Explicit-transaction gate wait timeout (P-4) ----
+
+    #[tokio::test]
+    async fn begin_permit_acquires_when_gate_is_free() {
+        let gate = new_tx_gate();
+        let metrics = Arc::new(Metrics::new());
+        let permit = acquire_begin_permit(&gate, Duration::from_secs(5), &metrics)
+            .await
+            .expect("should acquire a free gate");
+        assert_eq!(gate.available_permits(), 0, "permit must be held");
+        drop(permit);
+        assert_eq!(gate.available_permits(), 1, "permit must release on drop");
+    }
+
+    #[tokio::test]
+    async fn begin_permit_times_out_with_clear_error_and_truthful_metric() {
+        let gate = new_tx_gate();
+        let metrics = Arc::new(Metrics::new());
+        // Hold the only permit so the next acquire must wait, then time out.
+        let _held = gate.clone().acquire_owned().await.unwrap();
+        let err = acquire_begin_permit(&gate, Duration::from_millis(25), &metrics)
+            .await
+            .expect_err("must time out while the gate is held");
+        match err {
+            Message::Error { message } => {
+                assert!(
+                    message.contains("transaction gate timeout after 25ms"),
+                    "unexpected message: {message}"
+                );
+                assert!(
+                    message.contains("waiting for concurrent transaction"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let rendered = metrics.render();
+        assert!(rendered.contains("powdb_tx_gate_timeouts_total 1"));
+        // A timed-out begin is a failed statement from the client's view.
+        assert!(rendered.contains("powdb_queries_total{result=\"error\"} 1"));
     }
 
     #[test]

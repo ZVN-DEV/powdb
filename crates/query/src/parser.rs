@@ -290,6 +290,65 @@ impl Parser {
         }
     }
 
+    /// Consume an identifier in a position that names something (a field,
+    /// column, …). When the caller wrote a reserved word instead, the error
+    /// says so and points at the backtick-quoting escape hatch, rather than
+    /// the opaque `expected field name, got 'type'`.
+    fn expect_named_ident(&mut self, context: &str) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(n) => Ok(n),
+            t => Err(self.named_ident_error(context, &t)),
+        }
+    }
+
+    /// Build the error for a reserved word (or other token) appearing where an
+    /// identifier was required. `context` is the noun ("field name", "column
+    /// name") spliced into the message.
+    fn named_ident_error(&self, context: &str, got: &Token) -> ParseError {
+        if let Some(kw) = got.keyword_str() {
+            ParseError::Syntax {
+                // "syntax error" prefix keeps the message on the server's
+                // safe-to-forward allowlist (SAFE_ERROR_PREFIXES) so wire
+                // clients see the guidance instead of the generic mask.
+                message: format!(
+                    "syntax error: '{kw}' is a reserved word and cannot be used as a {context}; \
+                     rename it or quote it as `{kw}`"
+                ),
+            }
+        } else {
+            ParseError::UnexpectedToken {
+                expected: context.into(),
+                got: got.display_name(),
+            }
+        }
+    }
+
+    /// Consume an optional `if not exists` clause. `if` is not a keyword token
+    /// (it lexes as an identifier), so match it by spelling.
+    fn parse_optional_if_not_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(w) if w == "if")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Not))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Exists))
+        {
+            self.pos += 3;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume an optional `if exists` clause.
+    fn parse_optional_if_exists(&mut self) -> bool {
+        if matches!(self.peek(), Token::Ident(w) if w == "if")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Exists))
+        {
+            self.pos += 2;
+            true
+        } else {
+            false
+        }
+    }
+
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
@@ -328,6 +387,8 @@ impl Parser {
                 self.advance();
                 return Ok(Statement::Rollback);
             }
+            Token::Schema => self.parse_schema(),
+            Token::Describe => self.parse_describe(),
             Token::Count | Token::Avg | Token::Sum | Token::Min | Token::Max => {
                 self.parse_aggregate_query()
             }
@@ -725,15 +786,7 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut assignments = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
-            let field = match self.advance() {
-                Token::Ident(name) => name,
-                t => {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "field name".into(),
-                        got: t.display_name(),
-                    })
-                }
-            };
+            let field = self.expect_named_ident("field name")?;
             self.expect(&Token::Assign)?;
             let value = self.parse_expr()?;
             assignments.push(Assignment { field, value });
@@ -1532,9 +1585,10 @@ impl Parser {
         match self.peek() {
             Token::Add => {
                 self.advance();
-                // `alter <Table> add index .<column>`
+                // `alter <Table> add index [if not exists] .<column>`
                 if *self.peek() == Token::Index {
                     self.advance();
+                    let if_not_exists = self.parse_optional_if_not_exists();
                     let column = match self.advance() {
                         Token::DotIdent(n) => n,
                         t => {
@@ -1546,12 +1600,16 @@ impl Parser {
                     };
                     return Ok(Statement::AlterTable(AlterTableExpr {
                         table,
-                        action: AlterAction::AddIndex { column },
+                        action: AlterAction::AddIndex {
+                            column,
+                            if_not_exists,
+                        },
                     }));
                 }
-                // `alter <Table> add unique .<column>`
+                // `alter <Table> add unique [if not exists] .<column>`
                 if *self.peek() == Token::Unique {
                     self.advance();
+                    let if_not_exists = self.parse_optional_if_not_exists();
                     let column = match self.advance() {
                         Token::DotIdent(n) => n,
                         t => {
@@ -1563,7 +1621,10 @@ impl Parser {
                     };
                     return Ok(Statement::AlterTable(AlterTableExpr {
                         table,
-                        action: AlterAction::AddUnique { column },
+                        action: AlterAction::AddUnique {
+                            column,
+                            if_not_exists,
+                        },
                     }));
                 }
                 // optional `column` keyword
@@ -1576,15 +1637,7 @@ impl Parser {
                 } else {
                     false
                 };
-                let name = match self.advance() {
-                    Token::Ident(n) => n,
-                    t => {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "column name".into(),
-                            got: t.display_name(),
-                        })
-                    }
-                };
+                let name = self.expect_named_ident("column name")?;
                 self.expect(&Token::Colon)?;
                 let type_name = match self.advance() {
                     Token::Ident(n) => n,
@@ -1610,18 +1663,11 @@ impl Parser {
                 if *self.peek() == Token::Column {
                     self.advance();
                 }
-                let name = match self.advance() {
-                    Token::Ident(n) => n,
-                    t => {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "column name".into(),
-                            got: t.display_name(),
-                        })
-                    }
-                };
+                let if_exists = self.parse_optional_if_exists();
+                let name = self.expect_named_ident("column name")?;
                 Ok(Statement::AlterTable(AlterTableExpr {
                     table,
-                    action: AlterAction::DropColumn { name },
+                    action: AlterAction::DropColumn { name, if_exists },
                 }))
             }
             t => Err(ParseError::UnexpectedToken {
@@ -1631,11 +1677,12 @@ impl Parser {
         }
     }
 
-    /// `drop <Table>` or `drop view <ViewName>`
+    /// `drop [if exists] <Table>` or `drop view [if exists] <ViewName>`
     fn parse_drop_or_drop_view(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Drop)?;
         if *self.peek() == Token::View {
             self.advance(); // consume `view`
+            let if_exists = self.parse_optional_if_exists();
             let name = match self.advance() {
                 Token::Ident(name) => name,
                 t => {
@@ -1645,8 +1692,9 @@ impl Parser {
                     })
                 }
             };
-            return Ok(Statement::DropView(DropViewExpr { name }));
+            return Ok(Statement::DropView(DropViewExpr { name, if_exists }));
         }
+        let if_exists = self.parse_optional_if_exists();
         let table = match self.advance() {
             Token::Ident(name) => name,
             t => {
@@ -1656,7 +1704,7 @@ impl Parser {
                 })
             }
         };
-        Ok(Statement::DropTable(DropTableExpr { table }))
+        Ok(Statement::DropTable(DropTableExpr { table, if_exists }))
     }
 
     /// `materialize <ViewName> as <Query>`
@@ -1762,46 +1810,31 @@ impl Parser {
 
     fn parse_create_type(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Type)?;
-        let name = match self.advance() {
-            Token::Ident(n) => n,
-            t => {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "type name".into(),
-                    got: t.display_name(),
-                })
-            }
-        };
+        let name = self.expect_named_ident("type name")?;
+        let if_not_exists = self.parse_optional_if_not_exists();
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
             // Accept `required`, `unique`, and `auto` modifiers in any order.
+            // A modifier keyword immediately followed by `:` is instead the
+            // field's *name* (e.g. `required: int`) — leave it for
+            // `expect_named_ident`, which emits the reserved-word guidance.
             let (mut required, mut unique, mut auto) = (false, false, false);
             loop {
-                match self.peek() {
-                    Token::Required => {
-                        self.advance();
-                        required = true;
-                    }
-                    Token::Unique => {
-                        self.advance();
-                        unique = true;
-                    }
-                    Token::Auto => {
-                        self.advance();
-                        auto = true;
-                    }
-                    _ => break,
+                let is_modifier =
+                    matches!(self.peek(), Token::Required | Token::Unique | Token::Auto)
+                        && !matches!(self.tokens.get(self.pos + 1), Some(Token::Colon));
+                if !is_modifier {
+                    break;
+                }
+                match self.advance() {
+                    Token::Required => required = true,
+                    Token::Unique => unique = true,
+                    Token::Auto => auto = true,
+                    _ => unreachable!("guarded by is_modifier"),
                 }
             }
-            let field_name = match self.advance() {
-                Token::Ident(n) => n,
-                t => {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "field name".into(),
-                        got: t.display_name(),
-                    })
-                }
-            };
+            let field_name = self.expect_named_ident("field name")?;
             self.expect(&Token::Colon)?;
             let type_name = match self.advance() {
                 Token::Ident(n) => n,
@@ -1833,7 +1866,29 @@ impl Parser {
             }
         }
         self.expect(&Token::RBrace)?;
-        Ok(Statement::CreateType(CreateTypeExpr { name, fields }))
+        Ok(Statement::CreateType(CreateTypeExpr {
+            name,
+            fields,
+            if_not_exists,
+        }))
+    }
+
+    /// `schema` — list all types. `schema <Type>` is an alias for
+    /// `describe <Type>`.
+    fn parse_schema(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Schema)?;
+        if let Token::Ident(_) = self.peek() {
+            let table = self.expect_named_ident("type name")?;
+            return Ok(Statement::Describe(table));
+        }
+        Ok(Statement::ListTypes)
+    }
+
+    /// `describe <Type>` — the columns and indexes of one type.
+    fn parse_describe(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Describe)?;
+        let table = self.expect_named_ident("type name")?;
+        Ok(Statement::Describe(table))
     }
 
     /// Parse the literal following a `default` column modifier. Only scalar
@@ -1989,6 +2044,8 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Colon => out.push(':'),
             Token::Dot => out.push('.'),
             Token::Explain => out.push_str("explain"),
+            Token::Schema => out.push_str("schema"),
+            Token::Describe => out.push_str("describe"),
             Token::Eof => {}
         }
     }
@@ -2977,7 +3034,7 @@ mod tests {
         match stmt {
             Statement::AlterTable(at) => assert!(matches!(
                 at.action,
-                AlterAction::AddUnique { ref column } if column == "email"
+                AlterAction::AddUnique { ref column, .. } if column == "email"
             )),
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -2990,7 +3047,7 @@ mod tests {
             Statement::AlterTable(at) => {
                 assert_eq!(at.table, "User");
                 match at.action {
-                    AlterAction::DropColumn { name } => assert_eq!(name, "status"),
+                    AlterAction::DropColumn { name, .. } => assert_eq!(name, "status"),
                     other => panic!("expected DropColumn, got {other:?}"),
                 }
             }
@@ -3003,7 +3060,7 @@ mod tests {
         let stmt = parse("alter User drop status").unwrap();
         match stmt {
             Statement::AlterTable(at) => match at.action {
-                AlterAction::DropColumn { name } => assert_eq!(name, "status"),
+                AlterAction::DropColumn { name, .. } => assert_eq!(name, "status"),
                 other => panic!("expected DropColumn, got {other:?}"),
             },
             other => panic!("expected AlterTable, got {other:?}"),
@@ -3493,5 +3550,185 @@ mod cleanup_parser_dx_tests {
         let msg = err.to_string();
         assert!(msg.contains("near token"), "{msg}");
         assert!(msg.contains("did you mean `update`"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod capa_dx_tests {
+    use super::*;
+
+    // ── P-6: reserved words as column names ────────────────────────────
+
+    #[test]
+    fn reserved_word_field_name_gives_actionable_error() {
+        let err = parse("type Post { type: str }").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'type' is a reserved word")
+                && msg.contains("field name")
+                && msg.contains("quote it as `type`"),
+            "unhelpful message: {msg}"
+        );
+    }
+
+    #[test]
+    fn reserved_modifier_word_as_field_name_gives_actionable_error() {
+        // `required` is a modifier keyword; followed directly by `:` it is
+        // instead the field's (reserved) name — the old error was the opaque
+        // "expected field name, got ':'".
+        let err = parse("type Post { required: bool }").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'required' is a reserved word") && msg.contains("quote it as `required`"),
+            "unhelpful message: {msg}"
+        );
+    }
+
+    #[test]
+    fn reserved_word_in_insert_assignment_gives_actionable_error() {
+        let err = parse(r#"insert Post { type := "x" }"#).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'type' is a reserved word"), "{msg}");
+    }
+
+    #[test]
+    fn reserved_word_in_alter_column_gives_actionable_error() {
+        let err = parse("alter Post add column order: int").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'order' is a reserved word"), "{msg}");
+    }
+
+    #[test]
+    fn backtick_field_name_parses_as_identifier() {
+        let stmt = parse("type Post { `type`: str, `order`: int }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert_eq!(ct.fields[0].name, "type");
+                assert_eq!(ct.fields[1].name, "order");
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backtick_field_still_honors_modifiers() {
+        let stmt = parse("type Post { required `type`: str }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => {
+                assert_eq!(ct.fields[0].name, "type");
+                assert!(ct.fields[0].required);
+            }
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    // ── P-7: DDL idempotency ───────────────────────────────────────────
+
+    #[test]
+    fn create_type_if_not_exists_parses() {
+        let stmt = parse("type Post if not exists { id: int }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => assert!(ct.if_not_exists),
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_type_without_clause_defaults_false() {
+        let stmt = parse("type Post { id: int }").unwrap();
+        match stmt {
+            Statement::CreateType(ct) => assert!(!ct.if_not_exists),
+            other => panic!("expected CreateType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_if_exists_parses() {
+        match parse("drop if exists Post").unwrap() {
+            Statement::DropTable(dt) => assert!(dt.if_exists),
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+        match parse("drop Post").unwrap() {
+            Statement::DropTable(dt) => assert!(!dt.if_exists),
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_view_if_exists_parses() {
+        match parse("drop view if exists ActiveUsers").unwrap() {
+            Statement::DropView(dv) => {
+                assert!(dv.if_exists);
+                assert_eq!(dv.name, "ActiveUsers");
+            }
+            other => panic!("expected DropView, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_index_and_unique_if_not_exists_parse() {
+        match parse("alter Post add index if not exists .slug").unwrap() {
+            Statement::AlterTable(at) => {
+                assert!(matches!(
+                    at.action,
+                    AlterAction::AddIndex {
+                        if_not_exists: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+        match parse("alter Post add unique if not exists .slug").unwrap() {
+            Statement::AlterTable(at) => {
+                assert!(matches!(
+                    at.action,
+                    AlterAction::AddUnique {
+                        if_not_exists: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_drop_column_if_exists_parses() {
+        match parse("alter Post drop column if exists status").unwrap() {
+            Statement::AlterTable(at) => {
+                assert!(matches!(
+                    at.action,
+                    AlterAction::DropColumn {
+                        if_exists: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected AlterTable, got {other:?}"),
+        }
+    }
+
+    // ── P-8: introspection ─────────────────────────────────────────────
+
+    #[test]
+    fn schema_parses_to_list_types() {
+        assert_eq!(parse("schema").unwrap(), Statement::ListTypes);
+    }
+
+    #[test]
+    fn describe_parses_to_describe() {
+        assert_eq!(
+            parse("describe Post").unwrap(),
+            Statement::Describe("Post".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_with_type_aliases_describe() {
+        assert_eq!(
+            parse("schema Post").unwrap(),
+            Statement::Describe("Post".to_string())
+        );
     }
 }

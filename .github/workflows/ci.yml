@@ -162,7 +162,7 @@ jobs:
             exit 1
           fi
 
-          DOCKER_RUST=$(grep -E '^FROM rust:' Dockerfile | head -1 | sed -E 's/.*rust:([0-9]+\.[0-9]+).*/\1/')
+          DOCKER_RUST=$(grep -E '^FROM (--platform=\S+ )?rust:' Dockerfile | head -1 | sed -E 's/.*rust:([0-9]+\.[0-9]+).*/\1/')
           echo "Dockerfile rust: $DOCKER_RUST"
           # Dockerfile may be newer than MSRV, but never older.
           if [ "$(printf '%s\n%s\n' "$MSRV" "$DOCKER_RUST" | sort -V | head -1)" != "$MSRV" ]; then

@@ -275,6 +275,7 @@ use self::plan_exec::{
 pub fn is_read_only_statement(stmt: &Statement) -> bool {
     match stmt {
         Statement::Query(_) => true,
+        Statement::ListTypes | Statement::Describe(_) => true,
         Statement::Union(u) => is_read_only_statement(&u.left) && is_read_only_statement(&u.right),
         Statement::Insert(_)
         | Statement::Upsert(_)
@@ -1967,6 +1968,10 @@ impl Engine {
                         .collect(),
                 })
             }
+
+            PlanNode::ListTypes => self.introspect_list_types(),
+
+            PlanNode::Describe { table } => self.introspect_describe(table),
 
             // All write variants — caller must escalate to the write lock.
             PlanNode::Insert { .. }
