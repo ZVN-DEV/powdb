@@ -270,7 +270,10 @@ async fn same_connection_double_begin_errors_without_hanging() {
 
     // The connection is still usable: commit closes the (single) transaction.
     let commit = query(&mut a, "commit").await;
-    assert!(!is_error(&commit), "commit after double-begin failed: {commit:?}");
+    assert!(
+        !is_error(&commit),
+        "commit after double-begin failed: {commit:?}"
+    );
 }
 
 // ---- P-10: named-database gate ------------------------------------------
@@ -287,7 +290,10 @@ async fn pinned_server_rejects_foreign_db_name() {
     let (_s, reply) = connect_raw(addr, "staging").await;
     match reply {
         Message::Error { message } => {
-            assert_eq!(message, "unknown database 'staging'; this server serves 'prod'");
+            assert_eq!(
+                message,
+                "unknown database 'staging'; this server serves 'prod'"
+            );
         }
         other => panic!("expected rejection Error, got {other:?}"),
     }

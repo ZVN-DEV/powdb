@@ -5336,7 +5336,11 @@ fn test_reserved_word_column_roundtrips_end_to_end() {
         .execute_powql("alter Post add index .`order`")
         .unwrap();
     // Index-backed lookup returns the right row.
-    let looked = rows_of(engine.execute_powql("Post filter .`order` = 1 { .`type` }").unwrap());
+    let looked = rows_of(
+        engine
+            .execute_powql("Post filter .`order` = 1 { .`type` }")
+            .unwrap(),
+    );
     assert_eq!(looked.len(), 1);
     assert_eq!(looked[0][0], Value::Str("blog".into()));
 }
@@ -5344,11 +5348,12 @@ fn test_reserved_word_column_roundtrips_end_to_end() {
 #[test]
 fn test_reserved_word_ddl_without_quote_still_errors_clearly() {
     let mut engine = fresh_engine();
-    let err = engine
-        .execute_powql("type Post { type: str }")
-        .unwrap_err();
+    let err = engine.execute_powql("type Post { type: str }").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("reserved word") && msg.contains("`type`"), "{msg}");
+    assert!(
+        msg.contains("reserved word") && msg.contains("`type`"),
+        "{msg}"
+    );
 }
 
 // ── P-7: DDL idempotency ────────────────────────────────────────────────
@@ -5389,7 +5394,9 @@ fn test_drop_if_exists_is_noop_on_missing_type() {
 #[test]
 fn test_alter_drop_column_if_exists_is_noop() {
     let mut engine = fresh_engine();
-    engine.execute_powql("type Post { id: int, tag: str }").unwrap();
+    engine
+        .execute_powql("type Post { id: int, tag: str }")
+        .unwrap();
     engine
         .execute_powql("alter Post drop column if exists nonexistent")
         .unwrap();
@@ -5400,7 +5407,9 @@ fn test_alter_drop_column_if_exists_is_noop() {
 #[test]
 fn test_add_unique_if_not_exists_is_noop_when_indexed() {
     let mut engine = fresh_engine();
-    engine.execute_powql("type Post { id: int, slug: str }").unwrap();
+    engine
+        .execute_powql("type Post { id: int, slug: str }")
+        .unwrap();
     engine.execute_powql("alter Post add index .slug").unwrap();
     // Already indexed — plain `add unique` errors, `if not exists` no-ops.
     assert!(engine.execute_powql("alter Post add unique .slug").is_err());
@@ -5414,7 +5423,9 @@ fn test_add_unique_if_not_exists_is_noop_when_indexed() {
 #[test]
 fn test_schema_lists_types_with_column_counts() {
     let mut engine = fresh_engine();
-    engine.execute_powql("type Post { id: int, body: str }").unwrap();
+    engine
+        .execute_powql("type Post { id: int, body: str }")
+        .unwrap();
     engine.execute_powql("type Tag { name: str }").unwrap();
     let rows = rows_of(engine.execute_powql("schema").unwrap());
     // One row per type; find Post and check its column count.
@@ -5469,12 +5480,18 @@ fn test_describe_reflects_live_schema_after_alter() {
     // current schema after a DDL change, not a stale snapshot.
     let mut engine = fresh_engine();
     engine.execute_powql("type Post { id: int }").unwrap();
-    assert_eq!(rows_of(engine.execute_powql("describe Post").unwrap()).len(), 1);
+    assert_eq!(
+        rows_of(engine.execute_powql("describe Post").unwrap()).len(),
+        1
+    );
     engine
         .execute_powql("alter Post add column body: str")
         .unwrap();
     // Same query text — would hit the plan cache — must now show 2 columns.
-    assert_eq!(rows_of(engine.execute_powql("describe Post").unwrap()).len(), 2);
+    assert_eq!(
+        rows_of(engine.execute_powql("describe Post").unwrap()).len(),
+        2
+    );
 }
 
 #[test]

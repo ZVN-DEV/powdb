@@ -140,7 +140,9 @@ fn parse_args() -> Args {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_TX_WAIT_TIMEOUT_MS);
-    let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME").ok().filter(|s| !s.is_empty());
+    let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut tls_cert: Option<String> = std::env::var("POWDB_TLS_CERT")
         .ok()
         .filter(|s| !s.is_empty());

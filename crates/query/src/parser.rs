@@ -1818,10 +1818,9 @@ impl Parser {
             // `expect_named_ident`, which emits the reserved-word guidance.
             let (mut required, mut unique, mut auto) = (false, false, false);
             loop {
-                let is_modifier = matches!(
-                    self.peek(),
-                    Token::Required | Token::Unique | Token::Auto
-                ) && !matches!(self.tokens.get(self.pos + 1), Some(Token::Colon));
+                let is_modifier =
+                    matches!(self.peek(), Token::Required | Token::Unique | Token::Auto)
+                        && !matches!(self.tokens.get(self.pos + 1), Some(Token::Colon));
                 if !is_modifier {
                     break;
                 }
@@ -3667,13 +3666,25 @@ mod capa_dx_tests {
     fn add_index_and_unique_if_not_exists_parse() {
         match parse("alter Post add index if not exists .slug").unwrap() {
             Statement::AlterTable(at) => {
-                assert!(matches!(at.action, AlterAction::AddIndex { if_not_exists: true, .. }));
+                assert!(matches!(
+                    at.action,
+                    AlterAction::AddIndex {
+                        if_not_exists: true,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected AlterTable, got {other:?}"),
         }
         match parse("alter Post add unique if not exists .slug").unwrap() {
             Statement::AlterTable(at) => {
-                assert!(matches!(at.action, AlterAction::AddUnique { if_not_exists: true, .. }));
+                assert!(matches!(
+                    at.action,
+                    AlterAction::AddUnique {
+                        if_not_exists: true,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -3683,7 +3694,13 @@ mod capa_dx_tests {
     fn alter_drop_column_if_exists_parses() {
         match parse("alter Post drop column if exists status").unwrap() {
             Statement::AlterTable(at) => {
-                assert!(matches!(at.action, AlterAction::DropColumn { if_exists: true, .. }));
+                assert!(matches!(
+                    at.action,
+                    AlterAction::DropColumn {
+                        if_exists: true,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected AlterTable, got {other:?}"),
         }

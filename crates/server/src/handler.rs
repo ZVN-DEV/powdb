@@ -2108,9 +2108,7 @@ where
             // one-db-per-process mismatch is at least visible.
             match check_db_name(server_db_name.as_deref(), &db_name) {
                 Ok(()) => {
-                    if server_db_name.is_none()
-                        && !db_name.is_empty()
-                        && db_name != DEFAULT_DB_NAME
+                    if server_db_name.is_none() && !db_name.is_empty() && db_name != DEFAULT_DB_NAME
                     {
                         warn!(
                             peer = %peer, db = %db_name,
@@ -2690,7 +2688,10 @@ mod tests {
     #[test]
     fn db_name_unpinned_accepts_any_name() {
         for requested in ["", "default", "prod", "anything"] {
-            assert!(check_db_name(None, requested).is_ok(), "rejected {requested}");
+            assert!(
+                check_db_name(None, requested).is_ok(),
+                "rejected {requested}"
+            );
         }
     }
 

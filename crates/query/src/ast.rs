@@ -60,10 +60,7 @@ pub enum AlterAction {
     /// if any duplicate (non-null) value is present. Without `if not exists`
     /// it errors when the column is already indexed (no in-place upgrade);
     /// with it, an existing index is a no-op.
-    AddUnique {
-        column: String,
-        if_not_exists: bool,
-    },
+    AddUnique { column: String, if_not_exists: bool },
 }
 
 /// `drop [if exists] User`
