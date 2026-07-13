@@ -535,18 +535,25 @@ connection issues `begin` while another connection's transaction is still open,
 it **queues** rather than failing — so a burst of concurrent writers all commit
 instead of erroring out.
 
-The wait is bounded. If a `begin` waits longer than the configured window for
-the other transaction to finish, it fails with a clear error
-(`transaction gate timeout after 5000ms waiting for concurrent transaction to
-complete`) instead of hanging indefinitely. Tune the window with
-`--tx-wait-timeout-ms` (or `POWDB_TX_WAIT_TIMEOUT_MS`; default `5000`):
+Bare **autocommit** writes (an `insert`/`update`/`delete` with no surrounding
+`begin`) share the same gate: while one connection holds an explicit
+transaction open, another connection's autocommit write waits for it too. This
+keeps every writer serialized and durable.
+
+The wait is bounded for **both** paths. If a `begin` **or** a bare autocommit
+write waits longer than the configured window for the other transaction to
+finish, it fails with a clear error (`transaction gate timeout after 5000ms
+waiting for concurrent transaction to complete`) instead of hanging
+indefinitely, so a stalled or held-open transaction can never wedge other
+writers forever. Tune the window with `--tx-wait-timeout-ms` (or
+`POWDB_TX_WAIT_TIMEOUT_MS`; default `5000`):
 
 ```bash
 powdb-server --tx-wait-timeout-ms 2000
 ```
 
-The `powdb_tx_gate_timeouts_total` metric counts these timeouts (see
-`--metrics-addr`).
+The `powdb_tx_gate_timeouts_total` metric counts these timeouts from both the
+explicit-`begin` and autocommit paths (see `--metrics-addr`).
 
 ### Serving a named database
 

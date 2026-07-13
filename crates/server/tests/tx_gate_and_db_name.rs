@@ -24,6 +24,9 @@ static UNIQUE: AtomicU64 = AtomicU64::new(0);
 struct ServerConfig {
     tx_wait_timeout: Duration,
     db_name: Option<String>,
+    /// Shared metrics handle so a test can inspect counters the server bumps.
+    /// Defaults to a fresh instance when a test does not care.
+    metrics: Arc<Metrics>,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +34,7 @@ impl Default for ServerConfig {
         Self {
             tx_wait_timeout: Duration::from_secs(5),
             db_name: None,
+            metrics: Arc::new(Metrics::new()),
         }
     }
 }
@@ -74,7 +78,7 @@ async fn start_server(cfg: ServerConfig) -> std::net::SocketAddr {
                         query_timeout: Duration::from_secs(30),
                         rate_limiter: None,
                         peer_addr: Some(peer),
-                        metrics: Arc::new(Metrics::new()),
+                        metrics: cfg.metrics.clone(),
                         tx_wait_timeout: cfg.tx_wait_timeout,
                         db_name: cfg.db_name.clone(),
                     },
@@ -193,7 +197,7 @@ async fn concurrent_explicit_transactions_all_succeed() {
 async fn overlapping_begin_times_out_with_clear_error() {
     let addr = start_server(ServerConfig {
         tx_wait_timeout: Duration::from_millis(200),
-        db_name: None,
+        ..ServerConfig::default()
     })
     .await;
 
@@ -276,13 +280,141 @@ async fn same_connection_double_begin_errors_without_hanging() {
     );
 }
 
+// ---- Capa #4: bare autocommit writes are bounded by the same gate --------
+
+/// The Capa dogfood repro: connection A holds an explicit transaction open and
+/// never commits; connection B issues a BARE autocommit insert (no `begin`).
+/// Before this fix B waited on the gate UNBOUNDED (Capa measured ~7.7s behind
+/// an 8s holder, and a wedged holder wedged writers forever). Now B fails fast
+/// with the clear, typed timeout error. After A commits, a retry from B works.
+#[tokio::test]
+async fn bare_autocommit_write_behind_held_txn_times_out_then_recovers() {
+    let addr = start_server(ServerConfig {
+        tx_wait_timeout: Duration::from_millis(200),
+        ..ServerConfig::default()
+    })
+    .await;
+
+    let mut setup = connect(addr, "default").await;
+    let created = query(&mut setup, "type Item { required n: int }").await;
+    assert!(!is_error(&created), "type creation failed: {created:?}");
+
+    // A opens an explicit transaction and holds it (never commits).
+    let mut a = connect(addr, "default").await;
+    let begin_a = query(&mut a, "begin").await;
+    assert!(!is_error(&begin_a), "A begin failed: {begin_a:?}");
+
+    // B's BARE autocommit insert must resolve (not hang) with the timeout error.
+    let mut b = connect(addr, "default").await;
+    let insert_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        query(&mut b, "insert Item { n := 1 }"),
+    )
+    .await
+    .expect("B autocommit write must not hang past the wait timeout");
+    match insert_b {
+        Message::Error { message } => {
+            assert!(
+                message.contains("transaction gate timeout after 200ms"),
+                "unexpected error: {message}"
+            );
+        }
+        other => panic!("expected timeout Error, got {other:?}"),
+    }
+
+    // Once A commits and releases the gate, B's retry succeeds.
+    let commit_a = query(&mut a, "commit").await;
+    assert!(!is_error(&commit_a), "A commit failed: {commit_a:?}");
+
+    let retry_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        query(&mut b, "insert Item { n := 2 }"),
+    )
+    .await
+    .expect("B retry must resolve now that the gate is free");
+    assert!(!is_error(&retry_b), "B retry insert failed: {retry_b:?}");
+}
+
+/// A bare autocommit write that times out behind a held transaction bumps the
+/// SAME `powdb_tx_gate_timeouts_total` counter as an explicit `begin` timeout,
+/// so `powdb_queries_total{result="error"}` stays truthful for both paths.
+#[tokio::test]
+async fn bare_autocommit_timeout_increments_the_gate_metric() {
+    let metrics = Arc::new(Metrics::new());
+    let addr = start_server(ServerConfig {
+        tx_wait_timeout: Duration::from_millis(150),
+        metrics: metrics.clone(),
+        ..ServerConfig::default()
+    })
+    .await;
+
+    let mut setup = connect(addr, "default").await;
+    let created = query(&mut setup, "type Item { required n: int }").await;
+    assert!(!is_error(&created), "type creation failed: {created:?}");
+
+    let mut a = connect(addr, "default").await;
+    assert!(!is_error(&query(&mut a, "begin").await), "A begin failed");
+
+    let mut b = connect(addr, "default").await;
+    let insert_b = tokio::time::timeout(
+        Duration::from_secs(5),
+        query(&mut b, "insert Item { n := 9 }"),
+    )
+    .await
+    .expect("B write must not hang");
+    assert!(
+        is_error(&insert_b),
+        "expected a timeout error, got {insert_b:?}"
+    );
+
+    let rendered = metrics.render();
+    assert!(
+        rendered.contains("powdb_tx_gate_timeouts_total 1"),
+        "autocommit timeout must bump the gate counter:\n{rendered}"
+    );
+    // The failed write must also register as an errored query.
+    assert!(
+        rendered.contains("powdb_queries_total{result=\"error\"} 1"),
+        "autocommit timeout must count as an errored query:\n{rendered}"
+    );
+}
+
+/// Regression / common path: a bare autocommit write with NO concurrent holder
+/// must succeed immediately. The bounded acquire must add no latency and never
+/// spuriously time out when the gate is free.
+#[tokio::test]
+async fn bare_autocommit_write_with_no_holder_succeeds_immediately() {
+    // A deliberately tiny wait timeout: if the uncontended acquire were to wait
+    // on it at all, this would flake. It must not.
+    let addr = start_server(ServerConfig {
+        tx_wait_timeout: Duration::from_millis(50),
+        ..ServerConfig::default()
+    })
+    .await;
+
+    let mut s = connect(addr, "default").await;
+    let created = query(&mut s, "type Item { required n: int }").await;
+    assert!(!is_error(&created), "type creation failed: {created:?}");
+
+    for i in 0..5 {
+        let insert = query(&mut s, &format!("insert Item {{ n := {i} }}")).await;
+        assert!(!is_error(&insert), "bare insert {i} failed: {insert:?}");
+    }
+
+    let count = query(&mut s, "count(Item)").await;
+    match count {
+        Message::ResultScalar { value } => assert_eq!(value, "5"),
+        other => panic!("expected scalar count, got {other:?}"),
+    }
+}
+
 // ---- P-10: named-database gate ------------------------------------------
 
 #[tokio::test]
 async fn pinned_server_rejects_foreign_db_name() {
     let addr = start_server(ServerConfig {
-        tx_wait_timeout: Duration::from_secs(5),
         db_name: Some("prod".to_string()),
+        ..ServerConfig::default()
     })
     .await;
 
