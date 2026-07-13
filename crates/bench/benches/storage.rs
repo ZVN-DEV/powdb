@@ -1,6 +1,6 @@
 //! Storage-layer criterion benches for the regression gate.
 //!
-//! Workloads 1–3 from docs/superpowers/specs/2026-04-07-bench-regression-gate-design.md
+//! Workloads 1-3 from the bench regression gate design.
 //!
 //! 1. `insert_10k`       — Table::insert loop, 10K rows into a fresh User table
 //! 2. `btree_lookup`     — Table::index_lookup on a 50K-row table, 100 random keys per iter

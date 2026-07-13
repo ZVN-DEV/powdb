@@ -1234,13 +1234,36 @@ impl Parser {
         }
     }
 
-    /// Parse `group .field1, .field2 [having <expr>]`.
+    /// Parse `group .field1, alias.field2 [having <expr>]`.
+    ///
+    /// Two key forms are accepted:
+    ///   - `.field` is a bare `DotIdent`, an `Unqualified` key.
+    ///   - `alias.field` is an `Ident` followed by a `DotIdent`, a `Qualified`
+    ///     key (the lexer splits `u.status` into `Ident("u")` + `DotIdent("status")`).
     fn parse_group_by(&mut self) -> Result<GroupByClause, ParseError> {
         let mut keys = Vec::new();
-        while let Token::DotIdent(name) = self.peek() {
-            let name = name.clone();
-            self.advance();
-            keys.push(name);
+        loop {
+            match self.peek().clone() {
+                Token::DotIdent(field) => {
+                    self.advance();
+                    keys.push(GroupKey::Unqualified(field));
+                }
+                Token::Ident(alias) => {
+                    self.advance();
+                    match self.peek().clone() {
+                        Token::DotIdent(field) => {
+                            self.advance();
+                            keys.push(GroupKey::Qualified { alias, field });
+                        }
+                        _ => {
+                            return Err(ParseError::Syntax {
+                                message: "expected .field after qualifier in group key".into(),
+                            });
+                        }
+                    }
+                }
+                _ => break,
+            }
             if *self.peek() == Token::Comma {
                 self.advance();
             } else {
@@ -1249,7 +1272,7 @@ impl Parser {
         }
         if keys.is_empty() {
             return Err(ParseError::Syntax {
-                message: "expected at least one .field after group".into(),
+                message: "expected at least one group key after group".into(),
             });
         }
         let having = if *self.peek() == Token::Having {
@@ -2594,7 +2617,7 @@ mod tests {
         match stmt {
             Statement::Query(q) => {
                 let gb = q.group_by.unwrap();
-                assert_eq!(gb.keys, vec!["status"]);
+                assert_eq!(gb.keys, vec![GroupKey::Unqualified("status".into())]);
                 assert!(gb.having.is_none());
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
@@ -2614,7 +2637,13 @@ mod tests {
         match stmt {
             Statement::Query(q) => {
                 let gb = q.group_by.unwrap();
-                assert_eq!(gb.keys, vec!["status", "age"]);
+                assert_eq!(
+                    gb.keys,
+                    vec![
+                        GroupKey::Unqualified("status".into()),
+                        GroupKey::Unqualified("age".into())
+                    ]
+                );
             }
             _ => panic!("expected query"),
         }
@@ -2626,7 +2655,7 @@ mod tests {
         match stmt {
             Statement::Query(q) => {
                 let gb = q.group_by.unwrap();
-                assert_eq!(gb.keys, vec!["status"]);
+                assert_eq!(gb.keys, vec![GroupKey::Unqualified("status".into())]);
                 assert!(gb.having.is_some());
                 // HAVING is `count(.name) > 1` — BinaryOp(FunctionCall, Gt, Literal)
                 match gb.having.unwrap() {
@@ -3554,7 +3583,7 @@ mod cleanup_parser_dx_tests {
 }
 
 #[cfg(test)]
-mod capa_dx_tests {
+mod dogfood_dx_tests {
     use super::*;
 
     // ── P-6: reserved words as column names ────────────────────────────

@@ -1,24 +1,32 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
 use crate::page::{iter_page_slots, Page, PageType, MAX_ROW_DATA_SIZE, PAGE_SIZE};
-use crate::row::validate_row_format;
+use crate::row::{row_is_v2, validate_row_format};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
 
 pub const HEAP_MAGIC: &[u8; 5] = b"PHEAP";
+/// The heap superblock version a fresh heap is created with. A database that
+/// never spills a value stays at v2 forever and remains readable by pre-v0.11
+/// binaries (door D4 / section 3.8).
 pub const HEAP_FORMAT_VERSION: u16 = 2;
+/// Superblock version once the heap has stored at least one overflow chain.
+/// Bumped lazily on the FIRST chain write; old binaries refuse v3 outright
+/// (correct: they would misread Overflow pages mid-scan).
+pub const HEAP_FORMAT_VERSION_WITH_OVERFLOW: u16 = 3;
 const HEAP_SUPERBLOCK_OFFSET: usize = crate::page::PAGE_HEADER_SIZE;
 const HEAP_SUPERBLOCK_FIRST_DATA_PAGE: u32 = 1;
+const HEAP_SUPERBLOCK_VERSION_OFFSET: usize = HEAP_SUPERBLOCK_OFFSET + HEAP_MAGIC.len();
 
-fn heap_superblock_page() -> Page {
+fn heap_superblock_page_versioned(version: u16) -> Page {
     let page = Page::new(0, PageType::Meta);
     let mut bytes = *page.as_bytes();
     let mut pos = HEAP_SUPERBLOCK_OFFSET;
     bytes[pos..pos + HEAP_MAGIC.len()].copy_from_slice(HEAP_MAGIC);
     pos += HEAP_MAGIC.len();
-    bytes[pos..pos + 2].copy_from_slice(&HEAP_FORMAT_VERSION.to_le_bytes());
+    bytes[pos..pos + 2].copy_from_slice(&version.to_le_bytes());
     pos += 2;
     bytes[pos..pos + 2].copy_from_slice(&0u16.to_le_bytes()); // flags
     pos += 2;
@@ -30,9 +38,15 @@ fn heap_superblock_page() -> Page {
     page
 }
 
-fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<u32> {
+fn heap_superblock_page() -> Page {
+    heap_superblock_page_versioned(HEAP_FORMAT_VERSION)
+}
+
+/// Returns `(first_data_page, heap_version)`. New code accepts versions 2 and
+/// 3; a `first_data_page` of 0 signals a legacy pre-superblock (v1) heap.
+fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<(u32, u16)> {
     if buf[4] != PageType::Meta as u8 {
-        return Ok(0);
+        return Ok((0, 1));
     }
     let mut pos = HEAP_SUPERBLOCK_OFFSET;
     if &buf[pos..pos + HEAP_MAGIC.len()] != HEAP_MAGIC {
@@ -44,7 +58,7 @@ fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<u32> {
     pos += HEAP_MAGIC.len();
     let version = u16::from_le_bytes(buf[pos..pos + 2].try_into().expect("2-byte heap version"));
     pos += 2;
-    if version != HEAP_FORMAT_VERSION {
+    if version != HEAP_FORMAT_VERSION && version != HEAP_FORMAT_VERSION_WITH_OVERFLOW {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported heap format version: {version}"),
@@ -64,7 +78,7 @@ fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<u32> {
             .try_into()
             .expect("4-byte first data page"),
     );
-    Ok(first_data_page)
+    Ok((first_data_page, version))
 }
 
 /// A single dirty page pinned in memory for write-back coalescing.
@@ -125,6 +139,8 @@ pub struct HeapFile {
     /// [`flush_all_dirty`] call (or `Drop`). Scan operations call
     /// `flush_all_dirty` first so their view is consistent with disk.
     dirty_buffer: FxHashMap<u32, Page>,
+    free_overflow_pages: Vec<u32>,
+    heap_version: u16,
 }
 
 impl HeapFile {
@@ -143,14 +159,16 @@ impl HeapFile {
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
+            free_overflow_pages: Vec::new(),
+            heap_version: HEAP_FORMAT_VERSION,
         })
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut disk = DiskManager::open(path)?;
         let num_pages = disk.num_pages();
-        let first_data_page = if num_pages == 0 {
-            0
+        let (first_data_page, heap_version) = if num_pages == 0 {
+            (0, HEAP_FORMAT_VERSION)
         } else {
             let page0 = disk.read_page(0)?;
             heap_first_data_page(&page0)?
@@ -159,6 +177,15 @@ impl HeapFile {
         let mut in_free_list = vec![false; num_pages as usize];
         for i in first_data_page..num_pages {
             if let Ok(buf) = disk.read_page(i) {
+                // Overflow-chain pages are not data pages: they hold value
+                // payload behind a chunk header, never a slot directory, so
+                // they must never be offered to the row insert path nor
+                // validated as rows. Their reuse is driven by the in-memory
+                // free list (within a session) and by `sweep` (across
+                // restarts), not by this open-time free-space scan.
+                if buf[4] == PageType::Overflow as u8 {
+                    continue;
+                }
                 // Mission 2: a page whose `page_type` byte is 0 was
                 // allocated by [`DiskManager::allocate_page`] (which
                 // writes an all-zero 4KB block) but never populated with
@@ -202,6 +229,8 @@ impl HeapFile {
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
+            free_overflow_pages: Vec::new(),
+            heap_version,
         })
     }
 
@@ -209,7 +238,7 @@ impl HeapFile {
         if self.first_data_page == 0 {
             1
         } else {
-            HEAP_FORMAT_VERSION
+            self.heap_version
         }
     }
 
@@ -454,6 +483,208 @@ impl HeapFile {
             .into());
         }
         Ok(())
+    }
+
+    // ===================== Overflow chains (P-2) =====================
+
+    /// Lazily bump the heap superblock from v2 to v3 on the first overflow
+    /// chain write. A never-spilling database stays v2 and old-binary
+    /// readable; once a chain exists, old binaries must refuse the file
+    /// (they would misread Overflow pages), so the version advertises v3.
+    fn ensure_heap_v3(&mut self) -> io::Result<()> {
+        // Legacy pre-superblock heaps (first_data_page == 0) have no version
+        // word to bump; already-v3 heaps are done.
+        if self.first_data_page == 0 || self.heap_version >= HEAP_FORMAT_VERSION_WITH_OVERFLOW {
+            return Ok(());
+        }
+        let mut buf = self.disk.read_page(0)?;
+        buf[HEAP_SUPERBLOCK_VERSION_OFFSET..HEAP_SUPERBLOCK_VERSION_OFFSET + 2]
+            .copy_from_slice(&HEAP_FORMAT_VERSION_WITH_OVERFLOW.to_le_bytes());
+        let mut page = Page::from_bytes(&buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "corrupt heap superblock"))?;
+        page.stamp_checksum();
+        self.disk.write_page(0, page.as_bytes())?;
+        self.heap_version = HEAP_FORMAT_VERSION_WITH_OVERFLOW;
+        Ok(())
+    }
+
+    /// Allocate an overflow-chain page: reuse a freed one if the in-memory
+    /// free list has any, otherwise extend the file. Extending invalidates
+    /// the persistent mmap (the file grows past the mapped snapshot), so it
+    /// is torn down first — exactly as on the data-page allocation path.
+    pub fn allocate_overflow_page(&mut self) -> io::Result<u32> {
+        if let Some(pid) = self.free_overflow_pages.pop() {
+            return Ok(pid);
+        }
+        self.disable_mmap();
+        self.disk.allocate_page()
+    }
+
+    /// Write one chunk of an overflow chain to `page_id` directly to disk
+    /// (overflow pages bypass the data-page hot/dirty machinery). The page
+    /// is stamped with `lsn` so WAL replay of the corresponding
+    /// `OverflowWrite` record is idempotent under the per-page LSN skip, and
+    /// with a CRC32 so the verified read path accepts it. Bumps the heap
+    /// superblock to v3 on the first such write.
+    pub fn write_overflow_page(
+        &mut self,
+        page_id: u32,
+        next_page: u32,
+        chunk: &[u8],
+        lsn: u64,
+    ) -> io::Result<()> {
+        self.ensure_heap_v3()?;
+        // A replay may target a page id past the current file end (the chain
+        // page was allocated but never flushed before the crash). Grow the
+        // file with zero pages up to it, mirroring `insert_at`.
+        if page_id >= self.disk.num_pages() {
+            self.disable_mmap();
+            while self.disk.num_pages() <= page_id {
+                self.disk.allocate_page()?;
+            }
+        }
+        let mut page = Page::new_overflow(page_id);
+        page.set_overflow_chunk(next_page, chunk);
+        if lsn > 0 {
+            page.set_lsn(lsn);
+        }
+        page.stamp_checksum();
+        self.disk.write_page(page_id, page.as_bytes())
+    }
+
+    /// The current on-disk LSN of an overflow page (0 if past the file end or
+    /// unstamped). Used by WAL replay to skip already-applied `OverflowWrite`
+    /// records idempotently.
+    pub fn overflow_page_lsn(&self, page_id: u32) -> u64 {
+        if page_id < self.disk.num_pages() {
+            if let Ok(buf) = self.disk.read_page(page_id) {
+                return crate::page::page_lsn(&buf);
+            }
+        }
+        0
+    }
+
+    /// Walk an overflow chain from `first_page`, collecting every page id in
+    /// the chain (head-first order). Used to build `OverflowFree` payloads
+    /// and to return a chain's pages to the free list. A cycle guard caps the
+    /// walk at the current file length so a corrupt `next_page` can never
+    /// loop forever.
+    pub fn overflow_chain_pages(&self, first_page: u32) -> io::Result<Vec<u32>> {
+        let mut pages = Vec::new();
+        let mut pid = first_page;
+        let max_steps = self.disk.num_pages() as usize + 1;
+        while pid != crate::page::OVERFLOW_CHAIN_END && pages.len() < max_steps {
+            if pid >= self.disk.num_pages() {
+                break;
+            }
+            pages.push(pid);
+            let buf = self.disk.read_page(pid)?;
+            if buf[4] != PageType::Overflow as u8 {
+                break;
+            }
+            pid = crate::page::overflow_next_from_bytes(&buf);
+        }
+        Ok(pages)
+    }
+
+    /// Reassemble the full out-of-line value a stub points at, verifying its
+    /// length and whole-value CRC32 (typed `OverflowCorrupt` on mismatch —
+    /// torn or cross-linked chain).
+    pub fn read_overflow_value(
+        &self,
+        stub: &crate::row::OverflowStub,
+    ) -> crate::error::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(stub.total_len as usize);
+        let mut pid = stub.first_page;
+        let max_steps = self.disk.num_pages() as usize + 1;
+        let mut steps = 0usize;
+        while pid != crate::page::OVERFLOW_CHAIN_END {
+            if pid >= self.disk.num_pages() || steps > max_steps {
+                return Err(StorageError::OverflowCorrupt(format!(
+                    "overflow chain from page {} runs off the file at page {pid}",
+                    stub.first_page
+                )));
+            }
+            let buf = self.disk.read_page(pid).map_err(StorageError::Io)?;
+            // Verify the page CRC so on-disk bit-rot in a chain page is caught.
+            Page::from_bytes_verified(&buf)?;
+            if buf[4] != PageType::Overflow as u8 {
+                return Err(StorageError::OverflowCorrupt(format!(
+                    "overflow chain page {pid} is not an Overflow page"
+                )));
+            }
+            out.extend_from_slice(crate::page::overflow_chunk_from_bytes(&buf));
+            pid = crate::page::overflow_next_from_bytes(&buf);
+            steps += 1;
+            if out.len() as u64 > stub.total_len {
+                break;
+            }
+        }
+        if out.len() as u64 != stub.total_len {
+            return Err(StorageError::OverflowCorrupt(format!(
+                "overflow value length {} != stub total_len {}",
+                out.len(),
+                stub.total_len
+            )));
+        }
+        let crc = crc32fast::hash(&out);
+        if crc != stub.value_crc32 {
+            return Err(StorageError::OverflowCorrupt(format!(
+                "overflow value CRC32 mismatch: computed {crc:#010x}, stub {:#010x}",
+                stub.value_crc32
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Return a set of overflow pages to the in-memory free list for reuse by
+    /// the next chain allocation within this session.
+    pub fn release_overflow_pages(&mut self, pages: &[u32]) {
+        self.free_overflow_pages.extend_from_slice(pages);
+    }
+
+    /// Snapshot of the current overflow free list (test/introspection).
+    pub fn overflow_free_list_len(&self) -> usize {
+        self.free_overflow_pages.len()
+    }
+
+    /// Total page count (including the superblock and any overflow pages).
+    pub fn num_pages(&self) -> u32 {
+        self.disk.num_pages()
+    }
+
+    /// Sweep phase of overflow reclamation (design 3.6): reclaim every
+    /// Overflow-typed page in `[first_data_page, watermark)` that is NOT in the
+    /// `referenced` set and not already free, returning them to the in-memory
+    /// free list. The watermark is the current file length, so this runs under
+    /// the table write lock where no concurrent allocation can race it. Returns
+    /// the reclaimed page ids (for the caller's `OverflowFree` WAL record).
+    pub fn sweep_unreferenced_overflow(
+        &mut self,
+        referenced: &std::collections::HashSet<u32>,
+    ) -> io::Result<Vec<u32>> {
+        let already_free: std::collections::HashSet<u32> =
+            self.free_overflow_pages.iter().copied().collect();
+        let watermark = self.disk.num_pages();
+        let mut reclaimed = Vec::new();
+        for pid in self.first_data_page..watermark {
+            if referenced.contains(&pid) || already_free.contains(&pid) {
+                continue;
+            }
+            let buf = self.disk.read_page(pid)?;
+            if buf[4] == PageType::Overflow as u8 {
+                reclaimed.push(pid);
+            }
+        }
+        self.free_overflow_pages.extend_from_slice(&reclaimed);
+        Ok(reclaimed)
+    }
+
+    /// Split `value` into `OVERFLOW_PAYLOAD_CAP`-sized chunks. The plan is a
+    /// list of chunk byte-ranges; the caller allocates a page per chunk and
+    /// links them head-first.
+    pub fn overflow_chunk_count(value_len: usize) -> usize {
+        value_len.div_ceil(crate::page::OVERFLOW_PAYLOAD_CAP).max(1)
     }
 
     /// Insert encoded row data. Returns RowId.
@@ -756,6 +987,13 @@ impl HeapFile {
         self.ensure_hot(rid.page_id)?;
         let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
         if let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) {
+            // v0.11 overflow safety: byte-patch closures assume v1 layout math.
+            // Refuse v2 rows so a caller can never corrupt a spilled row's
+            // bytes through this primitive; the executor routes v2-capable
+            // tables to the reassembling update path instead.
+            if row_is_v2(bytes) {
+                return Ok(false);
+            }
             f(bytes);
             hot.dirty = true;
             return Ok(true);
@@ -788,6 +1026,12 @@ impl HeapFile {
         let Some(bytes) = hot.page.slot_bytes_mut(rid.slot_index) else {
             return Ok(false);
         };
+        // v0.11 overflow safety: refuse v2 rows (defence in depth — the patch
+        // closure's `patch_var_column_in_place` also refuses them). A v2 row
+        // patched with v1 offset math would corrupt.
+        if row_is_v2(bytes) {
+            return Ok(false);
+        }
         let old_len = bytes.len();
         let Some(new_len) = f(bytes) else {
             return Ok(false);
@@ -863,6 +1107,11 @@ impl HeapFile {
             let mut any_deleted = false;
             {
                 let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+                // Overflow-chain pages carry value payload, not a slot
+                // directory — never walk them as rows.
+                if hot.page.is_overflow() {
+                    continue;
+                }
                 let slot_count = hot.page.slot_count();
                 for slot in 0..slot_count {
                     // Scoped immutable borrow for the pred/hook invocation,
@@ -938,6 +1187,10 @@ impl HeapFile {
         for page_id in 0..num_pages {
             self.ensure_hot(page_id)?;
             let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+            // Skip overflow-chain pages (no slot directory to patch).
+            if hot.page.is_overflow() {
+                continue;
+            }
             let slot_count = hot.page.slot_count();
             let mut any_mutated = false;
             for slot in 0..slot_count {
@@ -950,6 +1203,15 @@ impl HeapFile {
                         page_id,
                         slot_index: slot,
                     };
+                    // v0.11 overflow safety: never byte-patch a v2 row here —
+                    // `try_mutate` closures assume v1 layout and would corrupt a
+                    // spilled row (and Path-1 fixed patches write unconditionally).
+                    // Route it to the fallback list so the caller re-applies the
+                    // mutation through the reassembling update path.
+                    if hot.page.get(slot).map(row_is_v2).unwrap_or(false) {
+                        fallback.push(rid);
+                        continue;
+                    }
                     if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
                         let old_len = bytes.len() as u16;
                         if let Some(new_len) = try_mutate(bytes) {
@@ -1996,6 +2258,99 @@ mod tests {
         );
         assert_eq!(heap.get(rid).unwrap(), old_bytes, "old row must survive");
         assert_eq!(heap.scan().count(), 1);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn write_chain(heap: &mut HeapFile, value: &[u8]) -> crate::row::OverflowStub {
+        use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
+        let n = value.len().div_ceil(OVERFLOW_PAYLOAD_CAP).max(1);
+        let mut pages = Vec::new();
+        for _ in 0..n {
+            pages.push(heap.allocate_overflow_page().unwrap());
+        }
+        for i in 0..n {
+            let start = i * OVERFLOW_PAYLOAD_CAP;
+            let end = (start + OVERFLOW_PAYLOAD_CAP).min(value.len());
+            let next = if i + 1 < n {
+                pages[i + 1]
+            } else {
+                OVERFLOW_CHAIN_END
+            };
+            heap.write_overflow_page(pages[i], next, &value[start..end], 0)
+                .unwrap();
+        }
+        crate::row::OverflowStub::new(value.len() as u64, pages[0], crc32fast::hash(value))
+    }
+
+    #[test]
+    fn test_overflow_chain_roundtrip_and_v3_bump() {
+        let (mut heap, path) = temp_heap("ovf_chain");
+        assert_eq!(heap.format_version(), HEAP_FORMAT_VERSION); // v2 before any chain
+        let value = vec![0x7Eu8; 10_000]; // spans 3 chunks
+        let stub = write_chain(&mut heap, &value);
+        assert_eq!(
+            heap.format_version(),
+            HEAP_FORMAT_VERSION_WITH_OVERFLOW,
+            "first chain write must lazily bump the heap to v3"
+        );
+        let got = heap.read_overflow_value(&stub).unwrap();
+        assert_eq!(got, value);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_overflow_crc_and_length_faults_are_typed_errors() {
+        let (mut heap, path) = temp_heap("ovf_crc");
+        let value = b"the whole out-of-line value".to_vec();
+        let mut stub = write_chain(&mut heap, &value);
+        // Correct stub reads clean.
+        assert_eq!(heap.read_overflow_value(&stub).unwrap(), value);
+        // Wrong CRC -> typed OverflowCorrupt.
+        stub.value_crc32 ^= 0xFFFF_FFFF;
+        assert!(matches!(
+            heap.read_overflow_value(&stub),
+            Err(crate::error::StorageError::OverflowCorrupt(_))
+        ));
+        // Wrong length -> typed OverflowCorrupt.
+        let mut bad_len = crate::row::OverflowStub::new(
+            value.len() as u64 + 100,
+            stub.first_page,
+            crc32fast::hash(&value),
+        );
+        bad_len.value_crc32 = crc32fast::hash(&value);
+        assert!(matches!(
+            heap.read_overflow_value(&bad_len),
+            Err(crate::error::StorageError::OverflowCorrupt(_))
+        ));
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_overflow_free_list_reuse() {
+        let (mut heap, path) = temp_heap("ovf_reuse");
+        let stub = write_chain(&mut heap, &vec![1u8; 9000]); // 3 pages
+        let pages = heap.overflow_chain_pages(stub.first_page).unwrap();
+        assert_eq!(pages.len(), 3);
+        // Free the chain; the next allocations must reuse those exact pages.
+        heap.release_overflow_pages(&pages);
+        assert_eq!(heap.overflow_free_list_len(), 3);
+        let reused: Vec<u32> = (0..3)
+            .map(|_| heap.allocate_overflow_page().unwrap())
+            .collect();
+        // Pop order is LIFO, so reused is the freed set reversed — but as a set
+        // they must be exactly the freed pages (no file growth).
+        let mut a = reused.clone();
+        a.sort_unstable();
+        let mut b = pages.clone();
+        b.sort_unstable();
+        assert_eq!(
+            a, b,
+            "freed chain pages must be reused, not newly allocated"
+        );
+        assert_eq!(heap.overflow_free_list_len(), 0);
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

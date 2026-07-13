@@ -1553,6 +1553,37 @@ async fn acquire_begin_permit(
     }
 }
 
+/// Acquire the TxGate for a BARE autocommit statement, bounded by
+/// `tx_wait_timeout` exactly like [`acquire_begin_permit`]. Autocommit writes
+/// serialize through the same gate as explicit transactions, so a stalled (or
+/// held-open) transaction on another connection would otherwise block this
+/// write indefinitely. Bounding the acquire turns that indefinite wait into a
+/// clear, client-facing timeout error and records the timeout so
+/// `powdb_tx_gate_timeouts_total` (and the error total) stay truthful. This
+/// only bounds the ACQUIRE; the permit is still dropped BEFORE the caller's
+/// durability wait so overlapping committers can share an fsync.
+async fn acquire_autocommit_permit(
+    tx_gate: &TxGate,
+    tx_wait_timeout: Duration,
+    metrics: &Arc<Metrics>,
+) -> Result<OwnedSemaphorePermit, Message> {
+    match tokio::time::timeout(tx_wait_timeout, tx_gate.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Message::Error {
+            message: "query execution error".into(),
+        }),
+        Err(_) => {
+            metrics.inc_tx_gate_timeout();
+            Err(Message::Error {
+                message: format!(
+                    "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
+                    tx_wait_timeout.as_millis()
+                ),
+            })
+        }
+    }
+}
+
 /// Execute one wire query frame and return the response plus its un-waited
 /// WAL durability ticket. The TxGate permit is managed here and — crucially —
 /// is already released (bare statements, commit/rollback) by the time this
@@ -1630,16 +1661,9 @@ async fn execute_wire_query(
             .await
         }
         None => {
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let out = run_blocking_query(
                 engine,
@@ -1726,16 +1750,9 @@ async fn execute_wire_query_sql(
             .await
         }
         None => {
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let out = run_blocking_query(
                 engine,
@@ -1832,16 +1849,9 @@ async fn execute_wire_query_with_params(
             .await
         }
         None => {
-            let permit = match tx_gate.acquire_owned().await {
+            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        Message::Error {
-                            message: "query execution error".into(),
-                        },
-                        None,
-                    )
-                }
+                Err(response) => return (response, None),
             };
             let out = run_blocking_query(
                 engine,

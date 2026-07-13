@@ -7,9 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-13
+
+Document-store foundations. **Overflow pages** remove the roughly 4KB
+row-size cap: a single row can now hold values of arbitrary size (up to the
+64MB `MAX_VALUE_SIZE` engine limit), spilling the oversized value to a chain
+of overflow pages behind a fixed-size stub. This release also fixes
+**grouped aggregates over joins** and adds a **bounded wait for bare
+autocommit writes** queued behind a held transaction, completing the
+transaction-gate story started in 0.10.
+
+On-disk compatibility: a database that never stores an oversized value stays
+byte-identical to 0.10 and opens on 0.10 binaries. The row format bumps to v2
+and the heap to v3 lazily, only on the first spill; once a value has spilled,
+older binaries correctly refuse the file rather than misread it. 0.10.x
+databases and backups open as-is.
+
+### Added
+
+- **Overflow pages (P-2).** Values larger than the inline page budget spill
+  to a chain of 4KB overflow pages, pointed to by a 24-byte stub carrying the
+  logical length, first page, and a CRC32. Fixed-size columns never spill;
+  indexed columns are kept inline where possible so index keys stay fast.
+  Spills, updates, and deletes are fully WAL-logged (`OverflowWrite` /
+  `OverflowFree` records) and replay on crash recovery. A mark-and-sweep
+  reclaimer (`powdb sweep`, and an automatic pass after recovery) returns
+  orphaned chains to the free list so churn does not leak disk.
+- **Bounded wait for bare autocommit writes.** 0.10's `--tx-wait-timeout-ms`
+  bounded explicit `begin` only; a bare autocommit write queued behind a held
+  transaction still waited unbounded. It now respects the same bound and fails
+  with the typed transaction-gate timeout error, and increments the
+  `powdb_tx_gate_timeouts_total` metric. A wedged transaction holder can no
+  longer wedge autocommit writers indefinitely.
+
+### Fixed
+
+- **Grouped aggregates over joins (P-5).** Aggregating a value field grouped
+  by another field across a joined/latest-version shape now resolves qualified
+  keys and arguments correctly instead of silently returning nulls.
+- **Row-format-v2 correctness (defect class closed).** A class of latent bugs
+  where v1 layout math or v1-only code paths were applied to v2 (spilled) rows
+  is closed systematically: row decode is v2-aware, every raw byte-patch
+  primitive refuses a v2 row, the executor's raw fast paths gate on whether a
+  table can hold spilled rows, rid relocation repoints every index, overflow
+  chains are freed on update and delete, and `ALTER` plus index rebuilds
+  reassemble spilled values. Round trips are byte-exact from 4KB through 256KB
+  and beyond, and survive crash recovery.
+- **Update fast path never silently drops a spilled row.** The all-fixed-column
+  update fast path now routes any row it cannot patch in place through the
+  reassembling update path instead of skipping it, so an update can never be
+  silently lost or the modified count under-reported.
+
+### Changed
+
+- **Row format v2 and heap format v3** are introduced lazily on first spill
+  (see the compatibility note above). Databases that never spill are
+  unaffected and remain readable by 0.10 binaries.
+
 ## [0.10.0] - 2026-07-13
 
-Dogfood-hardening release from the Capa v3x experiment: a **bounded
+Dogfood-hardening release from an internal dogfood workload: a **bounded
 transaction-gate wait** that turns concurrent `begin` hangs into a clear,
 metered error — fixing a ~54% concurrent-create failure mode — plus PowQL
 developer-experience work (reserved-word errors + backtick quoting, `if
@@ -31,8 +88,8 @@ reserved word in identifier position.
   `POWDB_TX_WAIT_TIMEOUT_MS`, default 5000ms) instead of hanging up to the
   300s idle timeout. On elapse the client gets a clear `transaction gate
   timeout` error and the new `powdb_tx_gate_timeouts_total` metric is
-  incremented. Fixes the ~54% concurrent-create failure mode from the Capa
-  dogfood run, where pooled clients saw `begin` hang past their own
+  incremented. Fixes the ~54% concurrent-create failure mode from an
+  internal dogfood run, where pooled clients saw `begin` hang past their own
   timeouts. New wire-level e2e tests including the 10-writer repro (0
   failures) and disconnect-mid-transaction gate release.
 - **Opt-in `--db-name` / `POWDB_DB_NAME` connect enforcement.** When set,
@@ -287,7 +344,7 @@ row-level sync, and DDL write-forward.
 ## [0.7.2] - 2026-06-29
 
 A correctness and documentation patch from the post-v0.7.1 gold-standard audit
-and Turbine ORM issue triage.
+and ORM integration issue triage.
 
 ### Fixed
 
@@ -316,8 +373,8 @@ and Turbine ORM issue triage.
 
 ## [0.7.1] - 2026-06-28
 
-A correctness, safety, and embedded-write-performance patch driven by the Turbine
-ORM team's v0.7.0 adoption review plus a PowDB-side audit.
+A correctness, safety, and embedded-write-performance patch driven by an ORM
+integration's v0.7.0 adoption review plus a PowDB-side audit.
 
 ### Fixed
 
@@ -365,7 +422,7 @@ catalogs (v1–v4) still load.
   `.queryReadonly(...)`. Results match the `@zvndev/powdb-client` `QueryResult`
   shape exactly (rows as `string[][]`, `affected` as `bigint`) so embedded and
   networked code paths are interchangeable — the foundation for local-first
-  apps (e.g. `turbinePowDB({ embedded })`). Built as a standalone
+  apps (e.g. `powdbEmbedded({ embedded })`). Built as a standalone
   `panic = "unwind"` workspace so a query panic is caught and surfaced as a JS
   error rather than aborting the host process.
 - **Embedded mode — `powdb` crate** (the SQLite-shaped front door). Run the
@@ -434,8 +491,8 @@ catalogs (v1–v4) still load.
   SQLite `synchronous=NORMAL` / Postgres `synchronous_commit=off` semantics and
   removes the per-write fsync from the latency path (~15–40× faster single-row
   writes). Select it with `POWDB_SYNC_MODE=full|normal|off` (default `full` —
-  no durability change unless opted in). Addresses the turbine-orm write-latency
-  finding; see `docs/design/2026-06-27-write-performance-*`.
+  no durability change unless opted in). Addresses an ORM integration's
+  write-latency finding; see `docs/design/2026-06-27-write-performance-*`.
 
 ### Security
 - **Fixed a remotely-triggerable denial-of-service in the in-place `UPDATE`
@@ -445,7 +502,7 @@ catalogs (v1–v4) still load.
   `panic = "abort"` profile, took the whole server process down for every
   connection. The fast path now coerces each assignment to the column's
   declared type before writing bytes and returns a typed `TypeError` on a
-  genuine mismatch. Reported by the turbine-orm integration.
+  genuine mismatch. Reported by an ORM integration test.
 
 ### Fixed
 - **The on-disk catalog now loads every format version from 1 up to the
@@ -472,7 +529,7 @@ catalogs (v1–v4) still load.
   denormal such as `5e-323`) — silent numeric corruption on the in-place
   update fast path. `INSERT` already coerced correctly; the byte-patch
   `UPDATE` path bypassed it. Fix covers both the indexed and the fused
-  `Filter(SeqScan)` update paths. Reported by the turbine-orm integration.
+  `Filter(SeqScan)` update paths. Reported by an ORM integration test.
 - **Completed that coercion fix across the remaining write paths** (#117/#118).
   The previous fix only covered literal assignments; a *computed* assignment
   (any non-literal RHS, e.g. `balance := .tag + 9`) took the per-row
@@ -484,7 +541,7 @@ catalogs (v1–v4) still load.
   — a remotely-triggerable DoS (#117). All write paths (`INSERT`, literal and
   expression `UPDATE` including `RETURNING`, and `UPSERT`) now coerce each
   assignment to the target column's declared type and return a typed error on
-  a genuine mismatch. Reported by the turbine-orm integration.
+  a genuine mismatch. Reported by an ORM integration test.
 
 ## [0.6.2] - 2026-06-26
 
@@ -567,9 +624,7 @@ catalogs (v1–v4) still load.
 
 ### Known limitations
 - Full cooperative query cancellation is still planned work rather than part of
-  this hardening patch. See
-  `docs/strategy/2026-06-19-query-cancellation-hardening.md` for the scoped
-  implementation plan.
+  this hardening patch. A scoped implementation plan is tracked separately.
 
 ## [0.6.0] - 2026-06-19
 
@@ -918,7 +973,7 @@ Phase 1 (perf + security hardening) + Phase 2 (deployment + DX), shipped togethe
 - **Deployment examples** — AWS ECS Fargate + EFS Terraform module, Cloudflare Tunnel docker-compose, Railway `railway.toml`, plus a refreshed Fly.io example with the new env vars and properly sized memory budget vs concurrency.
 - **CI `examples-smoke` job** — Terraform validate + docker compose config + `dev.sh up/down` lifecycle on every PR.
 - **`docs/powdb-vs-sqlite.md`** — honest when-to-use-which guide with side-by-side feature and benchmark tables.
-- **Phase 3 risky-research dossier** — `docs/superpowers/specs/2026-05-30-phase3-risky-research-plan.md` with per-subsystem go/no-go verdicts (Windows file I/O port, disk-spill external sort, cost-based optimizer plumbing — multi-writer MVCC explicitly no-go).
+- **Phase 3 risky-research dossier** with per-subsystem go/no-go verdicts (Windows file I/O port, disk-spill external sort, cost-based optimizer plumbing; multi-writer MVCC explicitly no-go).
 
 ### Fixed
 - **`BufferPool::ensure_loaded` panicked on a corrupt page** and skipped CRC verification — now uses `from_bytes_verified` and returns `PageCorrupt`. The four `BufferPool` write paths now stamp CRCs.

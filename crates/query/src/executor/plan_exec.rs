@@ -77,6 +77,12 @@ impl Engine {
     }
 
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        // Refuse any plan whose evaluable expressions still carry an aggregate
+        // FunctionCall the grouped-aggregate planner could not lower. Without
+        // this, such an aggregate would reach eval_expr and silently evaluate
+        // to Empty (a wrong answer). The outermost call validates the whole
+        // tree before any row is produced.
+        validate_no_stray_aggregates(plan)?;
         match plan {
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
@@ -136,49 +142,56 @@ impl Engine {
                 // loop. Uses decode_column() to evaluate the predicate on only
                 // the columns it references, avoiding heap allocations for
                 // String/Bytes columns that aren't part of the filter.
+                // Overflow safety (P0-4/P1): v2-capable tables fall through to
+                // the decoded general Filter path below — the raw fast path
+                // rehydrates to v1 and drops/mis-reads >= 64KB spilled values.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
-                    // Auto-refresh dirty materialized views.
-                    if self.view_registry.is_dirty(table) {
-                        self.refresh_view(table)?;
-                    }
-                    let schema = self
-                        .catalog
-                        .schema(table)
-                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
-                        .clone();
-                    let columns: Vec<String> =
-                        schema.columns.iter().map(|c| c.name.clone()).collect();
-                    let fast = FastLayout::new(&schema);
-                    let row_layout = RowLayout::new(&schema);
-                    // Mission F: pre-size to skip the first 4 Vec doublings
-                    // (4 → 8 → 16 → 32 → 64). On a 100K-row scan with 30%
-                    // selectivity that's ~4 fewer reallocations + memcpys.
-                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                    if !self.catalog.table_has_overflow(table) {
+                        // Auto-refresh dirty materialized views.
+                        if self.view_registry.is_dirty(table) {
+                            self.refresh_view(table)?;
+                        }
+                        let schema = self
+                            .catalog
+                            .schema(table)
+                            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
+                            .clone();
+                        let columns: Vec<String> =
+                            schema.columns.iter().map(|c| c.name.clone()).collect();
+                        let fast = FastLayout::new(&schema);
+                        let row_layout = RowLayout::new(&schema);
+                        // Mission F: pre-size to skip the first 4 Vec doublings
+                        // (4 → 8 → 16 → 32 → 64). On a 100K-row scan with 30%
+                        // selectivity that's ~4 fewer reallocations + memcpys.
+                        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
 
-                    // Try compiled predicate for the filter check (handles
-                    // int leaves, string-eq leaves, and And conjunctions).
-                    if let Some(compiled) = compile_predicate(predicate, &columns, &fast, &schema) {
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                if compiled(data) {
-                                    rows.push(decode_row(&schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    } else {
-                        let pred_cols = predicate_column_indices(predicate, &columns);
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                let pred_row =
-                                    decode_selective(&schema, &row_layout, data, &pred_cols);
-                                if eval_predicate(predicate, &pred_row, &columns) {
-                                    rows.push(decode_row(&schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    }
+                        // Try compiled predicate for the filter check (handles
+                        // int leaves, string-eq leaves, and And conjunctions).
+                        if let Some(compiled) =
+                            compile_predicate(predicate, &columns, &fast, &schema)
+                        {
+                            self.catalog
+                                .for_each_row_raw(table, |_rid, data| {
+                                    if compiled(data) {
+                                        rows.push(decode_row(&schema, data));
+                                    }
+                                })
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        } else {
+                            let pred_cols = predicate_column_indices(predicate, &columns);
+                            self.catalog
+                                .for_each_row_raw(table, |_rid, data| {
+                                    let pred_row =
+                                        decode_selective(&schema, &row_layout, data, &pred_cols);
+                                    if eval_predicate(predicate, &pred_row, &columns) {
+                                        rows.push(decode_row(&schema, data));
+                                    }
+                                })
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        }
 
-                    return Ok(QueryResult::Rows { columns, rows });
+                        return Ok(QueryResult::Rows { columns, rows });
+                    }
                 }
 
                 // General path: materialise then filter.
@@ -237,16 +250,23 @@ impl Engine {
                         })
                         .collect();
 
-                    if tbl.has_index(column) {
-                        let layout = RowLayout::new(&schema);
+                    // Only serve plain-field projections here; a computed
+                    // projection (e.g. `length(.v)`) must fall through to the
+                    // generic expression-evaluating path — otherwise its column
+                    // is silently dropped (proj_indices only collects Fields).
+                    let all_plain_fields = fields.iter().all(|f| matches!(f.expr, Expr::Field(_)));
+                    if tbl.has_index(column) && all_plain_fields {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         for rid in rids {
-                            if let Some(data) = tbl.heap.get(rid) {
-                                let row: Vec<Value> = proj_indices
-                                    .iter()
-                                    .map(|&ci| decode_column(&schema, &layout, &data, ci))
-                                    .collect();
+                            // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
+                            // spilled columns from their overflow chains. The old
+                            // `heap.get` + `decode_column` read raw v2 bytes and
+                            // returned Empty for a spilled column (or wrapped a
+                            // >= 64KB value).
+                            if let Some(full) = tbl.get(rid) {
+                                let row: Vec<Value> =
+                                    proj_indices.iter().map(|&ci| full[ci].clone()).collect();
                                 rows.push(row);
                             }
                         }
@@ -490,20 +510,25 @@ impl Engine {
             } => {
                 // Fast path: count() over SeqScan — count rows without any decode
                 if *function == AggFunc::Count {
+                    // Overflow safety (P0-4): the raw `for_each_row_raw` count
+                    // drops any row too large to re-inline (>= 64KB) and would
+                    // undercount; v2-capable tables use the decoded generic path.
                     if let PlanNode::SeqScan { table } = input.as_ref() {
-                        // Auto-refresh a dirty materialized view before
-                        // counting it — otherwise count(View) returns stale
-                        // data after an underlying mutation (F3).
-                        if self.view_registry.is_dirty(table) {
-                            self.refresh_view(table)?;
+                        if !self.catalog.table_has_overflow(table) {
+                            // Auto-refresh a dirty materialized view before
+                            // counting it — otherwise count(View) returns stale
+                            // data after an underlying mutation (F3).
+                            if self.view_registry.is_dirty(table) {
+                                self.refresh_view(table)?;
+                            }
+                            let mut count: i64 = 0;
+                            self.catalog
+                                .for_each_row_raw(table, |_rid, _data| {
+                                    count += 1;
+                                })
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
-                        let mut count: i64 = 0;
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, _data| {
-                                count += 1;
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                        return Ok(QueryResult::Scalar(Value::Int(count)));
                     }
                     // Fast path: count() over Filter(SeqScan) — try compiled
                     // predicate first, fall back to decode_column path.
@@ -525,46 +550,52 @@ impl Engine {
                         if let (PlanNode::SeqScan { table }, false) =
                             (inner.as_ref(), contains_subquery(predicate))
                         {
-                            let schema = self
-                                .catalog
-                                .schema(table)
-                                .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
-                                .clone();
-                            let columns: Vec<String> =
-                                schema.columns.iter().map(|c| c.name.clone()).collect();
-                            let fast = FastLayout::new(&schema);
-                            let row_layout = RowLayout::new(&schema);
+                            if !self.catalog.table_has_overflow(table) {
+                                let schema = self
+                                    .catalog
+                                    .schema(table)
+                                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
+                                    .clone();
+                                let columns: Vec<String> =
+                                    schema.columns.iter().map(|c| c.name.clone()).collect();
+                                let fast = FastLayout::new(&schema);
+                                let row_layout = RowLayout::new(&schema);
 
-                            // Try compiled predicate (zero-allocation hot path).
-                            // Handles int leaves, string-eq leaves, AND conjunctions.
-                            if let Some(compiled) =
-                                compile_predicate(predicate, &columns, &fast, &schema)
-                            {
+                                // Try compiled predicate (zero-allocation hot path).
+                                // Handles int leaves, string-eq leaves, AND conjunctions.
+                                if let Some(compiled) =
+                                    compile_predicate(predicate, &columns, &fast, &schema)
+                                {
+                                    let mut count: i64 = 0;
+                                    self.catalog
+                                        .for_each_row_raw(table, |_rid, data| {
+                                            if compiled(data) {
+                                                count += 1;
+                                            }
+                                        })
+                                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                    return Ok(QueryResult::Scalar(Value::Int(count)));
+                                }
+
+                                // Fallback: decode predicate columns
+                                let pred_cols = predicate_column_indices(predicate, &columns);
                                 let mut count: i64 = 0;
                                 self.catalog
                                     .for_each_row_raw(table, |_rid, data| {
-                                        if compiled(data) {
+                                        let pred_row = decode_selective(
+                                            &schema,
+                                            &row_layout,
+                                            data,
+                                            &pred_cols,
+                                        );
+                                        if eval_predicate(predicate, &pred_row, &columns) {
                                             count += 1;
                                         }
                                     })
                                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
+
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
-
-                            // Fallback: decode predicate columns
-                            let pred_cols = predicate_column_indices(predicate, &columns);
-                            let mut count: i64 = 0;
-                            self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
-                                    let pred_row =
-                                        decode_selective(&schema, &row_layout, data, &pred_cols);
-                                    if eval_predicate(predicate, &pred_row, &columns) {
-                                        count += 1;
-                                    }
-                                })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
-
-                            return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
                     }
                 }
@@ -863,11 +894,11 @@ impl Engine {
                     // The key column is guaranteed unique above, so this
                     // returns at most one matching row.
                     let rids = tbl.index_lookup_all(key_column, &key_value);
-                    rids.into_iter().next().and_then(|rid| {
-                        tbl.heap
-                            .get(rid)
-                            .map(|data| (rid, decode_row(&tbl.schema, &data)))
-                    })
+                    // Overflow safety (P0-3): reassemble via `tbl.get` so an
+                    // upsert conflict row with a spilled column is read in full.
+                    rids.into_iter()
+                        .next()
+                        .and_then(|rid| tbl.get(rid).map(|row| (rid, row)))
                 };
 
                 if let Some((rid, mut existing_row)) = existing {
@@ -1090,9 +1121,13 @@ impl Engine {
                             .get_table(table)
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let schema = &tbl.schema;
-                        let all_fixed_nonnull = resolved_assignments.iter().all(|(idx, val)| {
-                            is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
-                        });
+                        // Overflow safety (P0): byte-patching a v2 row with v1
+                        // offsets corrupts it. Overflow tables take the generic
+                        // reassembling `get` + `update_hinted` path below.
+                        let all_fixed_nonnull = !tbl.has_overflow_rows()
+                            && resolved_assignments.iter().all(|(idx, val)| {
+                                is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty()
+                            });
                         let no_indexed = !resolved_assignments
                             .iter()
                             .any(|(idx, _)| tbl.has_indexed_col(*idx));
@@ -1131,14 +1166,25 @@ impl Engine {
 
                     if let Some(patches) = fast_patch {
                         let mut count = 0u64;
-                        for rid in matching_rids {
+                        let mut fallback_rids: Vec<RowId> = Vec::new();
+                        for rid in &matching_rids {
                             // Mission B2: WAL-log every patch so crash
                             // recovery replays the update. Same mutation
                             // closure as before — the wrapper just sandwiches
                             // it between a hot-page read and a WAL append.
+                            //
+                            // A false return means the byte-patch was refused
+                            // (e.g. a v2/overflow row whose in-place layout the
+                            // fast path cannot compute, reachable on a legacy
+                            // heap where has_overflow_rows() under-reports). Do
+                            // NOT drop the row: push it to `fallback_rids` and
+                            // let the reassembling get + update_hinted path
+                            // apply it, mirroring the var-column fast path
+                            // below. The fast path is thus a pure optimization
+                            // that can never silently lose an update.
                             let ok = self
                                 .catalog
-                                .update_row_bytes_logged(table, rid, |row| {
+                                .update_row_bytes_logged(table, *rid, |row| {
                                     let base = row_body_base(row);
                                     for p in &patches {
                                         row[base + p.bitmap_byte_off] &= !p.bit_mask;
@@ -1151,7 +1197,22 @@ impl Engine {
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             if ok {
                                 count += 1;
+                            } else {
+                                fallback_rids.push(*rid);
                             }
+                        }
+                        for rid in fallback_rids {
+                            let mut row = match self.catalog.get(table, rid) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            for (idx, val) in resolved_assignments.iter() {
+                                row[*idx] = val.clone();
+                            }
+                            self.catalog
+                                .update_hinted(table, rid, &row, Some(&changed_cols))
+                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            count += 1;
                         }
                         self.view_registry.mark_dependents_dirty(table);
                         return Ok(QueryResult::Modified(count));
@@ -1164,7 +1225,10 @@ impl Engine {
                             .get_table(table)
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                         let schema = &tbl.schema;
-                        let is_single = resolved_assignments.len() == 1;
+                        // Overflow safety (P0/P0-2): the in-place var shrink
+                        // patch computes v1 offsets — never on a v2-capable
+                        // table. Falls through to the reassembling path.
+                        let is_single = resolved_assignments.len() == 1 && !tbl.has_overflow_rows();
                         let is_var_col = is_single
                             && !is_fixed_size(schema.columns[resolved_assignments[0].0].type_id);
                         let no_indexed = !resolved_assignments
@@ -1337,13 +1401,17 @@ impl Engine {
                 // heap exactly once, paying one `ensure_hot` per page
                 // instead of per-row. That closes the last major gap on
                 // the bench's `delete_by_filter` workload.
+                // Overflow safety (P1): a v2-capable table cannot take the fused
+                // raw-byte delete — the compiled predicate mis-reads spilled
+                // columns. Route it through the reassembling collect-rids path.
+                let delete_overflow = self.catalog.table_has_overflow(table);
                 if let PlanNode::Filter {
                     input: inner,
                     predicate,
                 } = input.as_ref()
                 {
                     if let PlanNode::SeqScan { table: t } = inner.as_ref() {
-                        if t == table {
+                        if t == table && !delete_overflow {
                             let schema = self
                                 .catalog
                                 .schema(table)
@@ -1369,7 +1437,7 @@ impl Engine {
                         }
                     }
                 } else if let PlanNode::SeqScan { table: t } = input.as_ref() {
-                    if t == table {
+                    if t == table && !delete_overflow {
                         // `delete from T` with no predicate — every live
                         // row matches. One pass is still the right shape.
                         // Mission B2: logged variant — see above.
@@ -1557,82 +1625,7 @@ impl Engine {
                         // WS2: byte-budget guard on the GROUP BY input buffer
                         // (the hash table is bounded by the input it groups).
                         self.charge_rows(&rows)?;
-                        // Resolve key column indices.
-                        let key_indices: Vec<usize> = keys
-                            .iter()
-                            .map(|k| {
-                                columns
-                                    .iter()
-                                    .position(|c| c == k)
-                                    .ok_or_else(|| format!("group-by column '{k}' not found"))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        // Resolve aggregate field indices. count(*) uses
-                        // sentinel usize::MAX — compute_group_aggregate
-                        // treats it as "count all rows in the group".
-                        let agg_field_indices: Vec<usize> = aggregates
-                            .iter()
-                            .map(|a| {
-                                if a.field == "*" {
-                                    Ok(usize::MAX)
-                                } else {
-                                    columns.iter().position(|c| c == &a.field).ok_or_else(|| {
-                                        format!("aggregate column '{}' not found", a.field)
-                                    })
-                                }
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-
-                        // Group rows by key values (preserving insertion order).
-                        let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> =
-                            rustc_hash::FxHashMap::default();
-                        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
-                        for (ri, row) in rows.iter().enumerate() {
-                            let key: Vec<Value> =
-                                key_indices.iter().map(|&i| row[i].clone()).collect();
-                            match group_map.get(&key) {
-                                Some(&idx) => groups[idx].1.push(ri),
-                                None => {
-                                    let idx = groups.len();
-                                    group_map.insert(key.clone(), idx);
-                                    groups.push((key, vec![ri]));
-                                }
-                            }
-                        }
-
-                        // Build output column names: keys ++ aggregate output names.
-                        let mut out_columns: Vec<String> = keys.clone();
-                        for agg in aggregates.iter() {
-                            out_columns.push(agg.output_name.clone());
-                        }
-
-                        // Compute aggregates per group.
-                        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
-                        for (key_vals, row_indices) in &groups {
-                            let mut row = key_vals.clone();
-                            for (ai, agg) in aggregates.iter().enumerate() {
-                                let col_idx = agg_field_indices[ai];
-                                let val = compute_group_aggregate(
-                                    agg.function,
-                                    &rows,
-                                    row_indices,
-                                    col_idx,
-                                );
-                                row.push(val);
-                            }
-                            out_rows.push(row);
-                        }
-
-                        // Apply HAVING filter.
-                        if let Some(having_expr) = having {
-                            out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
-                        }
-
-                        Ok(QueryResult::Rows {
-                            columns: out_columns,
-                            rows: out_rows,
-                        })
+                        exec_group_by(columns, rows, keys, aggregates, having)
                     }
                     _ => Err("group by requires row input".into()),
                 }
@@ -1985,8 +1978,11 @@ impl Engine {
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                     for rid in rids {
-                        if let Some(data) = tbl.heap.get(rid) {
-                            rows.push(decode_row(&tbl.schema, &data));
+                        // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
+                        // spilled columns; the old `heap.get` + `decode_row`
+                        // returned Empty / wrapped a >= 64KB value.
+                        if let Some(row) = tbl.get(rid) {
+                            rows.push(row);
                         }
                     }
                     return Ok(QueryResult::Rows { columns, rows });
@@ -2006,17 +2002,22 @@ impl Engine {
                     BinOp::Eq,
                     Box::new(key.clone()),
                 );
-                if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, schema) {
-                    // Mission F: skip the first 4 Vec doublings.
-                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                    self.catalog
-                        .for_each_row_raw(table, |_rid, data| {
-                            if compiled(data) {
-                                rows.push(decode_row(schema, data));
-                            }
-                        })
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    return Ok(QueryResult::Rows { columns, rows });
+                // Overflow safety (P0-4/P1): the raw compiled scan drops/mis-reads
+                // spilled columns; a v2-capable table uses the decoded scan below.
+                if !tbl.has_overflow_rows() {
+                    if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, schema)
+                    {
+                        // Mission F: skip the first 4 Vec doublings.
+                        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                        self.catalog
+                            .for_each_row_raw(table, |_rid, data| {
+                                if compiled(data) {
+                                    rows.push(decode_row(schema, data));
+                                }
+                            })
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        return Ok(QueryResult::Rows { columns, rows });
+                    }
                 }
 
                 // Last resort: slow eq-check on materialised rows.
@@ -2082,8 +2083,8 @@ impl Engine {
                             let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
                             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                             for rid in rids {
-                                if let Some(data) = tbl.heap.get(rid) {
-                                    let row = decode_row(schema, &data);
+                                // Overflow safety (P0-3): reassemble spilled cols.
+                                if let Some(row) = tbl.get(rid) {
                                     if !row[col_idx].is_empty()
                                         && range_matches(
                                             &row[col_idx],
@@ -2132,8 +2133,9 @@ impl Engine {
                                     }
                                 }
                             }
-                            if let Some(data) = tbl.heap.get(rid) {
-                                rows.push(decode_row(schema, &data));
+                            // Overflow safety (P0-3): reassemble spilled cols.
+                            if let Some(row) = tbl.get(rid) {
+                                rows.push(row);
                             }
                         }
                         return Ok(QueryResult::Rows { columns, rows });
@@ -2141,18 +2143,22 @@ impl Engine {
                 }
 
                 // Fallback: no index — synthesize range predicate and scan.
+                // Overflow safety (P0-4): v2-capable tables use the decoded
+                // last-resort scan below.
                 let fast = FastLayout::new(schema);
                 let synth = synthesize_range_predicate(column, start, end);
-                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
-                    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                    self.catalog
-                        .for_each_row_raw(table, |_rid, data| {
-                            if compiled(data) {
-                                rows.push(decode_row(schema, data));
-                            }
-                        })
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    return Ok(QueryResult::Rows { columns, rows });
+                if !tbl.has_overflow_rows() {
+                    if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
+                        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
+                        self.catalog
+                            .for_each_row_raw(table, |_rid, data| {
+                                if compiled(data) {
+                                    rows.push(decode_row(schema, data));
+                                }
+                            })
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        return Ok(QueryResult::Rows { columns, rows });
+                    }
                 }
 
                 let col_idx =
@@ -2324,6 +2330,12 @@ impl Engine {
         function: AggFunc,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        // Overflow safety (P0-4): this walks raw rehydrated bytes and would
+        // silently drop any row carrying a value too large to re-inline
+        // (>= 64KB), undercounting the aggregate. Fall back to the decoded path.
+        if self.catalog.table_has_overflow(table) {
+            return Ok(None);
+        }
         let schema = self
             .catalog
             .schema(table)
@@ -2629,6 +2641,12 @@ impl Engine {
         limit: usize,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        // Overflow safety (P0-4): raw-byte projection over rehydrated rows
+        // drops any row with a value too large to re-inline (>= 64KB) and
+        // cannot return such a value; fall back to the decoded generic path.
+        if self.catalog.table_has_overflow(table) {
+            return Ok(None);
+        }
         let schema = self
             .catalog
             .schema(table)
@@ -2709,6 +2727,11 @@ impl Engine {
         limit: usize,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        // Overflow safety (P0-4): raw-byte scan drops/wraps >= 64KB values;
+        // let the decoded generic path handle v2-capable tables.
+        if self.catalog.table_has_overflow(table) {
+            return Ok(None);
+        }
         if limit == 0 {
             // Degenerate case — empty result. Let the generic path handle it
             // for proper column naming.
@@ -2971,6 +2994,14 @@ impl Engine {
         resolved: &[(usize, Value)],
         changed_cols: &[usize],
     ) -> Option<Result<QueryResult, QueryError>> {
+        // Overflow safety (P0/P1): a table that may hold v2 rows can never take
+        // the byte-patch fast paths — patching computes v1 offsets and would
+        // corrupt a spilled row, and the compiled predicate over raw bytes
+        // mis-evaluates a spilled column. Fall through to the reassembling
+        // collect-rids + get/update_hinted path.
+        if self.catalog.table_has_overflow(table) {
+            return None;
+        }
         // Build compiled predicate. Requires a schema borrow that must be
         // dropped before we call scan_patch_matching_logged.
         let compiled = {
@@ -3115,6 +3146,18 @@ impl Engine {
         input: &PlanNode,
         table: &str,
     ) -> Result<Vec<RowId>, QueryError> {
+        // Overflow safety (P1/P0-4): the raw-byte fast paths below stream
+        // through `for_each_row_raw`, which rehydrates v2 rows to v1 and SKIPS
+        // any row carrying a value too large to re-inline (>= 64KB). For a
+        // v2-capable table, evaluate the predicate over fully decoded rows
+        // instead so no matching row is missed or mis-judged on a spilled
+        // column. Exact index lookups (value-size independent) still fall
+        // through to the normal path.
+        if self.catalog.table_has_overflow(table) {
+            if let Some(rids) = self.collect_rids_decoded(input, table)? {
+                return Ok(rids);
+            }
+        }
         match input {
             PlanNode::SeqScan { table: t } if t == table => {
                 // "Update/delete everything" — rare but legal.
@@ -3250,6 +3293,75 @@ impl Engine {
             }
             _ => self.generic_rid_match(input, table),
         }
+    }
+
+    /// Decode-based rid collection for v2-capable tables (see the guard in
+    /// [`Self::collect_rids_for_mutation`]). Scans fully reassembled rows via
+    /// `Catalog::scan` (`decode_row_v2`, chain fetch, correct for any value
+    /// size) and evaluates the predicate on decoded `Value`s. Returns `None`
+    /// for shapes it does not special-case (indexed `IndexScan`, or anything
+    /// exotic) so the caller falls through to the normal path.
+    fn collect_rids_decoded(
+        &mut self,
+        input: &PlanNode,
+        table: &str,
+    ) -> Result<Option<Vec<RowId>>, QueryError> {
+        // Determine the per-row predicate (None = match every row).
+        let pred: Option<Expr> = match input {
+            PlanNode::SeqScan { table: t } if t == table => None,
+            PlanNode::Filter {
+                input: inner,
+                predicate,
+            } => match inner.as_ref() {
+                PlanNode::SeqScan { table: t } if t == table => Some(predicate.clone()),
+                _ => return Ok(None),
+            },
+            PlanNode::IndexScan {
+                table: t,
+                column,
+                key,
+            } if t == table => {
+                // A real index makes the lookup exact and value-size
+                // independent — let the normal IndexScan path handle it.
+                let indexed = self
+                    .catalog
+                    .get_table(table)
+                    .map(|tb| tb.has_index(column))
+                    .unwrap_or(false);
+                if indexed {
+                    return Ok(None);
+                }
+                Some(Expr::BinaryOp(
+                    Box::new(Expr::Field(column.clone())),
+                    BinOp::Eq,
+                    Box::new(key.clone()),
+                ))
+            }
+            _ => return Ok(None),
+        };
+
+        let columns: Vec<String> = {
+            let schema = self
+                .catalog
+                .schema(table)
+                .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+            schema.columns.iter().map(|c| c.name.clone()).collect()
+        };
+        let mut rids: Vec<RowId> = Vec::new();
+        for (rid, row) in self
+            .catalog
+            .scan(table)
+            .map_err(|e| QueryError::StorageError(e.to_string()))?
+        {
+            let keep = match &pred {
+                None => true,
+                Some(p) => eval_predicate(p, &row, &columns),
+            };
+            if keep {
+                rids.push(rid);
+            }
+        }
+        Ok(Some(rids))
     }
 
     /// Last-ditch generic match: execute the plan, collect matching rows,
@@ -3561,6 +3673,227 @@ pub(super) fn execute_window(
     }
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/// Resolve a group-by key or aggregate argument name against the input
+/// columns of a `GroupBy` node.
+///
+/// Single-table inputs have bare column names (`status`); join inputs have
+/// `alias.field` names. Resolution rules:
+///   1. Exact match first. Single-table keys and fully qualified
+///      `alias.field` references hit here, preserving existing behavior.
+///   2. A qualified reference (one containing `.`) only ever matches exactly;
+///      if the exact column is absent it is genuinely missing.
+///   3. An unqualified name falls back to a unique `.field` suffix match over
+///      the join output columns. Zero matches is a column-not-found error;
+///      more than one is an ambiguity error naming the candidates.
+pub(super) fn resolve_group_column(name: &str, columns: &[String]) -> Result<usize, QueryError> {
+    if let Some(i) = columns.iter().position(|c| c == name) {
+        return Ok(i);
+    }
+    if name.contains('.') {
+        return Err(QueryError::ColumnNotFound {
+            table: String::new(),
+            column: name.to_string(),
+        });
+    }
+    let suffix = format!(".{name}");
+    let mut matches = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.ends_with(&suffix));
+    match matches.next() {
+        None => Err(QueryError::ColumnNotFound {
+            table: String::new(),
+            column: name.to_string(),
+        }),
+        Some((first_idx, _)) => {
+            let rest: Vec<&str> = matches.map(|(_, c)| c.as_str()).collect();
+            if rest.is_empty() {
+                Ok(first_idx)
+            } else {
+                // Rebuild the full candidate list (the consumed first match
+                // plus the rest) so the message names every ambiguous column.
+                let candidates: Vec<&str> = columns
+                    .iter()
+                    .filter(|c| c.ends_with(&suffix))
+                    .map(|c| c.as_str())
+                    .collect();
+                Err(QueryError::Execution(format!(
+                    "cannot group by ambiguous column '{name}'; candidates: {}",
+                    candidates.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// Mission E2b: execute a `GroupBy` plan node over already-materialized input
+/// rows. Shared by the mutable (`execute_plan`) and read-only
+/// (`execute_plan_readonly`) executors so key/argument resolution and the
+/// output-column naming stay identical on both paths.
+pub(super) fn exec_group_by(
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    keys: &[GroupKey],
+    aggregates: &[GroupAgg],
+    having: &Option<Expr>,
+) -> Result<QueryResult, QueryError> {
+    // Resolve key column indices. Qualified keys resolve exactly to
+    // `alias.field`; unqualified keys resolve by exact-then-suffix match.
+    let key_indices: Vec<usize> = keys
+        .iter()
+        .map(|k| resolve_group_column(&k.output_name(), &columns))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve aggregate field indices. count(*) uses the usize::MAX sentinel;
+    // every other argument gets the same resolution as keys.
+    let agg_field_indices: Vec<usize> = aggregates
+        .iter()
+        .map(|a| {
+            if a.field == "*" {
+                Ok(usize::MAX)
+            } else {
+                resolve_group_column(&a.field, &columns)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Group rows by key values (preserving insertion order).
+    let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> = rustc_hash::FxHashMap::default();
+    let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        let key: Vec<Value> = key_indices.iter().map(|&i| row[i].clone()).collect();
+        match group_map.get(&key) {
+            Some(&idx) => groups[idx].1.push(ri),
+            None => {
+                let idx = groups.len();
+                group_map.insert(key.clone(), idx);
+                groups.push((key, vec![ri]));
+            }
+        }
+    }
+
+    // Output columns: key display names ++ aggregate output names. Qualified
+    // keys are emitted as `alias.field` so a qualified HAVING reference and
+    // downstream projections resolve against them.
+    let mut out_columns: Vec<String> = keys.iter().map(|k| k.output_name()).collect();
+    for agg in aggregates.iter() {
+        out_columns.push(agg.output_name.clone());
+    }
+
+    // Compute aggregates per group.
+    let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+    for (key_vals, row_indices) in &groups {
+        let mut row = key_vals.clone();
+        for (ai, agg) in aggregates.iter().enumerate() {
+            let col_idx = agg_field_indices[ai];
+            let val = compute_group_aggregate(agg.function, &rows, row_indices, col_idx);
+            row.push(val);
+        }
+        out_rows.push(row);
+    }
+
+    // Apply HAVING filter.
+    if let Some(having_expr) = having {
+        out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
+    }
+
+    Ok(QueryResult::Rows {
+        columns: out_columns,
+        rows: out_rows,
+    })
+}
+
+/// Reject any aggregate `FunctionCall` that survives planning into an
+/// evaluable position (a projection field, a filter predicate, or a HAVING
+/// clause). The grouped-aggregate planner rewrites every supported aggregate
+/// into a `Field` reference to a computed column, so a surviving
+/// `FunctionCall` means the aggregate sits somewhere the engine cannot
+/// evaluate it. `eval_expr` would otherwise silently produce `Empty` there (a
+/// wrong answer); this turns that into a typed error before any row is
+/// evaluated. Walks the whole plan so fused fast paths cannot bypass it.
+pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::Project { input, fields } => {
+            for f in fields {
+                check_expr_no_aggregate(&f.expr)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::Filter { input, predicate } => {
+            check_expr_no_aggregate(predicate)?;
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::GroupBy { input, having, .. } => {
+            if let Some(h) = having {
+                check_expr_no_aggregate(h)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::NestedLoopJoin { left, right, .. } => {
+            validate_no_stray_aggregates(left)?;
+            validate_no_stray_aggregates(right)?;
+        }
+        PlanNode::Union { left, right, .. } => {
+            validate_no_stray_aggregates(left)?;
+            validate_no_stray_aggregates(right)?;
+        }
+        PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => {
+            validate_no_stray_aggregates(input)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Recurse an expression tree, rejecting any aggregate `FunctionCall`. Does
+/// not descend into subquery `QueryExpr`s (they are materialized and
+/// evaluated on their own path), only their outer operand expression.
+fn check_expr_no_aggregate(expr: &Expr) -> Result<(), QueryError> {
+    match expr {
+        Expr::FunctionCall(_, _) => Err(QueryError::Execution(
+            "invalid query: aggregate function in an unsupported position".to_string(),
+        )),
+        Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+            check_expr_no_aggregate(l)?;
+            check_expr_no_aggregate(r)
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => check_expr_no_aggregate(inner),
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                check_expr_no_aggregate(a)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr: e, list, .. } => {
+            check_expr_no_aggregate(e)?;
+            for item in list {
+                check_expr_no_aggregate(item)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery { expr: e, .. } => check_expr_no_aggregate(e),
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                check_expr_no_aggregate(c)?;
+                check_expr_no_aggregate(r)?;
+            }
+            if let Some(e) = else_expr {
+                check_expr_no_aggregate(e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Mission E2b: compute one aggregate over a set of rows in a group.
@@ -4115,10 +4448,11 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                 Some(h) => format!(" having={h:?}"),
                 None => String::new(),
             };
+            let key_strs: Vec<String> = keys.iter().map(|k| k.output_name()).collect();
             let child = format_plan_tree(input, depth + 1);
             format!(
                 "{indent}GroupBy keys=[{}] aggs=[{}]{having_str}\n{child}",
-                keys.join(", "),
+                key_strs.join(", "),
                 agg_strs.join(", "),
             )
         }

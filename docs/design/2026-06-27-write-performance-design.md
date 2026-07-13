@@ -2,15 +2,15 @@
 
 - **Date:** 2026-06-27
 - **Status:** Proposed
-- **Author:** Turbine ORM integration (cross-engine benchmark findings)
+- **Author:** the ORM integration (cross-engine benchmark findings)
 - **Scope:** Write-path latency & throughput. Reads are already competitive and are out of scope except where noted (§3.7).
 
 ---
 
 ## 1. Motivation
 
-While building the Turbine ORM PowDB backend, a cross-engine benchmark (same ORM-realistic
-workload run through Turbine against Postgres / SQLite / MySQL / PowDB) showed PowDB's **reads
+While building the ORM integration's PowDB backend, a cross-engine benchmark (same ORM-realistic
+workload run through the ORM integration against Postgres / SQLite / MySQL / PowDB) showed PowDB's **reads
 rivalling Postgres but its writes ~40× slower**. This spec roots-causes that gap in the PowDB
 source and proposes fixes, prioritised.
 
@@ -29,7 +29,7 @@ Reads are fine. **Single-row writes are the problem: ~4 ms each, ~250 ops/s.**
 
 ### 1.2 Isolating the engine from the ORM
 
-To rule out ORM overhead (Turbine does a reselect after each write because PowDB has no
+To rule out ORM overhead (the ORM integration does a reselect after each write because PowDB has no
 `RETURNING`), the same writes were measured with the **raw `@zvndev/powdb-client`**, no ORM:
 
 ```
@@ -109,7 +109,7 @@ allows it.
 
 - **No `RETURNING`** → clients must reselect after every write (extra round-trip; cheap here but
   doubles write RTTs and is pure waste under network latency).
-- **No server-generated IDs** → clients must mint PKs (Turbine generates UUIDs), pushing key
+- **No server-generated IDs** → clients must mint PKs (the ORM integration generates UUIDs), pushing key
   management to the app.
 - **Bulk insert overhead** — `createMany` 100 rows = 18 ms = ~0.18 ms/row, ~2.3× the ~0.077 ms
   in-memory insert. Relates to the `insert_single` regression in issue #57 (77 µs vs 3.6 µs).
@@ -179,10 +179,10 @@ define the visibility model explicitly).
 
 **What.** Let `insert`/`update`/`upsert`/`delete` return the affected rows.
 
-**Why.** Eliminates the client reselect (Turbine currently issues a follow-up `SELECT` after every
+**Why.** Eliminates the client reselect (the ORM integration currently issues a follow-up `SELECT` after every
 write because there's no way to get the row back). Saves a full round-trip per write.
 
-**Impact.** −1 round-trip per write; lets Turbine drop the reselect strategy. Bigger win over a
+**Impact.** −1 round-trip per write; lets the ORM integration drop the reselect strategy. Bigger win over a
 network than on loopback.
 
 **Effort/risk.** Medium (PowQL surface + executor returns rows it already has in hand).
@@ -193,7 +193,7 @@ network than on loopback.
 PK doesn't have to be client-supplied.
 
 **Why.** Removes app-side key management; with §3.4 enables the natural "insert, get id back"
-pattern. (Turbine currently mints client-side UUIDs as a workaround.)
+pattern. (the ORM integration currently mints client-side UUIDs as a workaround.)
 
 **Effort/risk.** Medium (sequence/identity allocation must be crash-safe & WAL-logged).
 
@@ -239,7 +239,7 @@ With **§3.1 + §3.2 + §3.3** (the P0 set):
 | single autocommit write (NORMAL durability) | ~4.0 ms | ~0.1–0.3 ms |
 | single autocommit write (FULL durability, 1 client) | ~4.0 ms | ~4.0 ms (1 fsync) |
 | durable write throughput, 16 concurrent clients | ~250/s (lock-serialised) | ~2–4 k/s (group commit) |
-| `create` ops/s (Turbine, NORMAL) | ~250 | ~5–10 k |
+| `create` ops/s (the ORM integration, NORMAL) | ~250 | ~5–10 k |
 
 This closes the bulk of the 40× gap and makes PowDB's writes competitive with Postgres, while
 keeping `Full` durability the default and correct.
@@ -256,7 +256,7 @@ keeping `Full` durability the default and correct.
 
 ## 6. Validation
 
-Re-run the Turbine cross-engine benchmark (`turbine-orm/benchmarks/cross-engine.ts`) after each P0
+Re-run a cross-engine ORM benchmark after each P0
 item. Targets: `create`/`update` p50 < 0.3 ms in NORMAL mode; durable-write throughput scaling with
 client concurrency in FULL mode. Add a concurrent-writer throughput bench (current suite is
 single-connection and therefore *understates* the lock-serialisation problem).
@@ -265,7 +265,7 @@ single-connection and therefore *understates* the lock-serialisation problem).
 
 ## Appendix — measurement method
 
-- Turbine cross-engine harness: 5 orgs / 100 users / 1 000 posts / 5 000 comments; one connection;
+- Cross-engine ORM harness: 5 orgs / 100 users / 1 000 posts / 5 000 comments; one connection;
   warmup 30 + 200 measured iterations; p50/p95/p99. Apple-Silicon mac, local loopback, PowDB 0.6.2.
 - Raw-client numbers: `@zvndev/powdb-client` 0.6.1, autocommit single statements, 200 iterations.
 

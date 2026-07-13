@@ -34,6 +34,26 @@ const DELETED_MARKER: u16 = 0xFFFF;
 pub const MAX_ROW_DATA_SIZE: usize =
     PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE - SLOT_ENTRY_SIZE;
 
+/// Overflow-page chunk header (door D3). An overflow page carries the
+/// standard 20-byte page header (type=Overflow, checksum flag + LSN for
+/// idempotent replay), then this 8-byte chunk header, then the payload:
+///
+/// ```text
+/// offset size field
+/// 20     4    next_page   u32   next chunk, OVERFLOW_CHAIN_END = end of chain
+/// 24     2    chunk_len   u16
+/// 26     2    reserved
+/// 28     4068 payload
+/// ```
+const OVF_NEXT_OFFSET: usize = PAGE_HEADER_SIZE; // 20
+const OVF_CHUNK_LEN_OFFSET: usize = PAGE_HEADER_SIZE + 4; // 24
+/// Byte offset of the overflow payload region.
+pub const OVF_PAYLOAD_OFFSET: usize = PAGE_HEADER_SIZE + 8; // 28
+/// Maximum bytes of value payload a single overflow page holds.
+pub const OVERFLOW_PAYLOAD_CAP: usize = PAGE_SIZE - OVF_PAYLOAD_OFFSET; // 4068
+/// Sentinel `next_page` marking the last chunk of an overflow chain.
+pub const OVERFLOW_CHAIN_END: u32 = u32::MAX;
+
 /// Byte range holding the page CRC32 (WS3). Lives just after the legacy
 /// 16-byte header so the slot directory at the bottom of the page is
 /// untouched — old and new pages share the same slot/slot_count layout,
@@ -464,9 +484,85 @@ impl Page {
     }
 
     /// Iterate over all live (non-deleted) slots. Returns (slot_index, data).
+    /// Overflow-chain pages have no slot directory (the bottom-of-page word is
+    /// value payload, not a slot count), so they yield nothing here.
     pub fn iter(&self) -> impl Iterator<Item = (u16, &[u8])> {
-        (0..self.slot_count()).filter_map(move |i| self.get(i).map(|data| (i, data)))
+        let count = if self.is_overflow() {
+            0
+        } else {
+            self.slot_count()
+        };
+        (0..count).filter_map(move |i| self.get(i).map(|data| (i, data)))
     }
+
+    /// Create a fresh overflow-chain page (door D3). The slot directory is
+    /// unused on overflow pages; the chunk header + payload live in the
+    /// region [20..4096].
+    pub fn new_overflow(page_id: u32) -> Self {
+        Page::new(page_id, PageType::Overflow)
+    }
+
+    /// True if this page is typed as an overflow-chain page.
+    #[inline]
+    pub fn is_overflow(&self) -> bool {
+        self.data[4] == PageType::Overflow as u8
+    }
+
+    /// Write a single chunk into this overflow page: `next_page` links to the
+    /// following chunk (`OVERFLOW_CHAIN_END` for the tail) and `chunk` is the
+    /// payload (must be <= `OVERFLOW_PAYLOAD_CAP`).
+    pub fn set_overflow_chunk(&mut self, next_page: u32, chunk: &[u8]) {
+        debug_assert!(chunk.len() <= OVERFLOW_PAYLOAD_CAP);
+        self.data[4] = PageType::Overflow as u8;
+        self.data[OVF_NEXT_OFFSET..OVF_NEXT_OFFSET + 4].copy_from_slice(&next_page.to_le_bytes());
+        self.data[OVF_CHUNK_LEN_OFFSET..OVF_CHUNK_LEN_OFFSET + 2]
+            .copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+        // reserved u16 at [26..28] stays zeroed.
+        let start = OVF_PAYLOAD_OFFSET;
+        self.data[start..start + chunk.len()].copy_from_slice(chunk);
+        // Zero any stale tail of the payload region so re-used pages carry no
+        // ghost bytes past chunk_len.
+        for b in &mut self.data[start + chunk.len()..PAGE_SIZE] {
+            *b = 0;
+        }
+    }
+
+    /// The next chunk's page id (`OVERFLOW_CHAIN_END` if this is the tail).
+    #[inline]
+    pub fn overflow_next(&self) -> u32 {
+        overflow_next_from_bytes(&self.data)
+    }
+
+    /// This overflow page's payload slice (`chunk_len` bytes).
+    #[inline]
+    pub fn overflow_chunk(&self) -> &[u8] {
+        overflow_chunk_from_bytes(&self.data)
+    }
+}
+
+/// Read an overflow page's `next_page` link from a raw page-sized slice
+/// (mmap / replay buffer), without constructing a `Page`.
+#[inline]
+pub fn overflow_next_from_bytes(page_bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(
+        page_bytes[OVF_NEXT_OFFSET..OVF_NEXT_OFFSET + 4]
+            .try_into()
+            .expect("4-byte next_page"),
+    )
+}
+
+/// Read an overflow page's payload slice from a raw page-sized slice. The
+/// returned length is clamped to `OVERFLOW_PAYLOAD_CAP` so a corrupt
+/// `chunk_len` can never produce an out-of-bounds slice.
+#[inline]
+pub fn overflow_chunk_from_bytes(page_bytes: &[u8]) -> &[u8] {
+    let chunk_len = u16::from_le_bytes(
+        page_bytes[OVF_CHUNK_LEN_OFFSET..OVF_CHUNK_LEN_OFFSET + 2]
+            .try_into()
+            .expect("2-byte chunk_len"),
+    ) as usize;
+    let len = chunk_len.min(OVERFLOW_PAYLOAD_CAP);
+    &page_bytes[OVF_PAYLOAD_OFFSET..OVF_PAYLOAD_OFFSET + len]
 }
 
 /// Iterate live slots directly from a page-sized byte slice without copying.
@@ -503,12 +599,20 @@ pub fn page_lsn(page_bytes: &[u8]) -> u64 {
 
 #[inline]
 pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
-    // SAFETY: slice is exactly 2 bytes, try_into is infallible.
-    let slot_count = u16::from_le_bytes(
-        page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
-            .try_into()
-            .expect("slot_count: 2-byte slice"),
-    );
+    // Overflow-chain pages carry value payload where a data page keeps its
+    // slot directory + slot_count word; they must never be walked as rows.
+    // Treating them as zero-slot pages makes every heap scan path skip them
+    // with a single branch (the scan iterators all funnel through here).
+    let slot_count = if page_bytes[4] == PageType::Overflow as u8 {
+        0
+    } else {
+        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
+        u16::from_le_bytes(
+            page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
+                .try_into()
+                .expect("slot_count: 2-byte slice"),
+        )
+    };
     (0..slot_count).filter_map(move |i| {
         let entry_off = PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE);
         // SAFETY: slices are exactly 2 bytes each, try_into is infallible.
@@ -719,6 +823,49 @@ mod tests {
             "re-stamping an unchanged page must be stable"
         );
         assert!(Page::from_bytes_verified(&second).is_ok());
+    }
+
+    #[test]
+    fn test_overflow_page_chunk_roundtrip() {
+        let mut page = Page::new_overflow(5);
+        assert!(page.is_overflow());
+        assert_eq!(page.page_type(), Some(PageType::Overflow));
+        let chunk = vec![0xABu8; OVERFLOW_PAYLOAD_CAP];
+        page.set_overflow_chunk(9, &chunk);
+        assert_eq!(page.overflow_next(), 9);
+        assert_eq!(page.overflow_chunk(), &chunk[..]);
+
+        // A tail chunk marks OVERFLOW_CHAIN_END and a short payload.
+        let mut tail = Page::new_overflow(9);
+        tail.set_overflow_chunk(OVERFLOW_CHAIN_END, b"hello");
+        assert_eq!(tail.overflow_next(), OVERFLOW_CHAIN_END);
+        assert_eq!(tail.overflow_chunk(), b"hello");
+
+        // Raw readers over the serialized bytes agree.
+        let bytes = *tail.as_bytes();
+        assert_eq!(overflow_next_from_bytes(&bytes), OVERFLOW_CHAIN_END);
+        assert_eq!(overflow_chunk_from_bytes(&bytes), b"hello");
+    }
+
+    #[test]
+    fn test_overflow_chunk_survives_checksum_and_reload() {
+        let mut page = Page::new_overflow(3);
+        page.set_overflow_chunk(4, b"chained-value-bytes");
+        page.stamp_checksum();
+        let bytes = *page.as_bytes();
+        let reloaded = Page::from_bytes_verified(&bytes).unwrap();
+        assert!(reloaded.is_overflow());
+        assert_eq!(reloaded.overflow_next(), 4);
+        assert_eq!(reloaded.overflow_chunk(), b"chained-value-bytes");
+    }
+
+    #[test]
+    fn test_overflow_chunk_rewrite_clears_stale_tail() {
+        let mut page = Page::new_overflow(1);
+        page.set_overflow_chunk(OVERFLOW_CHAIN_END, &vec![1u8; OVERFLOW_PAYLOAD_CAP]);
+        // Reuse the page for a shorter chunk — no ghost bytes past chunk_len.
+        page.set_overflow_chunk(OVERFLOW_CHAIN_END, b"short");
+        assert_eq!(page.overflow_chunk(), b"short");
     }
 
     #[test]

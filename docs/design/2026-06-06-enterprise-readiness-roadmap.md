@@ -1,7 +1,7 @@
 # PowDB Enterprise-Readiness Roadmap (multi-model consensus)
 
 **Date:** 2026-06-06
-**Status:** Roadmap / not yet scheduled. Each adopted epic gets its own TDD implementation plan (like `docs/superpowers/plans/2026-06-05-backup-pitr-sync-migrations.md`) before any code is written.
+**Status:** Roadmap / not yet scheduled. Each adopted epic gets its own TDD implementation plan before any code is written.
 
 ## How this list was built
 
@@ -67,4 +67,4 @@ Two models flagged the 2026-06-04 durability assessment that found PowDB **not p
 
 ## Next step
 
-Nothing here is scheduled yet. When ready, each epic becomes its own `docs/superpowers/plans/` TDD plan with the same continuous-verification protocol (per-task full-suite + clippy/fmt, per-phase `cargo run -p powdb-bench --bin compare` regression gate) used by the backup plan. The current in-flight work (backup/restore/PITR/sync/migrations) ships first.
+Nothing here is scheduled yet. When ready, each epic becomes its own TDD plan with the same continuous-verification protocol (per-task full-suite + clippy/fmt, per-phase `cargo run -p powdb-bench --bin compare` regression gate) used by the backup plan. The current in-flight work (backup/restore/PITR/sync/migrations) ships first.

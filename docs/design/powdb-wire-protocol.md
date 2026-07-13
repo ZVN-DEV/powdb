@@ -222,7 +222,7 @@ PowDB speaks the PostgreSQL v3 wire protocol on a configurable port. This enable
 - psql, pgAdmin, pgcli (command-line tools)
 - Grafana, Metabase, Tableau (BI tools)
 - Any PostgreSQL driver (psycopg2, node-postgres, JDBC)
-- Existing ORMs (including TurbineORM during migration)
+- Existing ORMs (during migration)
 
 The translation path:
 
@@ -423,13 +423,13 @@ The three-product stack:
 │  - B-tree indexes, WAL group commit              │
 │  - Embedded library or server process             │
 ├─────────────────────────────────────────────────┤
-│  TurbineORM (existing Postgres ORM)              │
+│  Existing Postgres ORM                           │
 │  → migrates to PowDB via PG wire protocol       │
 │  → eventually uses native PowQL protocol         │
 └─────────────────────────────────────────────────┘
 ```
 
-Migration path for existing TurbineORM users:
+Migration path for existing ORM users:
 1. Replace PostgreSQL with PowDB (PG wire protocol — drop-in replacement)
 2. Existing queries work immediately, faster storage engine underneath
 3. Gradually adopt PowQL for new queries (5-10x improvement over SQL)

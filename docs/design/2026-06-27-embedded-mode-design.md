@@ -81,7 +81,7 @@ This preserves the durability guarantees ([[project_v043_durability_p0]]) withou
 ### 4.1 Phase 1a — Node native addon (the prize)
 - Built with **napi-rs** (modern, prebuilt-binary tooling, N-API ABI stability across Node versions; preferred over neon).
 - Lives in its **own workspace** (e.g. `bindings/node/`), path-deps on the engine crates, `panic = "unwind"`.
-- JS API mirrors the existing TS client so it drops into Turbine:
+- JS API mirrors the existing TS client so it drops into the ORM integration:
 
 ```ts
 import { Database } from "@zvndev/powdb"; // (name = §7 decision)
@@ -149,5 +149,5 @@ Taken as decided: separate-workspace + `panic = "unwind"` + `catch_unwind` + han
 2. JS API surface + TDD suite incl. the panic-safety + reopen test.
 3. CI prebuilt-binary matrix + OIDC publish wiring.
 4. `powdb` Rust facade crate (parallel, low risk).
-5. Turbine `turbinePowDB({ embedded })` adapter (in the turbine repo).
+5. The ORM integration `powdbEmbedded({ embedded })` adapter (in the ORM's own repo).
 6. (Later) C ABI; (later) Phase 2 sync.

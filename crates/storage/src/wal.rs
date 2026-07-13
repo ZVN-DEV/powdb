@@ -20,6 +20,13 @@ pub enum WalRecordType {
     DdlAddColumn = 8,
     DdlDropColumn = 9,
     Begin = 10,
+    /// Physical log of one overflow-chain chunk (door D4). Payload:
+    /// `page_id u32 | next_page u32 | chunk_len u16 | chunk bytes`. Replayed
+    /// by page id under the per-page LSN skip, so it is idempotent.
+    OverflowWrite = 11,
+    /// Batch of overflow pages returned to the free list (door D4). Payload:
+    /// `count u32 | page_id u32 x count`. Idempotent on replay.
+    OverflowFree = 12,
 }
 
 impl WalRecordType {
@@ -35,6 +42,8 @@ impl WalRecordType {
             8 => Some(WalRecordType::DdlAddColumn),
             9 => Some(WalRecordType::DdlDropColumn),
             10 => Some(WalRecordType::Begin),
+            11 => Some(WalRecordType::OverflowWrite),
+            12 => Some(WalRecordType::OverflowFree),
             _ => None,
         }
     }
@@ -1096,6 +1105,38 @@ mod tests {
         assert_eq!(records[0].tx_id, 1);
         assert_eq!(records[2].tx_id, 1);
         assert_eq!(records[2].record_type, WalRecordType::Commit);
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_overflow_record_types_roundtrip() {
+        // Additive record types 11/12 append, flush, and read back with their
+        // type + payload intact, alongside the existing Insert/Commit records.
+        let (mut wal, path) = temp_wal("ovf_types");
+        wal.append(1, WalRecordType::OverflowWrite, b"chunk-payload")
+            .unwrap();
+        wal.append(1, WalRecordType::OverflowFree, b"\x02\x00\x00\x00")
+            .unwrap();
+        wal.append(1, WalRecordType::Insert, b"stub-row").unwrap();
+        wal.append(1, WalRecordType::Commit, b"").unwrap();
+        wal.flush().unwrap();
+
+        let records = wal.read_all().unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].record_type, WalRecordType::OverflowWrite);
+        assert_eq!(records[0].data, b"chunk-payload");
+        assert_eq!(records[1].record_type, WalRecordType::OverflowFree);
+        assert_eq!(records[2].record_type, WalRecordType::Insert);
+        assert_eq!(records[3].record_type, WalRecordType::Commit);
+        assert_eq!(
+            WalRecordType::from_u8(11),
+            Some(WalRecordType::OverflowWrite)
+        );
+        assert_eq!(
+            WalRecordType::from_u8(12),
+            Some(WalRecordType::OverflowFree)
+        );
         drop(wal);
         std::fs::remove_file(&path).ok();
     }

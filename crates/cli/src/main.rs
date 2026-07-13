@@ -176,6 +176,9 @@ enum Action {
     Passwd { name: String },
     /// Offline user-admin: list users (name + role) from the data dir's UserStore.
     Users,
+    /// Offline admin: mark-and-sweep reclaim orphaned overflow pages. `table`
+    /// is a table name, or "all" to sweep every table. Reports pages reclaimed.
+    Sweep { table: String },
 }
 
 struct CliArgs {
@@ -392,6 +395,8 @@ fn parse_args() -> CliArgs {
                 println!("        Change a user's password (or via POWDB_NEW_PASSWORD).");
                 println!("    users");
                 println!("        List users (name + role).");
+                println!("    sweep <TABLE|all>");
+                println!("        Reclaim orphaned overflow pages for a table (or all).");
                 std::process::exit(0);
             }
             "backup" => {
@@ -575,6 +580,16 @@ fn parse_args() -> CliArgs {
             "users" => {
                 action = Action::Users;
             }
+            "sweep" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: sweep requires a table name or \"all\"");
+                    std::process::exit(2);
+                }
+                action = Action::Sweep {
+                    table: argv[i].clone(),
+                };
+            }
             other if !other.starts_with('-') && !saw_positional => {
                 data_dir = other.to_string();
                 saw_positional = true;
@@ -723,6 +738,9 @@ fn main() {
         }
         Action::Users => {
             std::process::exit(run_users(&args.data_dir));
+        }
+        Action::Sweep { table } => {
+            std::process::exit(run_sweep(&args.data_dir, table));
         }
         Action::Default => {}
     }
@@ -1177,6 +1195,45 @@ fn run_users(data_dir: &str) -> i32 {
         if users.len() == 1 { "" } else { "s" }
     );
     0
+}
+
+/// Offline overflow reclamation. Opens the catalog at `data_dir` directly
+/// (like the other offline admin commands) and mark-and-sweeps orphaned
+/// overflow-chain pages for one table, or all tables when `table == "all"`.
+fn run_sweep(data_dir: &str, table: &str) -> i32 {
+    let dir = Path::new(data_dir);
+    let mut cat = match powdb_storage::catalog::Catalog::open(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to open catalog at {data_dir}: {e}");
+            return 1;
+        }
+    };
+    let result = if table == "all" {
+        cat.sweep_all()
+    } else {
+        cat.sweep(table)
+    };
+    match result {
+        Ok(reclaimed) => {
+            let scope = if table == "all" {
+                "all tables".to_string()
+            } else {
+                format!("table '{table}'")
+            };
+            println!("sweep {scope}: reclaimed {reclaimed} overflow page(s)");
+            // Checkpoint so the reclamation (and its OverflowFree record) is
+            // durable and the WAL is truncated cleanly.
+            if let Err(e) = cat.checkpoint() {
+                eprintln!("Warning: checkpoint after sweep failed: {e}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: sweep failed: {e}");
+            1
+        }
+    }
 }
 
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
