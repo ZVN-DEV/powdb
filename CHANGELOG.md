@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-13
+
+Document-store foundations. **Overflow pages** remove the roughly 4KB
+row-size cap: a single row can now hold values of arbitrary size (up to the
+64MB `MAX_VALUE_SIZE` engine limit), spilling the oversized value to a chain
+of overflow pages behind a fixed-size stub. This release also fixes
+**grouped aggregates over joins** and adds a **bounded wait for bare
+autocommit writes** queued behind a held transaction, completing the
+transaction-gate story started in 0.10.
+
+On-disk compatibility: a database that never stores an oversized value stays
+byte-identical to 0.10 and opens on 0.10 binaries. The row format bumps to v2
+and the heap to v3 lazily, only on the first spill; once a value has spilled,
+older binaries correctly refuse the file rather than misread it. 0.10.x
+databases and backups open as-is.
+
+### Added
+
+- **Overflow pages (P-2).** Values larger than the inline page budget spill
+  to a chain of 4KB overflow pages, pointed to by a 24-byte stub carrying the
+  logical length, first page, and a CRC32. Fixed-size columns never spill;
+  indexed columns are kept inline where possible so index keys stay fast.
+  Spills, updates, and deletes are fully WAL-logged (`OverflowWrite` /
+  `OverflowFree` records) and replay on crash recovery. A mark-and-sweep
+  reclaimer (`powdb sweep`, and an automatic pass after recovery) returns
+  orphaned chains to the free list so churn does not leak disk.
+- **Bounded wait for bare autocommit writes.** 0.10's `--tx-wait-timeout-ms`
+  bounded explicit `begin` only; a bare autocommit write queued behind a held
+  transaction still waited unbounded. It now respects the same bound and fails
+  with the typed transaction-gate timeout error, and increments the
+  `powdb_tx_gate_timeouts_total` metric. A wedged transaction holder can no
+  longer wedge autocommit writers indefinitely.
+
+### Fixed
+
+- **Grouped aggregates over joins (P-5).** Aggregating a value field grouped
+  by another field across a joined/latest-version shape now resolves qualified
+  keys and arguments correctly instead of silently returning nulls.
+- **Row-format-v2 correctness (defect class closed).** A class of latent bugs
+  where v1 layout math or v1-only code paths were applied to v2 (spilled) rows
+  is closed systematically: row decode is v2-aware, every raw byte-patch
+  primitive refuses a v2 row, the executor's raw fast paths gate on whether a
+  table can hold spilled rows, rid relocation repoints every index, overflow
+  chains are freed on update and delete, and `ALTER` plus index rebuilds
+  reassemble spilled values. Round trips are byte-exact from 4KB through 256KB
+  and beyond, and survive crash recovery.
+- **Update fast path never silently drops a spilled row.** The all-fixed-column
+  update fast path now routes any row it cannot patch in place through the
+  reassembling update path instead of skipping it, so an update can never be
+  silently lost or the modified count under-reported.
+
+### Changed
+
+- **Row format v2 and heap format v3** are introduced lazily on first spill
+  (see the compatibility note above). Databases that never spill are
+  unaffected and remain readable by 0.10 binaries.
+
 ## [0.10.0] - 2026-07-13
 
 Dogfood-hardening release from an internal dogfood workload: a **bounded
