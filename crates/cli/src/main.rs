@@ -1507,6 +1507,7 @@ fn run_embedded(data_dir: &str) {
                                         powdb_storage::types::TypeId::DateTime => "datetime",
                                         powdb_storage::types::TypeId::Uuid => "uuid",
                                         powdb_storage::types::TypeId::Bytes => "bytes",
+                                        powdb_storage::types::TypeId::Json => "json",
                                         powdb_storage::types::TypeId::Empty => "empty",
                                     },
                                     if col.required { "yes" } else { "no" }
@@ -1867,6 +1868,10 @@ fn format_value(v: &Value) -> String {
             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
         ),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        // Render canonical JSON text from the PJ1 bytes.
+        Value::Json(b) => {
+            powdb_storage::pj1::pj1_to_text(b).unwrap_or_else(|_| "null".into())
+        }
         Value::Empty => "NULL".into(),
     }
 }

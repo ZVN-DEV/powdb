@@ -787,6 +787,13 @@ impl BTree {
                 buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 buf.extend_from_slice(b);
             }
+            // Json keys are not produced by the v1 index mechanism (path
+            // indexes extract scalars), but encode reversibly like Bytes so no
+            // key path can panic on a Json value.
+            Value::Json(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
             Value::Empty => {}
         }
         // Append RowId as big-endian u64 so it sorts correctly.
@@ -827,6 +834,13 @@ impl BTree {
                 buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 buf.extend_from_slice(b);
             }
+            // Json keys are not produced by the v1 index mechanism (path
+            // indexes extract scalars), but encode reversibly like Bytes so no
+            // key path can panic on a Json value.
+            Value::Json(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
             Value::Empty => {}
         }
         // Append the smallest possible RowId (all zeros).
@@ -864,6 +878,13 @@ impl BTree {
             }
             Value::Uuid(u) => buf.extend_from_slice(u),
             Value::Bytes(b) => {
+                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+                buf.extend_from_slice(b);
+            }
+            // Json keys are not produced by the v1 index mechanism (path
+            // indexes extract scalars), but encode reversibly like Bytes so no
+            // key path can panic on a Json value.
+            Value::Json(b) => {
                 buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 buf.extend_from_slice(b);
             }
@@ -1301,6 +1322,10 @@ fn write_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::Json(b) => {
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
         Value::Empty => {}
     }
 }
@@ -1363,6 +1388,18 @@ fn read_value(buf: &[u8], pos: &mut usize) -> io::Result<Value> {
             *pos += n;
             Ok(Value::Bytes(v))
         }
+        TypeId::Json => {
+            let n = read_u32(buf, pos)? as usize;
+            if *pos + n > buf.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated btree json",
+                ));
+            }
+            let v = buf[*pos..*pos + n].to_vec();
+            *pos += n;
+            Ok(Value::Json(v.into()))
+        }
         TypeId::Empty => Ok(Value::Empty),
     }
 }
@@ -1377,6 +1414,7 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
         5 => Ok(TypeId::DateTime),
         6 => Ok(TypeId::Uuid),
         7 => Ok(TypeId::Bytes),
+        8 => Ok(TypeId::Json),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown btree value tag: {other}"),

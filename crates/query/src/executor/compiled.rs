@@ -66,6 +66,9 @@ pub(super) fn type_id_to_name(type_id: TypeId) -> &'static str {
         TypeId::DateTime => "datetime",
         TypeId::Uuid => "uuid",
         TypeId::Bytes => "bytes",
+        // Lane B/C own the `json` column-declaration keyword and path grammar;
+        // this arm only gives schema introspection a name to print.
+        TypeId::Json => "json",
         TypeId::Empty => "empty",
     }
 }
