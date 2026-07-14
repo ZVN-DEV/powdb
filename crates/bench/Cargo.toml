@@ -43,6 +43,13 @@ path = "src/bin/json_filter.rs"
 name = "phase0-read-baseline"
 path = "src/bin/phase0_read_baseline.rs"
 
+# Fixed-seed release proof for JSON-path equality/range indexes and bounded
+# ordered expression-index scans. Emits machine-readable JSON and enforces
+# relative speedup/scaling gates in release builds.
+[[bin]]
+name = "expression-index-release-gate"
+path = "src/bin/expression_index_release_gate.rs"
+
 [[bench]]
 name = "storage"
 harness = false

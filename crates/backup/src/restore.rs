@@ -50,7 +50,8 @@ pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
     let durable_name = name == "catalog.bin"
         || name == CATALOG_LSN_FILE
         || (name.ends_with(".heap") && name.len() > ".heap".len())
-        || (name.ends_with(".idx") && name.len() > ".idx".len());
+        || (name.ends_with(".idx") && name.len() > ".idx".len())
+        || (name.ends_with(".eidx") && name.len() > ".eidx".len());
     if !is_plain_manifest_name(name) || !durable_name {
         return Err(io::Error::other(format!(
             "invalid backup manifest file name: {name}"
@@ -197,6 +198,7 @@ mod tests {
             "..",
             ".heap",
             ".idx",
+            ".eidx",
             "wal.log",
         ] {
             assert!(
@@ -213,6 +215,7 @@ mod tests {
             CATALOG_LSN_FILE,
             "User.heap",
             "User_email.idx",
+            "User_7.eidx",
         ] {
             validate_backup_file_name(good).unwrap();
         }

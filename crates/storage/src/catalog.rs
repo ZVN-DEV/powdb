@@ -11,7 +11,14 @@ use rustc_hash::FxHashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
+
+static NEXT_STRUCTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_structure_generation() -> u64 {
+    NEXT_STRUCTURE_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Reject an encoded row that exceeds the single-page capacity BEFORE it is
 /// appended to the WAL. The heap performs the same check at its own insert/
@@ -124,8 +131,12 @@ pub enum IndexOrderDirection {
     Desc,
 }
 
-fn expression_index_file_name(table: &str, index_id: u64) -> String {
-    format!("{table}_idx_{index_id}.idx")
+/// Expression-index artifacts live in a filename namespace disjoint from
+/// legacy column indexes. Column indexes always end in `.idx`; expression
+/// indexes always end in `.eidx`. Keeping the extension distinct prevents a
+/// table/column underscore decomposition from ever aliasing an expression ID.
+pub fn expression_index_file_name(table: &str, index_id: u64) -> String {
+    format!("{table}_{index_id}.eidx")
 }
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
@@ -181,26 +192,53 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static CATALOG_PERSIST_FAILPOINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_catalog_persist_failpoint(stage: u8) -> bool {
+    CATALOG_PERSIST_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == stage {
+            failpoint.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+enum CatalogPersistError {
+    BeforeActivation(io::Error),
+    AfterActivation(io::Error),
+}
+
+impl CatalogPersistError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::BeforeActivation(error) | Self::AfterActivation(error) => error,
+        }
+    }
+}
+
 fn max_record_lsn(records: &[WalRecord]) -> Option<u64> {
     records.iter().map(|record| record.lsn).max()
 }
 
 /// System catalog: registry of all tables.
 ///
-/// Mission C Phase 18: tables live in a `Vec<Table>` addressed by a
-/// stable `slot` index, with a parallel `FxHashMap<String, usize>` for
-/// name-based resolution. Append-only (PowDB has no DROP TABLE yet), so
-/// slots are stable for the lifetime of the `Catalog` — callers like
-/// `PreparedQuery::insert_fast` cache a slot at prepare time and skip
-/// the name probe on every subsequent `execute_prepared_take`.
+/// Mission C Phase 18: tables live in a `Vec<Table>` addressed by a `slot`
+/// index, with a parallel `FxHashMap<String, usize>` for name-based resolution.
+/// DROP TABLE can move slots, so prepared fast paths pair a cached slot with the
+/// O(1) structural generation below and fall back when any DDL invalidates it.
 ///
 /// Earlier design (pre-Phase 18) held tables in a `FxHashMap<String, Table>`
 /// directly. That meant the `insert_batch_1k` hot path paid an
 /// `FxHash("User")` + bucket walk per row just to dispatch into the
 /// table — about 20-40ns out of a 233ns budget.
 pub struct Catalog {
-    /// All tables, in insertion order. Indexed by `slot: usize`. A table's
-    /// slot is assigned by `create_table`/`open` and never reused.
+    /// All tables, in insertion order. Indexed by `slot: usize`.
     tables: Vec<Table>,
     /// Name → slot index. Populated in sync with `tables` on every
     /// `create_table` / `open`.
@@ -245,6 +283,11 @@ pub struct Catalog {
     active_catalog_version: u16,
     /// Global, durable, monotonically increasing expression-index identity.
     next_index_id: u64,
+    /// Process-local catalog structure identity. Any table/schema/default/
+    /// auto/index DDL replaces this token, invalidating cached prepared
+    /// metadata in O(1). Opening a replacement Catalog (including rollback)
+    /// also receives a fresh token.
+    structure_generation: u64,
 }
 
 impl Catalog {
@@ -286,6 +329,7 @@ impl Catalog {
             durable_lsn: 0,
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
+            structure_generation: next_structure_generation(),
         };
         cat.persist()?;
         Ok(cat)
@@ -369,6 +413,7 @@ impl Catalog {
             durable_lsn,
             active_catalog_version,
             next_index_id,
+            structure_generation: next_structure_generation(),
         };
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
@@ -1167,13 +1212,21 @@ impl Catalog {
         // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
         let sync_mode = self.wal.sync_mode();
-        let restored = if prearchived {
+        let mut restored = if prearchived {
             let mut already_archived = |_dir: &Path, _records: &[WalRecord]| Ok(());
             let archive: WalArchiveCallback<'_> = &mut already_archived;
             Self::open_inner(&data_dir, Some(archive))?
         } else {
             Self::open_inner(&data_dir, archive)?
         };
+        // Row-only rollback reopens the catalog to discard dirty heap/index
+        // state, but it does not change prepared-query metadata. Preserve the
+        // O(1) token in that common case so existing PreparedQuery handles keep
+        // their fast path. Any schema/default/auto/index difference retains the
+        // fresh token assigned by open_inner and invalidates cached metadata.
+        if self.has_same_prepared_structure(&restored) {
+            restored.structure_generation = self.structure_generation;
+        }
         *self = restored;
         self.wal.set_sync_mode(sync_mode);
         Ok(())
@@ -1238,6 +1291,7 @@ impl Catalog {
         defaults: Vec<Option<Value>>,
         auto_cols: Vec<bool>,
     ) -> io::Result<()> {
+        self.invalidate_structure();
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {
             validate_column_name(&col.name)?;
@@ -1293,7 +1347,7 @@ impl Catalog {
     ///
     /// Mission 3: also writes the per-table list of indexed column names so
     /// `Catalog::open` can rehydrate b-tree indexes on restart.
-    fn persist(&self) -> io::Result<()> {
+    fn persist_at_activation_boundary(&self) -> Result<(), CatalogPersistError> {
         let cat_path = self.data_dir.join(CATALOG_FILE);
         let tmp_path = self.data_dir.join(format!("{CATALOG_FILE}.tmp"));
         let entries: Vec<CatalogEntryRef<'_>> = self
@@ -1312,18 +1366,84 @@ impl Catalog {
             self.active_catalog_version,
             self.next_index_id,
             &entries,
-        )?;
-        fs::rename(&tmp_path, &cat_path)?;
-        sync_directory(&self.data_dir)?;
-        Ok(())
+        )
+        .map_err(CatalogPersistError::BeforeActivation)?;
+        #[cfg(test)]
+        if take_catalog_persist_failpoint(1) {
+            return Err(CatalogPersistError::BeforeActivation(io::Error::other(
+                "injected catalog failure before rename",
+            )));
+        }
+        fs::rename(&tmp_path, &cat_path).map_err(CatalogPersistError::BeforeActivation)?;
+        #[cfg(test)]
+        let directory_sync = if take_catalog_persist_failpoint(2) {
+            Err(io::Error::other(
+                "injected catalog directory sync failure after rename",
+            ))
+        } else {
+            sync_directory(&self.data_dir)
+        };
+        #[cfg(not(test))]
+        let directory_sync = sync_directory(&self.data_dir);
+        directory_sync.map_err(CatalogPersistError::AfterActivation)
     }
 
-    /// Resolve a table name to its stable slot index. Prepared-query
-    /// fast paths cache this once and skip the hash probe on every
-    /// subsequent execution. Slots never shift once assigned.
+    fn persist(&self) -> io::Result<()> {
+        self.persist_at_activation_boundary()
+            .map_err(CatalogPersistError::into_io_error)
+    }
+
+    /// Resolve a table name to its current slot index. DROP TABLE uses
+    /// swap-remove, so prepared-query fast paths pair this value with
+    /// [`Self::structure_generation`] before every slot-indexed access.
     #[inline]
     pub fn table_slot(&self, name: &str) -> Option<usize> {
         self.name_to_slot.get(name).copied()
+    }
+
+    /// O(1) prepared-metadata validity token. It is process-local by design:
+    /// prepared queries do not cross process boundaries, and a reopened or
+    /// rollback-replaced Catalog must invalidate every cached slot/offset.
+    #[inline]
+    pub fn structure_generation(&self) -> u64 {
+        self.structure_generation
+    }
+
+    #[inline]
+    fn invalidate_structure(&mut self) {
+        self.structure_generation = next_structure_generation();
+    }
+
+    fn has_same_prepared_structure(&self, other: &Self) -> bool {
+        self.tables.len() == other.tables.len()
+            && self.tables.iter().zip(&other.tables).all(|(left, right)| {
+                let left_schema = &left.schema;
+                let right_schema = &right.schema;
+                left_schema.table_name == right_schema.table_name
+                    && left_schema.columns.len() == right_schema.columns.len()
+                    && left_schema.columns.iter().zip(&right_schema.columns).all(
+                        |(left_col, right_col)| {
+                            left_col.name == right_col.name
+                                && left_col.type_id == right_col.type_id
+                                && left_col.required == right_col.required
+                                && left_col.position == right_col.position
+                        },
+                    )
+                    && left.defaults() == right.defaults()
+                    && left.auto_cols() == right.auto_cols()
+                    && {
+                        let left_indexes = left.indexed_column_metas();
+                        let right_indexes = right.indexed_column_metas();
+                        left_indexes.len() == right_indexes.len()
+                            && left_indexes.iter().zip(&right_indexes).all(
+                                |(left_index, right_index)| {
+                                    left_index.name == right_index.name
+                                        && left_index.unique == right_index.unique
+                                },
+                            )
+                    }
+                    && left.expression_index_metas() == right.expression_index_metas()
+            })
     }
 
     /// O(1) slot-indexed table access. Panics on an out-of-range slot
@@ -1432,7 +1552,7 @@ impl Catalog {
             return self.by_name_mut(table)?.insert(values);
         }
         let slot = self.slot_of(table)?;
-        self.tables[slot].preflight_insert(values)?;
+        let _ = self.tables[slot].preflight_insert(values)?;
         // Allocate the tx id up front: any overflow chains for a spilled row
         // must be logged under the SAME tx (and before the Insert record) so
         // an uncommitted big row's chain writes are skipped on replay.
@@ -1465,7 +1585,7 @@ impl Catalog {
         if self.wal.is_off() {
             return self.tables[slot].insert(values);
         }
-        self.tables[slot].preflight_insert(values)?;
+        let _ = self.tables[slot].preflight_insert(values)?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
@@ -1964,6 +2084,7 @@ impl Catalog {
         column: &str,
         unique: bool,
     ) -> io::Result<()> {
+        self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         self.by_name_mut(table)?
             .create_index_with_unique(column, &data_dir, unique)?;
@@ -2078,14 +2199,25 @@ impl Catalog {
     }
 
     pub fn drop_expression_index(&mut self, table: &str, index_id: u64) -> io::Result<()> {
+        self.invalidate_structure();
         validate_table_name(table)?;
         let removed = self
             .by_name_mut(table)?
             .take_expression_index(index_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
-        if let Err(error) = self.persist() {
-            self.by_name_mut(table)?.restore_expression_index(removed);
-            return Err(error);
+        match self.persist_at_activation_boundary() {
+            Ok(()) => {}
+            Err(CatalogPersistError::BeforeActivation(error)) => {
+                self.by_name_mut(table)?.restore_expression_index(removed);
+                return Err(error);
+            }
+            Err(CatalogPersistError::AfterActivation(error)) => {
+                warn!(
+                    path = %self.data_dir.display(),
+                    error = %error,
+                    "expression index drop committed but catalog directory sync failed"
+                );
+            }
         }
         let index_path = self
             .data_dir
@@ -2101,7 +2233,7 @@ impl Catalog {
     }
 
     /// Persist expression-index identity and create its backup-compatible
-    /// `.idx` file. The catalog stays at v5 until every validation and file
+    /// `.eidx` file. The catalog stays at v5 until every validation and file
     /// creation step succeeds; the v6 catalog rename is the activation point.
     pub fn create_expression_index_metadata(
         &mut self,
@@ -2111,6 +2243,7 @@ impl Catalog {
         json_path: StoredJsonPathV1,
         unique: bool,
     ) -> io::Result<u64> {
+        self.invalidate_structure();
         validate_table_name(table)?;
         validate_column_name(&json_path.column)?;
         if canonical_version == 0 {
@@ -2186,14 +2319,24 @@ impl Catalog {
         let previous_next_id = self.next_index_id;
         self.active_catalog_version = CATALOG_VERSION;
         self.next_index_id = next_index_id;
-        if let Err(error) = self.persist() {
-            self.by_name_mut(table)?
-                .remove_expression_index_by_id(index_id);
-            self.active_catalog_version = previous_version;
-            self.next_index_id = previous_next_id;
-            let _ = fs::remove_file(&index_path);
-            let _ = sync_directory(&self.data_dir);
-            return Err(error);
+        match self.persist_at_activation_boundary() {
+            Ok(()) => {}
+            Err(CatalogPersistError::BeforeActivation(error)) => {
+                self.by_name_mut(table)?
+                    .remove_expression_index_by_id(index_id);
+                self.active_catalog_version = previous_version;
+                self.next_index_id = previous_next_id;
+                let _ = fs::remove_file(&index_path);
+                let _ = sync_directory(&self.data_dir);
+                return Err(error);
+            }
+            Err(CatalogPersistError::AfterActivation(error)) => {
+                warn!(
+                    path = %self.data_dir.display(),
+                    error = %error,
+                    "expression index creation committed but catalog directory sync failed"
+                );
+            }
         }
         Ok(index_id)
     }
@@ -2237,6 +2380,7 @@ impl Catalog {
     /// Drop a table: remove from the catalog and delete its data files.
     /// Returns `Err` if the table doesn't exist.
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        self.invalidate_structure();
         validate_table_name(name)?;
         let slot = *self.name_to_slot.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
@@ -2308,6 +2452,7 @@ impl Catalog {
     /// and silently storing `Empty` in a required slot would just
     /// shift the invariant violation to the next query.
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
+        self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         {
             let tbl = self.by_name_mut(table)?;
@@ -2399,6 +2544,7 @@ impl Catalog {
     /// through `Table::rewrite_rows_for_schema_change`. Dropping a
     /// column from an empty table skips the rewrite.
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
+        self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         {
             let tbl = self.by_name_mut(table)?;
@@ -3637,6 +3783,11 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fail_next_catalog_persist_at(stage: u8) {
+        CATALOG_PERSIST_FAILPOINT.with(|failpoint| failpoint.set(stage));
+    }
+
     fn temp_catalog(name: &str) -> Catalog {
         let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
@@ -3671,6 +3822,130 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("unsupported catalog version: 6"));
+    }
+
+    #[test]
+    fn expression_index_rolls_back_only_before_catalog_rename() {
+        let before_dir = tempfile::tempdir().unwrap();
+        let mut before = Catalog::create(before_dir.path()).unwrap();
+        before
+            .create_table(Schema {
+                table_name: "Doc".into(),
+                columns: vec![ColumnDef {
+                    name: "data".into(),
+                    type_id: TypeId::Json,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        let path =
+            StoredJsonPathV1::new("data", vec![StoredJsonPathSegmentV1::Key("score".into())]);
+
+        fail_next_catalog_persist_at(1);
+        let error = before
+            .create_expression_index_metadata("Doc", 1, path.canonical_text(), path.clone(), false)
+            .unwrap_err();
+        assert!(error.to_string().contains("before rename"));
+        assert_eq!(before.active_catalog_version(), LEGACY_CATALOG_VERSION);
+        assert_eq!(before.next_index_id(), 1);
+        assert!(before.expression_index_metadata("Doc").unwrap().is_empty());
+        assert!(!before_dir
+            .path()
+            .join(expression_index_file_name("Doc", 1))
+            .exists());
+
+        let before_index_id = before
+            .create_expression_index_metadata("Doc", 1, path.canonical_text(), path.clone(), false)
+            .unwrap();
+        fail_next_catalog_persist_at(1);
+        let error = before
+            .drop_expression_index("Doc", before_index_id)
+            .unwrap_err();
+        assert!(error.to_string().contains("before rename"));
+        assert!(before
+            .expression_index_btree("Doc", before_index_id)
+            .is_some());
+        assert!(before_dir
+            .path()
+            .join(expression_index_file_name("Doc", 1))
+            .exists());
+        std::mem::forget(before);
+        let before_reopened = Catalog::open(before_dir.path()).unwrap();
+        assert!(before_reopened
+            .expression_index_btree("Doc", before_index_id)
+            .is_some());
+
+        let after_dir = tempfile::tempdir().unwrap();
+        let mut after = Catalog::create(after_dir.path()).unwrap();
+        after
+            .create_table(Schema {
+                table_name: "Doc".into(),
+                columns: vec![ColumnDef {
+                    name: "data".into(),
+                    type_id: TypeId::Json,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        fail_next_catalog_persist_at(2);
+        let index_id = after
+            .create_expression_index_metadata("Doc", 1, path.canonical_text(), path.clone(), false)
+            .unwrap();
+        assert_eq!(index_id, 1);
+        assert_eq!(after.active_catalog_version(), CATALOG_VERSION);
+        assert_eq!(after.next_index_id(), 2);
+        assert!(after.expression_index_btree("Doc", index_id).is_some());
+        assert!(after_dir
+            .path()
+            .join(expression_index_file_name("Doc", 1))
+            .exists());
+        std::mem::forget(after);
+
+        let mut reopened = Catalog::open(after_dir.path()).unwrap();
+        assert!(reopened.expression_index_btree("Doc", index_id).is_some());
+        fail_next_catalog_persist_at(2);
+        reopened.drop_expression_index("Doc", index_id).unwrap();
+        assert!(reopened
+            .expression_index_metadata("Doc")
+            .unwrap()
+            .is_empty());
+        assert!(!after_dir
+            .path()
+            .join(expression_index_file_name("Doc", 1))
+            .exists());
+        std::mem::forget(reopened);
+
+        let final_open = Catalog::open(after_dir.path()).unwrap();
+        assert!(final_open
+            .expression_index_metadata("Doc")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ordinary_catalog_persist_reports_post_rename_directory_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        fail_next_catalog_persist_at(2);
+        let error = catalog
+            .create_table(Schema {
+                table_name: "VisibleAfterRename".into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("after rename"));
+        assert!(catalog.schema("VisibleAfterRename").is_some());
+
+        std::mem::forget(catalog);
+        let reopened = Catalog::open(dir.path()).unwrap();
+        assert!(reopened.schema("VisibleAfterRename").is_some());
     }
 
     fn schema_two_cols() -> Schema {

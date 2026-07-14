@@ -1,5 +1,6 @@
 use powdb_storage::catalog::{
-    Catalog, IndexKeySource, CATALOG_LSN_FILE, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+    expression_index_file_name, Catalog, IndexKeySource, CATALOG_LSN_FILE, CATALOG_VERSION,
+    LEGACY_CATALOG_VERSION,
 };
 use powdb_storage::wal::WAL_FORMAT_VERSION;
 use powdb_sync::IdentitySnapshot;
@@ -51,7 +52,7 @@ pub(crate) fn active_durable_file_names(catalog: &Catalog) -> BTreeSet<String> {
                         names.insert(format!("{table}_{column}.idx"));
                     }
                     IndexKeySource::Expression { index_id, .. } => {
-                        names.insert(format!("{table}_idx_{index_id}.idx"));
+                        names.insert(expression_index_file_name(table, index_id));
                     }
                 }
             }

@@ -40,7 +40,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.12.0";
+export const CLIENT_VERSION = "0.13.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -1570,6 +1570,7 @@ export { encode, tryDecode } from "./protocol.js";
 export type {
   Message,
   SyncRepairAction,
+  WireValue,
   WireParam,
   WireRetainedUnit,
   WireSyncStatus,

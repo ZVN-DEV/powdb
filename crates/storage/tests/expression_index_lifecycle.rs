@@ -1,5 +1,6 @@
 use powdb_storage::catalog::{
-    Catalog, IndexOrderDirection, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+    expression_index_file_name, Catalog, IndexOrderDirection, CATALOG_VERSION,
+    LEGACY_CATALOG_VERSION,
 };
 use powdb_storage::pj1::parse_json_text;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
@@ -229,7 +230,10 @@ fn unique_and_non_scalar_fail_before_heap_overflow_or_catalog_activation() {
         LEGACY_CATALOG_VERSION
     );
     assert_eq!(duplicate_catalog.next_index_id(), 1);
-    assert!(!duplicate_dir.path().join("Doc_idx_1.idx").exists());
+    assert!(!duplicate_dir
+        .path()
+        .join(expression_index_file_name("Doc", 1))
+        .exists());
 
     let nonscalar_dir = tempfile::tempdir().unwrap();
     let mut nonscalar_catalog = Catalog::create(nonscalar_dir.path()).unwrap();
@@ -244,7 +248,10 @@ fn unique_and_non_scalar_fail_before_heap_overflow_or_catalog_activation() {
         nonscalar_catalog.active_catalog_version(),
         LEGACY_CATALOG_VERSION
     );
-    assert!(!nonscalar_dir.path().join("Doc_idx_1.idx").exists());
+    assert!(!nonscalar_dir
+        .path()
+        .join(expression_index_file_name("Doc", 1))
+        .exists());
 
     let dir = tempfile::tempdir().unwrap();
     let mut catalog = Catalog::create(dir.path()).unwrap();
@@ -363,7 +370,7 @@ fn explicit_expression_index_drop_removes_metadata_and_file_without_reusing_id()
     let index_id = catalog
         .create_expression_index_metadata("Doc", 1, path.canonical_text(), path, false)
         .unwrap();
-    let index_file = dir.path().join("Doc_idx_1.idx");
+    let index_file = dir.path().join(expression_index_file_name("Doc", 1));
     assert!(index_file.exists());
 
     catalog.drop_expression_index("Doc", index_id).unwrap();

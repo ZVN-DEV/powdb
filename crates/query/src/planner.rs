@@ -398,23 +398,6 @@ fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
         }
     }
 
-    // Offset must be applied *before* Limit: skip M rows, then take N.
-    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
-    // and Limit wraps it (outer).
-    if let Some(off) = q.offset {
-        node = PlanNode::Offset {
-            input: Box::new(node),
-            count: off,
-        };
-    }
-
-    if let Some(lim) = q.limit {
-        node = PlanNode::Limit {
-            input: Box::new(node),
-            count: lim,
-        };
-    }
-
     // Mission E2b: GROUP BY path for joined queries.
     if let Some(group) = q.group_by {
         let mut grouped_order = q.order;
@@ -460,12 +443,45 @@ fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
                     .collect(),
             };
         }
+        // LIMIT/OFFSET operate on grouped result rows, never on the joined
+        // input. Applying either before GroupBy truncates source rows and can
+        // silently change aggregate values. Offset remains inside Limit so
+        // execution skips M grouped rows before taking N.
+        if let Some(off) = q.offset {
+            node = PlanNode::Offset {
+                input: Box::new(node),
+                count: off,
+            };
+        }
+        if let Some(lim) = q.limit {
+            node = PlanNode::Limit {
+                input: Box::new(node),
+                count: lim,
+            };
+        }
         if q.distinct {
             node = PlanNode::Distinct {
                 input: Box::new(node),
             };
         }
         return Ok(node);
+    }
+
+    // Offset must be applied *before* Limit: skip M rows, then take N.
+    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
+    // and Limit wraps it (outer).
+    if let Some(off) = q.offset {
+        node = PlanNode::Offset {
+            input: Box::new(node),
+            count: off,
+        };
+    }
+
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            count: lim,
+        };
     }
 
     if let Some(proj) = q.projection {
@@ -1052,6 +1068,8 @@ fn symmetric_provenance_alias(
     source_aliases: &std::collections::HashSet<String>,
 ) -> Result<Option<String>, PlanError> {
     if mode == AggregateMode::Raw
+        || source_aliases.len() < 2
+        || !matches!(function, AggFunc::Sum | AggFunc::Avg | AggFunc::Count)
         || (function == AggFunc::Count
             && argument.is_none_or(|argument| matches!(argument, Expr::Field(name) if name == "*")))
     {
@@ -1214,6 +1232,62 @@ mod tests {
     fn test_plan_count() {
         let plan = plan("count(User)").unwrap();
         assert!(matches!(plan, PlanNode::Aggregate { .. }));
+    }
+
+    #[test]
+    fn single_source_aggregates_do_not_request_provenance() {
+        for query in [
+            "sum(User { .amount })",
+            "avg(User { .amount })",
+            "count(User { .amount })",
+        ] {
+            match plan(query).unwrap() {
+                PlanNode::Aggregate {
+                    provenance_alias, ..
+                } => assert!(
+                    provenance_alias.is_none(),
+                    "unexpected provenance for {query}"
+                ),
+                other => panic!("expected Aggregate for {query}, got {other:?}"),
+            }
+        }
+
+        match plan("User group .dept { total: sum(.amount) }").unwrap() {
+            PlanNode::Project { input, .. } => match *input {
+                PlanNode::GroupBy { aggregates, .. } => {
+                    assert!(aggregates[0].provenance_alias.is_none());
+                }
+                other => panic!("expected GroupBy, got {other:?}"),
+            },
+            other => panic!("expected Project(GroupBy), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_provenance_is_limited_to_fanout_sensitive_aggregates() {
+        let base = "Account as a join Entry as e on a.id = e.account_id group a.dept";
+        for (function, expects_provenance) in [
+            ("sum(a.balance)", true),
+            ("avg(a.balance)", true),
+            ("count(a.balance)", true),
+            ("min(a.balance)", false),
+            ("max(a.balance)", false),
+            ("count(distinct a.balance)", false),
+            ("count(*)", false),
+        ] {
+            let query = format!("{base} {{ value: {function} }}");
+            match plan(&query).unwrap() {
+                PlanNode::Project { input, .. } => match *input {
+                    PlanNode::GroupBy { aggregates, .. } => assert_eq!(
+                        aggregates[0].provenance_alias.as_deref(),
+                        expects_provenance.then_some("a"),
+                        "unexpected provenance selection for {function}"
+                    ),
+                    other => panic!("expected GroupBy for {function}, got {other:?}"),
+                },
+                other => panic!("expected Project(GroupBy) for {function}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1534,6 +1608,35 @@ mod tests {
             }
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_plan_joined_group_applies_order_offset_limit_after_grouping() {
+        let plan = plan(
+            "User as u join Order as o on u.id = o.user_id \
+             group u.status { u.status, n: count(*) } order n desc offset 1 limit 2",
+        )
+        .unwrap();
+
+        let PlanNode::Limit { input, .. } = plan else {
+            panic!("expected Limit at the grouped-result boundary");
+        };
+        let PlanNode::Offset { input, .. } = *input else {
+            panic!("expected Offset below Limit");
+        };
+        let PlanNode::Sort { input, .. } = *input else {
+            panic!("expected Sort below Offset");
+        };
+        let PlanNode::Project { input, .. } = *input else {
+            panic!("expected Project below Sort");
+        };
+        let PlanNode::GroupBy { input, .. } = *input else {
+            panic!("expected GroupBy below Project");
+        };
+        assert!(
+            matches!(*input, PlanNode::NestedLoopJoin { .. }),
+            "joined rows must flow into GroupBy before result limiting"
+        );
     }
 
     #[test]

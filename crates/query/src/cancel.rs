@@ -36,6 +36,8 @@
 //! begins. The amortized loop cost is a register increment and a mask test.
 
 use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,6 +53,17 @@ const STATE_DISCONNECT: u8 = 2;
 /// lookup entirely. A non-zero value is only a hint that this thread might
 /// have a token; [`check`] still consults its thread-local slot for authority.
 static ACTIVE_INSTALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether any executor thread currently has a cancellation token installed.
+///
+/// This is only a fast-path hint: callers that observe `true` must still use
+/// [`check`] for the authoritative thread-local decision. Observing `false` is
+/// sufficient to skip per-iteration polling because no thread can currently
+/// have an installed token.
+#[inline]
+pub(crate) fn has_active_install() -> bool {
+    ACTIVE_INSTALLS.load(Ordering::Relaxed) != 0
+}
 
 /// One real cancellation check per this many [`CancelCheck::tick`] calls.
 /// A power of two so the gate is a mask test. 4096 rows of nested-loop work
@@ -197,12 +210,20 @@ thread_local! {
 pub fn install(token: Arc<ExecCancel>) -> InstallGuard {
     let prev = CURRENT.with(|c| c.borrow_mut().replace(token));
     ACTIVE_INSTALLS.fetch_add(1, Ordering::Relaxed);
-    InstallGuard { prev }
+    InstallGuard {
+        prev,
+        _thread_bound: PhantomData,
+    }
 }
 
 /// RAII guard from [`install`]; restores the previous token on drop.
+///
+/// The marker intentionally makes this guard `!Send`: installation and
+/// restoration both access thread-local state and therefore must occur on the
+/// same executor thread.
 pub struct InstallGuard {
     prev: Option<Arc<ExecCancel>>,
+    _thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Drop for InstallGuard {
@@ -217,7 +238,7 @@ impl Drop for InstallGuard {
 /// Cheap no-op (one relaxed atomic load) when no token is installed anywhere.
 #[inline]
 pub fn check() -> Result<(), QueryError> {
-    if ACTIVE_INSTALLS.load(Ordering::Relaxed) == 0 {
+    if !has_active_install() {
         return Ok(());
     }
     CURRENT.with(|c| match c.borrow().as_ref() {

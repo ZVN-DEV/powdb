@@ -1,5 +1,7 @@
 use powdb_backup::{ChangedFile, IncrementManifest};
-use powdb_storage::catalog::{Catalog, CATALOG_VERSION, LEGACY_CATALOG_VERSION};
+use powdb_storage::catalog::{
+    expression_index_file_name, Catalog, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+};
 use powdb_storage::page::PAGE_SIZE;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
@@ -117,7 +119,7 @@ fn v6_full_restore_preserves_id_named_expression_index_as_opaque_file() {
     let mut catalog = Catalog::create(source.path()).unwrap();
     catalog.create_table(document_schema()).unwrap();
     let index_id = activate_expression_index(&mut catalog);
-    let index_name = format!("Document_idx_{index_id}.idx");
+    let index_name = expression_index_file_name("Document", index_id);
     catalog.checkpoint().unwrap();
     let index_len = std::fs::metadata(source.path().join(&index_name))
         .unwrap()
@@ -165,7 +167,7 @@ fn v5_base_to_v6_increment_copies_aligned_bidx_whole_and_restores_activation() {
     assert_eq!(base.catalog_version, LEGACY_CATALOG_VERSION);
 
     let index_id = activate_expression_index(&mut catalog);
-    let index_name = format!("Document_idx_{index_id}.idx");
+    let index_name = expression_index_file_name("Document", index_id);
     catalog.checkpoint().unwrap();
     assert_eq!(
         std::fs::metadata(source.path().join(&index_name))
@@ -183,7 +185,7 @@ fn v5_base_to_v6_increment_copies_aligned_bidx_whole_and_restores_activation() {
     )));
     assert!(!inc.changed.iter().any(|changed| matches!(
         changed,
-        ChangedFile::Pages { name, .. } if name.ends_with(".idx")
+        ChangedFile::Pages { name, .. } if name.ends_with(".idx") || name.ends_with(".eidx")
     )));
     drop(catalog);
 
@@ -208,18 +210,18 @@ fn orphan_expression_index_ids_are_not_snapshot_metadata_or_files() {
     let active_id = activate_expression_index(&mut catalog);
     catalog.checkpoint().unwrap();
 
-    let active_name = format!("Document_idx_{active_id}.idx");
-    let orphan_name = "Document_idx_999.idx";
+    let active_name = expression_index_file_name("Document", active_id);
+    let orphan_name = expression_index_file_name("Document", 999);
     std::fs::copy(
         source.path().join(&active_name),
-        source.path().join(orphan_name),
+        source.path().join(&orphan_name),
     )
     .unwrap();
 
     let manifest = powdb_backup::full_backup(&mut catalog, backup.path()).unwrap();
     assert!(manifest.files.iter().any(|file| file.name == active_name));
     assert!(!manifest.files.iter().any(|file| file.name == orphan_name));
-    assert!(!backup.path().join(orphan_name).exists());
+    assert!(!backup.path().join(&orphan_name).exists());
     assert_eq!(
         catalog
             .expression_index_metadata("Document")

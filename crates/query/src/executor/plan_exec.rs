@@ -23,6 +23,27 @@ use powdb_storage::view::ViewDef;
 /// as bounded stable runs and cooperatively merged below.
 const CANCELLABLE_SORT_RUN: usize = 2_048;
 
+/// Compare ORDER BY values with the engine-wide `NULLS LAST` contract.
+///
+/// `Value::Empty` represents both SQL/PowQL null and a missing JSON path.
+/// Direction only reverses non-null values, so nulls remain last for both
+/// ascending and descending order.
+pub(super) fn compare_order_values(
+    left: &Value,
+    right: &Value,
+    descending: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (left, right) {
+        (Value::Empty, Value::Empty) => Ordering::Equal,
+        (Value::Empty, _) => Ordering::Greater,
+        (_, Value::Empty) => Ordering::Less,
+        _ if descending => left.cmp(right).reverse(),
+        _ => left.cmp(right),
+    }
+}
+
 /// Stable sort with cooperative cancellation throughout the sort itself.
 ///
 /// We sort original positions rather than moving potentially large rows on
@@ -125,6 +146,17 @@ pub(super) fn for_each_row_raw_cancellable(
     table: &str,
     mut f: impl FnMut(RowId, &[u8]),
 ) -> Result<(), QueryError> {
+    // Embedded/direct execution normally has no cancellation token. Preserve
+    // the original zero-poll raw-scan hot path in that case instead of paying
+    // a counter increment and mask branch for every row. The active-install
+    // flag is a process-wide hint, so a true result still enters the
+    // authoritative thread-local polling path below.
+    if !crate::cancel::has_active_install() {
+        return catalog
+            .for_each_row_raw(table, f)
+            .map_err(|err| QueryError::StorageError(err.to_string()));
+    }
+
     let mut cancel = CancelCheck::new();
     let mut cancel_err: Option<QueryError> = None;
     catalog
@@ -611,13 +643,10 @@ impl Engine {
                     self.query_memory_limit(),
                     |(left, _), (right, _)| {
                         for key in keys {
-                            let comparison = eval_expr(&key.expr, left, &input.columns)
-                                .cmp(&eval_expr(&key.expr, right, &input.columns));
-                            let comparison = if key.descending {
-                                comparison.reverse()
-                            } else {
-                                comparison
-                            };
+                            let left_value = eval_expr(&key.expr, left, &input.columns);
+                            let right_value = eval_expr(&key.expr, right, &input.columns);
+                            let comparison =
+                                compare_order_values(&left_value, &right_value, key.descending);
                             if comparison != std::cmp::Ordering::Equal {
                                 return comparison;
                             }
@@ -1241,12 +1270,19 @@ impl Engine {
                             .collect::<Result<_, QueryError>>()?;
                         cooperative_stable_sort_by(&mut rows, self.query_memory_limit, |a, b| {
                             for &(col_idx, expr, descending) in &key_specs {
-                                let cmp = match col_idx {
-                                    Some(index) => a[index].cmp(&b[index]),
-                                    None => eval_expr(expr, a, &columns)
-                                        .cmp(&eval_expr(expr, b, &columns)),
+                                let (left_value, right_value) = match col_idx {
+                                    Some(index) => (&a[index], &b[index]),
+                                    None => {
+                                        let left = eval_expr(expr, a, &columns);
+                                        let right = eval_expr(expr, b, &columns);
+                                        let cmp = compare_order_values(&left, &right, descending);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                        continue;
+                                    }
                                 };
-                                let cmp = if descending { cmp.reverse() } else { cmp };
+                                let cmp = compare_order_values(left_value, right_value, descending);
                                 if cmp != std::cmp::Ordering::Equal {
                                     return cmp;
                                 }
@@ -1869,7 +1905,7 @@ impl Engine {
                             .catalog
                             .get_table(table)
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                        let schema = &tbl.schema;
+                        let schema = tbl.schema();
                         // Overflow safety (P0): byte-patching a v2 row with v1
                         // offsets corrupts it. Overflow tables take the generic
                         // reassembling `get` + `update_hinted` path below.
@@ -1973,7 +2009,7 @@ impl Engine {
                             .catalog
                             .get_table(table)
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                        let schema = &tbl.schema;
+                        let schema = tbl.schema();
                         // Overflow safety (P0/P0-2): the in-place var shrink
                         // patch computes v1 offsets — never on a v2-capable
                         // table. Falls through to the reassembling path.
@@ -2586,7 +2622,7 @@ impl Engine {
                             .catalog
                             .get_table(table)
                             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                        let col_idx = tbl.schema.column_index(column).ok_or_else(|| {
+                        let col_idx = tbl.schema().column_index(column).ok_or_else(|| {
                             QueryError::ColumnNotFound {
                                 table: table.to_string(),
                                 column: column.clone(),
@@ -2795,8 +2831,12 @@ impl Engine {
                     .catalog
                     .get_table(table)
                     .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                let columns: Vec<String> =
-                    tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
+                let columns: Vec<String> = tbl
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
 
                 // Fast path: the table has a B-tree on this column.
                 // Uses index_lookup_all to return ALL matching rows for
@@ -2824,7 +2864,7 @@ impl Engine {
                 // first one. A non-indexed column isn't necessarily unique.
                 // We compile the eq predicate once and stream without any
                 // per-row decode for non-matching rows.
-                let schema = &tbl.schema;
+                let schema = tbl.schema();
                 let fast = FastLayout::new(schema);
                 let synth_pred = Expr::BinaryOp(
                     Box::new(Expr::Field(column.clone())),
@@ -2876,9 +2916,13 @@ impl Engine {
                     .catalog
                     .get_table(table)
                     .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-                let columns: Vec<String> =
-                    tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
-                let schema = &tbl.schema;
+                let columns: Vec<String> = tbl
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let schema = tbl.schema();
 
                 let start_val = match start {
                     Some((expr, _)) => Some(literal_to_value(expr)?),
@@ -3660,6 +3704,7 @@ impl Engine {
                     BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
+                let mut null_rows: Vec<Vec<u8>> = Vec::with_capacity(prealloc);
 
                 for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
                     if let Some(ref pred) = compiled_pred {
@@ -3676,7 +3721,12 @@ impl Engine {
                         return;
                     }
                     let is_null = (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    let id = seq;
+                    seq += 1;
                     if is_null {
+                        if null_rows.len() < limit {
+                            null_rows.push(data.to_vec());
+                        }
                         return;
                     }
                     let key = i64::from_le_bytes(
@@ -3684,9 +3734,6 @@ impl Engine {
                             .try_into()
                             .unwrap_or_else(|_| unreachable!()),
                     );
-                    let id = seq;
-                    seq += 1;
-
                     if descending {
                         if heap_desc.len() < limit {
                             heap_desc.push(Reverse((key, id, data.to_vec())));
@@ -3720,7 +3767,9 @@ impl Engine {
                         a.0.cmp(&b.0).then(a.1.cmp(&b.1))
                     })?;
                 }
-                drained.into_iter().map(|(_, _, d)| d).collect()
+                let mut rows: Vec<Vec<u8>> = drained.into_iter().map(|(_, _, d)| d).collect();
+                rows.extend(null_rows.into_iter().take(limit.saturating_sub(rows.len())));
+                rows
             }
             TypeId::Float => {
                 // Novel angle: rather than introducing a `TotalF64` newtype
@@ -3736,6 +3785,7 @@ impl Engine {
                     BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(u64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
+                let mut null_rows: Vec<Vec<u8>> = Vec::with_capacity(prealloc);
 
                 for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
                     if let Some(ref pred) = compiled_pred {
@@ -3751,7 +3801,12 @@ impl Engine {
                         return;
                     }
                     let is_null = (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    let id = seq;
+                    seq += 1;
                     if is_null {
+                        if null_rows.len() < limit {
+                            null_rows.push(data.to_vec());
+                        }
                         return;
                     }
                     let bits = u64::from_le_bytes(
@@ -3760,9 +3815,6 @@ impl Engine {
                             .unwrap_or_else(|_| unreachable!()),
                     );
                     let key = f64_bits_to_sortable_u64(bits);
-                    let id = seq;
-                    seq += 1;
-
                     if descending {
                         if heap_desc.len() < limit {
                             heap_desc.push(Reverse((key, id, data.to_vec())));
@@ -3796,7 +3848,9 @@ impl Engine {
                         a.0.cmp(&b.0).then(a.1.cmp(&b.1))
                     })?;
                 }
-                drained.into_iter().map(|(_, _, d)| d).collect()
+                let mut rows: Vec<Vec<u8>> = drained.into_iter().map(|(_, _, d)| d).collect();
+                rows.extend(null_rows.into_iter().take(limit.saturating_sub(rows.len())));
+                rows
             }
             _ => unreachable!("type guard above restricts to Int/Float"),
         };
@@ -3862,7 +3916,7 @@ impl Engine {
         // ── Path 1: fixed-width fast patch ──────────────────────────
         let fixed_patches: Option<Vec<FastPatch>> = {
             let tbl = self.catalog.get_table(table)?;
-            let schema = &tbl.schema;
+            let schema = tbl.schema();
             let all_fixed_nonnull = resolved
                 .iter()
                 .all(|(idx, val)| is_fixed_size(schema.columns[*idx].type_id) && !val.is_empty());
@@ -3925,7 +3979,7 @@ impl Engine {
         // ── Path 2: single var-col shrink fast patch ────────────────
         let var_patch: Option<(usize, Option<Vec<u8>>)> = {
             let tbl = self.catalog.get_table(table)?;
-            let schema = &tbl.schema;
+            let schema = tbl.schema();
             let is_single = resolved.len() == 1;
             let is_var = is_single && !is_fixed_size(schema.columns[resolved[0].0].type_id);
             let no_indexed = !resolved.iter().any(|(idx, _)| tbl.has_indexed_col(*idx));
@@ -4349,9 +4403,9 @@ pub(super) fn execute_window(
                 let bv = index
                     .map(|i| rows[b][i].clone())
                     .unwrap_or_else(|| eval_expr(expr, &rows[b], &columns));
-                let cmp = av.cmp(&bv);
+                let cmp = compare_order_values(&av, &bv, desc);
                 if cmp != std::cmp::Ordering::Equal {
-                    return if desc { cmp.reverse() } else { cmp };
+                    return cmp;
                 }
             }
             std::cmp::Ordering::Equal
@@ -5964,14 +6018,12 @@ fn execute_provenance_join(
                 for (index, row) in right.rows.iter().enumerate() {
                     cancel.tick()?;
                     let key = &row[spec.right_key_idx];
-                    if !key.is_empty() {
-                        build.entry(key.clone()).or_default().push(index);
-                    }
+                    build.entry(key.clone()).or_default().push(index);
                 }
                 for (left_index, left_row) in left.rows.iter().enumerate() {
                     cancel.tick()?;
                     let key = &left_row[spec.left_key_idx];
-                    let candidates = if key.is_empty() { None } else { build.get(key) };
+                    let candidates = build.get(key);
                     let mut matched = false;
                     if let Some(candidates) = candidates {
                         for &right_index in candidates {

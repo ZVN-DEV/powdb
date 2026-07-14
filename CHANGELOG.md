@@ -7,15 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The changes below are the v0.13.0 release-candidate scope. Release verification
-is still in progress.
+v0.13.0 implementation is complete and release-candidate validation is in progress. No v0.13
+package, container, tag, or release has been published yet.
 
 ### Added
 
 - **Persistent JSON-path indexes.** Native PowQL can add, add unique, and drop
   indexes over scalar paths with `alter T add index (.data->key)`. Equality,
   range, and bounded ordered reads use the path index automatically, while
-  missing indexes retain a sequential fallback.
+  missing indexes retain a sequential fallback. SQL `CREATE INDEX` and
+  `CREATE UNIQUE INDEX` lower direct JSON `->` paths to the same index form.
 - **Expression-valued JSON operations.** JSON paths now work as group keys,
   aggregate arguments, and order keys, including path-based `HAVING`, limit,
   and offset shapes.

@@ -27,7 +27,12 @@ import {
   type WireValue,
   type WireSyncStatus,
 } from "../src/protocol.js";
-import { Client, PowDBError, isPowDBError } from "../src/index.js";
+import {
+  Client,
+  PowDBError,
+  isPowDBError,
+  type WireValue as PublicWireValue,
+} from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -282,6 +287,35 @@ async function main() {
     assert.equal(decoded.msg.type, "ResultRowsNative");
     if (decoded.msg.type === "ResultRowsNative") {
       assert.deepStrictEqual(decoded.msg.rows, [nativeValues]);
+    }
+  });
+
+  await test("public lossless cells preserve empty, string null, and raw PJ1 null", () => {
+    const values: PublicWireValue[] = [
+      { type: "empty" },
+      { type: "str", value: "null" },
+      {
+        type: "json",
+        value: null,
+        pj1: Uint8Array.from([0]),
+      },
+    ];
+    const decoded = tryDecode(
+      encode({
+        type: "ResultRowsNative",
+        columns: ["missing", "text", "json"],
+        rows: [values],
+      }),
+    );
+    assert.ok(decoded);
+    assert.equal(decoded.msg.type, "ResultRowsNative");
+    if (decoded.msg.type === "ResultRowsNative") {
+      assert.deepStrictEqual(decoded.msg.rows[0], values);
+      const json = decoded.msg.rows[0]?.[2];
+      assert.equal(json?.type, "json");
+      if (json?.type === "json") {
+        assert.deepStrictEqual(json.pj1, Uint8Array.from([0]));
+      }
     }
   });
 

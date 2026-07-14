@@ -257,11 +257,11 @@ mod tests;
 pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
-    aggregate_rows, aggregate_rows_with_provenance, cooperative_stable_sort_by, exec_group_by,
-    exec_group_by_with_provenance, execute_materialized_join, execute_window,
-    for_each_row_raw_cancellable, format_plan_tree, lower_unindexed_scans,
-    predicate_column_indices_json, range_matches, synthesize_range_predicate,
-    validate_json_path_types, validate_no_stray_aggregates,
+    aggregate_rows, aggregate_rows_with_provenance, compare_order_values,
+    cooperative_stable_sort_by, exec_group_by, exec_group_by_with_provenance,
+    execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
+    lower_unindexed_scans, predicate_column_indices_json, range_matches,
+    synthesize_range_predicate, validate_json_path_types, validate_no_stray_aggregates,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -286,6 +286,55 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::DropView(_) => false,
         Statement::Begin | Statement::Commit | Statement::Rollback => false,
         Statement::Explain(inner) => is_read_only_statement(inner),
+    }
+}
+
+/// Return whether executing this read plan would have to refresh a dirty
+/// materialized view. This is intentionally a whole-plan preflight: the server
+/// may retry only this typed condition under exclusive admission, so it must be
+/// raised before any input branch performs row work.
+fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::AliasScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => views.is_dirty(table),
+
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. } => plan_reads_dirty_view(input, views),
+
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            plan_reads_dirty_view(left, views) || plan_reads_dirty_view(right, views)
+        }
+
+        // EXPLAIN formats its input without executing it, so inspecting a plan
+        // that names a dirty view never requires a refresh.
+        PlanNode::Explain { .. }
+        | PlanNode::AlterTable { .. }
+        | PlanNode::DropTable { .. }
+        | PlanNode::Insert { .. }
+        | PlanNode::Upsert { .. }
+        | PlanNode::Update { .. }
+        | PlanNode::Delete { .. }
+        | PlanNode::CreateTable { .. }
+        | PlanNode::ListTypes
+        | PlanNode::Describe { .. }
+        | PlanNode::CreateView { .. }
+        | PlanNode::RefreshView { .. }
+        | PlanNode::DropView { .. }
+        | PlanNode::Begin
+        | PlanNode::Commit
+        | PlanNode::Rollback => false,
     }
 }
 
@@ -1049,6 +1098,15 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        // Detect every dirty materialized-view source before executing any
+        // branch of the plan. Without this preflight, a join could fully scan
+        // its clean left input before discovering a dirty right input, then
+        // repeat that work after the server upgrades to writer admission.
+        // Alias scans also need this centralized check: they do not pass
+        // through the SeqScan arm below.
+        if plan_reads_dirty_view(plan, &self.view_registry) {
+            return Err(QueryError::ReadonlyNeedsWrite);
+        }
         // Mirror the mutable path: reject a stray aggregate FunctionCall before
         // evaluating any row (see execute_plan for the rationale).
         validate_no_stray_aggregates(plan)?;
@@ -1188,9 +1246,13 @@ impl Engine {
                     .catalog
                     .get_table(table)
                     .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                let columns: Vec<String> =
-                    tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
-                let schema = tbl.schema.clone();
+                let columns: Vec<String> = tbl
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let schema = tbl.schema().clone();
 
                 let start_val = match start {
                     Some((expr, _)) => Some(literal_to_value(expr)?),
@@ -1437,7 +1499,7 @@ impl Engine {
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                    let schema = &tbl.schema;
+                    let schema = tbl.schema();
 
                     let proj_columns: Vec<String> = fields
                         .iter()
@@ -1661,12 +1723,19 @@ impl Engine {
                             .collect::<Result<_, QueryError>>()?;
                         cooperative_stable_sort_by(&mut rows, self.query_memory_limit, |a, b| {
                             for &(col_idx, expr, descending) in &key_specs {
-                                let cmp = match col_idx {
-                                    Some(index) => a[index].cmp(&b[index]),
-                                    None => eval_expr(expr, a, &columns)
-                                        .cmp(&eval_expr(expr, b, &columns)),
+                                let (left_value, right_value) = match col_idx {
+                                    Some(index) => (&a[index], &b[index]),
+                                    None => {
+                                        let left = eval_expr(expr, a, &columns);
+                                        let right = eval_expr(expr, b, &columns);
+                                        let cmp = compare_order_values(&left, &right, descending);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                        continue;
+                                    }
                                 };
-                                let cmp = if descending { cmp.reverse() } else { cmp };
+                                let cmp = compare_order_values(left_value, right_value, descending);
                                 if cmp != std::cmp::Ordering::Equal {
                                     return cmp;
                                 }

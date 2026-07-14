@@ -3,7 +3,9 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.12.0** (Native JSON: a **`json` column type** storing documents in PJ1, a canonical binary encoding built for compiled-predicate scans, plus the **`->` path operator** for extracting and filtering on nested fields in PowQL and a **`json_type()`** function distinguishing null from missing. JSON-path filters on inline documents compile to a zero-parse, zero-allocation binary walk over mapped bytes (11ms over 100K ~1KB docs on the reference workload, 2.3x the generic decode path). Documents are canonicalized (sorted keys, last-wins duplicates, 128-depth cap, 64MB value cap) and large documents spill through the 0.11 overflow machinery. The TS client typed API gains `"json"`; the wire format is unchanged (cells render as canonical JSON text). Known limits documented in docs/POWQL.md: aggregate/group/order over paths error cleanly until expression indexes land; remote `json_type()` cannot distinguish null from missing until the typed wire surface. On-disk: databases without json are byte-identical to 0.11; json files require 0.12 binaries. `@zvndev/powdb-sync` remains beta-gated and NOT published to npm.).
+> **Next release: v0.13.0 (unreleased).** Fast document reads and complete JSON querying are under final verification. Package manifests use the next version during development, but no v0.13 package, container, tag, or release is published yet.
+>
+> **Current release: v0.12.0.** Use the published v0.12 packages and container image until the v0.13 release checklist is complete.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
@@ -84,7 +86,8 @@ one-time setup and the reusable standard.
 [ ] Update inter-crate dep versions in query/sync/backup/server/powdb/cli Cargo.toml
 [ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
 [ ] Update bindings/node/package.json version (@zvndev/powdb-embedded, lockstep)
-[ ] Update CHANGELOG.md and the Current release line in RELEASES.md
+[ ] Move CHANGELOG.md notes from Unreleased to the dated version entry
+[ ] Update both the Next release and Current release lines in RELEASES.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
 [ ] Commit: "chore: release vX.Y.Z"

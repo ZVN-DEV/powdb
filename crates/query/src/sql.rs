@@ -991,6 +991,7 @@ impl SqlParser {
         self.expect_kw("on")?;
         let table = self.expect_ident("table name")?;
         self.expect_sym('(')?;
+        let expression_parenthesized = self.eat_sym('(');
         if !matches!(self.peek(), Some(SqlTok::Word(_))) {
             return Err(ParseError::Unsupported {
                 feature: "SQL expression indexes are not supported; use PowQL `alter <table> add index (.<json-column>-><path>)`"
@@ -998,6 +999,63 @@ impl SqlParser {
             });
         }
         let col = self.expect_ident("column name")?;
+        let mut path = format!(".{col}");
+        let mut has_json_path = false;
+        loop {
+            match self.peek() {
+                Some(SqlTok::Op(operator)) if operator == "->" => {
+                    self.bump();
+                    has_json_path = true;
+                    match self.bump() {
+                        Some(SqlTok::String(key)) => {
+                            path.push_str("->");
+                            path.push_str(&quote_powql_string(&key));
+                        }
+                        Some(SqlTok::Number(index))
+                            if !index.starts_with('-')
+                                && !index.contains('.')
+                                && index.parse::<u32>().is_ok() =>
+                        {
+                            path.push_str("->");
+                            path.push_str(&index);
+                        }
+                        Some(segment) => {
+                            return Err(ParseError::Unsupported {
+                                feature: format!(
+                                    "SQL JSON expression indexes require string keys or non-negative integer path segments after ->, got {}",
+                                    segment.display()
+                                ),
+                            });
+                        }
+                        None => {
+                            return Err(ParseError::UnexpectedToken {
+                                expected: "JSON path segment after ->".into(),
+                                got: "<eof>".into(),
+                            });
+                        }
+                    }
+                }
+                Some(SqlTok::Op(operator)) if operator == "->>" => {
+                    return Err(ParseError::Unsupported {
+                        feature:
+                            "SQL ->> text expressions cannot be indexed; use a direct JSON -> path"
+                                .into(),
+                    });
+                }
+                _ => break,
+            }
+        }
+        if expression_parenthesized && !has_json_path {
+            return Err(ParseError::Unsupported {
+                feature: "SQL expression indexes support only direct JSON -> paths; use a plain column without extra parentheses"
+                    .into(),
+            });
+        }
+        if expression_parenthesized && !self.eat_sym(')') {
+            return Err(ParseError::Unsupported {
+                feature: "SQL expression indexes support only direct JSON -> paths".into(),
+            });
+        }
         if !self.eat_sym(')') {
             return Err(ParseError::Unsupported {
                 feature: "SQL expression and multi-column indexes are not supported; use PowQL `alter <table> add index (.<json-column>-><path>)` for a JSON path"
@@ -1005,9 +1063,17 @@ impl SqlParser {
             });
         }
         Ok(if unique {
-            format!("alter {table} add unique .{col}")
+            if has_json_path {
+                format!("alter {table} add unique ({path})")
+            } else {
+                format!("alter {table} add unique .{col}")
+            }
         } else {
-            format!("alter {table} add index .{col}")
+            if has_json_path {
+                format!("alter {table} add index ({path})")
+            } else {
+                format!("alter {table} add index .{col}")
+            }
         })
     }
 
@@ -1440,6 +1506,7 @@ fn is_reserved_identifier(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{AlterAction, IndexTarget};
 
     #[test]
     fn json_arrows_lex_longest_token_and_lower_to_powql_paths() {
@@ -1556,11 +1623,30 @@ mod tests {
             parse_sql("CREATE INDEX post_slug ON Post (slug)").unwrap(),
             Statement::AlterTable(_)
         ));
+        for sql in [
+            "CREATE INDEX post_age ON Post ((data -> 'age'))",
+            "CREATE INDEX post_first ON Post (data -> 'scores' -> 0)",
+            "CREATE UNIQUE INDEX post_code ON Post ((data -> 'code'))",
+        ] {
+            let Statement::AlterTable(alter) = parse_sql(sql).unwrap() else {
+                panic!("expected expression-index ALTER lowering for `{sql}`");
+            };
+            let target = match alter.action {
+                AlterAction::AddIndex { target, .. } | AlterAction::AddUnique { target, .. } => {
+                    target
+                }
+                action => panic!("expected add-index action, got {action:?}"),
+            };
+            assert!(matches!(target, IndexTarget::JsonPath(_)), "{sql}");
+        }
         let error = parse_sql("CREATE INDEX post_age ON Post (data->>'age')")
-            .expect_err("SQL expression indexes remain outside the SQL subset")
+            .expect_err("SQL text extraction is not an indexable path")
             .to_string();
-        assert!(error.contains("SQL expression"));
-        assert!(error.contains("alter <table> add index"));
+        assert!(error.contains("->>"));
+        let error = parse_sql("CREATE INDEX post_age ON Post ((data + 1))")
+            .expect_err("arbitrary SQL expressions remain unsupported")
+            .to_string();
+        assert!(error.contains("only direct JSON -> paths"));
     }
 
     #[test]

@@ -26,9 +26,9 @@ fn is_paged(name: &str) -> bool {
 
 /// Take an incremental backup: copy only heap pages whose page LSN is greater
 /// than `base.source_lsn`, plus every changed non-heap file. B+tree `.idx`
-/// files are opaque whole-file artifacts and are never interpreted as heap
-/// pages. Builds on `base` (a full backup or a prior increment's effective
-/// state).
+/// and `.eidx` files are opaque whole-file artifacts and are never interpreted
+/// as heap pages. Builds on `base` (a full backup or a prior increment's
+/// effective state).
 pub fn incremental_backup(
     catalog: &mut Catalog,
     base: &BackupManifest,

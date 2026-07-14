@@ -29,9 +29,18 @@ Supported expressions include literals, column references, qualified join refere
 
 The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, SQL `BETWEEN`, and column-projected `RETURNING a, b` (only `RETURNING *` is supported, because PowQL's `returning` is all-columns). Use native PowQL for those shapes until the SQL subset is expanded.
 
-SQL expression indexes are not part of the production subset. `CREATE INDEX`
-continues to accept one stored column. Use native PowQL's
-`alter T add index (.data->path)` syntax for JSON-path indexes.
+`CREATE INDEX` and `CREATE UNIQUE INDEX` accept either one stored column or a
+direct JSON `->` path:
+
+```sql
+CREATE INDEX post_author ON Post ((data->'author'->'name'));
+CREATE UNIQUE INDEX post_external_id ON Post ((data->'externalId'));
+```
+
+The extra expression parentheses are optional for a direct path. `->>` text
+extraction, arithmetic expressions, functions, and multi-column indexes remain
+outside the production subset. Native PowQL exposes the same path-index feature
+as `alter T add index (.data->path)`.
 
 ## JSON path operators
 

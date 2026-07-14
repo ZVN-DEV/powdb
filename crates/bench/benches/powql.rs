@@ -43,9 +43,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use powdb_query::ast::Literal;
 use powdb_query::executor::Engine;
+use powdb_query::result::QueryResult;
 use powdb_storage::types::*;
 use powdb_storage::wal::WalSyncMode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Read-workload fixture size. 100K rows per PLAN-MISSION-A.md §1.
@@ -123,7 +124,6 @@ fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
         )
         .expect("create type");
 
-    let data_dir: std::path::PathBuf = tmp.path().to_path_buf();
     {
         let table = engine
             .catalog_mut()
@@ -140,10 +140,15 @@ fn setup_user_fixture_n(n: usize) -> (Engine, TempDir) {
             ];
             table.insert(&row).expect("insert row");
         }
-        table
-            .create_index_with_unique("id", &data_dir, true)
-            .expect("build id index");
     }
+    // Build through the catalog so index metadata is persisted alongside the
+    // physical tree. Transaction rollback reopens that catalog; a table-only
+    // index would disappear from metadata and invalidate the prepared handle
+    // after the first stationary iteration.
+    engine
+        .catalog_mut()
+        .create_index_unique("User", "id", true)
+        .expect("build id index");
 
     (engine, tmp)
 }
@@ -558,43 +563,85 @@ fn insert_literals(id: i64, prefix: &str) -> Vec<Literal> {
 //
 // 1000 inserts in a tight loop. This is the stress test: the one workload
 // where SQLite's prepared-statement reuse is the tightest competition. If
-// PowDB still wins here, the thesis holds even on SQL's best loop. Each
-// criterion iteration inserts 1000 new rows with fresh ids; the table grows
-// unboundedly but that's fine — 10 samples × 10 iters × 1000 rows ≈ 100K
-// extra rows, which is comfortably under the heap's capacity.
+// PowDB still wins here, the thesis holds even on SQL's best loop. Every
+// measured iteration starts from the same checkpointed 100K-row fixture,
+// inserts exactly 1000 rows inside an explicit transaction, then rolls the
+// transaction back outside the accumulated duration. This keeps both table
+// cardinality and heap/index state stationary across Criterion samples.
 
 fn bench_insert_batch_1k(c: &mut Criterion) {
+    const INSERT_TEMPLATE: &str = r#"insert User { id := 0, name := "", age := 0, status := "", email := "", created_at := 0 }"#;
     let (mut engine, _tmp) = setup_user_fixture_n(N_ROWS_WRITE);
 
-    // WS1' (stabilize insert bench): prepare once and reuse across all 1000
-    // rows, mirroring SQLite's transaction-wrapped `prepare_cached` loop. The
-    // previous loop ran full `execute_powql` per row with an in-loop
-    // `format!()` — the source of the documented ~13x run-to-run swing.
+    // ROLLBACK restores the catalog from its last checkpoint, so persist the
+    // direct fixture build before preparing or measuring anything. Without
+    // this checkpoint, rollback would correctly discard the seeded dirty
+    // heap/index pages along with the measured inserts.
+    engine
+        .catalog_mut()
+        .checkpoint()
+        .expect("checkpoint insert batch fixture");
+
+    // WS1' (stabilize insert bench): prepare once and reuse across every
+    // identical checkpointed iteration, mirroring SQLite's transaction-wrapped
+    // `prepare_cached` loop and proving row-only rollback preserves prepared
+    // metadata validity.
     let prep = engine
-        .prepare(
-            r#"insert User { id := 0, name := "", age := 0, status := "", email := "", created_at := 0 }"#,
-        )
+        .prepare(INSERT_TEMPLATE)
         .expect("prepare insert template");
 
-    // Pre-build 1000 literal sets once; the timed loop only bumps the id slot
-    // so no string allocation happens under measurement.
-    let mut batch: Vec<Vec<Literal>> = (0..1000_i64).map(|i| insert_literals(i, "b")).collect();
+    // Pre-build one fixed 1000-row batch above the fixture's key range. Each
+    // rollback removes it, so the same literals can be reused without any
+    // mutation or allocation under measurement.
+    let batch: Vec<Vec<Literal>> = (N_ROWS_WRITE as i64..N_ROWS_WRITE as i64 + 1000)
+        .map(|id| insert_literals(id, "b"))
+        .collect();
 
-    // Anchor the counter well above the fixture so ids never collide with
-    // the seeded rows even across the entire sample run.
-    let mut base_id: i64 = (N_ROWS_WRITE as i64) * 10;
+    assert_user_count(&mut engine, N_ROWS_WRITE);
 
     c.bench_function("insert_batch_1k", |b| {
-        b.iter(|| {
-            let start_id = base_id;
-            base_id += 1000;
-            for (offset, lits) in batch.iter_mut().enumerate() {
-                lits[0] = Literal::Int(start_id + offset as i64);
-                let _ = engine.execute_prepared(&prep, lits).expect("insert failed");
+        b.iter_custom(|iters| {
+            let mut measured = Duration::ZERO;
+            for _ in 0..iters {
+                engine
+                    .execute_powql("begin")
+                    .expect("begin insert batch transaction");
+
+                let started = Instant::now();
+                for lits in &batch {
+                    black_box(engine.execute_prepared(&prep, lits).expect("insert failed"));
+                }
+                measured += started.elapsed();
+
+                // Prove the timed body performed the full batch before the
+                // reset. Both count checks are outside the accumulated time.
+                assert_user_count(&mut engine, N_ROWS_WRITE + batch.len());
+
+                // Reset work is deliberately outside `measured`. ROLLBACK
+                // discards the dirty heap and index pages and reopens the
+                // checkpointed catalog, giving the next measured iteration
+                // the identical 100K-row starting state.
+                engine
+                    .execute_powql("rollback")
+                    .expect("rollback insert batch transaction");
+                assert_user_count(&mut engine, N_ROWS_WRITE);
             }
-            black_box(base_id)
+            measured
         });
     });
+}
+
+/// Benchmark invariant for stationary write workloads. `count(User)` reads
+/// the heap's live-row header, so this is a cheap untimed check that catches a
+/// failed or incomplete reset immediately instead of silently biasing later
+/// Criterion samples.
+fn assert_user_count(engine: &mut Engine, expected: usize) {
+    match engine.execute_powql("count(User)") {
+        Ok(QueryResult::Scalar(Value::Int(actual))) => {
+            assert_eq!(actual, expected as i64, "insert batch fixture drifted")
+        }
+        other => panic!("count(User) returned an unexpected result: {other:?}"),
+    }
 }
 
 // ───── Workload 13. update_by_pk ───────────────────────────────────────────

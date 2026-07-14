@@ -1,5 +1,5 @@
 use crate::btree::BTree;
-use crate::catalog::ExpressionIndexMeta;
+use crate::catalog::{expression_index_file_name, ExpressionIndexMeta};
 use crate::error::StorageError;
 use crate::heap::HeapFile;
 use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
@@ -65,7 +65,7 @@ pub(crate) struct ExpressionIndexedPath {
 /// rows through `insert`/`update` reuse the same allocation across calls,
 /// cutting the allocator traffic to ~zero after the first row.
 pub struct Table {
-    pub schema: Schema,
+    pub(crate) schema: Schema,
     pub heap: HeapFile,
     /// Reusable scratch buffer for row encoding. Cleared on every call.
     encode_scratch: Vec<u8>,
@@ -258,22 +258,30 @@ impl Table {
                         "expression index root column is absent",
                     )
                 })?;
-            let idx_path = data_dir.join(format!(
-                "{}_idx_{}.idx",
-                table.schema.table_name, meta.index_id
+            let idx_path = data_dir.join(expression_index_file_name(
+                &table.schema.table_name,
+                meta.index_id,
             ));
-            let btree = BTree::load(&idx_path)?;
-            if btree.format_version() != crate::btree::BTREE_VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expression index requires BIDX v2",
-                ));
+            if idx_path.exists() {
+                let btree = BTree::load(&idx_path)?;
+                if btree.format_version() != crate::btree::BTREE_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expression index requires BIDX v2",
+                    ));
+                }
+                table.expression_indexes.push(ExpressionIndexedPath {
+                    meta: meta.clone(),
+                    root_col_idx,
+                    btree,
+                });
+            } else {
+                // Expression indexes were not released before the dedicated
+                // `.eidx` namespace. Rebuild any missing artifact from the
+                // heap instead of probing or deleting an ambiguous legacy
+                // `.idx` pathname that may belong to a live column index.
+                table.install_expression_index(meta.clone(), &idx_path)?;
             }
-            table.expression_indexes.push(ExpressionIndexedPath {
-                meta: meta.clone(),
-                root_col_idx,
-                btree,
-            });
         }
 
         Ok(table)
@@ -404,7 +412,7 @@ impl Table {
         Ok(())
     }
 
-    pub(crate) fn preflight_insert(&self, values: &Row) -> io::Result<Vec<Value>> {
+    pub(crate) fn preflight_insert(&self, values: &Row) -> io::Result<Option<Vec<Value>>> {
         for entry in &self.indexed_cols {
             if !entry.unique {
                 continue;
@@ -420,6 +428,13 @@ impl Table {
                 ));
             }
         }
+        // Keep the overwhelmingly common column-only table on the legacy
+        // insert shape. In particular, avoid constructing an expression-key
+        // result and entering a second maintenance loop for every row when no
+        // expression index exists.
+        if self.expression_indexes.is_empty() {
+            return Ok(None);
+        }
         let keys = self.expression_keys(values)?;
         for (index, key) in self.expression_indexes.iter().zip(&keys) {
             if index.meta.unique && !key.is_empty() && index.btree.lookup(key).is_some() {
@@ -429,7 +444,7 @@ impl Table {
                 ));
             }
         }
-        Ok(keys)
+        Ok(Some(keys))
     }
 
     pub(crate) fn preflight_update(&self, rid: RowId, values: &Row) -> io::Result<()> {
@@ -614,8 +629,15 @@ impl Table {
 
     /// Recalculate the cached row layout from the current schema. Must be
     /// called after any schema mutation (add/drop column).
-    pub fn refresh_layout(&mut self) {
+    pub(crate) fn refresh_layout(&mut self) {
         self.row_layout = RowLayout::new(&self.schema);
+    }
+
+    /// Return the table schema without exposing structural mutation.
+    /// Schema changes are catalog-owned so prepared-query metadata is
+    /// invalidated whenever column layout or table identity changes.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
     }
 
     /// Rewrite every live heap row to match a new schema shape.
@@ -879,7 +901,9 @@ impl Table {
             );
             let rid = self.heap.insert(&self.encode_scratch)?;
             self.maintain_indexes_on_insert(values, rid);
-            self.maintain_expression_indexes_on_insert(&expression_keys, rid);
+            if let Some(expression_keys) = expression_keys.as_deref() {
+                self.maintain_expression_indexes_on_insert(expression_keys, rid);
+            }
             return Ok(rid);
         }
         // Otherwise spill the largest var values out of line and store a v2
@@ -889,7 +913,9 @@ impl Table {
         let encoded = self.encode_row_spilling(values)?;
         let rid = self.heap.insert(&encoded)?;
         self.maintain_indexes_on_insert(values, rid);
-        self.maintain_expression_indexes_on_insert(&expression_keys, rid);
+        if let Some(expression_keys) = expression_keys.as_deref() {
+            self.maintain_expression_indexes_on_insert(expression_keys, rid);
+        }
         Ok(rid)
     }
 
@@ -1032,7 +1058,9 @@ impl Table {
         let expression_keys = self.preflight_insert(values)?;
         let rid = self.heap.insert(encoded)?;
         self.maintain_indexes_on_insert(values, rid);
-        self.maintain_expression_indexes_on_insert(&expression_keys, rid);
+        if let Some(expression_keys) = expression_keys.as_deref() {
+            self.maintain_expression_indexes_on_insert(expression_keys, rid);
+        }
         Ok(rid)
     }
 

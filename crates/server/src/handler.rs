@@ -69,6 +69,13 @@ impl TxGate {
     ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.semaphore.acquire_many_owned(permits).await
     }
+
+    fn try_acquire_many_owned(
+        self,
+        permits: u32,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        self.semaphore.try_acquire_many_owned(permits)
+    }
 }
 
 /// Maximum query text length accepted from the wire (1 MB).
@@ -480,9 +487,25 @@ fn dispatch_query(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
     principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
 ) -> DispatchOutcome {
     let stmt_result = parser::parse(query).map_err(|e| e.to_string());
+    dispatch_query_parsed(
+        engine,
+        query,
+        &stmt_result,
+        principal,
+        allow_readonly_escalation,
+    )
+}
 
+fn dispatch_query_parsed(
+    engine: &Arc<RwLock<Engine>>,
+    query: &str,
+    stmt_result: &Result<powdb_query::ast::Statement, String>,
+    principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
+) -> DispatchOutcome {
     // Role enforcement happens on the parsed AST. Statements that fail to
     // parse fall through — the engine returns the parse error itself and
     // can never execute anything for them.
@@ -509,14 +532,18 @@ fn dispatch_query(
         match res {
             Ok(r) => return (Ok(r), None),
             Err(QueryError::ReadonlyNeedsWrite) => {
-                // Escalate: fall through to the write path below.
+                if !allow_readonly_escalation {
+                    return (Err(QueryError::ReadonlyNeedsWrite), None);
+                }
+                // The caller already owns writer admission, so it is safe to
+                // fall through and retry under the engine write lock.
             }
             Err(e) => return (Err(e), None),
         }
     }
 
     if matches!(
-        parsed_transaction_control(&stmt_result),
+        parsed_transaction_control(stmt_result),
         Some(TransactionControl::Rollback)
     ) {
         let mut eng = match engine.write() {
@@ -533,13 +560,30 @@ fn dispatch_query(
     execute_write_deferred(engine, |eng| eng.execute_powql(query))
 }
 
+#[cfg(test)]
 fn dispatch_sql_query(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
     principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
 ) -> DispatchOutcome {
     let stmt_result = sql::parse_sql(query).map_err(|e| e.to_string());
+    dispatch_sql_query_parsed(
+        engine,
+        query,
+        &stmt_result,
+        principal,
+        allow_readonly_escalation,
+    )
+}
 
+fn dispatch_sql_query_parsed(
+    engine: &Arc<RwLock<Engine>>,
+    query: &str,
+    stmt_result: &Result<powdb_query::ast::Statement, String>,
+    principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
+) -> DispatchOutcome {
     if let Ok(stmt) = &stmt_result {
         if let Err(e) = check_statement_permitted(principal, stmt) {
             return (Err(e), None);
@@ -562,13 +606,17 @@ fn dispatch_sql_query(
         };
         match res {
             Ok(r) => return (Ok(r), None),
-            Err(QueryError::ReadonlyNeedsWrite) => {}
+            Err(QueryError::ReadonlyNeedsWrite) => {
+                if !allow_readonly_escalation {
+                    return (Err(QueryError::ReadonlyNeedsWrite), None);
+                }
+            }
             Err(e) => return (Err(e), None),
         }
     }
 
     if matches!(
-        parsed_transaction_control(&stmt_result),
+        parsed_transaction_control(stmt_result),
         Some(TransactionControl::Rollback)
     ) {
         let mut eng = match engine.write() {
@@ -630,18 +678,21 @@ fn statement_admission(stmt: &powdb_query::ast::Statement) -> AdmissionMode {
     }
 }
 
+#[cfg(test)]
 fn classify_query_admission(query: &str) -> AdmissionMode {
     parser::parse(query)
         .map(|stmt| statement_admission(&stmt))
         .unwrap_or(AdmissionMode::Writer)
 }
 
+#[cfg(test)]
 fn classify_sql_admission(query: &str) -> AdmissionMode {
     sql::parse_sql(query)
         .map(|stmt| statement_admission(&stmt))
         .unwrap_or(AdmissionMode::Writer)
 }
 
+#[cfg(test)]
 fn classify_params_admission(query: &str, params: &[WireParam]) -> AdmissionMode {
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
     parser::parse_with_params(query, &bound)
@@ -659,28 +710,6 @@ fn transaction_control(stmt: &powdb_query::ast::Statement) -> Option<Transaction
     }
 }
 
-fn classify_query_transaction_control(query: &str) -> Option<TransactionControl> {
-    parser::parse(query)
-        .ok()
-        .and_then(|stmt| transaction_control(&stmt))
-}
-
-fn classify_sql_transaction_control(query: &str) -> Option<TransactionControl> {
-    sql::parse_sql(query)
-        .ok()
-        .and_then(|stmt| transaction_control(&stmt))
-}
-
-fn classify_params_transaction_control(
-    query: &str,
-    params: &[WireParam],
-) -> Option<TransactionControl> {
-    let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
-    parser::parse_with_params(query, &bound)
-        .ok()
-        .and_then(|stmt| transaction_control(&stmt))
-}
-
 fn parsed_transaction_control(
     stmt_result: &Result<powdb_query::ast::Statement, String>,
 ) -> Option<TransactionControl> {
@@ -693,18 +722,37 @@ fn execute_rollback_preserving_sync_if_needed(
     engine.rollback_transaction_preserving_wal_archive()
 }
 
+#[cfg(test)]
 fn dispatch_query_with_params(
     engine: &Arc<RwLock<Engine>>,
     query: &str,
     params: &[WireParam],
     principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
 ) -> DispatchOutcome {
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
 
     // Parse once (with params bound) so role enforcement and read/write
     // classification see exactly the statement that will execute.
     let stmt_result = parser::parse_with_params(query, &bound).map_err(|e| e.to_string());
+    dispatch_query_with_bound_params_parsed(
+        engine,
+        query,
+        &bound,
+        &stmt_result,
+        principal,
+        allow_readonly_escalation,
+    )
+}
 
+fn dispatch_query_with_bound_params_parsed(
+    engine: &Arc<RwLock<Engine>>,
+    query: &str,
+    bound: &[powdb_query::ast::ParamValue],
+    stmt_result: &Result<powdb_query::ast::Statement, String>,
+    principal: Option<&Principal>,
+    allow_readonly_escalation: bool,
+) -> DispatchOutcome {
     if let Ok(stmt) = &stmt_result {
         if let Err(e) = check_statement_permitted(principal, stmt) {
             return (Err(e), None);
@@ -723,19 +771,21 @@ fn dispatch_query_with_params(
                     )
                 }
             };
-            eng.execute_powql_readonly_with_params(query, &bound)
+            eng.execute_powql_readonly_with_params(query, bound)
         };
         match res {
             Ok(r) => return (Ok(r), None),
             Err(QueryError::ReadonlyNeedsWrite) => {
-                // Escalate to the write path below.
+                if !allow_readonly_escalation {
+                    return (Err(QueryError::ReadonlyNeedsWrite), None);
+                }
             }
             Err(e) => return (Err(e), None),
         }
     }
 
     if matches!(
-        parsed_transaction_control(&stmt_result),
+        parsed_transaction_control(stmt_result),
         Some(TransactionControl::Rollback)
     ) {
         let mut eng = match engine.write() {
@@ -749,7 +799,7 @@ fn dispatch_query_with_params(
         };
         return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
-    execute_write_deferred(engine, |eng| eng.execute_powql_with_params(query, &bound))
+    execute_write_deferred(engine, |eng| eng.execute_powql_with_params(query, bound))
 }
 
 #[derive(Debug, Clone)]
@@ -1666,10 +1716,21 @@ async fn acquire_autocommit_permit(
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> Result<OwnedSemaphorePermit, Message> {
-    let acquire = tx_gate.clone().acquire_many_owned(match admission {
+    let permits = match admission {
         AdmissionMode::Reader => 1,
         AdmissionMode::Writer => tx_gate.permit_count(),
-    });
+    };
+
+    // The uncontended path is overwhelmingly common for autocommit work.
+    // Avoid constructing and polling a timeout-wrapped semaphore future when
+    // the permits are already available. If a reader or writer is queued, the
+    // try-acquire fails and we fall back to Tokio's fair semaphore queue, so a
+    // waiting writer still cannot be bypassed by later readers.
+    if let Ok(permit) = tx_gate.clone().try_acquire_many_owned(permits) {
+        return Ok(permit);
+    }
+
+    let acquire = tx_gate.clone().acquire_many_owned(permits);
     match tokio::time::timeout(tx_wait_timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(Message::Error {
@@ -1714,7 +1775,14 @@ async fn execute_wire_query<R>(
 where
     R: AsyncRead + Unpin,
 {
-    match classify_query_transaction_control(&query) {
+    let query_deadline = Instant::now() + query_timeout;
+    // Parse each frame once for transaction routing, admission, and role
+    // enforcement. The engine still canonicalizes/parses as needed for plan
+    // cache execution, but the server no longer repeats the same parse in
+    // three separate routing helpers before reaching it.
+    let stmt_result = parser::parse(&query).map_err(|e| e.to_string());
+    let parsed_query = Arc::new((query, stmt_result));
+    match parsed_transaction_control(&parsed_query.1) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
                 return (
@@ -1731,17 +1799,26 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let (response, ticket, termination) = run_blocking_query(
+            let (response, ticket, termination, _) = run_blocking_query(
                 engine,
-                query,
+                Arc::clone(&parsed_query),
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_success_response(&response) {
@@ -1765,17 +1842,26 @@ where
             } else {
                 None
             };
-            let (response, ticket, mut termination) = run_blocking_query(
+            let (response, ticket, mut termination, _) = run_blocking_query(
                 engine.clone(),
-                query,
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_success_response(&response) {
@@ -1794,25 +1880,38 @@ where
         None if tx_permit.is_some() => {
             let mut out = run_blocking_query(
                 engine.clone(),
-                query,
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_query_cancellation_response(&out.0) {
                 rollback_connection_transaction(engine, principal, tx_permit).await;
                 out.2 = Some(ConnectionTermination::Closed);
             }
-            out
+            (out.0, out.1, out.2)
         }
         None => {
-            let admission = classify_query_admission(&query);
+            let admission = parsed_query
+                .1
+                .as_ref()
+                .map(statement_admission)
+                .unwrap_or(AdmissionMode::Writer);
             let permit = match acquire_autocommit_permit(
                 &tx_gate,
                 admission,
@@ -1824,21 +1923,73 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let out = run_blocking_query(
+            // The parsed AST can be large. Share the first parse with the
+            // rare dirty-view retry instead of cloning it on every successful
+            // autocommit read.
+            let retry_engine = Arc::clone(&engine);
+            let retry_parsed_query = Arc::clone(&parsed_query);
+            let retry_principal = principal.clone();
+            let allow_readonly_escalation = admission == AdmissionMode::Writer;
+            let mut out = run_blocking_query(
                 engine,
-                query,
+                parsed_query,
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
+                move |engine, parsed_query, principal| {
+                    dispatch_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        allow_readonly_escalation,
+                    )
+                },
             )
             .await;
             drop(permit);
-            out
+            if out.3 {
+                let writer_permit = match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(response) => return (response, None, None),
+                };
+                out = run_blocking_query(
+                    retry_engine,
+                    retry_parsed_query,
+                    retry_principal,
+                    result_mode,
+                    query_timeout,
+                    query_deadline,
+                    metrics,
+                    reader,
+                    wire_read_buffer,
+                    pending_messages,
+                    |engine, parsed_query, principal| {
+                        dispatch_query_parsed(
+                            &engine,
+                            &parsed_query.0,
+                            &parsed_query.1,
+                            principal.as_ref(),
+                            true,
+                        )
+                    },
+                )
+                .await;
+                drop(writer_permit);
+            }
+            (out.0, out.1, out.2)
         }
     }
 }
@@ -1865,7 +2016,10 @@ async fn execute_wire_query_sql<R>(
 where
     R: AsyncRead + Unpin,
 {
-    match classify_sql_transaction_control(&query) {
+    let query_deadline = Instant::now() + query_timeout;
+    let stmt_result = sql::parse_sql(&query).map_err(|e| e.to_string());
+    let parsed_query = Arc::new((query, stmt_result));
+    match parsed_transaction_control(&parsed_query.1) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
                 return (
@@ -1882,17 +2036,26 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let (response, ticket, termination) = run_blocking_query(
+            let (response, ticket, termination, _) = run_blocking_query(
                 engine,
-                query,
+                Arc::clone(&parsed_query),
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_sql_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_success_response(&response) {
@@ -1916,17 +2079,26 @@ where
             } else {
                 None
             };
-            let (response, ticket, mut termination) = run_blocking_query(
+            let (response, ticket, mut termination, _) = run_blocking_query(
                 engine.clone(),
-                query,
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_sql_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_success_response(&response) {
@@ -1943,25 +2115,38 @@ where
         None if tx_permit.is_some() => {
             let mut out = run_blocking_query(
                 engine.clone(),
-                query,
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
+                |engine, parsed_query, principal| {
+                    dispatch_sql_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        true,
+                    )
+                },
             )
             .await;
             if is_query_cancellation_response(&out.0) {
                 rollback_connection_transaction(engine, principal, tx_permit).await;
                 out.2 = Some(ConnectionTermination::Closed);
             }
-            out
+            (out.0, out.1, out.2)
         }
         None => {
-            let admission = classify_sql_admission(&query);
+            let admission = parsed_query
+                .1
+                .as_ref()
+                .map(statement_admission)
+                .unwrap_or(AdmissionMode::Writer);
             let permit = match acquire_autocommit_permit(
                 &tx_gate,
                 admission,
@@ -1973,21 +2158,70 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let out = run_blocking_query(
+            let retry_engine = Arc::clone(&engine);
+            let retry_parsed_query = Arc::clone(&parsed_query);
+            let retry_principal = principal.clone();
+            let allow_readonly_escalation = admission == AdmissionMode::Writer;
+            let mut out = run_blocking_query(
                 engine,
-                query,
+                parsed_query,
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
+                move |engine, parsed_query, principal| {
+                    dispatch_sql_query_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        principal.as_ref(),
+                        allow_readonly_escalation,
+                    )
+                },
             )
             .await;
             drop(permit);
-            out
+            if out.3 {
+                let writer_permit = match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(response) => return (response, None, None),
+                };
+                out = run_blocking_query(
+                    retry_engine,
+                    retry_parsed_query,
+                    retry_principal,
+                    result_mode,
+                    query_timeout,
+                    query_deadline,
+                    metrics,
+                    reader,
+                    wire_read_buffer,
+                    pending_messages,
+                    |engine, parsed_query, principal| {
+                        dispatch_sql_query_parsed(
+                            &engine,
+                            &parsed_query.0,
+                            &parsed_query.1,
+                            principal.as_ref(),
+                            true,
+                        )
+                    },
+                )
+                .await;
+                drop(writer_permit);
+            }
+            (out.0, out.1, out.2)
         }
     }
 }
@@ -2018,7 +2252,11 @@ async fn execute_wire_query_with_params<R>(
 where
     R: AsyncRead + Unpin,
 {
-    match classify_params_transaction_control(&query, &params) {
+    let query_deadline = Instant::now() + query_timeout;
+    let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
+    let stmt_result = parser::parse_with_params(&query, &bound).map_err(|e| e.to_string());
+    let parsed_query = Arc::new((query, bound, stmt_result));
+    match parsed_transaction_control(&parsed_query.2) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
                 return (
@@ -2035,18 +2273,26 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let (response, ticket, termination) = run_blocking_query(
+            let (response, ticket, termination, _) = run_blocking_query(
                 engine,
-                (query, params),
+                Arc::clone(&parsed_query),
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, (query, params), principal| {
-                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                move |engine, parsed_query, principal| {
+                    dispatch_query_with_bound_params_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        &parsed_query.2,
+                        principal.as_ref(),
+                        true,
+                    )
                 },
             )
             .await;
@@ -2071,18 +2317,26 @@ where
             } else {
                 None
             };
-            let (response, ticket, mut termination) = run_blocking_query(
+            let (response, ticket, mut termination, _) = run_blocking_query(
                 engine.clone(),
-                (query, params),
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, (query, params), principal| {
-                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                |engine, parsed_query, principal| {
+                    dispatch_query_with_bound_params_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        &parsed_query.2,
+                        principal.as_ref(),
+                        true,
+                    )
                 },
             )
             .await;
@@ -2100,16 +2354,24 @@ where
         None if tx_permit.is_some() => {
             let mut out = run_blocking_query(
                 engine.clone(),
-                (query, params),
+                Arc::clone(&parsed_query),
                 principal.clone(),
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, (query, params), principal| {
-                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                |engine, parsed_query, principal| {
+                    dispatch_query_with_bound_params_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        &parsed_query.2,
+                        principal.as_ref(),
+                        true,
+                    )
                 },
             )
             .await;
@@ -2117,10 +2379,14 @@ where
                 rollback_connection_transaction(engine, principal, tx_permit).await;
                 out.2 = Some(ConnectionTermination::Closed);
             }
-            out
+            (out.0, out.1, out.2)
         }
         None => {
-            let admission = classify_params_admission(&query, &params);
+            let admission = parsed_query
+                .2
+                .as_ref()
+                .map(statement_admission)
+                .unwrap_or(AdmissionMode::Writer);
             let permit = match acquire_autocommit_permit(
                 &tx_gate,
                 admission,
@@ -2132,23 +2398,72 @@ where
                 Ok(permit) => permit,
                 Err(response) => return (response, None, None),
             };
-            let out = run_blocking_query(
+            let retry_engine = Arc::clone(&engine);
+            let retry_parsed_query = Arc::clone(&parsed_query);
+            let retry_principal = principal.clone();
+            let allow_readonly_escalation = admission == AdmissionMode::Writer;
+            let mut out = run_blocking_query(
                 engine,
-                (query, params),
+                parsed_query,
                 principal,
                 result_mode,
                 query_timeout,
+                query_deadline,
                 metrics,
                 reader,
                 wire_read_buffer,
                 pending_messages,
-                |engine, (query, params), principal| {
-                    dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
+                move |engine, parsed_query, principal| {
+                    dispatch_query_with_bound_params_parsed(
+                        &engine,
+                        &parsed_query.0,
+                        &parsed_query.1,
+                        &parsed_query.2,
+                        principal.as_ref(),
+                        allow_readonly_escalation,
+                    )
                 },
             )
             .await;
             drop(permit);
-            out
+            if out.3 {
+                let writer_permit = match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(response) => return (response, None, None),
+                };
+                out = run_blocking_query(
+                    retry_engine,
+                    retry_parsed_query,
+                    retry_principal,
+                    result_mode,
+                    query_timeout,
+                    query_deadline,
+                    metrics,
+                    reader,
+                    wire_read_buffer,
+                    pending_messages,
+                    |engine, parsed_query, principal| {
+                        dispatch_query_with_bound_params_parsed(
+                            &engine,
+                            &parsed_query.0,
+                            &parsed_query.1,
+                            &parsed_query.2,
+                            principal.as_ref(),
+                            true,
+                        )
+                    },
+                )
+                .await;
+                drop(writer_permit);
+            }
+            (out.0, out.1, out.2)
         }
     }
 }
@@ -2173,6 +2488,7 @@ async fn run_blocking_query<T, F, R>(
     principal: Option<Principal>,
     result_mode: WireResultMode,
     query_timeout: Duration,
+    query_deadline: Instant,
     metrics: &Arc<Metrics>,
     reader: &mut BufReader<R>,
     wire_read_buffer: &mut Vec<u8>,
@@ -2182,6 +2498,7 @@ async fn run_blocking_query<T, F, R>(
     Message,
     Option<PendingDurability>,
     Option<ConnectionTermination>,
+    bool,
 )
 where
     T: Send + 'static,
@@ -2200,7 +2517,7 @@ where
     // completion while it held the engine lock / tx-gate permit).
     let timeout_ms = query_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
     let cancel = Arc::new(powdb_query::cancel::ExecCancel::with_deadline(
-        Instant::now() + query_timeout,
+        query_deadline,
         timeout_ms,
     ));
     let cancel_task = Arc::clone(&cancel);
@@ -2210,7 +2527,7 @@ where
     });
     let mut exceeded_timeout = false;
     let mut termination = None;
-    let timeout = tokio::time::sleep(query_timeout);
+    let timeout = tokio::time::sleep(query_deadline.saturating_duration_since(Instant::now()));
     tokio::pin!(timeout);
     let join_result = loop {
         tokio::select! {
@@ -2267,17 +2584,39 @@ where
         }
     };
 
-    let (message, ticket, outcome) = match join_result {
+    let (message, ticket, outcome, readonly_needs_write) = match join_result {
         Ok((Ok(result), ticket)) => match query_result_to_message(result, result_mode) {
-            Ok(message) => (message, ticket, QueryOutcome::Ok),
+            Ok(message) => (message, ticket, QueryOutcome::Ok, false),
             Err(e) => (
                 Message::Error {
                     message: sanitize_error(&e.to_string()),
                 },
                 ticket,
                 QueryOutcome::Error,
+                false,
             ),
         },
+        Ok((Err(QueryError::ReadonlyNeedsWrite), ticket)) => {
+            if exceeded_timeout {
+                (
+                    Message::Error {
+                        message: sanitize_error(&QueryError::Timeout { timeout_ms }.to_string()),
+                    },
+                    ticket,
+                    QueryOutcome::Timeout,
+                    true,
+                )
+            } else {
+                (
+                    Message::Error {
+                        message: "query execution error".into(),
+                    },
+                    ticket,
+                    QueryOutcome::Error,
+                    true,
+                )
+            }
+        }
         Ok((Err(e), ticket)) => {
             // A deadline-driven cancellation returns Timeout even when the async
             // timeout arm has not fired yet (the executor self-cancels): treat it
@@ -2298,6 +2637,7 @@ where
                 },
                 ticket,
                 outcome,
+                false,
             )
         }
         Err(e) => (
@@ -2306,8 +2646,10 @@ where
             },
             None,
             QueryOutcome::Error,
+            false,
         ),
     };
+    let readonly_retry = readonly_needs_write && !exceeded_timeout && termination.is_none();
     match ticket {
         // The statement's durability (and thus its true outcome and the
         // latency the client observes) settles at batch end — defer the
@@ -2324,14 +2666,17 @@ where
                 },
             )),
             termination,
+            readonly_retry,
         ),
         None => {
-            if exceeded_timeout {
-                metrics.record_query(start.elapsed(), QueryOutcome::Timeout);
-            } else {
-                metrics.record_query(start.elapsed(), outcome);
+            if !readonly_retry {
+                if exceeded_timeout {
+                    metrics.record_query(start.elapsed(), QueryOutcome::Timeout);
+                } else {
+                    metrics.record_query(start.elapsed(), outcome);
+                }
             }
-            (message, None, termination)
+            (message, None, termination, readonly_retry)
         }
     }
 }
@@ -2364,7 +2709,7 @@ fn is_success_response(msg: &Message) -> bool {
 }
 
 fn rollback_open_transaction(engine: Arc<RwLock<Engine>>, principal: Option<Principal>) {
-    let (res, ticket) = dispatch_query(&engine, "rollback", principal.as_ref());
+    let (res, ticket) = dispatch_query(&engine, "rollback", principal.as_ref(), true);
     let _ = res;
     // Rollback takes the sync-preserving path (no ticket), but settle one
     // defensively if it ever appears so the durability watermark stays honest.
@@ -3729,6 +4074,159 @@ mod tests {
             .expect("late reader must eventually acquire")
             .expect("late reader task")
             .expect("late reader admission");
+    }
+
+    fn dirty_view_engine() -> (tempfile::TempDir, Arc<RwLock<Engine>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type Source { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert Source { id := 1 }").unwrap();
+        engine
+            .execute_powql("materialize Snapshot as Source")
+            .unwrap();
+        engine.execute_powql("insert Source { id := 2 }").unwrap();
+        (dir, Arc::new(RwLock::new(engine)))
+    }
+
+    #[test]
+    fn dirty_view_requests_explicit_escalation_on_every_frontend() {
+        let (_dir, engine) = dirty_view_engine();
+
+        assert!(matches!(
+            dispatch_query(&engine, "Snapshot", None, false).0,
+            Err(QueryError::ReadonlyNeedsWrite)
+        ));
+        assert!(matches!(
+            dispatch_sql_query(&engine, "SELECT * FROM Snapshot", None, false).0,
+            Err(QueryError::ReadonlyNeedsWrite)
+        ));
+        assert!(matches!(
+            dispatch_query_with_params(
+                &engine,
+                "Snapshot filter .id = $1",
+                &[WireParam::Int(1)],
+                None,
+                false,
+            )
+            .0,
+            Err(QueryError::ReadonlyNeedsWrite)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dirty_view_upgrade_waits_for_held_reader_then_records_once() {
+        let (_dir, engine) = dirty_view_engine();
+        let gate = new_tx_gate_with_permits(2);
+        let metrics = Arc::new(Metrics::new());
+        let held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+
+        // Keep the peer open so the query monitor waits instead of treating
+        // EOF as a client disconnect while the admission upgrade is blocked.
+        let (_client, server) = tokio::io::duplex(1024);
+        let task_gate = gate.clone();
+        let task_metrics = metrics.clone();
+        let mut task = tokio::spawn(async move {
+            let mut reader = BufReader::new(server);
+            let mut wire_read_buffer = Vec::new();
+            let mut pending_messages = InFlightReadAhead::default();
+            let mut tx_permit = None;
+            execute_wire_query(
+                engine,
+                task_gate,
+                &mut tx_permit,
+                "Snapshot".into(),
+                WireResultMode::Native,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                &task_metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "dirty-view retry must wait for exclusive admission while another reader is held"
+        );
+        drop(held_reader);
+
+        let (message, ticket, termination) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("upgrade must finish after the held reader releases")
+            .expect("query task");
+        assert!(matches!(message, Message::ResultRowsNative { .. }));
+        assert!(termination.is_none());
+
+        let (ticket, metric) = ticket.expect("view refresh must defer its WAL metric");
+        drop(ticket);
+        metrics.record_query(metric.start.elapsed(), metric.outcome);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("powdb_queries_total{result=\"ok\"} 1"));
+        assert!(rendered.contains("powdb_queries_total{result=\"error\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_readonly_escalation_is_not_retried_or_reported_as_generic_error() {
+        let (_dir, engine) = dirty_view_engine();
+        let metrics = Arc::new(Metrics::new());
+        // Keep the peer open so the socket monitor does not turn this into a
+        // disconnect before the deadline fires.
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let query_timeout = Duration::from_millis(20);
+        let query_deadline = Instant::now() + query_timeout;
+
+        let (message, ticket, termination, retry) = run_blocking_query(
+            engine,
+            (),
+            None,
+            WireResultMode::Native,
+            query_timeout,
+            query_deadline,
+            &metrics,
+            &mut reader,
+            &mut wire_read_buffer,
+            &mut pending_messages,
+            |_engine, (), _principal| {
+                // Ignore the token deliberately: this reproduces the race in
+                // which the async deadline wins but the joined task's final
+                // result is the internal dirty-view escalation sentinel.
+                std::thread::sleep(Duration::from_millis(50));
+                (Err(QueryError::ReadonlyNeedsWrite), None)
+            },
+        )
+        .await;
+
+        assert!(ticket.is_none());
+        assert!(termination.is_none());
+        assert!(!retry, "a timed-out query must never be resurrected");
+        match message {
+            Message::Error { message } => assert!(
+                message.contains("query timeout after 20ms"),
+                "timeout must remain client-visible, got {message}"
+            ),
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+        let rendered = metrics.render();
+        assert!(rendered.contains("powdb_query_timeouts_total 1"));
+        assert!(rendered.contains("powdb_queries_total{result=\"error\"} 1"));
     }
 
     #[test]

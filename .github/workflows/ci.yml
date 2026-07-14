@@ -534,6 +534,8 @@ jobs:
           fetch-depth: 0
 
       - name: Fail on tracked internal-only content
+        env:
+          PUBLICATION_DENYLIST_REGEX: ${{ secrets.PUBLICATION_DENYLIST_REGEX }}
         run: |
           set -uo pipefail
           fail=0
@@ -546,16 +548,15 @@ jobs:
             fail=1
           fi
 
-          # (2) No tracked doc/source may name an internal product codename.
-          # NOTE: git grep -P (PCRE) is required here. The ERE engine (-E)
-          # silently ignores \b word boundaries and would never match, giving a
-          # false pass. The trailing grep -v drops legitimate look-alikes
-          # (capability, capacity, capture, escape, toaster, coast).
-          names="$(git grep -niP '\b(capa|batadb|batadata|turbine|turbodb|casa[ -]?design|parcelle|bevrly)\b' -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' | grep -vEi 'capabilit|capacit|capture|escape|toaster|coast' || true)"
-          if [ -n "$names" ]; then
-            echo "::error::Internal codename(s) found in public files. De-identify to neutral wording:"
-            echo "$names"
-            fail=1
+          # (2) Optionally apply the private publication denylist without
+          # storing sensitive names in this public workflow.
+          if [ -n "${PUBLICATION_DENYLIST_REGEX:-}" ]; then
+            names="$(git grep -niP "$PUBLICATION_DENYLIST_REGEX" -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' || true)"
+            if [ -n "$names" ]; then
+              echo "::error::Private name found in a public file. Use neutral wording:"
+              echo "$names"
+              fail=1
+            fi
           fi
 
           if [ "$fail" -ne 0 ]; then

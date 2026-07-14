@@ -1,5 +1,8 @@
 use powdb_storage::btree::{BTree, BTREE_VERSION, LEGACY_BTREE_VERSION};
-use powdb_storage::catalog::{Catalog, IndexKeySource, CATALOG_VERSION, LEGACY_CATALOG_VERSION};
+use powdb_storage::catalog::{
+    expression_index_file_name, Catalog, IndexKeySource, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+};
+use powdb_storage::pj1::parse_json_text;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 
@@ -28,6 +31,95 @@ fn author_path() -> StoredJsonPathV1 {
 }
 
 #[test]
+fn expression_namespace_cannot_alias_cross_table_column_index_and_rebuilds_safely() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog
+        .create_table(Schema {
+            table_name: "A".into(),
+            columns: vec![ColumnDef {
+                name: "B_idx_1".into(),
+                type_id: TypeId::Str,
+                required: true,
+                position: 0,
+            }],
+        })
+        .unwrap();
+    catalog.create_table(schema("A_B")).unwrap();
+
+    let column_row = vec![Value::Str("legacy-key".into())];
+    catalog.insert("A", &column_row).unwrap();
+    catalog.create_index("A", "B_idx_1").unwrap();
+    let column_file = dir.path().join("A_B_idx_1.idx");
+    assert!(column_file.exists());
+    let column_bytes = std::fs::read(&column_file).unwrap();
+
+    let expression_row = vec![
+        Value::Int(1),
+        Value::Json(
+            parse_json_text(r#"{"author":"Ada"}"#)
+                .unwrap()
+                .into_boxed_slice(),
+        ),
+    ];
+    let expression_rid = catalog.insert("A_B", &expression_row).unwrap();
+    catalog.sync_wal().unwrap();
+
+    let path = author_path();
+    let expression_id = catalog
+        .create_expression_index_metadata("A_B", 1, path.canonical_text(), path, false)
+        .unwrap();
+    assert_eq!(expression_id, 1);
+    assert_eq!(catalog.next_index_id(), 2);
+    let expression_file = dir
+        .path()
+        .join(expression_index_file_name("A_B", expression_id));
+    assert!(expression_file.exists());
+    assert_eq!(std::fs::read(&column_file).unwrap(), column_bytes);
+    assert_eq!(
+        catalog
+            .index_lookup("A", "B_idx_1", &Value::Str("legacy-key".into()))
+            .unwrap(),
+        Some(column_row.clone())
+    );
+    assert_eq!(
+        catalog
+            .expression_index_lookup_all("A_B", expression_id, &Value::Str("Ada".into()))
+            .unwrap(),
+        vec![expression_rid]
+    );
+    catalog.checkpoint().unwrap();
+    drop(catalog);
+
+    // A missing expression artifact is rebuilt from the heap. The old flat
+    // name is a live column index here, so reopen must neither inspect nor
+    // delete it while reconstructing the dedicated `.eidx` file.
+    std::fs::remove_file(&expression_file).unwrap();
+    let mut reopened = Catalog::open(dir.path()).unwrap();
+    assert!(expression_file.exists());
+    assert_eq!(std::fs::read(&column_file).unwrap(), column_bytes);
+    assert_eq!(
+        reopened
+            .index_lookup("A", "B_idx_1", &Value::Str("legacy-key".into()))
+            .unwrap(),
+        Some(column_row)
+    );
+    assert_eq!(
+        reopened
+            .expression_index_lookup_all("A_B", expression_id, &Value::Str("Ada".into()))
+            .unwrap(),
+        vec![expression_rid]
+    );
+
+    reopened
+        .drop_expression_index("A_B", expression_id)
+        .unwrap();
+    assert!(!expression_file.exists());
+    assert!(column_file.exists());
+    assert_eq!(std::fs::read(column_file).unwrap(), column_bytes);
+}
+
+#[test]
 fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let mut catalog = Catalog::create(dir.path()).unwrap();
@@ -53,7 +145,8 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
     // A crash after the file fsync but before catalog activation can leave an
     // unreferenced ID file. The durable allocator must be able to reclaim that
     // exact orphan without consuming or reusing a referenced ID.
-    std::fs::write(dir.path().join("Doc_idx_1.idx"), b"orphan").unwrap();
+    let first_file = dir.path().join(expression_index_file_name("Doc", 1));
+    std::fs::write(&first_file, b"orphan").unwrap();
 
     let path = author_path();
     let first = catalog
@@ -62,7 +155,7 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
     assert_eq!(first, 1);
     assert_eq!(catalog.active_catalog_version(), CATALOG_VERSION);
     assert_eq!(catalog.next_index_id(), 2);
-    assert!(dir.path().join("Doc_idx_1.idx").exists());
+    assert!(first_file.exists());
     assert!(dir.path().join("Doc_id.idx").exists());
 
     let tree = catalog.expression_index_btree_mut("Doc", first).unwrap();
@@ -248,7 +341,7 @@ fn expression_index_files_follow_root_and_table_lifecycle_without_reusing_ids() 
         .create_expression_index_metadata("Doc", 1, first_path.canonical_text(), first_path, false)
         .unwrap();
     assert_eq!(first, 1);
-    let first_file = dir.path().join("Doc_idx_1.idx");
+    let first_file = dir.path().join(expression_index_file_name("Doc", first));
     assert!(first_file.exists());
 
     catalog.alter_table_drop_column("Doc", "data").unwrap();
@@ -267,7 +360,9 @@ fn expression_index_files_follow_root_and_table_lifecycle_without_reusing_ids() 
         )
         .unwrap();
     assert_eq!(second, 2);
-    let second_file = dir.path().join("Archive_idx_2.idx");
+    let second_file = dir
+        .path()
+        .join(expression_index_file_name("Archive", second));
     assert!(second_file.exists());
 
     catalog.drop_table("Archive").unwrap();

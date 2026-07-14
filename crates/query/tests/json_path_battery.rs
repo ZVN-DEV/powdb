@@ -537,6 +537,53 @@ fn grouped_order_by_path_rebinds_through_projection_alias() {
 }
 
 #[test]
+fn qualified_joined_paths_work_in_filter_group_and_aggregate_positions() {
+    let mut e = engine_with_posts("qualified_joined_paths");
+    exec(&mut e, "type Meta { required post_id: int, data: json }");
+    insert(&mut e, 1, r#"{"kind":"a"}"#);
+    insert(&mut e, 2, r#"{"kind":"b"}"#);
+    exec(
+        &mut e,
+        r#"insert Meta { post_id := 1, data := "{\"kind\":\"a\",\"value\":7}" }"#,
+    );
+    exec(
+        &mut e,
+        r#"insert Meta { post_id := 2, data := "{\"kind\":\"wrong\",\"value\":11}" }"#,
+    );
+
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post as p inner join Meta as m on p.id = m.post_id \
+             filter p.data->kind = m.data->kind \
+             group p.data->kind { kind: p.data->kind, total: sum(m.data->value) }",
+        ),
+        vec![vec![Value::Str("a".into()), Value::Int(7)]],
+    );
+}
+
+#[test]
+fn window_partition_and_order_accept_json_paths() {
+    let mut e = engine_with_posts("window_paths");
+    insert(&mut e, 1, r#"{"kind":"a","score":10}"#);
+    insert(&mut e, 2, r#"{"kind":"a","score":20}"#);
+    insert(&mut e, 3, r#"{"kind":"b","score":15}"#);
+
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post order .id { .id, rn: row_number() over \
+             (partition .data->kind order .data->score desc) }",
+        ),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(3), Value::Int(1)],
+        ],
+    );
+}
+
+#[test]
 fn non_json_path_bases_are_rejected_in_all_new_expression_slots() {
     let mut e = Engine::new(&temp_dir("non_json_expression_slots")).unwrap();
     exec(&mut e, "type Metric { age: int }");

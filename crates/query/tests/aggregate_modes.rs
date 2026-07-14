@@ -206,6 +206,85 @@ fn symmetric_provenance_survives_nested_outer_and_multi_joins() {
 }
 
 #[test]
+fn symmetric_nullable_hash_joins_match_raw_inner_and_outer_semantics() {
+    let mut engine = Engine::new(&temp_dir("nullable_hash_join")).unwrap();
+    engine
+        .execute_powql("type LeftRow { id: int, join_key: int, amount: int }")
+        .unwrap();
+    engine
+        .execute_powql("type RightRow { id: int, join_key: int }")
+        .unwrap();
+    for query in [
+        "insert LeftRow { id := 1, amount := 20 }",
+        "insert LeftRow { id := 2, join_key := 7, amount := 30 }",
+        "insert RightRow { id := 10 }",
+        "insert RightRow { id := 11 }",
+        "insert RightRow { id := 12, join_key := 9 }",
+    ] {
+        engine.execute_powql(query).unwrap();
+    }
+
+    let inner = "LeftRow as l join RightRow as r on l.join_key = r.join_key group l.id";
+    assert_eq!(
+        only_projected_value(&mut engine, &format!("{inner} {{ v: sum(l.amount) }}")),
+        Value::Int(20)
+    );
+    assert_eq!(
+        only_projected_value(&mut engine, &format!("{inner} {{ v: sum(raw l.amount) }}")),
+        Value::Int(40),
+        "raw mode must retain both nullable-key matches"
+    );
+
+    let (_, left_rows) = rows(
+        engine
+            .execute_powql(
+                "LeftRow as l left join RightRow as r on l.join_key = r.join_key \
+                 group l.id { l.id, v: sum(l.amount) }",
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        left_rows
+            .iter()
+            .find(|row| row[0] == Value::Int(1))
+            .unwrap()[1],
+        Value::Int(20)
+    );
+    assert_eq!(
+        left_rows
+            .iter()
+            .find(|row| row[0] == Value::Int(2))
+            .unwrap()[1],
+        Value::Int(30)
+    );
+
+    let (_, right_rows) = rows(
+        engine
+            .execute_powql(
+                "LeftRow as l right join RightRow as r on l.join_key = r.join_key \
+                 group r.id { r.id, v: sum(l.amount) }",
+            )
+            .unwrap(),
+    );
+    for right_id in [10, 11] {
+        assert_eq!(
+            right_rows
+                .iter()
+                .find(|row| row[0] == Value::Int(right_id))
+                .unwrap()[1],
+            Value::Int(20)
+        );
+    }
+    assert_eq!(
+        right_rows
+            .iter()
+            .find(|row| row[0] == Value::Int(12))
+            .unwrap()[1],
+        Value::Int(0)
+    );
+}
+
+#[test]
 fn min_max_and_count_star_remain_fanout_invariant_or_raw() {
     let mut engine = fanout_engine("fanout_invariants");
     let base = "Account as a join Entry as e on a.id = e.account_id group a.dept";
@@ -394,6 +473,31 @@ fn explicit_raw_powql_executes_through_the_same_surface() {
                 .unwrap()
         ),
         Value::Int(7)
+    );
+}
+
+#[test]
+fn materialized_view_refresh_preserves_explicit_raw_aggregate_mode() {
+    let mut engine = fanout_engine("raw_view_refresh");
+    engine
+        .execute_powql(
+            "materialize RawTotals as Account as a join Entry as e on a.id = e.account_id \
+             group a.dept { value: avg(raw a.balance) }",
+        )
+        .unwrap();
+    assert_eq!(
+        rows(engine.execute_powql("RawTotals").unwrap()).1,
+        vec![vec![Value::Float(15.0)]]
+    );
+
+    // This insert dirties the view. Its next read auto-refreshes by executing
+    // the stored source text, which must retain the explicit raw modifier.
+    engine
+        .execute_powql("insert Entry { id := 5, account_id := 2 }")
+        .unwrap();
+    assert_eq!(
+        rows(engine.execute_powql("RawTotals").unwrap()).1,
+        vec![vec![Value::Float(18.0)]]
     );
 }
 

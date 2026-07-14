@@ -33,6 +33,15 @@ fn row_ids(result: QueryResult) -> Vec<i64> {
         .collect()
 }
 
+fn first_values(result: QueryResult) -> Vec<Value> {
+    let QueryResult::Rows { rows, .. } = result else {
+        panic!("expected rows, got {result:?}");
+    };
+    rows.into_iter()
+        .map(|row| row.into_iter().next().expect("projected value"))
+        .collect()
+}
+
 fn sorted_row_ids(result: QueryResult) -> Vec<i64> {
     let mut ids = row_ids(result);
     ids.sort_unstable();
@@ -79,6 +88,20 @@ fn add_and_drop_path_index_preserve_fallback_parity_and_explain_actual_strategy(
 
     exec(&mut engine, "alter Doc add index (.data->score)");
     assert_eq!(sorted_row_ids(exec(&mut engine, query)), fallback);
+    assert_eq!(
+        sorted_row_ids(
+            engine
+                .execute_powql_readonly("Doc filter .data->score = 20 { .id }")
+                .unwrap()
+        ),
+        fallback,
+        "the shared-reader execution path must use the same expression index"
+    );
+    assert_eq!(
+        sorted_row_ids(exec(&mut engine, "Doc filter .data->score = null { .id }",)),
+        vec![4, 5],
+        "JSON null and missing paths retain existing Empty equality semantics"
+    );
 
     let indexed = explain_text(&mut engine, &format!("explain {query}"));
     assert!(indexed.contains("ExprIndexScan"), "{indexed}");
@@ -95,10 +118,111 @@ fn add_and_drop_path_index_preserve_fallback_parity_and_explain_actual_strategy(
 }
 
 #[test]
+fn sql_create_index_lowers_only_direct_json_arrow_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    seed_ranked_docs(&mut engine);
+
+    engine
+        .execute_sql("CREATE INDEX doc_score_idx ON Doc ((data -> 'score'))")
+        .unwrap();
+    assert_eq!(
+        sorted_row_ids(
+            engine
+                .execute_sql("SELECT id FROM Doc WHERE data -> 'score' = 20")
+                .unwrap()
+        ),
+        vec![1, 6]
+    );
+    let plan = explain_text(&mut engine, "explain Doc filter .data->score = 20 { .id }");
+    assert!(plan.contains("ExprIndexScan"), "{plan}");
+    assert!(plan.contains("index_id="), "{plan}");
+
+    engine
+        .execute_sql("CREATE UNIQUE INDEX doc_code_idx ON Doc ((data -> 'code'))")
+        .unwrap();
+    insert_doc(&mut engine, 7, r#"{"code":"only"}"#);
+    let duplicate = engine
+        .execute_powql(r#"insert Doc { id := 8, data := "{\"code\":\"only\"}" }"#)
+        .expect_err("SQL-lowered unique path index must enforce uniqueness");
+    let message = duplicate.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("unique") || message.contains("duplicate"),
+        "{duplicate}"
+    );
+
+    let text_error = engine
+        .execute_sql("CREATE INDEX doc_text_idx ON Doc ((data ->> 'score'))")
+        .expect_err("text extraction is not a stored JSON-path identity");
+    assert!(text_error.to_string().contains("->>"), "{text_error}");
+    let arbitrary_error = engine
+        .execute_sql("CREATE INDEX doc_math_idx ON Doc ((data + 1))")
+        .expect_err("arbitrary SQL expressions remain unsupported");
+    assert!(
+        arbitrary_error
+            .to_string()
+            .contains("only direct JSON -> paths"),
+        "{arbitrary_error}"
+    );
+}
+
+#[test]
 fn path_index_handles_exclusive_ranges_and_bounded_order_with_nulls_last() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(dir.path()).unwrap();
     seed_ranked_docs(&mut engine);
+
+    let asc_all = "Doc order .data->score asc limit 6 { score: .data->score }";
+    let desc_all = "Doc order .data->score desc limit 6 { score: .data->score }";
+    let asc_window = "Doc order .data->score asc limit 3 offset 1 { score: .data->score }";
+    let desc_window = "Doc order .data->score desc limit 3 offset 1 { score: .data->score }";
+    let asc_tie_cut = "Doc order .data->score asc limit 1 offset 1 { .id }";
+    let desc_tie_cut = "Doc order .data->score desc limit 1 offset 1 { .id }";
+    let fallback_asc_all = first_values(exec(&mut engine, asc_all));
+    let fallback_desc_all = first_values(exec(&mut engine, desc_all));
+    let fallback_asc_window = first_values(exec(&mut engine, asc_window));
+    let fallback_desc_window = first_values(exec(&mut engine, desc_window));
+    let fallback_asc_tie_cut = row_ids(exec(&mut engine, asc_tie_cut));
+    let fallback_desc_tie_cut = row_ids(exec(&mut engine, desc_tie_cut));
+    assert_eq!(
+        fallback_asc_all,
+        vec![
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(20),
+            Value::Int(30),
+            Value::Empty,
+            Value::Empty,
+        ]
+    );
+    assert_eq!(
+        fallback_desc_all,
+        vec![
+            Value::Int(30),
+            Value::Int(20),
+            Value::Int(20),
+            Value::Int(10),
+            Value::Empty,
+            Value::Empty,
+        ]
+    );
+    assert_eq!(
+        fallback_asc_window,
+        vec![Value::Int(20), Value::Int(20), Value::Int(30)]
+    );
+    assert_eq!(
+        fallback_desc_window,
+        vec![Value::Int(20), Value::Int(20), Value::Int(10)]
+    );
+    assert_eq!(fallback_asc_tie_cut, vec![1]);
+    assert_eq!(fallback_desc_tie_cut, vec![1]);
+    let fallback_plan = explain_text(&mut engine, &format!("explain {desc_window}"));
+    assert!(fallback_plan.contains("Sort"), "{fallback_plan}");
+    assert!(
+        !fallback_plan.contains("OrderedExprIndexScan"),
+        "{fallback_plan}"
+    );
+
     exec(&mut engine, "alter Doc add index (.data->score)");
 
     assert_eq!(
@@ -118,33 +242,41 @@ fn path_index_handles_exclusive_ranges_and_bounded_order_with_nulls_last() {
     );
 
     assert_eq!(
-        row_ids(exec(
-            &mut engine,
-            "Doc order .data->score asc limit 3 offset 1 { .id }",
-        )),
-        vec![1, 6, 3]
+        first_values(exec(&mut engine, asc_window)),
+        fallback_asc_window
     );
     assert_eq!(
-        row_ids(exec(
-            &mut engine,
-            "Doc order .data->score desc limit 3 offset 1 { .id }",
-        )),
-        vec![1, 6, 2]
+        first_values(exec(&mut engine, desc_window)),
+        fallback_desc_window
     );
     assert_eq!(
-        row_ids(exec(
-            &mut engine,
-            "Doc order .data->score asc limit 6 { .id }",
-        )),
-        vec![2, 1, 6, 3, 4, 5],
+        first_values(engine.execute_powql_readonly(desc_window).unwrap()),
+        fallback_desc_window,
+        "bounded order must also run natively through the shared-reader path"
+    );
+    assert_eq!(
+        row_ids(exec(&mut engine, asc_tie_cut)),
+        fallback_asc_tie_cut,
+        "ascending LIMIT/OFFSET must preserve scan order inside an equal-key group"
+    );
+    assert_eq!(
+        row_ids(exec(&mut engine, desc_tie_cut)),
+        fallback_desc_tie_cut,
+        "descending LIMIT/OFFSET must preserve scan order inside an equal-key group"
+    );
+    assert_eq!(
+        row_ids(engine.execute_powql_readonly(desc_tie_cut).unwrap()),
+        fallback_desc_tie_cut,
+        "readonly indexed ordering must preserve the same descending tie row"
+    );
+    assert_eq!(
+        first_values(exec(&mut engine, asc_all)),
+        fallback_asc_all,
         "missing and JSON null sort after indexed scalar values"
     );
     assert_eq!(
-        row_ids(exec(
-            &mut engine,
-            "Doc order .data->score desc limit 6 { .id }",
-        )),
-        vec![3, 1, 6, 2, 4, 5],
+        first_values(exec(&mut engine, desc_all)),
+        fallback_desc_all,
         "missing and JSON null remain last in descending order"
     );
 
@@ -155,10 +287,7 @@ fn path_index_handles_exclusive_ranges_and_bounded_order_with_nulls_last() {
     assert!(range_plan.contains("ExprRangeScan"), "{range_plan}");
     assert!(range_plan.contains("index_id="), "{range_plan}");
 
-    let order_plan = explain_text(
-        &mut engine,
-        "explain Doc order .data->score desc limit 3 offset 1 { .id }",
-    );
+    let order_plan = explain_text(&mut engine, &format!("explain {desc_window}"));
     assert!(order_plan.contains("OrderedExprIndexScan"), "{order_plan}");
     assert!(order_plan.contains("index_id="), "{order_plan}");
     assert!(order_plan.contains("descending=true"), "{order_plan}");

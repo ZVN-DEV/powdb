@@ -1,5 +1,6 @@
 use crate::types::{RowId, TypeId, Value};
 use crc32fast::Hasher as Crc32Hasher;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -688,21 +689,37 @@ impl BTree {
         descending: bool,
         offset: usize,
         limit: usize,
-    ) -> (Vec<RowId>, usize) {
+    ) -> (Vec<RowId>, usize, usize) {
         if limit == 0 {
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, 0);
         }
         let mut remaining_offset = offset;
-        let mut result = Vec::with_capacity(limit);
+        // LIMIT is user-controlled. Cap eager allocation while allowing the
+        // result to grow naturally for a genuinely large successful query.
+        let mut result = Vec::with_capacity(limit.min(4_096));
         let mut visited_scalars = 0;
+        let mut peak_reverse_group = 0;
         if descending {
-            self.visit_reverse_bounded(
+            let mut reverse_group = ReverseKeyGroup::default();
+            if self.visit_reverse_bounded(
                 self.root,
                 &mut remaining_offset,
                 limit,
                 &mut result,
                 &mut visited_scalars,
-            );
+                &mut reverse_group,
+            ) {
+                return (result, visited_scalars, reverse_group.peak);
+            }
+            if flush_reverse_key_group(
+                &mut reverse_group.rids,
+                &mut remaining_offset,
+                limit,
+                &mut result,
+            ) {
+                return (result, visited_scalars, reverse_group.peak);
+            }
+            peak_reverse_group = reverse_group.peak;
         } else {
             let mut node_id = self.root;
             while let Node::Internal { children, .. } = &self.nodes[node_id] {
@@ -723,7 +740,7 @@ impl BTree {
                     } else {
                         result.push(*rid);
                         if result.len() == limit {
-                            return (result, visited_scalars);
+                            return (result, visited_scalars, peak_reverse_group);
                         }
                     }
                 }
@@ -741,7 +758,7 @@ impl BTree {
                 }
             }
         }
-        (result, visited_scalars)
+        (result, visited_scalars, peak_reverse_group)
     }
 
     fn visit_reverse_bounded(
@@ -751,6 +768,7 @@ impl BTree {
         limit: usize,
         result: &mut Vec<RowId>,
         visited_scalars: &mut usize,
+        reverse_group: &mut ReverseKeyGroup,
     ) -> bool {
         match &self.nodes[node_id] {
             Node::Internal { children, .. } => {
@@ -761,23 +779,45 @@ impl BTree {
                         limit,
                         result,
                         visited_scalars,
+                        reverse_group,
                     ) {
                         return true;
                     }
                 }
                 false
             }
-            Node::Leaf { values, .. } => {
-                for rid in values.iter().rev() {
+            Node::Leaf { keys, values, .. } => {
+                for (key, rid) in keys.iter().zip(values).rev() {
                     *visited_scalars += 1;
-                    if *remaining_offset > 0 {
-                        *remaining_offset -= 1;
-                    } else {
-                        result.push(*rid);
-                        if result.len() == limit {
+                    if reverse_group
+                        .current_key
+                        .as_ref()
+                        .is_some_and(|current| current != key)
+                    {
+                        if flush_reverse_key_group(
+                            &mut reverse_group.rids,
+                            remaining_offset,
+                            limit,
+                            result,
+                        ) {
                             return true;
                         }
+                        reverse_group.current_key = Some(key.clone());
+                    } else if reverse_group.current_key.is_none() {
+                        reverse_group.current_key = Some(key.clone());
                     }
+                    // Reverse traversal sees the largest RID first. Only the
+                    // smallest `offset + remaining limit` RIDs can contribute
+                    // to this query window, so discard older/larger entries
+                    // instead of buffering an unbounded duplicate-key group.
+                    let group_window =
+                        (*remaining_offset).saturating_add(limit.saturating_sub(result.len()));
+                    if reverse_group.rids.len() == group_window {
+                        let _ = reverse_group.rids.pop_front();
+                    }
+                    reverse_group.rids.push_back(*rid);
+                    reverse_group.peak = reverse_group.peak.max(reverse_group.rids.len());
+                    debug_assert!(reverse_group.rids.len() <= group_window);
                 }
                 false
             }
@@ -1744,6 +1784,35 @@ impl BTree {
     }
 }
 
+#[derive(Default)]
+struct ReverseKeyGroup {
+    current_key: Option<Value>,
+    rids: VecDeque<RowId>,
+    peak: usize,
+}
+
+/// Reverse tree traversal visits equal-key entries in reverse RID order. Flush
+/// each complete key group backwards so descending ORDER BY reverses keys but
+/// preserves the same stable scan/RID order as the generic sort within ties.
+fn flush_reverse_key_group(
+    reverse_group: &mut VecDeque<RowId>,
+    remaining_offset: &mut usize,
+    limit: usize,
+    result: &mut Vec<RowId>,
+) -> bool {
+    while let Some(rid) = reverse_group.pop_back() {
+        if *remaining_offset > 0 {
+            *remaining_offset -= 1;
+        } else {
+            result.push(rid);
+            if result.len() == limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ─── on-disk value encoding ────────────────────────────────────────────────
 
 fn write_value(buf: &mut Vec<u8>, v: &Value) {
@@ -2708,19 +2777,25 @@ mod tests {
             );
         }
 
-        let (asc, asc_visited) = tree.bounded_ordered_rids_with_stats(false, 10, 5);
+        let (asc, asc_visited, asc_peak_group) = tree.bounded_ordered_rids_with_stats(false, 10, 5);
         assert_eq!(
             asc.iter().map(|rid| rid.page_id).collect::<Vec<_>>(),
             vec![10, 11, 12, 13, 14]
         );
         assert_eq!(asc_visited, 15);
+        assert_eq!(asc_peak_group, 0);
 
-        let (desc, desc_visited) = tree.bounded_ordered_rids_with_stats(true, 10, 5);
+        let (desc, desc_visited, desc_peak_group) =
+            tree.bounded_ordered_rids_with_stats(true, 10, 5);
         assert_eq!(
             desc.iter().map(|rid| rid.page_id).collect::<Vec<_>>(),
             vec![9_989, 9_988, 9_987, 9_986, 9_985]
         );
-        assert_eq!(desc_visited, 15);
+        assert_eq!(
+            desc_visited, 16,
+            "descending traversal reads one lookahead key to close the final tie group"
+        );
+        assert_eq!(desc_peak_group, 1);
     }
 
     #[test]
@@ -2761,6 +2836,72 @@ mod tests {
                 .map(|rid| rid.page_id)
                 .collect::<Vec<_>>(),
             vec![1, 4, 5]
+        );
+        assert_eq!(
+            tree.bounded_ordered_rids_nulls_last(true, 0, 2)
+                .iter()
+                .map(|rid| rid.page_id)
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "a satisfied descending scalar limit must not append null-side RIDs"
+        );
+    }
+
+    #[test]
+    fn bounded_descending_order_preserves_rid_order_inside_duplicate_key_groups() {
+        let path = std::env::temp_dir().join(format!(
+            "powdb_btree_bounded_desc_ties_{}.idx",
+            std::process::id()
+        ));
+        let mut tree = BTree::create_v2(&path).unwrap();
+
+        // More than one leaf of duplicate keys catches the boundary case: a
+        // reverse leaf walk must reverse key groups, not every RID entry.
+        for page_id in 0..600 {
+            tree.insert_duplicate(
+                Value::Int(20),
+                RowId {
+                    page_id,
+                    slot_index: 0,
+                },
+            );
+        }
+        for page_id in [1_000, 1_001] {
+            tree.insert_duplicate(
+                Value::Int(30),
+                RowId {
+                    page_id,
+                    slot_index: 0,
+                },
+            );
+        }
+
+        let (first_window, _, first_peak_group) = tree.bounded_ordered_rids_with_stats(true, 0, 4);
+        assert_eq!(
+            first_window
+                .iter()
+                .map(|rid| rid.page_id)
+                .collect::<Vec<_>>(),
+            vec![1_000, 1_001, 0, 1]
+        );
+        assert_eq!(
+            first_peak_group, 2,
+            "the earlier key group fills two result slots, leaving only two buffered tie rows"
+        );
+
+        let (offset_window, _, offset_peak_group) =
+            tree.bounded_ordered_rids_with_stats(true, 1, 3);
+        assert_eq!(
+            offset_window
+                .iter()
+                .map(|rid| rid.page_id)
+                .collect::<Vec<_>>(),
+            vec![1_001, 0, 1],
+            "OFFSET/LIMIT must cut through a tie in stable RID order"
+        );
+        assert_eq!(
+            offset_peak_group, 2,
+            "buffering tracks the remaining window, not the 600-row tie cardinality"
         );
     }
 }

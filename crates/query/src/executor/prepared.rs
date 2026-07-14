@@ -46,11 +46,10 @@ pub struct PreparedQuery {
 #[derive(Clone)]
 struct InsertFast {
     /// Mission C Phase 18: cached slot index into `Catalog::tables`.
-    /// Resolved once at `prepare` time and stable for the lifetime of
-    /// the catalog (PowDB has no DROP TABLE). Lets the hot path dispatch
-    /// through `catalog.table_by_slot_mut(slot)` — a pure Vec index,
-    /// no hash, no bucket walk, no string compare.
+    /// DROP/ALTER/index DDL can invalidate the slot or row contract, so every
+    /// execution compares the O(1) catalog structure generation below.
     table_slot: usize,
+    structure_generation: u64,
     /// Schema column index for each positional literal, in the order the
     /// caller passes them.
     col_indices: Vec<usize>,
@@ -58,6 +57,25 @@ struct InsertFast {
     /// must be resized to before filling positions via `col_indices`.
     /// Cached here so the hot loop skips `catalog.schema(table)` entirely.
     n_cols: usize,
+    /// Schema slots omitted by this prepared INSERT. The scratch row is shared
+    /// by all prepared inserts on an engine, so these positions must be reset
+    /// to NULL before each execution. Precomputing the complement avoids an
+    /// O(columns × assignments) membership scan on the write hot path.
+    omitted_col_indices: Vec<usize>,
+    /// Assigned column definitions in parameter order. Runtime literals still
+    /// pass through the same coercion rules as the generic INSERT executor;
+    /// preparing with an integer placeholder must not permit a later string to
+    /// be stored in an integer column.
+    assigned_columns: Vec<ColumnDef>,
+    /// Required slots are checked after coercion so a bound NULL cannot bypass
+    /// the generic INSERT required-column contract.
+    required_col_indices: Vec<usize>,
+    /// Needed to mark dependent materialized views dirty in both prepared
+    /// execution variants.
+    table_name: String,
+    /// Prepare-time schema names used only to preserve canonical required-field
+    /// errors. Structural validity is the O(1) generation check above.
+    schema_columns: Vec<ColumnDef>,
 }
 
 /// Mission C Phase 14: precomputed fast-path for `update_by_pk` shaped
@@ -65,17 +83,20 @@ struct InsertFast {
 /// `execute_prepared` call.
 #[derive(Clone)]
 struct UpdatePkFast {
-    /// Mission C Phase 18: cached slot index into `Catalog::tables`.
-    /// Resolved once at `prepare` time and stable for the lifetime of
-    /// the catalog. At a 52ns total budget the swap from FxHashMap
-    /// probe to a Vec index is measurable.
+    /// Mission C Phase 18: cached slot index into `Catalog::tables`, guarded
+    /// by the O(1) catalog structure generation on every execution.
     table_slot: usize,
+    structure_generation: u64,
     /// Name of the key column (the `.id = ?` side). We look this up in
     /// the owning table's `indexed_cols` at execute time rather than
     /// caching a raw `&BTree` — the engine owns the catalog and can't
     /// hand out long-lived borrows anyway, and the n≤5 linear scan is
     /// a handful of ns.
     key_col: String,
+    /// Target column position. A later ALTER ADD INDEX on this column must
+    /// disable the raw byte-patch path so live secondary indexes and unique
+    /// constraints are maintained by the generic update executor.
+    target_col_idx: usize,
     /// Byte offset of the target fixed column in the row encoding:
     /// `2 + bitmap_size + layout.fixed_offsets[target_col]`.
     field_off: usize,
@@ -93,6 +114,32 @@ struct UpdatePkFast {
     key_literal_idx: usize,
     /// Index into the caller's `literals` slice that holds the new value.
     value_literal_idx: usize,
+}
+
+fn cached_table_matches(catalog: &Catalog, structure_generation: u64) -> bool {
+    catalog.structure_generation() == structure_generation
+}
+
+fn literal_can_take_without_error(literal: &Literal, column: &ColumnDef) -> bool {
+    matches!(
+        (literal, column.type_id),
+        (
+            Literal::Int(_),
+            TypeId::Int | TypeId::Float | TypeId::DateTime
+        ) | (Literal::Float(_), TypeId::Float | TypeId::Int)
+            | (Literal::String(_), TypeId::Str)
+            | (Literal::Bool(_), TypeId::Bool)
+    )
+}
+
+fn restore_taken_strings(fast: &InsertFast, literals: &mut [Literal], values: &mut [Value]) {
+    for (position, literal) in literals.iter_mut().enumerate() {
+        if let Literal::String(destination) = literal {
+            if let Value::Str(source) = &mut values[fast.col_indices[position]] {
+                *destination = std::mem::take(source);
+            }
+        }
+    }
 }
 
 impl Engine {
@@ -126,7 +173,7 @@ impl Engine {
                     .catalog
                     .table_slot(table)
                     .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                let schema = &self.catalog.table_by_slot(table_slot).schema;
+                let schema = self.catalog.table_by_slot(table_slot).schema();
                 let n_cols = schema.columns.len();
                 let indices: Result<Vec<usize>, QueryError> = assignments
                     .iter()
@@ -140,23 +187,46 @@ impl Engine {
                     })
                     .collect();
                 let indices = indices?;
-                // The fast path writes each literal verbatim with no
-                // `coerce_value`, so a plain string into a uuid/bytes/json
-                // column would store a raw `Value::Str` — silent typed
-                // corruption (and, for json, invalid PJ1). Fall back to the
-                // generic (coercing, validating) path for those columns.
-                if indices.iter().any(|&i| {
-                    matches!(
-                        schema.columns[i].type_id,
-                        TypeId::Uuid | TypeId::Bytes | TypeId::Json
-                    )
-                }) {
+                let defaults = self.catalog.column_defaults(table).unwrap_or(&[]);
+                let auto = self.catalog.auto_columns(table).unwrap_or(&[]);
+                let omitted_required = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .any(|(index, column)| column.required && !indices.contains(&index));
+                // Defaults and auto columns require table-owned state updates.
+                // Keep those shapes on the generic executor, which applies the
+                // full schema contract. An omitted required column must also
+                // take the generic path so it returns the canonical error.
+                if defaults.iter().any(Option::is_some)
+                    || auto.iter().any(|is_auto| *is_auto)
+                    || omitted_required
+                {
                     None
                 } else {
+                    let omitted_col_indices = (0..n_cols)
+                        .filter(|index| !indices.contains(index))
+                        .collect();
+                    let assigned_columns = indices
+                        .iter()
+                        .map(|&index| schema.columns[index].clone())
+                        .collect();
+                    let required_col_indices = schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, column)| column.required.then_some(index))
+                        .collect();
                     Some(InsertFast {
                         table_slot,
+                        structure_generation: self.catalog.structure_generation(),
                         col_indices: indices,
                         n_cols,
+                        omitted_col_indices,
+                        assigned_columns,
+                        required_col_indices,
+                        table_name: table.clone(),
+                        schema_columns: schema.columns.clone(),
                     })
                 }
             }
@@ -231,7 +301,7 @@ impl Engine {
         // the slot so the execute path skips the name probe.
         let table_slot = catalog.table_slot(table)?;
         let tbl = catalog.table_by_slot(table_slot);
-        let schema = &tbl.schema;
+        let schema = tbl.schema();
 
         // Key column must have an index (the btree.lookup path is what
         // makes the fast path worth building).
@@ -264,7 +334,9 @@ impl Engine {
         // is literal 1.
         Some(UpdatePkFast {
             table_slot,
+            structure_generation: catalog.structure_generation(),
             key_col,
+            target_col_idx,
             field_off,
             bitmap_byte_off,
             bit_mask,
@@ -333,12 +405,49 @@ impl Engine {
         // HashMap lookup (`get_table_mut`) and dispatches straight into
         // `tbl.insert` — no intermediate schema lookup, no generic
         // `Catalog::insert` wrapper.
-        if let Some(fast) = &prep.insert_fast {
+        if let Some(fast) = prep
+            .insert_fast
+            .as_ref()
+            .filter(|fast| cached_table_matches(&self.catalog, fast.structure_generation))
+        {
             let mut values = std::mem::take(&mut self.insert_values_scratch);
-            values.clear();
             values.resize(fast.n_cols, Value::Empty);
+            // Columns omitted by the prepared INSERT must return to NULL on
+            // every execution. Assigned string slots keep their allocation so
+            // repeated prepared inserts copy into stable buffers instead of
+            // allocating one String per field per row.
+            for &index in &fast.omitted_col_indices {
+                values[index] = Value::Empty;
+            }
             for (pos, lit) in literals.iter().enumerate() {
-                values[fast.col_indices[pos]] = literal_value_from(lit);
+                let value = &mut values[fast.col_indices[pos]];
+                let column = &fast.assigned_columns[pos];
+                match (value, lit, column.type_id) {
+                    (Value::Str(buffer), Literal::String(text), TypeId::Str) => {
+                        buffer.clear();
+                        buffer.push_str(text);
+                    }
+                    (value, literal, _) => {
+                        let raw = literal_value_from(literal);
+                        match coerce_value(raw, column) {
+                            Ok(coerced) => *value = coerced,
+                            Err(error) => {
+                                self.insert_values_scratch = values;
+                                return Err(QueryError::Execution(error));
+                            }
+                        }
+                    }
+                }
+            }
+            for &index in &fast.required_col_indices {
+                if matches!(values[index], Value::Empty) {
+                    let column = &fast.schema_columns[index];
+                    self.insert_values_scratch = values;
+                    return Err(QueryError::Execution(format!(
+                        "column '{}' is required but no value was provided",
+                        column.name
+                    )));
+                }
             }
             // Mission C Phase 18: direct O(1) slot index — no
             // catalog hash probe. Slot was resolved at prepare time.
@@ -349,16 +458,21 @@ impl Engine {
                 .catalog
                 .insert_by_slot(fast.table_slot, &values)
                 .map_err(|e| e.to_string());
-            // Clear strings before returning the scratch — don't keep
-            // dangling allocations from the previous row alive across
-            // calls. `clear()` drops the Value::Str entries.
-            values.clear();
+            // Retain ordinary row buffers, but do not pin an overflow-sized
+            // client string in the engine forever after one prepared insert.
+            for value in &mut values {
+                if matches!(value, Value::Str(buffer) if buffer.capacity() > powdb_storage::page::MAX_ROW_DATA_SIZE)
+                {
+                    *value = Value::Empty;
+                }
+            }
+            // Keep one row's string buffers for the next prepared execution.
+            // This is bounded by the prepared row width and never escapes the
+            // engine; the catalog has already encoded/copied the values.
             self.insert_values_scratch = values;
             res?;
             // Mark dependent views dirty for prepared insert fast path.
-            if let PlanNode::Insert { table, .. } = &prep.plan_template {
-                self.view_registry.mark_dependents_dirty(table);
-            }
+            self.view_registry.mark_dependents_dirty(&fast.table_name);
             // Mission B (post-review): statement-boundary WAL group commit.
             self.catalog
                 .commit_autocommit()
@@ -398,6 +512,15 @@ impl Engine {
         fast: &UpdatePkFast,
         literals: &[Literal],
     ) -> Result<Option<QueryResult>, QueryError> {
+        if !cached_table_matches(&self.catalog, fast.structure_generation) {
+            return Ok(None);
+        }
+        let current_table = self.catalog.table_by_slot(fast.table_slot);
+        if current_table.has_indexed_col(fast.target_col_idx)
+            || !current_table.has_index(&fast.key_col)
+        {
+            return Ok(None);
+        }
         // 1) Extract the key literal. The fast path is only built for
         //    int key columns; any other literal type means the caller
         //    is violating the prepared-query contract or the schema
@@ -430,10 +553,9 @@ impl Engine {
         // extra cost is one WAL append + fsync per query — the hot
         // loop structure is unchanged.
         let tbl = self.catalog.table_by_slot_mut(fast.table_slot);
-        let Some(btree) = tbl.index(&fast.key_col) else {
-            // Index dropped since prepare — bail to the generic path.
-            return Ok(None);
-        };
+        let btree = tbl
+            .index(&fast.key_col)
+            .expect("prepared update index was revalidated above");
         let Some(rid) = btree.lookup_int(key_int) else {
             return Ok(Some(QueryResult::Modified(0)));
         };
@@ -488,28 +610,78 @@ impl Engine {
             )));
         }
 
-        if let Some(fast) = &prep.insert_fast {
+        if let Some(fast) = prep
+            .insert_fast
+            .as_ref()
+            .filter(|fast| cached_table_matches(&self.catalog, fast.structure_generation))
+        {
+            // Moving strings is only safe when coercion cannot fail or replace
+            // the string with another representation. Complex/coercing shapes
+            // use the borrowed path; on success we still honor this method's
+            // consume-on-success contract.
+            if !literals
+                .iter()
+                .zip(&fast.assigned_columns)
+                .all(|(literal, column)| literal_can_take_without_error(literal, column))
+            {
+                let result = self.execute_prepared(prep, literals);
+                if result.is_ok() {
+                    for literal in literals {
+                        if let Literal::String(value) = literal {
+                            value.clear();
+                        }
+                    }
+                }
+                return result;
+            }
             let mut values = std::mem::take(&mut self.insert_values_scratch);
             values.clear();
             values.resize(fast.n_cols, Value::Empty);
             for (pos, lit) in literals.iter_mut().enumerate() {
-                values[fast.col_indices[pos]] = literal_value_take(lit);
+                let raw = literal_value_take(lit);
+                match coerce_value(raw, &fast.assigned_columns[pos]) {
+                    Ok(coerced) => values[fast.col_indices[pos]] = coerced,
+                    Err(error) => {
+                        restore_taken_strings(fast, literals, &mut values);
+                        values.clear();
+                        self.insert_values_scratch = values;
+                        return Err(QueryError::Execution(error));
+                    }
+                }
+            }
+            for &index in &fast.required_col_indices {
+                if matches!(values[index], Value::Empty) {
+                    let column = &fast.schema_columns[index];
+                    let error = format!(
+                        "column '{}' is required but no value was provided",
+                        column.name
+                    );
+                    restore_taken_strings(fast, literals, &mut values);
+                    values.clear();
+                    self.insert_values_scratch = values;
+                    return Err(QueryError::Execution(error));
+                }
             }
             // Mission C Phase 18: direct O(1) slot index — see
             // `execute_prepared` for rationale. This is the hot path
             // for `insert_batch_1k`. Durability fix: WAL-logging
             // `insert_by_slot` (was the raw `Table::insert`).
-            let res = self
-                .catalog
-                .insert_by_slot(fast.table_slot, &values)
-                .map_err(|e| e.to_string());
+            if let Err(error) = self.catalog.insert_by_slot(fast.table_slot, &values) {
+                restore_taken_strings(fast, literals, &mut values);
+                values.clear();
+                self.insert_values_scratch = values;
+                return Err(QueryError::StorageError(error.to_string()));
+            }
+            self.view_registry.mark_dependents_dirty(&fast.table_name);
+            // Mission B (post-review): statement-boundary WAL group commit.
+            if let Err(error) = self.catalog.commit_autocommit() {
+                restore_taken_strings(fast, literals, &mut values);
+                values.clear();
+                self.insert_values_scratch = values;
+                return Err(QueryError::StorageError(error.to_string()));
+            }
             values.clear();
             self.insert_values_scratch = values;
-            res?;
-            // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog
-                .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -517,7 +689,15 @@ impl Engine {
         // can't usefully move the literals because `substitute_plan`
         // still expects an immutable slice, and the non-insert hot
         // paths are dominated by plan walks anyway.
-        self.execute_prepared(prep, literals)
+        let result = self.execute_prepared(prep, literals);
+        if result.is_ok() && matches!(prep.plan_template, PlanNode::Insert { .. }) {
+            for literal in literals {
+                if let Literal::String(value) = literal {
+                    value.clear();
+                }
+            }
+        }
+        result
     }
 
     /// Walk an expression tree and replace every `InSubquery` node with

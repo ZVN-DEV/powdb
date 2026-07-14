@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "artifact_kind": "historical_read_baseline_summary",
+  "source_full_artifact_fingerprint": "fnv1a64:cf3a645608f34e2b",
+  "run": {
+    "arch": "aarch64",
+    "dirty_tree_fingerprint": "fnv1a64:5a75c8bdfdae8d94",
+    "dirty_tree_fingerprint_scope": "git diff --binary HEAD plus all untracked files in the isolated worktree",
+    "git_commit": "712545435c36accc8e62ba01b0219ec161e6373c",
+    "git_dirty": true,
+    "label": "v0.12.0-folded-cancellation",
+    "logical_cpus": 18,
+    "os": "macos",
+    "package_version": "0.12.0",
+    "profile": "release",
+    "repetition": 1,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "transport": "TCP loopback; server and clients share one process",
+    "unix_time_ns": "1784059180219881000"
+  },
+  "fixture": {
+    "document_json_bytes": 2560,
+    "document_query": "DocumentRow filter .id = 1 { .data }",
+    "fingerprint": "fnv1a64:35aa943504ccb6f8",
+    "logical_equivalence_asserted": true,
+    "overlap_payload_bytes": 256,
+    "overlap_query": "ScanRow filter .bucket >= 0 { .id, .payload }",
+    "overlap_rows": 10000,
+    "typed_query": "TypedRow filter .id = 1 { .id, .status, .title, .score, .active, .payload }"
+  },
+  "point_reads": {
+    "document": {
+      "encoded_response_bytes": 2584,
+      "latency": {
+        "count": 500,
+        "max_us": 194.0,
+        "mean_us": 55.92425399999998,
+        "min_us": 35.958,
+        "p50_us": 45.458,
+        "p90_us": 84.33399999999999,
+        "p95_us": 93.084,
+        "p99_us": 114.5,
+        "stddev_us": 20.462601785537537
+      }
+    },
+    "typed": {
+      "encoded_response_bytes": 2589,
+      "latency": {
+        "count": 500,
+        "max_us": 180.875,
+        "mean_us": 60.38890199999997,
+        "min_us": 39.334,
+        "p50_us": 48.208999999999996,
+        "p90_us": 89.625,
+        "p95_us": 101.208,
+        "p99_us": 139.042,
+        "stddev_us": 23.661641938893332
+      }
+    }
+  },
+  "point_concurrency": [
+    {
+      "clients": 1,
+      "throughput_ops_s": 23761.5,
+      "scaling_vs_one_client": 1.0,
+      "latency": { "count": 47523, "max_us": 273.125, "mean_us": 41.98312429770867, "min_us": 29.042, "p50_us": 40.375, "p90_us": 48.792, "p95_us": 53.125, "p99_us": 67.333, "stddev_us": 7.420988075591461 }
+    },
+    {
+      "clients": 2,
+      "throughput_ops_s": 35342.0,
+      "scaling_vs_one_client": 1.487364013214654,
+      "latency": { "count": 70684, "max_us": 740.375, "mean_us": 56.4175049233208, "min_us": 30.833000000000002, "p50_us": 48.958, "p90_us": 81.667, "p95_us": 101.625, "p99_us": 149.917, "stddev_us": 22.924879319062374 }
+    },
+    {
+      "clients": 5,
+      "throughput_ops_s": 33715.0,
+      "scaling_vs_one_client": 1.4188919049723292,
+      "latency": { "count": 67430, "max_us": 4418.0, "mean_us": 148.10801293192955, "min_us": 67.667, "p50_us": 121.25, "p90_us": 234.166, "p95_us": 276.459, "p99_us": 362.666, "stddev_us": 85.41560266418075 }
+    },
+    {
+      "clients": 10,
+      "throughput_ops_s": 41711.5,
+      "scaling_vs_one_client": 1.7554236895818867,
+      "latency": { "count": 83423, "max_us": 1822.792, "mean_us": 239.56090174172687, "min_us": 51.25, "p50_us": 219.708, "p90_us": 295.41700000000003, "p95_us": 361.91700000000003, "p99_us": 538.875, "stddev_us": 67.24451307861014 }
+    }
+  ],
+  "overlap_concurrency": {
+    "encoded_response_bytes": 2678919,
+    "corrected_no_reencode_summary": {
+      "one_client_p50_us": 4507.792,
+      "aggregation": "median of two independent cold starts; arithmetic midpoint for the even sample count",
+      "methodology": "Full TCP request, server execution, response read, protocol decode, and row validation. Decoded responses are not re-encoded inside timed samples.",
+      "runner_source": "docs/benchmarks/harnesses/v0.12-overlap-no-reencode.patch",
+      "runner_patch_sha256": "ee85f8f5e2c2fbb07e2f2dc7afe2194ffc90ecbb7a1c334b806e0e4554584e68",
+      "runs": [
+        {
+          "clients": 1,
+          "completed_inside_window": 430,
+          "throughput_ops_s": 215.0,
+          "latency_p50_us": 4606.917
+        },
+        {
+          "clients": 2,
+          "completed_inside_window": 642,
+          "throughput_ops_s": 321.0,
+          "latency_p50_us": 6264.0
+        },
+        {
+          "clients": 5,
+          "completed_inside_window": 627,
+          "throughput_ops_s": 313.5,
+          "latency_p50_us": 15799.792
+        },
+        {
+          "clients": 10,
+          "completed_inside_window": 629,
+          "throughput_ops_s": 314.5,
+          "latency_p50_us": 31705.499999999996
+        },
+        {
+          "clients": 1,
+          "completed_inside_window": 449,
+          "throughput_ops_s": 224.5,
+          "latency_p50_us": 4408.6669999999995
+        },
+        {
+          "clients": 2,
+          "completed_inside_window": 655,
+          "throughput_ops_s": 327.5,
+          "latency_p50_us": 6090.0
+        },
+        {
+          "clients": 5,
+          "completed_inside_window": 616,
+          "throughput_ops_s": 308.0,
+          "latency_p50_us": 16157.833
+        },
+        {
+          "clients": 10,
+          "completed_inside_window": 625,
+          "throughput_ops_s": 312.5,
+          "latency_p50_us": 31876.25
+        }
+      ]
+    },
+    "results": [
+      {
+        "clients": 1,
+        "throughput_ops_s": 166.0,
+        "scaling_vs_one_client": 1.0,
+        "latency": { "count": 332, "max_us": 9709.042, "mean_us": 5769.3211777108445, "min_us": 4308.208, "p50_us": 5770.540999999999, "p90_us": 6518.584, "p95_us": 6690.042, "p99_us": 7349.917, "stddev_us": 689.1391865042827 }
+      },
+      {
+        "clients": 2,
+        "throughput_ops_s": 264.5,
+        "scaling_vs_one_client": 1.5933734939759037,
+        "latency": { "count": 529, "max_us": 14254.917000000001, "mean_us": 7166.181330812858, "min_us": 5394.2080000000005, "p50_us": 6878.125, "p90_us": 8619.417000000001, "p95_us": 9212.667000000001, "p99_us": 11218.334, "stddev_us": 1203.7719124562311 }
+      },
+      {
+        "clients": 5,
+        "throughput_ops_s": 276.5,
+        "scaling_vs_one_client": 1.6656626506024097,
+        "latency": { "count": 553, "max_us": 29154.540999999997, "mean_us": 17718.69489511754, "min_us": 8445.209, "p50_us": 17118.125, "p90_us": 20196.166, "p95_us": 21053.916999999998, "p99_us": 23014.875, "stddev_us": 1902.0384611535467 }
+      },
+      {
+        "clients": 10,
+        "throughput_ops_s": 267.5,
+        "scaling_vs_one_client": 1.6114457831325302,
+        "latency": { "count": 535, "max_us": 49321.708, "mean_us": 36777.075669158905, "min_us": 7929.500000000001, "p50_us": 34478.459, "p90_us": 44007.25, "p95_us": 45965.084, "p99_us": 48099.25, "stddev_us": 4990.602916189105 }
+      }
+    ]
+  },
+  "methodology": {
+    "artifact_scope": "Compact checked-in summary derived from the full isolated artifact; sufficient latency distributions are retained while raw per-sample arrays remain identified by source fingerprint.",
+    "isolation": "Benchmark runner was copied into a separate worktree at the recorded commit; the current branch was not mutated.",
+    "known_limitations": [
+      "Loopback server and clients share one process.",
+      "The isolated runner itself makes the historical worktree dirty, which is recorded in the fingerprint.",
+      "The original full artifact re-encoded each decoded response to calculate frame size inside the timed loop. The corrected no-reencode overlap summary is the sole comparator for the one-client overlap latency release gate.",
+      "Operating-system page cache was not evicted."
+    ]
+  }
+}
