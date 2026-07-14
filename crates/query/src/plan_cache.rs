@@ -69,6 +69,16 @@ impl PlanCache {
     /// correct. This check runs only on the populating miss, so the hot
     /// hit-path pays nothing.
     pub fn insert(&mut self, hash: u64, plan: PlanNode, source_literal_count: usize) {
+        // GROUP BY planning lifts aggregate arguments out of their source
+        // projection positions, and the parser accepts HAVING both before and
+        // after that projection. The physical plan does not retain which
+        // clause order the source used, so a literal-slot walk cannot safely
+        // reconstruct source order for grouped HAVING queries. Refuse to
+        // cache that shape until plans carry explicit source-slot ordinals.
+        // Replanning is cheaper than ever serving silently rebound literals.
+        if contains_grouped_having(&plan) {
+            return;
+        }
         if count_literal_slots(&plan) != source_literal_count {
             return;
         }
@@ -128,6 +138,49 @@ impl PlanCache {
     }
 }
 
+fn contains_grouped_having(plan: &PlanNode) -> bool {
+    match plan {
+        PlanNode::GroupBy {
+            having: Some(_), ..
+        } => true,
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Explain { input } => contains_grouped_having(input),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            contains_grouped_having(left) || contains_grouped_having(right)
+        }
+        PlanNode::SeqScan { .. }
+        | PlanNode::AliasScan { .. }
+        | PlanNode::IndexScan { .. }
+        | PlanNode::RangeScan { .. }
+        | PlanNode::ExprIndexScan { .. }
+        | PlanNode::ExprRangeScan { .. }
+        | PlanNode::OrderedExprIndexScan { .. }
+        | PlanNode::AlterTable { .. }
+        | PlanNode::DropTable { .. }
+        | PlanNode::Insert { .. }
+        | PlanNode::Upsert { .. }
+        | PlanNode::CreateTable { .. }
+        | PlanNode::ListTypes
+        | PlanNode::Describe { .. }
+        | PlanNode::CreateView { .. }
+        | PlanNode::RefreshView { .. }
+        | PlanNode::DropView { .. }
+        | PlanNode::Begin
+        | PlanNode::Commit
+        | PlanNode::Rollback => false,
+    }
+}
+
 /// Walk a plan tree depth-first, replacing every `Expr::Literal` with the
 /// next literal from `literals` (consumed by index). The traversal order
 /// is deterministic and matches the source order produced by
@@ -161,17 +214,64 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 substitute_expr(expr, literals, idx);
             }
         }
+        PlanNode::ExprIndexScan { key, .. } => substitute_expr(key, literals, idx),
+        PlanNode::ExprRangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                substitute_expr(expr, literals, idx);
+            }
+            if let Some((expr, _)) = end {
+                substitute_expr(expr, literals, idx);
+            }
+        }
+        PlanNode::OrderedExprIndexScan { limit, offset, .. } => {
+            substitute_expr(limit, literals, idx);
+            if let Some(offset) = offset {
+                substitute_expr(offset, literals, idx);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             substitute_plan(input, literals, idx);
             substitute_expr(predicate, literals, idx);
         }
         PlanNode::Project { input, fields } => {
-            substitute_plan(input, literals, idx);
-            for f in fields {
-                substitute_expr(&mut f.expr, literals, idx);
+            if let PlanNode::GroupBy {
+                input: group_input,
+                keys,
+                aggregates,
+                having: None,
+            } = input.as_mut()
+            {
+                // GROUP BY lifts aggregate arguments out of their projection
+                // positions. Walk the grouped input/keys first, then replay
+                // each lifted argument at the exact projection position where
+                // it appeared in source, preserving literal ordinals.
+                substitute_plan(group_input, literals, idx);
+                for key in keys {
+                    substitute_expr(&mut key.expr, literals, idx);
+                }
+                let mut visited = std::collections::HashSet::new();
+                for field in fields {
+                    substitute_group_projection_expr(
+                        &mut field.expr,
+                        aggregates,
+                        &mut visited,
+                        literals,
+                        idx,
+                    );
+                }
+            } else {
+                substitute_plan(input, literals, idx);
+                for f in fields {
+                    substitute_expr(&mut f.expr, literals, idx);
+                }
             }
         }
-        PlanNode::Sort { input, .. } => substitute_plan(input, literals, idx),
+        PlanNode::Sort { input, keys } => {
+            substitute_plan(input, literals, idx);
+            for key in keys {
+                substitute_expr(&mut key.expr, literals, idx);
+            }
+        }
         PlanNode::AlterTable { .. } => {}
         PlanNode::DropTable { .. } => {}
         PlanNode::Limit { input, count } => {
@@ -202,8 +302,13 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             substitute_plan(input, literals, idx);
             substitute_expr(count, literals, idx);
         }
-        PlanNode::Aggregate { input, .. } => {
+        PlanNode::Aggregate {
+            input, argument, ..
+        } => {
             substitute_plan(input, literals, idx);
+            if let Some(argument) = argument {
+                substitute_expr(argument, literals, idx);
+            }
         }
         PlanNode::NestedLoopJoin {
             left, right, on, ..
@@ -221,8 +326,19 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Distinct { input } => {
             substitute_plan(input, literals, idx);
         }
-        PlanNode::GroupBy { input, having, .. } => {
+        PlanNode::GroupBy {
+            input,
+            keys,
+            aggregates,
+            having,
+        } => {
             substitute_plan(input, literals, idx);
+            for key in keys {
+                substitute_expr(&mut key.expr, literals, idx);
+            }
+            for aggregate in aggregates {
+                substitute_expr(&mut aggregate.argument, literals, idx);
+            }
             if let Some(pred) = having {
                 substitute_expr(pred, literals, idx);
             }
@@ -259,6 +375,12 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 for arg in &mut w.args {
                     substitute_expr(arg, literals, idx);
                 }
+                for expr in &mut w.partition_by {
+                    substitute_expr(expr, literals, idx);
+                }
+                for key in &mut w.order_by {
+                    substitute_expr(&mut key.expr, literals, idx);
+                }
             }
         }
         PlanNode::Union { left, right, .. } => {
@@ -276,6 +398,53 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
 fn substitute_assignments(assignments: &mut [Assignment], literals: &[Literal], idx: &mut usize) {
     for a in assignments {
         substitute_expr(&mut a.value, literals, idx);
+    }
+}
+
+fn substitute_group_projection_expr(
+    expr: &mut Expr,
+    aggregates: &mut [crate::plan::GroupAgg],
+    visited: &mut std::collections::HashSet<String>,
+    literals: &[Literal],
+    idx: &mut usize,
+) {
+    if let Expr::Field(name) = expr {
+        if visited.insert(name.clone()) {
+            if let Some(aggregate) = aggregates.iter_mut().find(|agg| agg.output_name == *name) {
+                substitute_expr(&mut aggregate.argument, literals, idx);
+                return;
+            }
+        }
+    }
+    match expr {
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            substitute_group_projection_expr(left, aggregates, visited, literals, idx);
+            substitute_group_projection_expr(right, aggregates, visited, literals, idx);
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => {
+            substitute_group_projection_expr(inner, aggregates, visited, literals, idx);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                substitute_group_projection_expr(arg, aggregates, visited, literals, idx);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            substitute_group_projection_expr(expr, aggregates, visited, literals, idx);
+            for item in list {
+                substitute_group_projection_expr(item, aggregates, visited, literals, idx);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                substitute_group_projection_expr(condition, aggregates, visited, literals, idx);
+                substitute_group_projection_expr(result, aggregates, visited, literals, idx);
+            }
+            if let Some(expr) = else_expr {
+                substitute_group_projection_expr(expr, aggregates, visited, literals, idx);
+            }
+        }
+        _ => substitute_expr(expr, literals, idx),
     }
 }
 
@@ -303,17 +472,54 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 count_expr(expr, n);
             }
         }
+        PlanNode::ExprIndexScan { key, .. } => count_expr(key, n),
+        PlanNode::ExprRangeScan { start, end, .. } => {
+            if let Some((expr, _)) = start {
+                count_expr(expr, n);
+            }
+            if let Some((expr, _)) = end {
+                count_expr(expr, n);
+            }
+        }
+        PlanNode::OrderedExprIndexScan { limit, offset, .. } => {
+            count_expr(limit, n);
+            if let Some(offset) = offset {
+                count_expr(offset, n);
+            }
+        }
         PlanNode::Filter { input, predicate } => {
             count_plan(input, n);
             count_expr(predicate, n);
         }
         PlanNode::Project { input, fields } => {
-            count_plan(input, n);
-            for f in fields {
-                count_expr(&f.expr, n);
+            if let PlanNode::GroupBy {
+                input: group_input,
+                keys,
+                aggregates,
+                having: None,
+            } = input.as_ref()
+            {
+                count_plan(group_input, n);
+                for key in keys {
+                    count_expr(&key.expr, n);
+                }
+                let mut visited = std::collections::HashSet::new();
+                for field in fields {
+                    count_group_projection_expr(&field.expr, aggregates, &mut visited, n);
+                }
+            } else {
+                count_plan(input, n);
+                for f in fields {
+                    count_expr(&f.expr, n);
+                }
             }
         }
-        PlanNode::Sort { input, .. } => count_plan(input, n),
+        PlanNode::Sort { input, keys } => {
+            count_plan(input, n);
+            for key in keys {
+                count_expr(&key.expr, n);
+            }
+        }
         PlanNode::Limit { input, count } => {
             // Mirror the substitute walk: `Limit(Offset(...))` descends
             // into the offset's child first, then counts Limit.count,
@@ -336,7 +542,14 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             count_plan(input, n);
             count_expr(count, n);
         }
-        PlanNode::Aggregate { input, .. } => count_plan(input, n),
+        PlanNode::Aggregate {
+            input, argument, ..
+        } => {
+            count_plan(input, n);
+            if let Some(argument) = argument {
+                count_expr(argument, n);
+            }
+        }
         PlanNode::NestedLoopJoin {
             left, right, on, ..
         } => {
@@ -347,8 +560,19 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             }
         }
         PlanNode::Distinct { input } => count_plan(input, n),
-        PlanNode::GroupBy { input, having, .. } => {
+        PlanNode::GroupBy {
+            input,
+            keys,
+            aggregates,
+            having,
+        } => {
             count_plan(input, n);
+            for key in keys {
+                count_expr(&key.expr, n);
+            }
+            for aggregate in aggregates {
+                count_expr(&aggregate.argument, n);
+            }
             if let Some(pred) = having {
                 count_expr(pred, n);
             }
@@ -393,6 +617,12 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 for arg in &w.args {
                     count_expr(arg, n);
                 }
+                for expr in &w.partition_by {
+                    count_expr(expr, n);
+                }
+                for key in &w.order_by {
+                    count_expr(&key.expr, n);
+                }
             }
         }
         PlanNode::Union { left, right, .. } => {
@@ -407,6 +637,52 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
     }
 }
 
+fn count_group_projection_expr(
+    expr: &Expr,
+    aggregates: &[crate::plan::GroupAgg],
+    visited: &mut std::collections::HashSet<String>,
+    n: &mut usize,
+) {
+    if let Expr::Field(name) = expr {
+        if visited.insert(name.clone()) {
+            if let Some(aggregate) = aggregates.iter().find(|agg| agg.output_name == *name) {
+                count_expr(&aggregate.argument, n);
+                return;
+            }
+        }
+    }
+    match expr {
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            count_group_projection_expr(left, aggregates, visited, n);
+            count_group_projection_expr(right, aggregates, visited, n);
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => {
+            count_group_projection_expr(inner, aggregates, visited, n);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                count_group_projection_expr(arg, aggregates, visited, n);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            count_group_projection_expr(expr, aggregates, visited, n);
+            for item in list {
+                count_group_projection_expr(item, aggregates, visited, n);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                count_group_projection_expr(condition, aggregates, visited, n);
+                count_group_projection_expr(result, aggregates, visited, n);
+            }
+            if let Some(expr) = else_expr {
+                count_group_projection_expr(expr, aggregates, visited, n);
+            }
+        }
+        _ => count_expr(expr, n),
+    }
+}
+
 fn count_expr(expr: &Expr, n: &mut usize) {
     match expr {
         Expr::Literal(_) => *n += 1,
@@ -416,7 +692,7 @@ fn count_expr(expr: &Expr, n: &mut usize) {
             count_expr(r, n);
         }
         Expr::UnaryOp(_, inner) => count_expr(inner, n),
-        Expr::FunctionCall(_, inner) => count_expr(inner, n),
+        Expr::FunctionCall(_, inner, _) => count_expr(inner, n),
         Expr::Coalesce(l, r) => {
             count_expr(l, n);
             count_expr(r, n);
@@ -451,9 +727,20 @@ fn count_expr(expr: &Expr, n: &mut usize) {
             // Subquery literals are not counted — the subquery is
             // re-planned/executed separately.
         }
-        Expr::Window { args, .. } => {
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for a in args {
                 count_expr(a, n);
+            }
+            for expr in partition_by {
+                count_expr(expr, n);
+            }
+            for key in order_by {
+                count_expr(&key.expr, n);
             }
         }
         // JSON path segments are STRUCTURAL, never literal slots (#137): only
@@ -484,7 +771,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         Expr::UnaryOp(_, inner) => {
             substitute_expr(inner, literals, idx);
         }
-        Expr::FunctionCall(_, inner) => {
+        Expr::FunctionCall(_, inner, _) => {
             substitute_expr(inner, literals, idx);
         }
         Expr::Coalesce(l, r) => {
@@ -519,9 +806,20 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
             // Subquery has its own literal list; nothing to substitute
             // at this level.
         }
-        Expr::Window { args, .. } => {
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for a in args {
                 substitute_expr(a, literals, idx);
+            }
+            for expr in partition_by {
+                substitute_expr(expr, literals, idx);
+            }
+            for key in order_by {
+                substitute_expr(&mut key.expr, literals, idx);
             }
         }
         // JSON path segments are STRUCTURAL (#137): substitution only recurses
@@ -625,21 +923,20 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_join_query_shares_plan_across_literals() {
-        // P-5: a qualified-key grouped-join query with a HAVING literal must
-        // canonicalize identically regardless of that literal, cache cleanly
-        // (#137 slot-count invariant holds: group keys and aggregate args are
-        // structural identifiers, never literal slots), and substitute the new
-        // HAVING literal on a hit.
+    fn test_grouped_join_having_is_not_cached_without_source_slot_ordinals() {
+        // Qualified grouped joins have the same ambiguity as single-table
+        // grouped HAVING: planning no longer retains whether HAVING appeared
+        // before or after the projection, so matching slot counts alone do not
+        // make literal replay safe.
         let mut cache = PlanCache::new(100);
         let q1 = "User as u join Order as o on u.id = o.user_id \
                   group u.status having count(o.total) > 1 { u.status, n: count(o.total) }";
         let (h1, lits1) = canonicalize(q1).unwrap();
         let p1 = planner::plan(q1).unwrap();
 
-        // Only the HAVING `1` is a substitutable literal; the qualified keys
-        // and aggregate arguments are identifiers, so the slot count matches
-        // the canonical literal count and the plan is cacheable.
+        // Only the HAVING `1` is a substitutable literal; the slot count still
+        // matches, proving the grouped-HAVING shape guard is what protects the
+        // cache rather than an incidental count mismatch.
         assert_eq!(lits1.len(), 1, "only the HAVING literal is collected");
         assert_eq!(
             count_literal_slots(&p1),
@@ -647,22 +944,16 @@ mod tests {
             "group keys/args are structural, so slots == literals (#137)"
         );
         cache.insert(h1, p1, lits1.len());
-        assert_eq!(cache.len(), 1, "grouped-join plan must cache");
+        assert!(cache.is_empty(), "grouped HAVING plans must not cache");
 
         let q2 = "User as u join Order as o on u.id = o.user_id \
                   group u.status having count(o.total) > 5 { u.status, n: count(o.total) }";
         let (h2, lits2) = canonicalize(q2).unwrap();
         assert_eq!(h1, h2, "different HAVING literal must hash the same");
 
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
-        let mut found = Vec::new();
-        collect_literals_for_test(&plan, &mut found);
-        assert_eq!(
-            found,
-            vec![Literal::Int(5)],
-            "new HAVING literal substituted"
-        );
-        assert_eq!(cache.hits, 1);
+        assert!(cache.get_with_substitution(h2, &lits2).is_none());
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 1);
     }
 
     #[test]
@@ -727,6 +1018,78 @@ mod tests {
             cache.get_with_substitution(h2, &lits2).is_none(),
             "a different path must not hit the cached plan"
         );
+    }
+
+    #[test]
+    fn expression_aggregate_literal_substitutes_on_cache_hit() {
+        let mut cache = PlanCache::new(8);
+        let q1 = "Post group .data->kind { total: sum(.data->age + 1) }";
+        let (h1, literals1) = canonicalize(q1).unwrap();
+        let plan1 = planner::plan(q1).unwrap();
+        assert_eq!(count_literal_slots(&plan1), literals1.len());
+        cache.insert(h1, plan1, literals1.len());
+
+        let q2 = "Post group .data->kind { total: sum(.data->age + 7) }";
+        let (h2, literals2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2);
+        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(7)]);
+    }
+
+    #[test]
+    fn expression_index_equality_and_range_bounds_substitute_on_cache_hits() {
+        let mut cache = PlanCache::new(8);
+
+        let q1 = "Post filter .data->age = 21";
+        let (h1, literals1) = canonicalize(q1).unwrap();
+        let plan1 = planner::plan(q1).unwrap();
+        assert!(matches!(plan1, PlanNode::ExprIndexScan { .. }));
+        assert_eq!(count_literal_slots(&plan1), literals1.len());
+        cache.insert(h1, plan1, literals1.len());
+
+        let q2 = "Post filter .data->age = 65";
+        let (h2, literals2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2);
+        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(65)]);
+
+        let q3 = "Post filter .data->age >= 18 and .data->age < 65";
+        let (h3, literals3) = canonicalize(q3).unwrap();
+        let plan3 = planner::plan(q3).unwrap();
+        assert!(matches!(plan3, PlanNode::ExprRangeScan { .. }));
+        assert_eq!(count_literal_slots(&plan3), literals3.len());
+        cache.insert(h3, plan3, literals3.len());
+
+        let q4 = "Post filter .data->age >= 25 and .data->age < 80";
+        let (h4, literals4) = canonicalize(q4).unwrap();
+        assert_eq!(h3, h4);
+        let plan = cache.get_with_substitution(h4, &literals4).expect("hit");
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(25), Literal::Int(80)]);
+    }
+
+    #[test]
+    fn ordered_expression_scan_limit_offset_substitute_in_canonical_order() {
+        let mut cache = PlanCache::new(8);
+        let q1 = "Post order .data->age desc limit 10 offset 2";
+        let (h1, literals1) = canonicalize(q1).unwrap();
+        let plan1 = planner::plan(q1).unwrap();
+        assert!(matches!(plan1, PlanNode::OrderedExprIndexScan { .. }));
+        assert_eq!(count_literal_slots(&plan1), literals1.len());
+        cache.insert(h1, plan1, literals1.len());
+
+        let q2 = "Post order .data->age desc limit 20 offset 3";
+        let (h2, literals2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2);
+        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(20), Literal::Int(3)]);
     }
 
     #[test]
@@ -863,6 +1226,21 @@ mod tests {
                     collect_expr_literals(expr, out);
                 }
             }
+            PlanNode::ExprIndexScan { key, .. } => collect_expr_literals(key, out),
+            PlanNode::ExprRangeScan { start, end, .. } => {
+                if let Some((expr, _)) = start {
+                    collect_expr_literals(expr, out);
+                }
+                if let Some((expr, _)) = end {
+                    collect_expr_literals(expr, out);
+                }
+            }
+            PlanNode::OrderedExprIndexScan { limit, offset, .. } => {
+                collect_expr_literals(limit, out);
+                if let Some(offset) = offset {
+                    collect_expr_literals(offset, out);
+                }
+            }
             PlanNode::Filter { input, predicate } => {
                 collect_literals_for_test(input, out);
                 collect_expr_literals(predicate, out);
@@ -873,7 +1251,12 @@ mod tests {
                     collect_expr_literals(&f.expr, out);
                 }
             }
-            PlanNode::Sort { input, .. } => collect_literals_for_test(input, out),
+            PlanNode::Sort { input, keys } => {
+                collect_literals_for_test(input, out);
+                for key in keys {
+                    collect_expr_literals(&key.expr, out);
+                }
+            }
             PlanNode::Limit { input, count } => {
                 collect_literals_for_test(input, out);
                 collect_expr_literals(count, out);
@@ -882,7 +1265,14 @@ mod tests {
                 collect_literals_for_test(input, out);
                 collect_expr_literals(count, out);
             }
-            PlanNode::Aggregate { input, .. } => collect_literals_for_test(input, out),
+            PlanNode::Aggregate {
+                input, argument, ..
+            } => {
+                collect_literals_for_test(input, out);
+                if let Some(argument) = argument {
+                    collect_expr_literals(argument, out);
+                }
+            }
             PlanNode::NestedLoopJoin {
                 left, right, on, ..
             } => {
@@ -920,8 +1310,19 @@ mod tests {
                 }
             }
             PlanNode::Distinct { input } => collect_literals_for_test(input, out),
-            PlanNode::GroupBy { input, having, .. } => {
+            PlanNode::GroupBy {
+                input,
+                keys,
+                aggregates,
+                having,
+            } => {
                 collect_literals_for_test(input, out);
+                for key in keys {
+                    collect_expr_literals(&key.expr, out);
+                }
+                for aggregate in aggregates {
+                    collect_expr_literals(&aggregate.argument, out);
+                }
                 if let Some(pred) = having {
                     collect_expr_literals(pred, out);
                 }
@@ -938,6 +1339,12 @@ mod tests {
                 for w in windows {
                     for arg in &w.args {
                         collect_expr_literals(arg, out);
+                    }
+                    for expr in &w.partition_by {
+                        collect_expr_literals(expr, out);
+                    }
+                    for key in &w.order_by {
+                        collect_expr_literals(&key.expr, out);
                     }
                 }
             }
@@ -962,7 +1369,7 @@ mod tests {
                 collect_expr_literals(r, out);
             }
             Expr::UnaryOp(_, inner) => collect_expr_literals(inner, out),
-            Expr::FunctionCall(_, inner) => collect_expr_literals(inner, out),
+            Expr::FunctionCall(_, inner, _) => collect_expr_literals(inner, out),
             Expr::Coalesce(l, r) => {
                 collect_expr_literals(l, out);
                 collect_expr_literals(r, out);
@@ -992,9 +1399,20 @@ mod tests {
                 collect_expr_literals(expr, out);
             }
             Expr::ExistsSubquery { .. } => {}
-            Expr::Window { args, .. } => {
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
                 for a in args {
                     collect_expr_literals(a, out);
+                }
+                for expr in partition_by {
+                    collect_expr_literals(expr, out);
+                }
+                for key in order_by {
+                    collect_expr_literals(&key.expr, out);
                 }
             }
             // JSON path segments are structural, never literals — mirror

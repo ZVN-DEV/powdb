@@ -214,6 +214,7 @@ fn restore_chain_rejects_broken_chain() {
         format_version: powdb_backup::BackupManifest::FORMAT_VERSION,
         created_unix_secs: 0,
         source_lsn: inc_a.source_lsn,
+        catalog_version: inc_a.catalog_version,
         sync: inc_a.sync.clone(),
         files: base.files.clone(),
     };

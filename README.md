@@ -160,6 +160,10 @@ User as u inner join Team as t on u.team_id = t.id { u.name, team_name: t.name }
 -- GROUP BY + HAVING
 User group .city having avg(.age) > 30 { .city, avg_age: avg(.age) }
 
+-- JSON paths can be filtered, grouped, aggregated, ordered, and indexed
+Post group .data->category { .data->category, total: sum(.data->amount) }
+alter Post add index (.data->published_at)
+
 -- Subqueries
 User filter .id in (Order filter .total > 100 { .user_id })
 
@@ -226,7 +230,7 @@ if (result.kind === "rows") console.table(result.rows);
 | `POWDB_TLS_CERT` / `POWDB_TLS_KEY` | *(none)* | Paths to PEM cert + key; when both are set the server serves TLS |
 | `POWDB_REQUIRE_TLS` | *(off)* | When set (`1`/`true`), refuse to start if a password is configured without TLS |
 | `POWDB_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
-| `POWDB_QUERY_TIMEOUT` | `30` | Per-query timeout threshold in seconds; until cooperative cancellation is implemented, over-threshold blocking queries are recorded but finish before the server replies |
+| `POWDB_QUERY_TIMEOUT` | `30` | Per-query deadline in seconds; cooperative cancellation stops supported scan, join, group, and mutation-discovery work and releases server admission promptly |
 | `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated** — bind it to localhost or a private network, never the public internet |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
@@ -250,24 +254,24 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 
 **Storage engine**
 - Slotted-page heap with 4KB pages
-- B+tree indexes with crash-safe persistence (BIDX binary format)
+- B+tree indexes with crash-safe persistence (BIDX binary format), including scalar JSON-path indexes
 - Write-ahead log with statement-boundary group commit
 - Crash recovery (WAL replay + page-zero recovery + index rebuild)
 - Memory-mapped reads (zero-syscall scan path)
 - Compiled integer predicates (branch-free filter at the byte level)
-- Thread-safe concurrent reads via pread(2)/pwrite(2)
+- Thread-safe concurrent reads via pread(2)/pwrite(2), with shared server admission for autocommit reads
 - Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore` — see [docs/backup-and-restore.md](docs/backup-and-restore.md))
 
 **Query engine**
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
-- SQL frontend: a supported subset of SQL lowered to the PowQL AST, sharing the plan cache ([docs/SQL.md](docs/SQL.md))
-- Joins (nested-loop + hash join for equi-joins)
+- SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](docs/SQL.md))
+- Joins (hash join with compound-`ON` residuals, plus bounded nested-loop fallback)
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
-- Expressions in projections and filters (arithmetic, string ops, BETWEEN, LIKE, IN-list)
-- COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT
-- ORDER BY (multi-column), LIMIT, OFFSET
+- Expressions in projections, filters, group keys, aggregate arguments, and order keys (arithmetic, JSON paths, string ops, BETWEEN, LIKE, IN-list)
+- COUNT, SUM, AVG, MIN, MAX, COUNT DISTINCT, with symmetric PowQL join semantics and explicit `raw` opt-out
+- ORDER BY (multi-expression), LIMIT, OFFSET
 - Window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/MIN/MAX OVER)
 - CAST, CASE/WHEN, COALESCE (`??`)
 - Scalar functions: UPPER, LOWER, LENGTH, TRIM, SUBSTRING, CONCAT, ABS, ROUND, CEIL, FLOOR, SQRT, POW, NOW, EXTRACT, DATE_ADD, DATE_DIFF
@@ -281,11 +285,12 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 **DDL**
 - `type` (create table), `drop` (drop table)
 - `alter <T> add column`, `alter <T> drop column` (with full heap rewrite)
-- `alter <T> add index` (B+tree, persisted)
+- `alter <T> add index` / `add unique` / `drop index` for stored columns and scalar JSON paths
 
 **Server**
 - Tokio async TCP with `Arc<RwLock<Engine>>` for parallel readers
-- Binary wire protocol (length-prefixed framing)
+- Binary wire protocol (length-prefixed framing), with opt-in native typed rows/scalars for exact Bytes and PJ1 JSON
+- Cooperative query deadlines and disconnect cancellation
 - TLS support for encrypted connections
 - Authentication: shared password (`POWDB_PASSWORD`) or named users with roles (argon2id-hashed)
 

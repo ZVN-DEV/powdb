@@ -95,6 +95,19 @@ pub enum PathSeg<'a> {
     Index(u32),
 }
 
+/// Scalar view used by expression-index maintenance. Strings borrow directly
+/// from PJ1; arrays and objects are reported distinctly so callers can reject
+/// them before any heap, overflow, or WAL mutation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pj1Scalar<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(&'a str),
+    NonScalar,
+}
+
 /// Errors from PJ1 parsing, validation, and rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonError {
@@ -801,6 +814,40 @@ pub fn pj1_get<'a>(doc: &'a [u8], seg: &PathSeg) -> Option<&'a [u8]> {
             None
         }
         _ => None,
+    }
+}
+
+/// Decode one already-selected PJ1 node as a scalar without rendering JSON
+/// text. The input must be a complete canonical PJ1 node (as returned by
+/// [`pj1_get`]); malformed scalar payloads are rejected.
+pub fn pj1_scalar(doc: &[u8]) -> Result<Pj1Scalar<'_>, JsonError> {
+    let tag = *doc.first().ok_or(JsonError::Truncated)?;
+    match tag {
+        TAG_NULL if doc.len() == 1 => Ok(Pj1Scalar::Null),
+        TAG_FALSE if doc.len() == 1 => Ok(Pj1Scalar::Bool(false)),
+        TAG_TRUE if doc.len() == 1 => Ok(Pj1Scalar::Bool(true)),
+        TAG_INT if doc.len() == 9 => Ok(Pj1Scalar::Int(
+            read_i64(doc, 1).ok_or(JsonError::Truncated)?,
+        )),
+        TAG_FLOAT if doc.len() == 9 => {
+            let value = read_f64(doc, 1).ok_or(JsonError::Truncated)?;
+            if !value.is_finite() {
+                return Err(JsonError::MalformedPj1("non-finite float".into()));
+            }
+            Ok(Pj1Scalar::Float(value))
+        }
+        TAG_STRING => {
+            let (value, end) = read_str(doc, 0)?;
+            if end != doc.len() {
+                return Err(JsonError::MalformedPj1(
+                    "trailing bytes after string scalar".into(),
+                ));
+            }
+            Ok(Pj1Scalar::Str(value))
+        }
+        TAG_ARRAY | TAG_OBJECT => Ok(Pj1Scalar::NonScalar),
+        8..=15 => Err(JsonError::ReservedTag(tag)),
+        _ => Err(JsonError::ReservedTag(tag)),
     }
 }
 

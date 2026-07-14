@@ -1,5 +1,7 @@
-use crate::manifest::{current_sync_snapshot_metadata, BackupManifest, FileEntry};
-use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
+use crate::manifest::{
+    active_durable_file_names, current_sync_snapshot_metadata, BackupManifest, FileEntry,
+};
+use powdb_storage::catalog::Catalog;
 use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,24 +16,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManifest> {
     powdb_sync::checkpoint_preserving_retained_segments_if_enabled(catalog)?;
     let source_lsn = catalog.max_lsn();
+    let catalog_version = catalog.active_catalog_version();
     let src = catalog.data_dir().to_path_buf();
-    let sync = current_sync_snapshot_metadata(&src, source_lsn)?;
+    let sync = current_sync_snapshot_metadata(&src, source_lsn, catalog_version)?;
     std::fs::create_dir_all(dest)?;
 
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(&src)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Durable state only: catalog + heaps + indexes. wal.log was just
-        // truncated; manifest.json is ours.
-        let is_durable = name == "catalog.bin"
-            || name == CATALOG_LSN_FILE
-            || name.ends_with(".heap")
-            || name.ends_with(".idx");
-        if !is_durable {
-            continue;
+    for name in active_durable_file_names(catalog) {
+        let source_path = src.join(&name);
+        if !source_path.exists() {
+            // `catalog.lsn` is absent in pristine databases with no durable
+            // statement boundary yet. Every metadata-referenced heap/index is
+            // required and a missing one must fail closed.
+            if name == powdb_storage::catalog::CATALOG_LSN_FILE {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("catalog references missing durable file {name}"),
+            ));
         }
-        let bytes = std::fs::read(entry.path())?;
+        if !source_path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("catalog durable path is not a file: {name}"),
+            ));
+        }
+        let bytes = std::fs::read(source_path)?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
         std::fs::write(dest.join(&name), &bytes)?;
         files.push(FileEntry {
@@ -49,6 +60,7 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
             .map(|d| d.as_secs())
             .unwrap_or(0),
         source_lsn,
+        catalog_version,
         sync,
         files,
     };

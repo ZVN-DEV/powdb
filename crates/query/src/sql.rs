@@ -5,7 +5,7 @@
 //! equivalent canonical PowQL text so plan-cache entries are shared with the
 //! native PowQL spelling.
 
-use crate::ast::Statement;
+use crate::ast::{AggregateMode, Expr, QueryExpr, Statement};
 use crate::parser::{self, ParseError};
 
 #[derive(Debug, Clone)]
@@ -36,11 +36,178 @@ pub fn parse_sql_with_canonical(input: &str) -> Result<ParsedSql, ParseError> {
             ),
         });
     }
-    let statement = parser::parse(&canonical_powql)?;
+    let mut statement = parser::parse(&canonical_powql)?;
+    mark_sql_statement_raw(&mut statement);
     Ok(ParsedSql {
         statement,
         canonical_powql,
     })
+}
+
+fn mark_sql_statement_raw(statement: &mut Statement) {
+    match statement {
+        Statement::Query(query) => mark_sql_query_raw(query),
+        Statement::Union(union) => {
+            mark_sql_statement_raw(&mut union.left);
+            mark_sql_statement_raw(&mut union.right);
+        }
+        Statement::Explain(inner) => mark_sql_statement_raw(inner),
+        Statement::CreateView(view) => mark_sql_query_raw(&mut view.query),
+        _ => {}
+    }
+}
+
+fn mark_sql_query_raw(query: &mut QueryExpr) {
+    if let Some(aggregate) = &mut query.aggregation {
+        aggregate.mode = AggregateMode::Raw;
+        if let Some(argument) = &mut aggregate.argument {
+            mark_sql_expr_raw(argument);
+        }
+    }
+    for join in &mut query.joins {
+        if let Some(on) = &mut join.on {
+            mark_sql_expr_raw(on);
+        }
+    }
+    if let Some(filter) = &mut query.filter {
+        mark_sql_expr_raw(filter);
+    }
+    if let Some(order) = &mut query.order {
+        for key in &mut order.keys {
+            mark_sql_expr_raw(&mut key.expr);
+        }
+    }
+    if let Some(projection) = &mut query.projection {
+        for field in projection {
+            mark_sql_expr_raw(&mut field.expr);
+        }
+    }
+    if let Some(group) = &mut query.group_by {
+        for key in &mut group.keys {
+            mark_sql_expr_raw(&mut key.expr);
+        }
+        if let Some(having) = &mut group.having {
+            mark_sql_expr_raw(having);
+        }
+    }
+}
+
+fn mark_sql_expr_raw(expr: &mut Expr) {
+    match expr {
+        Expr::FunctionCall(_, argument, mode) => {
+            *mode = AggregateMode::Raw;
+            mark_sql_expr_raw(argument);
+        }
+        Expr::Window {
+            args,
+            mode,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            *mode = AggregateMode::Raw;
+            for expr in args.iter_mut().chain(partition_by.iter_mut()) {
+                mark_sql_expr_raw(expr);
+            }
+            for key in order_by {
+                mark_sql_expr_raw(&mut key.expr);
+            }
+        }
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            mark_sql_expr_raw(left);
+            mark_sql_expr_raw(right);
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::JsonPath { base: inner, .. } => {
+            mark_sql_expr_raw(inner);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for expr in args {
+                mark_sql_expr_raw(expr);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            mark_sql_expr_raw(expr);
+            for item in list {
+                mark_sql_expr_raw(item);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            mark_sql_expr_raw(expr);
+            mark_sql_query_raw(subquery);
+        }
+        Expr::ExistsSubquery { subquery, .. } => mark_sql_query_raw(subquery),
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                mark_sql_expr_raw(condition);
+                mark_sql_expr_raw(result);
+            }
+            if let Some(expr) = else_expr {
+                mark_sql_expr_raw(expr);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn statement_has_aggregate(statement: &Statement) -> bool {
+    match statement {
+        Statement::Query(query) => query_has_aggregate(query),
+        Statement::Union(union) => {
+            statement_has_aggregate(&union.left) || statement_has_aggregate(&union.right)
+        }
+        Statement::Explain(inner) => statement_has_aggregate(inner),
+        Statement::CreateView(view) => query_has_aggregate(&view.query),
+        _ => false,
+    }
+}
+
+fn query_has_aggregate(query: &QueryExpr) -> bool {
+    query.aggregation.is_some()
+        || query
+            .joins
+            .iter()
+            .filter_map(|join| join.on.as_ref())
+            .any(expr_has_aggregate)
+        || query.filter.as_ref().is_some_and(expr_has_aggregate)
+        || query
+            .order
+            .as_ref()
+            .is_some_and(|order| order.keys.iter().any(|key| expr_has_aggregate(&key.expr)))
+        || query.projection.as_ref().is_some_and(|projection| {
+            projection
+                .iter()
+                .any(|field| expr_has_aggregate(&field.expr))
+        })
+        || query.group_by.as_ref().is_some_and(|group| {
+            group.keys.iter().any(|key| expr_has_aggregate(&key.expr))
+                || group.having.as_ref().is_some_and(expr_has_aggregate)
+        })
+}
+
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(..) | Expr::Window { .. } => true,
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            expr_has_aggregate(left) || expr_has_aggregate(right)
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::JsonPath { base: inner, .. } => {
+            expr_has_aggregate(inner)
+        }
+        Expr::ScalarFunc(_, args) => args.iter().any(expr_has_aggregate),
+        Expr::InList { expr, list, .. } => {
+            expr_has_aggregate(expr) || list.iter().any(expr_has_aggregate)
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            expr_has_aggregate(expr) || query_has_aggregate(subquery)
+        }
+        Expr::ExistsSubquery { subquery, .. } => query_has_aggregate(subquery),
+        Expr::Case { whens, else_expr } => {
+            whens.iter().any(|(condition, result)| {
+                expr_has_aggregate(condition) || expr_has_aggregate(result)
+            }) || else_expr.as_deref().is_some_and(expr_has_aggregate)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +307,17 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 i += 1;
             }
             out.push(SqlTok::Param(chars[start..i].iter().collect()));
+            continue;
+        }
+        // Longest token first: `->>` must not be split into `->` plus `>`.
+        if c == '-' && chars.get(i + 1) == Some(&'>') {
+            if chars.get(i + 2) == Some(&'>') {
+                out.push(SqlTok::Op("->>".into()));
+                i += 3;
+            } else {
+                out.push(SqlTok::Op("->".into()));
+                i += 2;
+            }
             continue;
         }
         if c.is_ascii_digit() || (c == '-' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
@@ -399,7 +577,7 @@ impl SqlParser {
         };
         let group = if self.eat_kw("group") {
             self.expect_kw("by")?;
-            Some(self.field_list_until(&["having", "order", "limit", "offset"])?)
+            Some(self.expression_list_until(&["having", "order", "limit", "offset"])?)
         } else {
             None
         };
@@ -425,7 +603,6 @@ impl SqlParser {
             None
         };
 
-        let has_joins = !joins.is_empty();
         let has_group = group.is_some();
 
         let mut out = source;
@@ -470,9 +647,9 @@ impl SqlParser {
             // yields a scalar. Without this the SQL frontend lowered it to
             // `t { count(*) }` and returned one null row per source row.
             if !has_group && items.iter().any(|p| p.agg.is_some()) {
-                if has_joins || distinct {
+                if distinct {
                     return Err(ParseError::Unsupported {
-                        feature: "aggregates over a join or with DISTINCT and no GROUP BY are not supported by the SQL frontend".into(),
+                        feature: "aggregates with DISTINCT and no GROUP BY are not supported by the SQL frontend".into(),
                     });
                 }
                 if items.len() != 1 {
@@ -814,8 +991,19 @@ impl SqlParser {
         self.expect_kw("on")?;
         let table = self.expect_ident("table name")?;
         self.expect_sym('(')?;
+        if !matches!(self.peek(), Some(SqlTok::Word(_))) {
+            return Err(ParseError::Unsupported {
+                feature: "SQL expression indexes are not supported; use PowQL `alter <table> add index (.<json-column>-><path>)`"
+                    .into(),
+            });
+        }
         let col = self.expect_ident("column name")?;
-        self.expect_sym(')')?;
+        if !self.eat_sym(')') {
+            return Err(ParseError::Unsupported {
+                feature: "SQL expression and multi-column indexes are not supported; use PowQL `alter <table> add index (.<json-column>-><path>)` for a JSON path"
+                    .into(),
+            });
+        }
         Ok(if unique {
             format!("alter {table} add unique .{col}")
         } else {
@@ -930,21 +1118,24 @@ impl SqlParser {
         Ok(out)
     }
 
-    fn field_list_until(&mut self, stop: &[&str]) -> Result<Vec<String>, ParseError> {
-        let mut fields = Vec::new();
+    fn expression_list_until(&mut self, stop: &[&str]) -> Result<Vec<String>, ParseError> {
+        let mut expressions = Vec::new();
         loop {
-            fields.push(self.field_ref()?);
+            expressions.push(self.expr_until(stop)?);
             if !self.eat_sym(',') || self.next_is_stop(stop) {
                 break;
             }
         }
-        Ok(fields)
+        Ok(expressions)
     }
 
     fn order_list_until(&mut self, stop: &[&str]) -> Result<String, ParseError> {
         let mut parts = Vec::new();
+        let mut expression_stop = Vec::with_capacity(stop.len() + 2);
+        expression_stop.extend_from_slice(stop);
+        expression_stop.extend_from_slice(&["asc", "desc"]);
         loop {
-            let mut p = self.field_ref()?;
+            let mut p = self.expr_until(&expression_stop)?;
             if self.eat_kw("desc") {
                 p.push_str(" desc");
             } else if self.eat_kw("asc") {
@@ -956,16 +1147,6 @@ impl SqlParser {
             }
         }
         Ok(parts.join(", "))
-    }
-
-    fn field_ref(&mut self) -> Result<String, ParseError> {
-        let first = self.expect_ident("column name")?;
-        if self.eat_sym('.') {
-            let second = self.expect_ident("qualified column name")?;
-            Ok(format!("{first}.{second}"))
-        } else {
-            Ok(format!(".{first}"))
-        }
     }
 
     fn expr_until(&mut self, stop: &[&str]) -> Result<String, ParseError> {
@@ -1026,6 +1207,38 @@ impl SqlParser {
                 || matches!(self.peek(), Some(SqlTok::Symbol(')' | ',')))
             {
                 break;
+            }
+            if matches!(self.peek(), Some(SqlTok::Op(op)) if op == "->" || op == "->>") {
+                let text = matches!(self.bump(), Some(SqlTok::Op(op)) if op == "->>");
+                let segment = match self.bump() {
+                    Some(SqlTok::String(key)) => quote_powql_string(&key),
+                    Some(SqlTok::Number(index))
+                        if !index.starts_with('-') && !index.contains('.') =>
+                    {
+                        index
+                    }
+                    Some(token) => {
+                        return Err(ParseError::Syntax {
+                            message: format!(
+                                "SQL JSON arrows require a string key or non-negative integer index, got {}",
+                                token.display()
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "JSON object key or array index".into(),
+                            got: "<eof>".into(),
+                        });
+                    }
+                };
+                let path = format!("{lhs}->{segment}");
+                lhs = if text {
+                    format!("json_text({path})")
+                } else {
+                    path
+                };
+                continue;
             }
             if self.eat_kw("is") {
                 let not = self.eat_kw("not");
@@ -1229,6 +1442,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_arrows_lex_longest_token_and_lower_to_powql_paths() {
+        assert_eq!(
+            lex_sql("data->>'name'").unwrap(),
+            vec![
+                SqlTok::Word("data".into()),
+                SqlTok::Op("->>".into()),
+                SqlTok::String("name".into()),
+            ]
+        );
+        let parsed = parse_sql_with_canonical(
+            "SELECT data -> 'author' ->> 'name' AS name, data -> 'tags' -> 0 AS first FROM Post WHERE data ->> 'state' = 'ready'",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.canonical_powql,
+            "Post filter json_text(.data->\"state\") = \"ready\" { name: json_text(.data->\"author\"->\"name\"), first: .data->\"tags\"->0 }"
+        );
+        let raw = parse_sql_with_canonical("SELECT data -> 'name' FROM Post").unwrap();
+        let text = parse_sql_with_canonical("SELECT data ->> 'name' FROM Post").unwrap();
+        assert_ne!(
+            crate::canonicalize::canonicalize(&raw.canonical_powql)
+                .unwrap()
+                .0,
+            crate::canonicalize::canonicalize(&text.canonical_powql)
+                .unwrap()
+                .0,
+            "-> and ->> must never share a cached plan"
+        );
+
+        let ordered = parse_sql_with_canonical(
+            "SELECT id FROM Post ORDER BY data ->> 'rank' DESC, data -> 'tie' ASC",
+        )
+        .unwrap();
+        assert_eq!(
+            ordered.canonical_powql,
+            "Post order json_text(.data->\"rank\") desc, .data->\"tie\" asc { .id }"
+        );
+
+        let grouped = parse_sql_with_canonical(
+            "SELECT data ->> 'kind' AS kind, COUNT(*) AS n FROM Post GROUP BY data ->> 'kind'",
+        )
+        .unwrap();
+        assert_eq!(
+            grouped.canonical_powql,
+            "Post group json_text(.data->\"kind\") { kind: json_text(.data->\"kind\"), n: count(*) }"
+        );
+    }
+
+    #[test]
+    fn json_arrows_reject_invalid_path_segments() {
+        for sql in [
+            "SELECT data -> other FROM Post",
+            "SELECT data -> -1 FROM Post",
+            "SELECT data -> 1.5 FROM Post",
+        ] {
+            let err = parse_sql_with_canonical(sql).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("string key or non-negative integer index"),
+                "unexpected error for `{sql}`: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn select_lowers_to_powql_ast() {
         let sql = parse_sql_with_canonical(
             "SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 10",
@@ -1270,5 +1548,51 @@ mod tests {
         let err = parse_sql("SELECT name FROM User WHERE id IN (SELECT user_id FROM Orders)")
             .unwrap_err();
         assert!(err.to_string().contains("SQL IN"));
+    }
+
+    #[test]
+    fn sql_expression_index_has_targeted_powql_guidance() {
+        assert!(matches!(
+            parse_sql("CREATE INDEX post_slug ON Post (slug)").unwrap(),
+            Statement::AlterTable(_)
+        ));
+        let error = parse_sql("CREATE INDEX post_age ON Post (data->>'age')")
+            .expect_err("SQL expression indexes remain outside the SQL subset")
+            .to_string();
+        assert!(error.contains("SQL expression"));
+        assert!(error.contains("alter <table> add index"));
+    }
+
+    #[test]
+    fn sql_aggregates_lower_with_raw_mode() {
+        let Statement::Query(query) =
+            parse_sql("SELECT dept, SUM(balance) AS total FROM Account GROUP BY dept").unwrap()
+        else {
+            panic!("expected query");
+        };
+        let projection = query.projection.expect("projection");
+        assert!(matches!(
+            projection[1].expr,
+            Expr::FunctionCall(_, _, AggregateMode::Raw)
+        ));
+    }
+
+    #[test]
+    fn ungrouped_join_aggregate_lowers_to_raw_powql_aggregate() {
+        let lowered = parse_sql_with_canonical(
+            "SELECT AVG(a.balance) FROM Account a JOIN Entry e ON a.id = e.account_id",
+        )
+        .unwrap();
+        assert_eq!(
+            lowered.canonical_powql,
+            "avg(Account as a inner join Entry as e on a.id = e.account_id { a.balance })"
+        );
+        let Statement::Query(query) = lowered.statement else {
+            panic!("expected query");
+        };
+        assert_eq!(
+            query.aggregation.expect("aggregate").mode,
+            AggregateMode::Raw
+        );
     }
 }

@@ -178,7 +178,9 @@ fn hash_path_segment(h: u64, tok: &Token) -> u64 {
             hash_bytes(h, s.as_bytes())
         }
         Token::StringLit(s) => {
-            let h = hash_byte(h, 0x09);
+            // Quoted and unquoted object-key spellings have one structural
+            // identity: `->author` and `->"author"` share a plan shape.
+            let h = hash_byte(h, 0x08);
             let h = hash_byte(h, s.len() as u8);
             hash_bytes(h, s.as_bytes())
         }
@@ -272,6 +274,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Sum => hash_byte(h, 0x2E),
         Token::Min => hash_byte(h, 0x2F),
         Token::Max => hash_byte(h, 0x30),
+        Token::Raw => hash_byte(h, 0x8F),
         Token::Join => hash_byte(h, 0x31),
         Token::Inner => hash_byte(h, 0x32),
         Token::LeftKw => hash_byte(h, 0x33),
@@ -322,6 +325,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::DateAdd => hash_byte(h, 0x78),
         Token::DateDiff => hash_byte(h, 0x79),
         Token::JsonType => hash_byte(h, 0x0C),
+        Token::JsonText => hash_byte(h, 0x0D),
         Token::Cast => hash_byte(h, 0x7A),
         Token::Begin => hash_byte(h, 0x7B),
         Token::Commit => hash_byte(h, 0x7C),
@@ -493,5 +497,33 @@ mod tests {
         let (h1, _) = canonicalize(r#"Post filter .data->0 = 1"#).unwrap();
         let (h2, _) = canonicalize(r#"Post filter .data->"0" = 1"#).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn quoted_and_unquoted_path_keys_share_identity() {
+        let (unquoted, _) = canonicalize(r#"Post filter .data->author = "x""#).unwrap();
+        let (quoted, _) = canonicalize(r#"Post filter .data->"author" = "x""#).unwrap();
+        assert_eq!(unquoted, quoted);
+    }
+
+    #[test]
+    fn expression_index_ddl_paths_are_structural_and_key_index_safe() {
+        let (unquoted, literals) = canonicalize("alter Post add index (.data->author->0)").unwrap();
+        let (quoted, quoted_literals) =
+            canonicalize("alter Post add index (.data->\"author\"->0)").unwrap();
+        assert_eq!(unquoted, quoted);
+        assert!(literals.is_empty());
+        assert!(quoted_literals.is_empty());
+
+        let (array_index, _) = canonicalize("alter Post add index (.data->0)").unwrap();
+        let (object_key, _) = canonicalize("alter Post add index (.data->\"0\")").unwrap();
+        assert_ne!(array_index, object_key);
+    }
+
+    #[test]
+    fn aggregate_mode_is_part_of_canonical_identity() {
+        let (symmetric, _) = canonicalize("Post group .id { n: sum(.id) }").unwrap();
+        let (raw, _) = canonicalize("Post group .id { n: sum(raw .id) }").unwrap();
+        assert_ne!(symmetric, raw);
     }
 }

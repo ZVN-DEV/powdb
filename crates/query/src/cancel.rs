@@ -6,9 +6,16 @@
 //! stop such a query: it held the engine lock / transaction gate for its whole
 //! run, wedging even reads on other connections, and a client disconnect could
 //! not free the CPU either. This module adds a cheap cooperative-cancellation
-//! signal that the server installs per query and every unbounded executor loop
-//! polls, so an over-budget query returns a clean, typed error promptly and
-//! releases its locks.
+//! signal that the server installs per query and cancellable read/target-
+//! discovery loops poll, so an over-budget query can return a clean, typed
+//! error promptly and release its locks.
+//!
+//! Mutation application is an intentional boundary: target discovery may be
+//! cancelled and the token is checked once immediately before the first write,
+//! but an entered write phase runs to completion. The storage layer has no
+//! statement savepoint that could undo a logged prefix, so polling between row
+//! writes would trade responsiveness for a partial mutation reported as an
+//! error. Atomicity wins at that boundary.
 //!
 //! ## Why a thread-local token
 //!
@@ -25,10 +32,11 @@
 //! deadline, an `Instant::now()`) to the hottest loop in the engine. Instead
 //! each loop holds a [`CancelCheck`] with a plain local counter and calls
 //! [`CancelCheck::tick`] once per iteration; only every 4096th tick performs the
-//! real check. The amortized cost is a register increment and a mask test.
+//! real check. Statement entry points perform one immediate check before work
+//! begins. The amortized loop cost is a register increment and a mask test.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +45,12 @@ use crate::result::QueryError;
 const STATE_RUNNING: u8 = 0;
 const STATE_TIMEOUT: u8 = 1;
 const STATE_DISCONNECT: u8 = 2;
+
+/// Number of cancellation tokens installed across executor threads. The
+/// overwhelmingly common embedded/no-cancel path sees zero and skips the TLS
+/// lookup entirely. A non-zero value is only a hint that this thread might
+/// have a token; [`check`] still consults its thread-local slot for authority.
+static ACTIVE_INSTALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// One real cancellation check per this many [`CancelCheck::tick`] calls.
 /// A power of two so the gate is a mask test. 4096 rows of nested-loop work
@@ -64,6 +78,8 @@ pub struct ExecCancel {
     state: AtomicU8,
     deadline: Option<Instant>,
     timeout_ms: u64,
+    #[cfg(test)]
+    checkpoints: AtomicUsize,
 }
 
 impl ExecCancel {
@@ -73,6 +89,8 @@ impl ExecCancel {
             state: AtomicU8::new(STATE_RUNNING),
             deadline: None,
             timeout_ms: 0,
+            #[cfg(test)]
+            checkpoints: AtomicUsize::new(0),
         }
     }
 
@@ -83,6 +101,8 @@ impl ExecCancel {
             state: AtomicU8::new(STATE_RUNNING),
             deadline: Some(deadline),
             timeout_ms,
+            #[cfg(test)]
+            checkpoints: AtomicUsize::new(0),
         }
     }
 
@@ -93,14 +113,11 @@ impl ExecCancel {
             CancelReason::Timeout => STATE_TIMEOUT,
             CancelReason::Disconnect => STATE_DISCONNECT,
         };
-        // Only record a reason if none is set yet; a passed deadline still
-        // reports Timeout via `reason()` even without this store.
-        let _ = self.state.compare_exchange(
-            STATE_RUNNING,
-            want,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        // Only record a reason if none is set yet. A passed deadline is persisted
+        // by `reason()` when an executor checkpoint observes it.
+        let _ =
+            self.state
+                .compare_exchange(STATE_RUNNING, want, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Whether the query should stop: explicitly cancelled, or past its deadline.
@@ -118,7 +135,21 @@ impl ExecCancel {
         }
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
-                return Some(CancelReason::Timeout);
+                // Persist a deadline-driven timeout once it is observed. Without
+                // this transition, a later disconnect could overwrite an already
+                // reported timeout because the deadline used to be a computed
+                // result only. Whichever explicit signal/checkpoint wins the CAS
+                // remains the stable reason for the rest of the query.
+                let _ = self.state.compare_exchange(
+                    STATE_RUNNING,
+                    STATE_TIMEOUT,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                return match self.state.load(Ordering::Relaxed) {
+                    STATE_DISCONNECT => Some(CancelReason::Disconnect),
+                    _ => Some(CancelReason::Timeout),
+                };
             }
         }
         None
@@ -127,12 +158,22 @@ impl ExecCancel {
     /// The typed error this token's current reason maps to, or `None` if the
     /// query may continue.
     fn error(&self) -> Option<QueryError> {
+        #[cfg(test)]
+        self.checkpoints.fetch_add(1, Ordering::Relaxed);
         match self.reason()? {
             CancelReason::Timeout => Some(QueryError::Timeout {
                 timeout_ms: self.timeout_ms,
             }),
             CancelReason::Disconnect => Some(QueryError::Cancelled),
         }
+    }
+
+    /// Number of real executor cancellation checkpoints observed by this
+    /// token. Tests use this to signal cancellation only after a query has
+    /// entered the loop under test, avoiding sleep- or scheduler-based races.
+    #[cfg(test)]
+    pub(crate) fn checkpoint_count(&self) -> usize {
+        self.checkpoints.load(Ordering::Relaxed)
     }
 }
 
@@ -155,6 +196,7 @@ thread_local! {
 #[must_use = "the guard must be held for the duration of the query"]
 pub fn install(token: Arc<ExecCancel>) -> InstallGuard {
     let prev = CURRENT.with(|c| c.borrow_mut().replace(token));
+    ACTIVE_INSTALLS.fetch_add(1, Ordering::Relaxed);
     InstallGuard { prev }
 }
 
@@ -166,14 +208,18 @@ pub struct InstallGuard {
 impl Drop for InstallGuard {
     fn drop(&mut self) {
         CURRENT.with(|c| *c.borrow_mut() = self.prev.take());
+        ACTIVE_INSTALLS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// Perform the real cancellation check against the installed token. Returns the
 /// typed error if the query has been cancelled or has passed its deadline.
-/// Cheap no-op (one thread-local read) when no token is installed.
+/// Cheap no-op (one relaxed atomic load) when no token is installed anywhere.
 #[inline]
 pub fn check() -> Result<(), QueryError> {
+    if ACTIVE_INSTALLS.load(Ordering::Relaxed) == 0 {
+        return Ok(());
+    }
     CURRENT.with(|c| match c.borrow().as_ref() {
         Some(token) => match token.error() {
             Some(err) => Err(err),
@@ -184,9 +230,10 @@ pub fn check() -> Result<(), QueryError> {
 }
 
 /// A per-loop cancellation poller with a local iteration counter. Call
-/// [`CancelCheck::tick`] once per loop iteration; it performs the real
-/// [`check`] only every 4096th call, so the amortized per-iteration cost is a
-/// register increment and a mask test.
+/// [`CancelCheck::tick`] once per loop iteration; it performs the real [`check`]
+/// once per 4096 iterations, so the amortized per-iteration cost is a register
+/// increment and a mask test. Public statement entry points perform the initial
+/// immediate check.
 #[derive(Debug)]
 pub struct CancelCheck {
     n: u32,
@@ -249,11 +296,17 @@ mod tests {
             Instant::now() - Duration::from_millis(1),
             2000,
         ));
-        let _guard = install(token);
+        let _guard = install(Arc::clone(&token));
         match check() {
             Err(QueryError::Timeout { timeout_ms }) => assert_eq!(timeout_ms, 2000),
             other => panic!("expected Timeout, got {other:?}"),
         }
+        token.cancel(CancelReason::Disconnect);
+        assert_eq!(
+            token.reason(),
+            Some(CancelReason::Timeout),
+            "an observed timeout must remain the stable cancellation reason"
+        );
     }
 
     #[test]
@@ -290,7 +343,7 @@ mod tests {
         token.cancel(CancelReason::Timeout);
         let mut cc = CancelCheck::new();
         // The first 4095 ticks do not perform the real check; the 4096th does.
-        for _ in 0..(CHECK_INTERVAL_MASK) {
+        for _ in 0..CHECK_INTERVAL_MASK {
             cc.tick().expect("pre-boundary ticks skip the real check");
         }
         assert!(cc.tick().is_err(), "the 4096th tick runs the real check");

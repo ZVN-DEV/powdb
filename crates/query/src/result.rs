@@ -45,6 +45,13 @@ pub enum QueryError {
     TypeError(String),
     /// Join result exceeded MAX_JOIN_ROWS.
     JoinLimitExceeded,
+    /// A fallback nested-loop join would evaluate more candidate pairs than
+    /// the measured safety cap.
+    NestedLoopPairLimitExceeded {
+        left_rows: usize,
+        right_rows: usize,
+        limit: usize,
+    },
     /// Sort exceeded MAX_SORT_ROWS.
     SortLimitExceeded,
     /// Per-query memory budget exceeded during materialization (sort buffer,
@@ -89,6 +96,23 @@ impl fmt::Display for QueryError {
             }
             QueryError::TypeError(msg) => write!(f, "type mismatch: {msg}"),
             QueryError::JoinLimitExceeded => write!(f, "join result exceeds row limit"),
+            QueryError::NestedLoopPairLimitExceeded {
+                left_rows,
+                right_rows,
+                limit,
+            } => {
+                let pairs = left_rows.checked_mul(*right_rows);
+                match pairs {
+                    Some(pairs) => write!(
+                        f,
+                        "nested-loop join would evaluate {pairs} candidate pairs, above the {limit} pair limit; add an equi-key to ON, index/filter an input, or reduce the joined row counts"
+                    ),
+                    None => write!(
+                        f,
+                        "nested-loop join candidate count overflows usize ({left_rows} x {right_rows}), above the {limit} pair limit; add an equi-key to ON, index/filter an input, or reduce the joined row counts"
+                    ),
+                }
+            }
             QueryError::SortLimitExceeded => {
                 write!(f, "sort input exceeds row limit — add a LIMIT clause")
             }

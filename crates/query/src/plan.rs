@@ -1,4 +1,7 @@
-use crate::ast::{AggFunc, AlterAction, Assignment, Expr, GroupKey, JoinKind, Literal, WindowFunc};
+use crate::ast::{
+    AggFunc, AggregateMode, AlterAction, Assignment, Expr, GroupKey, JoinKind, Literal, WindowFunc,
+};
+use powdb_storage::stored_json_path::StoredJsonPathV1;
 
 /// A column definition carried by `PlanNode::CreateTable`. Replaces the
 /// old `(name, type_name, required)` tuple so the `unique` modifier can
@@ -49,6 +52,31 @@ pub enum PlanNode {
         /// Upper bound: (expr, inclusive). None = unbounded above.
         end: Option<(Expr, bool)>,
     },
+    /// Speculative equality lookup through an expression index. The planner is
+    /// catalog-pure; the executor resolves `path` at runtime and reconstructs
+    /// the equivalent path predicate if no matching index exists.
+    ExprIndexScan {
+        table: String,
+        path: StoredJsonPathV1,
+        key: Expr,
+    },
+    /// Speculative bounded lookup through an expression index. `path` is the
+    /// persisted table-local identity, never a runtime catalog identifier.
+    ExprRangeScan {
+        table: String,
+        path: StoredJsonPathV1,
+        start: Option<(Expr, bool)>,
+        end: Option<(Expr, bool)>,
+    },
+    /// Exact single-path ORDER BY + LIMIT/OFFSET candidate. Missing or
+    /// incompatible runtime indexes fall back to a normal scan/sort/slice.
+    OrderedExprIndexScan {
+        table: String,
+        path: StoredJsonPathV1,
+        descending: bool,
+        limit: Expr,
+        offset: Option<Expr>,
+    },
     Filter {
         input: Box<PlanNode>,
         predicate: Expr,
@@ -72,7 +100,11 @@ pub enum PlanNode {
     Aggregate {
         input: Box<PlanNode>,
         function: AggFunc,
-        field: Option<String>,
+        argument: Option<Expr>,
+        mode: AggregateMode,
+        /// Source alias whose physical row identity controls symmetric
+        /// de-duplication. `None` means raw aggregation semantics.
+        provenance_alias: Option<String>,
     },
     /// Mission E1.2: nested-loop join. Correctness-first implementation —
     /// O(L × R) scan for every join. E1.3 will add a hash-join fast path
@@ -197,7 +229,7 @@ pub struct ProjectField {
 
 #[derive(Debug, Clone)]
 pub struct SortKey {
-    pub field: String,
+    pub expr: Expr,
     pub descending: bool,
 }
 
@@ -205,8 +237,11 @@ pub struct SortKey {
 #[derive(Debug, Clone)]
 pub struct GroupAgg {
     pub function: AggFunc,
-    /// Source column name to aggregate over.
-    pub field: String,
+    pub argument: Expr,
+    pub mode: AggregateMode,
+    /// Source alias whose physical row identity controls symmetric
+    /// de-duplication. `None` means raw aggregation semantics.
+    pub provenance_alias: Option<String>,
     /// Synthetic output column name (`__agg_0`, `__agg_1`, …).
     pub output_name: String,
 }
@@ -216,7 +251,8 @@ pub struct GroupAgg {
 pub struct WindowDef {
     pub function: WindowFunc,
     pub args: Vec<Expr>,
-    pub partition_by: Vec<String>,
+    pub mode: AggregateMode,
+    pub partition_by: Vec<Expr>,
     pub order_by: Vec<SortKey>,
     pub output_name: String,
 }

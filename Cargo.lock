@@ -1857,10 +1857,14 @@ name = "powdb-bench"
 version = "0.12.0"
 dependencies = [
  "criterion",
+ "libc",
+ "powdb-auth",
  "powdb-query",
+ "powdb-server",
  "powdb-storage",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

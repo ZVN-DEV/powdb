@@ -1,3 +1,5 @@
+use powdb_storage::pj1::pj1_validate;
+use powdb_storage::types::{TypeId, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
@@ -26,6 +28,17 @@ const MSG_RESULT_MSG: u8 = 0x0B;
 const MSG_DISCONNECT: u8 = 0x10;
 const MSG_PING: u8 = 0x11;
 const MSG_PONG: u8 = 0x12;
+/// Native typed PowQL request. The response is `MSG_RESULT_ROWS_NATIVE` or
+/// `MSG_RESULT_SCALAR_NATIVE`; legacy result frames remain byte-identical.
+pub const MSG_QUERY_NATIVE: u8 = 0x13;
+/// Native typed PowQL request with positional `$N` parameters.
+pub const MSG_QUERY_PARAMS_NATIVE: u8 = 0x14;
+/// Native typed SQL request.
+pub const MSG_QUERY_SQL_NATIVE: u8 = 0x15;
+/// Native typed row result.
+pub const MSG_RESULT_ROWS_NATIVE: u8 = 0x16;
+/// Native typed scalar result.
+pub const MSG_RESULT_SCALAR_NATIVE: u8 = 0x17;
 
 /// Maximum payload size accepted from the wire (64 MB).
 const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
@@ -138,6 +151,19 @@ pub enum Message {
         query: String,
         params: Vec<WireParam>,
     },
+    /// PowQL request whose result preserves storage value types.
+    QueryNative {
+        query: String,
+    },
+    /// Parameterized PowQL request whose result preserves storage value types.
+    QueryWithParamsNative {
+        query: String,
+        params: Vec<WireParam>,
+    },
+    /// SQL request whose result preserves storage value types.
+    QuerySqlNative {
+        query: String,
+    },
     /// Request primary-side status for one embedded replica cursor.
     SyncStatus {
         replica_id: String,
@@ -182,6 +208,13 @@ pub enum Message {
     ResultScalar {
         value: String,
     },
+    ResultRowsNative {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    ResultScalarNative {
+        value: Value,
+    },
     ResultOk {
         affected: u64,
     },
@@ -224,31 +257,14 @@ impl Message {
             Message::Query { query } => (MSG_QUERY, encode_string(query)),
             Message::QuerySql { query } => (MSG_QUERY_SQL, encode_string(query)),
             Message::QueryWithParams { query, params } => {
-                let mut buf = encode_string(query);
-                buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
-                for p in params {
-                    match p {
-                        WireParam::Null => buf.push(0),
-                        WireParam::Int(v) => {
-                            buf.push(1);
-                            buf.extend_from_slice(&v.to_le_bytes());
-                        }
-                        WireParam::Float(v) => {
-                            buf.push(2);
-                            buf.extend_from_slice(&v.to_le_bytes());
-                        }
-                        WireParam::Bool(v) => {
-                            buf.push(3);
-                            buf.push(if *v { 1 } else { 0 });
-                        }
-                        WireParam::Str(s) => {
-                            buf.push(4);
-                            buf.extend_from_slice(&encode_string(s));
-                        }
-                    }
-                }
-                (MSG_QUERY_PARAMS, buf)
+                (MSG_QUERY_PARAMS, encode_query_with_params(query, params))
             }
+            Message::QueryNative { query } => (MSG_QUERY_NATIVE, encode_string(query)),
+            Message::QueryWithParamsNative { query, params } => (
+                MSG_QUERY_PARAMS_NATIVE,
+                encode_query_with_params(query, params),
+            ),
+            Message::QuerySqlNative { query } => (MSG_QUERY_SQL_NATIVE, encode_string(query)),
             Message::SyncStatus { replica_id } => (MSG_SYNC_STATUS, encode_string(replica_id)),
             Message::SyncPull {
                 replica_id,
@@ -328,6 +344,25 @@ impl Message {
                 (MSG_RESULT_ROWS, buf)
             }
             Message::ResultScalar { value } => (MSG_RESULT_SCALAR, encode_string(value)),
+            Message::ResultRowsNative { columns, rows } => {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+                for column in columns {
+                    buf.extend_from_slice(&encode_string(column));
+                }
+                buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                for row in rows {
+                    for value in row {
+                        encode_typed_value(&mut buf, value);
+                    }
+                }
+                (MSG_RESULT_ROWS_NATIVE, buf)
+            }
+            Message::ResultScalarNative { value } => {
+                let mut buf = Vec::new();
+                encode_typed_value(&mut buf, value);
+                (MSG_RESULT_SCALAR_NATIVE, buf)
+            }
             Message::ResultOk { affected } => (MSG_RESULT_OK, affected.to_le_bytes().to_vec()),
             Message::ResultMessage { message } => (MSG_RESULT_MSG, encode_string(message)),
             Message::Error { message } => (MSG_ERROR, encode_string(message)),
@@ -466,6 +501,18 @@ impl Message {
                 }
                 Ok(Message::QueryWithParams { query, params })
             }
+            MSG_QUERY_NATIVE => {
+                let query = decode_exact_string(payload, "native PowQL query")?;
+                Ok(Message::QueryNative { query })
+            }
+            MSG_QUERY_PARAMS_NATIVE => {
+                let (query, params) = decode_query_with_params_exact(payload)?;
+                Ok(Message::QueryWithParamsNative { query, params })
+            }
+            MSG_QUERY_SQL_NATIVE => {
+                let query = decode_exact_string(payload, "native SQL query")?;
+                Ok(Message::QuerySqlNative { query })
+            }
             MSG_SYNC_STATUS => {
                 let replica_id = decode_string(payload, &mut 0)?;
                 Ok(Message::SyncStatus { replica_id })
@@ -598,6 +645,13 @@ impl Message {
                 let value = decode_string(payload, &mut 0)?;
                 Ok(Message::ResultScalar { value })
             }
+            MSG_RESULT_ROWS_NATIVE => decode_native_rows(payload),
+            MSG_RESULT_SCALAR_NATIVE => {
+                let mut pos = 0;
+                let value = decode_typed_value(payload, &mut pos)?;
+                require_payload_end(payload, pos, "native scalar")?;
+                Ok(Message::ResultScalarNative { value })
+            }
             MSG_RESULT_OK => {
                 if payload.len() < 8 {
                     return Err("truncated result ok payload".into());
@@ -682,6 +736,246 @@ impl Message {
             .map(Some)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+}
+
+fn encode_query_with_params(query: &str, params: &[WireParam]) -> Vec<u8> {
+    let mut buf = encode_string(query);
+    buf.extend_from_slice(&(params.len() as u16).to_le_bytes());
+    for param in params {
+        match param {
+            WireParam::Null => buf.push(0),
+            WireParam::Int(value) => {
+                buf.push(1);
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+            WireParam::Float(value) => {
+                buf.push(2);
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+            WireParam::Bool(value) => {
+                buf.push(3);
+                buf.push(u8::from(*value));
+            }
+            WireParam::Str(value) => {
+                buf.push(4);
+                buf.extend_from_slice(&encode_string(value));
+            }
+        }
+    }
+    buf
+}
+
+fn decode_query_with_params_exact(payload: &[u8]) -> Result<(String, Vec<WireParam>), String> {
+    let mut pos = 0;
+    let query = decode_string_strict(payload, &mut pos, "native query")?;
+    let count = decode_u16(payload, &mut pos, "native param count")? as usize;
+    if count > MAX_PARAMS {
+        return Err("too many parameters".into());
+    }
+    // Every parameter consumes at least its one-byte tag.
+    if count > payload.len().saturating_sub(pos) {
+        return Err("parameter count exceeds payload size".into());
+    }
+    let mut params = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= payload.len() {
+            return Err("truncated param tag".into());
+        }
+        let tag = payload[pos];
+        pos += 1;
+        params.push(match tag {
+            0 => WireParam::Null,
+            1 => {
+                let bytes = take_exact(payload, &mut pos, 8, "int param")?;
+                WireParam::Int(i64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+            }
+            2 => {
+                let bytes = take_exact(payload, &mut pos, 8, "float param")?;
+                WireParam::Float(f64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+            }
+            3 => WireParam::Bool(decode_bool(payload, &mut pos, "bool param")?),
+            4 => WireParam::Str(decode_string_strict(payload, &mut pos, "string param")?),
+            other => return Err(format!("unknown param tag: {other}")),
+        });
+    }
+    require_payload_end(payload, pos, "native parameterized query")?;
+    Ok((query, params))
+}
+
+fn encode_typed_value(out: &mut Vec<u8>, value: &Value) {
+    out.push(value.type_id() as u8);
+    let body_len = match value {
+        Value::Empty => 0,
+        Value::Int(_) | Value::Float(_) | Value::DateTime(_) => 8,
+        Value::Bool(_) => 1,
+        Value::Str(value) => value.len(),
+        Value::Uuid(_) => 16,
+        Value::Bytes(value) => value.len(),
+        Value::Json(value) => value.len(),
+    };
+    out.extend_from_slice(&(body_len as u32).to_le_bytes());
+    match value {
+        Value::Empty => {}
+        Value::Int(value) | Value::DateTime(value) => out.extend_from_slice(&value.to_le_bytes()),
+        Value::Float(value) => out.extend_from_slice(&value.to_le_bytes()),
+        Value::Bool(value) => out.push(u8::from(*value)),
+        Value::Str(value) => out.extend_from_slice(value.as_bytes()),
+        Value::Uuid(value) => out.extend_from_slice(value),
+        Value::Bytes(value) => out.extend_from_slice(value),
+        Value::Json(value) => out.extend_from_slice(value),
+    }
+}
+
+fn decode_typed_value(data: &[u8], pos: &mut usize) -> Result<Value, String> {
+    if *pos >= data.len() {
+        return Err("truncated typed value tag".into());
+    }
+    let raw_type = data[*pos];
+    *pos += 1;
+    let type_id =
+        TypeId::from_u8(raw_type).ok_or_else(|| format!("unknown typed value tag: {raw_type}"))?;
+    let body_len = decode_u32(data, pos, "typed value body length")? as usize;
+    let body = take_exact(data, pos, body_len, "typed value body")?;
+
+    let require_len = |expected: usize| {
+        if body_len == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid {type_id:?} typed value length: expected {expected}, got {body_len}"
+            ))
+        }
+    };
+    match type_id {
+        TypeId::Empty => {
+            require_len(0)?;
+            Ok(Value::Empty)
+        }
+        TypeId::Int => {
+            require_len(8)?;
+            Ok(Value::Int(i64::from_le_bytes(
+                body.try_into().expect("validated 8-byte int"),
+            )))
+        }
+        TypeId::Float => {
+            require_len(8)?;
+            Ok(Value::Float(f64::from_le_bytes(
+                body.try_into().expect("validated 8-byte float"),
+            )))
+        }
+        TypeId::Bool => {
+            require_len(1)?;
+            match body[0] {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                other => Err(format!("invalid typed boolean: {other}")),
+            }
+        }
+        TypeId::Str => Ok(Value::Str(
+            std::str::from_utf8(body)
+                .map_err(|error| format!("invalid UTF-8 in typed string: {error}"))?
+                .to_owned(),
+        )),
+        TypeId::DateTime => {
+            require_len(8)?;
+            Ok(Value::DateTime(i64::from_le_bytes(
+                body.try_into().expect("validated 8-byte datetime"),
+            )))
+        }
+        TypeId::Uuid => {
+            require_len(16)?;
+            Ok(Value::Uuid(
+                body.try_into().expect("validated 16-byte UUID"),
+            ))
+        }
+        TypeId::Bytes => Ok(Value::Bytes(body.to_vec())),
+        TypeId::Json => {
+            pj1_validate(body).map_err(|error| format!("invalid typed PJ1 JSON: {error}"))?;
+            Ok(Value::Json(body.into()))
+        }
+    }
+}
+
+fn decode_native_rows(payload: &[u8]) -> Result<Message, String> {
+    let mut pos = 0;
+    let col_count = decode_u16(payload, &mut pos, "native column count")? as usize;
+    if col_count > MAX_COLUMNS {
+        return Err("too many columns".into());
+    }
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        columns.push(decode_string_strict(
+            payload,
+            &mut pos,
+            "native column name",
+        )?);
+    }
+    let row_count = decode_u32(payload, &mut pos, "native row count")? as usize;
+    if row_count > MAX_ROWS {
+        return Err("too many rows".into());
+    }
+    // Every cell has at least a one-byte type and four-byte body length.
+    let minimum_row_len = col_count
+        .checked_mul(5)
+        .ok_or_else(|| "native row width overflow".to_string())?;
+    if minimum_row_len == 0 {
+        if row_count != 0 {
+            return Err("nonzero native row count with zero columns".into());
+        }
+    } else if row_count > payload.len().saturating_sub(pos) / minimum_row_len {
+        return Err("native row count exceeds payload size".into());
+    }
+
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let mut row = Vec::with_capacity(col_count);
+        for _ in 0..col_count {
+            row.push(decode_typed_value(payload, &mut pos)?);
+        }
+        rows.push(row);
+    }
+    require_payload_end(payload, pos, "native rows")?;
+    Ok(Message::ResultRowsNative { columns, rows })
+}
+
+fn take_exact<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    len: usize,
+    label: &str,
+) -> Result<&'a [u8], String> {
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| format!("{label} length overflow"))?;
+    if end > data.len() {
+        return Err(format!("truncated {label}"));
+    }
+    let bytes = &data[*pos..end];
+    *pos = end;
+    Ok(bytes)
+}
+
+fn require_payload_end(payload: &[u8], pos: usize, label: &str) -> Result<(), String> {
+    if pos == payload.len() {
+        Ok(())
+    } else {
+        Err(format!("trailing bytes in {label} payload"))
+    }
+}
+
+fn decode_exact_string(payload: &[u8], label: &str) -> Result<String, String> {
+    let mut pos = 0;
+    let value = decode_string_strict(payload, &mut pos, label)?;
+    require_payload_end(payload, pos, label)?;
+    Ok(value)
+}
+
+fn decode_string_strict(data: &[u8], pos: &mut usize, label: &str) -> Result<String, String> {
+    let len = decode_u32(data, pos, label)? as usize;
+    let bytes = take_exact(data, pos, len, label)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| format!("invalid UTF-8 in {label}: {error}"))
 }
 
 fn encode_string(s: &str) -> Vec<u8> {
@@ -1026,6 +1320,185 @@ mod tests {
             }
             _ => panic!("expected ResultRows"),
         }
+    }
+
+    #[test]
+    fn legacy_rows_frame_is_byte_identical() {
+        let encoded = Message::ResultRows {
+            columns: vec!["x".into()],
+            rows: vec![vec!["y".into()]],
+        }
+        .encode();
+        assert_eq!(
+            encoded,
+            vec![
+                0x07, 0x00, 0x10, 0x00, 0x00, 0x00, // frame header
+                0x01, 0x00, // one column
+                0x01, 0x00, 0x00, 0x00, b'x', // column name
+                0x01, 0x00, 0x00, 0x00, // one row
+                0x01, 0x00, 0x00, 0x00, b'y', // one legacy string cell
+            ]
+        );
+    }
+
+    #[test]
+    fn native_request_tags_and_params_round_trip() {
+        let cases = [
+            (
+                MSG_QUERY_NATIVE,
+                Message::QueryNative {
+                    query: "T { .x }".into(),
+                },
+            ),
+            (
+                MSG_QUERY_SQL_NATIVE,
+                Message::QuerySqlNative {
+                    query: "SELECT x FROM T".into(),
+                },
+            ),
+        ];
+        for (tag, message) in cases {
+            let encoded = message.encode();
+            assert_eq!(encoded[0], tag);
+            match Message::decode(&encoded).expect("native request round trip") {
+                Message::QueryNative { query } => assert_eq!(query, "T { .x }"),
+                Message::QuerySqlNative { query } => assert_eq!(query, "SELECT x FROM T"),
+                other => panic!("unexpected native request: {other:?}"),
+            }
+        }
+
+        let encoded = Message::QueryWithParamsNative {
+            query: "T filter .x = $1".into(),
+            params: vec![WireParam::Int(7), WireParam::Bool(false)],
+        }
+        .encode();
+        assert_eq!(encoded[0], MSG_QUERY_PARAMS_NATIVE);
+        match Message::decode(&encoded).expect("native params round trip") {
+            Message::QueryWithParamsNative { query, params } => {
+                assert_eq!(query, "T filter .x = $1");
+                assert_eq!(params, vec![WireParam::Int(7), WireParam::Bool(false)]);
+            }
+            other => panic!("unexpected native parameterized request: {other:?}"),
+        }
+    }
+
+    fn every_native_value() -> Vec<Value> {
+        vec![
+            Value::Empty,
+            Value::Int(-9_007_199_254_740_993),
+            Value::Float(2.5),
+            Value::Bool(true),
+            Value::Str("héllo".into()),
+            Value::DateTime(1_723_650_123_456_789),
+            Value::Uuid([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]),
+            Value::Bytes(vec![0x00, 0x7f, 0x80, 0xff]),
+            Value::Json(
+                powdb_storage::pj1::parse_json_text("9007199254740993")
+                    .expect("PJ1 fixture")
+                    .into_boxed_slice(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn native_rows_and_scalar_round_trip_every_type() {
+        let values = every_native_value();
+        let columns = (0..values.len()).map(|index| format!("c{index}")).collect();
+        let encoded = Message::ResultRowsNative {
+            columns,
+            rows: vec![values.clone()],
+        }
+        .encode();
+        assert_eq!(encoded[0], MSG_RESULT_ROWS_NATIVE);
+        match Message::decode(&encoded).expect("native rows round trip") {
+            Message::ResultRowsNative { columns, rows } => {
+                assert_eq!(columns.len(), values.len());
+                assert_eq!(rows, vec![values.clone()]);
+            }
+            other => panic!("unexpected native rows: {other:?}"),
+        }
+
+        for value in values {
+            let encoded = Message::ResultScalarNative {
+                value: value.clone(),
+            }
+            .encode();
+            assert_eq!(encoded[0], MSG_RESULT_SCALAR_NATIVE);
+            match Message::decode(&encoded).expect("native scalar round trip") {
+                Message::ResultScalarNative { value: decoded } => assert_eq!(decoded, value),
+                other => panic!("unexpected native scalar: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn native_mixed_row_matches_cross_client_golden() {
+        let encoded = Message::ResultRowsNative {
+            columns: ["e", "i", "f", "b", "s", "d", "u", "x", "j"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            rows: vec![every_native_value()],
+        }
+        .encode();
+        let hex = encoded
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex,
+            "16009c000000090001000000650100000069010000006601000000620100000073010000006401000000750100000078010000006a0100000000000000000108000000ffffffffffffdfff02080000000000000000000440030100000001040600000068c3a96c6c6f050800000015615391a61f0600061000000000112233445566778899aabbccddeeff0704000000007f80ff0809000000030100000000002000"
+        );
+    }
+
+    fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![tag, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn typed_cell(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![tag];
+        payload.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    #[test]
+    fn native_scalar_rejects_malformed_cells() {
+        let malformed = [
+            typed_cell(0xff, &[]),
+            typed_cell(TypeId::Int as u8, &[0; 7]),
+            typed_cell(TypeId::Bool as u8, &[2]),
+            typed_cell(TypeId::Str as u8, &[0xff]),
+            typed_cell(TypeId::Json as u8, &[0xff]),
+            typed_cell(TypeId::Json as u8, &[0, 0]),
+        ];
+        for payload in malformed {
+            assert!(Message::decode(&frame(MSG_RESULT_SCALAR_NATIVE, &payload)).is_err());
+        }
+
+        let mut trailing = typed_cell(TypeId::Empty as u8, &[]);
+        trailing.push(0);
+        assert!(Message::decode(&frame(MSG_RESULT_SCALAR_NATIVE, &trailing)).is_err());
+    }
+
+    #[test]
+    fn native_rows_rejects_bad_counts_and_trailing_data() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&encode_string("x"));
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(&typed_cell(TypeId::Empty as u8, &[]));
+        assert!(Message::decode(&frame(MSG_RESULT_ROWS_NATIVE, &payload)).is_err());
+
+        payload[7..11].copy_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&[0xaa]);
+        assert!(Message::decode(&frame(MSG_RESULT_ROWS_NATIVE, &payload)).is_err());
     }
 
     #[test]

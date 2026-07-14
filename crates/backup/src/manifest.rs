@@ -1,10 +1,64 @@
-use powdb_storage::catalog::CATALOG_VERSION;
+use powdb_storage::catalog::{
+    Catalog, IndexKeySource, CATALOG_LSN_FILE, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+};
 use powdb_storage::wal::WAL_FORMAT_VERSION;
 use powdb_sync::IdentitySnapshot;
 use powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
+
+fn legacy_catalog_version() -> u16 {
+    LEGACY_CATALOG_VERSION
+}
+
+pub(crate) fn validate_catalog_version(version: u16) -> io::Result<()> {
+    if !(LEGACY_CATALOG_VERSION..=CATALOG_VERSION).contains(&version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported snapshot catalog format {version}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_catalog_transition(base: u16, next: u16) -> io::Result<()> {
+    validate_catalog_version(base)?;
+    validate_catalog_version(next)?;
+    if next < base {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("catalog format cannot move backward from {base} to {next}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Durable files referenced by current catalog metadata.
+///
+/// Expression-index filenames are reconstructed only from persisted table and
+/// index IDs. Stray files from a dropped or failed index are deliberately not
+/// included in a new snapshot.
+pub(crate) fn active_durable_file_names(catalog: &Catalog) -> BTreeSet<String> {
+    let mut names = BTreeSet::from(["catalog.bin".to_string(), CATALOG_LSN_FILE.to_string()]);
+    for table in catalog.list_tables() {
+        names.insert(format!("{table}.heap"));
+        if let Some(indexes) = catalog.index_metadata(table) {
+            for index in indexes {
+                match index.source {
+                    IndexKeySource::Column { column } => {
+                        names.insert(format!("{table}_{column}.idx"));
+                    }
+                    IndexKeySource::Expression { index_id, .. } => {
+                        names.insert(format!("{table}_idx_{index_id}.idx"));
+                    }
+                }
+            }
+        }
+    }
+    names
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -19,6 +73,9 @@ pub struct BackupManifest {
     pub created_unix_secs: u64,
     /// The page-LSN high-water mark this backup is consistent at.
     pub source_lsn: u64,
+    /// Active on-disk catalog format at the snapshot boundary.
+    #[serde(default = "legacy_catalog_version")]
+    pub catalog_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncSnapshotMetadata>,
     pub files: Vec<FileEntry>,
@@ -36,7 +93,8 @@ impl BackupManifest {
                 Self::FORMAT_VERSION
             )));
         }
-        validate_sync_metadata(&self.sync, self.source_lsn)?;
+        validate_catalog_version(self.catalog_version)?;
+        validate_sync_metadata(&self.sync, self.source_lsn, self.catalog_version)?;
         Ok(())
     }
 
@@ -62,7 +120,7 @@ pub enum ChangedFile {
         len: u64,
         blake3_hex: String,
     },
-    /// A paged file (.heap/.idx): only pages whose LSN > base.source_lsn.
+    /// A paged heap file: only pages whose LSN > base.source_lsn.
     /// The sidecar delta file `<name>.delta` holds, for each listed page index
     /// in order, a 4-byte LE page index followed by PAGE_SIZE bytes.
     Pages {
@@ -93,13 +151,14 @@ impl SyncSnapshotMetadata {
         identity: IdentitySnapshot,
         source_lsn: u64,
         catalog_blake3_hex: String,
+        catalog_version: u16,
     ) -> Self {
         Self {
             identity,
             source_lsn,
             catalog_blake3_hex,
             wal_format_version: WAL_FORMAT_VERSION,
-            catalog_version: CATALOG_VERSION,
+            catalog_version,
             retained_segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
         }
     }
@@ -130,15 +189,7 @@ impl SyncSnapshotMetadata {
                 ),
             ));
         }
-        if self.catalog_version != CATALOG_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported sync snapshot catalog format {}",
-                    self.catalog_version
-                ),
-            ));
-        }
+        validate_catalog_version(self.catalog_version)?;
         if self.retained_segment_format_version != RETAINED_SEGMENT_FORMAT_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -162,6 +213,9 @@ pub struct IncrementManifest {
     pub base_source_lsn: u64,
     /// high-water mark after this increment (== catalog.max_lsn())
     pub source_lsn: u64,
+    /// Active on-disk catalog format after applying this increment.
+    #[serde(default = "legacy_catalog_version")]
+    pub catalog_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncSnapshotMetadata>,
     pub changed: Vec<ChangedFile>,
@@ -179,7 +233,8 @@ impl IncrementManifest {
                 Self::FORMAT_VERSION
             )));
         }
-        validate_sync_metadata(&self.sync, self.source_lsn)?;
+        validate_catalog_version(self.catalog_version)?;
+        validate_sync_metadata(&self.sync, self.source_lsn, self.catalog_version)?;
         Ok(())
     }
 
@@ -199,6 +254,7 @@ impl IncrementManifest {
 pub(crate) fn current_sync_snapshot_metadata(
     data_dir: &Path,
     source_lsn: u64,
+    catalog_version: u16,
 ) -> io::Result<Option<SyncSnapshotMetadata>> {
     let Some(identity) = powdb_sync::read_identity_snapshot_if_exists(data_dir)? else {
         return Ok(None);
@@ -209,15 +265,23 @@ pub(crate) fn current_sync_snapshot_metadata(
         identity,
         source_lsn,
         catalog_blake3_hex,
+        catalog_version,
     )))
 }
 
 fn validate_sync_metadata(
     metadata: &Option<SyncSnapshotMetadata>,
     source_lsn: u64,
+    catalog_version: u16,
 ) -> io::Result<()> {
     if let Some(metadata) = metadata {
         metadata.validate_against_source_lsn(source_lsn)?;
+        if metadata.catalog_version != catalog_version {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sync snapshot catalog format does not match manifest catalog format",
+            ));
+        }
     }
     Ok(())
 }
@@ -231,6 +295,7 @@ mod tests {
             format_version: BackupManifest::FORMAT_VERSION,
             created_unix_secs: 1_700_000_000,
             source_lsn: 42,
+            catalog_version: LEGACY_CATALOG_VERSION,
             sync: None,
             files: vec![FileEntry {
                 name: "catalog.bin".into(),

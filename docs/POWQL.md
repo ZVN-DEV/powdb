@@ -195,13 +195,14 @@ User { .name, info: concat(.name, " age=", .age) }
 
 ### Ordering
 
-Sort results using `order` with one or more fields. Default direction is ascending. Use `asc` or `desc` explicitly:
+Sort results using `order` with one or more expressions. Default direction is ascending. Use `asc` or `desc` explicitly:
 
 ```
 User order .age
 User order .age desc
 User order .name asc
 User order .age asc, .name desc
+Post order .data->score desc
 ```
 
 ### Limit and Offset
@@ -453,7 +454,12 @@ count(distinct User { .age })
 | `min` | Minimum value | `min(Table { .field })` |
 | `max` | Maximum value | `max(Table { .field })` |
 
-For `sum`, `avg`, `min`, and `max`, the target column is specified via the projection `{ .field }`. For `count`, the projection is optional.
+For `sum`, `avg`, `min`, and `max`, the target expression is specified via the projection. For `count`, the projection is optional. The expression may be a stored field, a computed value, or a JSON path:
+
+```powql
+sum(Post { .data->price })
+avg(Post { .data->score + 1 })
+```
 
 ---
 
@@ -555,12 +561,12 @@ column ends in `.status`. A name that matches no column is an error, and a name
 that matches more than one (for example `.id`, present on both sides) is an
 ambiguity error that names the candidate columns; qualify the key to resolve it.
 
-### Grouped Aggregates over Joins: fan-out semantics
+### Grouped Aggregates over Joins: symmetric and raw semantics
 
 A one-to-many join repeats each row of the "one" side once per matching row on
-the "many" side. In v0.11, PowQL aggregates follow SQL-standard semantics: they
-aggregate the joined (fanned-out) rows directly, so `sum` and `avg` over a
-column from the "one" side double-count under fan-out.
+the "many" side. PowQL aggregates are symmetric by default: `sum`, `count`, and
+`avg` count each contributing source row once per group, identified by its row
+ID. Join fan-out therefore cannot inflate an aggregate from one source.
 
 Toy example. Three accounts in one tier, joined one-to-many to their orders:
 
@@ -576,14 +582,26 @@ Account as a join Ord as o on a.id = o.account_id
   group a.tier { a.tier, avg_bal: avg(a.balance) }
 ```
 
-Because account A appears in four joined rows, `avg(a.balance)` over the joined
-rows in the "gold" group is `(10*4 + 10 + 40) / 6 = 15.0`, not the true `20.0`.
-A real document-heavy CMS workload shows the same effect at scale: a true average of
-`12.92` collapses to `8.67` once the join fans out the rows.
+`avg(a.balance)` returns `20.0`: accounts A, B, and C each contribute once even
+though A has four matching orders. To aggregate the joined rows directly, add
+`raw` immediately inside the aggregate call:
 
-Until symmetric aggregates ship (see below), use `count(distinct ...)` as the
-fan-out-safe count. It counts distinct values within each group regardless of
-how many times the join repeats them:
+```powql
+Account as a join Ord as o on a.id = o.account_id
+  group a.tier { a.tier, joined_avg: avg(raw a.balance) }
+-- joined_avg = (10*4 + 10 + 40) / 6 = 15.0
+```
+
+The same modifier works for top-level aggregate queries:
+
+```powql
+avg(raw Account as a join Ord as o on a.id = o.account_id { a.balance })
+```
+
+`count(*)` always counts joined output rows. `min` and `max` have the same
+result under symmetric and raw evaluation because duplicates do not change an
+extreme. `count(distinct ...)` still counts distinct values rather than source
+rows:
 
 ```
 -- distinct accounts per group, unaffected by order counts
@@ -591,11 +609,13 @@ Account as a join Ord as o on a.id = o.account_id
   group a.balance { a.balance, accounts: count(distinct a.id) }
 ```
 
-Note: correct-by-default (symmetric) aggregates over joins, where an aggregate
-of a column from source `A` aggregates the distinct rows of `A` and fan-out
-cannot inflate it, ship in v0.13 with a `raw` opt-out that restores the
-SQL-standard behavior above. The SQL frontend keeps SQL semantics. See the
-document-store design doc (section 5.2) for details.
+The argument of a symmetric aggregate must resolve to exactly one source.
+Expressions such as `sum(a.balance + 1)` use `a`'s row identity. Constants,
+ambiguous unqualified fields, and expressions that mix sources require
+explicit raw semantics, for example `sum(raw a.balance + o.total)`.
+
+The SQL frontend always uses raw joined-row semantics, so SQL aggregate results
+remain SQL-compatible.
 
 ---
 
@@ -690,10 +710,15 @@ User as u join Order as o on u.id = o.user_id
 
 PowQL automatically selects the best join strategy:
 
-- **Hash join** (O(L + R)) -- used for equi-joins (`a.col = b.col`)
-- **Nested loop** (O(L x R)) -- fallback for non-equi predicates or cross joins
+- **Hash join** (O(L + R)) -- used when `ON` contains an equi-key, including
+  compound predicates such as `a.id = b.a_id and b.active = true`; residual
+  conditions are evaluated only inside matching hash buckets.
+- **Nested loop** (O(L x R)) -- fallback for pure non-equi predicates or cross
+  joins. PowDB rejects a pure nested-loop shape before execution when its
+  candidate-pair count exceeds the server safety bound.
 
-No hint syntax is needed; the engine detects the optimal path.
+No hint syntax is needed. Use `EXPLAIN` to inspect the selected strategy. Query
+deadlines and client disconnects also cooperatively stop allowed join work.
 
 ---
 
@@ -1065,6 +1090,13 @@ Post { .id, author: .data->author->name, views: .data->views }
 Post filter .data->views > 10 { .id }
 -- 1
 
+-- Group, aggregate, and order by extracted values.
+Post group .data->author->name {
+  author: .data->author->name,
+  views: sum(.data->views)
+}
+Post order .data->views desc limit 10 { .id, views: .data->views }
+
 -- Distinguish a missing key from a present one.
 Post { .id, has_tags: json_type(.data->tags) }
 -- 1, "array"
@@ -1075,22 +1107,39 @@ Post filter .id = 1 { sub: .data->author }
 -- {"name":"Ada"}
 ```
 
+### JSON path indexes
+
+Create a persistent B+tree index over an extracted scalar path by wrapping the
+path in parentheses:
+
+```powql
+alter Post add index (.data->author->name)
+alter Post add unique (.data->external_id)
+```
+
+Path indexes support equality and range filters. An index can also provide an
+ascending or descending `order path limit K` scan without sorting the table.
+Missing paths and explicit JSON null are valid indexed values and sort last in
+both directions. Objects and arrays are not valid path-index keys; index
+creation or a later write fails atomically if the indexed path resolves to one.
+Unique path indexes ignore missing and JSON-null values, like nullable unique
+column indexes.
+
+Use `alter Post drop index (.data->author->name)` to remove a path index. If a
+matching path index is absent, PowDB preserves the same query semantics with a
+sequential scan.
+
 ### Current limitations
 
-- **Aggregating over a path** (`sum(.data->price)`) and **grouping or ordering
-  by a path** (`group .data->cat`) are not supported yet; both fail with a
-  clear error rather than returning wrong results. Extract with a projection
-  and aggregate client-side for now. Both are planned alongside the JSON path
-  index support in an upcoming release.
 - **Ordering whole `json` columns** uses a total order (null < false < true <
   numbers < strings < arrays < objects). Numerically tied int/float values
   (`1` vs `1.0`) order deterministically with the int first; only byte-equal
   documents compare equal, so ordering, grouping, and equality always agree.
-- **`json_type()` over the network cannot distinguish JSON `null` from a
-  missing path.** The current wire format renders both a null cell and the
-  string `"null"` identically, so remote clients (CLI `-r`, the TS client) see
-  NULL for both. Embedded (in-process) use distinguishes them correctly. A
-  typed wire surface that fixes this is planned for an upcoming release.
+- The legacy string wire surface remains ambiguous for some values. Use the
+  native typed client surface when exact Empty, string, Bytes, and JSON
+  distinctions matter. Direct `->` intentionally maps both a missing path and
+  explicit JSON null to Empty; `json_type()` is the supported way to
+  distinguish them.
 
 ---
 
@@ -1336,6 +1385,17 @@ alter User add index if not exists .email  -- accepted for symmetry
 
 Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is already a no-op, so `if not exists` is accepted but does not change behavior.
 
+Index a scalar JSON path by parenthesizing the complete expression:
+
+```powql
+alter Post add index (.data->author->name)
+alter Post add index if not exists (.data->score)
+```
+
+The base must be an unqualified stored `json` column, and every segment must be
+an object key or non-negative array index. Parentheses are required for path
+indexes and are reserved for that syntax in v0.13.
+
 #### Add Unique
 
 Create a unique B+tree index on a column, enforcing that no two non-null rows share a value:
@@ -1343,9 +1403,21 @@ Create a unique B+tree index on a column, enforcing that no two non-null rows sh
 ```
 alter User add unique .email
 alter User add unique if not exists .email  -- no-op if already indexed
+alter Post add unique (.data->external_id)
 ```
 
 The command first scans the existing data — if any duplicate (non-null) value is already present, it fails and the index is not created. Without `if not exists` it also fails if the column already has an index, since there is no in-place index upgrade (drop and recreate the table to change an existing index's uniqueness); with `if not exists` an already-indexed column is a no-op. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
+
+#### Drop Index
+
+Remove a column or JSON-path index:
+
+```powql
+alter User drop index .email
+alter User drop index if exists .email
+alter Post drop index (.data->author->name)
+alter Post drop index if exists (.data->author->name)
+```
 
 ### DROP TABLE
 

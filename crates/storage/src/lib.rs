@@ -8,6 +8,7 @@ pub mod heap;
 pub mod page;
 pub mod pj1;
 pub mod row;
+pub mod stored_json_path;
 pub mod table;
 pub mod types;
 pub mod view;

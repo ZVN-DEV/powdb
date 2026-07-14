@@ -546,16 +546,17 @@ impl Engine {
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
-                    QueryResult::Rows { rows, .. } => rows
-                        .into_iter()
-                        .filter_map(|mut row| {
-                            if row.is_empty() {
-                                None
-                            } else {
-                                Some(value_to_expr(row.swap_remove(0)))
+                    QueryResult::Rows { rows, .. } => {
+                        let mut values = Vec::with_capacity(rows.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        for mut row in rows {
+                            cancel.tick()?;
+                            if !row.is_empty() {
+                                values.push(value_to_expr(row.swap_remove(0)));
                             }
-                        })
-                        .collect(),
+                        }
+                        values
+                    }
                     _ => Vec::new(),
                 };
                 // WS2: byte-budget guard on the materialized IN-list.
@@ -639,16 +640,17 @@ impl Engine {
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan(&sub_plan)?;
                 let values = match result {
-                    QueryResult::Rows { rows, .. } => rows
-                        .into_iter()
-                        .filter_map(|mut row| {
-                            if row.is_empty() {
-                                None
-                            } else {
-                                Some(value_to_expr(row.swap_remove(0)))
+                    QueryResult::Rows { rows, .. } => {
+                        let mut values = Vec::with_capacity(rows.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        for mut row in rows {
+                            cancel.tick()?;
+                            if !row.is_empty() {
+                                values.push(value_to_expr(row.swap_remove(0)));
                             }
-                        })
-                        .collect(),
+                        }
+                        values
+                    }
                     _ => Vec::new(),
                 };
                 Ok(Expr::InList {

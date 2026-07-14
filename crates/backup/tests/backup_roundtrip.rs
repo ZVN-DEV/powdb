@@ -164,8 +164,9 @@ fn full_backup_records_sync_metadata_plain_restore_strips_identity_explicit_pres
     );
     assert_eq!(
         sync.catalog_version,
-        powdb_storage::catalog::CATALOG_VERSION
+        powdb_storage::catalog::LEGACY_CATALOG_VERSION
     );
+    assert_eq!(manifest.catalog_version, sync.catalog_version);
     assert_eq!(
         sync.retained_segment_format_version,
         powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION

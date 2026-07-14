@@ -1,6 +1,6 @@
 use super::compiled::f64_bits_to_sortable_u64;
 use super::Engine;
-use crate::ast::Literal;
+use crate::ast::{BinOp, Expr, JoinKind, Literal};
 use crate::result::QueryResult;
 use powdb_storage::types::*;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -919,6 +919,205 @@ fn test_hash_join_handles_swapped_predicate_orientation() {
         }
         _ => panic!("expected rows"),
     }
+}
+
+fn result_rows(result: QueryResult) -> Vec<Vec<Value>> {
+    match result {
+        QueryResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_compound_join_hash_key_is_order_and_orientation_independent() {
+    let mut engine = join_engine();
+    let key_first = result_rows(
+        engine
+            .execute_powql(
+                "User as u join Order as o on u.id = o.user_id and o.total > 75 \
+                 { u.name, o.total }",
+            )
+            .unwrap(),
+    );
+    let residual_first_swapped = result_rows(
+        engine
+            .execute_powql(
+                "User as u join Order as o on o.total > 75 and o.user_id = u.id \
+                 { u.name, o.total }",
+            )
+            .unwrap(),
+    );
+    assert_eq!(key_first, residual_first_swapped);
+    assert_eq!(key_first.len(), 2);
+}
+
+#[test]
+fn test_compound_hash_join_matches_forced_nested_loop_semantics() {
+    let mut engine = join_engine();
+    let hashed = result_rows(
+        engine
+            .execute_powql(
+                "User as u join Order as o on u.id = o.user_id and o.total > 75 \
+                 { u.name, o.total }",
+            )
+            .unwrap(),
+    );
+    let forced_nested = result_rows(
+        engine
+            .execute_powql(
+                "User as u join Order as o on u.id + 0 = o.user_id and o.total > 75 \
+                 { u.name, o.total }",
+            )
+            .unwrap(),
+    );
+    assert_eq!(hashed, forced_nested);
+}
+
+#[test]
+fn test_nullable_duplicate_hash_keys_match_nested_semantics_for_all_outer_kinds() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_nullable_join_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type L { required id: int, k: int }")
+        .unwrap();
+    engine
+        .execute_powql("type R { required id: int, k: int }")
+        .unwrap();
+    engine
+        .execute_powql(
+            "insert L { id := 10, k := null }, { id := 11, k := 1 }, { id := 12, k := 1 }",
+        )
+        .unwrap();
+    engine
+        .execute_powql(
+            "insert R { id := 20, k := null }, { id := 21, k := 1 }, { id := 22, k := 1 }",
+        )
+        .unwrap();
+
+    for kind in ["join", "left join", "right join"] {
+        let mut hashed = result_rows(
+            engine
+                .execute_powql(&format!(
+                    "L as l {kind} R as r on l.k = r.k {{ l.id, r.id }}"
+                ))
+                .unwrap(),
+        );
+        let mut nested = result_rows(
+            engine
+                .execute_powql(&format!(
+                    "L as l {kind} R as r on l.k + 0 = r.k {{ l.id, r.id }}"
+                ))
+                .unwrap(),
+        );
+        hashed.sort();
+        nested.sort();
+        assert_eq!(hashed, nested, "{kind} hash/nested parity");
+        assert_eq!(hashed.len(), 5, "{kind} includes NULL/NULL plus duplicates");
+    }
+}
+
+#[test]
+fn test_left_compound_join_pads_when_residual_rejects_hash_bucket() {
+    let mut engine = join_engine();
+    let result = engine
+        .execute_powql(
+            "User as u left join Order as o on u.id = o.user_id and o.total > 75 \
+             { u.name, o.total }",
+        )
+        .unwrap();
+    let rows = result_rows(result);
+    assert_eq!(rows.len(), 4);
+    let bob = rows
+        .iter()
+        .find(|row| row[0] == Value::Str("Bob".into()))
+        .expect("Bob must be preserved by the left join");
+    assert_eq!(bob[1], Value::Empty);
+}
+
+#[test]
+fn test_right_compound_join_preserves_residual_rejections_after_rewrite() {
+    let mut engine = join_engine();
+    let result = engine
+        .execute_powql(
+            "User as u right join Order as o on u.id = o.user_id and o.total > 75 \
+             { u.name, o.total }",
+        )
+        .unwrap();
+    let rows = result_rows(result);
+    assert_eq!(rows.len(), 4);
+    for total in [50, 999] {
+        let row = rows
+            .iter()
+            .find(|row| row[1] == Value::Int(total))
+            .expect("right-side row must be preserved");
+        assert_eq!(row[0], Value::Empty);
+    }
+}
+
+#[test]
+fn test_nested_loop_pair_limit_allows_exact_cap_and_rejects_larger_products() {
+    assert_eq!(
+        super::plan_exec::check_nested_loop_pair_limit(2_500, 2_560),
+        Ok(super::MAX_NESTED_LOOP_PAIRS)
+    );
+    assert!(matches!(
+        super::plan_exec::check_nested_loop_pair_limit(2_501, 2_560),
+        Err(QueryError::NestedLoopPairLimitExceeded {
+            left_rows: 2_501,
+            right_rows: 2_560,
+            limit: super::MAX_NESTED_LOOP_PAIRS,
+        })
+    ));
+    assert!(matches!(
+        super::plan_exec::check_nested_loop_pair_limit(usize::MAX, 2),
+        Err(QueryError::NestedLoopPairLimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn test_cross_and_non_equi_products_are_bounded_before_iteration() {
+    let left = vec![vec![Value::Int(1)]; 2_501];
+    let right = vec![vec![Value::Int(2)]; 2_560];
+    let non_equi = Expr::BinaryOp(
+        Box::new(Expr::QualifiedField {
+            qualifier: "a".into(),
+            field: "id".into(),
+        }),
+        BinOp::Lt,
+        Box::new(Expr::QualifiedField {
+            qualifier: "b".into(),
+            field: "id".into(),
+        }),
+    );
+    let columns_left = vec!["a.id".to_string()];
+    let columns_right = vec!["b.id".to_string()];
+    let non_equi_result = super::plan_exec::execute_materialized_join(
+        columns_left.clone(),
+        left.clone(),
+        columns_right.clone(),
+        right.clone(),
+        Some(&non_equi),
+        JoinKind::Inner,
+    );
+    assert!(matches!(
+        non_equi_result,
+        Err(QueryError::NestedLoopPairLimitExceeded { .. })
+    ));
+
+    let cross_result = super::plan_exec::execute_materialized_join(
+        columns_left,
+        left,
+        columns_right,
+        right,
+        None,
+        JoinKind::Cross,
+    );
+    assert!(matches!(
+        cross_result,
+        Err(QueryError::NestedLoopPairLimitExceeded { .. })
+    ));
 }
 
 #[test]
@@ -3332,6 +3531,25 @@ fn explain_text(engine: &mut Engine, q: &str) -> String {
 }
 
 #[test]
+fn test_explain_distinguishes_compound_hash_and_bounded_nested_join() {
+    let mut engine = join_engine();
+    let compound = explain_text(
+        &mut engine,
+        "explain User as u join Order as o on o.total > 75 and o.user_id = u.id",
+    );
+    assert!(compound.contains("strategy=hash+residual"), "{compound}");
+
+    let non_equi = explain_text(
+        &mut engine,
+        "explain User as u join Order as o on u.id < o.user_id",
+    );
+    assert!(
+        non_equi.contains("strategy=nested-loop-bounded"),
+        "{non_equi}"
+    );
+}
+
+#[test]
 fn test_explain_eq_filter_unindexed_shows_seqscan_not_indexscan() {
     let mut engine = test_engine();
     // `email` has NO index in test_engine; the planner folds
@@ -5279,7 +5497,7 @@ fn test_delete_without_returning_still_modified() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Dogfood quick-wins (P-6 reserved words, P-7 idempotency, P-8 intro)
+// Parser and DDL regression coverage (reserved words, idempotency, intro)
 // ════════════════════════════════════════════════════════════════════════
 
 fn fresh_engine() -> Engine {
@@ -5654,14 +5872,24 @@ fn test_group_unqualified_key_suffix_resolves_over_join() {
 }
 
 #[test]
-fn test_group_unqualified_agg_arg_suffix_resolves_over_join() {
-    // `sum(.total)` is unqualified but only o.total ends with `.total`.
+fn test_group_unqualified_symmetric_agg_requires_explicit_raw() {
+    // The catalog-free planner cannot prove an unqualified joined expression
+    // belongs to one source, even when runtime columns would have one suffix
+    // match. Explicit raw retains the existing suffix-resolution behavior.
     let mut engine = group_join_engine();
+    let error = engine
+        .execute_powql(
+            "User as u join Order as o on u.id = o.user_id \
+             group u.status { u.status, s: sum(.total) }",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("use sum(raw ...)"), "{error}");
     let (_, rows) = cols_rows(
         engine
             .execute_powql(
                 "User as u join Order as o on u.id = o.user_id \
-                 group u.status { u.status, s: sum(.total) }",
+                 group u.status { u.status, s: sum(raw .total) }",
             )
             .unwrap(),
     );
@@ -5854,19 +6082,21 @@ fn test_group_fanout_avg_matches_docs_example() {
         engine
             .execute_powql(
                 "Account as a join Ord as o on a.id = o.account_id \
-                 group a.tier { a.tier, avg_bal: avg(a.balance), accounts: count(distinct a.id) }",
+                 group a.tier { a.tier, avg_bal: avg(a.balance), \
+                 raw_avg: avg(raw a.balance), accounts: count(distinct a.id) }",
             )
             .unwrap(),
     );
     assert_eq!(rows.len(), 1);
     match rows[0][1] {
         Value::Float(v) => assert!(
-            (v - 15.0).abs() < 1e-9,
-            "fan-out avg was {v}, expected 15.0"
+            (v - 20.0).abs() < 1e-9,
+            "symmetric source-row avg was {v}, expected 20.0"
         ),
         ref other => panic!("expected Float avg, got {other:?}"),
     }
-    assert_eq!(rows[0][2], Value::Int(3), "count(distinct) is fan-out-safe");
+    assert_eq!(rows[0][2], Value::Float(15.0), "raw avg keeps fan-out");
+    assert_eq!(rows[0][3], Value::Int(3), "count(distinct) is fan-out-safe");
 }
 
 #[test]
@@ -5888,4 +6118,379 @@ fn test_group_sql_qualified_group_by_parity() {
     assert_eq!(rows[0][2], Value::Int(350));
     assert_eq!(rows[1][1], Value::Int(1));
     assert_eq!(rows[1][2], Value::Int(300));
+}
+
+// ─── Cooperative query cancellation ──────────────────────────────
+//
+// These tests prove the deadline / cancel token actually stops a runaway
+// executor loop promptly and leaves the engine usable and consistent. WAL
+// sync is turned Off so the fixtures load quickly; durability is not under
+// test here.
+
+use crate::cancel::{CancelReason, ExecCancel};
+use crate::result::QueryError;
+use std::sync::Arc as CancelArc;
+use std::time::{Duration as CancelDuration, Instant as CancelInstant};
+
+/// Two tables used to exercise cancellation inside join execution. Tests that
+/// require the nested-loop path make the equality expression-valued so it is
+/// deliberately ineligible as a hash key.
+fn compound_join_engine(left: usize, right: usize) -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "powdb_cancel_join_{}_{}_{}",
+        std::process::id(),
+        id,
+        nonce
+    ));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.set_wal_sync_mode(super::WalSyncMode::Off);
+    engine
+        .execute_powql("type Ver { required id: int }")
+        .unwrap();
+    engine
+        .execute_powql("type Grp { required version_id: int, required field_ns: str }")
+        .unwrap();
+    for i in 0..left {
+        engine
+            .execute_powql(&format!("insert Ver {{ id := {i} }}"))
+            .unwrap();
+    }
+    for i in 0..right {
+        engine
+            .execute_powql(&format!(
+                r#"insert Grp {{ version_id := {i}, field_ns := "f1" }}"#
+            ))
+            .unwrap();
+    }
+    engine
+}
+
+/// A single table of `n` rows for scan/mutation cancellation tests.
+fn item_engine(n: usize) -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_cancel_item_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.set_wal_sync_mode(super::WalSyncMode::Off);
+    engine
+        .execute_powql("type Item { required id: int, required v: int }")
+        .unwrap();
+    for i in 0..n {
+        engine
+            .execute_powql(&format!("insert Item {{ id := {i}, v := 0 }}"))
+            .unwrap();
+    }
+    engine
+}
+
+/// Signal cancellation only after the executor has crossed `target` real
+/// checkpoints. This proves the statement was already running inside the loop
+/// under test rather than merely rejecting a pre-cancelled token at entry.
+fn cancel_after_checkpoint(
+    token: CancelArc<ExecCancel>,
+    target: usize,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let deadline = CancelInstant::now() + CancelDuration::from_secs(3);
+        while token.checkpoint_count() < target && CancelInstant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            token.checkpoint_count() >= target,
+            "query completed without reaching cancellation checkpoint {target}"
+        );
+        token.cancel(CancelReason::Disconnect);
+    })
+}
+
+#[test]
+fn nested_loop_join_honors_deadline() {
+    // 1200 x 1200 = 1.44M inner iterations of the unindexed nested-loop join —
+    // seconds of work uninstrumented. With a ~100ms deadline it must return the
+    // typed timeout error well under the generous CI bound.
+    let engine = compound_join_engine(1200, 1200);
+    let cancel = CancelArc::new(ExecCancel::with_deadline(
+        CancelInstant::now() + CancelDuration::from_millis(100),
+        100,
+    ));
+    let start = CancelInstant::now();
+    let result = engine.execute_powql_readonly_with_cancel(
+        r#"Ver as ver join Grp as g on ver.id + 0 = g.version_id and g.field_ns = "f1""#,
+        cancel,
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(result, Err(QueryError::Timeout { timeout_ms: 100 })),
+        "expected Timeout, got {result:?}"
+    );
+    assert!(
+        elapsed < CancelDuration::from_secs(3),
+        "cancellation should be prompt, took {elapsed:?}"
+    );
+    // The engine is still fully usable after a cancelled query.
+    let after = engine.execute_powql_readonly("count(Ver)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(1200))));
+}
+
+#[test]
+fn nested_loop_join_honors_explicit_cancel() {
+    // A second thread owns the same token the executor is polling, matching the
+    // server-side shape where socket monitoring signals a blocking query.
+    let engine = compound_join_engine(1200, 1200);
+    let cancel = CancelArc::new(ExecCancel::new());
+    // Entry is checkpoint 1; neither 1200-row input scan reaches the 4096-row
+    // interval. Checkpoint 2 is therefore necessarily inside the join product.
+    let cancel_thread = cancel_after_checkpoint(CancelArc::clone(&cancel), 2);
+    let start = CancelInstant::now();
+    let result = engine.execute_powql_readonly_with_cancel(
+        r#"Ver as ver join Grp as g on ver.id + 0 = g.version_id and g.field_ns = "f1""#,
+        cancel,
+    );
+    cancel_thread.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    assert!(start.elapsed() < CancelDuration::from_secs(3));
+}
+
+#[test]
+fn cooperative_stable_sort_matches_std_stable_sort() {
+    let mut actual: Vec<(u32, usize)> = (0..20_000).map(|i| (((i * 37) % 97) as u32, i)).collect();
+    let mut expected = actual.clone();
+    expected.sort_by_key(|&(key, _)| key);
+
+    super::mem_budget::reset();
+    super::plan_exec::cooperative_stable_sort_by(
+        &mut actual,
+        usize::MAX,
+        |&(left, _), &(right, _)| left.cmp(&right),
+    )
+    .unwrap();
+    assert_eq!(
+        actual, expected,
+        "ordering and equal-key stability must match"
+    );
+}
+
+#[test]
+fn regular_sort_honors_live_cancel_inside_sort_on_both_entry_paths() {
+    let mut mutable_engine = item_engine(20_000);
+    let mutable_cancel = CancelArc::new(ExecCancel::new());
+    // 1 entry + 4 scan + 4 memory-charge + helper entry + first run's
+    // before/after checks. Cancellation is signalled between sorted runs.
+    let mutable_signal = cancel_after_checkpoint(CancelArc::clone(&mutable_cancel), 12);
+    let mutable_result =
+        mutable_engine.execute_powql_with_cancel("Item order .id desc", mutable_cancel);
+    mutable_signal.join().unwrap();
+    assert!(matches!(mutable_result, Err(QueryError::Cancelled)));
+    assert!(matches!(
+        mutable_engine.execute_powql("count(Item)").unwrap(),
+        QueryResult::Scalar(Value::Int(20_000))
+    ));
+
+    let readonly_engine = item_engine(20_000);
+    let readonly_cancel = CancelArc::new(ExecCancel::new());
+    let readonly_signal = cancel_after_checkpoint(CancelArc::clone(&readonly_cancel), 12);
+    let readonly_result =
+        readonly_engine.execute_powql_readonly_with_cancel("Item order .id desc", readonly_cancel);
+    readonly_signal.join().unwrap();
+    assert!(matches!(readonly_result, Err(QueryError::Cancelled)));
+    assert!(matches!(
+        readonly_engine
+            .execute_powql_readonly("count(Item)")
+            .unwrap(),
+        QueryResult::Scalar(Value::Int(20_000))
+    ));
+}
+
+#[test]
+fn window_sort_honors_live_cancel_inside_sort_and_engine_stays_usable() {
+    let engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::new());
+    // 1 entry + 4 scan + helper entry + first run's before/after checks.
+    let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 8);
+    let result = engine.execute_powql_readonly_with_cancel(
+        "Item { .id, rn: row_number() over (order .id desc) }",
+        cancel,
+    );
+    signal.join().unwrap();
+    assert!(matches!(result, Err(QueryError::Cancelled)));
+    assert!(matches!(
+        engine.execute_powql_readonly("count(Item)").unwrap(),
+        QueryResult::Scalar(Value::Int(20_000))
+    ));
+}
+
+#[test]
+fn compiled_scan_honors_cancel_and_engine_stays_usable() {
+    // Checkpoint 1 is statement entry; checkpoint 2 is reached only after the
+    // compiled raw scan has processed 4096 rows. Cancellation is therefore
+    // live and must be observed by a later checkpoint inside the same scan.
+    let engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::new());
+    let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 2);
+    let result = engine.execute_powql_readonly_with_cancel("Item filter .id >= 0 { id }", cancel);
+    signal.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    // A fresh query with no token scans the whole table normally.
+    let full = engine
+        .execute_powql_readonly("count(Item filter .id >= 0)")
+        .unwrap();
+    assert!(matches!(full, QueryResult::Scalar(Value::Int(20_000))));
+}
+
+#[test]
+fn mutable_alias_scan_honors_live_cancel_and_engine_stays_usable() {
+    let mut engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::new());
+    let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 2);
+    let result = engine.execute_powql_with_cancel("Item as i", cancel);
+    signal.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    let after = engine.execute_powql("count(Item)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(20_000))));
+}
+
+#[test]
+fn readonly_fast_count_honors_live_cancel_and_engine_stays_usable() {
+    let engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::new());
+    let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 2);
+    let result = engine.execute_powql_readonly_with_cancel("count(Item)", cancel);
+    signal.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    let after = engine.execute_powql_readonly("count(Item)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(20_000))));
+}
+
+#[test]
+fn distinct_materialization_honors_live_cancel_and_engine_stays_usable() {
+    let engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::new());
+    // Entry + four projection-scan checkpoints + the first checkpoint in the
+    // distinct loop. The following distinct checkpoint must see cancellation.
+    let signal = cancel_after_checkpoint(CancelArc::clone(&cancel), 6);
+    let result = engine.execute_powql_readonly_with_cancel("Item distinct { .id, .v }", cancel);
+    signal.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    let after = engine.execute_powql_readonly("count(Item)").unwrap();
+    assert!(matches!(after, QueryResult::Scalar(Value::Int(20_000))));
+}
+
+#[test]
+fn cancelled_update_before_write_leaves_all_rows_unchanged() {
+    // Cancellation must happen before mutation begins. There is no
+    // statement-level savepoint for rolling back a partially applied update,
+    // so returning Timeout after a logged prefix would be unsafe.
+    let mut engine = item_engine(20_000);
+    let cancel = CancelArc::new(ExecCancel::with_deadline(
+        CancelInstant::now() - CancelDuration::from_millis(1),
+        500,
+    ));
+    let result =
+        engine.execute_powql_with_cancel("Item filter .id >= 0 update { v := .v + 1 }", cancel);
+    assert!(
+        matches!(result, Err(QueryError::Timeout { .. })),
+        "expected Timeout, got {result:?}"
+    );
+    let unchanged = engine.execute_powql("sum(Item { .v })").unwrap();
+    assert!(
+        matches!(unchanged, QueryResult::Scalar(Value::Int(0))),
+        "a cancelled update must not leave a written prefix: {unchanged:?}"
+    );
+
+    // A subsequent uncancelled statement applies to every row, proving the
+    // cancellation token and executor state were both released.
+    let full = engine
+        .execute_powql("Item filter .id >= 0 update { v := .v + 1 }")
+        .unwrap();
+    assert!(
+        matches!(full, QueryResult::Modified(20_000)),
+        "expected all rows updated, got {full:?}"
+    );
+}
+
+#[test]
+fn cancelled_mutation_does_not_abort_explicit_transaction() {
+    let mut engine = item_engine(1);
+    engine.execute_powql("begin").unwrap();
+
+    let cancel = CancelArc::new(ExecCancel::new());
+    cancel.cancel(CancelReason::Disconnect);
+    let result =
+        engine.execute_powql_with_cancel("Item filter .id = 0 update { v := .v + 1 }", cancel);
+    assert!(matches!(result, Err(QueryError::Cancelled)));
+
+    let unchanged = engine.execute_powql("sum(Item { .v })").unwrap();
+    assert!(matches!(unchanged, QueryResult::Scalar(Value::Int(0))));
+    let committed = engine.execute_powql("commit").unwrap();
+    assert!(matches!(committed, QueryResult::Executed { .. }));
+}
+
+#[test]
+fn cancel_only_affects_its_own_query() {
+    // After a cancelled query, a normal query on the same engine with no token
+    // runs to completion — the cancellation is per-query, not sticky.
+    let engine = compound_join_engine(600, 600);
+    let cancel = CancelArc::new(ExecCancel::new());
+    cancel.cancel(CancelReason::Timeout);
+    let _ = engine.execute_powql_readonly_with_cancel(
+        r#"Ver as ver join Grp as g on ver.id + 0 = g.version_id and g.field_ns = "f1""#,
+        cancel,
+    );
+    // No token installed now: the same join runs fully and returns matches.
+    let ok = engine
+        .execute_powql_readonly(
+            r#"Ver as ver join Grp as g on ver.id = g.version_id and g.field_ns = "f1""#,
+        )
+        .unwrap();
+    match ok {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 600),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn symmetric_rid_dedup_set_is_charged_to_query_memory_budget() {
+    super::mem_budget::reset();
+    let columns = vec!["a.value".to_string()];
+    let rows = vec![vec![Value::Int(10)]];
+    let provenance = vec![vec![Some(RowId {
+        page_id: 1,
+        slot_index: 0,
+    })]];
+    let error = super::plan_exec::compute_group_aggregate(
+        crate::ast::AggFunc::Sum,
+        &Expr::QualifiedField {
+            qualifier: "a".into(),
+            field: "value".into(),
+        },
+        Some(0),
+        super::plan_exec::GroupAggregateContext {
+            columns: &columns,
+            all_rows: &rows,
+            row_indices: &[0],
+            source_index: Some(0),
+            provenance: Some((&provenance, 1)),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, QueryError::MemoryLimitExceeded { .. }));
 }

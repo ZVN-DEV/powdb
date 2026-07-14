@@ -191,10 +191,8 @@ fn missing_path_and_json_null_both_extract_empty() {
 
 #[test]
 fn project_path_alongside_ordering_by_a_real_column() {
-    // Ordering/grouping BY a JSON path expression is a documented non-goal
-    // (needs Expr-valued order/group keys); PowQL does not resolve order keys
-    // against projection aliases either. The supported pattern is to ORDER by
-    // a real column while PROJECTING path values — verify that composes.
+    // Stored-column ordering remains the direct fast path while path
+    // projections use the shared expression evaluator.
     let mut engine = engine_with_posts("projorder");
     for (id, author, age) in [(3, "c", 30), (1, "a", 20), (2, "b", 40)] {
         exec(

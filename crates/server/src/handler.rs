@@ -11,12 +11,12 @@ use powdb_sync::{
     retained_segments_dir, validate_retained_tail_available, validate_v1_retained_units_applyable,
     ReplicaSyncStatus, RetainedUnit, SyncRepairAction, RETAINED_SEGMENT_FORMAT_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
@@ -24,19 +24,67 @@ use zeroize::Zeroizing;
 /// Tracks per-IP authentication failure counts for rate limiting.
 pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
 
-/// Gate that serializes wire-protocol statements while an explicit
-/// transaction is open on any connection. The connection that runs `begin`
-/// keeps an owned permit until `commit`, `rollback`, disconnect, or timeout,
-/// preventing other connections from observing or joining uncommitted state.
-pub type TxGate = Arc<Semaphore>;
+/// Fixed reader-permit pool. Read-only autocommit statements take one permit;
+/// writers, sync operations, and explicit transactions take the entire pool.
+/// Tokio's fair semaphore queue prevents a waiting writer from being starved by
+/// later readers.
+#[derive(Clone)]
+pub struct TxGate {
+    semaphore: Arc<Semaphore>,
+    permit_count: u32,
+}
+
+pub const DEFAULT_TX_GATE_READER_PERMITS: u32 = 1024;
 
 /// Create a transaction gate for a shared engine.
 pub fn new_tx_gate() -> TxGate {
-    Arc::new(Semaphore::new(1))
+    new_tx_gate_with_permits(DEFAULT_TX_GATE_READER_PERMITS)
+}
+
+/// Create a transaction gate with an explicit reader capacity.
+///
+/// The configurable constructor exists so benchmark and compatibility tests can
+/// reproduce the former single-permit admission policy using the exact same
+/// handler code. Production uses [`new_tx_gate`].
+pub fn new_tx_gate_with_permits(permit_count: u32) -> TxGate {
+    assert!(permit_count > 0, "transaction gate requires a permit");
+    TxGate {
+        semaphore: Arc::new(Semaphore::new(permit_count as usize)),
+        permit_count,
+    }
+}
+
+impl TxGate {
+    pub fn permit_count(&self) -> u32 {
+        self.permit_count
+    }
+
+    fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    async fn acquire_many_owned(
+        self,
+        permits: u32,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.semaphore.acquire_many_owned(permits).await
+    }
 }
 
 /// Maximum query text length accepted from the wire (1 MB).
 const MAX_QUERY_LENGTH: usize = 1024 * 1024;
+
+/// Maximum payload accepted by the post-auth cancellation-safe frame reader.
+/// Keep this equal to the protocol reader's public wire limit.
+const MAX_WIRE_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
+
+/// Frames received while a query is executing are retained for normal
+/// pipelined processing. Both limits are deliberately much smaller than the
+/// ordinary 64 MiB per-frame protocol limit: in-flight read-ahead is merely a
+/// liveness aid, not a second request buffer. Reaching either cap cancels the
+/// query and closes the connection; socket monitoring is never disabled.
+const MAX_IN_FLIGHT_READ_AHEAD_FRAMES: usize = 128;
+const MAX_IN_FLIGHT_READ_AHEAD_BYTES: usize = 1024 * 1024;
 
 /// Server-side cap for private sync pull batches.
 const MAX_SYNC_PULL_UNITS: u32 = 4096;
@@ -560,6 +608,45 @@ enum TransactionControl {
     Begin,
     Commit,
     Rollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionMode {
+    Reader,
+    Writer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WireResultMode {
+    LegacyText,
+    Native,
+}
+
+fn statement_admission(stmt: &powdb_query::ast::Statement) -> AdmissionMode {
+    if is_read_only_statement(stmt) {
+        AdmissionMode::Reader
+    } else {
+        AdmissionMode::Writer
+    }
+}
+
+fn classify_query_admission(query: &str) -> AdmissionMode {
+    parser::parse(query)
+        .map(|stmt| statement_admission(&stmt))
+        .unwrap_or(AdmissionMode::Writer)
+}
+
+fn classify_sql_admission(query: &str) -> AdmissionMode {
+    sql::parse_sql(query)
+        .map(|stmt| statement_admission(&stmt))
+        .unwrap_or(AdmissionMode::Writer)
+}
+
+fn classify_params_admission(query: &str, params: &[WireParam]) -> AdmissionMode {
+    let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
+    parser::parse_with_params(query, &bound)
+        .map(|stmt| statement_admission(&stmt))
+        .unwrap_or(AdmissionMode::Writer)
 }
 
 fn transaction_control(stmt: &powdb_query::ast::Statement) -> Option<TransactionControl> {
@@ -1489,7 +1576,8 @@ where
         return decision.message;
     }
 
-    let permit = match tx_gate.acquire_owned().await {
+    let permit_count = tx_gate.permit_count();
+    let permit = match tx_gate.acquire_many_owned(permit_count).await {
         Ok(permit) => permit,
         Err(_) => {
             let decision =
@@ -1541,7 +1629,12 @@ async fn acquire_begin_permit(
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> Result<OwnedSemaphorePermit, Message> {
-    match tokio::time::timeout(tx_wait_timeout, tx_gate.clone().acquire_owned()).await {
+    match tokio::time::timeout(
+        tx_wait_timeout,
+        tx_gate.clone().acquire_many_owned(tx_gate.permit_count()),
+    )
+    .await
+    {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(Message::Error {
             message: "query execution error".into(),
@@ -1569,10 +1662,15 @@ async fn acquire_begin_permit(
 /// durability wait so overlapping committers can share an fsync.
 async fn acquire_autocommit_permit(
     tx_gate: &TxGate,
+    admission: AdmissionMode,
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> Result<OwnedSemaphorePermit, Message> {
-    match tokio::time::timeout(tx_wait_timeout, tx_gate.clone().acquire_owned()).await {
+    let acquire = tx_gate.clone().acquire_many_owned(match admission {
+        AdmissionMode::Reader => 1,
+        AdmissionMode::Writer => tx_gate.permit_count(),
+    });
+    match tokio::time::timeout(tx_wait_timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(Message::Error {
             message: "query execution error".into(),
@@ -1595,16 +1693,27 @@ async fn acquire_autocommit_permit(
 /// returns, so the caller's `finalize_durability` wait happens OUTSIDE the
 /// gate and overlapping committers can share an fsync.
 #[allow(clippy::too_many_arguments)]
-async fn execute_wire_query(
+async fn execute_wire_query<R>(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
     tx_permit: &mut Option<OwnedSemaphorePermit>,
     query: String,
+    result_mode: WireResultMode,
     principal: Option<Principal>,
     query_timeout: Duration,
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> (Message, Option<PendingDurability>) {
+    reader: &mut BufReader<R>,
+    wire_read_buffer: &mut Vec<u8>,
+    pending_messages: &mut InFlightReadAhead,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)
+where
+    R: AsyncRead + Unpin,
+{
     match classify_query_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
@@ -1615,33 +1724,57 @@ async fn execute_wire_query(
                         ),
                     },
                     None,
+                    None,
                 );
             }
             let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
-            let (response, ticket) = run_blocking_query(
+            let (response, ticket, termination) = run_blocking_query(
                 engine,
                 query,
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            (response, ticket)
+            (response, ticket, termination)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let (response, ticket) = run_blocking_query(
-                engine,
+            let standalone_permit = if tx_permit.is_none() {
+                match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(response) => return (response, None, None),
+                }
+            } else {
+                None
+            };
+            let (response, ticket, mut termination) = run_blocking_query(
+                engine.clone(),
                 query,
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -1651,31 +1784,56 @@ async fn execute_wire_query(
                 // another connection's commit can start (and share the fsync)
                 // while this one waits.
                 tx_permit.take();
+            } else if is_query_cancellation_response(&response) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                termination = Some(ConnectionTermination::Closed);
             }
-            (response, ticket)
+            drop(standalone_permit);
+            (response, ticket, termination)
         }
         None if tx_permit.is_some() => {
-            run_blocking_query(
-                engine,
+            let mut out = run_blocking_query(
+                engine.clone(),
                 query,
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
-            .await
+            .await;
+            if is_query_cancellation_response(&out.0) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                out.2 = Some(ConnectionTermination::Closed);
+            }
+            out
         }
         None => {
-            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
+            let admission = classify_query_admission(&query);
+            let permit = match acquire_autocommit_permit(
+                &tx_gate,
+                admission,
+                tx_wait_timeout,
+                metrics,
+            )
+            .await
+            {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
             let out = run_blocking_query(
                 engine,
                 query,
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -1686,16 +1844,27 @@ async fn execute_wire_query(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_wire_query_sql(
+async fn execute_wire_query_sql<R>(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
     tx_permit: &mut Option<OwnedSemaphorePermit>,
     query: String,
+    result_mode: WireResultMode,
     principal: Option<Principal>,
     query_timeout: Duration,
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> (Message, Option<PendingDurability>) {
+    reader: &mut BufReader<R>,
+    wire_read_buffer: &mut Vec<u8>,
+    pending_messages: &mut InFlightReadAhead,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)
+where
+    R: AsyncRead + Unpin,
+{
     match classify_sql_transaction_control(&query) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
@@ -1706,33 +1875,57 @@ async fn execute_wire_query_sql(
                         ),
                     },
                     None,
+                    None,
                 );
             }
             let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
-            let (response, ticket) = run_blocking_query(
+            let (response, ticket, termination) = run_blocking_query(
                 engine,
                 query,
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            (response, ticket)
+            (response, ticket, termination)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let (response, ticket) = run_blocking_query(
-                engine,
+            let standalone_permit = if tx_permit.is_none() {
+                match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(response) => return (response, None, None),
+                }
+            } else {
+                None
+            };
+            let (response, ticket, mut termination) = run_blocking_query(
+                engine.clone(),
                 query,
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -1740,31 +1933,56 @@ async fn execute_wire_query_sql(
                 // See execute_wire_query: release the gate before the
                 // caller's durability wait so commits can coalesce.
                 tx_permit.take();
+            } else if is_query_cancellation_response(&response) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                termination = Some(ConnectionTermination::Closed);
             }
-            (response, ticket)
+            drop(standalone_permit);
+            (response, ticket, termination)
         }
         None if tx_permit.is_some() => {
-            run_blocking_query(
-                engine,
+            let mut out = run_blocking_query(
+                engine.clone(),
                 query,
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
-            .await
+            .await;
+            if is_query_cancellation_response(&out.0) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                out.2 = Some(ConnectionTermination::Closed);
+            }
+            out
         }
         None => {
-            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
+            let admission = classify_sql_admission(&query);
+            let permit = match acquire_autocommit_permit(
+                &tx_gate,
+                admission,
+                tx_wait_timeout,
+                metrics,
+            )
+            .await
+            {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
             let out = run_blocking_query(
                 engine,
                 query,
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, query, principal| dispatch_sql_query(&engine, &query, principal.as_ref()),
             )
             .await;
@@ -1778,17 +1996,28 @@ async fn execute_wire_query_sql(
 // to instrument the typed query result. Bundling these into a struct would add
 // more noise than it removes for an internal dispatcher.
 #[allow(clippy::too_many_arguments)]
-async fn execute_wire_query_with_params(
+async fn execute_wire_query_with_params<R>(
     engine: Arc<RwLock<Engine>>,
     tx_gate: TxGate,
     tx_permit: &mut Option<OwnedSemaphorePermit>,
     query: String,
     params: Vec<WireParam>,
+    result_mode: WireResultMode,
     principal: Option<Principal>,
     query_timeout: Duration,
     tx_wait_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> (Message, Option<PendingDurability>) {
+    reader: &mut BufReader<R>,
+    wire_read_buffer: &mut Vec<u8>,
+    pending_messages: &mut InFlightReadAhead,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)
+where
+    R: AsyncRead + Unpin,
+{
     match classify_params_transaction_control(&query, &params) {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
@@ -1799,18 +2028,23 @@ async fn execute_wire_query_with_params(
                         ),
                     },
                     None,
+                    None,
                 );
             }
             let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
-            let (response, ticket) = run_blocking_query(
+            let (response, ticket, termination) = run_blocking_query(
                 engine,
                 (query, params),
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -1819,15 +2053,34 @@ async fn execute_wire_query_with_params(
             if is_success_response(&response) {
                 *tx_permit = Some(permit);
             }
-            (response, ticket)
+            (response, ticket, termination)
         }
         Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let (response, ticket) = run_blocking_query(
-                engine,
+            let standalone_permit = if tx_permit.is_none() {
+                match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(response) => return (response, None, None),
+                }
+            } else {
+                None
+            };
+            let (response, ticket, mut termination) = run_blocking_query(
+                engine.clone(),
                 (query, params),
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -1837,33 +2090,58 @@ async fn execute_wire_query_with_params(
                 // See execute_wire_query: release the gate before the
                 // caller's durability wait so commits can coalesce.
                 tx_permit.take();
+            } else if is_query_cancellation_response(&response) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                termination = Some(ConnectionTermination::Closed);
             }
-            (response, ticket)
+            drop(standalone_permit);
+            (response, ticket, termination)
         }
         None if tx_permit.is_some() => {
-            run_blocking_query(
-                engine,
+            let mut out = run_blocking_query(
+                engine.clone(),
                 (query, params),
-                principal,
+                principal.clone(),
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
             )
-            .await
+            .await;
+            if is_query_cancellation_response(&out.0) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                out.2 = Some(ConnectionTermination::Closed);
+            }
+            out
         }
         None => {
-            let permit = match acquire_autocommit_permit(&tx_gate, tx_wait_timeout, metrics).await {
+            let admission = classify_params_admission(&query, &params);
+            let permit = match acquire_autocommit_permit(
+                &tx_gate,
+                admission,
+                tx_wait_timeout,
+                metrics,
+            )
+            .await
+            {
                 Ok(permit) => permit,
-                Err(response) => return (response, None),
+                Err(response) => return (response, None, None),
             };
             let out = run_blocking_query(
                 engine,
                 (query, params),
                 principal,
+                result_mode,
                 query_timeout,
                 metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
                 |engine, (query, params), principal| {
                     dispatch_query_with_params(&engine, &query, &params, principal.as_ref())
                 },
@@ -1888,17 +2166,27 @@ struct DeferredQueryMetric {
 /// Durability ticket + the deferred metric of the statement that produced it.
 type PendingDurability = (WalDurabilityTicket, DeferredQueryMetric);
 
-async fn run_blocking_query<T, F>(
+#[allow(clippy::too_many_arguments)]
+async fn run_blocking_query<T, F, R>(
     engine: Arc<RwLock<Engine>>,
     input: T,
     principal: Option<Principal>,
+    result_mode: WireResultMode,
     query_timeout: Duration,
     metrics: &Arc<Metrics>,
+    reader: &mut BufReader<R>,
+    wire_read_buffer: &mut Vec<u8>,
+    pending_messages: &mut InFlightReadAhead,
     f: F,
-) -> (Message, Option<PendingDurability>)
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)
 where
     T: Send + 'static,
     F: FnOnce(Arc<RwLock<Engine>>, T, Option<Principal>) -> DispatchOutcome + Send + 'static,
+    R: AsyncRead + Unpin,
 {
     let _in_flight = metrics.in_flight_guard();
     let start = Instant::now();
@@ -1921,21 +2209,66 @@ where
         f(engine, input, principal)
     });
     let mut exceeded_timeout = false;
-    let join_result = tokio::select! {
-        result = &mut handle => result,
-        _ = tokio::time::sleep(query_timeout) => {
-            exceeded_timeout = true;
-            // Signal the executor to stop at its next cancellation checkpoint,
-            // then await the (now promptly returning) handle. The closure
-            // returns a typed timeout error and releases the engine lock /
-            // tx-gate permit as it unwinds.
-            cancel.cancel(powdb_query::cancel::CancelReason::Timeout);
-            handle.await
+    let mut termination = None;
+    let timeout = tokio::time::sleep(query_timeout);
+    tokio::pin!(timeout);
+    let join_result = loop {
+        tokio::select! {
+            result = &mut handle => break result,
+            _ = &mut timeout => {
+                exceeded_timeout = true;
+                // Signal the executor to stop at its next cancellation checkpoint,
+                // then await the (now promptly returning) handle. The closure
+                // returns a typed timeout error and releases the engine lock /
+                // tx-gate permit as it unwinds.
+                cancel.cancel(powdb_query::cancel::CancelReason::Timeout);
+                break handle.await;
+            }
+            read = read_message_cancel_safe(
+                reader,
+                wire_read_buffer,
+                pending_messages.remaining_bytes(),
+            ) => {
+                match read {
+                    Ok(Some(DecodedWireMessage { message: Message::Disconnect, .. })) => {
+                        cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
+                        termination = Some(ConnectionTermination::Closed);
+                        break handle.await;
+                    }
+                    Ok(Some(frame)) => {
+                        if pending_messages.len() + 1 >= MAX_IN_FLIGHT_READ_AHEAD_FRAMES
+                            || pending_messages.wire_bytes + frame.wire_len
+                                >= MAX_IN_FLIGHT_READ_AHEAD_BYTES
+                        {
+                            // Never stop observing the socket behind a full
+                            // queue. Reaching either hard cap cancels the query
+                            // and closes this connection immediately.
+                            cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
+                            termination = Some(ConnectionTermination::ReadError);
+                            break handle.await;
+                        }
+                        // Preserve frames that arrive while the blocking query
+                        // runs. The normal batching/main-loop path consumes them
+                        // in order once execution completes.
+                        pending_messages.push_back(frame);
+                    }
+                    Ok(None) => {
+                        cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
+                        termination = Some(ConnectionTermination::Closed);
+                        break handle.await;
+                    }
+                    Err(_) => {
+                        cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
+                        termination = Some(ConnectionTermination::ReadError);
+                        break handle.await;
+                    }
+                }
+            }
         }
     };
 
     let (message, ticket, outcome) = match join_result {
-        Ok((Ok(result), ticket)) => match query_result_to_message(result) {
+        Ok((Ok(result), ticket)) => match query_result_to_message(result, result_mode) {
             Ok(message) => (message, ticket, QueryOutcome::Ok),
             Err(e) => (
                 Message::Error {
@@ -1990,6 +2323,7 @@ where
                     exceeded_timeout,
                 },
             )),
+            termination,
         ),
         None => {
             if exceeded_timeout {
@@ -1997,7 +2331,7 @@ where
             } else {
                 metrics.record_query(start.elapsed(), outcome);
             }
-            (message, None)
+            (message, None, termination)
         }
     }
 }
@@ -2022,6 +2356,8 @@ fn is_success_response(msg: &Message) -> bool {
         msg,
         Message::ResultRows { .. }
             | Message::ResultScalar { .. }
+            | Message::ResultRowsNative { .. }
+            | Message::ResultScalarNative { .. }
             | Message::ResultOk { .. }
             | Message::ResultMessage { .. }
     )
@@ -2035,6 +2371,171 @@ fn rollback_open_transaction(engine: Arc<RwLock<Engine>>, principal: Option<Prin
     if let Some(ticket) = ticket {
         let _ = ticket.wait();
     }
+}
+
+fn is_query_cancellation_response(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Error { message }
+            if message.starts_with("query timeout after")
+                || message == "query cancelled by client disconnect"
+    )
+}
+
+/// Roll back this connection's explicit transaction while it still owns the
+/// transaction-gate permit, then release the permit. A timed-out/cancelled
+/// statement cannot leave an ambiguous transaction open and block every later
+/// writer; releasing first would let another connection enter the engine before
+/// this rollback has restored the prior snapshot.
+async fn rollback_connection_transaction(
+    engine: Arc<RwLock<Engine>>,
+    principal: Option<Principal>,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+) {
+    if tx_permit.is_none() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || rollback_open_transaction(engine, principal)).await;
+    tx_permit.take();
+}
+
+/// Read one post-auth wire frame without losing partially-read bytes when the
+/// future is cancelled by `tokio::select!`.
+///
+/// `Message::read_from` uses `read_exact`, whose future is not cancellation
+/// safe: racing it against query completion can consume part of the next frame
+/// and then drop those bytes. This reader stores every completed `read` in a
+/// connection-owned buffer before awaiting again, so a query may safely race
+/// socket EOF / `DISCONNECT` while preserving ordinary pipelined frames.
+struct DecodedWireMessage {
+    message: Message,
+    wire_len: usize,
+}
+
+#[derive(Default)]
+struct InFlightReadAhead {
+    frames: VecDeque<DecodedWireMessage>,
+    wire_bytes: usize,
+}
+
+impl InFlightReadAhead {
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        MAX_IN_FLIGHT_READ_AHEAD_BYTES.saturating_sub(self.wire_bytes)
+    }
+
+    fn push_back(&mut self, frame: DecodedWireMessage) {
+        self.wire_bytes += frame.wire_len;
+        self.frames.push_back(frame);
+    }
+
+    fn pop_front(&mut self) -> Option<Message> {
+        let frame = self.frames.pop_front()?;
+        self.wire_bytes -= frame.wire_len;
+        Some(frame.message)
+    }
+}
+
+async fn read_message_cancel_safe<R>(
+    reader: &mut BufReader<R>,
+    buffered: &mut Vec<u8>,
+    max_frame_len: usize,
+) -> std::io::Result<Option<DecodedWireMessage>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        if buffered.len() >= 6 {
+            let payload_len = u32::from_le_bytes(
+                buffered[2..6]
+                    .try_into()
+                    .expect("four-byte wire payload length"),
+            ) as usize;
+            if payload_len > MAX_WIRE_PAYLOAD_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("payload too large: {payload_len} bytes (max {MAX_WIRE_PAYLOAD_SIZE})"),
+                ));
+            }
+            let frame_len = 6usize.checked_add(payload_len).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "wire frame length overflow",
+                )
+            })?;
+            if frame_len > max_frame_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "wire frame exceeds the available in-flight read-ahead budget: \
+                         {frame_len} bytes (available {max_frame_len})"
+                    ),
+                ));
+            }
+            if buffered.len() >= frame_len {
+                let frame: Vec<u8> = buffered.drain(..frame_len).collect();
+                return Message::decode(&frame)
+                    .map(|message| {
+                        Some(DecodedWireMessage {
+                            message,
+                            wire_len: frame_len,
+                        })
+                    })
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+            }
+        }
+
+        let mut chunk = [0u8; 8192];
+        // Read only the bytes needed for this frame stage. Besides preserving
+        // cancellation safety, this prevents a large pipelined payload from
+        // overshooting the in-flight byte budget in one buffered read.
+        let wanted = if buffered.len() < 6 {
+            6 - buffered.len()
+        } else {
+            let payload_len = u32::from_le_bytes(
+                buffered[2..6]
+                    .try_into()
+                    .expect("four-byte wire payload length"),
+            ) as usize;
+            6usize
+                .checked_add(payload_len)
+                .and_then(|frame_len| frame_len.checked_sub(buffered.len()))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid buffered wire frame length",
+                    )
+                })?
+        };
+        let read_limit = wanted.min(chunk.len());
+        let read = reader.read(&mut chunk[..read_limit]).await?;
+        if read == 0 {
+            if buffered.len() < 6 {
+                // Match the existing protocol behavior: EOF before a complete
+                // header is a clean connection close.
+                buffered.clear();
+                return Ok(None);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed in the middle of a wire frame",
+            ));
+        }
+        buffered.extend_from_slice(&chunk[..read]);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConnectionTermination {
+    Closed,
+    ReadError,
 }
 
 pub async fn handle_connection<S>(stream: S, opts: ConnOpts<'_>)
@@ -2202,6 +2703,11 @@ where
     }
 
     let mut tx_permit: Option<OwnedSemaphorePermit> = None;
+    // Persistent framing state makes reads cancellation-safe while they race
+    // an in-flight blocking query. Frames decoded during execution retain
+    // their original order here for normal pipelined processing afterwards.
+    let mut wire_read_buffer = Vec::new();
+    let mut pending_messages = InFlightReadAhead::default();
     // A non-query frame decoded during read-ahead batching, carried over to
     // the next iteration of the main loop.
     let mut carry: Option<Message> = None;
@@ -2210,12 +2716,21 @@ where
     'conn: loop {
         let msg = if let Some(m) = carry.take() {
             m
+        } else if let Some(m) = pending_messages.pop_front() {
+            m
         } else {
             tokio::select! {
                 // Read next message with idle timeout.
-                result = tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)) => {
+                result = tokio::time::timeout(
+                    idle_timeout,
+                    read_message_cancel_safe(
+                        &mut reader,
+                        &mut wire_read_buffer,
+                        MAX_WIRE_PAYLOAD_SIZE + 6,
+                    ),
+                ) => {
                     match result {
-                        Ok(Ok(Some(msg))) => msg,
+                        Ok(Ok(Some(frame))) => frame.message,
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
                             error!(peer = %peer, error = %e, "read error");
@@ -2249,7 +2764,12 @@ where
         // frame at a time exactly as before.
         if matches!(
             msg,
-            Message::Query { .. } | Message::QuerySql { .. } | Message::QueryWithParams { .. }
+            Message::Query { .. }
+                | Message::QuerySql { .. }
+                | Message::QueryWithParams { .. }
+                | Message::QueryNative { .. }
+                | Message::QuerySqlNative { .. }
+                | Message::QueryWithParamsNative { .. }
         ) {
             /// Read-ahead cap per batch: bounds unflushed responses and keeps
             /// the reply latency of the first statement bounded.
@@ -2259,13 +2779,6 @@ where
             /// hold gigabytes of replies hostage to the batch's durability
             /// wait.
             const MAX_PIPELINE_BATCH_BYTES: usize = 4 << 20;
-
-            /// How the read-ahead loop stopped, when it stopped the whole
-            /// connection rather than just the batch.
-            enum BatchFatal {
-                Closed,
-                ReadError,
-            }
 
             /// Approximate encoded size of a response, for the batch byte
             /// cap. Counts the dominant string payloads; exact per-frame
@@ -2280,6 +2793,18 @@ where
                                 .sum::<usize>()
                     }
                     Message::ResultScalar { value } => value.len(),
+                    Message::ResultRowsNative { columns, rows } => {
+                        columns.iter().map(|c| c.len() + 4).sum::<usize>()
+                            + rows
+                                .iter()
+                                .map(|row| {
+                                    row.iter()
+                                        .map(|value| 5 + native_value_body_len(value))
+                                        .sum::<usize>()
+                                })
+                                .sum::<usize>()
+                    }
+                    Message::ResultScalarNative { value } => 5 + native_value_body_len(value),
                     Message::ResultMessage { message } | Message::Error { message } => {
                         message.len()
                     }
@@ -2304,10 +2829,10 @@ where
             let mut response_bytes: usize = 0;
             let mut last_ticket: Option<WalDurabilityTicket> = None;
             let mut deferred_metrics: Vec<DeferredQueryMetric> = Vec::new();
-            let mut fatal: Option<BatchFatal> = None;
+            let mut fatal: Option<ConnectionTermination> = None;
             let mut current = msg;
             loop {
-                let (response, ticket) = match current {
+                let (response, ticket, termination) = match current {
                     Message::Query { query } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
@@ -2319,6 +2844,7 @@ where
                                     ),
                                 },
                                 None,
+                                None,
                             )
                         } else {
                             debug!(peer = %peer, query = %query, "received query");
@@ -2327,10 +2853,14 @@ where
                                 tx_gate.clone(),
                                 &mut tx_permit,
                                 query,
+                                WireResultMode::LegacyText,
                                 principal.clone(),
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
                             )
                             .await
                         }
@@ -2346,6 +2876,7 @@ where
                                     ),
                                 },
                                 None,
+                                None,
                             )
                         } else {
                             debug!(peer = %peer, query = %query, "received SQL query");
@@ -2354,10 +2885,14 @@ where
                                 tx_gate.clone(),
                                 &mut tx_permit,
                                 query,
+                                WireResultMode::LegacyText,
                                 principal.clone(),
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
                             )
                             .await
                         }
@@ -2373,6 +2908,7 @@ where
                                     ),
                                 },
                                 None,
+                                None,
                             )
                         } else {
                             debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
@@ -2382,10 +2918,111 @@ where
                                 &mut tx_permit,
                                 query,
                                 params,
+                                WireResultMode::LegacyText,
                                 principal.clone(),
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
+                            )
+                            .await
+                        }
+                    }
+                    Message::QueryNative { query } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, "received native query");
+                            execute_wire_query(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                WireResultMode::Native,
+                                principal.clone(),
+                                query_timeout,
+                                tx_wait_timeout,
+                                &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
+                            )
+                            .await
+                        }
+                    }
+                    Message::QuerySqlNative { query } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, "received native SQL query");
+                            execute_wire_query_sql(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                WireResultMode::Native,
+                                principal.clone(),
+                                query_timeout,
+                                tx_wait_timeout,
+                                &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
+                            )
+                            .await
+                        }
+                    }
+                    Message::QueryWithParamsNative { query, params } => {
+                        if query.len() > MAX_QUERY_LENGTH {
+                            (
+                                Message::Error {
+                                    message: format!(
+                                        "query too large: {} bytes (max {})",
+                                        query.len(),
+                                        MAX_QUERY_LENGTH
+                                    ),
+                                },
+                                None,
+                                None,
+                            )
+                        } else {
+                            debug!(peer = %peer, query = %query, n_params = params.len(), "received native parameterized query");
+                            execute_wire_query_with_params(
+                                engine.clone(),
+                                tx_gate.clone(),
+                                &mut tx_permit,
+                                query,
+                                params,
+                                WireResultMode::Native,
+                                principal.clone(),
+                                query_timeout,
+                                tx_wait_timeout,
+                                &metrics,
+                                &mut reader,
+                                &mut wire_read_buffer,
+                                &mut pending_messages,
                             )
                             .await
                         }
@@ -2401,6 +3038,10 @@ where
                 }
                 response_bytes += approx_response_bytes(&response);
                 responses.push(response);
+                if let Some(reason) = termination {
+                    fatal = Some(reason);
+                    break;
+                }
 
                 // Read ahead only when a COMPLETE next frame is already
                 // buffered (never await the socket mid-batch) and the
@@ -2410,18 +3051,43 @@ where
                 if tx_permit.is_some()
                     || responses.len() >= MAX_PIPELINE_BATCH
                     || response_bytes >= MAX_PIPELINE_BATCH_BYTES
-                    || !complete_frame_buffered(reader.buffer())
+                    || (pending_messages.is_empty()
+                        && !complete_frame_buffered(&wire_read_buffer)
+                        && !complete_frame_buffered(reader.buffer()))
                 {
                     break;
                 }
                 // The full frame is buffered, so this returns without socket
                 // I/O; the timeout is a defensive backstop only.
-                match tokio::time::timeout(idle_timeout, Message::read_from(&mut reader)).await {
-                    Ok(Ok(Some(
+                let next_message = if let Some(message) = pending_messages.pop_front() {
+                    Ok(Some(message))
+                } else {
+                    tokio::time::timeout(
+                        idle_timeout,
+                        read_message_cancel_safe(
+                            &mut reader,
+                            &mut wire_read_buffer,
+                            MAX_WIRE_PAYLOAD_SIZE + 6,
+                        ),
+                    )
+                    .await
+                    .map(|result| result.map(|frame| frame.map(|frame| frame.message)))
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timeout decoding fully-buffered frame",
+                        ))
+                    })
+                };
+                match next_message {
+                    Ok(Some(
                         next @ (Message::Query { .. }
                         | Message::QuerySql { .. }
-                        | Message::QueryWithParams { .. }),
-                    ))) => {
+                        | Message::QueryWithParams { .. }
+                        | Message::QueryNative { .. }
+                        | Message::QuerySqlNative { .. }
+                        | Message::QueryWithParamsNative { .. }),
+                    )) => {
                         // If another connection currently holds the TxGate,
                         // the next statement would block on the gate with
                         // this batch's replies still unflushed (pre-batching,
@@ -2435,26 +3101,19 @@ where
                         }
                         current = next;
                     }
-                    Ok(Ok(Some(other))) => {
+                    Ok(Some(other)) => {
                         // Not a plain query — flush this batch, then handle
                         // the frame on the next main-loop iteration.
                         carry = Some(other);
                         break;
                     }
-                    Ok(Ok(None)) => {
-                        fatal = Some(BatchFatal::Closed);
+                    Ok(None) => {
+                        fatal = Some(ConnectionTermination::Closed);
                         break;
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         error!(peer = %peer, error = %e, "read error");
-                        fatal = Some(BatchFatal::ReadError);
-                        break;
-                    }
-                    Err(_) => {
-                        // Unreachable in practice: the frame was fully
-                        // buffered, so read_from needs no socket I/O.
-                        error!(peer = %peer, "timeout decoding fully-buffered frame");
-                        fatal = Some(BatchFatal::ReadError);
+                        fatal = Some(ConnectionTermination::ReadError);
                         break;
                     }
                 }
@@ -2496,7 +3155,7 @@ where
             }
             match fatal {
                 None => continue,
-                Some(BatchFatal::Closed | BatchFatal::ReadError) => break,
+                Some(ConnectionTermination::Closed | ConnectionTermination::ReadError) => break,
             }
         }
 
@@ -2663,35 +3322,70 @@ fn charge_response_bytes(total: &mut usize, bytes: usize) -> Result<(), QueryErr
     Ok(())
 }
 
-fn query_result_to_message(result: QueryResult) -> Result<Message, QueryError> {
+fn native_value_body_len(value: &Value) -> usize {
+    match value {
+        Value::Empty => 0,
+        Value::Int(_) | Value::Float(_) | Value::DateTime(_) => 8,
+        Value::Bool(_) => 1,
+        Value::Str(value) => value.len(),
+        Value::Uuid(_) => 16,
+        Value::Bytes(value) => value.len(),
+        Value::Json(value) => value.len(),
+    }
+}
+
+fn query_result_to_message(
+    result: QueryResult,
+    result_mode: WireResultMode,
+) -> Result<Message, QueryError> {
     match result {
         QueryResult::Rows { columns, rows } => {
             let mut encoded_bytes = 2usize; // column count
-            let mut out_columns = Vec::with_capacity(columns.len());
-            for col in columns {
+            for col in &columns {
                 charge_response_bytes(&mut encoded_bytes, 4 + col.len())?;
-                out_columns.push(col);
             }
             charge_response_bytes(&mut encoded_bytes, 4)?; // row count
 
-            let mut str_rows = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut str_row = Vec::with_capacity(row.len());
-                for value in row {
-                    let display = value_to_display(&value);
-                    charge_response_bytes(&mut encoded_bytes, 4 + display.len())?;
-                    str_row.push(display);
+            match result_mode {
+                WireResultMode::Native => {
+                    for row in &rows {
+                        for value in row {
+                            charge_response_bytes(
+                                &mut encoded_bytes,
+                                5 + native_value_body_len(value),
+                            )?;
+                        }
+                    }
+                    Ok(Message::ResultRowsNative { columns, rows })
                 }
-                str_rows.push(str_row);
+                WireResultMode::LegacyText => {
+                    let mut str_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let mut str_row = Vec::with_capacity(row.len());
+                        for value in row {
+                            let display = value_to_display(&value);
+                            charge_response_bytes(&mut encoded_bytes, 4 + display.len())?;
+                            str_row.push(display);
+                        }
+                        str_rows.push(str_row);
+                    }
+                    Ok(Message::ResultRows {
+                        columns,
+                        rows: str_rows,
+                    })
+                }
             }
-            Ok(Message::ResultRows {
-                columns: out_columns,
-                rows: str_rows,
-            })
         }
-        QueryResult::Scalar(val) => Ok(Message::ResultScalar {
-            value: value_to_display(&val),
-        }),
+        QueryResult::Scalar(value) => match result_mode {
+            WireResultMode::Native => {
+                let mut encoded_bytes = 0;
+                charge_response_bytes(&mut encoded_bytes, 5 + native_value_body_len(&value))?;
+                Ok(Message::ResultScalarNative { value })
+            }
+            WireResultMode::LegacyText => Ok(Message::ResultScalar {
+                value: value_to_display(&value),
+            }),
+        },
         QueryResult::Modified(n) => Ok(Message::ResultOk { affected: n }),
         QueryResult::Created(name) => Ok(Message::ResultMessage {
             message: format!("type {name} created"),
@@ -2743,6 +3437,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancellation_errors_surface_to_remote_clients() {
+        // A cancelled/timed-out query must reach the client with its real
+        // message (both are derived from the configured timeout or a client
+        // disconnect and leak no internal state) rather than the generic mask.
+        for msg in [
+            &QueryError::Timeout { timeout_ms: 2000 }.to_string(),
+            &QueryError::Cancelled.to_string(),
+        ] {
+            assert_eq!(sanitize_error(msg), *msg, "should pass through verbatim");
+        }
+        // Sanity-check the exact wording the executor emits.
+        assert_eq!(
+            QueryError::Timeout { timeout_ms: 2000 }.to_string(),
+            "query timeout after 2000ms"
+        );
+        assert_eq!(
+            QueryError::Cancelled.to_string(),
+            "query cancelled by client disconnect"
+        );
+    }
+
     // ---- JSON (v0.12): canonical-text wire rendering + parse-error passthrough ----
 
     #[test]
@@ -2757,7 +3473,7 @@ mod tests {
             columns: vec!["doc".into()],
             rows: vec![vec![Value::Json(pj1.into())]],
         };
-        match query_result_to_message(result).expect("encodes") {
+        match query_result_to_message(result, WireResultMode::LegacyText).expect("encodes") {
             Message::ResultRows { columns, rows } => {
                 assert_eq!(columns, vec!["doc"]);
                 assert_eq!(
@@ -2805,7 +3521,7 @@ mod tests {
             .execute_powql("type Doc { required id: int, body: json }")
             .expect("json column DDL should be accepted once Lane B lands");
         let result = engine.execute_powql("describe Doc").expect("describe runs");
-        let msg = query_result_to_message(result).expect("encodes");
+        let msg = query_result_to_message(result, WireResultMode::LegacyText).expect("encodes");
         match msg {
             Message::ResultRows { columns, rows } => {
                 assert_eq!(columns[1], "type");
@@ -2858,15 +3574,23 @@ mod tests {
             .expect("should acquire a free gate");
         assert_eq!(gate.available_permits(), 0, "permit must be held");
         drop(permit);
-        assert_eq!(gate.available_permits(), 1, "permit must release on drop");
+        assert_eq!(
+            gate.available_permits(),
+            DEFAULT_TX_GATE_READER_PERMITS as usize,
+            "permit pool must release on drop"
+        );
     }
 
     #[tokio::test]
     async fn begin_permit_times_out_with_clear_error_and_truthful_metric() {
         let gate = new_tx_gate();
         let metrics = Arc::new(Metrics::new());
-        // Hold the only permit so the next acquire must wait, then time out.
-        let _held = gate.clone().acquire_owned().await.unwrap();
+        // Hold the full writer admission so the next acquire must time out.
+        let _held = gate
+            .clone()
+            .acquire_many_owned(DEFAULT_TX_GATE_READER_PERMITS)
+            .await
+            .unwrap();
         let err = acquire_begin_permit(&gate, Duration::from_millis(25), &metrics)
             .await
             .expect_err("must time out while the gate is held");
@@ -2887,6 +3611,124 @@ mod tests {
         assert!(rendered.contains("powdb_tx_gate_timeouts_total 1"));
         // A timed-out begin is a failed statement from the client's view.
         assert!(rendered.contains("powdb_queries_total{result=\"error\"} 1"));
+    }
+
+    #[test]
+    fn admission_classification_has_query_shape_parity_and_fails_closed() {
+        assert_eq!(
+            classify_query_admission("User filter .id = 1"),
+            AdmissionMode::Reader
+        );
+        assert_eq!(
+            classify_sql_admission("SELECT * FROM User WHERE id = 1"),
+            AdmissionMode::Reader
+        );
+        assert_eq!(
+            classify_params_admission("User filter .id = $1", &[WireParam::Int(1)]),
+            AdmissionMode::Reader
+        );
+
+        assert_eq!(
+            classify_query_admission("insert User { id := 1 }"),
+            AdmissionMode::Writer
+        );
+        assert_eq!(
+            classify_sql_admission("INSERT INTO User (id) VALUES (1)"),
+            AdmissionMode::Writer
+        );
+        assert_eq!(
+            classify_params_admission("insert User { id := $1 }", &[WireParam::Int(1)]),
+            AdmissionMode::Writer
+        );
+        assert_eq!(
+            classify_query_admission("this is not valid PowQL"),
+            AdmissionMode::Writer,
+            "uncertain statements must never enter through reader admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_admission_excludes_readers() {
+        let gate = new_tx_gate();
+        let metrics = Arc::new(Metrics::new());
+        let writer = acquire_begin_permit(&gate, Duration::from_secs(1), &metrics)
+            .await
+            .expect("writer admission");
+        let blocked = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_millis(25),
+            &metrics,
+        )
+        .await;
+        assert!(blocked.is_err(), "reader must wait behind writer admission");
+        drop(writer);
+        let _reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("reader must proceed after writer releases");
+    }
+
+    #[tokio::test]
+    async fn queued_writer_is_not_starved_by_later_readers() {
+        let gate = new_tx_gate();
+        let metrics = Arc::new(Metrics::new());
+        let first_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("first reader admission");
+
+        let writer_gate = gate.clone();
+        let writer_metrics = metrics.clone();
+        let mut writer = tokio::spawn(async move {
+            acquire_begin_permit(&writer_gate, Duration::from_secs(1), &writer_metrics).await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let late_gate = gate.clone();
+        let late_metrics = metrics.clone();
+        let mut late_reader = tokio::spawn(async move {
+            acquire_autocommit_permit(
+                &late_gate,
+                AdmissionMode::Reader,
+                Duration::from_secs(1),
+                &late_metrics,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut late_reader)
+                .await
+                .is_err(),
+            "a later reader must queue behind the waiting writer"
+        );
+
+        drop(first_reader);
+        let writer_permit = tokio::time::timeout(Duration::from_secs(1), &mut writer)
+            .await
+            .expect("writer must acquire once prior readers drain")
+            .expect("writer task")
+            .expect("writer admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut late_reader)
+                .await
+                .is_err(),
+            "writer must hold exclusive admission before the late reader"
+        );
+        drop(writer_permit);
+        let _late_reader = tokio::time::timeout(Duration::from_secs(1), late_reader)
+            .await
+            .expect("late reader must eventually acquire")
+            .expect("late reader task")
+            .expect("late reader admission");
     }
 
     #[test]
@@ -2912,7 +3754,7 @@ mod tests {
             columns: vec!["payload".into()],
             rows: vec![vec![Value::Str(long)]],
         };
-        let err = query_result_to_message(result).unwrap_err();
+        let err = query_result_to_message(result, WireResultMode::LegacyText).unwrap_err();
         assert!(
             err.to_string().starts_with("result too large"),
             "unexpected error: {err}"

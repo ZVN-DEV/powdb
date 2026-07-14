@@ -4,20 +4,730 @@ use crate::ast::*;
 use crate::cancel::CancelCheck;
 use crate::plan::*;
 use crate::result::{QueryError, QueryResult};
-use powdb_storage::catalog::Catalog;
+use powdb_storage::catalog::{Catalog, ExpressionIndexMeta, IndexOrderDirection};
 use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
+use powdb_storage::stored_json_path::StoredJsonPathV1;
 use powdb_storage::types::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::ops::ControlFlow;
 
 use super::compiled::*;
 use super::eval::*;
 use super::row_body_base;
-use super::{check_join_limit, Engine, MAX_SORT_ROWS};
+use super::{check_join_limit, mem_budget, Engine, MAX_NESTED_LOOP_PAIRS, MAX_SORT_ROWS};
 use powdb_storage::view::ViewDef;
 
+/// Maximum number of elements sorted by the standard-library stable sort
+/// without an intervening cancellation checkpoint. Larger inputs are sorted
+/// as bounded stable runs and cooperatively merged below.
+const CANCELLABLE_SORT_RUN: usize = 2_048;
+
+/// Stable sort with cooperative cancellation throughout the sort itself.
+///
+/// We sort original positions rather than moving potentially large rows on
+/// every merge pass. Each bounded run uses Rust's stable sort, with immediate
+/// checks on both sides; bottom-up merges poll while emitting positions and
+/// prefer the left run on equality, preserving global stability. The final
+/// permutation is applied in place and also polls. Two `usize` arrays are the
+/// only scratch allocation and are charged to the query memory budget.
+pub(super) fn cooperative_stable_sort_by<T, F>(
+    values: &mut [T],
+    memory_limit: usize,
+    compare: F,
+) -> Result<(), QueryError>
+where
+    F: Fn(&T, &T) -> std::cmp::Ordering,
+{
+    crate::cancel::check()?;
+    let len = values.len();
+    if len < 2 {
+        return Ok(());
+    }
+
+    let scratch_bytes = len
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_mul(2);
+    mem_budget::charge(scratch_bytes, memory_limit)?;
+
+    let mut order: Vec<usize> = (0..len).collect();
+    let mut scratch = vec![0usize; len];
+
+    for run in order.chunks_mut(CANCELLABLE_SORT_RUN) {
+        crate::cancel::check()?;
+        run.sort_by(|&a, &b| compare(&values[a], &values[b]));
+        crate::cancel::check()?;
+    }
+
+    let mut cancel = CancelCheck::new();
+    let mut width = CANCELLABLE_SORT_RUN;
+    while width < len {
+        let step = width.saturating_mul(2);
+        let mut start = 0usize;
+        while start < len {
+            let mid = start.saturating_add(width).min(len);
+            let end = start.saturating_add(step).min(len);
+            let (mut left, mut right, mut out) = (start, mid, start);
+
+            while left < mid && right < end {
+                cancel.tick()?;
+                if compare(&values[order[left]], &values[order[right]])
+                    != std::cmp::Ordering::Greater
+                {
+                    scratch[out] = order[left];
+                    left += 1;
+                } else {
+                    scratch[out] = order[right];
+                    right += 1;
+                }
+                out += 1;
+            }
+            while left < mid {
+                cancel.tick()?;
+                scratch[out] = order[left];
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                cancel.tick()?;
+                scratch[out] = order[right];
+                right += 1;
+                out += 1;
+            }
+            start = start.saturating_add(step);
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = step;
+    }
+
+    // `order[new_position] = old_position`; invert it to a destination for
+    // each item, then apply permutation cycles without cloning row payloads.
+    for (new_position, &old_position) in order.iter().enumerate() {
+        cancel.tick()?;
+        scratch[old_position] = new_position;
+    }
+    drop(order);
+    for position in 0..len {
+        while scratch[position] != position {
+            cancel.tick()?;
+            let destination = scratch[position];
+            values.swap(position, destination);
+            scratch.swap(position, destination);
+        }
+    }
+    Ok(())
+}
+
+/// Run a raw table scan with cooperative cancellation while preserving the
+/// existing allocation-free callback shape used by hot read paths.
+pub(super) fn for_each_row_raw_cancellable(
+    catalog: &Catalog,
+    table: &str,
+    mut f: impl FnMut(RowId, &[u8]),
+) -> Result<(), QueryError> {
+    let mut cancel = CancelCheck::new();
+    let mut cancel_err: Option<QueryError> = None;
+    catalog
+        .try_for_each_row_raw(table, |rid, data| {
+            if let Err(err) = cancel.tick() {
+                cancel_err = Some(err);
+                return ControlFlow::Break(());
+            }
+            f(rid, data);
+            ControlFlow::Continue(())
+        })
+        .map_err(|err| QueryError::StorageError(err.to_string()))?;
+    match cancel_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn resolve_expression_index(
+    catalog: &Catalog,
+    table: &str,
+    path: &StoredJsonPathV1,
+) -> Option<ExpressionIndexMeta> {
+    catalog
+        .expression_index_metadata(table)?
+        .into_iter()
+        .find(|metadata| metadata.canonical_version == 1 && metadata.json_path == *path)
+}
+
+fn expression_index_fallback(plan: &PlanNode) -> Option<PlanNode> {
+    match plan {
+        PlanNode::ExprIndexScan { table, path, key } => Some(PlanNode::Filter {
+            input: Box::new(PlanNode::SeqScan {
+                table: table.clone(),
+            }),
+            predicate: Expr::BinaryOp(
+                Box::new(stored_json_path_expr(path)),
+                BinOp::Eq,
+                Box::new(key.clone()),
+            ),
+        }),
+        PlanNode::ExprRangeScan {
+            table,
+            path,
+            start,
+            end,
+        } => Some(PlanNode::Filter {
+            input: Box::new(PlanNode::SeqScan {
+                table: table.clone(),
+            }),
+            predicate: synthesize_expr_range_predicate(path, start, end),
+        }),
+        PlanNode::OrderedExprIndexScan {
+            table,
+            path,
+            descending,
+            limit,
+            offset,
+        } => {
+            let sorted = PlanNode::Sort {
+                input: Box::new(PlanNode::SeqScan {
+                    table: table.clone(),
+                }),
+                keys: vec![SortKey {
+                    expr: stored_json_path_expr(path),
+                    descending: *descending,
+                }],
+            };
+            let sliced = match offset {
+                Some(count) => PlanNode::Offset {
+                    input: Box::new(sorted),
+                    count: count.clone(),
+                },
+                None => sorted,
+            };
+            Some(PlanNode::Limit {
+                input: Box::new(sliced),
+                count: limit.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProvenanceRows {
+    pub(super) columns: Vec<String>,
+    pub(super) rows: Vec<Vec<Value>>,
+    source_aliases: Vec<String>,
+    provenance: Vec<Vec<Option<RowId>>>,
+}
+
+impl ProvenanceRows {
+    fn source_index(&self, alias: &str) -> Option<usize> {
+        self.source_aliases
+            .iter()
+            .position(|source| source == alias)
+    }
+}
+
 impl Engine {
+    pub(super) fn execute_expression_index_plan(
+        &self,
+        plan: &PlanNode,
+        projected_fields: Option<&[ProjectField]>,
+    ) -> Result<Option<QueryResult>, QueryError> {
+        let (table, path) = match plan {
+            PlanNode::ExprIndexScan { table, path, .. }
+            | PlanNode::ExprRangeScan { table, path, .. }
+            | PlanNode::OrderedExprIndexScan { table, path, .. } => (table, path),
+            _ => return Ok(None),
+        };
+        let Some(index) = resolve_expression_index(&self.catalog, table, path) else {
+            return Ok(None);
+        };
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
+            .clone();
+        let all_columns: Vec<String> = schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+
+        let projection = match projected_fields {
+            Some(fields) => {
+                if !fields
+                    .iter()
+                    .all(|field| matches!(field.expr, Expr::Field(_)))
+                {
+                    return Ok(None);
+                }
+                let mut indices = Vec::with_capacity(fields.len());
+                let mut columns = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let Expr::Field(name) = &field.expr else {
+                        unreachable!("plain-field projection checked above")
+                    };
+                    let index =
+                        schema
+                            .column_index(name)
+                            .ok_or_else(|| QueryError::ColumnNotFound {
+                                table: table.clone(),
+                                column: name.clone(),
+                            })?;
+                    indices.push(index);
+                    columns.push(field.alias.clone().unwrap_or_else(|| name.clone()));
+                }
+                Some((indices, columns))
+            }
+            None => None,
+        };
+
+        let (rids, range) = match plan {
+            PlanNode::ExprIndexScan { key, .. } => {
+                let key = literal_to_value(key)?;
+                let rids = if key.is_empty() {
+                    self.catalog
+                        .expression_index_btree(table, index.index_id)
+                        .ok_or_else(|| {
+                            QueryError::Execution("expression index disappeared".to_string())
+                        })?
+                        .empty_rids()
+                        .to_vec()
+                } else {
+                    self.catalog
+                        .expression_index_lookup_all(table, index.index_id, &key)
+                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                };
+                (rids, None)
+            }
+            PlanNode::ExprRangeScan { start, end, .. } => {
+                let start_value = start
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let end_value = end
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let rids = self
+                    .catalog
+                    .expression_index_range_rids(
+                        table,
+                        index.index_id,
+                        start_value.as_ref(),
+                        end_value.as_ref(),
+                    )
+                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                (
+                    rids,
+                    Some((
+                        start_value,
+                        start.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                        end_value,
+                        end.as_ref().is_none_or(|(_, inclusive)| *inclusive),
+                    )),
+                )
+            }
+            PlanNode::OrderedExprIndexScan {
+                descending,
+                limit,
+                offset,
+                ..
+            } => {
+                let Expr::Literal(Literal::Int(limit)) = limit else {
+                    return Err(QueryError::Execution(
+                        "expression-index limit must be a non-negative integer".to_string(),
+                    ));
+                };
+                let offset = match offset {
+                    Some(Expr::Literal(Literal::Int(offset))) if *offset >= 0 => *offset as usize,
+                    None => 0,
+                    _ => {
+                        return Err(QueryError::Execution(
+                            "expression-index offset must be a non-negative integer".to_string(),
+                        ));
+                    }
+                };
+                if *limit < 0 {
+                    return Err(QueryError::Execution(
+                        "expression-index limit must be a non-negative integer".to_string(),
+                    ));
+                }
+                let rids = self
+                    .catalog
+                    .expression_index_ordered_rids_bounded(
+                        table,
+                        index.index_id,
+                        if *descending {
+                            IndexOrderDirection::Desc
+                        } else {
+                            IndexOrderDirection::Asc
+                        },
+                        offset,
+                        *limit as usize,
+                    )
+                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                (rids, None)
+            }
+            _ => unreachable!("expression-index plan checked above"),
+        };
+
+        let root_index =
+            schema
+                .column_index(&path.column)
+                .ok_or_else(|| QueryError::ColumnNotFound {
+                    table: table.clone(),
+                    column: path.column.clone(),
+                })?;
+        let path_expr = stored_json_path_expr(path);
+        let mut rows = Vec::with_capacity(rids.len());
+        let mut cancel = CancelCheck::new();
+        for rid in rids {
+            cancel.tick()?;
+            match &projection {
+                Some((projected_indices, _)) => {
+                    let mut fetch_indices = projected_indices.clone();
+                    let root_position = fetch_indices.iter().position(|index| *index == root_index);
+                    let root_position = match root_position {
+                        Some(position) => position,
+                        None => {
+                            fetch_indices.push(root_index);
+                            fetch_indices.len() - 1
+                        }
+                    };
+                    let Some(mut fetched) = self
+                        .catalog
+                        .get_projected(table, rid, &fetch_indices)
+                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                    else {
+                        continue;
+                    };
+                    if let Some((start, start_inclusive, end, end_inclusive)) = &range {
+                        let value = eval_expr(
+                            &path_expr,
+                            std::slice::from_ref(&fetched[root_position]),
+                            std::slice::from_ref(&path.column),
+                        );
+                        if value.is_empty()
+                            || !range_matches(&value, start, *start_inclusive, end, *end_inclusive)
+                        {
+                            continue;
+                        }
+                    }
+                    fetched.truncate(projected_indices.len());
+                    rows.push(fetched);
+                }
+                None => {
+                    let Some(row) = self.catalog.get(table, rid) else {
+                        continue;
+                    };
+                    if let Some((start, start_inclusive, end, end_inclusive)) = &range {
+                        let value = eval_expr(&path_expr, &row, &all_columns);
+                        if value.is_empty()
+                            || !range_matches(&value, start, *start_inclusive, end, *end_inclusive)
+                        {
+                            continue;
+                        }
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+
+        let columns = projection
+            .map(|(_, columns)| columns)
+            .unwrap_or(all_columns);
+        Ok(Some(QueryResult::Rows { columns, rows }))
+    }
+
+    fn charge_provenance(&self, rows: &ProvenanceRows) -> Result<(), QueryError> {
+        let aliases =
+            rows.source_aliases
+                .iter()
+                .fold(std::mem::size_of::<Vec<String>>(), |total, alias| {
+                    total
+                        .saturating_add(std::mem::size_of::<String>())
+                        .saturating_add(alias.capacity())
+                });
+        let per_row = std::mem::size_of::<Vec<Option<RowId>>>().saturating_add(
+            rows.source_aliases
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<RowId>>()),
+        );
+        mem_budget::charge(
+            aliases.saturating_add(rows.provenance.len().saturating_mul(per_row)),
+            self.query_memory_limit(),
+        )
+    }
+
+    fn provenance_scan(
+        &self,
+        table: &str,
+        alias: &str,
+        qualify_columns: bool,
+    ) -> Result<ProvenanceRows, QueryError> {
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
+            .clone();
+        let columns = schema
+            .columns
+            .iter()
+            .map(|column| {
+                if qualify_columns {
+                    format!("{alias}.{}", column.name)
+                } else {
+                    column.name.clone()
+                }
+            })
+            .collect();
+        let mut rows = Vec::new();
+        let mut provenance = Vec::new();
+        let mut cancel = CancelCheck::new();
+        for (rid, row) in self
+            .catalog
+            .scan(table)
+            .map_err(|error| QueryError::StorageError(error.to_string()))?
+        {
+            cancel.tick()?;
+            rows.push(row);
+            provenance.push(vec![Some(rid)]);
+        }
+        let result = ProvenanceRows {
+            columns,
+            rows,
+            source_aliases: vec![alias.to_string()],
+            provenance,
+        };
+        Ok(result)
+    }
+
+    pub(super) fn materialize_rows_with_provenance(
+        &self,
+        plan: &PlanNode,
+    ) -> Result<ProvenanceRows, QueryError> {
+        let result = match plan {
+            PlanNode::SeqScan { table } => self.provenance_scan(table, table, false)?,
+            PlanNode::AliasScan { table, alias } => self.provenance_scan(table, alias, true)?,
+            PlanNode::IndexScan { table, column, key } => {
+                let fallback = PlanNode::Filter {
+                    input: Box::new(PlanNode::SeqScan {
+                        table: table.clone(),
+                    }),
+                    predicate: Expr::BinaryOp(
+                        Box::new(Expr::Field(column.clone())),
+                        BinOp::Eq,
+                        Box::new(key.clone()),
+                    ),
+                };
+                self.materialize_rows_with_provenance(&fallback)?
+            }
+            PlanNode::RangeScan {
+                table,
+                column,
+                start,
+                end,
+            } => {
+                let fallback = PlanNode::Filter {
+                    input: Box::new(PlanNode::SeqScan {
+                        table: table.clone(),
+                    }),
+                    predicate: synthesize_range_predicate(column, start, end),
+                };
+                self.materialize_rows_with_provenance(&fallback)?
+            }
+            PlanNode::ExprIndexScan { .. }
+            | PlanNode::ExprRangeScan { .. }
+            | PlanNode::OrderedExprIndexScan { .. } => {
+                let fallback = expression_index_fallback(plan)
+                    .expect("expression-index branch always has a fallback");
+                self.materialize_rows_with_provenance(&fallback)?
+            }
+            PlanNode::Filter { input, predicate } => {
+                if contains_subquery(predicate) {
+                    return Err(QueryError::Execution(
+                        "symmetric aggregation over a subquery filter is not supported; use raw"
+                            .to_string(),
+                    ));
+                }
+                let input = self.materialize_rows_with_provenance(input)?;
+                let mut rows = Vec::new();
+                let mut provenance = Vec::new();
+                let mut cancel = CancelCheck::new();
+                for (row, row_provenance) in input.rows.into_iter().zip(input.provenance) {
+                    cancel.tick()?;
+                    if eval_predicate(predicate, &row, &input.columns) {
+                        rows.push(row);
+                        provenance.push(row_provenance);
+                    }
+                }
+                ProvenanceRows {
+                    columns: input.columns,
+                    rows,
+                    source_aliases: input.source_aliases,
+                    provenance,
+                }
+            }
+            PlanNode::Project { input, fields } => {
+                let input = self.materialize_rows_with_provenance(input)?;
+                let columns = fields
+                    .iter()
+                    .map(|field| {
+                        field.alias.clone().unwrap_or_else(|| match &field.expr {
+                            Expr::Field(name) => name.clone(),
+                            Expr::QualifiedField { qualifier, field } => {
+                                format!("{qualifier}.{field}")
+                            }
+                            _ => expression_output_name(&field.expr),
+                        })
+                    })
+                    .collect();
+                let mut rows = Vec::with_capacity(input.rows.len());
+                let mut cancel = CancelCheck::new();
+                for row in &input.rows {
+                    cancel.tick()?;
+                    rows.push(
+                        fields
+                            .iter()
+                            .map(|field| eval_expr(&field.expr, row, &input.columns))
+                            .collect(),
+                    );
+                }
+                ProvenanceRows {
+                    columns,
+                    rows,
+                    source_aliases: input.source_aliases,
+                    provenance: input.provenance,
+                }
+            }
+            PlanNode::Sort { input, keys } => {
+                let input = self.materialize_rows_with_provenance(input)?;
+                if input.rows.len() > MAX_SORT_ROWS {
+                    return Err(QueryError::SortLimitExceeded);
+                }
+                self.charge_rows(&input.rows)?;
+                let mut paired: Vec<_> = input.rows.into_iter().zip(input.provenance).collect();
+                cooperative_stable_sort_by(
+                    &mut paired,
+                    self.query_memory_limit(),
+                    |(left, _), (right, _)| {
+                        for key in keys {
+                            let comparison = eval_expr(&key.expr, left, &input.columns)
+                                .cmp(&eval_expr(&key.expr, right, &input.columns));
+                            let comparison = if key.descending {
+                                comparison.reverse()
+                            } else {
+                                comparison
+                            };
+                            if comparison != std::cmp::Ordering::Equal {
+                                return comparison;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    },
+                )?;
+                let (rows, provenance) = paired.into_iter().unzip();
+                ProvenanceRows {
+                    columns: input.columns,
+                    rows,
+                    source_aliases: input.source_aliases,
+                    provenance,
+                }
+            }
+            PlanNode::Limit { input, count } | PlanNode::Offset { input, count } => {
+                let input_rows = self.materialize_rows_with_provenance(input)?;
+                let Expr::Literal(Literal::Int(count)) = count else {
+                    return Err(QueryError::Execution(
+                        "limit/offset must be an integer literal".to_string(),
+                    ));
+                };
+                let count = *count as usize;
+                let is_limit = matches!(plan, PlanNode::Limit { .. });
+                let iterator = input_rows.rows.into_iter().zip(input_rows.provenance);
+                let (rows, provenance) = if is_limit {
+                    iterator.take(count).unzip()
+                } else {
+                    iterator.skip(count).unzip()
+                };
+                ProvenanceRows {
+                    columns: input_rows.columns,
+                    rows,
+                    source_aliases: input_rows.source_aliases,
+                    provenance,
+                }
+            }
+            PlanNode::Distinct { input } => {
+                let input = self.materialize_rows_with_provenance(input)?;
+                let mut seen = HashSet::new();
+                let mut rows = Vec::new();
+                let mut provenance = Vec::new();
+                let mut cancel = CancelCheck::new();
+                for (row, row_provenance) in input.rows.into_iter().zip(input.provenance) {
+                    cancel.tick()?;
+                    if seen.insert(row.clone()) {
+                        rows.push(row);
+                        provenance.push(row_provenance);
+                    }
+                }
+                ProvenanceRows {
+                    columns: input.columns,
+                    rows,
+                    source_aliases: input.source_aliases,
+                    provenance,
+                }
+            }
+            PlanNode::Union { left, right, all } => {
+                let mut left_rows = self.materialize_rows_with_provenance(left)?;
+                let right_rows = self.materialize_rows_with_provenance(right)?;
+                if left_rows.columns.len() != right_rows.columns.len() {
+                    return Err(QueryError::Execution(
+                        "union sides must have the same number of columns".to_string(),
+                    ));
+                }
+                if left_rows.source_aliases != right_rows.source_aliases {
+                    return Err(QueryError::Execution(
+                        "symmetric aggregation over union requires matching source aliases; use raw"
+                            .to_string(),
+                    ));
+                }
+                left_rows.rows.extend(right_rows.rows);
+                left_rows.provenance.extend(right_rows.provenance);
+                if !all {
+                    let mut seen = HashSet::new();
+                    let mut rows = Vec::new();
+                    let mut provenance = Vec::new();
+                    for (row, row_provenance) in
+                        left_rows.rows.into_iter().zip(left_rows.provenance)
+                    {
+                        if seen.insert(row.clone()) {
+                            rows.push(row);
+                            provenance.push(row_provenance);
+                        }
+                    }
+                    left_rows.rows = rows;
+                    left_rows.provenance = provenance;
+                }
+                left_rows
+            }
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                on,
+                kind,
+            } => {
+                let left = self.materialize_rows_with_provenance(left)?;
+                let right = self.materialize_rows_with_provenance(right)?;
+                execute_provenance_join(left, right, on.as_ref(), *kind)?
+            }
+            _ => {
+                return Err(QueryError::Execution(
+                    "symmetric aggregation input shape is not supported; use raw".to_string(),
+                ));
+            }
+        };
+        self.charge_provenance(&result)?;
+        Ok(result)
+    }
+
     /// `schema` — one result row per type: name + column count. Read-only;
     /// reads live catalog state, so a cached plan can never serve a stale list.
     pub(super) fn introspect_list_types(&self) -> Result<QueryResult, QueryError> {
@@ -87,6 +797,16 @@ impl Engine {
         validate_no_stray_aggregates(plan)?;
         validate_json_path_types(&self.catalog, plan)?;
         match plan {
+            PlanNode::ExprIndexScan { .. }
+            | PlanNode::ExprRangeScan { .. }
+            | PlanNode::OrderedExprIndexScan { .. } => {
+                if let Some(result) = self.execute_expression_index_plan(plan, None)? {
+                    return Ok(result);
+                }
+                let fallback = expression_index_fallback(plan)
+                    .expect("expression-index branch always has a fallback");
+                self.execute_plan(&fallback)
+            }
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
                 if self.view_registry.is_dirty(table) {
@@ -230,10 +950,14 @@ impl Engine {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
-                        let filtered: Vec<Vec<Value>> = rows
-                            .into_iter()
-                            .filter(|row| eval_predicate(predicate, row, &columns))
-                            .collect();
+                        let mut cancel = CancelCheck::new();
+                        let mut filtered: Vec<Vec<Value>> = Vec::new();
+                        for row in rows {
+                            cancel.tick()?;
+                            if eval_predicate(predicate, &row, &columns) {
+                                filtered.push(row);
+                            }
+                        }
                         Ok(QueryResult::Rows {
                             columns,
                             rows: filtered,
@@ -244,6 +968,16 @@ impl Engine {
             }
 
             PlanNode::Project { input, fields } => {
+                if matches!(
+                    input.as_ref(),
+                    PlanNode::ExprIndexScan { .. }
+                        | PlanNode::ExprRangeScan { .. }
+                        | PlanNode::OrderedExprIndexScan { .. }
+                ) {
+                    if let Some(result) = self.execute_expression_index_plan(input, Some(fields))? {
+                        return Ok(result);
+                    }
+                }
                 // Fast path: Project over IndexScan — decode only projected
                 // columns from raw bytes instead of full decode_row.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
@@ -290,7 +1024,9 @@ impl Engine {
                     if tbl.has_index(column) && all_plain_fields {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                        let mut cancel = CancelCheck::new();
                         for rid in rids {
+                            cancel.tick()?;
                             // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                             // spilled columns from their overflow chains. The old
                             // `heap.get` + `decode_column` read raw v2 bytes and
@@ -325,32 +1061,33 @@ impl Engine {
                     {
                         // Fast path only for single-key sorts
                         if keys.len() == 1 {
-                            let sort_field = &keys[0].field;
-                            let descending = keys[0].descending;
-                            let limit = match limit_expr {
-                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                _ => usize::MAX,
-                            };
-                            let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
-                                match sort_input.as_ref() {
-                                    PlanNode::SeqScan { table } => (Some(table.as_str()), None),
-                                    PlanNode::Filter {
-                                        input: fi,
-                                        predicate,
-                                    } => {
-                                        if let PlanNode::SeqScan { table } = fi.as_ref() {
-                                            (Some(table.as_str()), Some(predicate))
-                                        } else {
-                                            (None, None)
-                                        }
-                                    }
-                                    _ => (None, None),
+                            if let Expr::Field(sort_field) = &keys[0].expr {
+                                let descending = keys[0].descending;
+                                let limit = match limit_expr {
+                                    Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                                    _ => usize::MAX,
                                 };
-                            if let Some(table) = table_opt {
-                                if let Some(result) = self.project_filter_sort_limit_fast(
-                                    table, fields, sort_field, descending, limit, pred_opt,
-                                )? {
-                                    return Ok(result);
+                                let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
+                                    match sort_input.as_ref() {
+                                        PlanNode::SeqScan { table } => (Some(table.as_str()), None),
+                                        PlanNode::Filter {
+                                            input: fi,
+                                            predicate,
+                                        } => {
+                                            if let PlanNode::SeqScan { table } = fi.as_ref() {
+                                                (Some(table.as_str()), Some(predicate))
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        _ => (None, None),
+                                    };
+                                if let Some(table) = table_opt {
+                                    if let Some(result) = self.project_filter_sort_limit_fast(
+                                        table, fields, sort_field, descending, limit, pred_opt,
+                                    )? {
+                                        return Ok(result);
+                                    }
                                 }
                             }
                         }
@@ -447,15 +1184,17 @@ impl Engine {
                                 })
                             })
                             .collect();
-                        let proj_rows: Vec<Vec<Value>> = rows
-                            .iter()
-                            .map(|row| {
+                        let mut cancel = CancelCheck::new();
+                        let mut proj_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                        for row in &rows {
+                            cancel.tick()?;
+                            proj_rows.push(
                                 fields
                                     .iter()
                                     .map(|f| eval_expr(&f.expr, row, &columns))
-                                    .collect()
-                            })
-                            .collect();
+                                    .collect(),
+                            );
+                        }
                         Ok(QueryResult::Rows {
                             columns: proj_columns,
                             rows: proj_rows,
@@ -476,29 +1215,44 @@ impl Engine {
                             return Err(QueryError::SortLimitExceeded);
                         }
                         self.charge_rows(&rows)?;
-                        let key_indices: Vec<(usize, bool)> = keys
+                        let key_specs: Vec<(Option<usize>, &Expr, bool)> = keys
                             .iter()
                             .map(|k| {
-                                columns
-                                    .iter()
-                                    .position(|c| c == &k.field)
-                                    .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| QueryError::ColumnNotFound {
-                                        table: String::new(),
-                                        column: k.field.clone(),
-                                    })
+                                let stored_name = match &k.expr {
+                                    Expr::Field(name) => Some(name.clone()),
+                                    Expr::QualifiedField { qualifier, field } => {
+                                        Some(format!("{qualifier}.{field}"))
+                                    }
+                                    _ => None,
+                                };
+                                let index = stored_name
+                                    .as_ref()
+                                    .and_then(|name| columns.iter().position(|c| c == name));
+                                if let Some(name) = stored_name {
+                                    if index.is_none() {
+                                        return Err(QueryError::ColumnNotFound {
+                                            table: String::new(),
+                                            column: name,
+                                        });
+                                    }
+                                }
+                                Ok((index, &k.expr, k.descending))
                             })
                             .collect::<Result<_, QueryError>>()?;
-                        rows.sort_by(|a, b| {
-                            for &(col_idx, descending) in &key_indices {
-                                let cmp = a[col_idx].cmp(&b[col_idx]);
+                        cooperative_stable_sort_by(&mut rows, self.query_memory_limit, |a, b| {
+                            for &(col_idx, expr, descending) in &key_specs {
+                                let cmp = match col_idx {
+                                    Some(index) => a[index].cmp(&b[index]),
+                                    None => eval_expr(expr, a, &columns)
+                                        .cmp(&eval_expr(expr, b, &columns)),
+                                };
                                 let cmp = if descending { cmp.reverse() } else { cmp };
                                 if cmp != std::cmp::Ordering::Equal {
                                     return cmp;
                                 }
                             }
                             std::cmp::Ordering::Equal
-                        });
+                        })?;
                         Ok(QueryResult::Rows { columns, rows })
                     }
                     _ => Err("sort requires row input".into()),
@@ -512,10 +1266,18 @@ impl Engine {
                     _ => return Err("limit must be integer literal".into()),
                 };
                 match result {
-                    QueryResult::Rows { columns, rows } => Ok(QueryResult::Rows {
-                        columns,
-                        rows: rows.into_iter().take(n).collect(),
-                    }),
+                    QueryResult::Rows { columns, rows } => {
+                        let mut cancel = CancelCheck::new();
+                        let mut limited = Vec::with_capacity(n.min(rows.len()));
+                        for row in rows.into_iter().take(n) {
+                            cancel.tick()?;
+                            limited.push(row);
+                        }
+                        Ok(QueryResult::Rows {
+                            columns,
+                            rows: limited,
+                        })
+                    }
                     _ => Err("limit requires row input".into()),
                 }
             }
@@ -527,10 +1289,20 @@ impl Engine {
                     _ => return Err("offset must be integer literal".into()),
                 };
                 match result {
-                    QueryResult::Rows { columns, rows } => Ok(QueryResult::Rows {
-                        columns,
-                        rows: rows.into_iter().skip(n).collect(),
-                    }),
+                    QueryResult::Rows { columns, rows } => {
+                        let mut cancel = CancelCheck::new();
+                        let mut offset = Vec::with_capacity(rows.len().saturating_sub(n));
+                        for (index, row) in rows.into_iter().enumerate() {
+                            cancel.tick()?;
+                            if index >= n {
+                                offset.push(row);
+                            }
+                        }
+                        Ok(QueryResult::Rows {
+                            columns,
+                            rows: offset,
+                        })
+                    }
                     _ => Err("offset requires row input".into()),
                 }
             }
@@ -538,8 +1310,21 @@ impl Engine {
             PlanNode::Aggregate {
                 input,
                 function,
-                field,
+                argument,
+                mode: _,
+                provenance_alias,
             } => {
+                if let Some(provenance_alias) = provenance_alias {
+                    let input = self.materialize_rows_with_provenance(input)?;
+                    self.charge_rows(&input.rows)?;
+                    return aggregate_rows_with_provenance(
+                        *function,
+                        argument.as_ref(),
+                        &input,
+                        provenance_alias,
+                        self.query_memory_limit(),
+                    );
+                }
                 // Fast path: count() over SeqScan — count rows without any decode
                 if *function == AggFunc::Count {
                     // Overflow safety (P0-4): the raw `for_each_row_raw` count
@@ -554,11 +1339,9 @@ impl Engine {
                                 self.refresh_view(table)?;
                             }
                             let mut count: i64 = 0;
-                            self.catalog
-                                .for_each_row_raw(table, |_rid, _data| {
-                                    count += 1;
-                                })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            for_each_row_raw_cancellable(&self.catalog, table, |_rid, _data| {
+                                count += 1;
+                            })?;
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
                     }
@@ -599,21 +1382,25 @@ impl Engine {
                                     compile_predicate(predicate, &columns, &fast, &schema)
                                 {
                                     let mut count: i64 = 0;
-                                    self.catalog
-                                        .for_each_row_raw(table, |_rid, data| {
+                                    for_each_row_raw_cancellable(
+                                        &self.catalog,
+                                        table,
+                                        |_rid, data| {
                                             if compiled(data) {
                                                 count += 1;
                                             }
-                                        })
-                                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                        },
+                                    )?;
                                     return Ok(QueryResult::Scalar(Value::Int(count)));
                                 }
 
                                 // Fallback: decode predicate columns
                                 let pred_cols = predicate_column_indices_json(predicate, &columns);
                                 let mut count: i64 = 0;
-                                self.catalog
-                                    .for_each_row_raw(table, |_rid, data| {
+                                for_each_row_raw_cancellable(
+                                    &self.catalog,
+                                    table,
+                                    |_rid, data| {
                                         let pred_row = decode_selective(
                                             &schema,
                                             &row_layout,
@@ -623,8 +1410,8 @@ impl Engine {
                                         if eval_predicate(predicate, &pred_row, &columns) {
                                             count += 1;
                                         }
-                                    })
-                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                    },
+                                )?;
 
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
@@ -643,7 +1430,7 @@ impl Engine {
                         | AggFunc::Max
                         | AggFunc::CountDistinct
                 ) {
-                    if let Some(col) = field.as_ref() {
+                    if let Some(Expr::Field(col)) = argument.as_ref() {
                         // Shape: Aggregate(SeqScan) or Aggregate(Filter(SeqScan))
                         let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
                             match input.as_ref() {
@@ -677,93 +1464,7 @@ impl Engine {
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
-                        match function {
-                            AggFunc::Count => {
-                                Ok(QueryResult::Scalar(Value::Int(rows.len() as i64)))
-                            }
-                            AggFunc::CountDistinct => {
-                                let col = field.as_ref().ok_or("count distinct requires field")?;
-                                let idx = columns
-                                    .iter()
-                                    .position(|c| c == col)
-                                    .ok_or("col not found")?;
-                                let mut seen = std::collections::HashSet::new();
-                                for row in &rows {
-                                    let v = &row[idx];
-                                    if !v.is_empty() {
-                                        seen.insert(v.clone());
-                                    }
-                                }
-                                Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
-                            }
-                            AggFunc::Avg => {
-                                let col = field.as_ref().ok_or("avg requires field")?;
-                                let idx = columns
-                                    .iter()
-                                    .position(|c| c == col)
-                                    .ok_or("col not found")?;
-                                let mut count: u64 = 0;
-                                let sum: f64 = rows
-                                    .iter()
-                                    .filter_map(|r| match &r[idx] {
-                                        Value::Int(v) => Some(*v as f64),
-                                        Value::Float(v) => Some(*v),
-                                        _ => None,
-                                    })
-                                    .inspect(|_| count += 1)
-                                    .sum();
-                                if count == 0 {
-                                    Ok(QueryResult::Scalar(Value::Empty))
-                                } else {
-                                    Ok(QueryResult::Scalar(Value::Float(sum / count as f64)))
-                                }
-                            }
-                            AggFunc::Sum => {
-                                let col = field.as_ref().ok_or("sum requires field")?;
-                                let idx = columns
-                                    .iter()
-                                    .position(|c| c == col)
-                                    .ok_or("col not found")?;
-                                // Track int and float contributions separately so
-                                // Float columns (and mixed Int/Float rows) don't get
-                                // silently dropped as they did in the Int-only
-                                // version. If any Float is present, the whole sum
-                                // promotes to Float — matching Avg's semantics.
-                                let mut int_sum: i64 = 0;
-                                let mut float_sum: f64 = 0.0;
-                                let mut saw_float = false;
-                                for r in &rows {
-                                    match &r[idx] {
-                                        Value::Int(v) => int_sum += *v,
-                                        Value::Float(v) => {
-                                            float_sum += *v;
-                                            saw_float = true;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                let result = if saw_float {
-                                    Value::Float(float_sum + int_sum as f64)
-                                } else {
-                                    Value::Int(int_sum)
-                                };
-                                Ok(QueryResult::Scalar(result))
-                            }
-                            AggFunc::Min | AggFunc::Max => {
-                                let col = field.as_ref().ok_or("min/max requires field")?;
-                                let idx = columns
-                                    .iter()
-                                    .position(|c| c == col)
-                                    .ok_or("col not found")?;
-                                let vals: Vec<&Value> = rows.iter().map(|r| &r[idx]).collect();
-                                let result = if *function == AggFunc::Min {
-                                    vals.into_iter().min().cloned()
-                                } else {
-                                    vals.into_iter().max().cloned()
-                                };
-                                Ok(QueryResult::Scalar(result.unwrap_or(Value::Empty)))
-                            }
-                        }
+                        aggregate_rows(*function, argument.as_ref(), &columns, &rows)
                     }
                     _ => Err("aggregate requires row input".into()),
                 }
@@ -1072,24 +1773,14 @@ impl Engine {
                     };
                     let matching_rids = self.collect_rids_for_mutation(input, table)?;
                     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_rids.len());
-                    // Cooperative cancellation of a long mutation loop.
-                    //
-                    // Safety: each row is applied through `update_hinted`, which
-                    // WAL-logs that single row before the loop advances. A cancel
-                    // between rows therefore leaves an already-durable prefix of
-                    // rows updated and the rest untouched — equivalent to the
-                    // statement having matched that smaller set. No half-applied,
-                    // unlogged batch is possible because there is no batch: every
-                    // row is its own logged operation. The check sits at the top
-                    // of the loop (before this row is read or written), so the
-                    // in-flight row is never left partially applied.
-                    //
-                    // Because we return `Err(Timeout/Cancelled)` rather than
-                    // `Modified(count)`, the client is told the statement did NOT
-                    // complete; it must never observe a partial write as success.
-                    let mut cancel = CancelCheck::new();
+                    // Cancellation is safe while collecting the target set, but
+                    // once row writes start this executor has no statement-level
+                    // savepoint. Check at the mutation boundary and then apply the
+                    // full set without mid-loop cancellation; returning an error
+                    // after a logged prefix would violate statement atomicity and
+                    // is especially unsafe inside an explicit transaction.
+                    crate::cancel::check()?;
                     for rid in matching_rids {
-                        cancel.tick()?;
                         let mut row = match self.catalog.get(table, rid) {
                             Some(r) => r,
                             None => continue,
@@ -1140,6 +1831,12 @@ impl Engine {
                     {
                         if let PlanNode::SeqScan { table: t } = inner.as_ref() {
                             if t == table {
+                                // The fused primitive mutates during its scan and
+                                // cannot roll back a cancelled prefix. Honor an
+                                // already-triggered token before entering it, then
+                                // let the primitive finish atomically from the
+                                // query layer's perspective.
+                                crate::cancel::check()?;
                                 let fused_result = self.try_fused_scan_update(
                                     table,
                                     predicate,
@@ -1156,6 +1853,9 @@ impl Engine {
 
                 // Collect matching RowIds in a single pass.
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
+                // This is the last cancellable boundary before any row is
+                // changed. Mutation loops below deliberately do not poll.
+                crate::cancel::check()?;
 
                 // ── Literal-only fast paths ─────────────────────────────
                 if let Some(ref resolved_assignments) = resolved_assignments {
@@ -1216,11 +1916,7 @@ impl Engine {
                     if let Some(patches) = fast_patch {
                         let mut count = 0u64;
                         let mut fallback_rids: Vec<RowId> = Vec::new();
-                        // Cooperative cancellation — same per-row-logged safety
-                        // reasoning as the returning-update loop above.
-                        let mut cancel = CancelCheck::new();
                         for rid in &matching_rids {
-                            cancel.tick()?;
                             // Mission B2: WAL-log every patch so crash
                             // recovery replays the update. Same mutation
                             // closure as before — the wrapper just sandwiches
@@ -1315,10 +2011,7 @@ impl Engine {
                         let new_bytes_ref: Option<&[u8]> = new_bytes_opt.as_deref();
                         let mut count = 0u64;
                         let mut fallback_rids: Vec<RowId> = Vec::new();
-                        // Cooperative cancellation — per-row-logged, see above.
-                        let mut cancel = CancelCheck::new();
                         for rid in &matching_rids {
-                            cancel.tick()?;
                             // Mission B2: logged variant so crash recovery
                             // replays the shrink. On a false return (row
                             // would have to grow), the rid is pushed to
@@ -1353,10 +2046,7 @@ impl Engine {
 
                     // Generic literal path: decode row, apply literal values.
                     let mut count = 0u64;
-                    // Cooperative cancellation — per-row-logged, see above.
-                    let mut cancel = CancelCheck::new();
                     for rid in matching_rids {
-                        cancel.tick()?;
                         let mut row = match self.catalog.get(table, rid) {
                             Some(r) => r,
                             None => continue,
@@ -1384,10 +2074,7 @@ impl Engine {
                     schema_ref.columns.iter().map(|c| c.name.clone()).collect()
                 };
                 let mut count = 0u64;
-                // Cooperative cancellation — per-row-logged, see above.
-                let mut cancel = CancelCheck::new();
                 for rid in matching_rids {
-                    cancel.tick()?;
                     let mut row = match self.catalog.get(table, rid) {
                         Some(r) => r,
                         None => continue,
@@ -1442,6 +2129,7 @@ impl Engine {
                             out_rows.push(row);
                         }
                     }
+                    crate::cancel::check()?;
                     self.catalog
                         .delete_many(table, &matching_rids)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -1498,6 +2186,7 @@ impl Engine {
                                 // single-pass scan. Structure of the
                                 // fused scan is unchanged — only the
                                 // hook closure now also appends.
+                                crate::cancel::check()?;
                                 let count = self
                                     .catalog
                                     .scan_delete_matching_logged(table, |data| compiled(data))
@@ -1512,6 +2201,7 @@ impl Engine {
                         // `delete from T` with no predicate — every live
                         // row matches. One pass is still the right shape.
                         // Mission B2: logged variant — see above.
+                        crate::cancel::check()?;
                         let count = self
                             .catalog
                             .scan_delete_matching_logged(table, |_| true)
@@ -1522,6 +2212,7 @@ impl Engine {
                 }
 
                 let matching_rids = self.collect_rids_for_mutation(input, table)?;
+                crate::cancel::check()?;
                 let count = self
                     .catalog
                     .delete_many(table, &matching_rids)
@@ -1550,12 +2241,16 @@ impl Engine {
                     .iter()
                     .map(|c| format!("{alias}.{}", c.name))
                     .collect();
-                let rows: Vec<Vec<Value>> = self
+                let mut cancel = CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self
                     .catalog
                     .scan(table)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?
-                    .map(|(_, row)| row)
-                    .collect();
+                {
+                    cancel.tick()?;
+                    rows.push(row);
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -1592,84 +2287,14 @@ impl Engine {
                 self.charge_rows(&left_rows)?;
                 self.charge_rows(&right_rows)?;
 
-                // Hash-join fast path.
-                if !matches!(kind, JoinKind::Cross) {
-                    if let Some(pred) = on {
-                        if let Some((l_idx, r_idx)) =
-                            try_extract_equi_join_keys(pred, &left_columns, &right_columns)
-                        {
-                            let result = hash_join(
-                                left_columns,
-                                left_rows,
-                                right_columns,
-                                right_rows,
-                                l_idx,
-                                r_idx,
-                                *kind,
-                            )?;
-                            if let QueryResult::Rows { ref rows, .. } = result {
-                                check_join_limit(rows.len())?;
-                            }
-                            return Ok(result);
-                        }
-                    }
-                }
-
-                // Nested-loop fallback.
-                let n_left = left_columns.len();
-                let n_right = right_columns.len();
-                let mut columns = Vec::with_capacity(n_left + n_right);
-                columns.extend(left_columns);
-                columns.extend(right_columns);
-
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
-                let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
-
-                // Cooperative cancellation: an unindexed compound-ON join runs
-                // this loop left_rows.len() * right_rows.len() times, almost
-                // none of which push a row (so check_join_limit never fires).
-                // Poll the deadline on the inner loop so a timed-out or
-                // client-cancelled query returns promptly and releases the
-                // engine lock instead of running for tens of seconds.
-                let mut cancel = CancelCheck::new();
-                for left_row in &left_rows {
-                    let mut matched = false;
-                    for right_row in &right_rows {
-                        cancel.tick()?;
-                        combined.clear();
-                        combined.extend_from_slice(left_row);
-                        combined.extend_from_slice(right_row);
-                        let keep = match kind {
-                            JoinKind::Cross => true,
-                            JoinKind::Inner | JoinKind::LeftOuter => match on {
-                                Some(pred) => eval_predicate(pred, &combined, &columns),
-                                // Missing `on` for non-cross joins is a
-                                // parser error, but if it slips through we
-                                // treat it as "match everything".
-                                None => true,
-                            },
-                            // RightOuter is rewritten to LeftOuter by the
-                            // planner, so we never see it here.
-                            JoinKind::RightOuter => {
-                                unreachable!("planner rewrites RightOuter to LeftOuter")
-                            }
-                        };
-                        if keep {
-                            rows.push(combined.clone());
-                            check_join_limit(rows.len())?;
-                            matched = true;
-                        }
-                    }
-                    if !matched && matches!(kind, JoinKind::LeftOuter) {
-                        let mut row = Vec::with_capacity(n_left + n_right);
-                        row.extend_from_slice(left_row);
-                        row.resize(n_left + n_right, Value::Empty);
-                        rows.push(row);
-                        check_join_limit(rows.len())?;
-                    }
-                }
-
-                Ok(QueryResult::Rows { columns, rows })
+                execute_materialized_join(
+                    left_columns,
+                    left_rows,
+                    right_columns,
+                    right_rows,
+                    on.as_ref(),
+                    *kind,
+                )
             }
 
             PlanNode::Distinct { input } => {
@@ -1678,7 +2303,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
                         let mut unique_rows = Vec::new();
+                        let mut cancel = CancelCheck::new();
                         for row in rows {
+                            cancel.tick()?;
                             if seen.insert(row.clone()) {
                                 unique_rows.push(row);
                             }
@@ -1698,6 +2325,20 @@ impl Engine {
                 aggregates,
                 having,
             } => {
+                if aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.provenance_alias.is_some())
+                {
+                    let input = self.materialize_rows_with_provenance(input)?;
+                    self.charge_rows(&input.rows)?;
+                    return exec_group_by_with_provenance(
+                        input,
+                        keys,
+                        aggregates,
+                        having,
+                        self.query_memory_limit(),
+                    );
+                }
                 let result = self.execute_plan(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -1839,12 +2480,41 @@ impl Engine {
                     })
                 }
                 AlterAction::AddIndex {
-                    column,
+                    target,
                     if_not_exists: _,
                 } => {
+                    let IndexTarget::Column(column) = target else {
+                        let IndexTarget::JsonPath(path) = target else {
+                            unreachable!("index target variants are exhaustive")
+                        };
+                        if let Some(existing) = resolve_expression_index(&self.catalog, table, path)
+                        {
+                            return Ok(QueryResult::Executed {
+                                message: format!(
+                                    "expression index {} on '{}' already exists (skipped)",
+                                    existing.index_id, table
+                                ),
+                            });
+                        }
+                        crate::cancel::check()?;
+                        let index_id = self
+                            .catalog
+                            .create_expression_index_metadata(
+                                table,
+                                1,
+                                path.canonical_text(),
+                                path.clone(),
+                                false,
+                            )
+                            .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                        return Ok(QueryResult::Executed {
+                            message: format!("expression index {index_id} on '{}' created", table),
+                        });
+                    };
                     // `add index` is already idempotent (no-op if the index
                     // exists), so `if not exists` is accepted for symmetry but
                     // does not change behavior.
+                    crate::cancel::check()?;
                     self.catalog
                         .create_index(table, column)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -1853,9 +2523,46 @@ impl Engine {
                     })
                 }
                 AlterAction::AddUnique {
-                    column,
+                    target,
                     if_not_exists,
                 } => {
+                    let IndexTarget::Column(column) = target else {
+                        let IndexTarget::JsonPath(path) = target else {
+                            unreachable!("index target variants are exhaustive")
+                        };
+                        if let Some(existing) = resolve_expression_index(&self.catalog, table, path)
+                        {
+                            if *if_not_exists {
+                                return Ok(QueryResult::Executed {
+                                    message: format!(
+                                        "expression index {} on '{}' already exists (skipped)",
+                                        existing.index_id, table
+                                    ),
+                                });
+                            }
+                            return Err(QueryError::Execution(format!(
+                                "cannot add unique expression index on {}: path already indexed",
+                                table
+                            )));
+                        }
+                        crate::cancel::check()?;
+                        let index_id = self
+                            .catalog
+                            .create_expression_index_metadata(
+                                table,
+                                1,
+                                path.canonical_text(),
+                                path.clone(),
+                                true,
+                            )
+                            .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                        return Ok(QueryResult::Executed {
+                            message: format!(
+                                "unique expression index {index_id} on '{}' created",
+                                table
+                            ),
+                        });
+                    };
                     // `if not exists`: an already-indexed column is a no-op
                     // rather than the (default) "already indexed" error.
                     if self.catalog.has_index(table, column) {
@@ -1866,8 +2573,8 @@ impl Engine {
                                 ),
                             });
                         }
-                        // No DropIndex exists, so we cannot upgrade an existing
-                        // non-unique index in place — reject it cleanly.
+                        // Upgrading an existing non-unique index in place is
+                        // intentionally rejected.
                         return Err(QueryError::Execution(format!(
                             "cannot add unique on {table}.{column}: column already indexed"
                         )));
@@ -1886,7 +2593,9 @@ impl Engine {
                             }
                         })?;
                         let mut seen = std::collections::HashSet::new();
+                        let mut cancel = CancelCheck::new();
                         for (_, row) in tbl.scan() {
+                            cancel.tick()?;
                             let v = &row[col_idx];
                             if v.is_empty() {
                                 continue;
@@ -1899,11 +2608,44 @@ impl Engine {
                             }
                         }
                     }
+                    crate::cancel::check()?;
                     self.catalog
                         .create_index_unique(table, column, true)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Executed {
                         message: format!("unique index on '{table}.{column}' created"),
+                    })
+                }
+                AlterAction::DropIndex { target, if_exists } => {
+                    let IndexTarget::JsonPath(path) = target else {
+                        return Err(QueryError::Execution(
+                            "dropping stored-column indexes is not supported".to_string(),
+                        ));
+                    };
+                    let Some(existing) = resolve_expression_index(&self.catalog, table, path)
+                    else {
+                        if *if_exists {
+                            return Ok(QueryResult::Executed {
+                                message: format!(
+                                    "expression index on '{}' does not exist (skipped)",
+                                    table
+                                ),
+                            });
+                        }
+                        return Err(QueryError::Execution(format!(
+                            "expression index on '{}' does not exist",
+                            table
+                        )));
+                    };
+                    crate::cancel::check()?;
+                    self.catalog
+                        .drop_expression_index(table, existing.index_id)
+                        .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                    Ok(QueryResult::Executed {
+                        message: format!(
+                            "expression index {} on '{}' dropped",
+                            existing.index_id, table
+                        ),
                     })
                 }
             },
@@ -1954,7 +2696,7 @@ impl Engine {
 
             PlanNode::Window { input, windows } => {
                 let result = self.execute_plan(input)?;
-                execute_window(result, windows)
+                execute_window(result, windows, self.query_memory_limit)
             }
 
             PlanNode::Union { left, right, all } => {
@@ -1969,17 +2711,23 @@ impl Engine {
                     _ => return Err("UNION requires query results on right side".into()),
                 };
                 let mut combined = left_rows;
+                let mut cancel = CancelCheck::new();
                 if *all {
                     // UNION ALL — just concatenate.
-                    combined.extend(right_rows);
+                    for row in right_rows {
+                        cancel.tick()?;
+                        combined.push(row);
+                    }
                 } else {
                     // UNION — deduplicate using the same HashSet approach
                     // as DISTINCT. Value already implements Hash + Eq.
                     let mut seen = std::collections::HashSet::new();
                     for row in &combined {
+                        cancel.tick()?;
                         seen.insert(row.clone());
                     }
                     for row in right_rows {
+                        cancel.tick()?;
                         if seen.insert(row.clone()) {
                             combined.push(row);
                         }
@@ -1992,7 +2740,7 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                let text = format_plan_tree(input, 0);
+                let text = format_plan_tree(&self.catalog, input, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text
@@ -2056,7 +2804,9 @@ impl Engine {
                 if tbl.has_index(column) {
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                    let mut cancel = CancelCheck::new();
                     for rid in rids {
+                        cancel.tick()?;
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns; the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value.
@@ -2088,13 +2838,11 @@ impl Engine {
                     {
                         // Mission F: skip the first 4 Vec doublings.
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                if compiled(data) {
-                                    rows.push(decode_row(schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(schema, data));
+                            }
+                        })?;
                         return Ok(QueryResult::Rows { columns, rows });
                     }
                 }
@@ -2107,16 +2855,14 @@ impl Engine {
                             table: String::new(),
                             column: column.clone(),
                         })?;
-                let rows: Vec<Vec<Value>> = tbl
-                    .scan()
-                    .filter_map(|(_, row)| {
-                        if row[col_idx] == key_value {
-                            Some(row)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let mut cancel = CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in tbl.scan() {
+                    cancel.tick()?;
+                    if row[col_idx] == key_value {
+                        rows.push(row);
+                    }
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -2161,7 +2907,9 @@ impl Engine {
                             })?;
                             let rids = btree.range_rids(start_val.as_ref(), end_val.as_ref());
                             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                            let mut cancel = CancelCheck::new();
                             for rid in rids {
+                                cancel.tick()?;
                                 // Overflow safety (P0-3): reassemble spilled cols.
                                 if let Some(row) = tbl.get(rid) {
                                     if !row[col_idx].is_empty()
@@ -2191,13 +2939,19 @@ impl Engine {
                             (Some(s), None) => btree.range_from(s),
                             (None, Some(e)) => btree.range_to(e),
                             (None, None) => {
-                                let rows: Vec<Vec<Value>> =
-                                    tbl.scan().map(|(_, row)| row).collect();
+                                let mut cancel = CancelCheck::new();
+                                let mut rows: Vec<Vec<Value>> = Vec::new();
+                                for (_, row) in tbl.scan() {
+                                    cancel.tick()?;
+                                    rows.push(row);
+                                }
                                 return Ok(QueryResult::Rows { columns, rows });
                             }
                         };
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                        let mut cancel = CancelCheck::new();
                         for (key, rid) in hits {
+                            cancel.tick()?;
                             if !start_inclusive {
                                 if let Some(ref s) = start_val {
                                     if &key == s {
@@ -2229,13 +2983,11 @@ impl Engine {
                 if !tbl.has_overflow_rows() {
                     if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                if compiled(data) {
-                                    rows.push(decode_row(schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(schema, data));
+                            }
+                        })?;
                         return Ok(QueryResult::Rows { columns, rows });
                     }
                 }
@@ -2247,19 +2999,20 @@ impl Engine {
                             table: String::new(),
                             column: column.clone(),
                         })?;
-                let rows: Vec<Vec<Value>> = tbl
-                    .scan()
-                    .filter(|(_, row)| {
-                        range_matches(
-                            &row[col_idx],
-                            &start_val,
-                            start_inclusive,
-                            &end_val,
-                            end_inclusive,
-                        )
-                    })
-                    .map(|(_, row)| row)
-                    .collect();
+                let mut cancel = CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in tbl.scan() {
+                    cancel.tick()?;
+                    if range_matches(
+                        &row[col_idx],
+                        &start_val,
+                        start_inclusive,
+                        &end_val,
+                        end_inclusive,
+                    ) {
+                        rows.push(row);
+                    }
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
         }
@@ -2284,6 +3037,7 @@ impl Engine {
         // Derive a schema for the backing table from the query result columns.
         let schema = self.derive_view_schema(name, &columns, &rows);
         // Create the backing table and insert the result rows.
+        crate::cancel::check()?;
         self.catalog
             .create_table(schema)
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -2322,6 +3076,7 @@ impl Engine {
         // Clear old data and insert fresh results. Mission B2: logged
         // variant — view refreshes are a mutation and crash recovery
         // must see them.
+        crate::cancel::check()?;
         self.catalog
             .scan_delete_matching_logged(name, |_| true)
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
@@ -2766,9 +3521,16 @@ impl Engine {
         // once the limit is reached. The previous `done` flag only short-
         // circuited the closure body, so a `limit 100` over 100K rows still
         // walked all 100K slots — burning ~30x SQLite on scan_filter_project_top100.
+        // Cooperative cancellation: an unbounded (limit == usize::MAX) projected
+        // scan over a huge table must stay stoppable.
+        let mut cancel = CancelCheck::new();
+        let mut cancel_err: Option<QueryError> = None;
         self.catalog
             .try_for_each_row_raw(table, |_rid, data| {
-                use std::ops::ControlFlow;
+                if let Err(e) = cancel.tick() {
+                    cancel_err = Some(e);
+                    return ControlFlow::Break(());
+                }
                 if let Some(ref pred) = compiled_pred {
                     if !pred(data) {
                         return ControlFlow::Continue(());
@@ -2786,6 +3548,9 @@ impl Engine {
                 }
             })
             .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        if let Some(e) = cancel_err {
+            return Err(e);
+        }
 
         Ok(Some(QueryResult::Rows {
             columns: proj_columns,
@@ -2896,53 +3661,50 @@ impl Engine {
                 let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
 
-                self.catalog
-                    .for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) {
-                                return;
-                            }
-                        }
-                        // Inlined int-column reader: null check + i64 decode.
-                        let base = row_body_base(data);
-                        let sort_data_offset = base + sort_body_data_offset;
-                        if data.len() < sort_data_offset + 8
-                            || data.len() <= base + 2 + sort_bitmap_byte
-                        {
+                for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) {
                             return;
                         }
-                        let is_null =
-                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
-                        if is_null {
-                            return;
-                        }
-                        let key = i64::from_le_bytes(
-                            data[sort_data_offset..sort_data_offset + 8]
-                                .try_into()
-                                .unwrap_or_else(|_| unreachable!()),
-                        );
-                        let id = seq;
-                        seq += 1;
+                    }
+                    // Inlined int-column reader: null check + i64 decode.
+                    let base = row_body_base(data);
+                    let sort_data_offset = base + sort_body_data_offset;
+                    if data.len() < sort_data_offset + 8
+                        || data.len() <= base + 2 + sort_bitmap_byte
+                    {
+                        return;
+                    }
+                    let is_null = (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    if is_null {
+                        return;
+                    }
+                    let key = i64::from_le_bytes(
+                        data[sort_data_offset..sort_data_offset + 8]
+                            .try_into()
+                            .unwrap_or_else(|_| unreachable!()),
+                    );
+                    let id = seq;
+                    seq += 1;
 
-                        if descending {
-                            if heap_desc.len() < limit {
+                    if descending {
+                        if heap_desc.len() < limit {
+                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                        } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
+                            if key > *top_key {
+                                heap_desc.pop();
                                 heap_desc.push(Reverse((key, id, data.to_vec())));
-                            } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
-                                if key > *top_key {
-                                    heap_desc.pop();
-                                    heap_desc.push(Reverse((key, id, data.to_vec())));
-                                }
-                            }
-                        } else if heap_asc.len() < limit {
-                            heap_asc.push((key, id, data.to_vec()));
-                        } else if let Some((top_key, _, _)) = heap_asc.peek() {
-                            if key < *top_key {
-                                heap_asc.pop();
-                                heap_asc.push((key, id, data.to_vec()));
                             }
                         }
-                    })
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    } else if heap_asc.len() < limit {
+                        heap_asc.push((key, id, data.to_vec()));
+                    } else if let Some((top_key, _, _)) = heap_asc.peek() {
+                        if key < *top_key {
+                            heap_asc.pop();
+                            heap_asc.push((key, id, data.to_vec()));
+                        }
+                    }
+                })?;
 
                 let mut drained: Vec<(i64, u64, Vec<u8>)> = if descending {
                     heap_desc.into_iter().map(|Reverse(t)| t).collect()
@@ -2950,9 +3712,13 @@ impl Engine {
                     heap_asc.into_iter().collect()
                 };
                 if descending {
-                    drained.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                    cooperative_stable_sort_by(&mut drained, self.query_memory_limit, |a, b| {
+                        b.0.cmp(&a.0).then(a.1.cmp(&b.1))
+                    })?;
                 } else {
-                    drained.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                    cooperative_stable_sort_by(&mut drained, self.query_memory_limit, |a, b| {
+                        a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+                    })?;
                 }
                 drained.into_iter().map(|(_, _, d)| d).collect()
             }
@@ -2971,53 +3737,50 @@ impl Engine {
                 let mut heap_asc: BinaryHeap<(u64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
 
-                self.catalog
-                    .for_each_row_raw(table, |_rid, data| {
-                        if let Some(ref pred) = compiled_pred {
-                            if !pred(data) {
-                                return;
-                            }
-                        }
-                        let base = row_body_base(data);
-                        let sort_data_offset = base + sort_body_data_offset;
-                        if data.len() < sort_data_offset + 8
-                            || data.len() <= base + 2 + sort_bitmap_byte
-                        {
+                for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                    if let Some(ref pred) = compiled_pred {
+                        if !pred(data) {
                             return;
                         }
-                        let is_null =
-                            (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
-                        if is_null {
-                            return;
-                        }
-                        let bits = u64::from_le_bytes(
-                            data[sort_data_offset..sort_data_offset + 8]
-                                .try_into()
-                                .unwrap_or_else(|_| unreachable!()),
-                        );
-                        let key = f64_bits_to_sortable_u64(bits);
-                        let id = seq;
-                        seq += 1;
+                    }
+                    let base = row_body_base(data);
+                    let sort_data_offset = base + sort_body_data_offset;
+                    if data.len() < sort_data_offset + 8
+                        || data.len() <= base + 2 + sort_bitmap_byte
+                    {
+                        return;
+                    }
+                    let is_null = (data[base + 2 + sort_bitmap_byte] >> sort_bitmap_bit) & 1 == 1;
+                    if is_null {
+                        return;
+                    }
+                    let bits = u64::from_le_bytes(
+                        data[sort_data_offset..sort_data_offset + 8]
+                            .try_into()
+                            .unwrap_or_else(|_| unreachable!()),
+                    );
+                    let key = f64_bits_to_sortable_u64(bits);
+                    let id = seq;
+                    seq += 1;
 
-                        if descending {
-                            if heap_desc.len() < limit {
+                    if descending {
+                        if heap_desc.len() < limit {
+                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                        } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
+                            if key > *top_key {
+                                heap_desc.pop();
                                 heap_desc.push(Reverse((key, id, data.to_vec())));
-                            } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
-                                if key > *top_key {
-                                    heap_desc.pop();
-                                    heap_desc.push(Reverse((key, id, data.to_vec())));
-                                }
-                            }
-                        } else if heap_asc.len() < limit {
-                            heap_asc.push((key, id, data.to_vec()));
-                        } else if let Some((top_key, _, _)) = heap_asc.peek() {
-                            if key < *top_key {
-                                heap_asc.pop();
-                                heap_asc.push((key, id, data.to_vec()));
                             }
                         }
-                    })
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    } else if heap_asc.len() < limit {
+                        heap_asc.push((key, id, data.to_vec()));
+                    } else if let Some((top_key, _, _)) = heap_asc.peek() {
+                        if key < *top_key {
+                            heap_asc.pop();
+                            heap_asc.push((key, id, data.to_vec()));
+                        }
+                    }
+                })?;
 
                 let mut drained: Vec<(u64, u64, Vec<u8>)> = if descending {
                     heap_desc.into_iter().map(|Reverse(t)| t).collect()
@@ -3025,24 +3788,30 @@ impl Engine {
                     heap_asc.into_iter().collect()
                 };
                 if descending {
-                    drained.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                    cooperative_stable_sort_by(&mut drained, self.query_memory_limit, |a, b| {
+                        b.0.cmp(&a.0).then(a.1.cmp(&b.1))
+                    })?;
                 } else {
-                    drained.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                    cooperative_stable_sort_by(&mut drained, self.query_memory_limit, |a, b| {
+                        a.0.cmp(&b.0).then(a.1.cmp(&b.1))
+                    })?;
                 }
                 drained.into_iter().map(|(_, _, d)| d).collect()
             }
             _ => unreachable!("type guard above restricts to Int/Float"),
         };
 
-        let rows: Vec<Vec<Value>> = drained
-            .into_iter()
-            .map(|data| {
+        let mut cancel = CancelCheck::new();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(drained.len());
+        for data in drained {
+            cancel.tick()?;
+            rows.push(
                 proj_indices
                     .iter()
                     .map(|&ci| decode_column(&schema, &row_layout, &data, ci))
-                    .collect()
-            })
-            .collect();
+                    .collect(),
+            );
+        }
 
         Ok(Some(QueryResult::Rows {
             columns: proj_columns,
@@ -3240,12 +4009,16 @@ impl Engine {
         match input {
             PlanNode::SeqScan { table: t } if t == table => {
                 // "Update/delete everything" — rare but legal.
-                let rids: Vec<RowId> = self
+                let mut cancel = CancelCheck::new();
+                let mut rids: Vec<RowId> = Vec::new();
+                for (rid, _) in self
                     .catalog
                     .scan(table)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?
-                    .map(|(rid, _)| rid)
-                    .collect();
+                {
+                    cancel.tick()?;
+                    rids.push(rid);
+                }
                 Ok(rids)
             }
             PlanNode::IndexScan {
@@ -3292,13 +4065,23 @@ impl Engine {
                 if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
                     // Mission F: skip the first 4 Vec doublings.
                     let mut rids: Vec<RowId> = Vec::with_capacity(64);
+                    let mut cancel = CancelCheck::new();
+                    let mut cancel_err: Option<QueryError> = None;
                     self.catalog
-                        .for_each_row_raw(table, |rid, data| {
+                        .try_for_each_row_raw(table, |rid, data| {
+                            if let Err(e) = cancel.tick() {
+                                cancel_err = Some(e);
+                                return ControlFlow::Break(());
+                            }
                             if compiled(data) {
                                 rids.push(rid);
                             }
+                            ControlFlow::Continue(())
                         })
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    if let Some(e) = cancel_err {
+                        return Err(e);
+                    }
                     return Ok(rids);
                 }
 
@@ -3310,18 +4093,18 @@ impl Engine {
                             table: String::new(),
                             column: column.clone(),
                         })?;
-                let rids: Vec<RowId> = self
+                let mut cancel = CancelCheck::new();
+                let mut rids: Vec<RowId> = Vec::new();
+                for (rid, row) in self
                     .catalog
                     .scan(table)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?
-                    .filter_map(|(rid, row)| {
-                        if row[col_idx] == key_value {
-                            Some(rid)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                {
+                    cancel.tick()?;
+                    if row[col_idx] == key_value {
+                        rids.push(rid);
+                    }
+                }
                 Ok(rids)
             }
             PlanNode::Filter {
@@ -3341,17 +4124,30 @@ impl Engine {
                     let fast = FastLayout::new(schema);
                     let row_layout = RowLayout::new(schema);
 
+                    // Cooperative cancellation: the rid-collection scan that
+                    // backs `update/delete filter <unindexed pred>` walks the
+                    // whole table, so it must stay stoppable.
+                    let mut cancel = CancelCheck::new();
+                    let mut cancel_err: Option<QueryError> = None;
                     // Try compiled predicate first.
                     if let Some(compiled) = compile_predicate(predicate, &columns, &fast, schema) {
                         // Mission F: skip the first 4 Vec doublings.
                         let mut rids: Vec<RowId> = Vec::with_capacity(64);
                         self.catalog
-                            .for_each_row_raw(table, |rid, data| {
+                            .try_for_each_row_raw(table, |rid, data| {
+                                if let Err(e) = cancel.tick() {
+                                    cancel_err = Some(e);
+                                    return ControlFlow::Break(());
+                                }
                                 if compiled(data) {
                                     rids.push(rid);
                                 }
+                                ControlFlow::Continue(())
                             })
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        if let Some(e) = cancel_err {
+                            return Err(e);
+                        }
                         return Ok(rids);
                     }
 
@@ -3359,13 +4155,21 @@ impl Engine {
                     let pred_cols = predicate_column_indices_json(predicate, &columns);
                     let mut rids: Vec<RowId> = Vec::with_capacity(64);
                     self.catalog
-                        .for_each_row_raw(table, |rid, data| {
+                        .try_for_each_row_raw(table, |rid, data| {
+                            if let Err(e) = cancel.tick() {
+                                cancel_err = Some(e);
+                                return ControlFlow::Break(());
+                            }
                             let pred_row = decode_selective(schema, &row_layout, data, &pred_cols);
                             if eval_predicate(predicate, &pred_row, &columns) {
                                 rids.push(rid);
                             }
+                            ControlFlow::Continue(())
                         })
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    if let Some(e) = cancel_err {
+                        return Err(e);
+                    }
                     return Ok(rids);
                 }
                 self.generic_rid_match(input, table)
@@ -3427,11 +4231,13 @@ impl Engine {
             schema.columns.iter().map(|c| c.name.clone()).collect()
         };
         let mut rids: Vec<RowId> = Vec::new();
+        let mut cancel = CancelCheck::new();
         for (rid, row) in self
             .catalog
             .scan(table)
             .map_err(|e| QueryError::StorageError(e.to_string()))?
         {
+            cancel.tick()?;
             let keep = match &pred {
                 None => true,
                 Some(p) => eval_predicate(p, &row, &columns),
@@ -3456,13 +4262,26 @@ impl Engine {
             QueryResult::Rows { rows, .. } => rows,
             _ => return Err("mutation source must be rows".into()),
         };
-        let matching: Vec<RowId> = self
+        let mut matching: Vec<RowId> = Vec::new();
+        let mut cancel = CancelCheck::new();
+        for (rid, row) in self
             .catalog
             .scan(table)
             .map_err(|e| QueryError::StorageError(e.to_string()))?
-            .filter(|(_, row)| rows.iter().any(|r| r == row))
-            .map(|(rid, _)| rid)
-            .collect();
+        {
+            cancel.tick()?;
+            let mut matched = false;
+            for candidate in &rows {
+                cancel.tick()?;
+                if candidate == &row {
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                matching.push(rid);
+            }
+        }
         Ok(matching)
     }
 }
@@ -3470,80 +4289,73 @@ impl Engine {
 pub(super) fn execute_window(
     result: QueryResult,
     windows: &[WindowDef],
+    memory_limit: usize,
 ) -> Result<QueryResult, QueryError> {
     let (mut columns, mut rows) = match result {
         QueryResult::Rows { columns, rows } => (columns, rows),
         _ => return Err("window function requires row input".into()),
     };
 
+    let mut cancel = CancelCheck::new();
     for wdef in windows {
-        // Resolve partition/order column indices against current columns.
-        let part_indices: Vec<usize> = wdef
+        cancel.tick()?;
+        // Stored fields resolve once; expression-valued window keys use the
+        // common evaluator without changing the original row order.
+        let part_indices: Vec<Option<usize>> = wdef
             .partition_by
             .iter()
-            .map(|name| {
-                columns
-                    .iter()
-                    .position(|c| c == name)
-                    .ok_or_else(|| format!("window partition column '{name}' not found"))
-            })
+            .map(|expr| resolve_direct_group_expr(expr, &columns))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let ord_indices: Vec<(usize, bool)> = wdef
+        let ord_indices: Vec<(Option<usize>, &Expr, bool)> = wdef
             .order_by
             .iter()
             .map(|sk| {
-                columns
-                    .iter()
-                    .position(|c| c == &sk.field)
-                    .map(|i| (i, sk.descending))
-                    .ok_or_else(|| format!("window order column '{}' not found", sk.field))
+                resolve_direct_group_expr(&sk.expr, &columns)
+                    .map(|index| (index, &sk.expr, sk.descending))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Resolve the argument column index (for aggregate windows).
-        let arg_col_idx: Option<usize> = if let Some(arg) = wdef.args.first() {
-            match arg {
-                Expr::Field(name) => {
-                    if name == "*" {
-                        None // count(*) style — no specific column
-                    } else {
-                        Some(
-                            columns
-                                .iter()
-                                .position(|c| c == name)
-                                .ok_or_else(|| format!("window arg column '{name}' not found"))?,
-                        )
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let arg_expr = wdef.args.first();
+        let arg_col_idx = arg_expr
+            .map(|expr| resolve_direct_group_expr(expr, &columns))
+            .transpose()?
+            .flatten();
 
         // Build a sort-index to sort rows by partition_by then order_by
         // without actually reordering the original Vec (we need original
         // order to write results back).
         let n = rows.len();
         let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| {
+        cooperative_stable_sort_by(&mut indices, memory_limit, |&a, &b| {
             // Compare partition keys first.
-            for &pi in &part_indices {
-                let cmp = rows[a][pi].cmp(&rows[b][pi]);
+            for (expr, index) in wdef.partition_by.iter().zip(&part_indices) {
+                let av = index
+                    .map(|i| rows[a][i].clone())
+                    .unwrap_or_else(|| eval_expr(expr, &rows[a], &columns));
+                let bv = index
+                    .map(|i| rows[b][i].clone())
+                    .unwrap_or_else(|| eval_expr(expr, &rows[b], &columns));
+                let cmp = av.cmp(&bv);
                 if cmp != std::cmp::Ordering::Equal {
                     return cmp;
                 }
             }
             // Then order keys.
-            for &(oi, desc) in &ord_indices {
-                let cmp = rows[a][oi].cmp(&rows[b][oi]);
+            for &(index, expr, desc) in &ord_indices {
+                let av = index
+                    .map(|i| rows[a][i].clone())
+                    .unwrap_or_else(|| eval_expr(expr, &rows[a], &columns));
+                let bv = index
+                    .map(|i| rows[b][i].clone())
+                    .unwrap_or_else(|| eval_expr(expr, &rows[b], &columns));
+                let cmp = av.cmp(&bv);
                 if cmp != std::cmp::Ordering::Equal {
                     return if desc { cmp.reverse() } else { cmp };
                 }
             }
             std::cmp::Ordering::Equal
-        });
+        })?;
 
         // SQL window-frame semantics: with no `order` clause the frame for an
         // aggregate window is the ENTIRE partition, not the running prefix.
@@ -3581,6 +4393,7 @@ pub(super) fn execute_window(
         let mut same_rank_count: i64 = 0;
 
         for sorted_pos in 0..n {
+            cancel.tick()?;
             let row_idx = indices[sorted_pos];
 
             // Detect partition boundary.
@@ -3588,9 +4401,18 @@ pub(super) fn execute_window(
                 true
             } else {
                 let prev_row_idx = indices[sorted_pos - 1];
-                part_indices
+                wdef.partition_by
                     .iter()
-                    .any(|&pi| rows[row_idx][pi] != rows[prev_row_idx][pi])
+                    .zip(&part_indices)
+                    .any(|(expr, index)| {
+                        let current = index
+                            .map(|i| rows[row_idx][i].clone())
+                            .unwrap_or_else(|| eval_expr(expr, &rows[row_idx], &columns));
+                        let previous = index
+                            .map(|i| rows[prev_row_idx][i].clone())
+                            .unwrap_or_else(|| eval_expr(expr, &rows[prev_row_idx], &columns));
+                        current != previous
+                    })
             };
 
             if new_partition {
@@ -3600,6 +4422,7 @@ pub(super) fn execute_window(
                 if whole_partition_frame && sorted_pos > 0 {
                     let final_v = win_values[indices[sorted_pos - 1]].clone();
                     for ri in partition_row_indices.drain(..) {
+                        cancel.tick()?;
                         win_values[ri] = final_v.clone();
                     }
                 }
@@ -3619,9 +4442,22 @@ pub(super) fn execute_window(
             // Extract current order key for rank tracking.
             let current_order_key: Vec<Value> = ord_indices
                 .iter()
-                .map(|&(oi, _)| rows[row_idx][oi].clone())
+                .map(|&(index, expr, _)| {
+                    index
+                        .map(|i| rows[row_idx][i].clone())
+                        .unwrap_or_else(|| eval_expr(expr, &rows[row_idx], &columns))
+                })
                 .collect();
             let same_as_prev = prev_order_key.as_ref() == Some(&current_order_key);
+            let current_arg = || {
+                arg_expr.map(|expr| {
+                    arg_col_idx
+                        .map(|index| rows[row_idx][index].clone())
+                        .unwrap_or_else(|| eval_expr(expr, &rows[row_idx], &columns))
+                })
+            };
+            let count_all =
+                arg_expr.is_none() || matches!(arg_expr, Some(Expr::Field(name)) if name == "*");
 
             let value = match wdef.function {
                 WindowFunc::RowNumber => Value::Int((sorted_pos - partition_start + 1) as i64),
@@ -3644,8 +4480,8 @@ pub(super) fn execute_window(
                     Value::Int(dense_rank_counter)
                 }
                 WindowFunc::Sum => {
-                    if let Some(ci) = arg_col_idx {
-                        match &rows[row_idx][ci] {
+                    if let Some(value) = current_arg() {
+                        match value {
                             Value::Int(v) => running_int_sum += v,
                             Value::Float(v) => {
                                 running_float_sum += v;
@@ -3661,10 +4497,10 @@ pub(super) fn execute_window(
                     }
                 }
                 WindowFunc::Avg => {
-                    if let Some(ci) = arg_col_idx {
-                        match &rows[row_idx][ci] {
+                    if let Some(value) = current_arg() {
+                        match value {
                             Value::Int(v) => {
-                                running_float_sum += *v as f64;
+                                running_float_sum += v as f64;
                                 running_count += 1;
                             }
                             Value::Float(v) => {
@@ -3681,25 +4517,23 @@ pub(super) fn execute_window(
                     }
                 }
                 WindowFunc::Count => {
-                    if let Some(ci) = arg_col_idx {
-                        if !rows[row_idx][ci].is_empty() {
+                    if count_all {
+                        running_count += 1;
+                    } else if let Some(value) = current_arg() {
+                        if !value.is_empty() {
                             running_count += 1;
                         }
-                    } else {
-                        // count(*) — count all rows
-                        running_count += 1;
                     }
                     Value::Int(running_count)
                 }
                 WindowFunc::Min => {
-                    if let Some(ci) = arg_col_idx {
-                        let v = &rows[row_idx][ci];
+                    if let Some(v) = current_arg() {
                         if !v.is_empty() {
                             running_min = Some(match &running_min {
-                                None => v.clone(),
+                                None => v,
                                 Some(cur) => {
-                                    if v < cur {
-                                        v.clone()
+                                    if v < *cur {
+                                        v
                                     } else {
                                         cur.clone()
                                     }
@@ -3710,14 +4544,13 @@ pub(super) fn execute_window(
                     running_min.clone().unwrap_or(Value::Empty)
                 }
                 WindowFunc::Max => {
-                    if let Some(ci) = arg_col_idx {
-                        let v = &rows[row_idx][ci];
+                    if let Some(v) = current_arg() {
                         if !v.is_empty() {
                             running_max = Some(match &running_max {
-                                None => v.clone(),
+                                None => v,
                                 Some(cur) => {
-                                    if v > cur {
-                                        v.clone()
+                                    if v > *cur {
+                                        v
                                     } else {
                                         cur.clone()
                                     }
@@ -3740,12 +4573,14 @@ pub(super) fn execute_window(
         if whole_partition_frame && n > 0 {
             let final_v = win_values[indices[n - 1]].clone();
             for ri in partition_row_indices.drain(..) {
+                cancel.tick()?;
                 win_values[ri] = final_v.clone();
             }
         }
 
         // Append the computed window column to each row.
         for (ri, row) in rows.iter_mut().enumerate() {
+            cancel.tick()?;
             row.push(win_values[ri].clone());
         }
         columns.push(wdef.output_name.clone());
@@ -3818,23 +4653,83 @@ pub(super) fn exec_group_by(
     aggregates: &[GroupAgg],
     having: &Option<Expr>,
 ) -> Result<QueryResult, QueryError> {
-    // Resolve key column indices. Qualified keys resolve exactly to
-    // `alias.field`; unqualified keys resolve by exact-then-suffix match.
-    let key_indices: Vec<usize> = keys
+    exec_group_by_internal(columns, rows, None, keys, aggregates, having)
+}
+
+pub(super) fn exec_group_by_with_provenance(
+    input: ProvenanceRows,
+    keys: &[GroupKey],
+    aggregates: &[GroupAgg],
+    having: &Option<Expr>,
+    memory_limit: usize,
+) -> Result<QueryResult, QueryError> {
+    let ProvenanceRows {
+        columns,
+        rows,
+        source_aliases,
+        provenance,
+    } = input;
+    exec_group_by_internal(
+        columns,
+        rows,
+        Some(GroupProvenance {
+            source_aliases,
+            rows: provenance,
+            memory_limit,
+        }),
+        keys,
+        aggregates,
+        having,
+    )
+}
+
+struct GroupProvenance {
+    source_aliases: Vec<String>,
+    rows: Vec<Vec<Option<RowId>>>,
+    memory_limit: usize,
+}
+
+fn exec_group_by_internal(
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    provenance: Option<GroupProvenance>,
+    keys: &[GroupKey],
+    aggregates: &[GroupAgg],
+    having: &Option<Expr>,
+) -> Result<QueryResult, QueryError> {
+    // Stored fields resolve once and read directly. Expression-valued keys
+    // (including JSON paths) use the common expression evaluator per row.
+    let key_indices: Vec<Option<usize>> = keys
         .iter()
-        .map(|k| resolve_group_column(&k.output_name(), &columns))
+        .map(|k| resolve_direct_group_expr(&k.expr, &columns))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Resolve aggregate field indices. count(*) uses the usize::MAX sentinel;
-    // every other argument gets the same resolution as keys.
-    let agg_field_indices: Vec<usize> = aggregates
+    let agg_field_indices: Vec<Option<usize>> = aggregates
         .iter()
-        .map(|a| {
-            if a.field == "*" {
-                Ok(usize::MAX)
-            } else {
-                resolve_group_column(&a.field, &columns)
-            }
+        .map(|a| resolve_direct_group_expr(&a.argument, &columns))
+        .collect::<Result<Vec<_>, _>>()?;
+    let agg_source_indices: Vec<Option<usize>> = aggregates
+        .iter()
+        .map(|aggregate| {
+            aggregate
+                .provenance_alias
+                .as_ref()
+                .map(|alias| {
+                    provenance
+                        .as_ref()
+                        .and_then(|provenance| {
+                            provenance
+                                .source_aliases
+                                .iter()
+                                .position(|source| source == alias)
+                        })
+                        .ok_or_else(|| {
+                            QueryError::Execution(format!(
+                                "symmetric aggregate source alias '{alias}' is not present in its input"
+                            ))
+                        })
+                })
+                .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -3844,7 +4739,14 @@ pub(super) fn exec_group_by(
     let mut cancel = CancelCheck::new();
     for (ri, row) in rows.iter().enumerate() {
         cancel.tick()?;
-        let key: Vec<Value> = key_indices.iter().map(|&i| row[i].clone()).collect();
+        let key: Vec<Value> = keys
+            .iter()
+            .zip(&key_indices)
+            .map(|(key, index)| match index {
+                Some(index) => row[*index].clone(),
+                None => eval_expr(&key.expr, row, &columns),
+            })
+            .collect();
         match group_map.get(&key) {
             Some(&idx) => groups[idx].1.push(ri),
             None => {
@@ -3869,8 +4771,20 @@ pub(super) fn exec_group_by(
         cancel.tick()?;
         let mut row = key_vals.clone();
         for (ai, agg) in aggregates.iter().enumerate() {
-            let col_idx = agg_field_indices[ai];
-            let val = compute_group_aggregate(agg.function, &rows, row_indices, col_idx);
+            let val = compute_group_aggregate(
+                agg.function,
+                &agg.argument,
+                agg_field_indices[ai],
+                GroupAggregateContext {
+                    columns: &columns,
+                    all_rows: &rows,
+                    row_indices,
+                    source_index: agg_source_indices[ai],
+                    provenance: provenance
+                        .as_ref()
+                        .map(|provenance| (provenance.rows.as_slice(), provenance.memory_limit)),
+                },
+            )?;
             row.push(val);
         }
         out_rows.push(row);
@@ -3878,13 +4792,31 @@ pub(super) fn exec_group_by(
 
     // Apply HAVING filter.
     if let Some(having_expr) = having {
-        out_rows.retain(|row| eval_predicate(having_expr, row, &out_columns));
+        let mut filtered = Vec::with_capacity(out_rows.len());
+        for row in out_rows {
+            cancel.tick()?;
+            if eval_predicate(having_expr, &row, &out_columns) {
+                filtered.push(row);
+            }
+        }
+        out_rows = filtered;
     }
 
     Ok(QueryResult::Rows {
         columns: out_columns,
         rows: out_rows,
     })
+}
+
+fn resolve_direct_group_expr(expr: &Expr, columns: &[String]) -> Result<Option<usize>, QueryError> {
+    match expr {
+        Expr::Field(name) if name == "*" => Ok(None),
+        Expr::Field(name) => resolve_group_column(name, columns).map(Some),
+        Expr::QualifiedField { qualifier, field } => {
+            resolve_group_column(&format!("{qualifier}.{field}"), columns).map(Some)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Reject any aggregate `FunctionCall` that survives planning into an
@@ -3929,7 +4861,7 @@ fn collect_json_path_base_indices(expr: &Expr, columns: &[String], out: &mut Vec
             collect_json_path_base_indices(l, columns, out);
             collect_json_path_base_indices(r, columns, out);
         }
-        Expr::UnaryOp(_, i) | Expr::FunctionCall(_, i) | Expr::Cast(i, _) => {
+        Expr::UnaryOp(_, i) | Expr::FunctionCall(_, i, _) | Expr::Cast(i, _) => {
             collect_json_path_base_indices(i, columns, out);
         }
         Expr::ScalarFunc(_, args) => {
@@ -4121,12 +5053,26 @@ fn check_expr_json_paths(
             check_expr_json_paths(l, scope, shadowed)?;
             check_expr_json_paths(r, scope, shadowed)
         }
-        Expr::UnaryOp(_, inner) | Expr::FunctionCall(_, inner) | Expr::Cast(inner, _) => {
+        Expr::UnaryOp(_, inner) | Expr::FunctionCall(_, inner, _) | Expr::Cast(inner, _) => {
             check_expr_json_paths(inner, scope, shadowed)
         }
         Expr::ScalarFunc(_, args) => {
             for a in args {
                 check_expr_json_paths(a, scope, shadowed)?;
+            }
+            Ok(())
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter().chain(partition_by) {
+                check_expr_json_paths(expr, scope, shadowed)?;
+            }
+            for key in order_by {
+                check_expr_json_paths(&key.expr, scope, shadowed)?;
             }
             Ok(())
         }
@@ -4171,7 +5117,18 @@ fn check_plan_json_paths(
             }
             check_plan_json_paths(input, scope, shadowed)
         }
-        PlanNode::GroupBy { input, having, .. } => {
+        PlanNode::GroupBy {
+            input,
+            keys,
+            aggregates,
+            having,
+        } => {
+            for key in keys {
+                check_expr_json_paths(&key.expr, scope, shadowed)?;
+            }
+            for aggregate in aggregates {
+                check_expr_json_paths(&aggregate.argument, scope, shadowed)?;
+            }
             if let Some(h) = having {
                 check_expr_json_paths(h, scope, shadowed)?;
             }
@@ -4190,12 +5147,34 @@ fn check_plan_json_paths(
             check_plan_json_paths(left, scope, shadowed)?;
             check_plan_json_paths(right, scope, shadowed)
         }
-        PlanNode::Sort { input, .. }
-        | PlanNode::Limit { input, .. }
+        PlanNode::Sort { input, keys } => {
+            for key in keys {
+                check_expr_json_paths(&key.expr, scope, shadowed)?;
+            }
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::Aggregate {
+            input, argument, ..
+        } => {
+            if let Some(argument) = argument {
+                check_expr_json_paths(argument, scope, shadowed)?;
+            }
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::Window { input, windows } => {
+            for window in windows {
+                for expr in window.args.iter().chain(&window.partition_by) {
+                    check_expr_json_paths(expr, scope, shadowed)?;
+                }
+                for key in &window.order_by {
+                    check_expr_json_paths(&key.expr, scope, shadowed)?;
+                }
+            }
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::Limit { input, .. }
         | PlanNode::Offset { input, .. }
         | PlanNode::Distinct { input }
-        | PlanNode::Aggregate { input, .. }
-        | PlanNode::Window { input, .. }
         | PlanNode::Update { input, .. }
         | PlanNode::Delete { input, .. }
         | PlanNode::Explain { input } => check_plan_json_paths(input, scope, shadowed),
@@ -4215,13 +5194,29 @@ pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryE
             check_expr_no_aggregate(predicate)?;
             validate_no_stray_aggregates(input)?;
         }
-        PlanNode::GroupBy { input, having, .. } => {
+        PlanNode::GroupBy {
+            input,
+            keys,
+            aggregates,
+            having,
+        } => {
+            for key in keys {
+                check_expr_no_aggregate(&key.expr)?;
+            }
+            for aggregate in aggregates {
+                check_expr_no_aggregate(&aggregate.argument)?;
+            }
             if let Some(h) = having {
                 check_expr_no_aggregate(h)?;
             }
             validate_no_stray_aggregates(input)?;
         }
-        PlanNode::NestedLoopJoin { left, right, .. } => {
+        PlanNode::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            if let Some(on) = on {
+                check_expr_no_aggregate(on)?;
+            }
             validate_no_stray_aggregates(left)?;
             validate_no_stray_aggregates(right)?;
         }
@@ -4229,12 +5224,34 @@ pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryE
             validate_no_stray_aggregates(left)?;
             validate_no_stray_aggregates(right)?;
         }
-        PlanNode::Sort { input, .. }
-        | PlanNode::Limit { input, .. }
+        PlanNode::Sort { input, keys } => {
+            for key in keys {
+                check_expr_no_aggregate(&key.expr)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::Aggregate {
+            input, argument, ..
+        } => {
+            if let Some(argument) = argument {
+                check_expr_no_aggregate(argument)?;
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::Window { input, windows } => {
+            for window in windows {
+                for expr in window.args.iter().chain(&window.partition_by) {
+                    check_expr_no_aggregate(expr)?;
+                }
+                for key in &window.order_by {
+                    check_expr_no_aggregate(&key.expr)?;
+                }
+            }
+            validate_no_stray_aggregates(input)?;
+        }
+        PlanNode::Limit { input, .. }
         | PlanNode::Offset { input, .. }
         | PlanNode::Distinct { input }
-        | PlanNode::Aggregate { input, .. }
-        | PlanNode::Window { input, .. }
         | PlanNode::Update { input, .. }
         | PlanNode::Delete { input, .. }
         | PlanNode::Explain { input } => {
@@ -4250,14 +5267,16 @@ pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryE
 /// evaluated on their own path), only their outer operand expression.
 fn check_expr_no_aggregate(expr: &Expr) -> Result<(), QueryError> {
     match expr {
-        Expr::FunctionCall(_, _) => Err(QueryError::Execution(
+        Expr::FunctionCall(..) => Err(QueryError::Execution(
             "invalid query: aggregate function in an unsupported position".to_string(),
         )),
         Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
             check_expr_no_aggregate(l)?;
             check_expr_no_aggregate(r)
         }
-        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => check_expr_no_aggregate(inner),
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::JsonPath { base: inner, .. } => {
+            check_expr_no_aggregate(inner)
+        }
         Expr::ScalarFunc(_, args) => {
             for a in args {
                 check_expr_no_aggregate(a)?;
@@ -4282,74 +5301,68 @@ fn check_expr_no_aggregate(expr: &Expr) -> Result<(), QueryError> {
             }
             Ok(())
         }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter().chain(partition_by) {
+                check_expr_no_aggregate(expr)?;
+            }
+            for key in order_by {
+                check_expr_no_aggregate(&key.expr)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
 
-/// Mission E2b: compute one aggregate over a set of rows in a group.
-pub(super) fn compute_group_aggregate(
+/// Evaluate a scalar aggregate over already materialized rows. Stored-field
+/// aggregates retain their raw-column fast path in the caller; this generic
+/// path is also able to aggregate arbitrary expressions such as JSON paths.
+pub(super) fn aggregate_rows(
     func: AggFunc,
-    all_rows: &[Vec<Value>],
-    row_indices: &[usize],
-    col_idx: usize,
-) -> Value {
-    match func {
-        AggFunc::Count => {
-            if col_idx == usize::MAX {
-                // count(*) — count all rows in the group.
-                return Value::Int(row_indices.len() as i64);
-            }
-            let count = row_indices
-                .iter()
-                .filter(|&&ri| !all_rows[ri][col_idx].is_empty())
-                .count();
-            Value::Int(count as i64)
-        }
+    argument: Option<&Expr>,
+    columns: &[String],
+    rows: &[Vec<Value>],
+) -> Result<QueryResult, QueryError> {
+    let mut cancel = CancelCheck::new();
+    if func == AggFunc::Count && argument.is_none() {
+        return Ok(QueryResult::Scalar(Value::Int(rows.len() as i64)));
+    }
+    let argument = argument.ok_or_else(|| {
+        QueryError::Execution(format!(
+            "{} requires an argument",
+            format!("{func:?}").to_lowercase()
+        ))
+    })?;
+
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        cancel.tick()?;
+        values.push(eval_expr(argument, row, columns));
+    }
+
+    let value = match func {
+        AggFunc::Count => Value::Int(values.iter().filter(|v| !v.is_empty()).count() as i64),
         AggFunc::CountDistinct => {
-            let mut seen = std::collections::HashSet::new();
-            for &ri in row_indices {
-                let v = &all_rows[ri][col_idx];
-                if !v.is_empty() {
-                    seen.insert(v.clone());
-                }
-            }
+            let seen: std::collections::HashSet<Value> =
+                values.into_iter().filter(|v| !v.is_empty()).collect();
             Value::Int(seen.len() as i64)
         }
-        AggFunc::Sum => {
-            // Mirror the scalar Sum path: accumulate int and float
-            // contributions separately and promote the final result to
-            // Float if any Float row was observed. Prevents silent
-            // drop of Float columns in GROUP BY aggregates.
-            let mut int_sum: i64 = 0;
-            let mut float_sum: f64 = 0.0;
-            let mut saw_float = false;
-            for &ri in row_indices {
-                match &all_rows[ri][col_idx] {
-                    Value::Int(v) => int_sum += v,
-                    Value::Float(v) => {
-                        float_sum += *v;
-                        saw_float = true;
-                    }
-                    _ => {}
-                }
-            }
-            if saw_float {
-                Value::Float(float_sum + int_sum as f64)
-            } else {
-                Value::Int(int_sum)
-            }
-        }
         AggFunc::Avg => {
-            let mut sum = 0.0f64;
-            let mut count = 0usize;
-            for &ri in row_indices {
-                match &all_rows[ri][col_idx] {
+            let mut sum = 0.0;
+            let mut count = 0_u64;
+            for value in values {
+                match value {
                     Value::Int(v) => {
-                        sum += *v as f64;
+                        sum += v as f64;
                         count += 1;
                     }
                     Value::Float(v) => {
-                        sum += *v;
+                        sum += v;
                         count += 1;
                     }
                     _ => {}
@@ -4361,36 +5374,332 @@ pub(super) fn compute_group_aggregate(
                 Value::Float(sum / count as f64)
             }
         }
-        AggFunc::Min => row_indices
-            .iter()
-            .map(|&ri| &all_rows[ri][col_idx])
-            .filter(|v| !v.is_empty())
-            .min()
-            .cloned()
-            .unwrap_or(Value::Empty),
-        AggFunc::Max => row_indices
-            .iter()
-            .map(|&ri| &all_rows[ri][col_idx])
-            .filter(|v| !v.is_empty())
-            .max()
-            .cloned()
-            .unwrap_or(Value::Empty),
+        AggFunc::Sum => {
+            let mut int_sum = 0_i64;
+            let mut float_sum = 0.0;
+            let mut saw_float = false;
+            for value in values {
+                match value {
+                    Value::Int(v) => int_sum += v,
+                    Value::Float(v) => {
+                        float_sum += v;
+                        saw_float = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_float {
+                Value::Float(float_sum + int_sum as f64)
+            } else {
+                Value::Int(int_sum)
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut result: Option<Value> = None;
+            for value in values.into_iter().filter(|v| !v.is_empty()) {
+                let replace = match &result {
+                    None => true,
+                    Some(current) if func == AggFunc::Min => value < *current,
+                    Some(current) => value > *current,
+                };
+                if replace {
+                    result = Some(value);
+                }
+            }
+            result.unwrap_or(Value::Empty)
+        }
+    };
+    Ok(QueryResult::Scalar(value))
+}
+
+const SYMMETRIC_RID_SET_ENTRY_BYTES: usize =
+    std::mem::size_of::<RowId>() + 2 * std::mem::size_of::<usize>();
+
+pub(super) fn aggregate_rows_with_provenance(
+    func: AggFunc,
+    argument: Option<&Expr>,
+    input: &ProvenanceRows,
+    provenance_alias: &str,
+    memory_limit: usize,
+) -> Result<QueryResult, QueryError> {
+    if matches!(func, AggFunc::Min | AggFunc::Max | AggFunc::CountDistinct) {
+        return aggregate_rows(func, argument, &input.columns, &input.rows);
+    }
+    let argument = argument.ok_or_else(|| {
+        QueryError::Execution(
+            "symmetric aggregate requires a source-valued argument; use raw".to_string(),
+        )
+    })?;
+    let source_index = input.source_index(provenance_alias).ok_or_else(|| {
+        QueryError::Execution(format!(
+            "symmetric aggregate source alias '{provenance_alias}' is not present in its input"
+        ))
+    })?;
+    let mut seen = HashSet::new();
+    let mut int_sum = 0_i64;
+    let mut float_sum = 0.0_f64;
+    let mut saw_float = false;
+    let mut count = 0_u64;
+    let mut cancel = CancelCheck::new();
+    for (row, row_provenance) in input.rows.iter().zip(&input.provenance) {
+        cancel.tick()?;
+        let value = eval_expr(argument, row, &input.columns);
+        if value.is_empty() {
+            continue;
+        }
+        let Some(rid) = row_provenance[source_index] else {
+            continue;
+        };
+        if !seen.insert(rid) {
+            continue;
+        }
+        mem_budget::charge(SYMMETRIC_RID_SET_ENTRY_BYTES, memory_limit)?;
+        match func {
+            AggFunc::Count => count += 1,
+            AggFunc::Sum | AggFunc::Avg => match value {
+                Value::Int(value) => {
+                    int_sum += value;
+                    count += 1;
+                }
+                Value::Float(value) => {
+                    float_sum += value;
+                    saw_float = true;
+                    count += 1;
+                }
+                _ => {}
+            },
+            AggFunc::CountDistinct | AggFunc::Min | AggFunc::Max => unreachable!(),
+        }
+    }
+    let value = match func {
+        AggFunc::Count => Value::Int(count as i64),
+        AggFunc::Sum if saw_float => Value::Float(float_sum + int_sum as f64),
+        AggFunc::Sum => Value::Int(int_sum),
+        AggFunc::Avg if count == 0 => Value::Empty,
+        AggFunc::Avg => Value::Float((float_sum + int_sum as f64) / count as f64),
+        AggFunc::CountDistinct | AggFunc::Min | AggFunc::Max => unreachable!(),
+    };
+    Ok(QueryResult::Scalar(value))
+}
+
+/// Mission E2b: compute one aggregate over a set of rows in a group.
+pub(super) struct GroupAggregateContext<'a> {
+    pub(super) columns: &'a [String],
+    pub(super) all_rows: &'a [Vec<Value>],
+    pub(super) row_indices: &'a [usize],
+    pub(super) source_index: Option<usize>,
+    pub(super) provenance: Option<(&'a [Vec<Option<RowId>>], usize)>,
+}
+
+pub(super) fn compute_group_aggregate(
+    func: AggFunc,
+    argument: &Expr,
+    direct_index: Option<usize>,
+    context: GroupAggregateContext<'_>,
+) -> Result<Value, QueryError> {
+    let GroupAggregateContext {
+        columns,
+        all_rows,
+        row_indices,
+        source_index,
+        provenance,
+    } = context;
+    let count_all = matches!(argument, Expr::Field(name) if name == "*");
+    let value_at = |ri: usize| match direct_index {
+        Some(index) => all_rows[ri][index].clone(),
+        None => eval_expr(argument, &all_rows[ri], columns),
+    };
+    let mut cancel = CancelCheck::new();
+    let mut seen_rids = HashSet::new();
+    match func {
+        AggFunc::Count => {
+            if count_all {
+                // count(*) — count all rows in the group.
+                return Ok(Value::Int(row_indices.len() as i64));
+            }
+            let mut count = 0usize;
+            for &ri in row_indices {
+                cancel.tick()?;
+                let value = value_at(ri);
+                if !value.is_empty()
+                    && accept_symmetric_contribution(ri, source_index, provenance, &mut seen_rids)?
+                {
+                    count += 1;
+                }
+            }
+            Ok(Value::Int(count as i64))
+        }
+        AggFunc::CountDistinct => {
+            let mut seen = std::collections::HashSet::new();
+            for &ri in row_indices {
+                cancel.tick()?;
+                let v = value_at(ri);
+                if !v.is_empty() {
+                    seen.insert(v);
+                }
+            }
+            Ok(Value::Int(seen.len() as i64))
+        }
+        AggFunc::Sum => {
+            // Mirror the scalar Sum path: accumulate int and float
+            // contributions separately and promote the final result to
+            // Float if any Float row was observed. Prevents silent
+            // drop of Float columns in GROUP BY aggregates.
+            let mut int_sum: i64 = 0;
+            let mut float_sum: f64 = 0.0;
+            let mut saw_float = false;
+            for &ri in row_indices {
+                cancel.tick()?;
+                let value = value_at(ri);
+                if value.is_empty()
+                    || !accept_symmetric_contribution(ri, source_index, provenance, &mut seen_rids)?
+                {
+                    continue;
+                }
+                match value {
+                    Value::Int(v) => int_sum += v,
+                    Value::Float(v) => {
+                        float_sum += v;
+                        saw_float = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_float {
+                Ok(Value::Float(float_sum + int_sum as f64))
+            } else {
+                Ok(Value::Int(int_sum))
+            }
+        }
+        AggFunc::Avg => {
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            for &ri in row_indices {
+                cancel.tick()?;
+                let value = value_at(ri);
+                if value.is_empty()
+                    || !accept_symmetric_contribution(ri, source_index, provenance, &mut seen_rids)?
+                {
+                    continue;
+                }
+                match value {
+                    Value::Int(v) => {
+                        sum += v as f64;
+                        count += 1;
+                    }
+                    Value::Float(v) => {
+                        sum += v;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                Ok(Value::Empty)
+            } else {
+                Ok(Value::Float(sum / count as f64))
+            }
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let mut result: Option<Value> = None;
+            for &ri in row_indices {
+                cancel.tick()?;
+                let value = value_at(ri);
+                if value.is_empty() {
+                    continue;
+                }
+                let replace = match &result {
+                    None => true,
+                    Some(current) if func == AggFunc::Min => value < *current,
+                    Some(current) => value > *current,
+                };
+                if replace {
+                    result = Some(value);
+                }
+            }
+            Ok(result.unwrap_or(Value::Empty))
+        }
     }
 }
 
-/// Mission E1.3: try to extract equi-join key indices from a join `on`
-/// predicate. Returns `Some((left_col_idx, right_col_idx))` when the
-/// predicate is exactly `L = R` (or `R = L`) and both sides resolve
-/// cleanly — `L` to the left subtree's column list and `R` to the right
-/// subtree's column list.
-///
-/// This is deliberately narrow. We only recognise the two shapes:
-///   * `QualifiedField = QualifiedField`  (`u.id = o.user_id`)
-///   * `Field = Field`                    (`.id = .user_id`, unqualified)
-///
-/// Anything else — conjunctions, constants, function calls, or predicates
-/// that touch the same side on both halves — falls through to the
-/// nested-loop path unchanged.
+fn accept_symmetric_contribution(
+    row_index: usize,
+    source_index: Option<usize>,
+    provenance: Option<(&[Vec<Option<RowId>>], usize)>,
+    seen: &mut HashSet<RowId>,
+) -> Result<bool, QueryError> {
+    let Some(source_index) = source_index else {
+        return Ok(true);
+    };
+    let Some((provenance, memory_limit)) = provenance else {
+        return Err(QueryError::Execution(
+            "symmetric aggregate provenance is unavailable; use raw".to_string(),
+        ));
+    };
+    let Some(rid) = provenance[row_index][source_index] else {
+        return Ok(false);
+    };
+    if !seen.insert(rid) {
+        return Ok(false);
+    }
+    mem_budget::charge(SYMMETRIC_RID_SET_ENTRY_BYTES, memory_limit)?;
+    Ok(true)
+}
+
+struct HashJoinSpec<'a> {
+    left_key_idx: usize,
+    right_key_idx: usize,
+    residuals: Vec<&'a Expr>,
+}
+
+struct MaterializedJoinInputs {
+    left_columns: Vec<String>,
+    left_rows: Vec<Vec<Value>>,
+    right_columns: Vec<String>,
+    right_rows: Vec<Vec<Value>>,
+}
+
+fn flatten_conjunctions<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp(left, BinOp::And, right) => {
+            flatten_conjunctions(left, out);
+            flatten_conjunctions(right, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+/// Extract one cross-side equality from an arbitrary AND conjunction. The
+/// chosen equality becomes the hash key and every other conjunct remains a
+/// residual predicate evaluated only inside the matching hash bucket.
+fn try_extract_hash_join<'a>(
+    pred: &'a Expr,
+    left_columns: &[String],
+    right_columns: &[String],
+) -> Option<HashJoinSpec<'a>> {
+    let mut conjuncts = Vec::new();
+    flatten_conjunctions(pred, &mut conjuncts);
+    for (key_position, conjunct) in conjuncts.iter().enumerate() {
+        let Some((left_key_idx, right_key_idx)) =
+            try_extract_equi_join_keys(conjunct, left_columns, right_columns)
+        else {
+            continue;
+        };
+        let residuals = conjuncts
+            .iter()
+            .enumerate()
+            .filter_map(|(position, residual)| (position != key_position).then_some(*residual))
+            .collect();
+        return Some(HashJoinSpec {
+            left_key_idx,
+            right_key_idx,
+            residuals,
+        });
+    }
+    None
+}
+
+/// Resolve a single cross-side equality, accepting either operand orientation.
 pub(super) fn try_extract_equi_join_keys(
     pred: &Expr,
     left_columns: &[String],
@@ -4443,27 +5752,31 @@ fn resolve_side_column(expr: &Expr, columns: &[String]) -> Option<usize> {
     }
 }
 
-/// Mission E1.3: O(L + R) hash join. Builds a `FxHashMap<Value, Vec<usize>>`
-/// over the right (inner) side's join keys, then streams the left (outer)
-/// side and for each probe row emits every combined row whose right-side
-/// key matches. For `JoinKind::LeftOuter`, unmatched left rows are emitted
-/// padded with `Value::Empty` on the right side.
+/// O(L + R + matching bucket candidates) hash join. Residual predicates are
+/// evaluated only after the equi-key probe has found a candidate. For
+/// `JoinKind::LeftOuter`, a left row is padded with `Value::Empty` when there
+/// is no key bucket or when every candidate in its bucket fails a residual.
 ///
 /// The right side is always the build side. That choice is forced for
 /// LeftOuter (the left side must stream so we can detect orphans), and
 /// for Inner it's a reasonable default — left-deep plans tend to grow the
 /// left side with each join, so the un-joined right leaf is often the
 /// smaller of the two at each level.
-pub(super) fn hash_join(
-    left_columns: Vec<String>,
-    left_rows: Vec<Vec<Value>>,
-    right_columns: Vec<String>,
-    right_rows: Vec<Vec<Value>>,
+fn hash_join(
+    inputs: MaterializedJoinInputs,
     left_key_idx: usize,
     right_key_idx: usize,
     kind: JoinKind,
+    residuals: &[&Expr],
 ) -> Result<QueryResult, QueryError> {
     use rustc_hash::FxHashMap;
+
+    let MaterializedJoinInputs {
+        left_columns,
+        left_rows,
+        right_columns,
+        right_rows,
+    } = inputs;
 
     let n_left = left_columns.len();
     let n_right = right_columns.len();
@@ -4481,12 +5794,9 @@ pub(super) fn hash_join(
         FxHashMap::with_capacity_and_hasher(right_rows.len(), Default::default());
     for (i, row) in right_rows.iter().enumerate() {
         cancel.tick()?;
-        // Skip Empty keys on the build side — they can never match under
-        // SQL semantics (NULL ≠ NULL) and would collapse all nullables to
-        // one bucket.
-        if matches!(row[right_key_idx], Value::Empty) {
-            continue;
-        }
+        // PowQL equality is direct Value equality, including Empty = Empty.
+        // Hash joins must preserve the same semantics as the nested-loop
+        // evaluator rather than silently dropping nullable-key matches.
         build.entry(row[right_key_idx].clone()).or_default().push(i);
     }
 
@@ -4494,36 +5804,257 @@ pub(super) fn hash_join(
     // rows in the common 1:1 case, left-outer always emits ≥ left_rows.len().
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
 
+    crate::cancel::check()?;
     for left_row in &left_rows {
         cancel.tick()?;
         let key = &left_row[left_key_idx];
-        let matched = if matches!(key, Value::Empty) {
-            None
-        } else {
-            build.get(key)
-        };
-        match matched {
+        let candidates = build.get(key);
+        let mut matched = false;
+        match candidates {
             Some(matches) if !matches.is_empty() => {
                 for &ri in matches {
+                    cancel.tick()?;
                     let right_row = &right_rows[ri];
                     let mut combined = Vec::with_capacity(n_left + n_right);
                     combined.extend_from_slice(left_row);
                     combined.extend_from_slice(right_row);
-                    rows.push(combined);
+                    if residuals
+                        .iter()
+                        .all(|residual| eval_predicate(residual, &combined, &columns))
+                    {
+                        rows.push(combined);
+                        check_join_limit(rows.len())?;
+                        matched = true;
+                    }
                 }
             }
-            _ => {
-                if matches!(kind, JoinKind::LeftOuter) {
-                    let mut row = Vec::with_capacity(n_left + n_right);
-                    row.extend_from_slice(left_row);
-                    row.resize(n_left + n_right, Value::Empty);
-                    rows.push(row);
-                }
-            }
+            _ => {}
+        }
+        if !matched && matches!(kind, JoinKind::LeftOuter) {
+            let mut row = Vec::with_capacity(n_left + n_right);
+            row.extend_from_slice(left_row);
+            row.resize(n_left + n_right, Value::Empty);
+            rows.push(row);
+            check_join_limit(rows.len())?;
         }
     }
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+#[inline]
+pub(super) fn check_nested_loop_pair_limit(
+    left_rows: usize,
+    right_rows: usize,
+) -> Result<usize, QueryError> {
+    let candidate_pairs =
+        left_rows
+            .checked_mul(right_rows)
+            .ok_or(QueryError::NestedLoopPairLimitExceeded {
+                left_rows,
+                right_rows,
+                limit: MAX_NESTED_LOOP_PAIRS,
+            })?;
+    if candidate_pairs > MAX_NESTED_LOOP_PAIRS {
+        return Err(QueryError::NestedLoopPairLimitExceeded {
+            left_rows,
+            right_rows,
+            limit: MAX_NESTED_LOOP_PAIRS,
+        });
+    }
+    Ok(candidate_pairs)
+}
+
+/// Execute a join over already materialized inputs. Runtime column resolution
+/// decides whether a cross-side equality is usable as a hash key; otherwise the
+/// checked and cancellation-aware nested loop remains the compatibility path.
+pub(super) fn execute_materialized_join(
+    left_columns: Vec<String>,
+    left_rows: Vec<Vec<Value>>,
+    right_columns: Vec<String>,
+    right_rows: Vec<Vec<Value>>,
+    on: Option<&Expr>,
+    kind: JoinKind,
+) -> Result<QueryResult, QueryError> {
+    crate::cancel::check()?;
+    if !matches!(kind, JoinKind::Cross) {
+        if let Some(pred) = on {
+            if let Some(spec) = try_extract_hash_join(pred, &left_columns, &right_columns) {
+                return hash_join(
+                    MaterializedJoinInputs {
+                        left_columns,
+                        left_rows,
+                        right_columns,
+                        right_rows,
+                    },
+                    spec.left_key_idx,
+                    spec.right_key_idx,
+                    kind,
+                    &spec.residuals,
+                );
+            }
+        }
+    }
+
+    check_nested_loop_pair_limit(left_rows.len(), right_rows.len())?;
+    let n_left = left_columns.len();
+    let n_right = right_columns.len();
+    let mut columns = Vec::with_capacity(n_left + n_right);
+    columns.extend(left_columns);
+    columns.extend(right_columns);
+
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
+    let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
+    let mut cancel = CancelCheck::new();
+    for left_row in &left_rows {
+        let mut matched = false;
+        for right_row in &right_rows {
+            cancel.tick()?;
+            combined.clear();
+            combined.extend_from_slice(left_row);
+            combined.extend_from_slice(right_row);
+            let keep = match kind {
+                JoinKind::Cross => true,
+                JoinKind::Inner | JoinKind::LeftOuter => {
+                    on.is_none_or(|pred| eval_predicate(pred, &combined, &columns))
+                }
+                JoinKind::RightOuter => {
+                    unreachable!("planner rewrites RightOuter to LeftOuter")
+                }
+            };
+            if keep {
+                rows.push(combined.clone());
+                check_join_limit(rows.len())?;
+                matched = true;
+            }
+        }
+        if !matched && matches!(kind, JoinKind::LeftOuter) {
+            let mut row = Vec::with_capacity(n_left + n_right);
+            row.extend_from_slice(left_row);
+            row.resize(n_left + n_right, Value::Empty);
+            rows.push(row);
+            check_join_limit(rows.len())?;
+        }
+    }
+    Ok(QueryResult::Rows { columns, rows })
+}
+
+fn execute_provenance_join(
+    left: ProvenanceRows,
+    right: ProvenanceRows,
+    on: Option<&Expr>,
+    kind: JoinKind,
+) -> Result<ProvenanceRows, QueryError> {
+    let left_width = left.columns.len();
+    let right_width = right.columns.len();
+    let right_source_count = right.source_aliases.len();
+    let mut columns = left.columns.clone();
+    columns.extend(right.columns.clone());
+    let mut source_aliases = left.source_aliases.clone();
+    source_aliases.extend(right.source_aliases.clone());
+    let mut rows = Vec::new();
+    let mut provenance = Vec::new();
+    let mut cancel = CancelCheck::new();
+
+    if !matches!(kind, JoinKind::Cross) {
+        if let Some(predicate) = on {
+            if let Some(spec) = try_extract_hash_join(predicate, &left.columns, &right.columns) {
+                let mut build: rustc_hash::FxHashMap<Value, Vec<usize>> =
+                    rustc_hash::FxHashMap::default();
+                for (index, row) in right.rows.iter().enumerate() {
+                    cancel.tick()?;
+                    let key = &row[spec.right_key_idx];
+                    if !key.is_empty() {
+                        build.entry(key.clone()).or_default().push(index);
+                    }
+                }
+                for (left_index, left_row) in left.rows.iter().enumerate() {
+                    cancel.tick()?;
+                    let key = &left_row[spec.left_key_idx];
+                    let candidates = if key.is_empty() { None } else { build.get(key) };
+                    let mut matched = false;
+                    if let Some(candidates) = candidates {
+                        for &right_index in candidates {
+                            cancel.tick()?;
+                            let mut row = Vec::with_capacity(left_width + right_width);
+                            row.extend_from_slice(left_row);
+                            row.extend_from_slice(&right.rows[right_index]);
+                            if spec
+                                .residuals
+                                .iter()
+                                .all(|residual| eval_predicate(residual, &row, &columns))
+                            {
+                                let mut row_provenance = left.provenance[left_index].clone();
+                                row_provenance.extend_from_slice(&right.provenance[right_index]);
+                                rows.push(row);
+                                provenance.push(row_provenance);
+                                check_join_limit(rows.len())?;
+                                matched = true;
+                            }
+                        }
+                    }
+                    if !matched && matches!(kind, JoinKind::LeftOuter) {
+                        let mut row = left_row.clone();
+                        row.resize(left_width + right_width, Value::Empty);
+                        let mut row_provenance = left.provenance[left_index].clone();
+                        row_provenance.extend(std::iter::repeat_n(None, right_source_count));
+                        rows.push(row);
+                        provenance.push(row_provenance);
+                        check_join_limit(rows.len())?;
+                    }
+                }
+                return Ok(ProvenanceRows {
+                    columns,
+                    rows,
+                    source_aliases,
+                    provenance,
+                });
+            }
+        }
+    }
+
+    check_nested_loop_pair_limit(left.rows.len(), right.rows.len())?;
+    for (left_index, left_row) in left.rows.iter().enumerate() {
+        let mut matched = false;
+        for (right_index, right_row) in right.rows.iter().enumerate() {
+            cancel.tick()?;
+            let mut row = Vec::with_capacity(left_width + right_width);
+            row.extend_from_slice(left_row);
+            row.extend_from_slice(right_row);
+            let keep = match kind {
+                JoinKind::Cross => true,
+                JoinKind::Inner | JoinKind::LeftOuter => {
+                    on.is_none_or(|predicate| eval_predicate(predicate, &row, &columns))
+                }
+                JoinKind::RightOuter => {
+                    unreachable!("planner rewrites RightOuter to LeftOuter")
+                }
+            };
+            if keep {
+                let mut row_provenance = left.provenance[left_index].clone();
+                row_provenance.extend_from_slice(&right.provenance[right_index]);
+                rows.push(row);
+                provenance.push(row_provenance);
+                check_join_limit(rows.len())?;
+                matched = true;
+            }
+        }
+        if !matched && matches!(kind, JoinKind::LeftOuter) {
+            let mut row = left_row.clone();
+            row.resize(left_width + right_width, Value::Empty);
+            let mut row_provenance = left.provenance[left_index].clone();
+            row_provenance.extend(std::iter::repeat_n(None, right_source_count));
+            rows.push(row);
+            provenance.push(row_provenance);
+            check_join_limit(rows.len())?;
+        }
+    }
+    Ok(ProvenanceRows {
+        columns,
+        rows,
+        source_aliases,
+        provenance,
+    })
 }
 
 /// Lower unindexed `RangeScan` and `IndexScan` nodes to `Filter(SeqScan)`
@@ -4541,6 +6072,16 @@ pub(super) fn hash_join(
 /// This pass runs once per query, before execution.
 pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
+        PlanNode::ExprIndexScan { table, path, .. }
+        | PlanNode::ExprRangeScan { table, path, .. }
+        | PlanNode::OrderedExprIndexScan { table, path, .. } => {
+            if resolve_expression_index(catalog, table, path).is_some() {
+                plan.clone()
+            } else {
+                expression_index_fallback(plan)
+                    .expect("expression-index branch always has a fallback")
+            }
+        }
         PlanNode::RangeScan {
             table,
             column,
@@ -4588,11 +6129,15 @@ pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
         PlanNode::Aggregate {
             input,
             function,
-            field,
+            argument,
+            mode,
+            provenance_alias,
         } => PlanNode::Aggregate {
             input: Box::new(lower_unindexed_scans(catalog, input)),
             function: *function,
-            field: field.clone(),
+            argument: argument.clone(),
+            mode: *mode,
+            provenance_alias: provenance_alias.clone(),
         },
         PlanNode::Distinct { input } => PlanNode::Distinct {
             input: Box::new(lower_unindexed_scans(catalog, input)),
@@ -4673,6 +6218,49 @@ pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
     }
 }
 
+fn stored_json_path_expr(path: &powdb_storage::stored_json_path::StoredJsonPathV1) -> Expr {
+    use powdb_storage::stored_json_path::StoredJsonPathSegmentV1;
+
+    Expr::JsonPath {
+        base: Box::new(Expr::Field(path.column.clone())),
+        segments: path
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                StoredJsonPathSegmentV1::Key(key) => PathSeg::Key(key.clone()),
+                StoredJsonPathSegmentV1::Index(index) => PathSeg::Index(*index),
+            })
+            .collect(),
+    }
+}
+
+fn synthesize_expr_range_predicate(
+    path: &powdb_storage::stored_json_path::StoredJsonPathV1,
+    start: &Option<(Expr, bool)>,
+    end: &Option<(Expr, bool)>,
+) -> Expr {
+    let lower = start.as_ref().map(|(expr, inclusive)| {
+        Expr::BinaryOp(
+            Box::new(stored_json_path_expr(path)),
+            if *inclusive { BinOp::Gte } else { BinOp::Gt },
+            Box::new(expr.clone()),
+        )
+    });
+    let upper = end.as_ref().map(|(expr, inclusive)| {
+        Expr::BinaryOp(
+            Box::new(stored_json_path_expr(path)),
+            if *inclusive { BinOp::Lte } else { BinOp::Lt },
+            Box::new(expr.clone()),
+        )
+    });
+    match (lower, upper) {
+        (Some(lower), Some(upper)) => Expr::BinaryOp(Box::new(lower), BinOp::And, Box::new(upper)),
+        (Some(lower), None) => lower,
+        (None, Some(upper)) => upper,
+        (None, None) => Expr::Literal(Literal::Bool(true)),
+    }
+}
+
 /// Synthesize a range predicate from RangeScan bounds for the fallback path.
 pub(super) fn synthesize_range_predicate(
     column: &str,
@@ -4732,9 +6320,89 @@ pub(super) fn range_matches(
     true
 }
 
+fn collect_plan_qualifiers(plan: &PlanNode, qualifiers: &mut HashSet<String>) {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => {
+            qualifiers.insert(table.clone());
+        }
+        PlanNode::AliasScan { alias, .. } => {
+            qualifiers.insert(alias.clone());
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Explain { input } => collect_plan_qualifiers(input, qualifiers),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            collect_plan_qualifiers(left, qualifiers);
+            collect_plan_qualifiers(right, qualifiers);
+        }
+        _ => {}
+    }
+}
+
+fn qualified_ref(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::QualifiedField { qualifier, .. } => Some(qualifier),
+        _ => None,
+    }
+}
+
+fn explain_join_strategy(
+    left: &PlanNode,
+    right: &PlanNode,
+    on: Option<&Expr>,
+    kind: JoinKind,
+) -> &'static str {
+    if matches!(kind, JoinKind::Cross) {
+        return "nested-loop-bounded";
+    }
+    let Some(predicate) = on else {
+        return "nested-loop-bounded";
+    };
+    let mut conjunctions = Vec::new();
+    flatten_conjunctions(predicate, &mut conjunctions);
+    let mut left_qualifiers = HashSet::new();
+    let mut right_qualifiers = HashSet::new();
+    collect_plan_qualifiers(left, &mut left_qualifiers);
+    collect_plan_qualifiers(right, &mut right_qualifiers);
+
+    let has_cross_side_equi = conjunctions.iter().any(|expr| {
+        let Expr::BinaryOp(lhs, BinOp::Eq, rhs) = expr else {
+            return false;
+        };
+        let (Some(lhs_q), Some(rhs_q)) = (qualified_ref(lhs), qualified_ref(rhs)) else {
+            return false;
+        };
+        (left_qualifiers.contains(lhs_q) && right_qualifiers.contains(rhs_q))
+            || (left_qualifiers.contains(rhs_q) && right_qualifiers.contains(lhs_q))
+    });
+    if has_cross_side_equi {
+        if conjunctions.len() > 1 {
+            "hash+residual"
+        } else {
+            "hash"
+        }
+    } else {
+        "nested-loop-bounded"
+    }
+}
+
 /// Format a `PlanNode` tree as a human-readable, indented text
 /// representation. Used by the `EXPLAIN` command.
-pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
+pub(super) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     match plan {
         PlanNode::SeqScan { table } => format!("{indent}SeqScan table={table}"),
@@ -4766,8 +6434,46 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             };
             format!("{indent}RangeScan table={table} column={column} [{s}, {e}]")
         }
+        PlanNode::ExprIndexScan { table, path, key } => {
+            let index_id = resolve_expression_index(catalog, table, path)
+                .map(|metadata| metadata.index_id.to_string())
+                .unwrap_or_else(|| "unresolved".to_string());
+            format!(
+                "{indent}ExprIndexScan table={table} path={} index_id={index_id} key={key:?}",
+                path.canonical_text()
+            )
+        }
+        PlanNode::ExprRangeScan {
+            table,
+            path,
+            start,
+            end,
+        } => {
+            let index_id = resolve_expression_index(catalog, table, path)
+                .map(|metadata| metadata.index_id.to_string())
+                .unwrap_or_else(|| "unresolved".to_string());
+            format!(
+                "{indent}ExprRangeScan table={table} path={} index_id={index_id} start={start:?} end={end:?}",
+                path.canonical_text()
+            )
+        }
+        PlanNode::OrderedExprIndexScan {
+            table,
+            path,
+            descending,
+            limit,
+            offset,
+        } => {
+            let index_id = resolve_expression_index(catalog, table, path)
+                .map(|metadata| metadata.index_id.to_string())
+                .unwrap_or_else(|| "unresolved".to_string());
+            format!(
+                "{indent}OrderedExprIndexScan table={table} path={} index_id={index_id} descending={descending} limit={limit:?} offset={offset:?}",
+                path.canonical_text()
+            )
+        }
         PlanNode::Filter { input, predicate } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Filter predicate={predicate:?}\n{child}")
         }
         PlanNode::Project { input, fields } => {
@@ -4778,39 +6484,45 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                     None => format!("{:?}", f.expr),
                 })
                 .collect();
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Project fields=[{}]\n{child}", names.join(", "))
         }
         PlanNode::Sort { input, keys } => {
             let ks: Vec<String> = keys
                 .iter()
                 .map(|k| {
+                    let expr = expression_output_name(&k.expr);
                     if k.descending {
-                        format!("{} desc", k.field)
+                        format!("{expr} desc")
                     } else {
-                        k.field.clone()
+                        expr
                     }
                 })
                 .collect();
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Sort keys=[{}]\n{child}", ks.join(", "))
         }
         PlanNode::Limit { input, count } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Limit count={count:?}\n{child}")
         }
         PlanNode::Offset { input, count } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Offset count={count:?}\n{child}")
         }
         PlanNode::Aggregate {
             input,
             function,
-            field,
+            argument,
+            mode,
+            provenance_alias: _,
         } => {
-            let f = field.as_deref().unwrap_or("*");
-            let child = format_plan_tree(input, depth + 1);
-            format!("{indent}Aggregate fn={function:?} field={f}\n{child}")
+            let argument = argument
+                .as_ref()
+                .map(expression_output_name)
+                .unwrap_or_else(|| "*".to_string());
+            let child = format_plan_tree(catalog, input, depth + 1);
+            format!("{indent}Aggregate fn={function:?} mode={mode:?} argument={argument}\n{child}")
         }
         PlanNode::NestedLoopJoin {
             left,
@@ -4818,16 +6530,19 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             on,
             kind,
         } => {
-            let left_child = format_plan_tree(left, depth + 1);
-            let right_child = format_plan_tree(right, depth + 1);
+            let left_child = format_plan_tree(catalog, left, depth + 1);
+            let right_child = format_plan_tree(catalog, right, depth + 1);
             let on_str = match on {
                 Some(pred) => format!("{pred:?}"),
                 None => "none".to_string(),
             };
-            format!("{indent}NestedLoopJoin kind={kind:?} on={on_str}\n{left_child}\n{right_child}")
+            let strategy = explain_join_strategy(left, right, on.as_ref(), *kind);
+            format!(
+                "{indent}NestedLoopJoin kind={kind:?} strategy={strategy} on={on_str}\n{left_child}\n{right_child}"
+            )
         }
         PlanNode::Distinct { input } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Distinct\n{child}")
         }
         PlanNode::GroupBy {
@@ -4838,14 +6553,22 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
         } => {
             let agg_strs: Vec<String> = aggregates
                 .iter()
-                .map(|a| format!("{:?}({}) as {}", a.function, a.field, a.output_name))
+                .map(|a| {
+                    format!(
+                        "{:?}({}) mode={:?} as {}",
+                        a.function,
+                        expression_output_name(&a.argument),
+                        a.mode,
+                        a.output_name
+                    )
+                })
                 .collect();
             let having_str = match having {
                 Some(h) => format!(" having={h:?}"),
                 None => String::new(),
             };
             let key_strs: Vec<String> = keys.iter().map(|k| k.output_name()).collect();
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!(
                 "{indent}GroupBy keys=[{}] aggs=[{}]{having_str}\n{child}",
                 key_strs.join(", "),
@@ -4891,7 +6614,7 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             returning,
         } => {
             let cols: Vec<&str> = assignments.iter().map(|a| a.field.as_str()).collect();
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             let ret = if *returning { " returning" } else { "" };
             format!(
                 "{indent}Update table={table} set=[{}]{ret}\n{child}",
@@ -4903,7 +6626,7 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
             table,
             returning,
         } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             let ret = if *returning { " returning" } else { "" };
             format!("{indent}Delete table={table}{ret}\n{child}")
         }
@@ -4937,17 +6660,17 @@ pub(super) fn format_plan_tree(plan: &PlanNode, depth: usize) -> String {
                 .iter()
                 .map(|w| format!("{:?} as {}", w.function, w.output_name))
                 .collect();
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Window fns=[{}]\n{child}", ws.join(", "))
         }
         PlanNode::Union { left, right, all } => {
             let kind = if *all { "UNION ALL" } else { "UNION" };
-            let left_child = format_plan_tree(left, depth + 1);
-            let right_child = format_plan_tree(right, depth + 1);
+            let left_child = format_plan_tree(catalog, left, depth + 1);
+            let right_child = format_plan_tree(catalog, right, depth + 1);
             format!("{indent}{kind}\n{left_child}\n{right_child}")
         }
         PlanNode::Explain { input } => {
-            let child = format_plan_tree(input, depth + 1);
+            let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Explain\n{child}")
         }
         PlanNode::Begin => format!("{indent}Begin"),

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The changes below are the v0.13.0 release-candidate scope. Release verification
+is still in progress.
+
+### Added
+
+- **Persistent JSON-path indexes.** Native PowQL can add, add unique, and drop
+  indexes over scalar paths with `alter T add index (.data->key)`. Equality,
+  range, and bounded ordered reads use the path index automatically, while
+  missing indexes retain a sequential fallback.
+- **Expression-valued JSON operations.** JSON paths now work as group keys,
+  aggregate arguments, and order keys, including path-based `HAVING`, limit,
+  and offset shapes.
+- **Lossless native result wire.** Additive typed PowQL, parameterized PowQL,
+  and SQL request/result frames preserve actual cell types. The TypeScript
+  client exposes `queryNative()` and `querySqlNative()` for exact bytes,
+  recursive JSON, and integers outside JavaScript's safe range. Legacy query
+  methods and string result frames remain unchanged.
+- **SQL JSON arrows.** The SQL frontend supports postfix `->` extraction and
+  `->>` canonical text extraction for object keys and array indexes.
+
+### Changed
+
+- **PowQL aggregates over joins are symmetric by default.** `sum`, `count`,
+  and `avg` deduplicate fan-out by source row identity. `raw` restores joined-row
+  evaluation explicitly; SQL aggregates always retain raw SQL semantics.
+- **Concurrent autocommit reads share server admission.** Independent
+  read-only queries can overlap, while writers and explicit transactions remain
+  exclusive and preserve complete before-or-after visibility.
+- **Compound join predicates use hash plus residual evaluation.** An equi-key
+  inside a compound `ON` clause selects a hash join, and oversized pure
+  non-equi nested loops fail before entering an unbounded pair loop.
+
+### Fixed
+
+- **Query deadlines and disconnects cooperatively stop work.** Supported scan,
+  join, group, and mutation-discovery loops release server locks/admission when
+  cancelled. Mutation writes retain statement-atomic boundaries.
+- **Remote result types no longer require lossy string rendering.** Native
+  typed results preserve Empty, strings, raw Bytes, and PJ1 JSON on the wire;
+  `json_type()` can distinguish missing paths from explicit JSON null remotely.
+
 ## [0.12.0] - 2026-07-14
 
 Native JSON. A new `json` column type stores documents in **PJ1**, a canonical

@@ -24,10 +24,12 @@ import {
   MAX_SYNC_PULL_BYTES,
   MAX_SYNC_PULL_UNITS,
   type Message,
+  type NativeJson,
   type SyncRepairAction,
   type WireRetainedUnit,
   type WireParam,
   type WireSyncStatus,
+  type WireValue,
 } from "./protocol.js";
 import { PowDBError, PowDBScriptError, isPowDBError } from "./errors.js";
 import { splitStatements } from "./script.js";
@@ -43,6 +45,24 @@ export const CLIENT_VERSION = "0.12.0";
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
   | { kind: "scalar"; value: string }
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string };
+
+export type { NativeJson } from "./protocol.js";
+
+/** A value returned by the lossless native wire surface. */
+export type NativeValue =
+  | null
+  | number
+  | bigint
+  | boolean
+  | string
+  | Uint8Array
+  | NativeJson;
+
+export type NativeQueryResult =
+  | { kind: "rows"; columns: string[]; rows: NativeValue[][] }
+  | { kind: "scalar"; value: NativeValue }
   | { kind: "ok"; affected: bigint }
   | { kind: "message"; message: string };
 
@@ -162,6 +182,58 @@ function toWireParam(p: QueryParam): WireParam {
     default:
       throw new PowDBError(
         `unsupported query parameter type: ${typeof p}`,
+        "protocol_error",
+      );
+  }
+}
+
+function fromWireValue(value: WireValue): NativeValue {
+  switch (value.type) {
+    case "empty":
+      return null;
+    case "int":
+      return value.value >= BigInt(Number.MIN_SAFE_INTEGER) &&
+        value.value <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(value.value)
+        : value.value;
+    case "float":
+    case "bool":
+    case "str":
+      return value.value;
+    case "datetime":
+      return value.value;
+    case "uuid": {
+      const hex = Array.from(value.value, (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+    case "bytes":
+      return new Uint8Array(value.value);
+    case "json":
+      return value.value;
+  }
+}
+
+function nativeQueryResult(reply: Message): NativeQueryResult {
+  switch (reply.type) {
+    case "ResultRowsNative":
+      return {
+        kind: "rows",
+        columns: reply.columns,
+        rows: reply.rows.map((row) => row.map(fromWireValue)),
+      };
+    case "ResultScalarNative":
+      return { kind: "scalar", value: fromWireValue(reply.value) };
+    case "ResultOk":
+      return { kind: "ok", affected: reply.affected };
+    case "ResultMessage":
+      return { kind: "message", message: reply.message };
+    case "Error":
+      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+    default:
+      throw new PowDBError(
+        `unexpected reply to native query: ${reply.type}`,
         "protocol_error",
       );
   }
@@ -575,6 +647,51 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 
   /**
+   * Run PowQL over the lossless typed wire surface. Unlike {@link query},
+   * cells are not stringified: bytes remain bytes, JSON is recursive data,
+   * and unsafe integers remain bigint. This method never retries as a legacy
+   * query, because replaying a mutation after an ambiguous response is unsafe.
+   */
+  async queryNative(
+    query: string,
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<NativeQueryResult> {
+    const hasParams = Array.isArray(paramsOrOpts);
+    const params = hasParams ? (paramsOrOpts as QueryParam[]) : undefined;
+    const opts = hasParams
+      ? maybeOpts
+      : (paramsOrOpts as { signal?: AbortSignal } | undefined);
+    const start = Date.now();
+    try {
+      const request: Message =
+        params === undefined
+          ? { type: "QueryNative", query }
+          : {
+              type: "QueryWithParamsNative",
+              query,
+              params: params.map(toWireParam),
+            };
+      const result = nativeQueryResult(await this.send(request, opts));
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
    * Run a SQL statement through the server-side SQL frontend. The plain
    * {@link query} method remains PowQL for wire compatibility.
    */
@@ -604,6 +721,34 @@ export class Client extends EventEmitter<ClientEvents> {
         default:
           throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
       }
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /** Run SQL through the lossless typed wire surface without legacy replay. */
+  async querySqlNative(
+    query: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<NativeQueryResult> {
+    const start = Date.now();
+    try {
+      const result = nativeQueryResult(
+        await this.send({ type: "QuerySqlNative", query }, opts),
+      );
       this.emit("query", {
         query,
         durationMs: Date.now() - start,

@@ -36,7 +36,8 @@ const ORDER: usize = 256;
 //   byte. For Str: u32 len + UTF-8 bytes. For Uuid: 16 bytes. For Bytes:
 //   u32 len + raw bytes. For Empty: no payload.
 const BTREE_MAGIC: &[u8; 4] = b"BIDX";
-pub const BTREE_VERSION: u16 = 1;
+pub const LEGACY_BTREE_VERSION: u16 = 1;
+pub const BTREE_VERSION: u16 = 2;
 const NODE_TAG_INTERNAL: u8 = 0;
 const NODE_TAG_LEAF: u8 = 1;
 
@@ -69,6 +70,11 @@ pub struct BTree {
     /// is clear, so a checkpoint that touches an untouched tree is free.
     /// Set to `false` on `create` / `load` / any successful `save_to`.
     dirty: bool,
+    format_version: u16,
+    /// Missing/JSON-null expression results. Kept outside the ordered key
+    /// space so equality/range scans never match them; callers append this
+    /// stable RID order for NULLS LAST.
+    empty_rids: Vec<RowId>,
 }
 
 impl BTree {
@@ -86,7 +92,50 @@ impl BTree {
             // expected to `save` once after bulk-loading before the
             // dirty flag is meaningful.
             dirty: false,
+            format_version: LEGACY_BTREE_VERSION,
+            empty_rids: Vec::new(),
         })
+    }
+
+    /// Create the v2 expression-index shape. Legacy column indexes continue
+    /// using [`BTree::create`] and remain v1 until explicitly rebuilt.
+    pub fn create_v2(path: &Path) -> std::io::Result<Self> {
+        let mut tree = Self::create(path)?;
+        tree.format_version = BTREE_VERSION;
+        Ok(tree)
+    }
+
+    pub fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    pub fn insert_empty(&mut self, rid: RowId) {
+        self.dirty = true;
+        let pair = (rid.page_id, rid.slot_index);
+        let position = self
+            .empty_rids
+            .partition_point(|existing| (existing.page_id, existing.slot_index) < pair);
+        if self.empty_rids.get(position) != Some(&rid) {
+            self.empty_rids.insert(position, rid);
+        }
+    }
+
+    pub fn delete_empty(&mut self, rid: RowId) -> bool {
+        self.dirty = true;
+        let pair = (rid.page_id, rid.slot_index);
+        let position = self
+            .empty_rids
+            .partition_point(|existing| (existing.page_id, existing.slot_index) < pair);
+        if self.empty_rids.get(position) == Some(&rid) {
+            self.empty_rids.remove(position);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn empty_rids(&self) -> &[RowId] {
+        &self.empty_rids
     }
 
     pub fn insert(&mut self, key: Value, rid: RowId) {
@@ -96,7 +145,7 @@ impl BTree {
         // `Catalog::checkpoint` or on `Drop`.
         self.dirty = true;
         let root = self.root;
-        if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid) {
+        if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, true) {
             // Root was split — create new root
             let new_root = Node::Internal {
                 keys: vec![mid_key],
@@ -106,6 +155,83 @@ impl BTree {
             self.nodes.push(new_root);
             self.root = new_root_id;
         }
+    }
+
+    /// Insert a raw key/value pair without replacing an existing equal key.
+    /// Equal keys may span multiple leaves; lookup and pair deletion use a
+    /// left-biased descent and leaf-chain walk so split boundaries are
+    /// transparent.
+    pub fn insert_duplicate(&mut self, key: Value, rid: RowId) {
+        if key.is_empty() {
+            self.insert_empty(rid);
+            return;
+        }
+        let rid_key = (rid.page_id, rid.slot_index);
+        let last_rid = self.last_rid_for_raw_key(&key);
+        if last_rid == Some(rid) {
+            return;
+        }
+        if last_rid.is_some_and(|last| (last.page_id, last.slot_index) > rid_key) {
+            let existing = self.lookup_all(&key);
+            if existing.contains(&rid) {
+                return;
+            }
+            let mut pairs = self.ordered_pairs();
+            pairs.push((key, rid));
+            pairs.sort_by(|(left_key, left_rid), (right_key, right_rid)| {
+                left_key.cmp(right_key).then_with(|| {
+                    (left_rid.page_id, left_rid.slot_index)
+                        .cmp(&(right_rid.page_id, right_rid.slot_index))
+                })
+            });
+            self.nodes = vec![Node::Leaf {
+                keys: Vec::new(),
+                values: Vec::new(),
+                next_leaf: None,
+            }];
+            self.root = 0;
+            for (stored_key, stored_rid) in pairs {
+                let root = self.root;
+                if let Some((mid_key, new_node_id)) =
+                    self.insert_recursive(root, stored_key, stored_rid, false)
+                {
+                    let new_root_id = self.nodes.len();
+                    self.nodes.push(Node::Internal {
+                        keys: vec![mid_key],
+                        children: vec![self.root, new_node_id],
+                    });
+                    self.root = new_root_id;
+                }
+            }
+            self.dirty = true;
+            return;
+        }
+        self.dirty = true;
+        let root = self.root;
+        if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, false) {
+            let new_root = Node::Internal {
+                keys: vec![mid_key],
+                children: vec![self.root, new_node_id],
+            };
+            let new_root_id = self.nodes.len();
+            self.nodes.push(new_root);
+            self.root = new_root_id;
+        }
+    }
+
+    fn last_rid_for_raw_key(&self, key: &Value) -> Option<RowId> {
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            node_id = children[keys.partition_point(|separator| separator <= key)];
+        }
+        let Node::Leaf { keys, values, .. } = &self.nodes[node_id] else {
+            unreachable!("B+tree descent ended at an internal node");
+        };
+        let position = keys.partition_point(|stored| stored <= key);
+        position
+            .checked_sub(1)
+            .filter(|position| keys[*position] == *key)
+            .map(|position| values[position])
     }
 
     /// Mission C Phase 15: specialised int-keyed insert.
@@ -246,6 +372,7 @@ impl BTree {
         node_id: usize,
         key: Value,
         rid: RowId,
+        replace_duplicate: bool,
     ) -> Option<(Value, usize)> {
         // Mission C Phase 6: in-place insert.
         //
@@ -267,10 +394,24 @@ impl BTree {
         //      insert the promoted key. No node-level clone anywhere.
         match &mut self.nodes[node_id] {
             Node::Leaf { keys, values, .. } => {
-                let pos = keys.partition_point(|k| k < &key);
+                let mut pos = if replace_duplicate {
+                    keys.partition_point(|k| k < &key)
+                } else {
+                    keys.partition_point(|k| k < &key)
+                };
+
+                if !replace_duplicate {
+                    while pos < keys.len()
+                        && keys[pos] == key
+                        && (values[pos].page_id, values[pos].slot_index)
+                            < (rid.page_id, rid.slot_index)
+                    {
+                        pos += 1;
+                    }
+                }
 
                 // Duplicate key — update in place.
-                if pos < keys.len() && keys[pos] == key {
+                if replace_duplicate && pos < keys.len() && keys[pos] == key {
                     values[pos] = rid;
                     return None;
                 }
@@ -317,7 +458,8 @@ impl BTree {
                 let child_id = children[pos];
                 // Borrow on self.nodes[node_id] ends here.
 
-                let (mid_key, new_child_id) = self.insert_recursive(child_id, key, rid)?;
+                let (mid_key, new_child_id) =
+                    self.insert_recursive(child_id, key, rid, replace_duplicate)?;
 
                 // Re-borrow to insert the promoted key; possibly split this
                 // internal node. All work that needs the borrow happens
@@ -380,6 +522,264 @@ impl BTree {
                     let pos = keys.partition_point(|k| k <= key);
                     node_id = children[pos];
                 }
+            }
+        }
+    }
+
+    /// Return every RowId stored under an equal raw key. Unlike the legacy
+    /// non-unique composite-key helper, the key remains its original `Value`
+    /// (including `Empty`).
+    pub fn lookup_all(&self, key: &Value) -> Vec<RowId> {
+        if key.is_empty() {
+            return Vec::new();
+        }
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            node_id = children[keys.partition_point(|separator| separator < key)];
+        }
+
+        let mut matches = Vec::new();
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let Node::Leaf {
+                keys,
+                values,
+                next_leaf,
+            } = &self.nodes[id]
+            else {
+                unreachable!("leaf chain pointed at an internal node");
+            };
+            for (stored_key, rid) in keys.iter().zip(values) {
+                match stored_key.cmp(key) {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => matches.push(*rid),
+                    std::cmp::Ordering::Greater => return matches,
+                }
+            }
+            current = *next_leaf;
+        }
+        matches
+    }
+
+    /// Delete exactly one raw `(key, RowId)` pair while preserving other
+    /// duplicate entries.
+    pub fn delete_pair(&mut self, key: &Value, rid: RowId) -> bool {
+        if key.is_empty() {
+            return self.delete_empty(rid);
+        }
+        self.dirty = true;
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            node_id = children[keys.partition_point(|separator| separator < key)];
+        }
+
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let (found, next, passed_key) = match &self.nodes[id] {
+                Node::Leaf {
+                    keys,
+                    values,
+                    next_leaf,
+                } => (
+                    keys.iter()
+                        .zip(values)
+                        .position(|(stored_key, stored_rid)| {
+                            stored_key == key && *stored_rid == rid
+                        }),
+                    *next_leaf,
+                    keys.last().is_some_and(|stored_key| stored_key > key),
+                ),
+                Node::Internal { .. } => unreachable!("leaf chain pointed at an internal node"),
+            };
+            if let Some(position) = found {
+                if let Node::Leaf { keys, values, .. } = &mut self.nodes[id] {
+                    keys.remove(position);
+                    values.remove(position);
+                }
+                return true;
+            }
+            if passed_key {
+                return false;
+            }
+            current = next;
+        }
+        false
+    }
+
+    /// Snapshot every raw `(Value, RowId)` pair in B+tree key order.
+    pub fn ordered_pairs(&self) -> Vec<(Value, RowId)> {
+        let mut node_id = self.root;
+        while let Node::Internal { children, .. } = &self.nodes[node_id] {
+            node_id = children[0];
+        }
+        let mut pairs = Vec::with_capacity(self.len());
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let Node::Leaf {
+                keys,
+                values,
+                next_leaf,
+            } = &self.nodes[id]
+            else {
+                unreachable!("leaf chain pointed at an internal node");
+            };
+            pairs.extend(keys.iter().cloned().zip(values.iter().copied()));
+            current = *next_leaf;
+        }
+        pairs.sort_by(|(left_key, left_rid), (right_key, right_rid)| {
+            left_key.cmp(right_key).then_with(|| {
+                (left_rid.page_id, left_rid.slot_index)
+                    .cmp(&(right_rid.page_id, right_rid.slot_index))
+            })
+        });
+        pairs
+    }
+
+    /// Ordered raw pairs followed by missing/JSON-null RIDs. This is the
+    /// expression-index ORDER BY contract: ordinary typed values use the
+    /// B+tree order while the side set is appended as NULLS LAST.
+    pub fn ordered_pairs_nulls_last(&self) -> Vec<(Value, RowId)> {
+        let mut pairs = self.ordered_pairs();
+        pairs.extend(
+            self.empty_rids
+                .iter()
+                .copied()
+                .map(|rid| (Value::Empty, rid)),
+        );
+        pairs
+    }
+
+    /// Inclusive range over raw typed keys. Empty/null side-set entries are
+    /// deliberately excluded from range semantics.
+    pub fn raw_range_rids(&self, start: Option<&Value>, end: Option<&Value>) -> Vec<RowId> {
+        self.ordered_pairs()
+            .into_iter()
+            .filter(|(key, _)| match start {
+                Some(bound) => key >= bound,
+                None => true,
+            })
+            .filter(|(key, _)| match end {
+                Some(bound) => key <= bound,
+                None => true,
+            })
+            .map(|(_, rid)| rid)
+            .collect()
+    }
+
+    pub fn ordered_rids_nulls_last(&self) -> Vec<RowId> {
+        self.ordered_pairs_nulls_last()
+            .into_iter()
+            .map(|(_, rid)| rid)
+            .collect()
+    }
+
+    pub fn bounded_ordered_rids_nulls_last(
+        &self,
+        descending: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<RowId> {
+        self.bounded_ordered_rids_with_stats(descending, offset, limit)
+            .0
+    }
+
+    fn bounded_ordered_rids_with_stats(
+        &self,
+        descending: bool,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<RowId>, usize) {
+        if limit == 0 {
+            return (Vec::new(), 0);
+        }
+        let mut remaining_offset = offset;
+        let mut result = Vec::with_capacity(limit);
+        let mut visited_scalars = 0;
+        if descending {
+            self.visit_reverse_bounded(
+                self.root,
+                &mut remaining_offset,
+                limit,
+                &mut result,
+                &mut visited_scalars,
+            );
+        } else {
+            let mut node_id = self.root;
+            while let Node::Internal { children, .. } = &self.nodes[node_id] {
+                node_id = children[0];
+            }
+            let mut current = Some(node_id);
+            while let Some(id) = current {
+                let Node::Leaf {
+                    values, next_leaf, ..
+                } = &self.nodes[id]
+                else {
+                    unreachable!("leaf chain pointed at an internal node");
+                };
+                for rid in values {
+                    visited_scalars += 1;
+                    if remaining_offset > 0 {
+                        remaining_offset -= 1;
+                    } else {
+                        result.push(*rid);
+                        if result.len() == limit {
+                            return (result, visited_scalars);
+                        }
+                    }
+                }
+                current = *next_leaf;
+            }
+        }
+
+        for rid in &self.empty_rids {
+            if remaining_offset > 0 {
+                remaining_offset -= 1;
+            } else {
+                result.push(*rid);
+                if result.len() == limit {
+                    break;
+                }
+            }
+        }
+        (result, visited_scalars)
+    }
+
+    fn visit_reverse_bounded(
+        &self,
+        node_id: usize,
+        remaining_offset: &mut usize,
+        limit: usize,
+        result: &mut Vec<RowId>,
+        visited_scalars: &mut usize,
+    ) -> bool {
+        match &self.nodes[node_id] {
+            Node::Internal { children, .. } => {
+                for child in children.iter().rev() {
+                    if self.visit_reverse_bounded(
+                        *child,
+                        remaining_offset,
+                        limit,
+                        result,
+                        visited_scalars,
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Node::Leaf { values, .. } => {
+                for rid in values.iter().rev() {
+                    *visited_scalars += 1;
+                    if *remaining_offset > 0 {
+                        *remaining_offset -= 1;
+                    } else {
+                        result.push(*rid);
+                        if result.len() == limit {
+                            return true;
+                        }
+                    }
+                }
+                false
             }
         }
     }
@@ -1074,7 +1474,7 @@ impl BTree {
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(64 + 32 * self.nodes.len());
         buf.extend_from_slice(BTREE_MAGIC);
-        buf.extend_from_slice(&BTREE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&self.format_version.to_le_bytes());
         buf.extend_from_slice(&(self.root as u32).to_le_bytes());
         buf.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
         for node in &self.nodes {
@@ -1116,6 +1516,13 @@ impl BTree {
                         }
                     }
                 }
+            }
+        }
+        if self.format_version >= 2 {
+            buf.extend_from_slice(&(self.empty_rids.len() as u32).to_le_bytes());
+            for rid in &self.empty_rids {
+                buf.extend_from_slice(&rid.page_id.to_le_bytes());
+                buf.extend_from_slice(&rid.slot_index.to_le_bytes());
             }
         }
 
@@ -1217,7 +1624,7 @@ impl BTree {
         }
         pos += 4;
         let version = read_u16(&buf, &mut pos)?;
-        if version != BTREE_VERSION {
+        if version == 0 || version > BTREE_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported btree version: {version}"),
@@ -1286,6 +1693,38 @@ impl BTree {
             }
         }
 
+        let mut empty_rids = Vec::new();
+        if version >= 2 {
+            let count = read_u32(&buf, &mut pos)? as usize;
+            if count > (buf.len().saturating_sub(pos)) / 6 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "btree empty RID count exceeds remaining file size",
+                ));
+            }
+            empty_rids.reserve(count);
+            for _ in 0..count {
+                empty_rids.push(RowId {
+                    page_id: read_u32(&buf, &mut pos)?,
+                    slot_index: read_u16(&buf, &mut pos)?,
+                });
+            }
+            if empty_rids.windows(2).any(|pair| {
+                (pair[0].page_id, pair[0].slot_index) >= (pair[1].page_id, pair[1].slot_index)
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "btree empty RID side set is not strictly ordered",
+                ));
+            }
+        }
+        if pos != buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "btree file has trailing bytes",
+            ));
+        }
+
         if root >= nodes.len() && !nodes.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1299,6 +1738,8 @@ impl BTree {
             path: path.to_path_buf(),
             // Loaded tree matches its backing file exactly.
             dirty: false,
+            format_version: version,
+            empty_rids,
         })
     }
 }
@@ -2248,5 +2689,78 @@ mod tests {
         let hr = bt.lookup_prefix(&Value::Str("HR".into()));
         assert!(hr.is_empty(), "all HR rows should be deleted");
         assert_eq!(bt.len(), 800);
+    }
+
+    #[test]
+    fn bounded_raw_order_visits_only_offset_plus_limit_scalars() {
+        let path = std::env::temp_dir().join(format!(
+            "powdb_btree_bounded_raw_{}.idx",
+            std::process::id()
+        ));
+        let mut tree = BTree::create_v2(&path).unwrap();
+        for value in 0..10_000u32 {
+            tree.insert_duplicate(
+                Value::Int(value as i64),
+                RowId {
+                    page_id: value,
+                    slot_index: 0,
+                },
+            );
+        }
+
+        let (asc, asc_visited) = tree.bounded_ordered_rids_with_stats(false, 10, 5);
+        assert_eq!(
+            asc.iter().map(|rid| rid.page_id).collect::<Vec<_>>(),
+            vec![10, 11, 12, 13, 14]
+        );
+        assert_eq!(asc_visited, 15);
+
+        let (desc, desc_visited) = tree.bounded_ordered_rids_with_stats(true, 10, 5);
+        assert_eq!(
+            desc.iter().map(|rid| rid.page_id).collect::<Vec<_>>(),
+            vec![9_989, 9_988, 9_987, 9_986, 9_985]
+        );
+        assert_eq!(desc_visited, 15);
+    }
+
+    #[test]
+    fn bounded_raw_order_keeps_empty_side_set_last_in_both_directions() {
+        let path = std::env::temp_dir().join(format!(
+            "powdb_btree_bounded_empty_{}.idx",
+            std::process::id()
+        ));
+        let mut tree = BTree::create_v2(&path).unwrap();
+        for value in 1..=3u32 {
+            tree.insert_duplicate(
+                Value::Int(value as i64),
+                RowId {
+                    page_id: value,
+                    slot_index: 0,
+                },
+            );
+        }
+        tree.insert_empty(RowId {
+            page_id: 4,
+            slot_index: 0,
+        });
+        tree.insert_empty(RowId {
+            page_id: 5,
+            slot_index: 0,
+        });
+
+        assert_eq!(
+            tree.bounded_ordered_rids_nulls_last(false, 2, 3)
+                .iter()
+                .map(|rid| rid.page_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            tree.bounded_ordered_rids_nulls_last(true, 2, 3)
+                .iter()
+                .map(|rid| rid.page_id)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 5]
+        );
     }
 }

@@ -1,15 +1,24 @@
 use crate::ast::*;
 use crate::parser::{parse, ParseError};
 use crate::plan::*;
+use powdb_storage::stored_json_path::StoredJsonPathV1;
 
-/// (column_name, lower_bound, upper_bound) — used by range-index extraction.
-type RangeBound = (String, Option<(Expr, bool)>, Option<(Expr, bool)>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RangeTarget {
+    Column(String),
+    JsonPath(StoredJsonPathV1),
+}
+
+/// (target, lower_bound, upper_bound) — used by range-index extraction.
+type RangeBound = (RangeTarget, Option<(Expr, bool)>, Option<(Expr, bool)>);
 
 /// Plan-phase error — wraps ParseError for the full lex→parse→plan chain.
 #[derive(Debug)]
 pub enum PlanError {
     /// Error originated in the parser (or lexer, via ParseError::Lex).
     Parse(ParseError),
+    /// The parsed query is structurally valid but cannot be planned safely.
+    Semantic(String),
 }
 
 impl PlanError {
@@ -23,6 +32,7 @@ impl std::fmt::Display for PlanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(e) => write!(f, "{e}"),
+            Self::Semantic(message) => write!(f, "{message}"),
         }
     }
 }
@@ -31,6 +41,7 @@ impl std::error::Error for PlanError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Parse(e) => Some(e),
+            Self::Semantic(_) => None,
         }
     }
 }
@@ -94,7 +105,7 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
     }
 }
 
-fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     // Mission E1.2: if the query has joins, build a left-deep nested-loop
     // plan. Correctness first — hash-join optimization is E1.3. We also
     // don't try to fold an IndexScan under a joined query yet (the
@@ -103,6 +114,7 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     if !q.joins.is_empty() {
         return plan_joined_query(q);
     }
+    let source_aliases = std::collections::HashSet::from([q.source.clone()]);
     // Try to fold `filter .col = literal` into an IndexScan. The executor
     // decides at run time whether the column actually has an index — if not,
     // it transparently falls back to a sequential scan with the same predicate,
@@ -111,25 +123,36 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     // We only rewrite the *simple* eq case: `filter .col = literal`. Conjunctions
     // like `filter .col = 1 and .other > 5` fall through to SeqScan + Filter.
     // Extending this to split conjunctions is a future optimization.
-    let (source, filter) = match q.filter {
-        Some(pred) => match try_extract_eq_index_key(&q.source, &pred) {
-            Some(index_scan) => (index_scan, None),
-            None => match try_extract_range_index_keys(&q.source, &pred) {
-                Some(range_scan) => (range_scan, None),
-                None => (
-                    PlanNode::SeqScan {
-                        table: q.source.clone(),
-                    },
-                    Some(pred),
-                ),
+    let ordered_expr_scan = try_extract_ordered_expr_index_scan(&q);
+    let (source, filter) = if let Some(scan) = ordered_expr_scan {
+        // The ordered expression node owns these clauses and executes them in
+        // index order. Clear them so the generic pipeline does not wrap a
+        // second Sort/Offset/Limit around the speculative node.
+        q.order = None;
+        q.limit = None;
+        q.offset = None;
+        (scan, None)
+    } else {
+        match q.filter {
+            Some(pred) => match try_extract_eq_index_key(&q.source, &pred) {
+                Some(index_scan) => (index_scan, None),
+                None => match try_extract_range_index_keys(&q.source, &pred) {
+                    Some(range_scan) => (range_scan, None),
+                    None => (
+                        PlanNode::SeqScan {
+                            table: q.source.clone(),
+                        },
+                        Some(pred),
+                    ),
+                },
             },
-        },
-        None => (
-            PlanNode::SeqScan {
-                table: q.source.clone(),
-            },
-            None,
-        ),
+            None => (
+                PlanNode::SeqScan {
+                    table: q.source.clone(),
+                },
+                None,
+            ),
+        }
     };
     let mut node = source;
 
@@ -143,6 +166,7 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     // Mission E2b: GROUP BY path — insert GroupBy + Project before
     // order/limit/offset/distinct.
     if let Some(group) = q.group_by {
+        let mut grouped_order = q.order;
         let mut proj_fields: Vec<ProjectField> = q
             .projection
             .map(|proj| {
@@ -155,7 +179,9 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             })
             .unwrap_or_default();
         let mut having = group.having;
-        let aggregates = extract_aggregates(&mut proj_fields, &mut having);
+        let aggregates = extract_aggregates(&mut proj_fields, &mut having, &source_aliases)?;
+        rewrite_group_order_keys(grouped_order.as_mut(), &proj_fields, &group.keys);
+        rewrite_group_key_references(&mut proj_fields, &mut having, &group.keys);
 
         node = PlanNode::GroupBy {
             input: Box::new(node),
@@ -171,14 +197,14 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             };
         }
 
-        if let Some(order) = q.order {
+        if let Some(order) = grouped_order {
             node = PlanNode::Sort {
                 input: Box::new(node),
                 keys: order
                     .keys
                     .into_iter()
                     .map(|k| SortKey {
-                        field: k.field,
+                        expr: k.expr,
                         descending: k.descending,
                     })
                     .collect(),
@@ -214,7 +240,7 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
                 .keys
                 .into_iter()
                 .map(|k| SortKey {
-                    field: k.field,
+                    expr: k.expr,
                     descending: k.descending,
                 })
                 .collect(),
@@ -266,10 +292,18 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     if let Some(agg) = q.aggregation {
+        let provenance_alias = symmetric_provenance_alias(
+            agg.function,
+            agg.argument.as_ref(),
+            agg.mode,
+            &source_aliases,
+        )?;
         node = PlanNode::Aggregate {
             input: Box::new(node),
             function: agg.function,
-            field: agg.field,
+            argument: agg.argument,
+            mode: agg.mode,
+            provenance_alias,
         };
     }
 
@@ -297,8 +331,10 @@ fn plan_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
 /// RightOuter is rewritten into LeftOuter with inputs swapped — the two
 /// differ only in which side survives non-matching rows, and swapping
 /// inputs lets the executor ship a single LeftOuter path.
-fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     let primary_alias = q.alias.clone().unwrap_or_else(|| q.source.clone());
+    let mut aliases = std::collections::HashSet::new();
+    aliases.insert(primary_alias.clone());
     let mut node = PlanNode::AliasScan {
         table: q.source.clone(),
         alias: primary_alias,
@@ -306,6 +342,14 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
 
     for join in q.joins {
         let right_alias = join.alias.unwrap_or_else(|| join.source.clone());
+        if !aliases.insert(right_alias.clone()) {
+            return Err(ParseError::Syntax {
+                message: format!(
+                    "duplicate source alias `{right_alias}` in join; every joined source needs a unique alias"
+                ),
+            }
+            .into());
+        }
         let right = PlanNode::AliasScan {
             table: join.source,
             alias: right_alias,
@@ -338,18 +382,20 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
     }
 
-    if let Some(order) = q.order {
-        node = PlanNode::Sort {
-            input: Box::new(node),
-            keys: order
-                .keys
-                .into_iter()
-                .map(|k| SortKey {
-                    field: k.field,
-                    descending: k.descending,
-                })
-                .collect(),
-        };
+    if q.group_by.is_none() {
+        if let Some(order) = q.order.take() {
+            node = PlanNode::Sort {
+                input: Box::new(node),
+                keys: order
+                    .keys
+                    .into_iter()
+                    .map(|k| SortKey {
+                        expr: k.expr,
+                        descending: k.descending,
+                    })
+                    .collect(),
+            };
+        }
     }
 
     // Offset must be applied *before* Limit: skip M rows, then take N.
@@ -371,6 +417,7 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
 
     // Mission E2b: GROUP BY path for joined queries.
     if let Some(group) = q.group_by {
+        let mut grouped_order = q.order;
         let mut proj_fields: Vec<ProjectField> = q
             .projection
             .map(|proj| {
@@ -383,7 +430,9 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             })
             .unwrap_or_default();
         let mut having = group.having;
-        let aggregates = extract_aggregates(&mut proj_fields, &mut having);
+        let aggregates = extract_aggregates(&mut proj_fields, &mut having, &aliases)?;
+        rewrite_group_order_keys(grouped_order.as_mut(), &proj_fields, &group.keys);
+        rewrite_group_key_references(&mut proj_fields, &mut having, &group.keys);
 
         node = PlanNode::GroupBy {
             input: Box::new(node),
@@ -396,6 +445,19 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
             node = PlanNode::Project {
                 input: Box::new(node),
                 fields: proj_fields,
+            };
+        }
+        if let Some(order) = grouped_order {
+            node = PlanNode::Sort {
+                input: Box::new(node),
+                keys: order
+                    .keys
+                    .into_iter()
+                    .map(|key| SortKey {
+                        expr: key.expr,
+                        descending: key.descending,
+                    })
+                    .collect(),
             };
         }
         if q.distinct {
@@ -434,10 +496,14 @@ fn plan_joined_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     if let Some(agg) = q.aggregation {
+        let provenance_alias =
+            symmetric_provenance_alias(agg.function, agg.argument.as_ref(), agg.mode, &aliases)?;
         node = PlanNode::Aggregate {
             input: Box::new(node),
             function: agg.function,
-            field: agg.field,
+            argument: agg.argument,
+            mode: agg.mode,
+            provenance_alias,
         };
     }
 
@@ -553,16 +619,33 @@ fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
     if op != BinOp::Eq {
         return None;
     }
-    let (column, key) = match (lhs, rhs) {
-        (Expr::Field(name), Expr::Literal(_)) => (name.clone(), rhs.clone()),
-        (Expr::Literal(_), Expr::Field(name)) => (name.clone(), lhs.clone()),
-        _ => return None,
-    };
-    Some(PlanNode::IndexScan {
-        table: table.to_string(),
-        column,
-        key,
-    })
+    match (lhs, rhs) {
+        (path @ Expr::JsonPath { .. }, Expr::Literal(_)) => Some(PlanNode::ExprIndexScan {
+            table: table.to_string(),
+            path: stored_json_path(path)?,
+            key: rhs.clone(),
+        }),
+        (Expr::Literal(_), path @ Expr::JsonPath { .. }) => Some(PlanNode::ExprIndexScan {
+            table: table.to_string(),
+            path: stored_json_path(path)?,
+            key: lhs.clone(),
+        }),
+        (Expr::Field(name), Expr::Literal(_)) => Some(PlanNode::IndexScan {
+            table: table.to_string(),
+            column: name.clone(),
+            key: rhs.clone(),
+        }),
+        (Expr::Literal(_), Expr::Field(name)) => Some(PlanNode::IndexScan {
+            table: table.to_string(),
+            column: name.clone(),
+            key: lhs.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn stored_json_path(expr: &Expr) -> Option<StoredJsonPathV1> {
+    JsonPathIdentityV1::from_expr(expr)?.bind_table_local(None)
 }
 
 /// Extract a single range bound from a simple inequality predicate.
@@ -575,43 +658,101 @@ fn extract_single_bound(pred: &Expr) -> Option<RangeBound> {
     match op {
         // .col > literal  →  lower=(literal, exclusive)
         BinOp::Gt => match (lhs, rhs) {
-            (Expr::Field(name), Expr::Literal(_)) => {
-                Some((name.clone(), Some((rhs.clone(), false)), None))
-            }
+            (Expr::Field(name), Expr::Literal(_)) => Some((
+                RangeTarget::Column(name.clone()),
+                Some((rhs.clone(), false)),
+                None,
+            )),
             (Expr::Literal(_), Expr::Field(name)) => {
                 // literal > .col  →  col < literal  →  upper=(literal, exclusive)
-                Some((name.clone(), None, Some((lhs.clone(), false))))
+                Some((
+                    RangeTarget::Column(name.clone()),
+                    None,
+                    Some((lhs.clone(), false)),
+                ))
             }
+            (path @ Expr::JsonPath { .. }, Expr::Literal(_)) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                Some((rhs.clone(), false)),
+                None,
+            )),
+            (Expr::Literal(_), path @ Expr::JsonPath { .. }) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                None,
+                Some((lhs.clone(), false)),
+            )),
             _ => None,
         },
         // .col >= literal  →  lower=(literal, inclusive)
         BinOp::Gte => match (lhs, rhs) {
-            (Expr::Field(name), Expr::Literal(_)) => {
-                Some((name.clone(), Some((rhs.clone(), true)), None))
-            }
-            (Expr::Literal(_), Expr::Field(name)) => {
-                Some((name.clone(), None, Some((lhs.clone(), true))))
-            }
+            (Expr::Field(name), Expr::Literal(_)) => Some((
+                RangeTarget::Column(name.clone()),
+                Some((rhs.clone(), true)),
+                None,
+            )),
+            (Expr::Literal(_), Expr::Field(name)) => Some((
+                RangeTarget::Column(name.clone()),
+                None,
+                Some((lhs.clone(), true)),
+            )),
+            (path @ Expr::JsonPath { .. }, Expr::Literal(_)) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                Some((rhs.clone(), true)),
+                None,
+            )),
+            (Expr::Literal(_), path @ Expr::JsonPath { .. }) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                None,
+                Some((lhs.clone(), true)),
+            )),
             _ => None,
         },
         // .col < literal  →  upper=(literal, exclusive)
         BinOp::Lt => match (lhs, rhs) {
-            (Expr::Field(name), Expr::Literal(_)) => {
-                Some((name.clone(), None, Some((rhs.clone(), false))))
-            }
-            (Expr::Literal(_), Expr::Field(name)) => {
-                Some((name.clone(), Some((lhs.clone(), false)), None))
-            }
+            (Expr::Field(name), Expr::Literal(_)) => Some((
+                RangeTarget::Column(name.clone()),
+                None,
+                Some((rhs.clone(), false)),
+            )),
+            (Expr::Literal(_), Expr::Field(name)) => Some((
+                RangeTarget::Column(name.clone()),
+                Some((lhs.clone(), false)),
+                None,
+            )),
+            (path @ Expr::JsonPath { .. }, Expr::Literal(_)) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                None,
+                Some((rhs.clone(), false)),
+            )),
+            (Expr::Literal(_), path @ Expr::JsonPath { .. }) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                Some((lhs.clone(), false)),
+                None,
+            )),
             _ => None,
         },
         // .col <= literal  →  upper=(literal, inclusive)
         BinOp::Lte => match (lhs, rhs) {
-            (Expr::Field(name), Expr::Literal(_)) => {
-                Some((name.clone(), None, Some((rhs.clone(), true))))
-            }
-            (Expr::Literal(_), Expr::Field(name)) => {
-                Some((name.clone(), Some((lhs.clone(), true)), None))
-            }
+            (Expr::Field(name), Expr::Literal(_)) => Some((
+                RangeTarget::Column(name.clone()),
+                None,
+                Some((rhs.clone(), true)),
+            )),
+            (Expr::Literal(_), Expr::Field(name)) => Some((
+                RangeTarget::Column(name.clone()),
+                Some((lhs.clone(), true)),
+                None,
+            )),
+            (path @ Expr::JsonPath { .. }, Expr::Literal(_)) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                None,
+                Some((rhs.clone(), true)),
+            )),
+            (Expr::Literal(_), path @ Expr::JsonPath { .. }) => Some((
+                RangeTarget::JsonPath(stored_json_path(path)?),
+                Some((lhs.clone(), true)),
+                None,
+            )),
             _ => None,
         },
         _ => None,
@@ -632,12 +773,7 @@ fn try_extract_range_index_keys(table: &str, pred: &Expr) -> Option<PlanNode> {
                 let start = s1.or(s2);
                 let end = e1.or(e2);
                 if start.is_some() || end.is_some() {
-                    return Some(PlanNode::RangeScan {
-                        table: table.to_string(),
-                        column: col1,
-                        start,
-                        end,
-                    });
+                    return Some(range_scan_for_target(table, col1, start, end));
                 }
             }
         }
@@ -645,15 +781,76 @@ fn try_extract_range_index_keys(table: &str, pred: &Expr) -> Option<PlanNode> {
 
     // Case 2: single inequality.
     if let Some((col, start, end)) = extract_single_bound(pred) {
-        return Some(PlanNode::RangeScan {
-            table: table.to_string(),
-            column: col,
-            start,
-            end,
-        });
+        return Some(range_scan_for_target(table, col, start, end));
     }
 
     None
+}
+
+fn range_scan_for_target(
+    table: &str,
+    target: RangeTarget,
+    start: Option<(Expr, bool)>,
+    end: Option<(Expr, bool)>,
+) -> PlanNode {
+    match target {
+        RangeTarget::Column(column) => PlanNode::RangeScan {
+            table: table.to_string(),
+            column,
+            start,
+            end,
+        },
+        RangeTarget::JsonPath(path) => PlanNode::ExprRangeScan {
+            table: table.to_string(),
+            path,
+            start,
+            end,
+        },
+    }
+}
+
+/// Fold only the exact, semantics-preserving single-table shape that can stream
+/// directly from one expression index. Anything involving filters, joins,
+/// grouping, distinct, aggregation, windows, multiple sort keys, or non-integer
+/// slice expressions retains the generic Sort pipeline.
+fn try_extract_ordered_expr_index_scan(query: &QueryExpr) -> Option<PlanNode> {
+    if query.alias.is_some()
+        || !query.joins.is_empty()
+        || query.filter.is_some()
+        || query.group_by.is_some()
+        || query.distinct
+        || query.aggregation.is_some()
+        || query.projection.as_ref().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| matches!(field.expr, Expr::Window { .. }))
+        })
+    {
+        return None;
+    }
+    let order = query.order.as_ref()?;
+    let [key] = order.keys.as_slice() else {
+        return None;
+    };
+    let path = stored_json_path(&key.expr)?;
+    let limit = query.limit.as_ref()?;
+    if !matches!(limit, Expr::Literal(Literal::Int(value)) if *value >= 0) {
+        return None;
+    }
+    if !query
+        .offset
+        .as_ref()
+        .is_none_or(|offset| matches!(offset, Expr::Literal(Literal::Int(value)) if *value >= 0))
+    {
+        return None;
+    }
+    Some(PlanNode::OrderedExprIndexScan {
+        table: query.source.clone(),
+        path,
+        descending: key.descending,
+        limit: limit.clone(),
+        offset: query.offset.clone(),
+    })
 }
 
 /// Walk projection fields, replacing every `Expr::Window { .. }` with
@@ -667,6 +864,7 @@ fn extract_windows(proj_fields: &mut [ProjectField]) -> Vec<WindowDef> {
         if let Expr::Window {
             function,
             args,
+            mode,
             partition_by,
             order_by,
         } = &f.expr
@@ -675,11 +873,12 @@ fn extract_windows(proj_fields: &mut [ProjectField]) -> Vec<WindowDef> {
             defs.push(WindowDef {
                 function: *function,
                 args: args.clone(),
+                mode: *mode,
                 partition_by: partition_by.clone(),
                 order_by: order_by
                     .iter()
                     .map(|k| SortKey {
-                        field: k.field.clone(),
+                        expr: k.expr.clone(),
                         descending: k.descending,
                     })
                     .collect(),
@@ -700,85 +899,275 @@ fn extract_windows(proj_fields: &mut [ProjectField]) -> Vec<WindowDef> {
 fn extract_aggregates(
     proj_fields: &mut [ProjectField],
     having: &mut Option<Expr>,
-) -> Vec<GroupAgg> {
+    source_aliases: &std::collections::HashSet<String>,
+) -> Result<Vec<GroupAgg>, PlanError> {
     let mut aggs: Vec<GroupAgg> = Vec::new();
     let mut counter = 0usize;
     for f in proj_fields.iter_mut() {
-        rewrite_agg_expr(&mut f.expr, &mut aggs, &mut counter);
+        rewrite_agg_expr(&mut f.expr, &mut aggs, &mut counter, source_aliases)?;
     }
     if let Some(h) = having {
-        rewrite_agg_expr(h, &mut aggs, &mut counter);
+        rewrite_agg_expr(h, &mut aggs, &mut counter, source_aliases)?;
     }
-    aggs
+    Ok(aggs)
 }
 
-fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usize) {
+fn rewrite_group_key_references(
+    fields: &mut [ProjectField],
+    having: &mut Option<Expr>,
+    keys: &[GroupKey],
+) {
+    for field in fields {
+        rewrite_group_key_expr(&mut field.expr, keys);
+    }
+    if let Some(having) = having {
+        rewrite_group_key_expr(having, keys);
+    }
+}
+
+fn rewrite_group_order_keys(
+    order: Option<&mut OrderClause>,
+    projection: &[ProjectField],
+    keys: &[GroupKey],
+) {
+    let Some(order) = order else {
+        return;
+    };
+    for order_key in &mut order.keys {
+        let Some(group_key) = keys.iter().find(|key| key.expr == order_key.expr) else {
+            continue;
+        };
+        let projected_name = projection
+            .iter()
+            .find(|field| field.expr == group_key.expr)
+            .and_then(|field| field.alias.clone())
+            .unwrap_or_else(|| group_key.output_name());
+        order_key.expr = Expr::Field(projected_name);
+    }
+}
+
+fn rewrite_group_key_expr(expr: &mut Expr, keys: &[GroupKey]) {
+    if let Some(key) = keys.iter().find(|key| key.expr == *expr) {
+        *expr = Expr::Field(key.output_name());
+        return;
+    }
     match expr {
-        Expr::FunctionCall(func, inner) => {
-            // Extract the aggregate's source column. Both the single-table
-            // form `count(.total)` (a `Field`) and the join form
-            // `count(o.total)` (a `QualifiedField`) must be lowered here; a
-            // qualified inner is folded to `Field("alias.field")` so it lines
-            // up with the join output columns named `alias.field`. Anything
-            // else (a nested expression, another aggregate) is left as a
-            // `FunctionCall`, which the executor's validation guard rejects as
-            // an unsupported position rather than silently evaluating it to
-            // Empty (a wrong answer). JsonPath inners (sum(.data->price)) are
-            // NOT extracted here: GroupAgg is keyed by column name end to end,
-            // so aggregating over a path needs Expr-valued aggregate inners.
-            // That lands in v0.13 with symmetric aggregates; until then such
-            // queries fail loudly via the unsupported-position guard.
-            let field_name = match inner.as_ref() {
-                Expr::Field(name) => Some(name.clone()),
-                Expr::QualifiedField { qualifier, field } => Some(format!("{qualifier}.{field}")),
-                _ => None,
-            };
-            if let Some(name) = field_name {
-                let output = find_or_insert_agg(aggs, *func, &name, counter);
-                *expr = Expr::Field(output);
+        // Aggregate arguments run against input rows and have already been
+        // extracted before this pass, so a survivor must not be rebound to a
+        // grouped output column.
+        Expr::FunctionCall(..) => {}
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            rewrite_group_key_expr(left, keys);
+            rewrite_group_key_expr(right, keys);
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) => rewrite_group_key_expr(inner, keys),
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                rewrite_group_key_expr(arg, keys);
             }
         }
-        Expr::BinaryOp(l, _, r) => {
-            rewrite_agg_expr(l, aggs, counter);
-            rewrite_agg_expr(r, aggs, counter);
-        }
-        Expr::UnaryOp(_, inner) => rewrite_agg_expr(inner, aggs, counter),
-        Expr::Coalesce(l, r) => {
-            rewrite_agg_expr(l, aggs, counter);
-            rewrite_agg_expr(r, aggs, counter);
-        }
-        Expr::InList { expr: e, list, .. } => {
-            rewrite_agg_expr(e, aggs, counter);
+        Expr::InList { expr, list, .. } => {
+            rewrite_group_key_expr(expr, keys);
             for item in list {
-                rewrite_agg_expr(item, aggs, counter);
+                rewrite_group_key_expr(item, keys);
             }
         }
-        Expr::InSubquery { expr: e, .. } => {
-            rewrite_agg_expr(e, aggs, counter);
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                rewrite_group_key_expr(condition, keys);
+                rewrite_group_key_expr(result, keys);
+            }
+            if let Some(expr) = else_expr {
+                rewrite_group_key_expr(expr, keys);
+            }
         }
         _ => {}
     }
 }
 
+fn rewrite_agg_expr(
+    expr: &mut Expr,
+    aggs: &mut Vec<GroupAgg>,
+    counter: &mut usize,
+    source_aliases: &std::collections::HashSet<String>,
+) -> Result<(), PlanError> {
+    match expr {
+        Expr::FunctionCall(func, inner, mode) => {
+            let output = find_or_insert_agg(aggs, *func, inner, *mode, counter, source_aliases)?;
+            *expr = Expr::Field(output);
+        }
+        Expr::BinaryOp(l, _, r) => {
+            rewrite_agg_expr(l, aggs, counter, source_aliases)?;
+            rewrite_agg_expr(r, aggs, counter, source_aliases)?;
+        }
+        Expr::UnaryOp(_, inner) => rewrite_agg_expr(inner, aggs, counter, source_aliases)?,
+        Expr::Coalesce(l, r) => {
+            rewrite_agg_expr(l, aggs, counter, source_aliases)?;
+            rewrite_agg_expr(r, aggs, counter, source_aliases)?;
+        }
+        Expr::InList { expr: e, list, .. } => {
+            rewrite_agg_expr(e, aggs, counter, source_aliases)?;
+            for item in list {
+                rewrite_agg_expr(item, aggs, counter, source_aliases)?;
+            }
+        }
+        Expr::InSubquery { expr: e, .. } => {
+            rewrite_agg_expr(e, aggs, counter, source_aliases)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn find_or_insert_agg(
     aggs: &mut Vec<GroupAgg>,
     func: AggFunc,
-    field: &str,
+    argument: &Expr,
+    mode: AggregateMode,
     counter: &mut usize,
-) -> String {
+    source_aliases: &std::collections::HashSet<String>,
+) -> Result<String, PlanError> {
     for existing in aggs.iter() {
-        if existing.function == func && existing.field == field {
-            return existing.output_name.clone();
+        if existing.function == func && existing.argument == *argument && existing.mode == mode {
+            return Ok(existing.output_name.clone());
         }
     }
+    let provenance_alias = symmetric_provenance_alias(func, Some(argument), mode, source_aliases)?;
     let output_name = format!("__agg_{counter}");
     aggs.push(GroupAgg {
         function: func,
-        field: field.to_string(),
+        argument: argument.clone(),
+        mode,
+        provenance_alias,
         output_name: output_name.clone(),
     });
     *counter += 1;
-    output_name
+    Ok(output_name)
+}
+
+fn symmetric_provenance_alias(
+    function: AggFunc,
+    argument: Option<&Expr>,
+    mode: AggregateMode,
+    source_aliases: &std::collections::HashSet<String>,
+) -> Result<Option<String>, PlanError> {
+    if mode == AggregateMode::Raw
+        || (function == AggFunc::Count
+            && argument.is_none_or(|argument| matches!(argument, Expr::Field(name) if name == "*")))
+    {
+        return Ok(None);
+    }
+    let Some(argument) = argument else {
+        return Err(symmetric_aggregate_error(
+            function,
+            "does not reference a source row",
+        ));
+    };
+
+    let mut qualified = std::collections::HashSet::new();
+    let mut has_unqualified = false;
+    collect_expression_sources(argument, &mut qualified, &mut has_unqualified);
+
+    for alias in &qualified {
+        if !source_aliases.contains(alias) {
+            return Err(symmetric_aggregate_error(
+                function,
+                &format!("references unknown source alias '{alias}'"),
+            ));
+        }
+    }
+    if has_unqualified {
+        if source_aliases.len() != 1 {
+            return Err(symmetric_aggregate_error(
+                function,
+                "contains an ambiguous unqualified field",
+            ));
+        }
+        qualified.extend(source_aliases.iter().cloned());
+    }
+    match qualified.len() {
+        1 => Ok(qualified.into_iter().next()),
+        0 => Err(symmetric_aggregate_error(
+            function,
+            "does not reference a source row",
+        )),
+        _ => Err(symmetric_aggregate_error(
+            function,
+            "references multiple source aliases",
+        )),
+    }
+}
+
+fn symmetric_aggregate_error(function: AggFunc, reason: &str) -> PlanError {
+    let name = format!("{function:?}").to_lowercase();
+    PlanError::Semantic(format!(
+        "symmetric {name} expression {reason}; reference exactly one source alias or use {name}(raw ...)"
+    ))
+}
+
+fn collect_expression_sources(
+    expr: &Expr,
+    qualified: &mut std::collections::HashSet<String>,
+    has_unqualified: &mut bool,
+) {
+    match expr {
+        Expr::Field(name) if name != "*" => *has_unqualified = true,
+        Expr::QualifiedField { qualifier, .. } => {
+            qualified.insert(qualifier.clone());
+        }
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            collect_expression_sources(left, qualified, has_unqualified);
+            collect_expression_sources(right, qualified, has_unqualified);
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::JsonPath { base: inner, .. } => {
+            collect_expression_sources(inner, qualified, has_unqualified);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for argument in args {
+                collect_expression_sources(argument, qualified, has_unqualified);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expression_sources(expr, qualified, has_unqualified);
+            for item in list {
+                collect_expression_sources(item, qualified, has_unqualified);
+            }
+        }
+        Expr::InSubquery { expr, .. } => {
+            collect_expression_sources(expr, qualified, has_unqualified);
+        }
+        Expr::Case { whens, else_expr } => {
+            for (condition, result) in whens {
+                collect_expression_sources(condition, qualified, has_unqualified);
+                collect_expression_sources(result, qualified, has_unqualified);
+            }
+            if let Some(expr) = else_expr {
+                collect_expression_sources(expr, qualified, has_unqualified);
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter().chain(partition_by) {
+                collect_expression_sources(expr, qualified, has_unqualified);
+            }
+            for key in order_by {
+                collect_expression_sources(&key.expr, qualified, has_unqualified);
+            }
+        }
+        Expr::FunctionCall(_, inner, _) => {
+            collect_expression_sources(inner, qualified, has_unqualified);
+        }
+        Expr::ExistsSubquery { .. }
+        | Expr::Field(_)
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::ValueLit(_)
+        | Expr::Null => {}
+    }
 }
 
 #[cfg(test)]
@@ -847,6 +1236,113 @@ mod tests {
         // Literal-on-the-left form should fold the same way.
         let plan = plan(r#"User filter "NYC" = .city"#).unwrap();
         assert!(matches!(plan, PlanNode::IndexScan { .. }));
+    }
+
+    #[test]
+    fn json_path_equality_and_reversed_equality_are_speculative_expression_scans() {
+        for query in ["Post filter .data->age = 21", "Post filter 21 = .data->age"] {
+            match plan(query).unwrap() {
+                PlanNode::ExprIndexScan { table, path, key } => {
+                    assert_eq!(table, "Post");
+                    assert_eq!(path.canonical_text(), "v1:.data->\"age\"");
+                    assert!(matches!(key, Expr::Literal(Literal::Int(21))));
+                }
+                other => panic!("expected ExprIndexScan for `{query}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn json_path_range_and_same_path_compound_bounds_are_speculative_scans() {
+        for query in ["Post filter .data->age > 18", "Post filter 18 < .data->age"] {
+            match plan(query).unwrap() {
+                PlanNode::ExprRangeScan {
+                    path, start, end, ..
+                } => {
+                    assert_eq!(path.canonical_text(), "v1:.data->\"age\"");
+                    assert!(start.is_some());
+                    assert!(end.is_none());
+                }
+                other => panic!("expected ExprRangeScan for `{query}`, got {other:?}"),
+            }
+        }
+
+        match plan("Post filter .data->age >= 18 and .data->age < 65").unwrap() {
+            PlanNode::ExprRangeScan {
+                path, start, end, ..
+            } => {
+                assert_eq!(path.canonical_text(), "v1:.data->\"age\"");
+                assert_eq!(start, Some((Expr::Literal(Literal::Int(18)), true)));
+                assert_eq!(end, Some((Expr::Literal(Literal::Int(65)), false)));
+            }
+            other => panic!("expected bounded ExprRangeScan, got {other:?}"),
+        }
+
+        assert!(matches!(
+            plan("Post filter .data->age >= 18 and .data->score < 65").unwrap(),
+            PlanNode::Filter { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_single_path_order_limit_uses_ordered_expression_scan() {
+        match plan("Post order .data->age desc limit 10 offset 2 { .id }").unwrap() {
+            PlanNode::Project { input, .. } => match *input {
+                PlanNode::OrderedExprIndexScan {
+                    table,
+                    path,
+                    descending,
+                    limit,
+                    offset,
+                } => {
+                    assert_eq!(table, "Post");
+                    assert_eq!(path.canonical_text(), "v1:.data->\"age\"");
+                    assert!(descending);
+                    assert_eq!(limit, Expr::Literal(Literal::Int(10)));
+                    assert_eq!(offset, Some(Expr::Literal(Literal::Int(2))));
+                }
+                other => panic!("expected OrderedExprIndexScan, got {other:?}"),
+            },
+            other => panic!("expected Project(OrderedExprIndexScan), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incompatible_path_order_shapes_keep_generic_sort() {
+        for query in [
+            "Post order .data->age",
+            "Post order .data->age, .id limit 10",
+            "Post filter .data->active = true order .data->age limit 10",
+            "Post order .data->age limit .id",
+        ] {
+            let planned = plan(query).unwrap();
+            assert!(
+                !plan_contains_ordered_expr_scan(&planned),
+                "`{query}` must remain on the generic pipeline: {planned:?}"
+            );
+        }
+    }
+
+    fn plan_contains_ordered_expr_scan(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::OrderedExprIndexScan { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Sort { input, .. }
+            | PlanNode::Limit { input, .. }
+            | PlanNode::Offset { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input }
+            | PlanNode::GroupBy { input, .. }
+            | PlanNode::Update { input, .. }
+            | PlanNode::Delete { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::Explain { input } => plan_contains_ordered_expr_scan(input),
+            PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+                plan_contains_ordered_expr_scan(left) || plan_contains_ordered_expr_scan(right)
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -942,6 +1438,15 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_join_aliases_are_rejected_before_execution() {
+        let err = plan("A as x join A as x on x.id = x.id").unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate source alias `x`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_plan_right_join_rewritten_as_left_with_swapped_inputs() {
         let plan = plan("User as u right join Order as o on u.id = o.user_id").unwrap();
         match plan {
@@ -1012,10 +1517,16 @@ mod tests {
                         having,
                     } => {
                         assert!(matches!(*inner, PlanNode::SeqScan { .. }));
-                        assert_eq!(keys, vec![GroupKey::Unqualified("status".into())]);
+                        assert_eq!(
+                            keys,
+                            vec![GroupKey {
+                                expr: Expr::Field("status".into()),
+                                output_name: "status".into(),
+                            }]
+                        );
                         assert_eq!(aggregates.len(), 1);
                         assert_eq!(aggregates[0].function, AggFunc::Count);
-                        assert_eq!(aggregates[0].field, "name");
+                        assert_eq!(aggregates[0].argument, Expr::Field("name".into()));
                         assert!(having.is_none());
                     }
                     other => panic!("expected GroupBy, got {other:?}"),

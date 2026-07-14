@@ -33,6 +33,11 @@ export const MSG_RESULT_MSG = 0x0b;
 export const MSG_DISCONNECT = 0x10;
 export const MSG_PING = 0x11;
 export const MSG_PONG = 0x12;
+export const MSG_QUERY_NATIVE = 0x13;
+export const MSG_QUERY_PARAMS_NATIVE = 0x14;
+export const MSG_QUERY_SQL_NATIVE = 0x15;
+export const MSG_RESULT_ROWS_NATIVE = 0x16;
+export const MSG_RESULT_SCALAR_NATIVE = 0x17;
 
 // ───── Size limits (mirror crates/server/src/protocol.rs) ──────────────────
 
@@ -72,6 +77,28 @@ export type WireParam =
   | { tag: "float"; value: number }
   | { tag: "bool"; value: boolean }
   | { tag: "str"; value: string };
+
+/** Recursively decoded PJ1 JSON. Integers outside JS's safe range are bigint. */
+export type NativeJson =
+  | null
+  | boolean
+  | number
+  | bigint
+  | string
+  | NativeJson[]
+  | { [key: string]: NativeJson };
+
+/** Lossless typed cell used internally by the native result protocol. */
+export type WireValue =
+  | { type: "empty" }
+  | { type: "int"; value: bigint }
+  | { type: "float"; value: number }
+  | { type: "bool"; value: boolean }
+  | { type: "str"; value: string }
+  | { type: "datetime"; value: bigint }
+  | { type: "uuid"; value: Uint8Array }
+  | { type: "bytes"; value: Uint8Array }
+  | { type: "json"; value: NativeJson; pj1: Uint8Array };
 
 export type SyncRepairAction =
   | "none"
@@ -119,6 +146,9 @@ export type Message =
   | { type: "Query"; query: string }
   | { type: "QuerySql"; query: string }
   | { type: "QueryWithParams"; query: string; params: WireParam[] }
+  | { type: "QueryNative"; query: string }
+  | { type: "QueryWithParamsNative"; query: string; params: WireParam[] }
+  | { type: "QuerySqlNative"; query: string }
   | { type: "SyncStatus"; replicaId: string }
   | {
       type: "SyncPull";
@@ -155,6 +185,8 @@ export type Message =
     }
   | { type: "ResultRows"; columns: string[]; rows: string[][] }
   | { type: "ResultScalar"; value: string }
+  | { type: "ResultRowsNative"; columns: string[]; rows: WireValue[][] }
+  | { type: "ResultScalarNative"; value: WireValue }
   | { type: "ResultOk"; affected: bigint }
   | { type: "ResultMessage"; message: string }
   | { type: "Error"; message: string }
@@ -198,41 +230,22 @@ export function encode(msg: Message): Buffer {
       msgType = MSG_QUERY_SQL;
       break;
     case "QueryWithParams": {
-      const parts: Buffer[] = [encodeString(msg.query)];
-      const count = Buffer.alloc(2);
-      count.writeUInt16LE(msg.params.length, 0);
-      parts.push(count);
-      for (const p of msg.params) {
-        switch (p.tag) {
-          case "null":
-            parts.push(Buffer.from([0]));
-            break;
-          case "int": {
-            const b = Buffer.alloc(9);
-            b.writeUInt8(1, 0);
-            b.writeBigInt64LE(p.value, 1);
-            parts.push(b);
-            break;
-          }
-          case "float": {
-            const b = Buffer.alloc(9);
-            b.writeUInt8(2, 0);
-            b.writeDoubleLE(p.value, 1);
-            parts.push(b);
-            break;
-          }
-          case "bool":
-            parts.push(Buffer.from([3, p.value ? 1 : 0]));
-            break;
-          case "str":
-            parts.push(Buffer.from([4]), encodeString(p.value));
-            break;
-        }
-      }
-      payload = Buffer.concat(parts);
+      payload = encodeQueryWithParams(msg.query, msg.params);
       msgType = MSG_QUERY_PARAMS;
       break;
     }
+    case "QueryNative":
+      payload = encodeString(msg.query);
+      msgType = MSG_QUERY_NATIVE;
+      break;
+    case "QueryWithParamsNative":
+      payload = encodeQueryWithParams(msg.query, msg.params);
+      msgType = MSG_QUERY_PARAMS_NATIVE;
+      break;
+    case "QuerySqlNative":
+      payload = encodeString(msg.query);
+      msgType = MSG_QUERY_SQL_NATIVE;
+      break;
     case "SyncStatus":
       payload = encodeString(msg.replicaId);
       msgType = MSG_SYNC_STATUS;
@@ -310,6 +323,21 @@ export function encode(msg: Message): Buffer {
       payload = encodeString(msg.value);
       msgType = MSG_RESULT_SCALAR;
       break;
+    case "ResultRowsNative": {
+      const parts: Buffer[] = [u16LE(msg.columns.length)];
+      for (const column of msg.columns) parts.push(encodeString(column));
+      parts.push(u32LE(msg.rows.length));
+      for (const row of msg.rows) {
+        for (const value of row) parts.push(encodeWireValue(value));
+      }
+      payload = Buffer.concat(parts);
+      msgType = MSG_RESULT_ROWS_NATIVE;
+      break;
+    }
+    case "ResultScalarNative":
+      payload = encodeWireValue(msg.value);
+      msgType = MSG_RESULT_SCALAR_NATIVE;
+      break;
     case "ResultOk": {
       payload = Buffer.alloc(8);
       payload.writeBigUInt64LE(msg.affected, 0);
@@ -344,6 +372,85 @@ export function encode(msg: Message): Buffer {
   frame.writeUInt32LE(payload.length, 2);
   payload.copy(frame, 6);
   return frame;
+}
+
+function encodeQueryWithParams(query: string, params: WireParam[]): Buffer {
+  const parts: Buffer[] = [encodeString(query), u16LE(params.length)];
+  for (const param of params) {
+    switch (param.tag) {
+      case "null":
+        parts.push(Buffer.from([0]));
+        break;
+      case "int": {
+        const body = Buffer.alloc(9);
+        body.writeUInt8(1, 0);
+        body.writeBigInt64LE(param.value, 1);
+        parts.push(body);
+        break;
+      }
+      case "float": {
+        const body = Buffer.alloc(9);
+        body.writeUInt8(2, 0);
+        body.writeDoubleLE(param.value, 1);
+        parts.push(body);
+        break;
+      }
+      case "bool":
+        parts.push(Buffer.from([3, param.value ? 1 : 0]));
+        break;
+      case "str":
+        parts.push(Buffer.from([4]), encodeString(param.value));
+        break;
+    }
+  }
+  return Buffer.concat(parts);
+}
+
+function encodeWireValue(value: WireValue): Buffer {
+  let tag: number;
+  let body: Buffer;
+  switch (value.type) {
+    case "empty":
+      tag = 0;
+      body = Buffer.alloc(0);
+      break;
+    case "int":
+    case "datetime":
+      tag = value.type === "int" ? 1 : 5;
+      body = Buffer.alloc(8);
+      body.writeBigInt64LE(value.value, 0);
+      break;
+    case "float":
+      tag = 2;
+      body = Buffer.alloc(8);
+      body.writeDoubleLE(value.value, 0);
+      break;
+    case "bool":
+      tag = 3;
+      body = Buffer.from([value.value ? 1 : 0]);
+      break;
+    case "str":
+      tag = 4;
+      body = Buffer.from(value.value, "utf8");
+      break;
+    case "uuid":
+      if (value.value.length !== 16) {
+        throw new Error(`native UUID must be exactly 16 bytes, got ${value.value.length}`);
+      }
+      tag = 6;
+      body = Buffer.from(value.value);
+      break;
+    case "bytes":
+      tag = 7;
+      body = Buffer.from(value.value);
+      break;
+    case "json":
+      tag = 8;
+      body = Buffer.from(value.pj1);
+      decodePj1(body);
+      break;
+  }
+  return Buffer.concat([Buffer.from([tag]), u32LE(body.length), body]);
 }
 
 // ───── Decoding ────────────────────────────────────────────────────────────
@@ -428,6 +535,21 @@ function decodePayload(msgType: number, payload: Buffer): Message {
         }
       }
       return { type: "QueryWithParams", query, params };
+    }
+    case MSG_QUERY_NATIVE: {
+      const query = decodeStringStrict(payload, cursor, "native PowQL query");
+      requirePayloadEnd(payload, cursor, "native PowQL query");
+      return { type: "QueryNative", query };
+    }
+    case MSG_QUERY_PARAMS_NATIVE: {
+      const { query, params } = decodeNativeQueryWithParams(payload, cursor);
+      requirePayloadEnd(payload, cursor, "native parameterized query");
+      return { type: "QueryWithParamsNative", query, params };
+    }
+    case MSG_QUERY_SQL_NATIVE: {
+      const query = decodeStringStrict(payload, cursor, "native SQL query");
+      requirePayloadEnd(payload, cursor, "native SQL query");
+      return { type: "QuerySqlNative", query };
     }
     case MSG_SYNC_STATUS:
       return { type: "SyncStatus", replicaId: decodeString(payload, cursor) };
@@ -554,6 +676,44 @@ function decodePayload(msgType: number, payload: Buffer): Message {
     }
     case MSG_RESULT_SCALAR:
       return { type: "ResultScalar", value: decodeString(payload, cursor) };
+    case MSG_RESULT_ROWS_NATIVE: {
+      const colCount = readU16(payload, cursor, "native column count");
+      if (colCount > MAX_COLUMNS) {
+        throw new Error(`too many columns: ${colCount} (max ${MAX_COLUMNS})`);
+      }
+      const columns: string[] = [];
+      for (let i = 0; i < colCount; i++) {
+        columns.push(decodeStringStrict(payload, cursor, "native column name"));
+      }
+      const rowCount = readU32(payload, cursor, "native row count");
+      if (rowCount > MAX_ROWS) {
+        throw new Error(`too many rows: ${rowCount} (max ${MAX_ROWS})`);
+      }
+      if (colCount === 0 && rowCount > 0) {
+        throw new Error("nonzero native row count with zero columns");
+      }
+      const minimumBytes = BigInt(rowCount) * BigInt(colCount) * 5n;
+      if (BigInt(payload.length - cursor.pos) < minimumBytes) {
+        throw new Error(
+          `native row data too short for declared shape: ${rowCount} rows x ${colCount} columns`,
+        );
+      }
+      const rows: WireValue[][] = [];
+      for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const row: WireValue[] = [];
+        for (let columnIndex = 0; columnIndex < colCount; columnIndex++) {
+          row.push(decodeWireValue(payload, cursor));
+        }
+        rows.push(row);
+      }
+      requirePayloadEnd(payload, cursor, "native rows");
+      return { type: "ResultRowsNative", columns, rows };
+    }
+    case MSG_RESULT_SCALAR_NATIVE: {
+      const value = decodeWireValue(payload, cursor);
+      requirePayloadEnd(payload, cursor, "native scalar");
+      return { type: "ResultScalarNative", value };
+    }
     case MSG_RESULT_OK: {
       const affected = readU64(payload, cursor, "affected count");
       return { type: "ResultOk", affected };
@@ -570,6 +730,107 @@ function decodePayload(msgType: number, payload: Buffer): Message {
       return { type: "Pong" };
     default:
       throw new Error(`unknown message type: 0x${msgType.toString(16)}`);
+  }
+}
+
+function decodeNativeQueryWithParams(
+  payload: Buffer,
+  cursor: { pos: number },
+): { query: string; params: WireParam[] } {
+  const query = decodeStringStrict(payload, cursor, "native query");
+  const count = readU16(payload, cursor, "native param count");
+  if (count > MAX_PARAMS) {
+    throw new Error(`too many parameters: ${count} (max ${MAX_PARAMS})`);
+  }
+  if (count > payload.length - cursor.pos) {
+    throw new Error("parameter count exceeds payload size");
+  }
+  const params: WireParam[] = [];
+  for (let index = 0; index < count; index++) {
+    const tag = readU8(payload, cursor, "param tag");
+    switch (tag) {
+      case 0:
+        params.push({ tag: "null" });
+        break;
+      case 1:
+        params.push({ tag: "int", value: readI64(payload, cursor, "int param") });
+        break;
+      case 2:
+        params.push({ tag: "float", value: readF64(payload, cursor, "float param") });
+        break;
+      case 3:
+        params.push({ tag: "bool", value: readBool(payload, cursor, "bool param") });
+        break;
+      case 4:
+        params.push({
+          tag: "str",
+          value: decodeStringStrict(payload, cursor, "string param"),
+        });
+        break;
+      default:
+        throw new Error(`unknown param tag: ${tag}`);
+    }
+  }
+  return { query, params };
+}
+
+function decodeWireValue(buf: Buffer, cursor: { pos: number }): WireValue {
+  const tag = readU8(buf, cursor, "typed value tag");
+  const bodyLength = readU32(buf, cursor, "typed value body length");
+  const body = readFixedBytes(buf, cursor, bodyLength, "typed value body");
+  const requireLength = (expected: number, label: string): void => {
+    if (body.length !== expected) {
+      throw new Error(
+        `invalid ${label} typed value length: expected ${expected}, got ${body.length}`,
+      );
+    }
+  };
+
+  switch (tag) {
+    case 0:
+      requireLength(0, "Empty");
+      return { type: "empty" };
+    case 1:
+      requireLength(8, "Int");
+      return { type: "int", value: body.readBigInt64LE(0) };
+    case 2: {
+      requireLength(8, "Float");
+      return { type: "float", value: body.readDoubleLE(0) };
+    }
+    case 3:
+      requireLength(1, "Bool");
+      if (body[0] !== 0 && body[0] !== 1) {
+        throw new Error(`invalid typed boolean: ${body[0]}`);
+      }
+      return { type: "bool", value: body[0] === 1 };
+    case 4:
+      return { type: "str", value: decodeUtf8Strict(body, "typed string") };
+    case 5:
+      requireLength(8, "DateTime");
+      return { type: "datetime", value: body.readBigInt64LE(0) };
+    case 6:
+      requireLength(16, "UUID");
+      return { type: "uuid", value: new Uint8Array(body) };
+    case 7:
+      return { type: "bytes", value: new Uint8Array(body) };
+    case 8:
+      return {
+        type: "json",
+        value: decodePj1(body),
+        pj1: new Uint8Array(body),
+      };
+    default:
+      throw new Error(`unknown typed value tag: ${tag}`);
+  }
+}
+
+function requirePayloadEnd(
+  payload: Buffer,
+  cursor: { pos: number },
+  label: string,
+): void {
+  if (cursor.pos !== payload.length) {
+    throw new Error(`trailing bytes in ${label} payload`);
   }
 }
 
@@ -740,6 +1001,187 @@ function decodeString(buf: Buffer, cursor: { pos: number }): string {
   const s = buf.toString("utf8", cursor.pos, cursor.pos + len);
   cursor.pos += len;
   return s;
+}
+
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+function decodeUtf8Strict(bytes: Uint8Array, label: string): string {
+  try {
+    return strictUtf8.decode(bytes);
+  } catch {
+    throw new Error(`invalid UTF-8 in ${label}`);
+  }
+}
+
+function decodeStringStrict(
+  buf: Buffer,
+  cursor: { pos: number },
+  label: string,
+): string {
+  const len = readU32(buf, cursor, `${label} length`);
+  const bytes = readFixedBytes(buf, cursor, len, label);
+  return decodeUtf8Strict(bytes, label);
+}
+
+function decodePj1(doc: Buffer): NativeJson {
+  const [value, end] = decodePj1Node(doc, 0, 0);
+  if (end !== doc.length) throw new Error("invalid typed PJ1 JSON: trailing bytes");
+  return value;
+}
+
+function decodePj1Node(
+  doc: Buffer,
+  start: number,
+  depth: number,
+): [NativeJson, number] {
+  if (depth > 128) throw new Error("invalid typed PJ1 JSON: nesting too deep");
+  if (start >= doc.length) throw new Error("invalid typed PJ1 JSON: truncated node");
+  const tag = doc[start];
+  switch (tag) {
+    case 0:
+      return [null, start + 1];
+    case 1:
+      return [false, start + 1];
+    case 2:
+      return [true, start + 1];
+    case 3: {
+      ensurePj1Range(doc, start + 1, 8);
+      const integer = doc.readBigInt64LE(start + 1);
+      const value =
+        integer >= BigInt(Number.MIN_SAFE_INTEGER) &&
+        integer <= BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number(integer)
+          : integer;
+      return [value, start + 9];
+    }
+    case 4: {
+      ensurePj1Range(doc, start + 1, 8);
+      const value = doc.readDoubleLE(start + 1);
+      if (!Number.isFinite(value)) {
+        throw new Error("invalid typed PJ1 JSON: non-finite float");
+      }
+      return [value, start + 9];
+    }
+    case 5: {
+      const [value, end] = decodePj1String(doc, start + 1);
+      return [value, end];
+    }
+    case 6:
+      return decodePj1Array(doc, start, depth);
+    case 7:
+      return decodePj1Object(doc, start, depth);
+    default:
+      throw new Error(`invalid typed PJ1 JSON: reserved/invalid tag ${tag}`);
+  }
+}
+
+function decodePj1Array(
+  doc: Buffer,
+  start: number,
+  depth: number,
+): [NativeJson[], number] {
+  const count = pj1U32(doc, start + 1);
+  const headerSize = 5 + 4 * (count + 1);
+  ensurePj1Range(doc, start, headerSize);
+  let expectedOffset = headerSize;
+  const values: NativeJson[] = [];
+  for (let index = 0; index < count; index++) {
+    const offset = pj1U32(doc, start + 5 + index * 4);
+    const nextOffset = pj1U32(doc, start + 5 + (index + 1) * 4);
+    if (offset !== expectedOffset || nextOffset < offset) {
+      throw new Error("invalid typed PJ1 JSON: array offsets not canonical");
+    }
+    const [value, end] = decodePj1Node(doc, start + offset, depth + 1);
+    if (end !== start + nextOffset) {
+      throw new Error("invalid typed PJ1 JSON: array element length mismatch");
+    }
+    values.push(value);
+    expectedOffset = nextOffset;
+  }
+  const total = pj1U32(doc, start + 5 + count * 4);
+  if (total !== expectedOffset) {
+    throw new Error("invalid typed PJ1 JSON: array end offset mismatch");
+  }
+  ensurePj1Range(doc, start, total);
+  return [values, start + total];
+}
+
+function decodePj1Object(
+  doc: Buffer,
+  start: number,
+  depth: number,
+): [Record<string, NativeJson>, number] {
+  const count = pj1U32(doc, start + 1);
+  const headerSize = 5 + count * 8 + 4;
+  ensurePj1Range(doc, start, headerSize);
+  const keys: Array<{ text: string; bytes: Buffer }> = [];
+  let expectedKeyOffset = headerSize;
+  for (let index = 0; index < count; index++) {
+    const keyOffset = pj1U32(doc, start + 5 + index * 8);
+    if (keyOffset !== expectedKeyOffset) {
+      throw new Error("invalid typed PJ1 JSON: object key offset mismatch");
+    }
+    const [text, end, bytes] = decodePj1String(doc, start + keyOffset);
+    const previous = keys[keys.length - 1];
+    if (previous && Buffer.compare(previous.bytes, bytes) >= 0) {
+      throw new Error("invalid typed PJ1 JSON: object keys not strictly sorted");
+    }
+    keys.push({ text, bytes });
+    expectedKeyOffset = end - start;
+  }
+
+  const result: Record<string, NativeJson> = {};
+  let expectedValueOffset = expectedKeyOffset;
+  for (let index = 0; index < count; index++) {
+    const valueOffset = pj1U32(doc, start + 5 + index * 8 + 4);
+    if (valueOffset !== expectedValueOffset) {
+      throw new Error("invalid typed PJ1 JSON: object value offset mismatch");
+    }
+    const [value, end] = decodePj1Node(doc, start + valueOffset, depth + 1);
+    const key = keys[index];
+    if (!key) throw new Error("invalid typed PJ1 JSON: missing object key");
+    Object.defineProperty(result, key.text, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expectedValueOffset = end - start;
+  }
+  const total = pj1U32(doc, start + 5 + count * 8);
+  if (total !== expectedValueOffset) {
+    throw new Error("invalid typed PJ1 JSON: object end offset mismatch");
+  }
+  ensurePj1Range(doc, start, total);
+  return [result, start + total];
+}
+
+function decodePj1String(
+  doc: Buffer,
+  lengthOffset: number,
+): [string, number, Buffer] {
+  const len = pj1U32(doc, lengthOffset);
+  const dataStart = lengthOffset + 4;
+  ensurePj1Range(doc, dataStart, len);
+  const bytes = doc.subarray(dataStart, dataStart + len);
+  return [decodeUtf8Strict(bytes, "PJ1 string"), dataStart + len, bytes];
+}
+
+function pj1U32(doc: Buffer, offset: number): number {
+  ensurePj1Range(doc, offset, 4);
+  return doc.readUInt32LE(offset);
+}
+
+function ensurePj1Range(doc: Buffer, offset: number, len: number): void {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(len) ||
+    offset < 0 ||
+    len < 0 ||
+    offset + len > doc.length
+  ) {
+    throw new Error("invalid typed PJ1 JSON: truncated or overflowing range");
+  }
 }
 
 function readU8(buf: Buffer, cursor: { pos: number }, label: string): number {

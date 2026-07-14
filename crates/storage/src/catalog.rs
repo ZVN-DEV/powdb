@@ -1,7 +1,9 @@
+use crate::btree::BTree;
 use crate::error::StorageError;
 use crate::heap::HeapFile;
 use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
 use crate::row::{encode_row_into, encode_row_v2_into, plan_spill, OverflowStub, MAX_VALUE_SIZE};
+use crate::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
 use crate::table::Table;
 use crate::types::*;
 use crate::wal::{Wal, WalDurabilityTicket, WalRecord, WalRecordType, WalSyncMode};
@@ -82,7 +84,49 @@ const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// Version 4 appends a per-table column-defaults section after the indexed
 /// column list; version 5 appends an auto-increment column section after that.
 /// Older files load cleanly (no defaults / no auto columns).
-pub const CATALOG_VERSION: u16 = 5;
+pub const LEGACY_CATALOG_VERSION: u16 = 5;
+pub const CATALOG_VERSION: u16 = 6;
+
+/// Persisted metadata for a JSON-path expression index. Expression index files
+/// are addressed only by `index_id`; canonical expression text never reaches a
+/// filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpressionIndexMeta {
+    pub index_id: u64,
+    pub unique: bool,
+    pub canonical_version: u16,
+    pub canonical_text: String,
+    pub json_path: StoredJsonPathV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexKeySource {
+    Column {
+        column: String,
+    },
+    Expression {
+        index_id: u64,
+        canonical_version: u16,
+        canonical_text: String,
+        json_path: StoredJsonPathV1,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMetadata {
+    pub unique: bool,
+    pub source: IndexKeySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOrderDirection {
+    Asc,
+    Desc,
+}
+
+fn expression_index_file_name(table: &str, index_id: u64) -> String {
+    format!("{table}_idx_{index_id}.idx")
+}
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
@@ -196,6 +240,11 @@ pub struct Catalog {
     /// Drained by `commit_transaction`; discarded (via reopen) by ROLLBACK.
     /// Entries are `(table_slot, chain_pages)`.
     pending_free_overflow: Vec<(usize, Vec<u32>)>,
+    /// Catalog format currently active on disk. v6 activates lazily on the
+    /// first successful expression-index metadata creation.
+    active_catalog_version: u16,
+    /// Global, durable, monotonically increasing expression-index identity.
+    next_index_id: u64,
 }
 
 impl Catalog {
@@ -235,6 +284,8 @@ impl Catalog {
             pending_free_overflow: Vec::new(),
             checkpointed: false,
             durable_lsn: 0,
+            active_catalog_version: LEGACY_CATALOG_VERSION,
+            next_index_id: 1,
         };
         cat.persist()?;
         Ok(cat)
@@ -273,7 +324,10 @@ impl Catalog {
         if !cat_path.exists() {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
-        let entries = read_catalog_file(&cat_path)?;
+        let catalog_file = read_catalog_file(&cat_path)?;
+        let active_catalog_version = catalog_file.version;
+        let next_index_id = catalog_file.next_index_id;
+        let entries = catalog_file.entries;
         let durable_lsn = read_durable_lsn(data_dir)?;
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
         let mut name_to_slot =
@@ -281,6 +335,7 @@ impl Catalog {
         for CatalogEntry {
             schema,
             indexed_cols,
+            expression_indexes: expression_metas,
             defaults,
             auto_cols,
         } in entries
@@ -291,10 +346,11 @@ impl Catalog {
             // missing (e.g. first open after upgrade from catalog v1) it
             // falls back to rebuilding from the heap scan and saving to
             // disk so subsequent opens hit the fast path.
-            let mut table = Table::open_with_indexes(schema, data_dir, &indexed_cols)?;
+            let mut table =
+                Table::open_with_indexes(schema, data_dir, &indexed_cols, &expression_metas)?;
             table.set_defaults(defaults);
             table.set_auto_cols(auto_cols);
-            name_to_slot.insert(name, tables.len());
+            name_to_slot.insert(name.clone(), tables.len());
             tables.push(table);
         }
         let wal_path = data_dir.join(WAL_FILE);
@@ -311,6 +367,8 @@ impl Catalog {
             pending_free_overflow: Vec::new(),
             checkpointed: false,
             durable_lsn,
+            active_catalog_version,
+            next_index_id,
         };
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
@@ -621,6 +679,12 @@ impl Catalog {
                                     let _ = fs::remove_file(&idx_path);
                                 }
                             }
+                            for index_id in self.tables[slot].expression_index_ids() {
+                                let idx_path = self
+                                    .data_dir
+                                    .join(expression_index_file_name(&table_name, index_id));
+                                let _ = fs::remove_file(idx_path);
+                            }
                             self.name_to_slot.remove(&table_name);
                             let last = self.tables.len() - 1;
                             if slot != last {
@@ -668,29 +732,40 @@ impl Catalog {
                     saw_ddl = true;
                     if let Some((table_name, col_name)) = decode_ddl_alter_drop_column(&rec.data) {
                         if let Some(&slot) = self.name_to_slot.get(&table_name) {
-                            let tbl = &mut self.tables[slot];
-                            if let Some(idx) =
-                                tbl.schema.columns.iter().position(|c| c.name == col_name)
                             {
-                                let old_schema = tbl.schema.clone();
-                                let has_rows = tbl.heap.scan().next().is_some();
-                                tbl.schema.columns.remove(idx);
-                                for (i, c) in tbl.schema.columns.iter_mut().enumerate() {
-                                    c.position = i as u16;
+                                let tbl = &mut self.tables[slot];
+                                if let Some(idx) =
+                                    tbl.schema.columns.iter().position(|c| c.name == col_name)
+                                {
+                                    let old_schema = tbl.schema.clone();
+                                    let has_rows = tbl.heap.scan().next().is_some();
+                                    tbl.schema.columns.remove(idx);
+                                    for (i, c) in tbl.schema.columns.iter_mut().enumerate() {
+                                        c.position = i as u16;
+                                    }
+                                    tbl.refresh_layout();
+                                    if has_rows {
+                                        let fill = vec![Value::Empty; tbl.schema.columns.len()];
+                                        let data_dir = self.data_dir.clone();
+                                        let _ = tbl.rewrite_rows_for_schema_change(
+                                            &old_schema,
+                                            &fill,
+                                            &data_dir,
+                                        );
+                                    }
                                 }
-                                tbl.refresh_layout();
-                                if has_rows {
-                                    let fill = vec![Value::Empty; tbl.schema.columns.len()];
-                                    let data_dir = self.data_dir.clone();
-                                    let _ = tbl.rewrite_rows_for_schema_change(
-                                        &old_schema,
-                                        &fill,
-                                        &data_dir,
-                                    );
+                                if rec.lsn > 0 {
+                                    let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
                                 }
                             }
-                            if rec.lsn > 0 {
-                                let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+
+                            let removed_ids =
+                                self.tables[slot].remove_expression_indexes_for_root(&col_name);
+                            for index_id in removed_ids {
+                                let idx_path = self
+                                    .data_dir
+                                    .join(expression_index_file_name(&table_name, index_id));
+                                let _ = fs::remove_file(idx_path);
                             }
                         }
                     }
@@ -1227,12 +1302,19 @@ impl Catalog {
             .map(|t| CatalogEntryRef {
                 schema: &t.schema,
                 indexed_cols: t.indexed_column_metas(),
+                expression_indexes: t.expression_index_metas(),
                 defaults: t.defaults(),
                 auto_cols: t.auto_cols(),
             })
             .collect();
-        write_catalog_file(&tmp_path, &entries)?;
+        write_catalog_file(
+            &tmp_path,
+            self.active_catalog_version,
+            self.next_index_id,
+            &entries,
+        )?;
         fs::rename(&tmp_path, &cat_path)?;
+        sync_directory(&self.data_dir)?;
         Ok(())
     }
 
@@ -1349,11 +1431,12 @@ impl Catalog {
         if self.wal.is_off() {
             return self.by_name_mut(table)?.insert(values);
         }
+        let slot = self.slot_of(table)?;
+        self.tables[slot].preflight_insert(values)?;
         // Allocate the tx id up front: any overflow chains for a spilled row
         // must be logged under the SAME tx (and before the Insert record) so
         // an uncommitted big row's chain writes are skipped on replay.
         let tx_id = self.next_tx();
-        let slot = self.slot_of(table)?;
         let row_bytes = {
             let Catalog { tables, wal, .. } = self;
             encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
@@ -1382,6 +1465,7 @@ impl Catalog {
         if self.wal.is_off() {
             return self.tables[slot].insert(values);
         }
+        self.tables[slot].preflight_insert(values)?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
@@ -1406,6 +1490,15 @@ impl Catalog {
 
     pub fn get(&self, table: &str, rid: RowId) -> Option<Row> {
         self.get_table(table)?.get(rid)
+    }
+
+    pub fn get_projected(
+        &self,
+        table: &str,
+        rid: RowId,
+        column_indices: &[usize],
+    ) -> io::Result<Option<Vec<Value>>> {
+        self.by_name(table)?.get_projected(rid, column_indices)
     }
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
@@ -1620,8 +1713,9 @@ impl Catalog {
             self.free_overflow_chain(slot, old_pages);
             return Ok(new_rid);
         }
-        let tx_id = self.next_tx();
         let slot = self.slot_of(table)?;
+        self.tables[slot].preflight_update(rid, values)?;
+        let tx_id = self.next_tx();
         // Capture the old row's overflow chain (empty for inline-only tables)
         // BEFORE the update replaces it, so it can be freed once safe (design
         // 3.6). A chain-replacing update always orphans the old chain.
@@ -1664,8 +1758,9 @@ impl Catalog {
             self.free_overflow_chain(slot, old_pages);
             return Ok(new_rid);
         }
-        let tx_id = self.next_tx();
         let slot = self.slot_of(table)?;
+        self.tables[slot].preflight_update(rid, values)?;
+        let tx_id = self.next_tx();
         let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
         let row_bytes = {
             let Catalog { tables, wal, .. } = self;
@@ -1878,6 +1973,231 @@ impl Catalog {
         self.persist()
     }
 
+    pub fn active_catalog_version(&self) -> u16 {
+        self.active_catalog_version
+    }
+
+    pub fn next_index_id(&self) -> u64 {
+        self.next_index_id
+    }
+
+    /// Return both legacy column-index and v6 expression-index identities.
+    pub fn index_metadata(&self, table: &str) -> Option<Vec<IndexMetadata>> {
+        let table_ref = self.get_table(table)?;
+        let mut metadata = table_ref
+            .indexed_column_metas()
+            .into_iter()
+            .map(|index| IndexMetadata {
+                unique: index.unique,
+                source: IndexKeySource::Column { column: index.name },
+            })
+            .collect::<Vec<_>>();
+        metadata.extend(table_ref.expression_index_metas().into_iter().map(|index| {
+            IndexMetadata {
+                unique: index.unique,
+                source: IndexKeySource::Expression {
+                    index_id: index.index_id,
+                    canonical_version: index.canonical_version,
+                    canonical_text: index.canonical_text,
+                    json_path: index.json_path,
+                },
+            }
+        }));
+        Some(metadata)
+    }
+
+    pub fn expression_index_metadata(&self, table: &str) -> Option<Vec<ExpressionIndexMeta>> {
+        Some(self.get_table(table)?.expression_index_metas())
+    }
+
+    pub fn expression_index_btree(&self, table: &str, index_id: u64) -> Option<&BTree> {
+        self.get_table(table)?.expression_index_btree(index_id)
+    }
+
+    pub fn expression_index_btree_mut(&mut self, table: &str, index_id: u64) -> Option<&mut BTree> {
+        self.get_table_mut(table)?
+            .expression_index_btree_mut(index_id)
+    }
+
+    pub fn expression_index_lookup_all(
+        &self,
+        table: &str,
+        index_id: u64,
+        key: &Value,
+    ) -> io::Result<Vec<RowId>> {
+        let tree = self
+            .by_name(table)?
+            .expression_index_btree(index_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
+        Ok(tree.lookup_all(key))
+    }
+
+    pub fn expression_index_range_rids(
+        &self,
+        table: &str,
+        index_id: u64,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> io::Result<Vec<RowId>> {
+        let tree = self
+            .by_name(table)?
+            .expression_index_btree(index_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
+        Ok(tree.raw_range_rids(start, end))
+    }
+
+    pub fn expression_index_ordered_rids(
+        &self,
+        table: &str,
+        index_id: u64,
+    ) -> io::Result<Vec<RowId>> {
+        let tree = self
+            .by_name(table)?
+            .expression_index_btree(index_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
+        Ok(tree.ordered_rids_nulls_last())
+    }
+
+    pub fn expression_index_ordered_rids_bounded(
+        &self,
+        table: &str,
+        index_id: u64,
+        direction: IndexOrderDirection,
+        offset: usize,
+        limit: usize,
+    ) -> io::Result<Vec<RowId>> {
+        let tree = self
+            .by_name(table)?
+            .expression_index_btree(index_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
+        Ok(tree.bounded_ordered_rids_nulls_last(
+            direction == IndexOrderDirection::Desc,
+            offset,
+            limit,
+        ))
+    }
+
+    pub fn drop_expression_index(&mut self, table: &str, index_id: u64) -> io::Result<()> {
+        validate_table_name(table)?;
+        let removed = self
+            .by_name_mut(table)?
+            .take_expression_index(index_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expression index not found"))?;
+        if let Err(error) = self.persist() {
+            self.by_name_mut(table)?.restore_expression_index(removed);
+            return Err(error);
+        }
+        let index_path = self
+            .data_dir
+            .join(expression_index_file_name(table, index_id));
+        if let Err(error) = fs::remove_file(&index_path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                warn!(path = %index_path.display(), error = %error, "failed to remove dropped expression index file");
+            }
+        } else if let Err(error) = sync_directory(&self.data_dir) {
+            warn!(path = %self.data_dir.display(), error = %error, "failed to sync expression index deletion");
+        }
+        Ok(())
+    }
+
+    /// Persist expression-index identity and create its backup-compatible
+    /// `.idx` file. The catalog stays at v5 until every validation and file
+    /// creation step succeeds; the v6 catalog rename is the activation point.
+    pub fn create_expression_index_metadata(
+        &mut self,
+        table: &str,
+        canonical_version: u16,
+        canonical_text: impl Into<String>,
+        json_path: StoredJsonPathV1,
+        unique: bool,
+    ) -> io::Result<u64> {
+        validate_table_name(table)?;
+        validate_column_name(&json_path.column)?;
+        if canonical_version == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expression canonical version must be non-zero",
+            ));
+        }
+        let canonical_text = canonical_text.into();
+        if canonical_text.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expression canonical text must not be empty",
+            ));
+        }
+        if canonical_version == 1 && canonical_text != json_path.canonical_text() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expression canonical text does not match its stored JSON path",
+            ));
+        }
+        let table_ref = self.by_name(table)?;
+        let root_index = table_ref
+            .schema
+            .column_index(&json_path.column)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "JSON root column not found"))?;
+        if table_ref.schema.columns[root_index].type_id != TypeId::Json {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expression index root column must have type json",
+            ));
+        }
+        if table_ref.expression_index_metas().iter().any(|index| {
+            index.canonical_version == canonical_version && index.canonical_text == canonical_text
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "expression index already exists",
+            ));
+        }
+
+        let index_id = self.next_index_id;
+        let next_index_id = index_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("expression index id space exhausted"))?;
+        let index_path = self
+            .data_dir
+            .join(expression_index_file_name(table, index_id));
+        if index_path.exists() {
+            // The allocator proves this ID is not referenced by the active
+            // catalog. A file here can therefore only be an orphan from a
+            // crash after the index-file fsync but before catalog activation.
+            fs::remove_file(&index_path)?;
+            sync_directory(&self.data_dir)?;
+        }
+        let meta = ExpressionIndexMeta {
+            index_id,
+            unique,
+            canonical_version,
+            canonical_text,
+            json_path,
+        };
+        self.by_name_mut(table)?
+            .install_expression_index(meta, &index_path)?;
+        if let Err(error) = sync_directory(&self.data_dir) {
+            self.by_name_mut(table)?
+                .remove_expression_index_by_id(index_id);
+            let _ = fs::remove_file(&index_path);
+            return Err(error);
+        }
+
+        let previous_version = self.active_catalog_version;
+        let previous_next_id = self.next_index_id;
+        self.active_catalog_version = CATALOG_VERSION;
+        self.next_index_id = next_index_id;
+        if let Err(error) = self.persist() {
+            self.by_name_mut(table)?
+                .remove_expression_index_by_id(index_id);
+            self.active_catalog_version = previous_version;
+            self.next_index_id = previous_next_id;
+            let _ = fs::remove_file(&index_path);
+            let _ = sync_directory(&self.data_dir);
+            return Err(error);
+        }
+        Ok(index_id)
+    }
+
     /// Whether `table.column` has a UNIQUE index. Returns `Some(true)` for
     /// a unique index, `Some(false)` for a non-unique index, and `None`
     /// when the column is not indexed or the table is unknown.
@@ -1945,6 +2265,7 @@ impl Catalog {
                 let _ = fs::remove_file(&idx_path);
             }
         }
+        let expression_index_ids = table.expression_index_ids();
         // Swap-remove from the Vec and fix up name_to_slot.
         self.name_to_slot.remove(name);
         let last = self.tables.len() - 1;
@@ -1955,6 +2276,12 @@ impl Catalog {
         }
         self.tables.pop();
         self.persist()?;
+        for index_id in expression_index_ids {
+            let idx_path = self
+                .data_dir
+                .join(expression_index_file_name(name, index_id));
+            let _ = fs::remove_file(idx_path);
+        }
         Ok(())
     }
 
@@ -2086,6 +2413,9 @@ impl Catalog {
                     )
                 })?;
         }
+        let removed_expression_index_ids = self
+            .by_name_mut(table)?
+            .remove_expression_indexes_for_root(col_name);
         let barrier_lsn = if !self.wal.is_off() {
             let payload = encode_ddl_alter_drop_column(table, col_name);
             self.wal.append(0, WalRecordType::DdlDropColumn, &payload)?;
@@ -2134,6 +2464,12 @@ impl Catalog {
         }
 
         self.persist()?;
+        for index_id in removed_expression_index_ids {
+            let idx_path = self
+                .data_dir
+                .join(expression_index_file_name(table, index_id));
+            let _ = fs::remove_file(idx_path);
+        }
         Ok(())
     }
 }
@@ -2642,6 +2978,7 @@ pub(crate) struct IndexedColMeta {
 pub(crate) struct CatalogEntry {
     pub schema: Schema,
     pub indexed_cols: Vec<IndexedColMeta>,
+    pub expression_indexes: Vec<ExpressionIndexMeta>,
     /// Per-column defaults aligned to `schema.columns` by position. Empty when
     /// no column has a default (v1–v3 files always decode to empty).
     pub defaults: Vec<Option<Value>>,
@@ -2654,6 +2991,7 @@ pub(crate) struct CatalogEntry {
 pub(crate) struct CatalogEntryRef<'a> {
     pub schema: &'a Schema,
     pub indexed_cols: Vec<IndexedColMeta>,
+    pub expression_indexes: Vec<ExpressionIndexMeta>,
     pub defaults: &'a [Option<Value>],
     pub auto_cols: &'a [bool],
 }
@@ -2809,11 +3147,115 @@ fn decode_auto_section(data: &[u8], pos: &mut usize, n_cols: usize) -> Option<Ve
     Some(out)
 }
 
-fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Result<()> {
+fn push_catalog_string(out: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    let len = u32::try_from(value.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "catalog string is too large"))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn encode_expression_indexes(out: &mut Vec<u8>, indexes: &[ExpressionIndexMeta]) -> io::Result<()> {
+    let count = u16::try_from(indexes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many expression indexes on one table",
+        )
+    })?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for index in indexes {
+        out.extend_from_slice(&index.index_id.to_le_bytes());
+        out.push(u8::from(index.unique));
+        out.extend_from_slice(&index.canonical_version.to_le_bytes());
+        push_catalog_string(out, &index.canonical_text)?;
+        push_catalog_string(out, &index.json_path.column)?;
+        let segment_count = u16::try_from(index.json_path.segments.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JSON path has too many segments",
+            )
+        })?;
+        out.extend_from_slice(&segment_count.to_le_bytes());
+        for segment in &index.json_path.segments {
+            match segment {
+                StoredJsonPathSegmentV1::Key(key) => {
+                    out.push(1);
+                    push_catalog_string(out, key)?;
+                }
+                StoredJsonPathSegmentV1::Index(position) => {
+                    out.push(2);
+                    out.extend_from_slice(&position.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_expression_indexes(data: &[u8], pos: &mut usize) -> io::Result<Vec<ExpressionIndexMeta>> {
+    let count = read_u16(data, pos)? as usize;
+    let mut indexes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let index_id = read_u64(data, pos)?;
+        if index_id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expression index id must be non-zero",
+            ));
+        }
+        let unique = read_u8(data, pos)? != 0;
+        let canonical_version = read_u16(data, pos)?;
+        let canonical_len = read_u32(data, pos)? as usize;
+        let canonical_text = read_string(data, pos, canonical_len)?;
+        let column_len = read_u32(data, pos)? as usize;
+        let column = read_string(data, pos, column_len)?;
+        let segment_count = read_u16(data, pos)? as usize;
+        let mut segments = Vec::with_capacity(segment_count);
+        for _ in 0..segment_count {
+            match read_u8(data, pos)? {
+                1 => {
+                    let len = read_u32(data, pos)? as usize;
+                    segments.push(StoredJsonPathSegmentV1::Key(read_string(data, pos, len)?));
+                }
+                2 => segments.push(StoredJsonPathSegmentV1::Index(read_u32(data, pos)?)),
+                tag => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown stored JSON path segment tag: {tag}"),
+                    ));
+                }
+            }
+        }
+        indexes.push(ExpressionIndexMeta {
+            index_id,
+            unique,
+            canonical_version,
+            canonical_text,
+            json_path: StoredJsonPathV1 { column, segments },
+        });
+    }
+    Ok(indexes)
+}
+
+fn write_catalog_file(
+    path: &Path,
+    version: u16,
+    next_index_id: u64,
+    entries: &[CatalogEntryRef<'_>],
+) -> io::Result<()> {
+    if !(1..=CATALOG_VERSION).contains(&version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported catalog write version: {version}"),
+        ));
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     buf.extend_from_slice(CATALOG_MAGIC);
-    buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
+    buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    if version >= 6 {
+        buf.extend_from_slice(&next_index_id.to_le_bytes());
+    }
 
     for entry in entries {
         let schema = entry.schema;
@@ -2841,6 +3283,9 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
         encode_defaults_section(&mut buf, entry.defaults);
         // Per-table auto-increment columns (version 5).
         encode_auto_section(&mut buf, entry.auto_cols);
+        if version >= 6 {
+            encode_expression_indexes(&mut buf, &entry.expression_indexes)?;
+        }
     }
 
     // Append a CRC32 checksum of the entire payload so the reader can
@@ -2859,7 +3304,20 @@ fn write_catalog_file(path: &Path, entries: &[CatalogEntryRef<'_>]) -> io::Resul
     Ok(())
 }
 
-fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
+struct CatalogFile {
+    version: u16,
+    next_index_id: u64,
+    entries: Vec<CatalogEntry>,
+}
+
+fn read_catalog_file(path: &Path) -> io::Result<CatalogFile> {
+    read_catalog_file_with_max_version(path, CATALOG_VERSION)
+}
+
+fn read_catalog_file_with_max_version(
+    path: &Path,
+    max_supported_version: u16,
+) -> io::Result<CatalogFile> {
     let mut f = fs::File::open(path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
@@ -2907,7 +3365,7 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
     // version != 2 && version != CATALOG_VERSION` form silently rejected the
     // intermediate v3/v4 files when the constant moved to 5, which would have
     // failed to open a v0.6.x database on upgrade (data loss).
-    if version == 0 || version > CATALOG_VERSION {
+    if version == 0 || version > max_supported_version {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported catalog version: {version}"),
@@ -2919,6 +3377,18 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog header"))?,
     ) as usize;
     pos += 4;
+    let next_index_id = if version >= 6 {
+        let id = read_u64(buf, &mut pos)?;
+        if id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "catalog next index id must be non-zero",
+            ));
+        }
+        id
+    } else {
+        1
+    };
 
     // Don't size an allocation from an unvalidated count: a corrupt or hostile
     // catalog could claim billions of tables and make the `Vec::with_capacity`
@@ -3002,18 +3472,79 @@ fn read_catalog_file(path: &Path) -> io::Result<Vec<CatalogEntry>> {
             Vec::new()
         };
 
+        let expression_indexes = if version >= 6 {
+            decode_expression_indexes(buf, &mut pos)?
+        } else {
+            Vec::new()
+        };
+
         entries.push(CatalogEntry {
             schema: Schema {
                 table_name,
                 columns,
             },
             indexed_cols,
+            expression_indexes,
             defaults,
             auto_cols,
         });
     }
 
-    Ok(entries)
+    let mut seen_index_ids = FxHashMap::default();
+    let mut max_index_id = 0;
+    for entry in &entries {
+        for index in &entry.expression_indexes {
+            if index.canonical_version == 0 || index.canonical_text.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expression index has invalid canonical identity",
+                ));
+            }
+            if index.canonical_version == 1
+                && index.canonical_text != index.json_path.canonical_text()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expression index canonical identity does not match its JSON path",
+                ));
+            }
+            let Some(root) = entry
+                .schema
+                .columns
+                .iter()
+                .find(|column| column.name == index.json_path.column)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expression index JSON root is absent from its table",
+                ));
+            };
+            if root.type_id != TypeId::Json {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expression index root column is not JSON",
+                ));
+            }
+            if seen_index_ids.insert(index.index_id, ()).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate expression index id in catalog",
+                ));
+            }
+            max_index_id = max_index_id.max(index.index_id);
+        }
+    }
+    if next_index_id <= max_index_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalog next index id does not exceed persisted index ids",
+        ));
+    }
+    Ok(CatalogFile {
+        version,
+        next_index_id,
+        entries,
+    })
 }
 
 fn read_u8(buf: &[u8], pos: &mut usize) -> io::Result<u8> {
@@ -3057,6 +3588,21 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> io::Result<u32> {
     *pos += 4;
     Ok(v)
 }
+fn read_u64(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
+    if *pos + 8 > buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated catalog",
+        ));
+    }
+    let value = u64::from_le_bytes(
+        buf[*pos..*pos + 8]
+            .try_into()
+            .expect("bounds checked above"),
+    );
+    *pos += 8;
+    Ok(value)
+}
 fn read_string(buf: &[u8], pos: &mut usize, len: usize) -> io::Result<String> {
     if *pos + len > buf.len() {
         return Err(io::Error::new(
@@ -3094,6 +3640,37 @@ mod tests {
     fn temp_catalog(name: &str) -> Catalog {
         let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
+    }
+
+    #[test]
+    fn v5_reader_rejects_v6_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "Doc".into(),
+                columns: vec![ColumnDef {
+                    name: "data".into(),
+                    type_id: TypeId::Json,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        let path =
+            StoredJsonPathV1::new("data", vec![StoredJsonPathSegmentV1::Key("author".into())]);
+        catalog
+            .create_expression_index_metadata("Doc", 1, path.canonical_text(), path, false)
+            .unwrap();
+        let result = read_catalog_file_with_max_version(
+            &dir.path().join(CATALOG_FILE),
+            LEGACY_CATALOG_VERSION,
+        );
+        let error = match result {
+            Ok(_) => panic!("a v5 reader must reject v6 before decoding its payload"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported catalog version: 6"));
     }
 
     fn schema_two_cols() -> Schema {
@@ -3284,8 +3861,9 @@ mod tests {
                 std::process::id()
             ));
             write_legacy_catalog(&path, version);
-            let entries = read_catalog_file(&path)
+            let catalog_file = read_catalog_file(&path)
                 .unwrap_or_else(|e| panic!("version {version} catalog must load, got: {e}"));
+            let entries = catalog_file.entries;
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].schema.table_name, "T");
             assert_eq!(entries[0].schema.columns.len(), 2);
@@ -3311,7 +3889,8 @@ mod tests {
         buf.extend_from_slice(CATALOG_MAGIC);
         buf.extend_from_slice(&CATALOG_VERSION.to_le_bytes());
         buf.extend_from_slice(&1000u32.to_le_bytes()); // claims 1000 tables…
-                                                       // …but no table data follows (payload is only 10 bytes).
+        buf.extend_from_slice(&1u64.to_le_bytes()); // valid v6 next-index id
+                                                    // …but no table data follows.
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
         let path =
