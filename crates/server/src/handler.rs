@@ -2761,16 +2761,12 @@ mod tests {
         );
     }
 
-    // TODO(v0.12, Lane B): `describe <Type>` renders a json column's type as the
-    // bareword "json" over the wire. The rendering side is already correct:
-    // introspect_describe emits type_id_to_name(TypeId::Json) = "json"
-    // (crates/query/src/executor/compiled.rs) as a Str cell, which flows through
-    // value_to_display unchanged. This test stays #[ignore] until Lane B teaches
-    // type_name_to_id to accept "json" so `type Doc { body: json }` can be
-    // created; today that DDL is rejected with "unknown type name: 'json'".
-    // Un-ignore (delete the attribute) once Lane B's DDL keyword lands.
+    // `describe <Type>` renders a json column's type as the bareword "json"
+    // over the wire. introspect_describe emits type_id_to_name(TypeId::Json) =
+    // "json" (crates/query/src/executor/compiled.rs) as a Str cell, which flows
+    // through value_to_display unchanged; Lane B's DDL keyword makes `type Doc
+    // { body: json }` accepted, so this runs end to end (v0.12, Lane D).
     #[test]
-    #[ignore = "blocked on Lane B: type_name_to_id must accept the json DDL keyword"]
     fn describe_shows_json_type_over_the_wire() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(dir.path()).unwrap();
