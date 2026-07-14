@@ -2712,6 +2712,87 @@ mod tests {
         );
     }
 
+    // ---- JSON (v0.12): canonical-text wire rendering + parse-error passthrough ----
+
+    #[test]
+    fn json_cell_renders_canonical_text_on_wire() {
+        // A Json value flows through the same string-cell path as every other
+        // value (value_to_display -> Value::to_wire_string). PJ1 is canonical,
+        // so keys come back sorted bytewise regardless of input order and the
+        // client receives parseable JSON text with no protocol change.
+        let pj1 = powdb_storage::pj1::parse_json_text(r#"{"b":2,"a":1,"nested":{"z":true}}"#)
+            .expect("valid JSON");
+        let result = QueryResult::Rows {
+            columns: vec!["doc".into()],
+            rows: vec![vec![Value::Json(pj1.into())]],
+        };
+        match query_result_to_message(result).expect("encodes") {
+            Message::ResultRows { columns, rows } => {
+                assert_eq!(columns, vec!["doc"]);
+                assert_eq!(
+                    rows,
+                    vec![vec![r#"{"a":1,"b":2,"nested":{"z":true}}"#.to_string()]]
+                );
+            }
+            other => panic!("expected ResultRows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_parse_error_surfaces_to_remote_clients() {
+        // Lane B rejects invalid JSON on insert as QueryError::TypeError, whose
+        // Display is "type mismatch: <detail>" (crates/query/src/result.rs).
+        // That prefix is allowlisted, so the actionable detail reaches the
+        // client instead of the generic "query execution error". The raw
+        // storage-layer phrasing ("invalid JSON: ...") is also allowlisted as
+        // defense-in-depth. Internal PJ1 corruption ("malformed PJ1: ...") is
+        // deliberately NOT allowlisted: it leaks storage internals and never
+        // occurs on the client-driven insert path.
+        for msg in [
+            "type mismatch: invalid JSON: unexpected character 'x' at position 3",
+            "invalid JSON: nesting exceeds depth cap 128",
+        ] {
+            assert_eq!(sanitize_error(msg), msg, "should pass through verbatim");
+        }
+        assert_eq!(
+            sanitize_error("malformed PJ1: truncated"),
+            "query execution error",
+            "internal storage corruption must stay masked"
+        );
+    }
+
+    // TODO(v0.12, Lane B): `describe <Type>` renders a json column's type as the
+    // bareword "json" over the wire. The rendering side is already correct:
+    // introspect_describe emits type_id_to_name(TypeId::Json) = "json"
+    // (crates/query/src/executor/compiled.rs) as a Str cell, which flows through
+    // value_to_display unchanged. This test stays #[ignore] until Lane B teaches
+    // type_name_to_id to accept "json" so `type Doc { body: json }` can be
+    // created; today that DDL is rejected with "unknown type name: 'json'".
+    // Un-ignore (delete the attribute) once Lane B's DDL keyword lands.
+    #[test]
+    #[ignore = "blocked on Lane B: type_name_to_id must accept the json DDL keyword"]
+    fn describe_shows_json_type_over_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type Doc { required id: int, body: json }")
+            .expect("json column DDL should be accepted once Lane B lands");
+        let result = engine.execute_powql("describe Doc").expect("describe runs");
+        let msg = query_result_to_message(result).expect("encodes");
+        match msg {
+            Message::ResultRows { columns, rows } => {
+                assert_eq!(columns[1], "type");
+                // The `body` column's type cell must be the bareword "json".
+                let body = rows
+                    .iter()
+                    .find(|r| r[0] == "body")
+                    .expect("body column present");
+                assert_eq!(body[1], "json");
+            }
+            other => panic!("expected ResultRows, got {other:?}"),
+        }
+    }
+
     // ---- Named-database gate (P-10) ----
 
     #[test]
