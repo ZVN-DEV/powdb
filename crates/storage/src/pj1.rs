@@ -879,8 +879,17 @@ fn cmp_numeric(a: Num, b: Num) -> Ordering {
     match (a, b) {
         (Num::Int(x), Num::Int(y)) => x.cmp(&y),
         (Num::Float(x), Num::Float(y)) => x.total_cmp(&y),
-        (Num::Int(x), Num::Float(y)) => (x as f64).total_cmp(&y),
-        (Num::Float(x), Num::Int(y)) => x.total_cmp(&(y as f64)),
+        // Cross-type comparisons promote to f64 and, when numerically tied,
+        // tie-break by tag (int before float). Without the tie-break,
+        // pj1_cmp(1, 1.0) == Equal while their canonical bytes differ, which
+        // breaks the Ord/Eq contract on Value::Json: order/min/max would call
+        // documents equal that group/distinct/= call distinct. The tie-break
+        // makes pj1_cmp a true total order under byte identity: Equal iff
+        // canonical bytes are equal. Lexicographic (promoted f64, tag, exact
+        // value) is transitive; the f64 promotion precision cliff at 2^53 is
+        // documented and shared with engine-wide Value::cmp.
+        (Num::Int(x), Num::Float(y)) => (x as f64).total_cmp(&y).then(Ordering::Less),
+        (Num::Float(x), Num::Int(y)) => x.total_cmp(&(y as f64)).then(Ordering::Greater),
     }
 }
 
@@ -1269,9 +1278,14 @@ mod tests {
     fn total_order_numeric_across_types() {
         let a = parse_json_text("1").unwrap();
         let b = parse_json_text("1.0").unwrap();
-        // Numerically equal across int/float even though bytes differ.
-        assert_eq!(pj1_cmp(&a, &b), Ordering::Equal);
+        // Numerically tied across int/float, so the tag tie-break decides:
+        // int before float. Equal is reserved for byte-equal documents so the
+        // Ord/Eq contract on Value::Json holds.
+        assert_eq!(pj1_cmp(&a, &b), Ordering::Less);
+        assert_eq!(pj1_cmp(&b, &a), Ordering::Greater);
         let c = parse_json_text("2").unwrap();
         assert_eq!(pj1_cmp(&b, &c), Ordering::Less);
+        // Byte-equal documents are the only Equal.
+        assert_eq!(pj1_cmp(&a, &a), Ordering::Equal);
     }
 }

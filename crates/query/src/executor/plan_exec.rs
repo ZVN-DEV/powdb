@@ -4020,7 +4020,7 @@ fn json_path_base_error(
     match resolve_scan_type(&name, scope) {
         Some(TypeId::Json) | None => None,
         Some(other) => Some(format!(
-            "type mismatch: '{}' is a {} column, not json — the '->' path operator requires a json column",
+            "'{}' is a {} column, not json: the '->' path operator requires a json column",
             name,
             type_id_to_name(other)
         )),

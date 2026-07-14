@@ -234,7 +234,10 @@ Canonicalization (permanent semantics): object keys sorted bytewise (insertion o
 preserved); duplicate keys last-wins, deduplicated at encode; int/float distinction kept
 from input text; total order null < false < true < numbers < strings < arrays < objects,
 defined once and used for min/max, index keys, and group keys. Equal documents have
-equal bytes. Floats are f64 (documented precision limits; reserved tag space is the
+equal bytes, and (refined at v0.12 implementation) the converse holds too: pj1_cmp
+returns Equal ONLY for byte-equal documents. Numerically tied int/float pairs (1 vs
+1.0, and promoted ties at the 2^53 f64 precision cliff) break the tie by tag, int
+before float, keeping Ord consistent with byte Eq/Hash everywhere. Floats are f64 (documented precision limits; reserved tag space is the
 decimal escape). Insert validation rejects invalid JSON/UTF-8 with a typed error and
 enforces a depth cap. Encoder/decoder are hand-rolled in the storage crate (engine-owned,
 no serde_json in the runtime; differential tests against a dev-dependency parser are fine).
@@ -473,8 +476,12 @@ Benchmarks (powdb-bench + powdb-compare, Depot-only baselines per standing polic
   containment/GIN-style indexes (expression B-trees only), arbitrary-precision numerics.
 - General VACUUM or tombstone compaction (sweep reclaims overflow pages only).
 - Per-cell typed wire protocol now; Postgres/MySQL wire compatibility (standing rule).
-- Grouping BY a JSON path expression (fast-follow once Expr-valued group keys are
-  designed; aggregating OVER a JSON path works via the 5.1 extraction machinery).
+- Grouping BY a JSON path expression AND aggregating OVER a JSON path (both need
+  Expr-valued keys/inners in the aggregate machinery; the 5.1 extraction machinery
+  handles Field/QualifiedField only. CORRECTED at v0.12 implementation: the original
+  claim that agg-over-path "works via 5.1" was wrong. Both are v0.13 fast-follows
+  alongside symmetric aggregates; in v0.12 both fail loudly as
+  "aggregate function in an unsupported position" / a parse error, never silently).
 
 ## 11. Sign-off checklist
 

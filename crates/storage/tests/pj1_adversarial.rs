@@ -120,33 +120,38 @@ fn a_unicode_keys_sort_bytewise_which_equals_codepoint_order() {
 
 #[test]
 fn b_int_and_float_compare_numerically_but_signed_zero_splits() {
-    // 1 == 1.0 numerically across the int/float split.
-    assert_eq!(pj1_cmp(&enc("1"), &enc("1.0")), Ordering::Equal);
-    // int 0 == float 0.0.
-    assert_eq!(pj1_cmp(&enc("0"), &enc("0.0")), Ordering::Equal);
-    // But -0.0 and 0.0 are BOTH floats compared with total_cmp, which
+    // 1 and 1.0 are numerically tied across the int/float split; the tag
+    // tie-break orders int BEFORE float so Equal is reserved for byte-equal
+    // documents (the Ord/Eq contract on Value::Json).
+    assert_eq!(pj1_cmp(&enc("1"), &enc("1.0")), Ordering::Less);
+    assert_eq!(pj1_cmp(&enc("1.0"), &enc("1")), Ordering::Greater);
+    // int 0 vs float 0.0: same tie-break.
+    assert_eq!(pj1_cmp(&enc("0"), &enc("0.0")), Ordering::Less);
+    // -0.0 and 0.0 are BOTH floats compared with total_cmp, which
     // distinguishes the sign bit: -0.0 < 0.0. (Deliberate: pj1_cmp mirrors
-    // Value::cmp, whose float arm is total_cmp. It is a total order, not a
-    // numeric-equality relation, which is exactly what index/group keys need.)
+    // Value::cmp, whose float arm is total_cmp. It is a total order under
+    // byte identity, which is exactly what index/group keys need.)
     assert_eq!(pj1_cmp(&enc("-0.0"), &enc("0.0")), Ordering::Less);
-    // int 0 promotes to +0.0, so it is GREATER than float -0.0.
+    // int 0 promotes to +0.0, so it is GREATER than float -0.0 (no tie).
     assert_eq!(pj1_cmp(&enc("0"), &enc("-0.0")), Ordering::Greater);
-    // Consistency: the -0 integer literal canonicalizes to 0, so it equals 0.0.
-    assert_eq!(pj1_cmp(&enc("-0"), &enc("0.0")), Ordering::Equal);
+    // The -0 integer literal canonicalizes to int 0: numerically tied with
+    // float 0.0, int-before-float.
+    assert_eq!(pj1_cmp(&enc("-0"), &enc("0.0")), Ordering::Less);
 }
 
 #[test]
 fn b_precision_cliff_around_two_pow_53() {
     // 2^53 and 2^53+1 both fit i64. Promoting the int to f64 rounds 2^53+1 down
-    // to 2^53, so the int compares EQUAL to the float 2^53. This is the
-    // documented "i64 as f64 loses precision above 2^53 but stays monotonic"
-    // behaviour; pin it so a future change to the numeric ladder is caught.
+    // to 2^53, so the pair is a PROMOTED TIE and the tag tie-break decides:
+    // int before float. This is the documented "i64 as f64 loses precision
+    // above 2^53 but stays monotonic" behaviour plus the byte-identity
+    // tie-break; pin it so a future change to the numeric ladder is caught.
     let int_hi = enc("9007199254740993"); // 2^53 + 1
     let float_53 = enc("9007199254740992.0"); // 2^53 exactly
     assert_eq!(
         pj1_cmp(&int_hi, &float_53),
-        Ordering::Equal,
-        "2^53+1 (i64) rounds to 2^53 (f64) on promotion"
+        Ordering::Less,
+        "2^53+1 (i64) rounds to 2^53 (f64) on promotion, then int-before-float"
     );
     // Well below the cliff the comparison is exact.
     assert_eq!(pj1_cmp(&enc("3"), &enc("2.0")), Ordering::Greater);

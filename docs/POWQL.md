@@ -1075,6 +1075,23 @@ Post filter .id = 1 { sub: .data->author }
 -- {"name":"Ada"}
 ```
 
+### Current limitations
+
+- **Aggregating over a path** (`sum(.data->price)`) and **grouping or ordering
+  by a path** (`group .data->cat`) are not supported yet; both fail with a
+  clear error rather than returning wrong results. Extract with a projection
+  and aggregate client-side for now. Both are planned alongside the JSON path
+  index support in an upcoming release.
+- **Ordering whole `json` columns** uses a total order (null < false < true <
+  numbers < strings < arrays < objects). Numerically tied int/float values
+  (`1` vs `1.0`) order deterministically with the int first; only byte-equal
+  documents compare equal, so ordering, grouping, and equality always agree.
+- **`json_type()` over the network cannot distinguish JSON `null` from a
+  missing path.** The current wire format renders both a null cell and the
+  string `"null"` identically, so remote clients (CLI `-r`, the TS client) see
+  NULL for both. Embedded (in-process) use distinguishes them correctly. A
+  typed wire surface that fixes this is planned for an upcoming release.
+
 ---
 
 ## Mutations

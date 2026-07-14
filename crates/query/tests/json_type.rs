@@ -288,13 +288,25 @@ fn path_on_non_json_column_is_a_typed_error() {
     );
     // `.id` is an int column; a `->` on it is a type error, not a silent Empty.
     let err = engine.execute_powql("Post filter .id->x = 1").unwrap_err();
-    match err {
+    match &err {
         QueryError::TypeError(msg) => {
-            assert!(msg.starts_with("type mismatch"), "safe prefix, got: {msg}");
             assert!(msg.contains("not json"), "names the problem, got: {msg}");
+            // The prefix must not be duplicated inside the variant: Display
+            // adds exactly one "type mismatch: " for the wire allowlist.
+            assert!(
+                !msg.contains("type mismatch"),
+                "prefix belongs to Display, not the message: {msg}"
+            );
         }
         other => panic!("expected a TypeError, got {other:?}"),
     }
+    // What actually reaches the wire sanitizer is the Display form: exactly
+    // one safe prefix.
+    let rendered = err.to_string();
+    assert!(
+        rendered.starts_with("type mismatch: '") && !rendered[15..].contains("type mismatch"),
+        "single wire-safe prefix, got: {rendered}"
+    );
 }
 
 #[test]

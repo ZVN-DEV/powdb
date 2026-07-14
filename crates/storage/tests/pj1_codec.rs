@@ -201,11 +201,18 @@ fn total_order_reflexive_and_transitive() {
 
 #[test]
 fn numeric_equality_across_int_float() {
-    // int 1 and float 1.0 are numerically equal even though bytes differ.
+    // int 1 and float 1.0 are numerically tied but their bytes differ, so the
+    // tag tie-break (int before float) keeps Ord consistent with byte Eq:
+    // Equal is reserved for byte-equal documents.
     let i = parse_json_text("1").unwrap();
     let f = parse_json_text("1.0").unwrap();
     assert_ne!(i, f, "distinct encodings");
-    assert_eq!(pj1_cmp(&i, &f), Ordering::Equal, "numerically equal");
+    assert_eq!(
+        pj1_cmp(&i, &f),
+        Ordering::Less,
+        "numeric tie breaks int-first"
+    );
+    assert_eq!(pj1_cmp(&f, &i), Ordering::Greater, "antisymmetric");
 }
 
 // ─── zero-alloc path walk ────────────────────────────────────────────────────

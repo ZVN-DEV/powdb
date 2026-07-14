@@ -723,8 +723,11 @@ fn rewrite_agg_expr(expr: &mut Expr, aggs: &mut Vec<GroupAgg>, counter: &mut usi
             // else (a nested expression, another aggregate) is left as a
             // `FunctionCall`, which the executor's validation guard rejects as
             // an unsupported position rather than silently evaluating it to
-            // Empty (a wrong answer). JsonPath inners land here too once the
-            // v0.12 grammar exists; they will be added alongside that feature.
+            // Empty (a wrong answer). JsonPath inners (sum(.data->price)) are
+            // NOT extracted here: GroupAgg is keyed by column name end to end,
+            // so aggregating over a path needs Expr-valued aggregate inners.
+            // That lands in v0.13 with symmetric aggregates; until then such
+            // queries fail loudly via the unsupported-position guard.
             let field_name = match inner.as_ref() {
                 Expr::Field(name) => Some(name.clone()),
                 Expr::QualifiedField { qualifier, field } => Some(format!("{qualifier}.{field}")),
