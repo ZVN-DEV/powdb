@@ -6,6 +6,7 @@ pub mod error;
 pub mod format;
 pub mod heap;
 pub mod page;
+pub mod pj1;
 pub mod row;
 pub mod table;
 pub mod types;
