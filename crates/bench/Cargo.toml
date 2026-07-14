@@ -24,6 +24,14 @@ path = "src/smoke.rs"
 name = "compare"
 path = "src/bin/compare.rs"
 
+# Standalone JSON-path-filter workload (design 4.4, B2). NOT part of the
+# criterion regression gate or baseline/main.json (Depot-only policy): it just
+# prints measured latency/throughput for the compiled inline leaf vs the decode
+# fallback vs a flat-column ceiling. Run: `cargo run --release -p powdb-bench --bin json-filter`.
+[[bin]]
+name = "json-filter"
+path = "src/bin/json_filter.rs"
+
 [[bench]]
 name = "storage"
 harness = false

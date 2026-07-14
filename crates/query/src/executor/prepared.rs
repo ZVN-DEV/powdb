@@ -141,13 +141,16 @@ impl Engine {
                     .collect();
                 let indices = indices?;
                 // The fast path writes each literal verbatim with no
-                // `coerce_value`, so a plain string into a uuid/bytes column
-                // would store a raw `Value::Str` — silent typed corruption.
-                // Fall back to the generic (coercing) path for those columns.
-                if indices
-                    .iter()
-                    .any(|&i| matches!(schema.columns[i].type_id, TypeId::Uuid | TypeId::Bytes))
-                {
+                // `coerce_value`, so a plain string into a uuid/bytes/json
+                // column would store a raw `Value::Str` — silent typed
+                // corruption (and, for json, invalid PJ1). Fall back to the
+                // generic (coercing, validating) path for those columns.
+                if indices.iter().any(|&i| {
+                    matches!(
+                        schema.columns[i].type_id,
+                        TypeId::Uuid | TypeId::Bytes | TypeId::Json
+                    )
+                }) {
                     None
                 } else {
                     Some(InsertFast {

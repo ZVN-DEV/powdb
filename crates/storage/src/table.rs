@@ -647,7 +647,8 @@ impl Table {
                 .expect("plan_spill only returns var columns");
             let bytes: Vec<u8> = match &values[col_idx] {
                 Value::Str(s) => s.as_bytes().to_vec(),
-                Value::Bytes(b) => b.clone(),
+                Value::Bytes(b) => b.to_vec(),
+                Value::Json(b) => b.to_vec(),
                 _ => continue,
             };
             if bytes.len() > MAX_VALUE_SIZE {
@@ -930,6 +931,7 @@ impl Table {
             let val = match schema.columns[entry.col_idx].type_id {
                 TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
                 TypeId::Bytes => Value::Bytes(bytes),
+                TypeId::Json => Value::Json(bytes.into()),
                 _ => continue,
             };
             if entry.unique {
@@ -1158,6 +1160,7 @@ impl Table {
             let v = match schema.columns[indexed_cols[slot_i].col_idx].type_id {
                 TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
                 TypeId::Bytes => Value::Bytes(bytes),
+                TypeId::Json => Value::Json(bytes.into()),
                 _ => continue,
             };
             entries_per_index[slot_i].push((v, rid));

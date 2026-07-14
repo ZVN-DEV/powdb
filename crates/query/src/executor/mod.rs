@@ -264,8 +264,8 @@ pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
     exec_group_by, execute_window, format_plan_tree, hash_join, lower_unindexed_scans,
-    range_matches, synthesize_range_predicate, try_extract_equi_join_keys,
-    validate_no_stray_aggregates,
+    predicate_column_indices_json, range_matches, synthesize_range_predicate,
+    try_extract_equi_join_keys, validate_json_path_types, validate_no_stray_aggregates,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -963,6 +963,7 @@ impl Engine {
         // Mirror the mutable path: reject a stray aggregate FunctionCall before
         // evaluating any row (see execute_plan for the rationale).
         validate_no_stray_aggregates(plan)?;
+        validate_json_path_types(&self.catalog, plan)?;
         match plan {
             PlanNode::SeqScan { table } => {
                 // Dirty view means we'd need to refresh it — can't do that
@@ -1255,7 +1256,7 @@ impl Engine {
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         } else {
-                            let pred_cols = predicate_column_indices(predicate, &columns);
+                            let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
                                 .for_each_row_raw(table, |_rid, data| {
                                     let pred_row =
@@ -1621,7 +1622,7 @@ impl Engine {
                                     return Ok(QueryResult::Scalar(Value::Int(count)));
                                 }
 
-                                let pred_cols = predicate_column_indices(predicate, &columns);
+                                let pred_cols = predicate_column_indices_json(predicate, &columns);
                                 let mut count: i64 = 0;
                                 self.catalog
                                     .for_each_row_raw(table, |_rid, data| {

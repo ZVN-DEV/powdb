@@ -298,21 +298,31 @@ import { Client } from "@zvndev/powdb-client";
 const client = await Client.connect({ host: "localhost", port: 5433 });
 
 const rows = await client.queryTyped(
-  "User { .id, .name, .age, .active, .created_at }",
+  "User { .id, .name, .age, .active, .created_at, .prefs }",
   {
     id: "int",        // number — or bigint if > Number.MAX_SAFE_INTEGER
     age: "int",
     active: "bool",
     created_at: "datetime",
+    prefs: "json",    // parsed with JSON.parse into an object/array/scalar
     // columns not in the schema (like `name`) pass through as strings
   },
 );
 
 rows[0].age;         // typeof number
 rows[0].created_at;  // instanceof Date
+rows[0].prefs;       // parsed JSON value (object, array, or scalar)
 ```
 
-Supported column types: `int` | `float` | `bool` | `str` | `datetime` | `uuid`.
+Supported column types: `int` | `float` | `bool` | `str` | `datetime` | `uuid` | `json`.
+
+`json` columns render as canonical JSON text on the wire (keys sorted
+bytewise, no whitespace) and are parsed with `JSON.parse`. A JSON `null`
+document decodes to `null`. Unlike the other typed columns, a parse failure
+does not throw: it returns the raw string, so a malformed or non-canonical
+cell can never turn a readable result into an exception (canonical server
+output always parses, so this fallback is inert in normal use).
+
 Bytes columns are intentionally unsupported (the wire format is lossy —
 it renders `<N bytes>`) and throw on coercion. Declare `str` if you just
 want the placeholder.

@@ -29,6 +29,8 @@ Supported expressions include literals, column references, qualified join refere
 
 The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, SQL `BETWEEN`, and column-projected `RETURNING a, b` (only `RETURNING *` is supported, because PowQL's `returning` is all-columns). Use native PowQL for those shapes until the SQL subset is expanded.
 
+The SQL JSON path operators `->` and `->>` are not yet part of the SQL frontend; they arrive in a later release. Until then, use native PowQL's `->` operator (see [JSON Documents](POWQL.md#json-documents)) to query `json` columns.
+
 > **Where you see the explicit message.** These detailed messages reach
 > **embedded** callers — the Rust `Engine::execute_sql` / `execute_sql_readonly`
 > API and the in-process `@zvndev/powdb-embedded` Node addon, which propagate the

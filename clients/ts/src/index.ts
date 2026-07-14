@@ -38,7 +38,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.11.0";
+export const CLIENT_VERSION = "0.12.0";
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
@@ -1470,4 +1470,5 @@ export type {
   TypedSchema,
   TypedRow,
   Coerced,
+  JsonValue,
 } from "./typed.js";

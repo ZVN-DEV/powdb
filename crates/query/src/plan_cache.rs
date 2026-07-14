@@ -456,6 +456,10 @@ fn count_expr(expr: &Expr, n: &mut usize) {
                 count_expr(a, n);
             }
         }
+        // JSON path segments are STRUCTURAL, never literal slots (#137): only
+        // the base can carry literals (it can't today — it is a Field — but
+        // recursing keeps this correct if the base grammar ever widens).
+        Expr::JsonPath { base, .. } => count_expr(base, n),
         // Runtime-only literal (correlated/subquery substitution); never
         // reaches the plan cache, and it occupies no source literal slot.
         Expr::ValueLit(_) => {}
@@ -520,6 +524,9 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
                 substitute_expr(a, literals, idx);
             }
         }
+        // JSON path segments are STRUCTURAL (#137): substitution only recurses
+        // into the base, mirroring `count_expr`, so the slot walk stays aligned.
+        Expr::JsonPath { base, .. } => substitute_expr(base, literals, idx),
         // Runtime-only literal (correlated/subquery substitution); never
         // reaches the plan cache, so there is nothing to substitute.
         Expr::ValueLit(_) => {}
@@ -656,6 +663,70 @@ mod tests {
             "new HAVING literal substituted"
         );
         assert_eq!(cache.hits, 1);
+    }
+
+    #[test]
+    fn json_path_slot_count_invariant() {
+        // #137 property: over path-bearing queries, count_literal_slots(plan)
+        // must equal the source literal count from canonicalize. Path segments
+        // (keys and array indexes) are structural and must not inflate either
+        // side, so the plan is cacheable.
+        for q in [
+            r#"Post filter .data->author->name = "x""#,
+            r#"Post filter .data->tags->0 = "rust""#,
+            r#"Post filter .data->age > 21 and .data->year = 2026"#,
+            r#"Post filter .data->"weird key" = 1 { .id }"#,
+            r#"Post { author: .data->author, first_tag: .data->tags->0 }"#,
+        ] {
+            let (_, lits) = canonicalize(q).unwrap();
+            let plan = planner::plan(q).unwrap();
+            assert_eq!(
+                count_literal_slots(&plan),
+                lits.len(),
+                "slot count must equal source literal count for `{q}`"
+            );
+        }
+    }
+
+    #[test]
+    fn json_path_plan_round_trips_cache() {
+        // A path-bearing query caches on first call and, on a second call with
+        // a DIFFERENT comparison literal but the SAME path, hits the cache and
+        // substitutes the new literal (no panic, no stale value).
+        let mut cache = PlanCache::new(100);
+        let q1 = r#"Post filter .data->age > 21"#;
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        let p1 = planner::plan(q1).unwrap();
+        assert_eq!(count_literal_slots(&p1), lits1.len());
+        cache.insert(h1, p1, lits1.len());
+        assert_eq!(cache.len(), 1, "path plan must cache");
+
+        let q2 = r#"Post filter .data->age > 65"#;
+        let (h2, lits2) = canonicalize(q2).unwrap();
+        assert_eq!(h1, h2, "same path, different literal → same hash");
+        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+
+        let mut found = Vec::new();
+        collect_literals_for_test(&plan, &mut found);
+        assert_eq!(found, vec![Literal::Int(65)], "new literal substituted");
+        assert_eq!(cache.hits, 1);
+    }
+
+    #[test]
+    fn json_path_different_path_is_a_cache_miss() {
+        let mut cache = PlanCache::new(100);
+        let q1 = r#"Post filter .data->age > 21"#;
+        let (h1, lits1) = canonicalize(q1).unwrap();
+        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+
+        // Different key → different shape → miss (would otherwise serve a plan
+        // that walks the wrong path).
+        let q2 = r#"Post filter .data->year > 21"#;
+        let (h2, lits2) = canonicalize(q2).unwrap();
+        assert!(
+            cache.get_with_substitution(h2, &lits2).is_none(),
+            "a different path must not hit the cached plan"
+        );
     }
 
     #[test]
@@ -926,6 +997,9 @@ mod tests {
                     collect_expr_literals(a, out);
                 }
             }
+            // JSON path segments are structural, never literals — mirror
+            // count_expr/substitute_expr and recurse into the base only.
+            Expr::JsonPath { base, .. } => collect_expr_literals(base, out),
             Expr::ValueLit(_) => {}
             Expr::Null => {}
         }

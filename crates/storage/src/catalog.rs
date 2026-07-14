@@ -2301,7 +2301,8 @@ fn encode_row_with_spill_logged(
             .expect("plan_spill only returns var columns");
         let bytes: Vec<u8> = match &values[col_idx] {
             Value::Str(s) => s.as_bytes().to_vec(),
-            Value::Bytes(b) => b.clone(),
+            Value::Bytes(b) => b.to_vec(),
+            Value::Json(b) => b.to_vec(),
             _ => continue,
         };
         let stub = write_overflow_chain_logged(&mut tbl.heap, wal, &table_name, tx_id, &bytes)?;
@@ -2678,6 +2679,10 @@ fn encode_value_blob(out: &mut Vec<u8>, v: &Value) {
             out.extend_from_slice(&(b.len() as u32).to_le_bytes());
             out.extend_from_slice(b);
         }
+        Value::Json(b) => {
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
         Value::Empty => {}
     }
 }
@@ -2716,6 +2721,10 @@ fn decode_value_blob(data: &[u8], pos: &mut usize) -> Option<Value> {
         TypeId::Bytes => {
             let len = u32::from_le_bytes(take_fixed(pos, 4)?.try_into().ok()?) as usize;
             Some(Value::Bytes(take_fixed(pos, len)?))
+        }
+        TypeId::Json => {
+            let len = u32::from_le_bytes(take_fixed(pos, 4)?.try_into().ok()?) as usize;
+            Some(Value::Json(take_fixed(pos, len)?.into()))
         }
     }
 }
@@ -3071,6 +3080,7 @@ fn type_id_from_u8(v: u8) -> io::Result<TypeId> {
         5 => Ok(TypeId::DateTime),
         6 => Ok(TypeId::Uuid),
         7 => Ok(TypeId::Bytes),
+        8 => Ok(TypeId::Json),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown type id: {v}"),

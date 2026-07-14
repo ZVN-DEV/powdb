@@ -13,6 +13,9 @@ pub enum TypeId {
     DateTime = 5,
     Uuid = 6,
     Bytes = 7,
+    /// Canonical binary JSON (PJ1). Variable-length like `Str`/`Bytes`, so it
+    /// participates in row v2 overflow spill. See [`crate::pj1`].
+    Json = 8,
 }
 
 impl TypeId {
@@ -27,6 +30,7 @@ impl TypeId {
             5 => Some(TypeId::DateTime),
             6 => Some(TypeId::Uuid),
             7 => Some(TypeId::Bytes),
+            8 => Some(TypeId::Json),
             _ => None,
         }
     }
@@ -42,6 +46,9 @@ pub enum Value {
     DateTime(i64), // microseconds since Unix epoch
     Uuid([u8; 16]),
     Bytes(Vec<u8>),
+    /// Canonical PJ1 (binary JSON) bytes. Rendered as canonical JSON text on
+    /// the wire; ordered by the PJ1 total order. See [`crate::pj1`].
+    Json(Box<[u8]>),
     Empty, // {} — the empty set, not NULL
 }
 
@@ -55,6 +62,7 @@ impl Value {
             Value::DateTime(_) => TypeId::DateTime,
             Value::Uuid(_) => TypeId::Uuid,
             Value::Bytes(_) => TypeId::Bytes,
+            Value::Json(_) => TypeId::Json,
             Value::Empty => TypeId::Empty,
         }
     }
@@ -69,6 +77,7 @@ impl Value {
             Value::DateTime(_) => 8,
             Value::Uuid(_) => 16,
             Value::Bytes(b) => 4 + b.len(), // u32 length prefix + raw bytes
+            Value::Json(b) => 4 + b.len(),  // canonical PJ1 bytes, like Bytes
             Value::Empty => 0,
         }
     }
@@ -96,6 +105,11 @@ impl Value {
                 u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
             ),
             Value::Bytes(b) => format!("<{} bytes>", b.len()),
+            // Render canonical JSON text by decoding the PJ1 bytes. Stored
+            // bytes are always canonical, so the error path is unreachable; a
+            // malformed blob falls back to the `null` sentinel rather than
+            // panicking on the wire.
+            Value::Json(b) => crate::pj1::pj1_to_text(b).unwrap_or_else(|_| "null".into()),
             Value::Empty => "null".into(),
         }
     }
@@ -119,6 +133,9 @@ impl PartialEq for Value {
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            // Canonical PJ1: equal documents have equal bytes, so byte equality
+            // IS document equality.
+            (Value::Json(a), Value::Json(b)) => a == b,
             (Value::Empty, Value::Empty) => true,
             _ => false,
         }
@@ -143,6 +160,9 @@ impl Hash for Value {
             Value::DateTime(v) => v.hash(state),
             Value::Uuid(v) => v.hash(state),
             Value::Bytes(v) => v.hash(state),
+            // Canonical bytes => hashing the bytes is consistent with the
+            // byte-equality above.
+            Value::Json(v) => v.hash(state),
             Value::Empty => {} // discriminant already hashed
         }
     }
@@ -171,6 +191,9 @@ impl Ord for Value {
             (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            // Json uses the PJ1 total order (null < false < true < numbers <
+            // strings < arrays < objects), not a raw byte compare.
+            (Value::Json(a), Value::Json(b)) => crate::pj1::pj1_cmp(a, b),
             (Value::Empty, Value::Empty) => Ordering::Equal,
             (Value::Empty, _) => Ordering::Less,
             (_, Value::Empty) => Ordering::Greater,

@@ -269,6 +269,7 @@ pub fn encode_row_into_with_layout(
             }
             Value::Str(s) => var_data_size += s.len(),
             Value::Bytes(b) => var_data_size += b.len(),
+            Value::Json(b) => var_data_size += b.len(),
             _ => {}
         }
     }
@@ -353,6 +354,12 @@ pub fn encode_row_into_with_layout(
                     out[abs..abs + len].copy_from_slice(b);
                     var_cursor += len as u16;
                 }
+                Value::Json(b) => {
+                    let len = b.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(b);
+                    var_cursor += len as u16;
+                }
                 _ => unreachable!("variable column with non-variable value"),
             }
         }
@@ -415,6 +422,18 @@ pub fn try_encode_row_into_with_layout(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "row too large: bytes value in column '{}' is {} bytes, exceeds 64KB limit",
+                            schema.columns[i].name, b.len()
+                        ),
+                    ));
+                }
+                var_data_size += b.len();
+            }
+            Value::Json(b) => {
+                if b.len() > u16::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "row too large: json value in column '{}' is {} bytes, exceeds 64KB limit",
                             schema.columns[i].name, b.len()
                         ),
                     ));
@@ -493,6 +512,12 @@ pub fn try_encode_row_into_with_layout(
                     var_cursor += len as u16;
                 }
                 Value::Bytes(b) => {
+                    let len = b.len();
+                    let abs = var_data_start + var_cursor as usize;
+                    out[abs..abs + len].copy_from_slice(b);
+                    var_cursor += len as u16;
+                }
+                Value::Json(b) => {
                     let len = b.len();
                     let abs = var_data_start + var_cursor as usize;
                     out[abs..abs + len].copy_from_slice(b);
@@ -697,6 +722,7 @@ pub fn decode_column(schema: &Schema, layout: &RowLayout, data: &[u8], col_idx: 
             // any allocation.
             TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
+            TypeId::Json => Value::Json(bytes.into()),
             _ => unreachable!(),
         }
     }
@@ -956,6 +982,7 @@ pub fn decode_row(schema: &Schema, data: &[u8]) -> Row {
             // corrupted bytes get replacement characters instead of UB.
             TypeId::Str => Value::Str(String::from_utf8_lossy(bytes).into_owned()),
             TypeId::Bytes => Value::Bytes(bytes.to_vec()),
+            TypeId::Json => Value::Json(bytes.into()),
             _ => unreachable!(),
         };
     }
@@ -1014,6 +1041,7 @@ pub fn encode_row_v2_into(
                         Value::Empty => null_bitmap[i >> 3] |= 1 << (i & 7),
                         Value::Str(s) => var_data_size += s.len(),
                         Value::Bytes(b) => var_data_size += b.len(),
+                        Value::Json(b) => var_data_size += b.len(),
                         _ => {}
                     }
                 }
@@ -1072,6 +1100,12 @@ pub fn encode_row_v2_into(
                         var_cursor += len as u16;
                     }
                     Value::Bytes(b) => {
+                        let len = b.len();
+                        let abs = var_data_start + var_cursor as usize;
+                        out[abs..abs + len].copy_from_slice(b);
+                        var_cursor += len as u16;
+                    }
+                    Value::Json(b) => {
                         let len = b.len();
                         let abs = var_data_start + var_cursor as usize;
                         out[abs..abs + len].copy_from_slice(b);
@@ -1226,6 +1260,7 @@ where
             values[i] = match col.type_id {
                 TypeId::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned()),
                 TypeId::Bytes => Value::Bytes(bytes),
+                TypeId::Json => Value::Json(bytes.into()),
                 _ => unreachable!(),
             };
         }
@@ -1287,6 +1322,7 @@ pub fn v1_encoded_len(layout: &RowLayout, values: &[Value]) -> usize {
         match val {
             Value::Str(s) => var_data = var_data.saturating_add(s.len()),
             Value::Bytes(b) => var_data = var_data.saturating_add(b.len()),
+            Value::Json(b) => var_data = var_data.saturating_add(b.len()),
             _ => {}
         }
     }
@@ -1319,6 +1355,7 @@ pub fn plan_spill(
             let len = match v {
                 Value::Str(s) => s.len(),
                 Value::Bytes(b) => b.len(),
+                Value::Json(b) => b.len(),
                 _ => return None,
             };
             if len == 0 {

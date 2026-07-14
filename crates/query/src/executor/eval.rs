@@ -43,6 +43,9 @@ pub(super) fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
                 collect_field_refs(e, out);
             }
         }
+        // A JSON path references only the column named by its base; the
+        // segments address into that value and name no additional columns.
+        Expr::JsonPath { base, .. } => collect_field_refs(base, out),
         _ => {}
     }
 }
@@ -188,6 +191,16 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
         (Value::Float(_), Float) => Ok(val),
         (Value::Bool(_), Bool) => Ok(val),
         (Value::Str(_), Str) => Ok(val),
+        // An already-encoded PJ1 document passes through untouched (e.g. a
+        // `returning`/subquery value flowing back into a json column).
+        (Value::Json(_), Json) => Ok(val),
+        // A string literal into a json column is parsed and canonicalized to
+        // PJ1 at write time (the storage layer does not auto-coerce text). The
+        // error is prefixed `invalid JSON` so it survives the server's
+        // safe-error allowlist ("invalid" is a known-safe prefix).
+        (Value::Str(s), Json) => powdb_storage::pj1::parse_json_text(s)
+            .map(|bytes| Value::Json(bytes.into_boxed_slice()))
+            .map_err(|e| format!("invalid JSON for column '{}': {}", col.name, e)),
         (Value::DateTime(_), DateTime) => Ok(val),
         (Value::Uuid(_), Uuid) => Ok(val),
         (Value::Bytes(_), Bytes) => Ok(val),
@@ -415,8 +428,24 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             }
         }
         Expr::ScalarFunc(func, args) => {
+            // `json_type` needs the raw PJ1 node, not a scalarized Value, so it
+            // can tell a JSON `null` (node present, tag 0) from a missing path
+            // (no node). Intercept it before the generic arg scalarization.
+            if *func == ScalarFn::JsonType {
+                return eval_json_type(args.first(), row, columns);
+            }
             let vals: Vec<Value> = args.iter().map(|a| eval_expr(a, row, columns)).collect();
             eval_scalar_func(*func, &vals)
+        }
+        Expr::JsonPath { base, segments } => {
+            let base_val = eval_expr(base, row, columns);
+            match walk_json_path(&base_val, segments) {
+                // Scalarize the addressed node per design 4.4. JSON `null` and
+                // a missing path both collapse to `Empty` here (use `json_type`
+                // to distinguish them).
+                Some(node) => pj1_scalarize(node),
+                None => Value::Empty,
+            }
         }
         Expr::Case { whens, else_expr } => {
             for (condition, result) in whens {
@@ -437,6 +466,103 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
         Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => {
             Value::Empty
         }
+    }
+}
+
+/// Walk `segments` over a JSON `base` value, returning the addressed PJ1 node
+/// bytes (a borrow into `base`), or `None` if `base` is not a JSON document or
+/// any segment misses. The returned slice is itself a self-contained PJ1
+/// document (see [`powdb_storage::pj1`]), so it can be scalarized or walked
+/// further with no re-basing.
+fn walk_json_path<'a>(base: &'a Value, segments: &[PathSeg]) -> Option<&'a [u8]> {
+    let Value::Json(bytes) = base else {
+        // Missing column (`Empty`) or a base that is not a JSON document.
+        return None;
+    };
+    let mut cur: &[u8] = bytes;
+    for seg in segments {
+        let pj = match seg {
+            PathSeg::Key(k) => powdb_storage::pj1::PathSeg::Key(k.as_str()),
+            PathSeg::Index(i) => powdb_storage::pj1::PathSeg::Index(*i),
+        };
+        cur = powdb_storage::pj1::pj1_get(cur, &pj)?;
+    }
+    Some(cur)
+}
+
+/// Scalarize a PJ1 node (a self-contained document slice) into a `Value` per
+/// design 4.4:
+///   - JSON string -> `Str`, integral number -> `Int`, other number -> `Float`,
+///     bool -> `Bool`, object/array -> `Json` (owned sub-document copy),
+///     JSON `null` -> `Empty`.
+///
+/// Reads only the node's documented leading tag byte and, for fixed scalars,
+/// its fixed little-endian payload. Stored PJ1 is always canonical and
+/// validated, so the defensive `Empty` fallbacks (truncated/reserved) are
+/// unreachable in practice and, crucially, never panic.
+fn pj1_scalarize(node: &[u8]) -> Value {
+    match node.first() {
+        // null (tag 0) and a missing path are indistinguishable after
+        // scalarization — both are the empty set.
+        Some(0) => Value::Empty,
+        Some(1) => Value::Bool(false),
+        Some(2) => Value::Bool(true),
+        // int: [tag][i64 LE]
+        Some(3) if node.len() >= 9 => {
+            Value::Int(i64::from_le_bytes(node[1..9].try_into().unwrap()))
+        }
+        // float: [tag][f64 LE]
+        Some(4) if node.len() >= 9 => {
+            Value::Float(f64::from_le_bytes(node[1..9].try_into().unwrap()))
+        }
+        // string: [tag][len u32 LE][UTF-8]
+        Some(5) if node.len() >= 5 => {
+            let len = u32::from_le_bytes(node[1..5].try_into().unwrap()) as usize;
+            match node
+                .get(5..5 + len)
+                .and_then(|b| std::str::from_utf8(b).ok())
+            {
+                Some(s) => Value::Str(s.to_string()),
+                None => Value::Empty,
+            }
+        }
+        // array (6) / object (7): return the owned sub-document.
+        Some(6) | Some(7) => Value::Json(node.to_vec().into_boxed_slice()),
+        // Truncated scalar, reserved tag, or empty slice: never panic.
+        _ => Value::Empty,
+    }
+}
+
+/// The `json_type(expr)` scalar: `'null'|'string'|'number'|'bool'|'object'|
+/// 'array'` for the addressed JSON node, or `Empty` when the path is missing.
+/// Operates on the raw PJ1 node (not a scalarized Value) so it can distinguish
+/// a JSON `null` (returns `'null'`) from a missing path (returns `Empty`).
+fn eval_json_type(arg: Option<&Expr>, row: &[Value], columns: &[String]) -> Value {
+    let Some(arg) = arg else {
+        return Value::Empty;
+    };
+    // Resolve the raw node: for a `->` path, walk without scalarizing so a
+    // present JSON null survives; for any other expression, a `Value::Json`
+    // IS a node and anything else is treated as missing.
+    let node: Option<Vec<u8>> = match arg {
+        Expr::JsonPath { base, segments } => {
+            let base_val = eval_expr(base, row, columns);
+            walk_json_path(&base_val, segments).map(|n| n.to_vec())
+        }
+        other => match eval_expr(other, row, columns) {
+            Value::Json(b) => Some(b.into_vec()),
+            _ => None,
+        },
+    };
+    match node.as_deref().and_then(<[u8]>::first) {
+        Some(0) => Value::Str("null".into()),
+        Some(1) | Some(2) => Value::Str("bool".into()),
+        Some(3) | Some(4) => Value::Str("number".into()),
+        Some(5) => Value::Str("string".into()),
+        Some(6) => Value::Str("array".into()),
+        Some(7) => Value::Str("object".into()),
+        // Missing path (no node) or a defensive truncated/reserved node.
+        _ => Value::Empty,
     }
 }
 
@@ -623,6 +749,9 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             };
             Value::Int(result)
         }
+        // `json_type` is intercepted in `eval_expr` (it needs the raw PJ1 node,
+        // not a scalarized Value); it never reaches this Value-based dispatch.
+        ScalarFn::JsonType => Value::Empty,
     }
 }
 

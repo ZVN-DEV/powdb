@@ -73,8 +73,21 @@ pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
     // Most queries hold 0-3 literals; we pre-size to avoid allocation
     // churn on the bench's tight loops.
     let mut literals: Vec<Literal> = Vec::with_capacity(4);
+    // A JSON `->` path segment (the token immediately after an `Arrow`) is
+    // STRUCTURAL, not a literal. `.data->tags->0` array indexes and
+    // `->"key"` string keys must hash into the query SHAPE (so a different
+    // path is a different plan) and must NOT be collected as literal slots
+    // (so `count_literal_slots(plan)` still equals the source literal count —
+    // the #137 invariant). Track whether the previous token was `->` and, if
+    // so, hash the segment structurally instead of as a literal.
+    let mut prev_arrow = false;
     for tok in &tokens {
-        hash = hash_token(hash, tok, &mut literals);
+        if prev_arrow {
+            hash = hash_path_segment(hash, tok);
+        } else {
+            hash = hash_token(hash, tok, &mut literals);
+        }
+        prev_arrow = matches!(tok, Token::Arrow);
     }
     Ok((hash, literals))
 }
@@ -147,6 +160,37 @@ fn normalize_limit_offset_order(mut tokens: Vec<Token>) -> Vec<Token> {
     tokens.extend(offset_chunk);
     tokens.extend(tail);
     tokens
+}
+
+/// Hash a JSON `->` path segment token STRUCTURALLY, folding its value into
+/// the query-shape hash and collecting NO literal. Object keys (`Ident` /
+/// `StringLit`) and array indexes (`IntLit`) each get a distinct segment tag
+/// so `->0` (index) and `->"0"` (string key) hash differently, and so a
+/// path segment can never collide with the same token in literal position.
+/// Any other token after `->` is malformed and rejected by the parser; here
+/// it just contributes its ordinary shape tag (with no literal push) so the
+/// cache key stays deterministic.
+fn hash_path_segment(h: u64, tok: &Token) -> u64 {
+    match tok {
+        Token::Ident(s) => {
+            let h = hash_byte(h, 0x08);
+            let h = hash_byte(h, s.len() as u8);
+            hash_bytes(h, s.as_bytes())
+        }
+        Token::StringLit(s) => {
+            let h = hash_byte(h, 0x09);
+            let h = hash_byte(h, s.len() as u8);
+            hash_bytes(h, s.as_bytes())
+        }
+        Token::IntLit(v) => {
+            let h = hash_byte(h, 0x0A);
+            hash_bytes(h, &v.to_le_bytes())
+        }
+        // Any other token after `->` is a malformed path the parser rejects;
+        // fold a single marker byte so canonicalization stays deterministic
+        // and, crucially, never collects a literal for it.
+        _ => hash_byte(h, 0x0B),
+    }
 }
 
 fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
@@ -277,6 +321,7 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Extract => hash_byte(h, 0x77),
         Token::DateAdd => hash_byte(h, 0x78),
         Token::DateDiff => hash_byte(h, 0x79),
+        Token::JsonType => hash_byte(h, 0x0C),
         Token::Cast => hash_byte(h, 0x7A),
         Token::Begin => hash_byte(h, 0x7B),
         Token::Commit => hash_byte(h, 0x7C),
@@ -400,5 +445,53 @@ mod tests {
     fn test_update_by_pk_literals_in_source_order() {
         let (_, lits) = canonicalize("User filter .id = 42 update { age := 31 }").unwrap();
         assert_eq!(lits, vec![Literal::Int(42), Literal::Int(31)]);
+    }
+
+    // ── JSON path (#137: segments are structural, never literals) ──────────
+
+    #[test]
+    fn json_path_array_index_is_not_a_literal() {
+        // The `0` in `.data->tags->0` is a STRUCTURAL path index, so it must
+        // NOT be collected as a literal — only the comparison `5` is.
+        let (_, lits) = canonicalize(r#"Post filter .data->tags->0 = 5"#).unwrap();
+        assert_eq!(lits, vec![Literal::Int(5)]);
+    }
+
+    #[test]
+    fn json_path_string_key_is_not_a_literal() {
+        // The `"key"` in `.data->"key"` is a structural key, not a literal;
+        // only the comparison string is collected.
+        let (_, lits) = canonicalize(r#"Post filter .data->"key" = "v""#).unwrap();
+        assert_eq!(lits, vec![Literal::String("v".into())]);
+    }
+
+    #[test]
+    fn different_literal_same_path_shares_hash() {
+        // Same path, different comparison literal → same plan (one cache entry).
+        let (h1, l1) = canonicalize(r#"Post filter .data->age > 21"#).unwrap();
+        let (h2, l2) = canonicalize(r#"Post filter .data->age > 65"#).unwrap();
+        assert_eq!(h1, h2);
+        assert_eq!(l1, vec![Literal::Int(21)]);
+        assert_eq!(l2, vec![Literal::Int(65)]);
+    }
+
+    #[test]
+    fn different_path_different_hash() {
+        // Different key → different plan.
+        let (h1, _) = canonicalize(r#"Post filter .data->age > 21"#).unwrap();
+        let (h2, _) = canonicalize(r#"Post filter .data->year > 21"#).unwrap();
+        assert_ne!(h1, h2);
+        // Different array index → different plan.
+        let (h3, _) = canonicalize(r#"Post filter .data->tags->0 = "x""#).unwrap();
+        let (h4, _) = canonicalize(r#"Post filter .data->tags->1 = "x""#).unwrap();
+        assert_ne!(h3, h4);
+    }
+
+    #[test]
+    fn string_key_and_int_index_hash_differently() {
+        // `->0` (index) and `->"0"` (string key) must not collide.
+        let (h1, _) = canonicalize(r#"Post filter .data->0 = 1"#).unwrap();
+        let (h2, _) = canonicalize(r#"Post filter .data->"0" = 1"#).unwrap();
+        assert_ne!(h1, h2);
     }
 }

@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-14
+
+Native JSON. A new `json` column type stores documents in **PJ1**, a canonical
+binary encoding designed for PowDB's compiled-predicate scans, and the new
+**`->` path operator** extracts and filters on nested fields directly in
+PowQL. Filters on JSON paths compile to a zero-parse, zero-allocation
+directory walk over raw mapped bytes: on the reference workload (100K rows,
+~1KB documents, 10% selectivity) a JSON-path filter runs in **11ms**, 2.3x
+faster than the generic decode path.
+
+### Added
+
+- **`json` column type.** Documents are validated on insert (typed errors for
+  invalid JSON/UTF-8, a 128-level nesting cap, and the 64MB value limit) and
+  stored canonically: object keys sorted bytewise, duplicate keys last-wins,
+  int/float distinction preserved. Equal documents have equal bytes, and
+  ordering, grouping, and equality agree everywhere. Large documents spill
+  transparently through the 0.11 overflow-page machinery.
+- **`->` path extraction.** `.data->author->name`, `.data->tags->0`, and
+  `.data->"weird key"` walk into documents and scalarize the result (string
+  to `str`, integral number to `int`, bool to `bool`, object/array to a
+  `json` sub-document, null and missing to empty). Works in filters,
+  projections, and anywhere expressions do, with plan-cache-safe structural
+  hashing (same path shares a plan across different literals).
+- **`json_type()` scalar function** distinguishing an explicit JSON `null`
+  from a missing path, and reporting a node's type.
+- **Compiled JSON-path filter leaf.** `filter .data->status = "live"` on an
+  inline-document table compiles to a direct binary walk over the row's
+  mapped bytes, with semantics differentially tested byte-for-byte identical
+  to the interpreted path.
+- **Clients.** JSON cells render as canonical JSON text over the existing
+  wire format (no protocol change); the TypeScript client's typed API gains
+  the `"json"` column type (parsed to objects), and the embedded Node addon
+  passes canonical text through.
+
+### Known limitations (documented in docs/POWQL.md)
+
+- Aggregating over a path (`sum(.data->price)`) and grouping/ordering BY a
+  path fail with a clear error; both arrive with the expression-index work in
+  a following release.
+- Over the network, `json_type()` cannot distinguish JSON `null` from a
+  missing path (both render as NULL); embedded use distinguishes them. A
+  typed wire surface fixes this in a following release.
+- Path filters over spilled (>4KB) documents use the decode path rather than
+  the compiled walk; correct, but slower until path indexes land.
+
+### On-disk compatibility
+
+Databases that never use `json` are byte-identical to 0.11 and open on 0.11
+binaries. The `json` type id is new; files containing json columns require
+0.12 binaries. 0.11.x databases and backups open as-is.
+
 ## [0.11.0] - 2026-07-13
 
 Document-store foundations. **Overflow pages** remove the roughly 4KB

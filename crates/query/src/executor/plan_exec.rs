@@ -83,6 +83,7 @@ impl Engine {
         // to Empty (a wrong answer). The outermost call validates the whole
         // tree before any row is produced.
         validate_no_stray_aggregates(plan)?;
+        validate_json_path_types(&self.catalog, plan)?;
         match plan {
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
@@ -178,7 +179,7 @@ impl Engine {
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         } else {
-                            let pred_cols = predicate_column_indices(predicate, &columns);
+                            let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
                                 .for_each_row_raw(table, |_rid, data| {
                                     let pred_row =
@@ -578,7 +579,7 @@ impl Engine {
                                 }
 
                                 // Fallback: decode predicate columns
-                                let pred_cols = predicate_column_indices(predicate, &columns);
+                                let pred_cols = predicate_column_indices_json(predicate, &columns);
                                 let mut count: i64 = 0;
                                 self.catalog
                                     .for_each_row_raw(table, |_rid, data| {
@@ -1240,6 +1241,10 @@ impl Engine {
                             let bytes_opt: Option<Vec<u8>> = match val {
                                 Value::Str(s) => Some(s.as_bytes().to_vec()),
                                 Value::Bytes(b) => Some(b.clone()),
+                                // A json column stores its PJ1 bytes as the var
+                                // payload (u32 length prefix + bytes, like Bytes),
+                                // so the in-place patch writes them verbatim.
+                                Value::Json(b) => Some(b.to_vec()),
                                 Value::Empty => None,
                                 _ => {
                                     return Err(QueryError::TypeError(format!(
@@ -3277,7 +3282,7 @@ impl Engine {
                     }
 
                     // Fallback: selective decode + eval.
-                    let pred_cols = predicate_column_indices(predicate, &columns);
+                    let pred_cols = predicate_column_indices_json(predicate, &columns);
                     let mut rids: Vec<RowId> = Vec::with_capacity(64);
                     self.catalog
                         .for_each_row_raw(table, |rid, data| {
@@ -3813,6 +3818,314 @@ pub(super) fn exec_group_by(
 /// evaluate it. `eval_expr` would otherwise silently produce `Empty` there (a
 /// wrong answer); this turns that into a typed error before any row is
 /// evaluated. Walks the whole plan so fused fast paths cannot bypass it.
+/// Column indices a predicate reads, INCLUDING the json columns that JSON `->`
+/// path bases decode from. The compiled walker `predicate_column_indices`
+/// (`collect_field_indices`) does not descend into `Expr::JsonPath`, so on its
+/// own it would leave the json column undecoded and every path evaluate to the
+/// empty set. This augments it with each path's base column so `decode_selective`
+/// materializes the value the path walks.
+pub(super) fn predicate_column_indices_json(expr: &Expr, columns: &[String]) -> Vec<usize> {
+    let mut indices = predicate_column_indices(expr, columns);
+    collect_json_path_base_indices(expr, columns, &mut indices);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+/// Add the column index of every `JsonPath` base reachable from `expr`.
+fn collect_json_path_base_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) {
+    match expr {
+        Expr::JsonPath { base, .. } => {
+            let name = match base.as_ref() {
+                Expr::Field(n) => n.clone(),
+                Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+                other => {
+                    collect_json_path_base_indices(other, columns, out);
+                    return;
+                }
+            };
+            if let Some(idx) = columns.iter().position(|c| *c == name) {
+                out.push(idx);
+            }
+        }
+        Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+            collect_json_path_base_indices(l, columns, out);
+            collect_json_path_base_indices(r, columns, out);
+        }
+        Expr::UnaryOp(_, i) | Expr::FunctionCall(_, i) | Expr::Cast(i, _) => {
+            collect_json_path_base_indices(i, columns, out);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                collect_json_path_base_indices(a, columns, out);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_json_path_base_indices(expr, columns, out);
+            for item in list {
+                collect_json_path_base_indices(item, columns, out);
+            }
+        }
+        Expr::InSubquery { expr, .. } => collect_json_path_base_indices(expr, columns, out),
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                collect_json_path_base_indices(c, columns, out);
+                collect_json_path_base_indices(r, columns, out);
+            }
+            if let Some(e) = else_expr {
+                collect_json_path_base_indices(e, columns, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reject a JSON `->` path whose base column is not of type `json` (e.g.
+/// `.age->x` on an int column) before any row is produced, so a mistyped path
+/// never silently evaluates to the empty set on every row (the "database must
+/// not have silent-wrong-answer paths" rule).
+///
+/// Resolution is deliberately conservative to never reject a VALID query: a
+/// base name a `Project` node could redefine (shadowing the scan column), a
+/// base that resolves to more than one type across joined tables, or a base
+/// that resolves to no scan column at all, is skipped. Such paths fall through
+/// to the generic evaluator, which safely yields `Empty` for a non-JSON base.
+pub(super) fn validate_json_path_types(
+    catalog: &Catalog,
+    plan: &PlanNode,
+) -> Result<(), QueryError> {
+    let mut scope: Vec<(String, TypeId)> = Vec::new();
+    collect_scan_columns(catalog, plan, &mut scope);
+    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_projected_names(plan, &mut shadowed);
+    check_plan_json_paths(plan, &scope, &shadowed)
+}
+
+/// Gather the output column names and types of every scan leaf reachable from
+/// `plan`. `SeqScan`/`IndexScan`/`RangeScan` contribute bare column names;
+/// `AliasScan` contributes `alias.field` names (the join output shape).
+fn collect_scan_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(String, TypeId)>) {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. } => {
+            if let Some(schema) = catalog.schema(table) {
+                for c in &schema.columns {
+                    out.push((c.name.clone(), c.type_id));
+                }
+            }
+        }
+        PlanNode::AliasScan { table, alias } => {
+            if let Some(schema) = catalog.schema(table) {
+                for c in &schema.columns {
+                    out.push((format!("{alias}.{}", c.name), c.type_id));
+                }
+            }
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => collect_scan_columns(catalog, input, out),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            collect_scan_columns(catalog, left, out);
+            collect_scan_columns(catalog, right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Collect the output names produced by every `Project` node, so a base name a
+/// projection could rebind to a different type is left unvalidated.
+fn collect_projected_names(plan: &PlanNode, out: &mut std::collections::HashSet<String>) {
+    if let PlanNode::Project { fields, .. } = plan {
+        for f in fields {
+            if let Some(a) = &f.alias {
+                out.insert(a.clone());
+            } else {
+                match &f.expr {
+                    Expr::Field(n) => {
+                        out.insert(n.clone());
+                    }
+                    Expr::QualifiedField { qualifier, field } => {
+                        out.insert(format!("{qualifier}.{field}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    match plan {
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => collect_projected_names(input, out),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            collect_projected_names(left, out);
+            collect_projected_names(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Resolve `name` in `scope` to a single column type. Returns `None` when the
+/// name is absent or resolves to more than one distinct type (ambiguous across
+/// joined tables) — both cases are skipped by the caller.
+fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
+    let mut found: Option<TypeId> = None;
+    for (n, t) in scope {
+        if n == name {
+            match found {
+                None => found = Some(*t),
+                Some(prev) if prev == *t => {}
+                Some(_) => return None, // ambiguous
+            }
+        }
+    }
+    found
+}
+
+/// If `base` (the base of a `JsonPath`) resolves to a non-`json` scan column,
+/// return a typed error message; otherwise `None`.
+fn json_path_base_error(
+    base: &Expr,
+    scope: &[(String, TypeId)],
+    shadowed: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let name = match base {
+        Expr::Field(n) => n.clone(),
+        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+        // The parser flattens nested paths, so a JsonPath base is always a
+        // Field/QualifiedField; anything else is left to the generic evaluator.
+        _ => return None,
+    };
+    if shadowed.contains(&name) {
+        return None;
+    }
+    match resolve_scan_type(&name, scope) {
+        Some(TypeId::Json) | None => None,
+        Some(other) => Some(format!(
+            "'{}' is a {} column, not json: the '->' path operator requires a json column",
+            name,
+            type_id_to_name(other)
+        )),
+    }
+}
+
+/// Walk `expr`, validating the base of every `JsonPath` it contains.
+fn check_expr_json_paths(
+    expr: &Expr,
+    scope: &[(String, TypeId)],
+    shadowed: &std::collections::HashSet<String>,
+) -> Result<(), QueryError> {
+    match expr {
+        Expr::JsonPath { base, .. } => {
+            if let Some(msg) = json_path_base_error(base, scope, shadowed) {
+                return Err(QueryError::TypeError(msg));
+            }
+            check_expr_json_paths(base, scope, shadowed)
+        }
+        Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+            check_expr_json_paths(l, scope, shadowed)?;
+            check_expr_json_paths(r, scope, shadowed)
+        }
+        Expr::UnaryOp(_, inner) | Expr::FunctionCall(_, inner) | Expr::Cast(inner, _) => {
+            check_expr_json_paths(inner, scope, shadowed)
+        }
+        Expr::ScalarFunc(_, args) => {
+            for a in args {
+                check_expr_json_paths(a, scope, shadowed)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr, list, .. } => {
+            check_expr_json_paths(expr, scope, shadowed)?;
+            for item in list {
+                check_expr_json_paths(item, scope, shadowed)?;
+            }
+            Ok(())
+        }
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                check_expr_json_paths(c, scope, shadowed)?;
+                check_expr_json_paths(r, scope, shadowed)?;
+            }
+            if let Some(e) = else_expr {
+                check_expr_json_paths(e, scope, shadowed)?;
+            }
+            Ok(())
+        }
+        // Subquery operands validate their own paths on their own plan; only
+        // the outer operand is on this plan's scope.
+        Expr::InSubquery { expr, .. } => check_expr_json_paths(expr, scope, shadowed),
+        _ => Ok(()),
+    }
+}
+
+/// Recurse `plan`, validating JSON paths in every expression-bearing field.
+fn check_plan_json_paths(
+    plan: &PlanNode,
+    scope: &[(String, TypeId)],
+    shadowed: &std::collections::HashSet<String>,
+) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::Filter { input, predicate } => {
+            check_expr_json_paths(predicate, scope, shadowed)?;
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::Project { input, fields } => {
+            for f in fields {
+                check_expr_json_paths(&f.expr, scope, shadowed)?;
+            }
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::GroupBy { input, having, .. } => {
+            if let Some(h) = having {
+                check_expr_json_paths(h, scope, shadowed)?;
+            }
+            check_plan_json_paths(input, scope, shadowed)
+        }
+        PlanNode::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            if let Some(on) = on {
+                check_expr_json_paths(on, scope, shadowed)?;
+            }
+            check_plan_json_paths(left, scope, shadowed)?;
+            check_plan_json_paths(right, scope, shadowed)
+        }
+        PlanNode::Union { left, right, .. } => {
+            check_plan_json_paths(left, scope, shadowed)?;
+            check_plan_json_paths(right, scope, shadowed)
+        }
+        PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => check_plan_json_paths(input, scope, shadowed),
+        _ => Ok(()),
+    }
+}
+
 pub(super) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
     match plan {
         PlanNode::Project { input, fields } => {

@@ -80,6 +80,38 @@ test("rows come back as string[][] matching the wire shape", () => {
   }
 });
 
+test("json values round-trip as canonical JSON text", (t) => {
+  // The addon is an untyped passthrough: every cell is rendered by the shared
+  // Value::to_wire_string, so a json column comes back as canonical JSON text
+  // (keys sorted bytewise, no whitespace) that the caller can JSON.parse. This
+  // asserts the full round trip end to end.
+  //
+  // Skips until the `json` DDL keyword lands (Lane B) AND the addon is rebuilt
+  // against it; the prebuilt .node in this repo predates the json type, so
+  // `body: json` is rejected there.
+  const dir = freshDir();
+  try {
+    const db = Database.open(dir);
+    let created;
+    try {
+      created = db.query("type Doc { required id: int, body: json }");
+    } catch (err) {
+      t.skip(`json column type not available in this build: ${err.message}`);
+      return;
+    }
+    assert.equal(created.kind, "message");
+    // Insert unsorted keys; the engine canonicalizes to sorted-key PJ1.
+    db.query(`insert Doc { id := 1, body := "{\\"b\\":2,\\"a\\":1}" }`);
+    const r = db.query("Doc { body }");
+    assert.equal(r.kind, "rows");
+    assert.deepEqual(r.rows, [[`{"a":1,"b":2}`]]);
+    // The rendered text is valid JSON the caller can parse.
+    assert.deepEqual(JSON.parse(r.rows[0][0]), { a: 1, b: 2 });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("SQL frontend works in-process", () => {
   const dir = freshDir();
   try {

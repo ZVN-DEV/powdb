@@ -1,8 +1,10 @@
 //! Compiled predicates and fast-path layout utilities.
 
 use crate::ast::*;
+use powdb_storage::pj1::{pj1_get, PathSeg as Pj1Seg};
 use powdb_storage::row::{decode_column, row_is_v2, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
+use std::cmp::Ordering;
 
 /// Mission C Phase 4: precomputed byte-patch for the in-place update fast
 /// path. Built once per `Update` query (outside the rid loop) and reused on
@@ -51,6 +53,10 @@ pub(super) fn type_name_to_id(name: &str) -> Result<TypeId, String> {
         "datetime" => Ok(TypeId::DateTime),
         "uuid" => Ok(TypeId::Uuid),
         "bytes" => Ok(TypeId::Bytes),
+        // Lane B: `type T { data: json }` declares a canonical-binary JSON
+        // (PJ1) column. This is the type-name lookup table, not the compiled
+        // predicate fast path (which a later lane owns).
+        "json" => Ok(TypeId::Json),
         _ => Err(format!("unknown type name: '{name}'")),
     }
 }
@@ -66,6 +72,9 @@ pub(super) fn type_id_to_name(type_id: TypeId) -> &'static str {
         TypeId::DateTime => "datetime",
         TypeId::Uuid => "uuid",
         TypeId::Bytes => "bytes",
+        // Lane B/C own the `json` column-declaration keyword and path grammar;
+        // this arm only gives schema introspection a name to print.
+        TypeId::Json => "json",
         TypeId::Empty => "empty",
     }
 }
@@ -195,6 +204,44 @@ enum CompiledLeaf {
         negate: bool,
         needle: Vec<u8>,
     },
+    /// `.jsoncol->seg->... <op> literal` (or reversed) over an INLINE PJ1
+    /// document (design 4.4, the compiled inline-document leaf). Locates the
+    /// json column's var-slot bytes (raw canonical PJ1, no inner length prefix,
+    /// exactly like `StrEq`), walks the path zero-copy via `pj1_get`, and
+    /// compares the addressed scalar node against a literal pre-encoded once at
+    /// compile time. No parse, no allocation on the hot path: numeric/bool nodes
+    /// are read straight from their fixed LE payload and string nodes compare
+    /// byte-for-byte against the literal's UTF-8 bytes. The comparison honors the
+    /// exact `Value` `PartialEq`/`Ord` semantics the decode path uses (via
+    /// [`json_scalar_eq`]/[`json_scalar_cmp`]), so a compiled JSON filter is
+    /// byte-for-byte identical in results to the generic `pj1_scalarize` +
+    /// `eval_binop` fallback. Only built when the base column's `TypeId` is
+    /// `Json`; the "table has no overflow rows" half of the gate is enforced by
+    /// callers (every compiled read/mutation path checks `table_has_overflow`
+    /// first), and the per-row `row_is_v2` guard in `compile_predicate` routes
+    /// any stray v2 row to the fallback.
+    Json {
+        var_offset_table_start: usize,
+        var_data_start: usize,
+        var_idx: usize,
+        bitmap_byte: usize,
+        bitmap_bit: u8,
+        segments: Vec<JsonSeg>,
+        op: BinOp,
+        /// The comparison literal, pre-encoded once as a scalar `Value`
+        /// (`Int`/`Float`/`Str`/`Bool`). `.as_bytes()` on the `Str` variant is
+        /// the needle for the zero-alloc string-node compare.
+        literal: Value,
+    },
+}
+
+/// An owned path segment for a compiled JSON leaf. Mirrors [`crate::ast::PathSeg`]
+/// but is stored inside the `'static` closure; the borrowed
+/// [`powdb_storage::pj1::PathSeg`] the walker needs is reconstructed per segment
+/// with no allocation (a `&str` borrow of the owned `String`).
+enum JsonSeg {
+    Key(String),
+    Index(u32),
 }
 
 impl CompiledLeaf {
@@ -329,7 +376,188 @@ impl CompiledLeaf {
                     eq
                 }
             }
+            CompiledLeaf::Json {
+                var_offset_table_start,
+                var_data_start,
+                var_idx,
+                bitmap_byte,
+                bitmap_bit,
+                segments,
+                op,
+                literal,
+            } => {
+                let node = json_locate_node(
+                    data,
+                    *var_offset_table_start,
+                    *var_data_start,
+                    *var_idx,
+                    *bitmap_byte,
+                    *bitmap_bit,
+                    segments,
+                );
+                json_compare(node, *op, literal)
+            }
         }
+    }
+}
+
+/// Locate and path-walk the inline PJ1 document for a compiled JSON leaf,
+/// returning the addressed node as a borrowed sub-slice (itself a valid
+/// standalone PJ1 document). Returns `None` — semantically the empty set, i.e.
+/// scalarizes to `Value::Empty` — when the json column is NULL, the path
+/// misses, or the bytes are truncated. The document slice is located exactly
+/// like [`CompiledLeaf::StrEq`]: a var column stores its raw payload directly
+/// between the offset-table entries (no inner length prefix), and for a `Json`
+/// column that payload IS the canonical PJ1 bytes.
+#[inline]
+fn json_locate_node<'a>(
+    data: &'a [u8],
+    var_offset_table_start: usize,
+    var_data_start: usize,
+    var_idx: usize,
+    bitmap_byte: usize,
+    bitmap_bit: u8,
+    segments: &[JsonSeg],
+) -> Option<&'a [u8]> {
+    if data.len() < 3 + bitmap_byte {
+        return None;
+    }
+    // NULL json column: no document at all -> empty set.
+    if (data[2 + bitmap_byte] >> bitmap_bit) & 1 == 1 {
+        return None;
+    }
+    let off_pos = var_offset_table_start + var_idx * 2;
+    let next_pos = var_offset_table_start + (var_idx + 1) * 2;
+    if data.len() < next_pos + 2 {
+        return None;
+    }
+    let start = u16::from_le_bytes(data[off_pos..off_pos + 2].try_into().ok()?) as usize;
+    let end = u16::from_le_bytes(data[next_pos..next_pos + 2].try_into().ok()?) as usize;
+    let abs_start = var_data_start + start;
+    let abs_end = var_data_start + end;
+    if abs_end > data.len() || abs_start > abs_end {
+        return None;
+    }
+    let mut cur: &[u8] = &data[abs_start..abs_end];
+    for seg in segments {
+        let pj = match seg {
+            JsonSeg::Key(k) => Pj1Seg::Key(k.as_str()),
+            JsonSeg::Index(i) => Pj1Seg::Index(*i),
+        };
+        cur = pj1_get(cur, &pj)?;
+    }
+    Some(cur)
+}
+
+/// Compare the addressed JSON `node` (None = the empty set) against a
+/// pre-encoded scalar `literal` under `op`, reproducing `eval_binop` exactly:
+/// `Eq`/`Neq` use `Value::PartialEq` (so `Int` never equals `Float`), the
+/// ordering ops use `Value::Ord` (cross-numeric promotion, `Empty` sorts
+/// first, unrelated types by `TypeId`). `And`/`Or`/arithmetic/`Like` never
+/// build a `Json` leaf, so they return `false` here defensively.
+#[inline]
+fn json_compare(node: Option<&[u8]>, op: BinOp, literal: &Value) -> bool {
+    match op {
+        BinOp::Eq => json_scalar_eq(node, literal),
+        BinOp::Neq => !json_scalar_eq(node, literal),
+        BinOp::Lt => json_scalar_cmp(node, literal) == Ordering::Less,
+        BinOp::Gt => json_scalar_cmp(node, literal) == Ordering::Greater,
+        BinOp::Lte => json_scalar_cmp(node, literal) != Ordering::Greater,
+        BinOp::Gte => json_scalar_cmp(node, literal) != Ordering::Less,
+        _ => false,
+    }
+}
+
+/// `TypeId`-rank comparison, the tail arm of `Value::cmp` for unrelated types.
+#[inline]
+fn type_id_cmp(a: TypeId, b: TypeId) -> Ordering {
+    (a as u8).cmp(&(b as u8))
+}
+
+/// Equality of a scalarized JSON `node` against `lit` under `Value::PartialEq`.
+/// A missing/null node (the empty set) equals no scalar literal. String nodes
+/// compare byte-for-byte (zero alloc); numbers are strict-typed (an `Int` node
+/// never equals a `Float` literal, matching `Value::PartialEq`).
+#[inline]
+fn json_scalar_eq(node: Option<&[u8]>, lit: &Value) -> bool {
+    let Some(n) = node else { return false };
+    match n.first() {
+        Some(1) => matches!(lit, Value::Bool(false)),
+        Some(2) => matches!(lit, Value::Bool(true)),
+        Some(3) if n.len() >= 9 => match lit {
+            Value::Int(l) => i64::from_le_bytes(n[1..9].try_into().unwrap()) == *l,
+            _ => false,
+        },
+        Some(4) if n.len() >= 9 => match lit {
+            Value::Float(l) => {
+                f64::from_le_bytes(n[1..9].try_into().unwrap()).total_cmp(l) == Ordering::Equal
+            }
+            _ => false,
+        },
+        Some(5) if n.len() >= 5 => match lit {
+            Value::Str(l) => {
+                let len = u32::from_le_bytes(n[1..5].try_into().unwrap()) as usize;
+                n.get(5..5 + len) == Some(l.as_bytes())
+            }
+            _ => false,
+        },
+        // null (0), object (6), array (7), truncated, or missing: not equal to
+        // any scalar literal.
+        _ => false,
+    }
+}
+
+/// Order a scalarized JSON `node` against `lit` under `Value::Ord`. Mirrors
+/// `Value::cmp`: numbers promote across int/float via `total_cmp`, the empty
+/// set (missing/null node) sorts before every literal, and unrelated types
+/// fall back to `TypeId` rank. Zero allocation for every same-type comparison
+/// (the realistic case); cross-type paths read only the node's tag.
+#[inline]
+fn json_scalar_cmp(node: Option<&[u8]>, lit: &Value) -> Ordering {
+    let Some(n) = node else { return Ordering::Less };
+    match n.first() {
+        // JSON null scalarizes to Empty, which sorts before any literal.
+        Some(0) => Ordering::Less,
+        Some(1) => cmp_bool_lit(false, lit),
+        Some(2) => cmp_bool_lit(true, lit),
+        Some(3) if n.len() >= 9 => {
+            let a = i64::from_le_bytes(n[1..9].try_into().unwrap());
+            match lit {
+                Value::Int(b) => a.cmp(b),
+                Value::Float(b) => (a as f64).total_cmp(b),
+                other => type_id_cmp(TypeId::Int, other.type_id()),
+            }
+        }
+        Some(4) if n.len() >= 9 => {
+            let a = f64::from_le_bytes(n[1..9].try_into().unwrap());
+            match lit {
+                Value::Float(b) => a.total_cmp(b),
+                Value::Int(b) => a.total_cmp(&(*b as f64)),
+                other => type_id_cmp(TypeId::Float, other.type_id()),
+            }
+        }
+        Some(5) if n.len() >= 5 => {
+            let len = u32::from_le_bytes(n[1..5].try_into().unwrap()) as usize;
+            match (n.get(5..5 + len), lit) {
+                (Some(s), Value::Str(b)) => s.cmp(b.as_bytes()),
+                (Some(_), other) => type_id_cmp(TypeId::Str, other.type_id()),
+                // Truncated string node scalarizes to Empty.
+                (None, _) => Ordering::Less,
+            }
+        }
+        // object/array node vs a scalar literal: ordered by TypeId rank.
+        Some(6) | Some(7) => type_id_cmp(TypeId::Json, lit.type_id()),
+        // Truncated/reserved/missing: the empty set.
+        _ => Ordering::Less,
+    }
+}
+
+/// Order a bool JSON node against a literal per `Value::cmp`.
+#[inline]
+fn cmp_bool_lit(b: bool, lit: &Value) -> Ordering {
+    match lit {
+        Value::Bool(lb) => b.cmp(lb),
+        other => type_id_cmp(TypeId::Bool, other.type_id()),
     }
 }
 
@@ -432,6 +660,10 @@ fn flatten_and_compile(
                 return Some(());
             }
             if let Some(leaf) = build_str_eq_leaf(left, *op, right, columns, layout, schema) {
+                out.push(leaf);
+                return Some(());
+            }
+            if let Some(leaf) = build_json_leaf(left, *op, right, columns, layout, schema) {
                 out.push(leaf);
                 return Some(());
             }
@@ -616,6 +848,92 @@ fn build_str_eq_leaf(
     })
 }
 
+/// Build a `Json` leaf from `.jsoncol->seg... <op> literal` (or the reversed
+/// `literal <op> .jsoncol->seg...`), the compiled inline-document path (design
+/// 4.4). Fires only when:
+///   - one side is an `Expr::JsonPath` whose base is a bare `Expr::Field`,
+///   - that field is a column of declared type `TypeId::Json`, and
+///   - the other side is a scalar `Literal` and `op` is a comparison.
+///
+/// Everything else (a `QualifiedField` base, a non-json column, a non-literal
+/// comparand, `And`/`Or`/arithmetic) returns `None` and falls back to the
+/// generic `pj1_scalarize` + `eval_binop` decode path, which stays correct.
+/// The "table has no overflow rows" half of the design 4.4 gate is the
+/// caller's responsibility (every compiled scan path checks `table_has_overflow`
+/// before compiling); a stray v2 row is still routed to the fallback by the
+/// `row_is_v2` guard in `compile_predicate`.
+fn build_json_leaf(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    columns: &[String],
+    layout: &FastLayout,
+    schema: &Schema,
+) -> Option<CompiledLeaf> {
+    // Normalise to (path, literal, op-with-field-on-left). When the literal is
+    // on the left, flip the comparison so eval can assume the path is the LHS.
+    let (base, segments, lit, op) = match (left, right) {
+        (Expr::JsonPath { base, segments }, Expr::Literal(l)) => (base, segments, l, op),
+        (Expr::Literal(l), Expr::JsonPath { base, segments }) => {
+            let flipped = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Lte => BinOp::Gte,
+                BinOp::Gte => BinOp::Lte,
+                other => other, // Eq, Neq symmetric
+            };
+            (base, segments, l, flipped)
+        }
+        _ => return None,
+    };
+
+    // Only comparison operators build a leaf.
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+    ) {
+        return None;
+    }
+
+    // The base must be a bare field naming a scan column (a qualified base is
+    // left to the generic path).
+    let Expr::Field(name) = base.as_ref() else {
+        return None;
+    };
+    let col_idx = columns.iter().position(|c| c == name)?;
+    if schema.columns[col_idx].type_id != TypeId::Json {
+        return None;
+    }
+    let var_idx = layout.var_indices[col_idx]?;
+
+    // Pre-encode the comparison literal once as a scalar Value.
+    let literal = match lit {
+        Literal::Int(v) => Value::Int(*v),
+        Literal::Float(v) => Value::Float(*v),
+        Literal::String(s) => Value::Str(s.clone()),
+        Literal::Bool(b) => Value::Bool(*b),
+    };
+
+    let segs: Vec<JsonSeg> = segments
+        .iter()
+        .map(|s| match s {
+            PathSeg::Key(k) => JsonSeg::Key(k.clone()),
+            PathSeg::Index(i) => JsonSeg::Index(*i),
+        })
+        .collect();
+
+    Some(CompiledLeaf::Json {
+        var_offset_table_start: layout.var_offset_table_start(),
+        var_data_start: layout.var_data_start(),
+        var_idx,
+        bitmap_byte: col_idx / 8,
+        bitmap_bit: (col_idx % 8) as u8,
+        segments: segs,
+        op,
+        literal,
+    })
+}
+
 /// Collect the column indices referenced by a predicate expression.
 pub(super) fn predicate_column_indices(expr: &Expr, columns: &[String]) -> Vec<usize> {
     let mut indices = Vec::new();
@@ -729,5 +1047,217 @@ mod tests {
         let err = type_name_to_id("Foo").unwrap_err();
         assert!(err.contains("unknown type name"), "got: {err}");
         assert!(err.contains("Foo"), "got: {err}");
+    }
+
+    // ── compiled JSON leaf (design 4.4) ─────────────────────────────────────
+    //
+    // The compiled inline-document leaf must be byte-for-byte identical in
+    // results to the generic decode fallback (`pj1_scalarize` + `eval_binop`).
+    // These tests build a real row, compile a JSON predicate, and assert the
+    // compiled closure agrees with `eval_predicate` over the decoded row for a
+    // wide matrix of node types, operators, and literal types — including the
+    // cross-type and missing/null corner cases where the two code paths could
+    // most easily diverge.
+
+    use powdb_storage::row::{decode_row, encode_row};
+
+    fn json_schema() -> Schema {
+        Schema {
+            table_name: "Post".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "data".into(),
+                    type_id: TypeId::Json,
+                    required: false,
+                    position: 1,
+                },
+            ],
+        }
+    }
+
+    /// Encode a row `{ id, data }` where `data` is `Some(json_text)` (coerced
+    /// to canonical PJ1) or `None` (a NULL json column).
+    fn json_row(schema: &Schema, id: i64, data: Option<&str>) -> Vec<u8> {
+        let dv = match data {
+            Some(t) => Value::Json(
+                powdb_storage::pj1::parse_json_text(t)
+                    .expect("valid json")
+                    .into_boxed_slice(),
+            ),
+            None => Value::Empty,
+        };
+        encode_row(schema, &[Value::Int(id), dv])
+    }
+
+    fn path(base: &str, segs: &[PathSeg]) -> Expr {
+        Expr::JsonPath {
+            base: Box::new(Expr::Field(base.into())),
+            segments: segs.to_vec(),
+        }
+    }
+
+    /// Assert the compiled leaf and the generic decode fallback agree for
+    /// `expr` on every `(id, data)` row.
+    fn assert_agrees(expr: &Expr, rows: &[(i64, Option<&str>)]) {
+        let schema = json_schema();
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let fast = FastLayout::new(&schema);
+        let compiled =
+            compile_predicate(expr, &columns, &fast, &schema).expect("JSON predicate must compile");
+        for &(id, data) in rows {
+            let encoded = json_row(&schema, id, data);
+            let decoded = decode_row(&schema, &encoded);
+            let want = super::super::eval::eval_predicate(expr, &decoded, &columns);
+            let got = compiled(&encoded);
+            assert_eq!(
+                got, want,
+                "compiled != decode for id={id} data={data:?} expr={expr:?}"
+            );
+        }
+    }
+
+    const SAMPLE_ROWS: &[(i64, Option<&str>)] = &[
+        (
+            1,
+            Some(r#"{"author":"alice","age":30,"score":9.5,"active":true}"#),
+        ),
+        (
+            2,
+            Some(r#"{"author":"bob","age":18,"score":9.5,"active":false}"#),
+        ),
+        (
+            3,
+            Some(r#"{"author":"carol","age":30,"tags":["x","y"],"nested":{"k":7}}"#),
+        ),
+        (4, Some(r#"{"maybe":null,"age":21}"#)),
+        (5, Some(r#"{"other":1}"#)), // author/age missing
+        (6, None),                   // NULL json column
+    ];
+
+    fn cmp(left: Expr, op: BinOp, right: Expr) -> Expr {
+        Expr::BinaryOp(Box::new(left), op, Box::new(right))
+    }
+
+    fn lit_str(s: &str) -> Expr {
+        Expr::Literal(Literal::String(s.into()))
+    }
+    fn lit_int(v: i64) -> Expr {
+        Expr::Literal(Literal::Int(v))
+    }
+    fn lit_float(v: f64) -> Expr {
+        Expr::Literal(Literal::Float(v))
+    }
+    fn lit_bool(v: bool) -> Expr {
+        Expr::Literal(Literal::Bool(v))
+    }
+
+    #[test]
+    fn json_leaf_matches_fallback_string_eq() {
+        let author = || path("data", &[PathSeg::Key("author".into())]);
+        assert_agrees(&cmp(author(), BinOp::Eq, lit_str("alice")), SAMPLE_ROWS);
+        assert_agrees(&cmp(author(), BinOp::Neq, lit_str("alice")), SAMPLE_ROWS);
+        // Reversed operand order (literal on the left) flips correctly.
+        assert_agrees(&cmp(lit_str("bob"), BinOp::Eq, author()), SAMPLE_ROWS);
+        // String ordering.
+        assert_agrees(&cmp(author(), BinOp::Lt, lit_str("bob")), SAMPLE_ROWS);
+        assert_agrees(&cmp(author(), BinOp::Gte, lit_str("bob")), SAMPLE_ROWS);
+    }
+
+    #[test]
+    fn json_leaf_matches_fallback_numeric() {
+        let age = || path("data", &[PathSeg::Key("age".into())]);
+        for op in [
+            BinOp::Eq,
+            BinOp::Neq,
+            BinOp::Lt,
+            BinOp::Gt,
+            BinOp::Lte,
+            BinOp::Gte,
+        ] {
+            assert_agrees(&cmp(age(), op, lit_int(21)), SAMPLE_ROWS);
+            // Reversed order.
+            assert_agrees(&cmp(lit_int(21), op, age()), SAMPLE_ROWS);
+            // Int node vs Float literal (cross-numeric: Eq is strict-false,
+            // ordering promotes) — the sharpest divergence risk.
+            assert_agrees(&cmp(age(), op, lit_float(21.0)), SAMPLE_ROWS);
+        }
+    }
+
+    #[test]
+    fn json_leaf_matches_fallback_float_and_bool() {
+        let score = || path("data", &[PathSeg::Key("score".into())]);
+        let active = || path("data", &[PathSeg::Key("active".into())]);
+        for op in [BinOp::Eq, BinOp::Neq, BinOp::Lt, BinOp::Gte] {
+            assert_agrees(&cmp(score(), op, lit_float(9.5)), SAMPLE_ROWS);
+            assert_agrees(&cmp(score(), op, lit_int(9)), SAMPLE_ROWS);
+            assert_agrees(&cmp(active(), op, lit_bool(true)), SAMPLE_ROWS);
+        }
+    }
+
+    #[test]
+    fn json_leaf_matches_fallback_nested_and_array() {
+        let nested_k = path(
+            "data",
+            &[PathSeg::Key("nested".into()), PathSeg::Key("k".into())],
+        );
+        assert_agrees(&cmp(nested_k, BinOp::Eq, lit_int(7)), SAMPLE_ROWS);
+        let tag0 = path("data", &[PathSeg::Key("tags".into()), PathSeg::Index(0)]);
+        assert_agrees(&cmp(tag0, BinOp::Eq, lit_str("x")), SAMPLE_ROWS);
+    }
+
+    #[test]
+    fn json_leaf_matches_fallback_type_mismatch_and_composite() {
+        // Type-mismatched comparisons must still match Value semantics exactly.
+        let author = || path("data", &[PathSeg::Key("author".into())]);
+        // String node vs int literal (unrelated types -> TypeId rank ordering).
+        assert_agrees(&cmp(author(), BinOp::Lt, lit_int(5)), SAMPLE_ROWS);
+        assert_agrees(&cmp(author(), BinOp::Eq, lit_int(5)), SAMPLE_ROWS);
+        // Composite (object/array) node compared to a scalar literal.
+        let tags = || path("data", &[PathSeg::Key("tags".into())]);
+        assert_agrees(&cmp(tags(), BinOp::Eq, lit_str("x")), SAMPLE_ROWS);
+        assert_agrees(&cmp(tags(), BinOp::Gt, lit_int(0)), SAMPLE_ROWS);
+        // JSON null value vs missing path vs NULL column: all scalarize Empty.
+        let maybe = || path("data", &[PathSeg::Key("maybe".into())]);
+        assert_agrees(&cmp(maybe(), BinOp::Eq, lit_str("x")), SAMPLE_ROWS);
+        assert_agrees(&cmp(maybe(), BinOp::Lt, lit_int(0)), SAMPLE_ROWS);
+    }
+
+    #[test]
+    fn json_leaf_composes_with_and_conjunction() {
+        // A JSON leaf ANDed with an Int-column leaf: both must flatten and the
+        // compiled conjunction must agree with the fallback.
+        let expr = cmp(
+            path("data", &[PathSeg::Key("author".into())]),
+            BinOp::Eq,
+            lit_str("alice"),
+        );
+        let and = Expr::BinaryOp(
+            Box::new(expr),
+            BinOp::And,
+            Box::new(cmp(Expr::Field("id".into()), BinOp::Lt, lit_int(3))),
+        );
+        assert_agrees(&and, SAMPLE_ROWS);
+    }
+
+    #[test]
+    fn json_leaf_not_built_for_non_json_column() {
+        // `.id->x` on an int column must NOT compile a JSON leaf (the base type
+        // guard). `compile_predicate` returns None so the caller uses the
+        // fallback (where `validate_json_path_types` has already rejected it).
+        let schema = json_schema();
+        let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let fast = FastLayout::new(&schema);
+        let expr = cmp(
+            path("id", &[PathSeg::Key("x".into())]),
+            BinOp::Eq,
+            lit_int(1),
+        );
+        assert!(compile_predicate(&expr, &columns, &fast, &schema).is_none());
     }
 }

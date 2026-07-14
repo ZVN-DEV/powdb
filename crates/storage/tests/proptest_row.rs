@@ -28,6 +28,26 @@ fn value_for_type(tid: TypeId) -> BoxedStrategy<Value> {
         TypeId::Bytes => prop::collection::vec(any::<u8>(), 0..64)
             .prop_map(Value::Bytes)
             .boxed(),
+        // Generate a small canonical PJ1 document by parsing a simple JSON
+        // object of random string->int pairs. The row layer treats these bytes
+        // exactly like Bytes, so this exercises the same var-length path.
+        TypeId::Json => prop::collection::vec(("[a-z]{1,6}", any::<i64>()), 0..5)
+            .prop_map(|pairs| {
+                let mut json = String::from("{");
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        json.push(',');
+                    }
+                    json.push_str(&format!("\"k{i}_{k}\":{v}"));
+                }
+                json.push('}');
+                Value::Json(
+                    powdb_storage::pj1::parse_json_text(&json)
+                        .expect("valid json")
+                        .into(),
+                )
+            })
+            .boxed(),
         TypeId::Empty => Just(Value::Empty).boxed(),
     }
 }
@@ -43,6 +63,7 @@ fn type_id_strategy() -> impl Strategy<Value = TypeId> {
         Just(TypeId::DateTime),
         Just(TypeId::Uuid),
         Just(TypeId::Bytes),
+        Just(TypeId::Json),
     ]
 }
 

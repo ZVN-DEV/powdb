@@ -65,6 +65,7 @@ fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
         Token::Extract => ScalarFn::Extract,
         Token::DateAdd => ScalarFn::DateAdd,
         Token::DateDiff => ScalarFn::DateDiff,
+        Token::JsonType => ScalarFn::JsonType,
         _ => unreachable!(),
     }
 }
@@ -1334,7 +1335,82 @@ impl Parser {
         }
         let result = self.parse_primary_inner();
         self.depth -= 1;
-        result
+        // JSON `->` path access is the tightest-binding postfix level: it binds
+        // above every binary operator, so `.data->age > 21` parses as
+        // `(.data->age) > 21`. Applying it here (inside `parse_primary`) means
+        // every caller — multiplicative, unary prefixes, function args — gets
+        // path access for free without threading a new precedence level.
+        self.parse_json_path_postfix(result?)
+    }
+
+    /// If the current token is `->`, consume a chain of path segments and wrap
+    /// `base` in an `Expr::JsonPath`. `base` must be a `Field`, `QualifiedField`,
+    /// or (nested) `JsonPath`; any other base is a parse error. Each segment is
+    /// an object key (bareword `Ident` or double-quoted string) or an array
+    /// index (non-negative integer). Segments are STRUCTURAL — the plan cache
+    /// hashes them into the query shape and never treats them as literal slots.
+    fn parse_json_path_postfix(&mut self, base: Expr) -> Result<Expr, ParseError> {
+        if *self.peek() != Token::Arrow {
+            return Ok(base);
+        }
+        match &base {
+            Expr::Field(_) | Expr::QualifiedField { .. } | Expr::JsonPath { .. } => {}
+            _ => {
+                return Err(ParseError::Syntax {
+                    message: "'->' JSON path access requires a field base \
+                              (e.g. .data->key or posts.data->author)"
+                        .into(),
+                })
+            }
+        }
+        let mut segments = Vec::new();
+        while *self.peek() == Token::Arrow {
+            self.advance(); // consume `->`
+            let seg = match self.advance() {
+                // Bareword key: `->author`.
+                Token::Ident(name) => PathSeg::Key(name),
+                // String-form key: `->"weird key!"` (PowQL strings are
+                // double-quoted; the design's single-quote spelling maps here).
+                Token::StringLit(s) => PathSeg::Key(s),
+                // Array index: `->0`. Must be a non-negative integer that fits
+                // a u32; the lexer produces a signed `IntLit`, so reject `< 0`
+                // and overflow explicitly.
+                Token::IntLit(v) => {
+                    let idx = u32::try_from(v).map_err(|_| ParseError::Syntax {
+                        message: format!(
+                            "invalid JSON path array index {v}: expected a non-negative integer that fits in 32 bits"
+                        ),
+                    })?;
+                    PathSeg::Index(idx)
+                }
+                other => {
+                    return Err(ParseError::Syntax {
+                        message: format!(
+                            "expected a JSON path segment (object key or array index) after '->', found {}",
+                            other.display_name()
+                        ),
+                    })
+                }
+            };
+            segments.push(seg);
+        }
+        // Flatten a nested-JsonPath base into a single segment list so the AST
+        // for `a->b->c` is one node regardless of how it was assembled.
+        if let Expr::JsonPath {
+            base: inner_base,
+            segments: mut inner_segments,
+        } = base
+        {
+            inner_segments.extend(segments);
+            return Ok(Expr::JsonPath {
+                base: inner_base,
+                segments: inner_segments,
+            });
+        }
+        Ok(Expr::JsonPath {
+            base: Box::new(base),
+            segments,
+        })
     }
 
     fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
@@ -1544,7 +1620,8 @@ impl Parser {
             | Token::Now
             | Token::Extract
             | Token::DateAdd
-            | Token::DateDiff => {
+            | Token::DateDiff
+            | Token::JsonType => {
                 let tok = self.advance();
                 let func = token_to_scalar_fn(&tok);
                 self.expect(&Token::LParen)?;
@@ -2030,6 +2107,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Extract => out.push_str("extract"),
             Token::DateAdd => out.push_str("date_add"),
             Token::DateDiff => out.push_str("date_diff"),
+            Token::JsonType => out.push_str("json_type"),
             Token::Cast => out.push_str("cast"),
             Token::Case => out.push_str("case"),
             Token::When => out.push_str("when"),
@@ -3759,5 +3837,195 @@ mod dogfood_dx_tests {
             parse("schema Post").unwrap(),
             Statement::Describe("Post".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod json_path_tests {
+    use super::*;
+
+    /// Pull the filter expression out of a single-table query.
+    fn filter_of(src: &str) -> Expr {
+        match parse(src).unwrap() {
+            Statement::Query(q) => q.filter.expect("expected a filter"),
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ident_key_path() {
+        // .data->author->name
+        let e = filter_of(r#"Post filter .data->author->name = "x""#);
+        let Expr::BinaryOp(lhs, BinOp::Eq, _) = e else {
+            panic!("expected an equality, got {e:?}");
+        };
+        assert_eq!(
+            *lhs,
+            Expr::JsonPath {
+                base: Box::new(Expr::Field("data".into())),
+                segments: vec![PathSeg::Key("author".into()), PathSeg::Key("name".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn string_form_key_path() {
+        // .data->"weird key!" (PowQL strings are double-quoted)
+        let e = filter_of(r#"Post filter .data->"weird key!" = 1"#);
+        let Expr::BinaryOp(lhs, _, _) = e else {
+            panic!("expected binop");
+        };
+        assert_eq!(
+            *lhs,
+            Expr::JsonPath {
+                base: Box::new(Expr::Field("data".into())),
+                segments: vec![PathSeg::Key("weird key!".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn array_index_path() {
+        // .data->tags->0
+        let e = filter_of(r#"Post filter .data->tags->0 = "rust""#);
+        let Expr::BinaryOp(lhs, _, _) = e else {
+            panic!("expected binop");
+        };
+        assert_eq!(
+            *lhs,
+            Expr::JsonPath {
+                base: Box::new(Expr::Field("data".into())),
+                segments: vec![PathSeg::Key("tags".into()), PathSeg::Index(0)],
+            }
+        );
+    }
+
+    #[test]
+    fn qualified_base_path() {
+        // posts.data->author  (join-qualified base)
+        let e = filter_of(r#"Post as posts filter posts.data->author = "a""#);
+        let Expr::BinaryOp(lhs, _, _) = e else {
+            panic!("expected binop");
+        };
+        assert_eq!(
+            *lhs,
+            Expr::JsonPath {
+                base: Box::new(Expr::QualifiedField {
+                    qualifier: "posts".into(),
+                    field: "data".into(),
+                }),
+                segments: vec![PathSeg::Key("author".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn path_binds_tighter_than_comparison_and_arithmetic() {
+        // `.data->age > 21` must be `(.data->age) > 21`, not `.data->(age > 21)`.
+        let e = filter_of("Post filter .data->age > 21");
+        let Expr::BinaryOp(lhs, BinOp::Gt, rhs) = e else {
+            panic!("expected a top-level `>`, got {e:?}");
+        };
+        assert!(matches!(*lhs, Expr::JsonPath { .. }));
+        assert_eq!(*rhs, Expr::Literal(Literal::Int(21)));
+
+        // `.a->b + 1` must be `(.a->b) + 1`.
+        let e = filter_of("Post filter .a->b + 1 = 3");
+        let Expr::BinaryOp(add, BinOp::Eq, _) = e else {
+            panic!("expected eq");
+        };
+        let Expr::BinaryOp(lhs, BinOp::Add, _) = *add else {
+            panic!("expected `+` under `=`, got {add:?}");
+        };
+        assert!(matches!(*lhs, Expr::JsonPath { .. }));
+    }
+
+    #[test]
+    fn dash_vs_arrow_lexing() {
+        // `.a->1` is a path index: `->` lexes as one token because the chars
+        // are adjacent, ahead of the single-char `-`.
+        let idx = filter_of("Post filter .a->1 = 0");
+        let Expr::BinaryOp(lhs, BinOp::Eq, _) = idx else {
+            panic!("expected eq");
+        };
+        assert_eq!(
+            *lhs,
+            Expr::JsonPath {
+                base: Box::new(Expr::Field("a".into())),
+                segments: vec![PathSeg::Index(1)],
+            }
+        );
+
+        // `.a - 1` (spaced) is subtraction — the `-` is not glued to a digit,
+        // so it lexes as the minus operator.
+        let sub = filter_of("Post filter .a - 1 = 0");
+        let Expr::BinaryOp(lhs, BinOp::Eq, _) = sub else {
+            panic!("expected eq");
+        };
+        assert!(
+            matches!(*lhs, Expr::BinaryOp(_, BinOp::Sub, _)),
+            "`.a - 1` should be subtraction, got {lhs:?}"
+        );
+
+        // `.a-1` (no spaces) is the lexer gotcha: `-1` is a NEGATIVE INTEGER
+        // literal (the number rule fires when `-` is glued to a digit), so the
+        // stream is `.a` then `-1` with no operator between — a parse error,
+        // NOT subtraction and NOT a path.
+        assert!(
+            parse("Post filter .a-1 = 0").is_err(),
+            "`.a-1` should fail to parse (negative-literal gotcha)"
+        );
+
+        // `.a - >` is `.a` `-` `>` — a dangling `>`, a parse error.
+        assert!(
+            parse("Post filter .a - > 0").is_err(),
+            "`.a - >` should fail to parse"
+        );
+    }
+
+    #[test]
+    fn negative_index_rejected() {
+        let err = parse("Post filter .data->-1 = 0").unwrap_err();
+        assert!(
+            err.to_string().contains("array index"),
+            "expected an index error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn path_on_literal_base_rejected() {
+        // A `->` after a non-field base is a parse error.
+        let err = parse("Post filter 5->x = 1").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("field base"),
+            "expected a field-base error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn json_type_scalar_parses() {
+        let e = filter_of(r#"Post filter json_type(.data->x) = "string""#);
+        let Expr::BinaryOp(lhs, _, _) = e else {
+            panic!("expected binop");
+        };
+        let Expr::ScalarFunc(ScalarFn::JsonType, args) = *lhs else {
+            panic!("expected json_type call, got {lhs:?}");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], Expr::JsonPath { .. }));
+    }
+
+    #[test]
+    fn path_in_projection() {
+        // Projecting a path to an alias is how order-by/group-by over a path
+        // are expressed (native path group/order keys are a documented
+        // non-goal). Confirm the projection carries the JsonPath expr.
+        let stmt = parse("Post { author: .data->author }").unwrap();
+        let Statement::Query(q) = stmt else {
+            panic!("expected query");
+        };
+        let proj = q.projection.unwrap();
+        assert_eq!(proj[0].alias.as_deref(), Some("author"));
+        assert!(matches!(proj[0].expr, Expr::JsonPath { .. }));
     }
 }
