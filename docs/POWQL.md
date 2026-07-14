@@ -18,18 +18,19 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 8. [Set Operations](#set-operations)
 9. [Subqueries](#subqueries)
 10. [Functions](#functions)
-11. [Mutations](#mutations)
-12. [Transactions](#transactions)
-13. [DDL](#ddl)
-14. [Introspection](#introspection)
-15. [Reserved Words and Quoting](#reserved-words-and-quoting)
-16. [Materialized Views](#materialized-views)
-17. [Window Functions](#window-functions)
-18. [UPSERT](#upsert)
-19. [EXPLAIN](#explain)
-20. [Prepared Queries](#prepared-queries)
-21. [Type System](#type-system)
-22. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+11. [JSON Documents](#json-documents)
+12. [Mutations](#mutations)
+13. [Transactions](#transactions)
+14. [DDL](#ddl)
+15. [Introspection](#introspection)
+16. [Reserved Words and Quoting](#reserved-words-and-quoting)
+17. [Materialized Views](#materialized-views)
+18. [Window Functions](#window-functions)
+19. [UPSERT](#upsert)
+20. [EXPLAIN](#explain)
+21. [Prepared Queries](#prepared-queries)
+22. [Type System](#type-system)
+23. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -138,6 +139,12 @@ Fields without `required` are nullable -- they can hold empty/null values. Null 
 | `datetime` | Timestamp as 64-bit integer (epoch) | 8 bytes fixed |
 | `uuid` | 128-bit UUID | 16 bytes fixed |
 | `bytes` | Raw binary data | Variable-length |
+| `json` | JSON document (object, array, or scalar) | Variable-length |
+
+`json` columns store a whole JSON document and support path extraction with
+the `->` operator. See [JSON Documents](#json-documents) for the storage
+semantics you need to know (keys are sorted, not insertion-ordered) and a
+worked example.
 
 ---
 
@@ -826,6 +833,23 @@ User { info: concat(.name, " age=", .age) }
 -- "Alice age=30"
 ```
 
+#### json_type
+
+Return the JSON type of a value extracted from a `json` column as one of
+`'null'`, `'string'`, `'number'`, `'bool'`, `'object'`, or `'array'`. A path
+that is missing (or extracts nothing) returns the empty set. This is the way
+to distinguish a JSON `null` from a missing key, since `->` scalarizes both to
+the empty set:
+
+```
+Post { kind: json_type(.data->author) }
+-- "object" when author is present, empty when the key is absent
+
+Post filter json_type(.data->tags) = "array"
+```
+
+See [JSON Documents](#json-documents) for the full `->` extraction rules.
+
 ### Math Functions
 
 #### abs
@@ -951,6 +975,104 @@ CASE without ELSE returns null (Empty) when no branch matches:
 ```
 User { .name, label: case when .age > 100 then "old" end }
 -- all labels will be null since no one is over 100
+```
+
+---
+
+## JSON Documents
+
+A `json` column stores a whole JSON document -- an object, an array, or a
+scalar -- as a single value. You insert JSON as a string literal; PowDB
+validates it, rejects malformed input, and stores a canonical binary form.
+
+```
+type Post {
+  required id: int,
+  data: json
+}
+
+insert Post {
+  id := 1,
+  data := "{\"author\": {\"name\": \"Ada\"}, \"tags\": [\"db\", \"powql\"], \"views\": 12}"
+}
+```
+
+### Path extraction with `->`
+
+The `->` operator walks into a JSON document by object key or array index. It
+binds tighter than any other operator, so `.data->author->name = "Ada"`
+extracts first and compares second. A key that is not a bare identifier can be
+written as a string:
+
+```
+Post { author: .data->author->name }        -- object key
+Post { first_tag: .data->tags->0 }           -- array index (0-based)
+Post { weird: .data->'has spaces!' }         -- string-form key
+Post filter .data->views > 10                -- extract, then compare
+```
+
+`->` extracts and scalarizes the value it lands on:
+
+| JSON value at the path | PowQL value |
+|---|---|
+| string | `str` |
+| integral number | `int` |
+| non-integral number | `float` |
+| `true` / `false` | `bool` |
+| object or array | `json` (a sub-document) |
+| JSON `null` | empty set |
+| missing key or index | empty set |
+
+Because both JSON `null` and a missing path scalarize to the empty set, use
+[`json_type`](#json_type) when you need to tell them apart. There is no
+implicit cross-type coercion: `.data->views > 10` compares whatever the
+extraction yields under the normal PowQL value rules; use `cast` for stringly
+numbers.
+
+### Canonicalization semantics (important)
+
+PowDB stores JSON in a canonical binary form, not as the text you typed. This
+has user-visible consequences you must know:
+
+- **Object key order is not preserved.** Keys are sorted bytewise on write, so
+  `{"b":2,"a":1}` reads back as `{"a":1,"b":2}`. Do not depend on insertion
+  order (this matches PostgreSQL's `jsonb`).
+- **Duplicate keys are de-duplicated, last value wins.** `{"a":1,"a":2}`
+  becomes `{"a":2}`.
+- **Equal documents have equal bytes.** Two documents that differ only in key
+  order or whitespace are equal, group together, and compare equal.
+- **Numbers keep their int/float distinction** from the input text. Floating
+  point values are IEEE 754 `f64`, with the usual precision limits.
+- **Limits.** A single JSON value may not exceed 64MB, and nesting may not
+  exceed a depth of 128 levels. Exceeding either is a typed error on insert.
+- Invalid JSON or invalid UTF-8 is rejected on insert with a typed error; the
+  value is never stored.
+
+### Worked example
+
+```
+type Post { required id: int, data: json }
+
+insert Post { id := 1, data := "{\"tags\":[\"db\"],\"author\":{\"name\":\"Ada\"},\"views\":12}" }
+insert Post { id := 2, data := "{\"author\":{\"name\":\"Grace\"},\"views\":3}" }
+
+-- Extract nested fields. Note the canonical (sorted-key) output.
+Post { .id, author: .data->author->name, views: .data->views }
+-- 1, "Ada",   12
+-- 2, "Grace", 3
+
+-- Filter on an extracted scalar.
+Post filter .data->views > 10 { .id }
+-- 1
+
+-- Distinguish a missing key from a present one.
+Post { .id, has_tags: json_type(.data->tags) }
+-- 1, "array"
+-- 2, (empty)   -- post 2 has no "tags" key
+
+-- Extract a sub-document (object/array come back as json text).
+Post filter .id = 1 { sub: .data->author }
+-- {"name":"Ada"}
 ```
 
 ---
@@ -1509,7 +1631,7 @@ for i in 0..1000 {
 
 ## Type System
 
-PowQL has seven data types plus a null representation.
+PowQL has eight data types plus a null representation.
 
 | Type | PowQL Name | Rust Mapping | Size | Description |
 |---|---|---|---|---|
@@ -1520,6 +1642,7 @@ PowQL has seven data types plus a null representation.
 | DateTime | `datetime` | `i64` (epoch) | 8 bytes | Unix timestamp |
 | UUID | `uuid` | `[u8; 16]` | 16 bytes | 128-bit identifier |
 | Bytes | `bytes` | `Vec<u8>` | Variable | Raw binary data |
+| JSON | `json` | canonical binary | Variable | JSON document; see [JSON Documents](#json-documents) |
 | Null | (empty) | `Value::Empty` | 0 bytes | Absence of a value |
 
 ### Nullability
