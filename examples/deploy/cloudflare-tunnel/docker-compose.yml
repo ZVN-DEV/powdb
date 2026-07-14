@@ -20,7 +20,7 @@
 
 services:
   powdb-server:
-    image: ghcr.io/zvn-dev/powdb:v0.11.0
+    image: ghcr.io/zvn-dev/powdb:v0.12.0
     container_name: powdb-server
     restart: unless-stopped
     environment:
