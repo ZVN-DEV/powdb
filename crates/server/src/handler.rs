@@ -329,6 +329,11 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     // an ordinary failed query (the statement may still be visible until the
     // server restarts). The io::Error detail leaks no internal state.
     "wal durability sync failed",
+    // Cooperative query cancellation. Both messages are derived purely from
+    // the configured timeout / a client disconnect and leak no internal state.
+    // See QueryError::{Timeout,Cancelled} in crates/query/src/result.rs.
+    "query timeout after",
+    "query cancelled",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -1897,16 +1902,34 @@ where
 {
     let _in_flight = metrics.in_flight_guard();
     let start = Instant::now();
-    let mut handle = tokio::task::spawn_blocking(move || f(engine, input, principal));
+
+    // Cooperative cancellation. The blocking closure installs this token for the
+    // executor thread; every unbounded executor loop polls it. We give it a
+    // deadline of `now + query_timeout` so the query self-terminates even if the
+    // async timeout arm below is slow to be scheduled — that is what actually
+    // makes the timeout enforceable (a `spawn_blocking` thread cannot be
+    // aborted, so before this the timeout arm just awaited the runaway query to
+    // completion while it held the engine lock / tx-gate permit).
+    let timeout_ms = query_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    let cancel = Arc::new(powdb_query::cancel::ExecCancel::with_deadline(
+        Instant::now() + query_timeout,
+        timeout_ms,
+    ));
+    let cancel_task = Arc::clone(&cancel);
+    let mut handle = tokio::task::spawn_blocking(move || {
+        let _cancel_guard = powdb_query::cancel::install(cancel_task);
+        f(engine, input, principal)
+    });
     let mut exceeded_timeout = false;
     let join_result = tokio::select! {
         result = &mut handle => result,
         _ = tokio::time::sleep(query_timeout) => {
             exceeded_timeout = true;
-            // `spawn_blocking` tasks that have started cannot be aborted safely.
-            // Wait for completion before replying so a client never receives a
-            // timeout while the same query keeps running and possibly mutating
-            // state in the background.
+            // Signal the executor to stop at its next cancellation checkpoint,
+            // then await the (now promptly returning) handle. The closure
+            // returns a typed timeout error and releases the engine lock /
+            // tx-gate permit as it unwinds.
+            cancel.cancel(powdb_query::cancel::CancelReason::Timeout);
             handle.await
         }
     };
@@ -1923,8 +1946,16 @@ where
             ),
         },
         Ok((Err(e), ticket)) => {
+            // A deadline-driven cancellation returns Timeout even when the async
+            // timeout arm has not fired yet (the executor self-cancels): treat it
+            // as a timeout for metrics either way.
+            if matches!(e, QueryError::Timeout { .. }) {
+                exceeded_timeout = true;
+            }
             let outcome = if matches!(e, QueryError::MemoryLimitExceeded { .. }) {
                 QueryOutcome::MemoryLimit
+            } else if matches!(e, QueryError::Timeout { .. }) {
+                QueryOutcome::Timeout
             } else {
                 QueryOutcome::Error
             };

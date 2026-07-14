@@ -1,6 +1,7 @@
 //! The execute_plan method and associated helpers.
 
 use crate::ast::*;
+use crate::cancel::CancelCheck;
 use crate::plan::*;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
@@ -8,6 +9,7 @@ use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, R
 use powdb_storage::types::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ops::ControlFlow;
 
 use super::compiled::*;
 use super::eval::*;
@@ -96,12 +98,18 @@ impl Engine {
                     .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows: Vec<Vec<Value>> = self
+                // Cooperative cancellation: a full-table scan of a huge table
+                // must stay stoppable.
+                let mut cancel = CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self
                     .catalog
                     .scan(table)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?
-                    .map(|(_, row)| row)
-                    .collect();
+                {
+                    cancel.tick()?;
+                    rows.push(row);
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -123,7 +131,11 @@ impl Engine {
                     return match result {
                         QueryResult::Rows { columns, rows } => {
                             let mut filtered = Vec::new();
+                            // Cooperative cancellation: a subquery runs per outer
+                            // row, so a large outer scan must stay stoppable.
+                            let mut cancel = CancelCheck::new();
                             for row in rows {
+                                cancel.tick()?;
                                 let row_pred =
                                     self.materialize_correlated_for_row(predicate, &row, &columns)?;
                                 if eval_predicate(&row_pred, &row, &columns) {
@@ -168,27 +180,46 @@ impl Engine {
 
                         // Try compiled predicate for the filter check (handles
                         // int leaves, string-eq leaves, and And conjunctions).
+                        // Cooperative cancellation: a full-table compiled/
+                        // selective predicate scan must stay stoppable, so use
+                        // the early-terminating scan and break on cancel. The
+                        // captured error is surfaced after the scan returns.
+                        let mut cancel = CancelCheck::new();
+                        let mut cancel_err: Option<QueryError> = None;
                         if let Some(compiled) =
                             compile_predicate(predicate, &columns, &fast, &schema)
                         {
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return ControlFlow::Break(());
+                                    }
                                     if compiled(data) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         } else {
                             let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return ControlFlow::Break(());
+                                    }
                                     let pred_row =
                                         decode_selective(&schema, &row_layout, data, &pred_cols);
                                     if eval_predicate(predicate, &pred_row, &columns) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        }
+                        if let Some(e) = cancel_err {
+                            return Err(e);
                         }
 
                         return Ok(QueryResult::Rows { columns, rows });
@@ -1041,7 +1072,24 @@ impl Engine {
                     };
                     let matching_rids = self.collect_rids_for_mutation(input, table)?;
                     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_rids.len());
+                    // Cooperative cancellation of a long mutation loop.
+                    //
+                    // Safety: each row is applied through `update_hinted`, which
+                    // WAL-logs that single row before the loop advances. A cancel
+                    // between rows therefore leaves an already-durable prefix of
+                    // rows updated and the rest untouched — equivalent to the
+                    // statement having matched that smaller set. No half-applied,
+                    // unlogged batch is possible because there is no batch: every
+                    // row is its own logged operation. The check sits at the top
+                    // of the loop (before this row is read or written), so the
+                    // in-flight row is never left partially applied.
+                    //
+                    // Because we return `Err(Timeout/Cancelled)` rather than
+                    // `Modified(count)`, the client is told the statement did NOT
+                    // complete; it must never observe a partial write as success.
+                    let mut cancel = CancelCheck::new();
                     for rid in matching_rids {
+                        cancel.tick()?;
                         let mut row = match self.catalog.get(table, rid) {
                             Some(r) => r,
                             None => continue,
@@ -1168,7 +1216,11 @@ impl Engine {
                     if let Some(patches) = fast_patch {
                         let mut count = 0u64;
                         let mut fallback_rids: Vec<RowId> = Vec::new();
+                        // Cooperative cancellation — same per-row-logged safety
+                        // reasoning as the returning-update loop above.
+                        let mut cancel = CancelCheck::new();
                         for rid in &matching_rids {
+                            cancel.tick()?;
                             // Mission B2: WAL-log every patch so crash
                             // recovery replays the update. Same mutation
                             // closure as before — the wrapper just sandwiches
@@ -1263,7 +1315,10 @@ impl Engine {
                         let new_bytes_ref: Option<&[u8]> = new_bytes_opt.as_deref();
                         let mut count = 0u64;
                         let mut fallback_rids: Vec<RowId> = Vec::new();
+                        // Cooperative cancellation — per-row-logged, see above.
+                        let mut cancel = CancelCheck::new();
                         for rid in &matching_rids {
+                            cancel.tick()?;
                             // Mission B2: logged variant so crash recovery
                             // replays the shrink. On a false return (row
                             // would have to grow), the rid is pushed to
@@ -1298,7 +1353,10 @@ impl Engine {
 
                     // Generic literal path: decode row, apply literal values.
                     let mut count = 0u64;
+                    // Cooperative cancellation — per-row-logged, see above.
+                    let mut cancel = CancelCheck::new();
                     for rid in matching_rids {
+                        cancel.tick()?;
                         let mut row = match self.catalog.get(table, rid) {
                             Some(r) => r,
                             None => continue,
@@ -1326,7 +1384,10 @@ impl Engine {
                     schema_ref.columns.iter().map(|c| c.name.clone()).collect()
                 };
                 let mut count = 0u64;
+                // Cooperative cancellation — per-row-logged, see above.
+                let mut cancel = CancelCheck::new();
                 for rid in matching_rids {
+                    cancel.tick()?;
                     let mut row = match self.catalog.get(table, rid) {
                         Some(r) => r,
                         None => continue,
@@ -1371,7 +1432,12 @@ impl Engine {
                     };
                     let matching_rids = self.collect_rids_for_mutation(input, table)?;
                     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(matching_rids.len());
+                    // Cooperative cancellation of the pre-delete image read. The
+                    // actual removal below is a single batched `delete_many`, so
+                    // cancelling here happens before any row is deleted.
+                    let mut cancel = CancelCheck::new();
                     for rid in &matching_rids {
+                        cancel.tick()?;
                         if let Some(row) = self.catalog.get(table, *rid) {
                             out_rows.push(row);
                         }
@@ -1540,7 +1606,7 @@ impl Engine {
                                 l_idx,
                                 r_idx,
                                 *kind,
-                            );
+                            )?;
                             if let QueryResult::Rows { ref rows, .. } = result {
                                 check_join_limit(rows.len())?;
                             }
@@ -1559,9 +1625,17 @@ impl Engine {
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
                 let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
 
+                // Cooperative cancellation: an unindexed compound-ON join runs
+                // this loop left_rows.len() * right_rows.len() times, almost
+                // none of which push a row (so check_join_limit never fires).
+                // Poll the deadline on the inner loop so a timed-out or
+                // client-cancelled query returns promptly and releases the
+                // engine lock instead of running for tens of seconds.
+                let mut cancel = CancelCheck::new();
                 for left_row in &left_rows {
                     let mut matched = false;
                     for right_row in &right_rows {
+                        cancel.tick()?;
                         combined.clear();
                         combined.extend_from_slice(left_row);
                         combined.extend_from_slice(right_row);
@@ -3767,7 +3841,9 @@ pub(super) fn exec_group_by(
     // Group rows by key values (preserving insertion order).
     let mut group_map: rustc_hash::FxHashMap<Vec<Value>, usize> = rustc_hash::FxHashMap::default();
     let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    let mut cancel = CancelCheck::new();
     for (ri, row) in rows.iter().enumerate() {
+        cancel.tick()?;
         let key: Vec<Value> = key_indices.iter().map(|&i| row[i].clone()).collect();
         match group_map.get(&key) {
             Some(&idx) => groups[idx].1.push(ri),
@@ -3790,6 +3866,7 @@ pub(super) fn exec_group_by(
     // Compute aggregates per group.
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
     for (key_vals, row_indices) in &groups {
+        cancel.tick()?;
         let mut row = key_vals.clone();
         for (ai, agg) in aggregates.iter().enumerate() {
             let col_idx = agg_field_indices[ai];
@@ -4385,7 +4462,7 @@ pub(super) fn hash_join(
     left_key_idx: usize,
     right_key_idx: usize,
     kind: JoinKind,
-) -> QueryResult {
+) -> Result<QueryResult, QueryError> {
     use rustc_hash::FxHashMap;
 
     let n_left = left_columns.len();
@@ -4394,11 +4471,16 @@ pub(super) fn hash_join(
     columns.extend(left_columns);
     columns.extend(right_columns);
 
+    // Cooperative cancellation: build and probe both walk the full input, so
+    // poll the deadline in each so a huge-input join can be timed out / freed.
+    let mut cancel = CancelCheck::new();
+
     // Build: right_key -> list of right-row indices. Pre-size to the row
     // count so the map doesn't rehash mid-build.
     let mut build: FxHashMap<Value, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(right_rows.len(), Default::default());
     for (i, row) in right_rows.iter().enumerate() {
+        cancel.tick()?;
         // Skip Empty keys on the build side — they can never match under
         // SQL semantics (NULL ≠ NULL) and would collapse all nullables to
         // one bucket.
@@ -4413,6 +4495,7 @@ pub(super) fn hash_join(
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
 
     for left_row in &left_rows {
+        cancel.tick()?;
         let key = &left_row[left_key_idx];
         let matched = if matches!(key, Value::Empty) {
             None
@@ -4440,7 +4523,7 @@ pub(super) fn hash_join(
         }
     }
 
-    QueryResult::Rows { columns, rows }
+    Ok(QueryResult::Rows { columns, rows })
 }
 
 /// Lower unindexed `RangeScan` and `IndexScan` nodes to `Filter(SeqScan)`

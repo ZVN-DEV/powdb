@@ -64,6 +64,14 @@ pub enum QueryError {
     StorageError(String),
     /// Readonly path needs write lock (internal sentinel).
     ReadonlyNeedsWrite,
+    /// The per-query deadline elapsed before execution finished. Returned as a
+    /// clean early-return from an unbounded executor loop so the query releases
+    /// its locks instead of running to completion. `timeout_ms` is the
+    /// configured per-query timeout.
+    Timeout { timeout_ms: u64 },
+    /// Execution was cancelled cooperatively (e.g. the issuing client
+    /// disconnected). Like [`QueryError::Timeout`], a clean early-return.
+    Cancelled,
     /// Generic execution error (catch-all for migration).
     Execution(String),
 }
@@ -98,6 +106,10 @@ impl fmt::Display for QueryError {
             QueryError::ReadonlyNeedsWrite => {
                 write!(f, "__POWDB_READONLY_NEEDS_WRITE__")
             }
+            QueryError::Timeout { timeout_ms } => {
+                write!(f, "query timeout after {timeout_ms}ms")
+            }
+            QueryError::Cancelled => write!(f, "query cancelled by client disconnect"),
             QueryError::Execution(msg) => write!(f, "{msg}"),
         }
     }

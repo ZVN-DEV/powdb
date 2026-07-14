@@ -883,6 +883,73 @@ impl Engine {
         self.execute_plan_readonly(&plan)
     }
 
+    /// Cancellation-aware variant of [`Engine::execute_powql`]. Installs
+    /// `cancel` as the current thread's cancellation token for the duration of
+    /// the statement, so every unbounded executor loop polls it and the query
+    /// returns [`QueryError::Timeout`] / [`QueryError::Cancelled`] promptly
+    /// instead of running to completion. The base methods are unchanged: a
+    /// caller with no token (embedded/direct use) never cancels.
+    pub fn execute_powql_with_cancel(
+        &mut self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_sql`].
+    pub fn execute_sql_with_cancel(
+        &mut self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_sql(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_readonly`].
+    pub fn execute_powql_readonly_with_cancel(
+        &self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_readonly(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_sql_readonly`].
+    pub fn execute_sql_readonly_with_cancel(
+        &self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_sql_readonly(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_with_params`].
+    pub fn execute_powql_with_params_and_cancel(
+        &mut self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_with_params(input, params)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_readonly_with_params`].
+    pub fn execute_powql_readonly_with_params_and_cancel(
+        &self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_readonly_with_params(input, params)
+    }
+
     /// Plan cache stats — useful for benches and debugging.
     pub fn plan_cache_stats(&self) -> (u64, u64, usize) {
         let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -977,12 +1044,14 @@ impl Engine {
                     .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows: Vec<Vec<Value>> = self
-                    .catalog
-                    .scan(table)
-                    .map_err(|e| e.to_string())?
-                    .map(|(_, row)| row)
-                    .collect();
+                // Cooperative cancellation: a full-table scan of a huge table
+                // must stay stoppable.
+                let mut cancel = crate::cancel::CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                    cancel.tick()?;
+                    rows.push(row);
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -1209,7 +1278,11 @@ impl Engine {
                     return match result {
                         QueryResult::Rows { columns, rows } => {
                             let mut filtered = Vec::new();
+                            // Cooperative cancellation: this runs a subquery per
+                            // outer row, so a large outer scan must stay stoppable.
+                            let mut cancel = crate::cancel::CancelCheck::new();
                             for row in rows {
+                                cancel.tick()?;
                                 let row_pred = self.materialize_correlated_for_row_readonly(
                                     predicate, &row, &columns,
                                 )?;
@@ -1245,27 +1318,45 @@ impl Engine {
                         let row_layout = RowLayout::new(&schema);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
 
+                        // Cooperative cancellation: full-table compiled/selective
+                        // predicate scan must stay stoppable (see the write-path
+                        // Filter fast path for the same pattern).
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut cancel_err: Option<QueryError> = None;
                         if let Some(compiled) =
                             compile_predicate(predicate, &columns, &fast, &schema)
                         {
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return std::ops::ControlFlow::Break(());
+                                    }
                                     if compiled(data) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    std::ops::ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         } else {
                             let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return std::ops::ControlFlow::Break(());
+                                    }
                                     let pred_row =
                                         decode_selective(&schema, &row_layout, data, &pred_cols);
                                     if eval_predicate(predicate, &pred_row, &columns) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    std::ops::ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        }
+                        if let Some(e) = cancel_err {
+                            return Err(e);
                         }
 
                         return Ok(QueryResult::Rows { columns, rows });
@@ -1837,7 +1928,7 @@ impl Engine {
                                 l_idx,
                                 r_idx,
                                 *kind,
-                            );
+                            )?;
                             if let QueryResult::Rows { ref rows, .. } = result {
                                 check_join_limit(rows.len())?;
                             }
@@ -1855,9 +1946,13 @@ impl Engine {
                 let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
                 let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
 
+                // Cooperative cancellation on the unindexed nested-loop join —
+                // this is the read path the compound-ON join DoS repro takes.
+                let mut cancel = crate::cancel::CancelCheck::new();
                 for left_row in &left_rows {
                     let mut matched = false;
                     for right_row in &right_rows {
+                        cancel.tick()?;
                         combined.clear();
                         combined.extend_from_slice(left_row);
                         combined.extend_from_slice(right_row);
