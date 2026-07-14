@@ -51,6 +51,10 @@ pub(super) fn type_name_to_id(name: &str) -> Result<TypeId, String> {
         "datetime" => Ok(TypeId::DateTime),
         "uuid" => Ok(TypeId::Uuid),
         "bytes" => Ok(TypeId::Bytes),
+        // Lane B: `type T { data: json }` declares a canonical-binary JSON
+        // (PJ1) column. This is the type-name lookup table, not the compiled
+        // predicate fast path (which a later lane owns).
+        "json" => Ok(TypeId::Json),
         _ => Err(format!("unknown type name: '{name}'")),
     }
 }
