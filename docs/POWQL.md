@@ -1007,7 +1007,7 @@ written as a string:
 ```
 Post { author: .data->author->name }        -- object key
 Post { first_tag: .data->tags->0 }           -- array index (0-based)
-Post { weird: .data->'has spaces!' }         -- string-form key
+Post { weird: .data->"has spaces!" }         -- string-form key (double-quoted)
 Post filter .data->views > 10                -- extract, then compare
 ```
 
