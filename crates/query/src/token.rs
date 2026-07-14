@@ -89,6 +89,9 @@ pub enum Token {
     DateAdd,  // date_add
     DateDiff, // date_diff
 
+    // JSON functions
+    JsonType, // json_type
+
     // Type conversion
     Cast, // cast
 
@@ -241,6 +244,7 @@ impl Token {
             Token::Extract => "'extract'".into(),
             Token::DateAdd => "'date_add'".into(),
             Token::DateDiff => "'date_diff'".into(),
+            Token::JsonType => "'json_type'".into(),
             Token::Cast => "'cast'".into(),
             Token::Case => "'case'".into(),
             Token::When => "'when'".into(),
@@ -372,6 +376,7 @@ impl Token {
             Token::Extract => "extract",
             Token::DateAdd => "date_add",
             Token::DateDiff => "date_diff",
+            Token::JsonType => "json_type",
             Token::Cast => "cast",
             Token::Case => "case",
             Token::When => "when",

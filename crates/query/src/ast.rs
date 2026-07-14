@@ -319,6 +319,8 @@ pub enum ScalarFn {
     Extract,  // extract("year"|"month"|..., datetime_expr)
     DateAdd,  // date_add(datetime_expr, amount, "unit")
     DateDiff, // date_diff(dt1, dt2, "unit")
+    // JSON
+    JsonType, // json_type(expr) — 'null'|'string'|'number'|'bool'|'object'|'array', Empty when missing
 }
 
 /// Target type for CAST expressions.
@@ -331,6 +333,21 @@ pub enum CastType {
     DateTime,
     Uuid,
     Bytes,
+}
+
+/// A single step in a JSON `->` path expression.
+///
+/// This is the query-crate's OWNED path-segment type (distinct from
+/// [`powdb_storage::pj1::PathSeg`], which borrows `&str` keys). Segments are
+/// STRUCTURAL: they are part of the query shape, never literal slots, so the
+/// plan cache hashes them into the canonical token stream and neither counts
+/// nor substitutes them (see `plan_cache::count_expr` / `substitute_expr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathSeg {
+    /// Object member access: `->author` or `->"weird key!"`.
+    Key(String),
+    /// Array element access: `->0`.
+    Index(u32),
 }
 
 /// Expressions.
@@ -394,6 +411,14 @@ pub enum Expr {
     ValueLit(Value),
     /// The `null` literal — produces `Value::Empty`.
     Null,
+    /// A JSON path access: `base->seg->seg...`. `base` is restricted at parse
+    /// time to `Field`, `QualifiedField`, or (nested) `JsonPath`. Evaluating it
+    /// walks the base `Value::Json` document and scalarizes the addressed node
+    /// (see `eval_expr`); the `segments` are structural (see [`PathSeg`]).
+    JsonPath {
+        base: Box<Expr>,
+        segments: Vec<PathSeg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
