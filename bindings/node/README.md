@@ -102,6 +102,12 @@ type QueryResult =
   | { kind: "message"; message: string };
 ```
 
+Every cell is a string, using the same wire rendering as the server. `json`
+columns come back as canonical JSON text (keys sorted bytewise, no whitespace),
+so `JSON.parse(cell)` reconstructs the document. This addon is an untyped
+passthrough: it does not coerce cells the way `@zvndev/powdb-client`'s
+`queryTyped` does, so parse json cells yourself with `JSON.parse`.
+
 ## When to use embedded vs the server
 
 - **Embedded** (this package): one process, in-process speed, local-first apps,

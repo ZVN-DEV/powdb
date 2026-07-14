@@ -1470,4 +1470,5 @@ export type {
   TypedSchema,
   TypedRow,
   Coerced,
+  JsonValue,
 } from "./typed.js";

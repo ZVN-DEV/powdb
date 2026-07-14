@@ -9,6 +9,7 @@
  *   Str      → raw UTF-8 (may contain anything)
  *   DateTime → microseconds since Unix epoch as decimal, e.g. "1718928000000000"
  *   Uuid     → canonical "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+ *   Json     → canonical JSON text (keys sorted bytewise, no whitespace)
  *   Bytes    → "<N bytes>" (LOSSY — see note below)
  *
  * `queryTyped` takes a user-supplied schema and coerces each column string
@@ -27,16 +28,32 @@
 import { PowDBError } from "./errors.js";
 
 /**
- * Supported column types. Mirrors the server's `DataType` enum minus the
+ * Supported column types. Mirrors the server's `TypeId` enum minus the
  * `Bytes` variant, which is intentionally unsupported here.
  */
-export type ColumnType = "int" | "float" | "bool" | "str" | "datetime" | "uuid";
+export type ColumnType =
+  | "int"
+  | "float"
+  | "bool"
+  | "str"
+  | "datetime"
+  | "uuid"
+  | "json";
 
 /** Map of column name → declared type. Columns not in the map pass through as strings. */
 export type TypedSchema = Record<string, ColumnType>;
 
+/** Any value produced by `JSON.parse` of a canonical JSON document. */
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 /** Coerced value type. `int` may return `bigint` if the value exceeds Number.MAX_SAFE_INTEGER. */
-export type Coerced = number | bigint | boolean | string | Date | null;
+export type Coerced = number | bigint | boolean | string | Date | null | JsonValue;
 
 /** A row of coerced values keyed by column name. */
 export type TypedRow = Record<string, Coerced>;
@@ -117,6 +134,25 @@ export function coerceValue(
         );
       }
       return raw;
+    }
+
+    case "json": {
+      // The server renders json cells as canonical JSON text, so JSON.parse
+      // reconstructs the document (object, array, or scalar). A JSON `null`
+      // document already returned above via the shared null-sentinel guard.
+      //
+      // Unlike the other typed columns, a parse failure does NOT throw: it
+      // returns the raw string. Rationale: json is the one column type whose
+      // wire text is not a fixed, server-controlled shape a client can fully
+      // predict, and a future server that ever emits a non-canonical cell (or
+      // a proxy that rewrites it) must not turn a readable result into an
+      // exception. Canonical output always parses, so this fallback is inert
+      // in normal operation and exists purely as a safety net.
+      try {
+        return JSON.parse(raw) as JsonValue;
+      } catch {
+        return raw;
+      }
     }
   }
 }

@@ -228,6 +228,47 @@ async function main() {
   });
 
   // ──────────────────────────────────────────────────────────
+  console.log("\ncoerceValue — json");
+  // ──────────────────────────────────────────────────────────
+
+  await test("json object parses to a plain object", () => {
+    // Canonical PJ1 text: keys sorted, no whitespace.
+    assert.deepEqual(
+      coerceValue("doc", '{"a":1,"b":"two","c":true}', "json"),
+      { a: 1, b: "two", c: true },
+    );
+  });
+
+  await test("json array parses to an array", () => {
+    assert.deepEqual(coerceValue("tags", "[1,2,3]", "json"), [1, 2, 3]);
+  });
+
+  await test("json nested document round-trips", () => {
+    assert.deepEqual(
+      coerceValue("doc", '{"author":{"name":"Ada"},"ids":[1,2]}', "json"),
+      { author: { name: "Ada" }, ids: [1, 2] },
+    );
+  });
+
+  await test("json scalar string parses to a string", () => {
+    assert.equal(coerceValue("v", '"hello"', "json"), "hello");
+  });
+
+  await test("json scalar number parses to a number", () => {
+    assert.equal(coerceValue("v", "42", "json"), 42);
+  });
+
+  await test("json scalar bool parses to a bool", () => {
+    assert.equal(coerceValue("v", "true", "json"), true);
+  });
+
+  await test("json invalid text falls back to the raw string (no throw)", () => {
+    // The server never emits non-canonical JSON, but the fallback must never
+    // turn a readable result into an exception.
+    assert.equal(coerceValue("v", "{not json", "json"), "{not json");
+  });
+
+  // ──────────────────────────────────────────────────────────
   console.log("\ncoerceValue — null sentinel");
   // ──────────────────────────────────────────────────────────
 
@@ -249,6 +290,10 @@ async function main() {
 
   await test("\"null\" on uuid returns null", () => {
     assert.equal(coerceValue("id", "null", "uuid"), null);
+  });
+
+  await test("\"null\" on json returns null (shared sentinel, before parse)", () => {
+    assert.equal(coerceValue("doc", "null", "json"), null);
   });
 
   // ──────────────────────────────────────────────────────────
