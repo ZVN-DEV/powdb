@@ -958,11 +958,18 @@ mod tests {
         wal.set_sync_mode(WalSyncMode::Normal);
         wal.append(1, WalRecordType::Insert, b"bg1").unwrap();
         wal.flush().unwrap(); // buffers to OS + marks dirty; no inline fsync
-                              // The background flusher should fsync within its (~10 ms) interval.
-        std::thread::sleep(std::time::Duration::from_millis(80));
+                              // The background flusher fsyncs on its (~10 ms) interval. Poll
+                              // rather than sleeping a fixed 80 ms: on loaded CI runners the
+                              // flusher thread can be starved well past one interval, and the
+                              // property under test is "it happens off the commit path", not
+                              // "it happens within 80 ms".
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while wal.synced_generation() < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             wal.synced_generation() >= 1,
-            "background flusher did not sync (synced_generation = {})",
+            "background flusher did not sync within 2s (synced_generation = {})",
             wal.synced_generation()
         );
         std::fs::remove_file(&path).ok();
