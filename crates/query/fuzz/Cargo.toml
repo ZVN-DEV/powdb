@@ -38,3 +38,9 @@ name = "fuzz_sql"
 path = "fuzz_targets/fuzz_sql.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_pj1"
+path = "fuzz_targets/fuzz_pj1.rs"
+test = false
+doc = false
