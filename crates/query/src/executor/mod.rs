@@ -1414,6 +1414,17 @@ impl Engine {
                     };
                 }
 
+                // Lane A fast path: Filter over an equality-driven index scan
+                // (mirrors the mutable path). Pure `&self`, so it is shared.
+                if matches!(
+                    input.as_ref(),
+                    PlanNode::IndexScan { .. } | PlanNode::ExprIndexScan { .. }
+                ) {
+                    if let Some(result) = self.try_filter_index_residual_fast(input, predicate)? {
+                        return Ok(result);
+                    }
+                }
+
                 // Fused Filter+SeqScan fast path.
                 // Overflow safety (P0-4/P1): v2-capable tables fall through to
                 // the decoded general path below.
@@ -2097,7 +2108,10 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                let text = format_plan_tree(&self.catalog, input, 0);
+                // Format the plan that actually runs: lower speculative and
+                // conjunction scans first so EXPLAIN reflects execution.
+                let lowered = lower_unindexed_scans(&self.catalog, input);
+                let text = format_plan_tree(&self.catalog, &lowered, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text

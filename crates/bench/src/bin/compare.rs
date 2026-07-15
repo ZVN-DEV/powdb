@@ -81,6 +81,7 @@ const WORKLOADS: &[&str] = &[
     "agg_min",                    // MA#8
     "agg_max",                    // MA#9
     "multi_col_and_filter",       // MA#10
+    "conjunction_index_residual", // Lane A conjunction index selection
     // ── Mission A writes (workloads 11-15) ──
     "insert_single",    // MA#11
     "insert_batch_1k",  // MA#12

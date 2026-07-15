@@ -3,6 +3,9 @@
 use crate::ast::*;
 use crate::cancel::CancelCheck;
 use crate::plan::*;
+use crate::planner::{
+    extract_single_bound, range_scan_for_target, try_extract_eq_index_key, RangeBound, RangeTarget,
+};
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{Catalog, ExpressionIndexMeta, IndexOrderDirection};
 use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
@@ -470,6 +473,102 @@ impl Engine {
         Ok(Some(QueryResult::Rows { columns, rows }))
     }
 
+    /// Lane A residual-recheck fast path for `Filter(<equality index scan>)`.
+    ///
+    /// The index narrows the candidate rids; the residual predicate is then
+    /// re-checked while decoding only the columns it references
+    /// (`get_projected`), and only the rows that pass are fully materialized.
+    /// A non-matching candidate never pays a full-row decode, the win that
+    /// turns a driven conjunction into single-digit milliseconds.
+    ///
+    /// Returns `None` for any shape it does not accelerate (range-driven scans,
+    /// unresolved indexes, subquery predicates), deferring to the general
+    /// Filter path, which stays correct in every case. `get_projected`
+    /// reassembles spilled columns, so this path is overflow-safe and needs no
+    /// v2 gating. Output rows and their order match the general path exactly.
+    pub(super) fn try_filter_index_residual_fast(
+        &self,
+        input: &PlanNode,
+        predicate: &Expr,
+    ) -> Result<Option<QueryResult>, QueryError> {
+        // A subquery residual cannot be evaluated row-at-a-time here; let the
+        // general path materialize it.
+        if contains_subquery(predicate) {
+            return Ok(None);
+        }
+        let (table, rids) = match input {
+            PlanNode::IndexScan { table, column, key } => {
+                let Some(tbl) = self.catalog.get_table(table) else {
+                    return Ok(None);
+                };
+                if !tbl.has_index(column) {
+                    return Ok(None);
+                }
+                let key_value = literal_to_value(key)?;
+                (table.as_str(), tbl.index_lookup_all(column, &key_value))
+            }
+            PlanNode::ExprIndexScan { table, path, key } => {
+                let Some(index) = resolve_expression_index(&self.catalog, table, path) else {
+                    return Ok(None);
+                };
+                let key_value = literal_to_value(key)?;
+                let rids = if key_value.is_empty() {
+                    self.catalog
+                        .expression_index_btree(table, index.index_id)
+                        .ok_or_else(|| {
+                            QueryError::Execution("expression index disappeared".to_string())
+                        })?
+                        .empty_rids()
+                        .to_vec()
+                } else {
+                    self.catalog
+                        .expression_index_lookup_all(table, index.index_id, &key_value)
+                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                };
+                (table.as_str(), rids)
+            }
+            _ => return Ok(None),
+        };
+
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
+            .clone();
+        let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        // Decode only the columns the residual touches when rechecking; the
+        // matching rows are materialized in full afterwards.
+        let residual_indices = predicate_column_indices_json(predicate, &all_columns);
+        let residual_names: Vec<String> = residual_indices
+            .iter()
+            .map(|&index| all_columns[index].clone())
+            .collect();
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        // Cooperative cancellation: a driving key with many matching rids can
+        // fetch a large candidate set, so this loop must stay stoppable.
+        let mut cancel = CancelCheck::new();
+        for rid in rids {
+            cancel.tick()?;
+            let Some(sparse) = self
+                .catalog
+                .get_projected(table, rid, &residual_indices)
+                .map_err(|error| QueryError::StorageError(error.to_string()))?
+            else {
+                continue;
+            };
+            if eval_predicate(predicate, &sparse, &residual_names) {
+                if let Some(full) = self.catalog.get(table, rid) {
+                    rows.push(full);
+                }
+            }
+        }
+        Ok(Some(QueryResult::Rows {
+            columns: all_columns,
+            rows,
+        }))
+    }
+
     fn charge_provenance(&self, rows: &ProvenanceRows) -> Result<(), QueryError> {
         let aliases =
             rows.source_aliases
@@ -904,6 +1003,18 @@ impl Engine {
                         }
                         _ => Err("filter requires row input".into()),
                     };
+                }
+
+                // Lane A fast path: Filter over an equality-driven index scan.
+                // The index narrows the candidate rids; the residual is
+                // re-checked with a partial decode, full rows only for matches.
+                if matches!(
+                    input.as_ref(),
+                    PlanNode::IndexScan { .. } | PlanNode::ExprIndexScan { .. }
+                ) {
+                    if let Some(result) = self.try_filter_index_residual_fast(input, predicate)? {
+                        return Ok(result);
+                    }
                 }
 
                 // Fast path: fuse Filter + SeqScan into a zero-copy streaming
@@ -2783,7 +2894,10 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                let text = format_plan_tree(&self.catalog, input, 0);
+                // Format the plan that actually runs: lower speculative and
+                // conjunction scans first so EXPLAIN reflects execution.
+                let lowered = lower_unindexed_scans(&self.catalog, input);
+                let text = format_plan_tree(&self.catalog, &lowered, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text
@@ -6131,6 +6245,172 @@ fn execute_provenance_join(
 /// `Filter(SeqScan)` would trigger. Lowering both speculative leaf kinds
 /// also keeps EXPLAIN honest: it prints the plan that actually runs.
 ///
+/// Flatten a top-level `and` chain into its individual conjuncts. A predicate
+/// that is not an `and` yields a single-element list.
+fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::BinaryOp(lhs, BinOp::And, rhs) => {
+            flatten_and(lhs, out);
+            flatten_and(rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Selectivity tier of an equality index-scan candidate, or `None` when the
+/// index does not resolve in the catalog. Lower is better:
+/// 0 = unique-index equality, 1 = non-unique-index equality.
+fn eq_candidate_tier(catalog: &Catalog, scan: &PlanNode) -> Option<u8> {
+    match scan {
+        PlanNode::IndexScan { table, column, .. } => match catalog.is_index_unique(table, column) {
+            Some(true) => Some(0),
+            Some(false) => Some(1),
+            None => None,
+        },
+        PlanNode::ExprIndexScan { table, path, .. } => {
+            resolve_expression_index(catalog, table, path).map(|meta| u8::from(!meta.unique))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a range candidate's index exists in the catalog.
+fn range_candidate_resolves(catalog: &Catalog, scan: &PlanNode) -> bool {
+    match scan {
+        PlanNode::RangeScan { table, column, .. } => catalog.has_index(table, column),
+        PlanNode::ExprRangeScan { table, path, .. } => {
+            resolve_expression_index(catalog, table, path).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// A conjunct chosen to drive an indexed scan, plus the conjunct indices it
+/// consumes (the rest become the residual Filter).
+struct ConjunctionCandidate {
+    plan: PlanNode,
+    consumed: Vec<usize>,
+    tier: u8,
+}
+
+/// Lane A: rewrite a `Filter(SeqScan)` whose predicate is a top-level `and`
+/// chain into `Filter(residual)(index scan)` driven by the most selective
+/// indexed conjunct. Returns `None` when the predicate is not a conjunction or
+/// no conjunct resolves to an existing index, so the caller keeps today's
+/// `Filter(SeqScan)` byte-identical.
+///
+/// Selection is a zero-stats heuristic: unique equality beats non-unique
+/// equality beats range, first match within a tier wins, and there is no
+/// probing (lowering runs on every execution, so it stays cheap). A wrong pick
+/// is only ever slower, never wrong: the residual re-checks the full
+/// conjunction on each fetched row.
+fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> Option<PlanNode> {
+    let mut conjuncts: Vec<&Expr> = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+
+    let mut candidates: Vec<ConjunctionCandidate> = Vec::new();
+
+    // Equality candidates, in conjunct order so ties resolve to the first.
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        if let Some(scan) = try_extract_eq_index_key(table, conjunct) {
+            if let Some(tier) = eq_candidate_tier(catalog, &scan) {
+                candidates.push(ConjunctionCandidate {
+                    plan: scan,
+                    consumed: vec![i],
+                    tier,
+                });
+            }
+        }
+    }
+
+    // Range candidates: merge same-column bounds into one BETWEEN scan. Only
+    // the first lower and first upper bound on a target are folded in; any
+    // extra bound on that target stays a residual conjunct so the recheck
+    // preserves exact semantics.
+    let bounds: Vec<(usize, RangeBound)> = conjuncts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, conjunct)| extract_single_bound(conjunct).map(|bound| (i, bound)))
+        .collect();
+    let mut seen_targets: Vec<RangeTarget> = Vec::new();
+    for (_, (target, _, _)) in &bounds {
+        if !seen_targets.contains(target) {
+            seen_targets.push(target.clone());
+        }
+    }
+    for target in seen_targets {
+        let mut lower: Option<(Expr, bool)> = None;
+        let mut lower_idx: Option<usize> = None;
+        let mut upper: Option<(Expr, bool)> = None;
+        let mut upper_idx: Option<usize> = None;
+        for (i, (candidate_target, start, end)) in &bounds {
+            if *candidate_target != target {
+                continue;
+            }
+            if lower.is_none() {
+                if let Some(bound) = start.clone() {
+                    lower = Some(bound);
+                    lower_idx = Some(*i);
+                }
+            }
+            if upper.is_none() {
+                if let Some(bound) = end.clone() {
+                    upper = Some(bound);
+                    upper_idx = Some(*i);
+                }
+            }
+        }
+        if lower.is_none() && upper.is_none() {
+            continue;
+        }
+        let scan = range_scan_for_target(table, target, lower, upper);
+        if !range_candidate_resolves(catalog, &scan) {
+            continue;
+        }
+        let mut consumed: Vec<usize> = Vec::new();
+        if let Some(i) = lower_idx {
+            consumed.push(i);
+        }
+        if let Some(i) = upper_idx {
+            if !consumed.contains(&i) {
+                consumed.push(i);
+            }
+        }
+        candidates.push(ConjunctionCandidate {
+            plan: scan,
+            consumed,
+            tier: 2,
+        });
+    }
+
+    // Best tier wins; `min_by_key` keeps the first element on a tie, which is
+    // the earliest-built candidate (equalities in conjunct order, then ranges).
+    let winner = candidates
+        .into_iter()
+        .min_by_key(|candidate| candidate.tier)?;
+
+    let mut residual: Vec<Expr> = Vec::new();
+    for (i, conjunct) in conjuncts.iter().enumerate() {
+        if !winner.consumed.contains(&i) {
+            residual.push((*conjunct).clone());
+        }
+    }
+    if residual.is_empty() {
+        return Some(winner.plan);
+    }
+    let residual_expr = residual
+        .into_iter()
+        .reduce(|acc, next| Expr::BinaryOp(Box::new(acc), BinOp::And, Box::new(next)))
+        .expect("residual is non-empty");
+    Some(PlanNode::Filter {
+        input: Box::new(winner.plan),
+        predicate: residual_expr,
+    })
+}
+
 /// This pass runs once per query, before execution.
 pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
@@ -6168,10 +6448,21 @@ pub(super) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
                 predicate: pred,
             }
         }
-        PlanNode::Filter { input, predicate } => PlanNode::Filter {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
-            predicate: predicate.clone(),
-        },
+        PlanNode::Filter { input, predicate } => {
+            // Lane A: a `Filter(SeqScan)` whose predicate is a top-level `and`
+            // chain can be driven by an indexed conjunct, re-checking the rest
+            // as a residual. The planner emits this shape because it is pure;
+            // lowering makes the choice with real catalog knowledge.
+            if let PlanNode::SeqScan { table } = input.as_ref() {
+                if let Some(lowered) = lower_conjunction_scan(catalog, table, predicate) {
+                    return lowered;
+                }
+            }
+            PlanNode::Filter {
+                input: Box::new(lower_unindexed_scans(catalog, input)),
+                predicate: predicate.clone(),
+            }
+        }
         PlanNode::Project { input, fields } => PlanNode::Project {
             input: Box::new(lower_unindexed_scans(catalog, input)),
             fields: fields.clone(),

@@ -7046,3 +7046,326 @@ fn symmetric_rid_dedup_set_is_charged_to_query_memory_budget() {
     .unwrap_err();
     assert!(matches!(error, QueryError::MemoryLimitExceeded { .. }));
 }
+
+// ── Lane A: conjunction index selection with residual recheck ──────
+//
+// These unit tests inspect the output of `lower_unindexed_scans` directly:
+// a top-level `and` filter over a bare `SeqScan` must be rewritten to drive
+// the scan from an indexed conjunct, re-checking the rest as a residual
+// Filter. Selection follows a zero-stats heuristic
+// (unique eq > non-unique eq > range) and never depends on probing.
+
+use crate::plan::PlanNode;
+
+/// `Doc { id, data: json }` with a non-unique expression index on
+/// `.data->score` and no index on `.id`.
+fn doc_score_index_engine() -> Engine {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type Doc { required id: int, data: json }")
+        .unwrap();
+    engine
+        .execute_powql("alter Doc add index (.data->score)")
+        .unwrap();
+    engine
+}
+
+/// `Doc { id, data: json }` with no indexes at all.
+fn doc_no_index_engine() -> Engine {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type Doc { required id: int, data: json }")
+        .unwrap();
+    engine
+}
+
+fn engine_only() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_laneA_{}_{}", std::process::id(), id));
+    Engine::new(&dir).unwrap()
+}
+
+fn lower(engine: &Engine, query: &str) -> PlanNode {
+    let plan = crate::planner::plan(query).unwrap();
+    super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan)
+}
+
+#[test]
+fn conjunction_lowers_to_filter_over_expr_index_scan() {
+    let engine = doc_score_index_engine();
+    // `.data->score` is indexed, `.id` is not: the path conjunct drives the
+    // scan and `.id = 1` becomes the residual.
+    let lowered = lower(&engine, "Doc filter .data->score = 20 and .id = 1");
+    match &lowered {
+        PlanNode::Filter { input, predicate } => {
+            assert!(
+                matches!(input.as_ref(), PlanNode::ExprIndexScan { .. }),
+                "driving scan should be ExprIndexScan, got {input:?}"
+            );
+            let residual = format!("{predicate:?}");
+            assert!(
+                residual.contains("\"id\""),
+                "residual should recheck .id: {residual}"
+            );
+            assert!(
+                !residual.contains("data"),
+                "the driving path conjunct must not remain in the residual: {residual}"
+            );
+        }
+        other => panic!("expected Filter(ExprIndexScan), got {other:?}"),
+    }
+}
+
+#[test]
+fn conjunction_without_any_index_is_left_byte_identical() {
+    let engine = doc_no_index_engine();
+    let plan = crate::planner::plan("Doc filter .data->score = 20 and .id = 1").unwrap();
+    let before = format!("{plan:?}");
+    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan);
+    assert_eq!(
+        before,
+        format!("{lowered:?}"),
+        "no resolvable index means the plan must be returned unchanged"
+    );
+}
+
+/// `Rec { a, b, c }` where `a` has a unique index, `b` and `c` have
+/// non-unique indexes.
+fn rec_engine(ddl: &[&str]) -> Engine {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type Rec { required a: int, b: int, c: int }")
+        .unwrap();
+    for stmt in ddl {
+        engine.execute_powql(stmt).unwrap();
+    }
+    engine
+}
+
+fn driving_column(plan: &PlanNode) -> String {
+    match plan {
+        PlanNode::Filter { input, .. } => match input.as_ref() {
+            PlanNode::IndexScan { column, .. } | PlanNode::RangeScan { column, .. } => {
+                column.clone()
+            }
+            other => panic!("expected an indexed driving scan, got {other:?}"),
+        },
+        other => panic!("expected Filter over an index scan, got {other:?}"),
+    }
+}
+
+#[test]
+fn unique_eq_beats_non_unique_eq_beats_range() {
+    // All three conjuncts resolve; unique `a` must win.
+    let unique_and_more = rec_engine(&[
+        "alter Rec add unique .a",
+        "alter Rec add index .b",
+        "alter Rec add index .c",
+    ]);
+    let lowered = lower(&unique_and_more, "Rec filter .c > 5 and .b = 2 and .a = 1");
+    assert_eq!(
+        driving_column(&lowered),
+        "a",
+        "unique eq should drive: {lowered:?}"
+    );
+    assert!(
+        matches!(&lowered, PlanNode::Filter { input, .. } if matches!(input.as_ref(), PlanNode::IndexScan { .. }))
+    );
+
+    // No index on `a`: non-unique eq `b` beats the range on `c`.
+    let non_unique = rec_engine(&["alter Rec add index .b", "alter Rec add index .c"]);
+    let lowered = lower(&non_unique, "Rec filter .c > 5 and .b = 2 and .a = 1");
+    assert_eq!(
+        driving_column(&lowered),
+        "b",
+        "non-unique eq should beat range: {lowered:?}"
+    );
+
+    // Only the range column is indexed: the range drives the scan.
+    let range_only = rec_engine(&["alter Rec add index .c"]);
+    let lowered = lower(&range_only, "Rec filter .c > 5 and .b = 2 and .a = 1");
+    assert_eq!(
+        driving_column(&lowered),
+        "c",
+        "range should drive when it is the only index: {lowered:?}"
+    );
+    assert!(
+        matches!(&lowered, PlanNode::Filter { input, .. } if matches!(input.as_ref(), PlanNode::RangeScan { .. }))
+    );
+}
+
+#[test]
+fn same_column_between_pair_merges_and_empties_the_residual() {
+    // A hand-built `Filter(SeqScan)` whose predicate is a same-column
+    // BETWEEN pair: lowering merges both bounds into one RangeScan and,
+    // with nothing left over, emits the bare scan (no residual Filter).
+    // The planner normally folds this shape itself, so we construct it
+    // directly to exercise the residual-empty branch of the lowering.
+    let engine = rec_engine(&["alter Rec add index .a"]);
+    let between = Expr::BinaryOp(
+        Box::new(Expr::BinaryOp(
+            Box::new(Expr::Field("a".into())),
+            BinOp::Gte,
+            Box::new(Expr::Literal(Literal::Int(1))),
+        )),
+        BinOp::And,
+        Box::new(Expr::BinaryOp(
+            Box::new(Expr::Field("a".into())),
+            BinOp::Lte,
+            Box::new(Expr::Literal(Literal::Int(5))),
+        )),
+    );
+    let plan = PlanNode::Filter {
+        input: Box::new(PlanNode::SeqScan {
+            table: "Rec".into(),
+        }),
+        predicate: between,
+    };
+    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan);
+    match &lowered {
+        PlanNode::RangeScan {
+            column, start, end, ..
+        } => {
+            assert_eq!(column, "a");
+            assert!(
+                start.is_some() && end.is_some(),
+                "both bounds must survive the merge"
+            );
+        }
+        other => panic!("expected a bare RangeScan with an empty residual, got {other:?}"),
+    }
+}
+
+#[test]
+fn update_conjunction_discovery_scan_is_lowered() {
+    let engine = rec_engine(&["alter Rec add index .b"]);
+    let lowered = lower(&engine, "Rec filter .b = 2 and .a = 1 update { c := 9 }");
+    match &lowered {
+        PlanNode::Update { input, .. } => match input.as_ref() {
+            PlanNode::Filter { input, predicate } => {
+                assert!(
+                    matches!(input.as_ref(), PlanNode::IndexScan { column, .. } if column == "b")
+                );
+                assert!(
+                    format!("{predicate:?}").contains("\"a\""),
+                    "residual should recheck .a"
+                );
+            }
+            other => panic!("expected Filter(IndexScan) under Update, got {other:?}"),
+        },
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn delete_conjunction_discovery_scan_is_lowered() {
+    let engine = rec_engine(&["alter Rec add index .b"]);
+    let lowered = lower(&engine, "Rec filter .b = 2 and .a = 1 delete");
+    match &lowered {
+        PlanNode::Delete { input, .. } => match input.as_ref() {
+            PlanNode::Filter { input, .. } => {
+                assert!(
+                    matches!(input.as_ref(), PlanNode::IndexScan { column, .. } if column == "b")
+                );
+            }
+            other => panic!("expected Filter(IndexScan) under Delete, got {other:?}"),
+        },
+        other => panic!("expected Delete, got {other:?}"),
+    }
+}
+
+fn sorted_debug(result: QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Rows { rows, .. } => {
+            let mut out: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+            out.sort();
+            out
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// The compiled residual fast path (Filter over an index scan) must produce
+/// exactly the same rows as the general SeqScan path for the same query.
+#[test]
+fn residual_fast_path_agrees_with_general_path() {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type Doc { required id: int, model_id: int, data: json }")
+        .unwrap();
+    for id in 0..40i64 {
+        let tag = if id % 2 == 0 { "x" } else { "y" };
+        engine
+            .execute_powql(&format!(
+                r#"insert Doc {{ id := {id}, model_id := {}, data := "{{\"tag\":\"{tag}\"}}" }}"#,
+                id % 3
+            ))
+            .unwrap();
+    }
+    engine
+        .execute_powql("alter Doc add index (.data->tag)")
+        .unwrap();
+
+    let query = r#"Doc filter .data->tag = "x" and .model_id = 1"#;
+    let raw_plan = crate::planner::plan(query).unwrap();
+    // General path: execute the un-lowered Filter(SeqScan) directly.
+    let general = engine.execute_plan(&raw_plan).unwrap();
+
+    // Fast path: the lowered plan must be driven by the expression index.
+    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &raw_plan);
+    match &lowered {
+        PlanNode::Filter { input, .. } => {
+            assert!(
+                matches!(input.as_ref(), PlanNode::ExprIndexScan { .. }),
+                "expected an ExprIndexScan-driven fast path, got {input:?}"
+            );
+        }
+        other => panic!("expected Filter over an index scan, got {other:?}"),
+    }
+    let fast = engine.execute_plan(&lowered).unwrap();
+
+    assert_eq!(sorted_debug(general), sorted_debug(fast));
+}
+
+/// The fast-path candidate loop must remain cancellable when a driving key
+/// resolves to a large rid set.
+#[test]
+fn conjunction_fast_path_honors_explicit_cancel() {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_laneA_cancel_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine.set_wal_sync_mode(super::WalSyncMode::Off);
+    engine
+        .execute_powql("type Big { required id: int, required model_id: int, required v: int }")
+        .unwrap();
+    engine
+        .execute_powql("alter Big add index .model_id")
+        .unwrap();
+    // 6000 rows share model_id = 1, so the driving index lookup returns 6000
+    // rids and the fast-path loop crosses the 4096-tick cancellation interval.
+    for i in 0..6000 {
+        engine
+            .execute_powql(&format!(
+                "insert Big {{ id := {i}, model_id := 1, v := {i} }}"
+            ))
+            .unwrap();
+    }
+
+    let cancel = CancelArc::new(ExecCancel::new());
+    // Entry is checkpoint 1; the index lookup adds none, so checkpoint 2 is
+    // necessarily the first in-loop tick.
+    let cancel_thread = cancel_after_checkpoint(CancelArc::clone(&cancel), 2);
+    let result =
+        engine.execute_powql_readonly_with_cancel("Big filter .model_id = 1 and .v > -1", cancel);
+    cancel_thread.join().unwrap();
+    assert!(
+        matches!(result, Err(QueryError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    // The engine is still usable afterward.
+    assert!(matches!(
+        engine.execute_powql_readonly("count(Big)").unwrap(),
+        QueryResult::Scalar(Value::Int(6000))
+    ));
+}
