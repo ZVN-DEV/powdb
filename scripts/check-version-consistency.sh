@@ -65,11 +65,16 @@ done
 
 # Release metadata distinguishes the next development version from the latest
 # version that is actually published. This prevents a release-prep branch from
-# advertising packages or container tags that do not exist yet.
-grep -q "Next release: v$workspace_version (unreleased)" RELEASES.md \
-  || fail "RELEASES.md next release does not reference unreleased v$workspace_version"
+# advertising packages or container tags that do not exist yet. Two states are
+# valid: released (workspace version == Current release in RELEASES.md) and
+# development (workspace version is ahead, and RELEASES.md must announce it as
+# the unreleased Next release).
 current_release="$(sed -nE 's/.*Current release: v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' RELEASES.md | head -1)"
 [[ -n "$current_release" ]] || fail "could not parse current published release from RELEASES.md"
+if [[ "$workspace_version" != "$current_release" ]]; then
+  grep -q "Next release: v$workspace_version (unreleased)" RELEASES.md \
+    || fail "RELEASES.md next release does not reference unreleased v$workspace_version"
+fi
 
 # Deploy examples pin a published ghcr image tag; every such pin must track the
 # current published release, never the unreleased workspace version.
@@ -93,13 +98,16 @@ done <<< "$site_versions"
 grep -qE '^## \[Unreleased\]' CHANGELOG.md \
   || fail "CHANGELOG.md is missing the Unreleased section for v$workspace_version work"
 
-# SECURITY.md must list the published minor series (e.g. 0.12.x) as supported,
-# while an unreleased workspace version remains explicitly unsupported.
+# SECURITY.md must list the published minor series (e.g. 0.12.x) as supported.
+# During development an unreleased workspace series must additionally remain
+# explicitly unsupported until it ships.
 minor_series="${current_release%.*}.x"
 grep -F ':white_check_mark:' SECURITY.md | grep -qF "$minor_series" \
   || fail "SECURITY.md does not list published series $minor_series as supported"
 next_minor_series="${workspace_version%.*}.x"
-grep -F ':x: (unreleased)' SECURITY.md | grep -qF "$next_minor_series" \
-  || fail "SECURITY.md does not mark development series $next_minor_series as unreleased"
+if [[ "$next_minor_series" != "$minor_series" ]]; then
+  grep -F ':x: (unreleased)' SECURITY.md | grep -qF "$next_minor_series" \
+    || fail "SECURITY.md does not mark development series $next_minor_series as unreleased"
+fi
 
 log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, and SECURITY.md."
