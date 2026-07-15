@@ -237,19 +237,28 @@ async fn test_query_timeout_threshold_does_not_detach_query() {
     let msg = read_message(&mut stream).await.unwrap();
     assert!(matches!(msg, Message::ConnectOk { .. }));
 
-    // Send a query. If the threshold elapses, the server now waits for the
-    // blocking task to finish before replying, because started spawn_blocking
-    // tasks cannot be cancelled safely.
+    // Send a query. With cooperative cancellation the 1ms threshold may fire
+    // (a timeout Error) or the tiny scan may finish first (ResultRows); both
+    // are correct. What must never happen is a detached query: the connection
+    // must produce exactly one coherent reply per request and stay usable.
     stream.write_all(&encode_query("Item")).await.unwrap();
 
     let msg = read_message(&mut stream).await.unwrap();
     match msg {
-        Message::ResultRows { .. } => {
-            // Query completed and no detached execution remains behind the
-            // response. This is the conservative v0.6.1 mitigation until the
-            // executor has cooperative cancellation points.
-        }
-        other => panic!("expected ResultRows, got: {other:?}"),
+        Message::ResultRows { .. } => {}
+        Message::Error { ref message } if message.contains("timeout") => {}
+        other => panic!("expected ResultRows or timeout Error, got: {other:?}"),
+    }
+
+    // The connection must remain framed and usable after a timeout: a second
+    // query gets its own definitive reply, not silence or leftover bytes from
+    // a detached first execution.
+    stream.write_all(&encode_query("Item")).await.unwrap();
+    let msg = read_message(&mut stream).await.unwrap();
+    match msg {
+        Message::ResultRows { .. } => {}
+        Message::Error { ref message } if message.contains("timeout") => {}
+        other => panic!("expected ResultRows or timeout Error on reuse, got: {other:?}"),
     }
 }
 
