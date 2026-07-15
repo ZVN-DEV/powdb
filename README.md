@@ -35,7 +35,7 @@ PowQL uses `.field` dot syntax for column references, `:=` for assignments, and 
 
 **Already think in SQL?** Since v0.5.0 PowDB also accepts a supported subset of SQL through a frontend that lowers to the same PowQL plan tree (and shares the plan cache) — see [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md). PowQL remains the native, fastest path.
 
-Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | SQL frontend: [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/zvndev/powdb/blob/main/docs/backup-and-restore.md)
+Full language reference: [docs/POWQL.md](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md) | SQL frontend: [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md) | Getting started: [docs/getting-started.md](https://github.com/zvndev/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/zvndev/powdb/blob/main/docs/backup-and-restore.md) | Driver/ORM implementers: [docs/integrations/powql-for-drivers.md](https://github.com/zvndev/powdb/blob/main/docs/integrations/powql-for-drivers.md)
 
 ## Install
 

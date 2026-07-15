@@ -136,7 +136,7 @@ Fields without `required` are nullable -- they can hold empty/null values. Null 
 | `int` | 64-bit signed integer | 8 bytes fixed |
 | `float` | 64-bit floating point (IEEE 754) | 8 bytes fixed |
 | `bool` | Boolean (true/false) | 1 byte fixed |
-| `datetime` | Timestamp as 64-bit integer (epoch) | 8 bytes fixed |
+| `datetime` | Timestamp as 64-bit integer (epoch microseconds) | 8 bytes fixed |
 | `uuid` | 128-bit UUID | 16 bytes fixed |
 | `bytes` | Raw binary data | Variable-length |
 | `json` | JSON document (object, array, or scalar) | Variable-length |
@@ -1733,7 +1733,7 @@ PowQL has eight data types plus a null representation.
 | Float | `float` | `f64` | 8 bytes | IEEE 754 double precision |
 | Boolean | `bool` | `bool` | 1 byte | `true` or `false` |
 | String | `str` | `String` | Variable | UTF-8 text |
-| DateTime | `datetime` | `i64` (epoch) | 8 bytes | Unix timestamp |
+| DateTime | `datetime` | `i64` (epoch microseconds) | 8 bytes | Unix timestamp in microseconds |
 | UUID | `uuid` | `[u8; 16]` | 16 bytes | 128-bit identifier |
 | Bytes | `bytes` | `Vec<u8>` | Variable | Raw binary data |
 | JSON | `json` | canonical binary | Variable | JSON document; see [JSON Documents](#json-documents) |
