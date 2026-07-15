@@ -204,21 +204,27 @@ Return shapes:
 - `{ kind: "scalar", value: string }` — aggregates
 - `{ kind: "ok", affected: bigint }` — mutations and DDL
 
+For lossless values, use `queryNative()` (PowQL) or `querySqlNative()` (SQL). Native results
+preserve Empty, booleans, exact integers, floats, UUIDs, datetime microseconds, raw bytes, and
+PJ1 JSON without routing the value through text. Integers outside JavaScript's safe range and
+datetime values are returned as `bigint`; bytes are `Uint8Array`; JSON is decoded recursively.
+The legacy `query()` and `querySql()` result shapes above remain unchanged.
+
 ---
 
 ## Writing queries that perform
 
-- **Point lookup on an indexed column** is the fast path: `User filter .email = "alice@example.com" { .name }` — ~200ns parse, ~100ns plan, ~800ns execute with a warm cache.
+- **Point lookup on an indexed column** is the fast path: `User filter .email = "alice@example.com" { .name }` — ~200ns parse, ~100ns plan, ~800ns execute with a warm cache. JSON paths can also be indexed with `alter Post add index (.data->slug)` or SQL `CREATE INDEX post_slug ON Post ((data->'slug'))` and serve equality, range, and ordered reads.
 - **Sort+limit without an index** uses a top-k heap in the executor, not a full sort. `User order .age desc limit 10` is O(N log K).
-- **Joins** use hash join when `on` is an equi-predicate (`u.id = o.user_id`), nested loop otherwise. Put the smaller table on the **right** — the hash table is built over the right side.
+- **Joins** use hash join when `on` contains an equi-predicate (`u.id = o.user_id`), including compound predicates with residual conditions. Pure non-equi joins use a bounded nested loop and fail before execution when the estimated pair count exceeds the safety limit. Put the smaller table on the **right** — the hash table is built over the right side.
 - **Projections before aggregates save work.** `sum(User filter .active = true { .amount })` is cheaper than decoding the whole row.
 - **`count(*)` is free** — it reads the live-row count from the heap header, no scan.
 
 ---
 
-## What's shipped vs. what's planned
+## What's available in this development tree vs. what's planned
 
-Shipped: joins (inner/left/right/cross, nested-loop + hash), GROUP BY + HAVING, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL — `docs/SQL.md`).
+Available in the v0.13 development tree (not yet released): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL — `docs/SQL.md`).
 
 Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, UDFs, per-row permissions, replication.
 

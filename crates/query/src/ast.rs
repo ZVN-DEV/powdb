@@ -33,6 +33,14 @@ pub struct AlterTableExpr {
     pub action: AlterAction,
 }
 
+/// A persisted index target. Stored JSON paths are table-local and therefore
+/// never retain a query alias or runtime catalog/index identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IndexTarget {
+    Column(String),
+    JsonPath(powdb_storage::stored_json_path::StoredJsonPathV1),
+}
+
 /// An individual ALTER TABLE action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterAction {
@@ -50,7 +58,7 @@ pub enum AlterAction {
     /// `alter <Table> add index [if not exists] .<column>` — creates a
     /// B+Tree index on `column`. No-op if the index already exists.
     AddIndex {
-        column: String,
+        target: IndexTarget,
         /// Parsed for symmetry with the other DDL; `add index` is already
         /// idempotent, so this does not change behavior.
         if_not_exists: bool,
@@ -60,7 +68,16 @@ pub enum AlterAction {
     /// if any duplicate (non-null) value is present. Without `if not exists`
     /// it errors when the column is already indexed (no in-place upgrade);
     /// with it, an existing index is a no-op.
-    AddUnique { column: String, if_not_exists: bool },
+    AddUnique {
+        target: IndexTarget,
+        if_not_exists: bool,
+    },
+    /// `alter <Table> drop index [if exists] <target>` — removes either a
+    /// stored-column index or an expression index with the exact path identity.
+    DropIndex {
+        target: IndexTarget,
+        if_exists: bool,
+    },
 }
 
 /// `drop [if exists] User`
@@ -132,19 +149,11 @@ pub struct GroupByClause {
     pub having: Option<Expr>,
 }
 
-/// A single GROUP BY key.
-///
-/// `Unqualified` covers the classic single-table form `group .status`, whose
-/// field name is resolved against the input columns by an exact match first
-/// and a unique `.field` suffix match second (so it also works over a join
-/// whose output columns are named `alias.field`).
-///
-/// `Qualified` covers the join form `group u.status`; it resolves exactly to
-/// the `alias.field` output column and never suffix-matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GroupKey {
-    Unqualified(String),
-    Qualified { alias: String, field: String },
+/// A single expression-valued GROUP BY key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupKey {
+    pub expr: Expr,
+    pub output_name: String,
 }
 
 impl GroupKey {
@@ -152,10 +161,7 @@ impl GroupKey {
     /// their bare field name; qualified keys are emitted as `alias.field` so
     /// HAVING and downstream projections can reference them consistently.
     pub fn output_name(&self) -> String {
-        match self {
-            GroupKey::Unqualified(field) => field.clone(),
-            GroupKey::Qualified { alias, field } => format!("{alias}.{field}"),
-        }
+        self.output_name.clone()
     }
 }
 
@@ -193,7 +199,7 @@ pub struct OrderClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderKey {
-    pub field: String,
+    pub expr: Expr,
     pub descending: bool,
 }
 
@@ -272,7 +278,14 @@ pub struct FieldDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggregateExpr {
     pub function: AggFunc,
-    pub field: Option<String>,
+    pub argument: Option<Expr>,
+    pub mode: AggregateMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateMode {
+    Symmetric,
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -321,6 +334,7 @@ pub enum ScalarFn {
     DateDiff, // date_diff(dt1, dt2, "unit")
     // JSON
     JsonType, // json_type(expr) — 'null'|'string'|'number'|'bool'|'object'|'array', Empty when missing
+    JsonText, // json_text(expr) — SQL ->> text, canonical JSON for object/array
 }
 
 /// Target type for CAST expressions.
@@ -342,7 +356,7 @@ pub enum CastType {
 /// STRUCTURAL: they are part of the query shape, never literal slots, so the
 /// plan cache hashes them into the canonical token stream and neither counts
 /// nor substitutes them (see `plan_cache::count_expr` / `substitute_expr`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathSeg {
     /// Object member access: `->author` or `->"weird key!"`.
     Key(String),
@@ -366,7 +380,7 @@ pub enum Expr {
     Param(String),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
     UnaryOp(UnaryOp, Box<Expr>),
-    FunctionCall(AggFunc, Box<Expr>),
+    FunctionCall(AggFunc, Box<Expr>, AggregateMode),
     /// Scalar (non-aggregate) function call.
     ScalarFunc(ScalarFn, Vec<Expr>),
     Coalesce(Box<Expr>, Box<Expr>),
@@ -399,7 +413,8 @@ pub enum Expr {
     Window {
         function: WindowFunc,
         args: Vec<Expr>,
-        partition_by: Vec<String>,
+        mode: AggregateMode,
+        partition_by: Vec<Expr>,
         order_by: Vec<OrderKey>,
     },
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
@@ -419,6 +434,155 @@ pub enum Expr {
         base: Box<Expr>,
         segments: Vec<PathSeg>,
     },
+}
+
+/// Versioned structural identity for a query JSON path. Unlike the stored
+/// table-local form, this retains a qualified root until binding resolves it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JsonPathIdentityV1 {
+    pub root: JsonPathRootV1,
+    pub segments: Vec<PathSeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum JsonPathRootV1 {
+    Unqualified(String),
+    Qualified { qualifier: String, field: String },
+}
+
+impl JsonPathIdentityV1 {
+    pub const VERSION: u8 = 1;
+
+    pub fn from_expr(expr: &Expr) -> Option<Self> {
+        let Expr::JsonPath { base, segments } = expr else {
+            return None;
+        };
+        let root = match base.as_ref() {
+            Expr::Field(field) => JsonPathRootV1::Unqualified(field.clone()),
+            Expr::QualifiedField { qualifier, field } => JsonPathRootV1::Qualified {
+                qualifier: qualifier.clone(),
+                field: field.clone(),
+            },
+            _ => return None,
+        };
+        Some(Self {
+            root,
+            segments: segments.clone(),
+        })
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = vec![Self::VERSION];
+        match &self.root {
+            JsonPathRootV1::Unqualified(field) => {
+                out.push(1);
+                push_identity_str(&mut out, field);
+            }
+            JsonPathRootV1::Qualified { qualifier, field } => {
+                out.push(2);
+                push_identity_str(&mut out, qualifier);
+                push_identity_str(&mut out, field);
+            }
+        }
+        out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
+        for segment in &self.segments {
+            match segment {
+                PathSeg::Key(key) => {
+                    out.push(1);
+                    push_identity_str(&mut out, key);
+                }
+                PathSeg::Index(index) => {
+                    out.push(2);
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn canonical_text(&self) -> String {
+        let mut out = match &self.root {
+            JsonPathRootV1::Unqualified(field) => format!("v1:.{field}"),
+            JsonPathRootV1::Qualified { qualifier, field } => {
+                format!("v1:{qualifier}.{field}")
+            }
+        };
+        for segment in &self.segments {
+            match segment {
+                PathSeg::Key(key) => {
+                    out.push_str("->\"");
+                    push_identity_escaped(&mut out, key);
+                    out.push('"');
+                }
+                PathSeg::Index(index) => {
+                    out.push_str("->");
+                    out.push_str(&index.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Bind an unqualified root, or a qualified root matching `qualifier`, to
+    /// the storage-owned table-local identity used by future expression-index
+    /// catalog entries.
+    pub fn bind_table_local(
+        &self,
+        qualifier: Option<&str>,
+    ) -> Option<powdb_storage::stored_json_path::StoredJsonPathV1> {
+        use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
+        let column = match &self.root {
+            JsonPathRootV1::Unqualified(field) => field.clone(),
+            JsonPathRootV1::Qualified {
+                qualifier: actual,
+                field,
+            } if qualifier == Some(actual.as_str()) => field.clone(),
+            JsonPathRootV1::Qualified { .. } => return None,
+        };
+        Some(StoredJsonPathV1::new(
+            column,
+            self.segments
+                .iter()
+                .map(|segment| match segment {
+                    PathSeg::Key(key) => StoredJsonPathSegmentV1::Key(key.clone()),
+                    PathSeg::Index(index) => StoredJsonPathSegmentV1::Index(*index),
+                })
+                .collect(),
+        ))
+    }
+}
+
+pub fn expression_output_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Field(field) => field.clone(),
+        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+        Expr::JsonPath { .. } => JsonPathIdentityV1::from_expr(expr)
+            .map(|path| path.canonical_text())
+            .unwrap_or_else(|| "?".into()),
+        _ => "?".into(),
+    }
+}
+
+fn push_identity_str(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn push_identity_escaped(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c <= '\u{1f}' => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -469,4 +633,62 @@ pub enum UnaryOp {
     NotExists,
     IsNull,
     IsNotNull,
+}
+
+#[cfg(test)]
+mod json_path_identity_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_path_identity_goldens() {
+        let unquoted = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Unqualified("data".into()),
+            segments: vec![PathSeg::Key("author".into())],
+        };
+        let quoted = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Unqualified("data".into()),
+            segments: vec![PathSeg::Key("author".into())],
+        };
+        assert_eq!(unquoted, quoted);
+        assert_eq!(unquoted.canonical_text(), "v1:.data->\"author\"");
+        assert_eq!(
+            unquoted.canonical_bytes(),
+            vec![
+                1, 1, 4, 0, 0, 0, b'd', b'a', b't', b'a', 1, 0, 0, 0, 1, 6, 0, 0, 0, b'a', b'u',
+                b't', b'h', b'o', b'r',
+            ]
+        );
+
+        let key_zero = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Unqualified("data".into()),
+            segments: vec![PathSeg::Key("0".into())],
+        };
+        let index_zero = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Unqualified("data".into()),
+            segments: vec![PathSeg::Index(0)],
+        };
+        assert_ne!(key_zero.canonical_bytes(), index_zero.canonical_bytes());
+
+        let unicode = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Unqualified("data".into()),
+            segments: vec![PathSeg::Key("café\n\"x\\y".into())],
+        };
+        assert_eq!(unicode.canonical_text(), "v1:.data->\"café\\n\\\"x\\\\y\"");
+    }
+
+    #[test]
+    fn qualified_root_binding_is_explicit() {
+        let qualified = JsonPathIdentityV1 {
+            root: JsonPathRootV1::Qualified {
+                qualifier: "p".into(),
+                field: "data".into(),
+            },
+            segments: vec![PathSeg::Key("age".into())],
+        };
+        assert!(qualified.bind_table_local(Some("other")).is_none());
+        let stored = qualified
+            .bind_table_local(Some("p"))
+            .expect("matching root");
+        assert_eq!(stored.canonical_text(), "v1:.data->\"age\"");
+    }
 }

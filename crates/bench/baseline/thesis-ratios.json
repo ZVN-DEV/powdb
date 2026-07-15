@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "updated": "2026-04-09",
+  "updated": "2026-07-14",
   "_README": [
     "This file is HAND-EDITED ONLY. No script writes to it.",
     "Each ratio enforces a structural property of PowDB that should not silently degrade.",
-    "Raising a ceiling means the thesis gave ground — justify it in the commit message.",
+    "Raising a ceiling means the thesis gave ground \u2014 justify it in the commit message.",
     "Convention: 'bench: relax <ratio_name> <old> -> <new> (<why>)'."
   ],
   "ratios": {
@@ -13,25 +13,22 @@
       "denominator": "btree_lookup",
       "ceiling": 7.0,
       "observed_at_last_edit": 6.172,
-      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. Previous ceilings: 2.5 (M1, btree_lookup ~1832ns), 6.0 (Mission D, btree_lookup ~262ns, observed 5.004x). PR #14 CI: 1529ns / 248ns = 6.172x — btree_lookup improved -6.15% while powql_point was -1.59%, both within absolute gates. Same denominator-shrinkage pattern. Relaxed 6.0 -> 7.0 with ~13% headroom. The absolute gate on powql_point (7%) is the real regression detector; this ratio guards against structural parse/plan/exec overhead growth."
+      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. Previous ceilings: 2.5 (M1, btree_lookup ~1832ns), 6.0 (Mission D, btree_lookup ~262ns, observed 5.004x). PR #14 CI: 1529ns / 248ns = 6.172x \u2014 btree_lookup improved -6.15% while powql_point was -1.59%, both within absolute gates. Same denominator-shrinkage pattern. Relaxed 6.0 -> 7.0 with ~13% headroom. The absolute gate on powql_point (7%) is the real regression detector; this ratio guards against structural parse/plan/exec overhead growth."
     },
-
     "scan_filter_count_over_btree_lookup": {
       "numerator": "powql_aggregation",
       "denominator": "btree_lookup",
-      "ceiling": 2500.0,
-      "observed_at_last_edit": 2079.734,
-      "meaning": "Sanity ceiling: a count-filter aggregate over 100K rows vs a single B-tree probe. Previous ceiling was 8000 (pre-CI-capture). Post-Mission-D10 on ubuntu-24.04: 545729ns / 262ns = 2079.734x. Tightened 8000 -> 2500 to reflect reality with ~20% headroom. A regression here almost certainly means the compiled predicate or raw-bytes walker got un-wired."
+      "ceiling": 3500.0,
+      "observed_at_last_edit": 3053.75,
+      "meaning": "Sanity ceiling: a count-filter aggregate over 100K rows vs a single B-tree probe. Previous ceilings: 8000 (pre-CI-capture), 2500 (post-Mission-D10, 545729ns / 262ns = 2079.734x). Depot run 29380092439 at d77d09a (v0.13): 561420ns / 184ns = 3053.75x. Same denominator-shrinkage pattern as powql_point_over_btree_lookup: btree_lookup improved -37% (btree v2 work) while powql_aggregation improved -5.67% in absolute terms; nothing regressed. Relaxed 2500 -> 3500 with ~15% headroom. The absolute gate on powql_aggregation (20%) is the real regression detector; this ratio guards against the compiled predicate or raw-bytes walker getting un-wired, which would blow far past 3500 instantly."
     },
-
     "update_by_pk_over_powql_point": {
       "numerator": "update_by_pk",
       "denominator": "powql_point",
       "ceiling": 2.0,
       "observed_at_last_edit": 1.218,
-      "meaning": "An indexed update should be within a small multiple of an indexed read. Previous ceiling was 15000 (pre-FASTPATH, when update_by_pk was an O(N) full-rescan). Mission C Phase 14 (update_pk prepared fast path) landed the Update(IndexScan) fold and collapsed the ratio from ~9130x to 1.218x (1596ns / 1311ns). Tightened 15000 -> 2.0 to lock in the structural win — any future regression that loses the Update(IndexScan) fold will blow past this instantly."
+      "meaning": "An indexed update should be within a small multiple of an indexed read. Previous ceiling was 15000 (pre-FASTPATH, when update_by_pk was an O(N) full-rescan). Mission C Phase 14 (update_pk prepared fast path) landed the Update(IndexScan) fold and collapsed the ratio from ~9130x to 1.218x (1596ns / 1311ns). Tightened 15000 -> 2.0 to lock in the structural win \u2014 any future regression that loses the Update(IndexScan) fold will blow past this instantly."
     },
-
     "insert_single_over_btree_lookup": {
       "numerator": "insert_single",
       "denominator": "btree_lookup",

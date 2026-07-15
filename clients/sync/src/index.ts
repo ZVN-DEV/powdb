@@ -8,6 +8,33 @@ export type QueryParam = string | number | bigint | boolean | null;
 export type SyncU64 = bigint | number;
 export type SyncRepairAction = "none" | "pull" | "awaitArchive" | "rebootstrap";
 
+/**
+ * The maximum catalog format version this client can read. This is the
+ * `catalogVersion` a replica should state in its identity: the primary accepts
+ * any replica whose maximum is at least the database's active catalog format,
+ * and rejects an older replica.
+ */
+export const SUPPORTED_CATALOG_VERSION = 6;
+
+/**
+ * Throw when a server-reported catalog format is newer than this client can
+ * read. Accepts `serverCatalogVersion <= clientMax`; rejects a newer server,
+ * which requires upgrading the client.
+ */
+export function assertServerCatalogVersionSupported(
+  serverCatalogVersion: number,
+  clientMax: number = SUPPORTED_CATALOG_VERSION,
+): void {
+  if (!Number.isInteger(serverCatalogVersion) || serverCatalogVersion < 1) {
+    throw new Error(`invalid server catalog version ${serverCatalogVersion}`);
+  }
+  if (serverCatalogVersion > clientMax) {
+    throw new Error(
+      `server catalog format v${serverCatalogVersion} is newer than this client supports (max v${clientMax}); upgrade the client`,
+    );
+  }
+}
+
 export interface SyncStatus {
   replicaId: string;
   active: boolean;

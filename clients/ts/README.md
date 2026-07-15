@@ -287,10 +287,80 @@ const client = await Client.connect({
 });
 ```
 
-## Typed rows
+## Native typed results
 
-The wire protocol serialises every value as a string. If you want JS types
-back (numbers, `Date`, booleans), call `queryTyped` with a schema:
+Use `queryNative` when values must cross the wire without legacy string
+rendering:
+
+```typescript
+const result = await client.queryNative(
+  "Post filter .id = $1 { .id, .data, raw: .attachment }",
+  [42],
+);
+
+if (result.kind === "rows") {
+  const [id, data, raw] = result.rows[0];
+  // id: number, or bigint outside JavaScript's safe integer range
+  // data: recursively decoded JSON
+  // raw: Uint8Array
+}
+
+const sqlResult = await client.querySqlNative(
+  "SELECT data->'author' FROM Post WHERE id = 42",
+);
+```
+
+Native results preserve each cell's actual type. Integers become `number` when
+safe and `bigint` otherwise; floats and booleans remain primitives; `bytes`
+become `Uint8Array`; UUIDs become canonical strings; datetimes remain epoch
+microseconds as `bigint`; and PJ1 JSON is decoded recursively without a JSON
+text round trip. Empty cells become `null`.
+
+`queryNative` accepts the same `$N` parameter array and `AbortSignal` options
+as `query`. `querySqlNative` is the corresponding SQL method. Neither method
+silently replays a request through the legacy string protocol, because replay
+would be unsafe for a mutation after an ambiguous response.
+
+Legacy `query` and `querySql` keep their existing string result shapes for
+wire compatibility.
+
+### Fully lossless access with `queryNativeRaw`
+
+`queryNative` is friendly, but its convenience conversion erases a few
+storage-level distinctions: it maps every empty cell, JSON `null`, and even a
+successful decode to a plain JavaScript `null`, and it drops the raw PJ1 bytes
+that back a JSON value. When you need that fidelity, use `queryNativeRaw`, which
+returns every cell as the raw `WireValue` tagged union straight off the wire:
+
+```typescript
+const raw = await client.queryNativeRaw(
+  "Doc filter .id = $1 { .note, .missing, .data }",
+  [1],
+);
+
+if (raw.kind === "rows") {
+  const [note, missing, data] = raw.rows[0];
+  // note:    { type: "str", value: "null" }   : the string "null"
+  // missing: { type: "empty" }                : an absent value
+  // data:    { type: "json", value: null, pj1: Uint8Array }  : a JSON null
+}
+```
+
+Reach for `queryNativeRaw` when you need:
+
+- **Storage-level identity**: telling an absent value (`{ type: "empty" }`)
+  apart from the string `"null"` and a JSON `null`, all of which `queryNative`
+  collapses to `null`.
+- **Raw PJ1 bytes**: the `pj1: Uint8Array` on a `json` cell is the exact
+  on-wire binary JSON, for byte-identical storage, hashing, or re-encoding.
+
+It accepts the same `$N` parameter array and `AbortSignal` options as
+`queryNative`. For ordinary reads, prefer `queryNative`.
+
+## Schema-coerced rows
+
+The legacy wire protocol serialises every value as a string. If you want JS
+types back using a caller-supplied schema, call `queryTyped`:
 
 ```typescript
 import { Client } from "@zvndev/powdb-client";
@@ -323,9 +393,8 @@ does not throw: it returns the raw string, so a malformed or non-canonical
 cell can never turn a readable result into an exception (canonical server
 output always parses, so this fallback is inert in normal use).
 
-Bytes columns are intentionally unsupported (the wire format is lossy —
-it renders `<N bytes>`) and throw on coercion. Declare `str` if you just
-want the placeholder.
+Bytes columns are intentionally unsupported by `queryTyped` because the
+legacy wire format renders `<N bytes>`. Use `queryNative` for exact bytes.
 
 ## Structured errors
 
@@ -485,6 +554,27 @@ AbortSignal` cancels the query (see Cancellation above).
 ```typescript
 const result = await client.querySql("SELECT name, age FROM User WHERE age > 27");
 ```
+
+### `client.queryNative(query, params?, opts?)`
+
+Runs PowQL through the native typed wire surface and returns a
+`Promise<NativeQueryResult>`. Row and scalar cells retain their actual types,
+including exact bytes and recursively decoded JSON. Parameters and abort
+options match `query()`. The method does not replay through the legacy string
+surface.
+
+### `client.queryNativeRaw(query, params?, opts?)`
+
+Like `queryNative`, but returns every cell as the raw `WireValue` tagged union
+(`Promise<RawNativeQueryResult>`) with no conversion to `NativeValue`. Use it
+for storage-level identity (Empty vs `"null"` vs a JSON null) or the raw PJ1
+bytes of a JSON cell (`pj1`). Parameters and abort options match `queryNative`.
+
+### `client.querySqlNative(query, opts?)`
+
+Runs SQL through the native typed wire surface and returns a
+`Promise<NativeQueryResult>`. It has the same no-replay guarantee as
+`queryNative()`.
 
 ### `client.queryTyped(query, schema, opts?)`
 

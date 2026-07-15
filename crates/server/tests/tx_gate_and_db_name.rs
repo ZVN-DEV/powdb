@@ -1,4 +1,4 @@
-//! End-to-end tests for two internal dogfood fixes:
+//! End-to-end transaction-gate and database-name regressions:
 //!
 //!   P-4  — overlapping explicit transactions QUEUE behind the transaction gate
 //!          (they no longer fail fast), bounded by a configurable wait timeout
@@ -154,9 +154,8 @@ fn is_error(msg: &Message) -> bool {
 
 // ---- P-4: transaction gate queuing + timeout ----------------------------
 
-/// The dogfood repro: 10 concurrent connections each running begin/insert/commit
-/// must ALL succeed. Before queuing, the second overlapping `begin` failed fast
-/// (~54% failure under 10-way concurrency); now they serialize through the gate.
+/// Concurrency regression: 10 connections each running begin/insert/commit must
+/// all succeed. Overlapping explicit transactions serialize through the gate.
 #[tokio::test]
 async fn concurrent_explicit_transactions_all_succeed() {
     let addr = start_server(ServerConfig::default()).await;
@@ -280,13 +279,11 @@ async fn same_connection_double_begin_errors_without_hanging() {
     );
 }
 
-// ---- Dogfood #4: bare autocommit writes are bounded by the same gate --------
+// ---- Bare autocommit writes are bounded by the same gate --------------------
 
-/// The dogfood repro: connection A holds an explicit transaction open and
-/// never commits; connection B issues a BARE autocommit insert (no `begin`).
-/// Before this fix B waited on the gate UNBOUNDED (the dogfood run measured ~7.7s behind
-/// an 8s holder, and a wedged holder wedged writers forever). Now B fails fast
-/// with the clear, typed timeout error. After A commits, a retry from B works.
+/// Connection A holds an explicit transaction open while connection B issues a
+/// bare autocommit insert. B must fail with a bounded, typed timeout; after A
+/// commits, a retry from B succeeds.
 #[tokio::test]
 async fn bare_autocommit_write_behind_held_txn_times_out_then_recovers() {
     let addr = start_server(ServerConfig {
@@ -333,6 +330,46 @@ async fn bare_autocommit_write_behind_held_txn_times_out_then_recovers() {
     .await
     .expect("B retry must resolve now that the gate is free");
     assert!(!is_error(&retry_b), "B retry insert failed: {retry_b:?}");
+}
+
+/// An explicit transaction owns writer admission for its whole lifetime, so a
+/// read on another connection cannot observe globally uncommitted state.
+#[tokio::test]
+async fn read_behind_explicit_transaction_times_out_then_recovers() {
+    let addr = start_server(ServerConfig {
+        tx_wait_timeout: Duration::from_millis(200),
+        ..ServerConfig::default()
+    })
+    .await;
+
+    let mut setup = connect(addr, "default").await;
+    assert!(!is_error(
+        &query(&mut setup, "type Item { required n: int }").await
+    ));
+
+    let mut writer = connect(addr, "default").await;
+    assert!(!is_error(&query(&mut writer, "begin").await));
+    assert!(!is_error(
+        &query(&mut writer, "insert Item { n := 1 }").await
+    ));
+
+    let mut reader = connect(addr, "default").await;
+    let blocked = tokio::time::timeout(Duration::from_secs(2), query(&mut reader, "count(Item)"))
+        .await
+        .expect("reader admission must be bounded");
+    match blocked {
+        Message::Error { message } => assert!(
+            message.contains("transaction gate timeout after 200ms"),
+            "unexpected error: {message}"
+        ),
+        other => panic!("expected reader admission timeout, got {other:?}"),
+    }
+
+    assert!(!is_error(&query(&mut writer, "commit").await));
+    match query(&mut reader, "count(Item)").await {
+        Message::ResultScalar { value } => assert_eq!(value, "1"),
+        other => panic!("expected committed row after writer release, got {other:?}"),
+    }
 }
 
 /// A bare autocommit write that times out behind a held transaction bumps the
@@ -457,7 +494,7 @@ async fn unpinned_server_accepts_any_db_name() {
 /// The reserved-word and duplicate-type guidance is only useful if it reaches
 /// wire clients. These messages must stay on the server's safe-to-forward
 /// allowlist (SAFE_ERROR_PREFIXES) — a prefix drift here silently masks them
-/// back to "query execution error", which is exactly the dogfood complaint.
+/// back to "query execution error", which would hide the actionable guidance.
 #[tokio::test]
 async fn dx_error_messages_survive_wire_sanitization() {
     let addr = start_server(ServerConfig::default()).await;

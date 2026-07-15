@@ -1,5 +1,6 @@
 use crate::manifest::{
-    current_sync_snapshot_metadata, BackupManifest, ChangedFile, IncrementManifest,
+    active_durable_file_names, current_sync_snapshot_metadata, validate_catalog_transition,
+    BackupManifest, ChangedFile, IncrementManifest,
 };
 use crate::restore::{
     apply_restore_sync_mode, ensure_empty_dir, validate_backup_file_name, validate_delta_file_name,
@@ -19,21 +20,15 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn is_durable(name: &str) -> bool {
-    name == "catalog.bin"
-        || name == CATALOG_LSN_FILE
-        || name.ends_with(".heap")
-        || name.ends_with(".idx")
-}
-
 fn is_paged(name: &str) -> bool {
-    name.ends_with(".heap") || name.ends_with(".idx")
+    name.ends_with(".heap")
 }
 
-/// Take an incremental backup: copy only the pages of each heap/idx file whose
-/// page LSN is greater than `base.source_lsn`, plus any non-paged file (e.g.
-/// catalog.bin) that changed. Builds on `base` (a full backup or a prior
-/// increment's effective state).
+/// Take an incremental backup: copy only heap pages whose page LSN is greater
+/// than `base.source_lsn`, plus every changed non-heap file. B+tree `.idx`
+/// and `.eidx` files are opaque whole-file artifacts and are never interpreted
+/// as heap pages. Builds on `base` (a full backup or a prior increment's
+/// effective state).
 pub fn incremental_backup(
     catalog: &mut Catalog,
     base: &BackupManifest,
@@ -42,8 +37,10 @@ pub fn incremental_backup(
     base.validate_version()?;
     powdb_sync::checkpoint_preserving_retained_segments_if_enabled(catalog)?;
     let source_lsn = catalog.max_lsn();
+    let catalog_version = catalog.active_catalog_version();
+    validate_catalog_transition(base.catalog_version, catalog_version)?;
     let src = catalog.data_dir().to_path_buf();
-    let sync = current_sync_snapshot_metadata(&src, source_lsn)?;
+    let sync = current_sync_snapshot_metadata(&src, source_lsn, catalog_version)?;
     if !sync_metadata_builds_on_same_history(base.sync.as_ref(), sync.as_ref()) {
         return Err(io::Error::other(
             "sync identity changed between base and incremental backup",
@@ -54,20 +51,24 @@ pub fn incremental_backup(
     let mut changed: Vec<ChangedFile> = Vec::new();
 
     // Stable iteration order so manifests are deterministic.
-    let mut entries: Vec<_> = std::fs::read_dir(&src)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| is_durable(n))
-        .collect();
-    entries.sort();
+    let entries = active_durable_file_names(catalog);
 
     for name in entries {
         let path = src.join(&name);
+        if !path.exists() {
+            if name == CATALOG_LSN_FILE {
+                continue;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("catalog references missing durable file {name}"),
+            ));
+        }
         let bytes = std::fs::read(&path)?;
 
         if !is_paged(&name) || bytes.len() % PAGE_SIZE != 0 {
-            // Whole-file path: catalog.bin, or a defensively-handled
-            // non-page-aligned paged file. Only record if changed vs base.
+            // Whole-file path: catalog metadata, every B+tree, or a
+            // defensively handled non-page-aligned heap file.
             let hash = blake3::hash(&bytes).to_hex().to_string();
             let unchanged = base
                 .files
@@ -120,6 +121,7 @@ pub fn incremental_backup(
         created_unix_secs: now_secs(),
         base_source_lsn: base.source_lsn,
         source_lsn,
+        catalog_version,
         sync,
         changed,
     };
@@ -156,6 +158,7 @@ pub fn restore_chain_with_sync_mode(
     let full_manifest = BackupManifest::read(full_dir)?;
     verify_and_copy_full(&full_manifest, full_dir, dest)?;
     let mut running_lsn = full_manifest.source_lsn;
+    let mut running_catalog_version = full_manifest.catalog_version;
     let mut running_sync = full_manifest.sync.clone();
 
     // 2. Apply each increment in order.
@@ -172,6 +175,7 @@ pub fn restore_chain_with_sync_mode(
                 "increment sync identity does not match full backup identity",
             ));
         }
+        validate_catalog_transition(running_catalog_version, inc.catalog_version)?;
         for cf in &inc.changed {
             match cf {
                 ChangedFile::Whole {
@@ -210,6 +214,7 @@ pub fn restore_chain_with_sync_mode(
             }
         }
         running_lsn = inc.source_lsn;
+        running_catalog_version = inc.catalog_version;
         running_sync = inc.sync.clone();
     }
 
@@ -217,6 +222,12 @@ pub fn restore_chain_with_sync_mode(
 
     // 3. Validate the reconstructed DB opens (LSN invariant).
     let cat = Catalog::open(dest)?;
+    if cat.active_catalog_version() != running_catalog_version {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restored catalog format does not match increment manifest",
+        ));
+    }
     drop(cat);
     Ok(())
 }
@@ -230,7 +241,6 @@ fn sync_metadata_builds_on_same_history(
         (Some(base), Some(next)) => {
             base.identity == next.identity
                 && base.wal_format_version == next.wal_format_version
-                && base.catalog_version == next.catalog_version
                 && base.retained_segment_format_version == next.retained_segment_format_version
         }
         _ => false,

@@ -13,9 +13,7 @@
 //!   6. mutation / constraint / grouping / ordering edges,
 //!   7. `json_type` including missing paths and a non-json base.
 //!
-//! Every case asserts a concrete correct result OR, for documented non-goals
-//! (ordering/grouping BY a path expression), a CLEAN typed error with the
-//! engine still usable afterward. Nothing may panic.
+//! Every case asserts a concrete correct result. Nothing may panic.
 
 use powdb_query::executor::Engine;
 use powdb_query::result::{QueryError, QueryResult};
@@ -493,25 +491,137 @@ fn order_by_json_column_follows_the_pj1_total_order() {
 }
 
 #[test]
-fn order_or_group_by_a_path_expression_is_a_clean_non_goal() {
-    // Ordering / grouping BY a `->` path expression is a documented non-goal
-    // (order/group keys are field names, not expressions). Whatever the engine
-    // does, it must be a clean error (parse or type), never a panic, and the
-    // engine must remain usable afterward.
+fn path_expressions_work_in_order_group_and_aggregate_positions() {
     let mut e = engine_with_posts("pathkey");
-    insert(&mut e, 1, r#"{"age":30}"#);
-    insert(&mut e, 2, r#"{"age":18}"#);
-    let order_res = e.execute_powql("Post order .data->age { .id }");
-    let group_res = e.execute_powql("Post group .data->age { .id }");
-    // Accept success OR a typed/parse error; only forbid a panic (which would
-    // have aborted the test) and require survival.
-    let _ = (order_res, group_res);
-    // Engine still works after the non-goal queries.
+    insert(&mut e, 1, r#"{"age":30,"kind":"a"}"#);
+    insert(&mut e, 2, r#"{"age":18,"kind":"b"}"#);
+    insert(&mut e, 3, r#"{"age":12,"kind":"a"}"#);
+
     assert_eq!(
-        count(&mut e, "Post filter .data->age = 30 { .id }"),
-        1,
-        "engine survived"
+        rows(&mut e, "Post order .data->age { .id }"),
+        vec![
+            vec![Value::Int(3)],
+            vec![Value::Int(2)],
+            vec![Value::Int(1)]
+        ]
     );
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post group .data->kind { kind: .data->kind, total: sum(.data->age) }",
+        ),
+        vec![
+            vec![Value::Str("a".into()), Value::Int(42)],
+            vec![Value::Str("b".into()), Value::Int(18)]
+        ]
+    );
+    assert_eq!(scalar(&mut e, "sum(Post { .data->age })"), Value::Int(60));
+}
+
+#[test]
+fn grouped_order_by_path_rebinds_through_projection_alias() {
+    let mut e = engine_with_posts("grouped_path_order");
+    insert(&mut e, 1, r#"{"kind":"z"}"#);
+    insert(&mut e, 2, r#"{"kind":"a"}"#);
+    insert(&mut e, 3, r#"{"kind":"z"}"#);
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post group .data->kind order .data->kind { kind: .data->kind, n: count(*) }",
+        ),
+        vec![
+            vec![Value::Str("a".into()), Value::Int(1)],
+            vec![Value::Str("z".into()), Value::Int(2)],
+        ]
+    );
+}
+
+#[test]
+fn qualified_joined_paths_work_in_filter_group_and_aggregate_positions() {
+    let mut e = engine_with_posts("qualified_joined_paths");
+    exec(&mut e, "type Meta { required post_id: int, data: json }");
+    insert(&mut e, 1, r#"{"kind":"a"}"#);
+    insert(&mut e, 2, r#"{"kind":"b"}"#);
+    exec(
+        &mut e,
+        r#"insert Meta { post_id := 1, data := "{\"kind\":\"a\",\"value\":7}" }"#,
+    );
+    exec(
+        &mut e,
+        r#"insert Meta { post_id := 2, data := "{\"kind\":\"wrong\",\"value\":11}" }"#,
+    );
+
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post as p inner join Meta as m on p.id = m.post_id \
+             filter p.data->kind = m.data->kind \
+             group p.data->kind { kind: p.data->kind, total: sum(m.data->value) }",
+        ),
+        vec![vec![Value::Str("a".into()), Value::Int(7)]],
+    );
+}
+
+#[test]
+fn window_partition_and_order_accept_json_paths() {
+    let mut e = engine_with_posts("window_paths");
+    insert(&mut e, 1, r#"{"kind":"a","score":10}"#);
+    insert(&mut e, 2, r#"{"kind":"a","score":20}"#);
+    insert(&mut e, 3, r#"{"kind":"b","score":15}"#);
+
+    assert_eq!(
+        rows(
+            &mut e,
+            "Post order .id { .id, rn: row_number() over \
+             (partition .data->kind order .data->score desc) }",
+        ),
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(1)],
+            vec![Value::Int(3), Value::Int(1)],
+        ],
+    );
+}
+
+#[test]
+fn non_json_path_bases_are_rejected_in_all_new_expression_slots() {
+    let mut e = Engine::new(&temp_dir("non_json_expression_slots")).unwrap();
+    exec(&mut e, "type Metric { age: int }");
+    exec(&mut e, "insert Metric { age := 7 }");
+    for query in [
+        "Metric order .age->x",
+        "Metric group .age->x { .age->x }",
+        "sum(Metric { .age->x })",
+        "Metric group .age { total: sum(.age->x) }",
+        "Metric { n: row_number() over (partition .age->x) }",
+    ] {
+        let err = e.execute_powql(query).expect_err(query);
+        assert!(
+            err.to_string().contains("not json"),
+            "`{query}` should reject non-json path base, got {err}"
+        );
+    }
+}
+
+#[test]
+fn stray_aggregates_are_rejected_in_every_expression_slot() {
+    let mut e = Engine::new(&temp_dir("stray_aggregate_slots")).unwrap();
+    exec(&mut e, "type Metric { age: int }");
+    exec(&mut e, "insert Metric { age := 7 }");
+    for query in [
+        "Metric order sum(.age)",
+        "Metric group sum(.age) { .age }",
+        "sum(Metric { sum(.age) })",
+        "Metric { n: row_number() over (partition sum(.age)) }",
+        "Metric as a join Metric as b on sum(a.age) = b.age",
+    ] {
+        let err = e.execute_powql(query).expect_err(query);
+        assert!(
+            err.to_string()
+                .contains("aggregate function in an unsupported position"),
+            "`{query}` should reject stray aggregate, got {err}"
+        );
+    }
 }
 
 #[test]

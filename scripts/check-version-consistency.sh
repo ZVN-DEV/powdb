@@ -63,34 +63,51 @@ for peer in @zvndev/powdb-client @zvndev/powdb-embedded; do
     || fail "clients/sync/package.json peerDependency $peer pins $peer_pin, expected $workspace_version"
 done
 
+# Release metadata distinguishes the next development version from the latest
+# version that is actually published. This prevents a release-prep branch from
+# advertising packages or container tags that do not exist yet. Two states are
+# valid: released (workspace version == Current release in RELEASES.md) and
+# development (workspace version is ahead, and RELEASES.md must announce it as
+# the unreleased Next release).
+current_release="$(sed -nE 's/.*Current release: v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' RELEASES.md | head -1)"
+[[ -n "$current_release" ]] || fail "could not parse current published release from RELEASES.md"
+if [[ "$workspace_version" != "$current_release" ]]; then
+  grep -q "Next release: v$workspace_version (unreleased)" RELEASES.md \
+    || fail "RELEASES.md next release does not reference unreleased v$workspace_version"
+fi
+
 # Deploy examples pin a published ghcr image tag; every such pin must track the
-# workspace version so following the examples never deploys a stale release.
+# current published release, never the unreleased workspace version.
 example_tags="$(grep -RhoE 'ghcr\.io/zvn-dev/powdb:v[0-9]+\.[0-9]+\.[0-9]+' examples/ | sort -u || true)"
 while IFS= read -r ref; do
   [[ -n "$ref" ]] || continue
   ref_version="${ref##*:v}"
-  [[ "$ref_version" == "$workspace_version" ]] \
-    || fail "examples pin $ref, expected ghcr.io/zvn-dev/powdb:v$workspace_version"
+  [[ "$ref_version" == "$current_release" ]] \
+    || fail "examples pin $ref, expected ghcr.io/zvn-dev/powdb:v$current_release"
 done <<< "$example_tags"
 
 # The marketing site quotes versioned banners/output; any vX.Y.Z it mentions
-# must be the shipping release so the site can't freeze on an old version again.
+# must be the published release, not the in-progress development version.
 site_versions="$(grep -RhoE 'v[0-9]+\.[0-9]+\.[0-9]+' site/*.html | sort -u || true)"
 while IFS= read -r ref; do
   [[ -n "$ref" ]] || continue
-  [[ "$ref" == "v$workspace_version" ]] \
-    || fail "site/ mentions $ref, expected v$workspace_version"
+  [[ "$ref" == "v$current_release" ]] \
+    || fail "site/ mentions $ref, expected v$current_release"
 done <<< "$site_versions"
 
-grep -qE "^## \[$workspace_version\]" CHANGELOG.md \
-  || fail "CHANGELOG.md is missing a top-level entry for [$workspace_version]"
-grep -q "Current release: v$workspace_version" RELEASES.md \
-  || fail "RELEASES.md current release does not reference v$workspace_version"
+grep -qE '^## \[Unreleased\]' CHANGELOG.md \
+  || fail "CHANGELOG.md is missing the Unreleased section for v$workspace_version work"
 
-# SECURITY.md must list the current minor series (e.g. 0.6.x) as supported, so
-# the supported-versions table can't silently fall behind the shipping release.
-minor_series="${workspace_version%.*}.x"
+# SECURITY.md must list the published minor series (e.g. 0.12.x) as supported.
+# During development an unreleased workspace series must additionally remain
+# explicitly unsupported until it ships.
+minor_series="${current_release%.*}.x"
 grep -F ':white_check_mark:' SECURITY.md | grep -qF "$minor_series" \
-  || fail "SECURITY.md does not list $minor_series as a supported version (workspace is $workspace_version)"
+  || fail "SECURITY.md does not list published series $minor_series as supported"
+next_minor_series="${workspace_version%.*}.x"
+if [[ "$next_minor_series" != "$minor_series" ]]; then
+  grep -F ':x: (unreleased)' SECURITY.md | grep -qF "$next_minor_series" \
+    || fail "SECURITY.md does not mark development series $next_minor_series as unreleased"
+fi
 
-log "Rust crate versions, TS client version, sync package + peer pins, deploy example image tags, site version strings, changelog, release docs, and SECURITY.md supported versions agree."
+log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, and SECURITY.md."

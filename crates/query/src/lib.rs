@@ -4,6 +4,7 @@
 //! The planner is pure (no catalog access); plan lowering happens at execution time.
 
 pub mod ast;
+pub mod cancel;
 pub mod canonicalize;
 pub mod executor;
 pub mod lexer;

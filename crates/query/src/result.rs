@@ -45,6 +45,13 @@ pub enum QueryError {
     TypeError(String),
     /// Join result exceeded MAX_JOIN_ROWS.
     JoinLimitExceeded,
+    /// A fallback nested-loop join would evaluate more candidate pairs than
+    /// the measured safety cap.
+    NestedLoopPairLimitExceeded {
+        left_rows: usize,
+        right_rows: usize,
+        limit: usize,
+    },
     /// Sort exceeded MAX_SORT_ROWS.
     SortLimitExceeded,
     /// Per-query memory budget exceeded during materialization (sort buffer,
@@ -64,6 +71,14 @@ pub enum QueryError {
     StorageError(String),
     /// Readonly path needs write lock (internal sentinel).
     ReadonlyNeedsWrite,
+    /// The per-query deadline elapsed before execution finished. Returned as a
+    /// clean early-return from an unbounded executor loop so the query releases
+    /// its locks instead of running to completion. `timeout_ms` is the
+    /// configured per-query timeout.
+    Timeout { timeout_ms: u64 },
+    /// Execution was cancelled cooperatively (e.g. the issuing client
+    /// disconnected). Like [`QueryError::Timeout`], a clean early-return.
+    Cancelled,
     /// Generic execution error (catch-all for migration).
     Execution(String),
 }
@@ -81,6 +96,23 @@ impl fmt::Display for QueryError {
             }
             QueryError::TypeError(msg) => write!(f, "type mismatch: {msg}"),
             QueryError::JoinLimitExceeded => write!(f, "join result exceeds row limit"),
+            QueryError::NestedLoopPairLimitExceeded {
+                left_rows,
+                right_rows,
+                limit,
+            } => {
+                let pairs = left_rows.checked_mul(*right_rows);
+                match pairs {
+                    Some(pairs) => write!(
+                        f,
+                        "nested-loop join would evaluate {pairs} candidate pairs, above the {limit} pair limit; add an equi-key to ON, index/filter an input, reduce the joined row counts, or raise the cap via POWDB_MAX_NESTED_LOOP_PAIRS"
+                    ),
+                    None => write!(
+                        f,
+                        "nested-loop join candidate count overflows usize ({left_rows} x {right_rows}), above the {limit} pair limit; add an equi-key to ON, index/filter an input, reduce the joined row counts, or raise the cap via POWDB_MAX_NESTED_LOOP_PAIRS"
+                    ),
+                }
+            }
             QueryError::SortLimitExceeded => {
                 write!(f, "sort input exceeds row limit — add a LIMIT clause")
             }
@@ -98,6 +130,10 @@ impl fmt::Display for QueryError {
             QueryError::ReadonlyNeedsWrite => {
                 write!(f, "__POWDB_READONLY_NEEDS_WRITE__")
             }
+            QueryError::Timeout { timeout_ms } => {
+                write!(f, "query timeout after {timeout_ms}ms")
+            }
+            QueryError::Cancelled => write!(f, "query cancelled by client disconnect"),
             QueryError::Execution(msg) => write!(f, "{msg}"),
         }
     }

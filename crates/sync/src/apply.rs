@@ -56,7 +56,10 @@ pub fn apply_retained_tail(
 ) -> io::Result<RetainedTailApplySummary> {
     expected_identity.validate()?;
     let local_identity = read_identity(catalog.data_dir())?;
-    if local_identity.segment_identity() != expected_identity {
+    if !local_identity
+        .segment_identity()
+        .lineage_matches(expected_identity)
+    {
         return Err(invalid_input(
             "replica sync identity does not match retained tail history",
         ));
@@ -155,7 +158,10 @@ pub fn seed_retained_apply_boundary(
 ) -> io::Result<()> {
     expected_identity.validate()?;
     let local_identity = read_identity(data_dir)?;
-    if local_identity.segment_identity() != expected_identity {
+    if !local_identity
+        .segment_identity()
+        .lineage_matches(expected_identity)
+    {
         return Err(invalid_input(
             "replica sync identity does not match retained tail history",
         ));
@@ -179,7 +185,10 @@ pub fn apply_retained_units_chunk(
 ) -> io::Result<RetainedTailApplySummary> {
     expected_identity.validate()?;
     let local_identity = read_identity(catalog.data_dir())?;
-    if local_identity.segment_identity() != expected_identity {
+    if !local_identity
+        .segment_identity()
+        .lineage_matches(expected_identity)
+    {
         return Err(invalid_input(
             "replica sync identity does not match retained tail history",
         ));
@@ -327,7 +336,7 @@ fn reconcile_apply_state(
     };
 
     state.validate()?;
-    if state.identity() != expected_identity {
+    if !state.identity().lineage_matches(expected_identity) {
         return Err(invalid_data(
             "local retained-tail apply state belongs to a different database history",
         ));
@@ -381,7 +390,7 @@ fn ensure_retained_chunk_target_provenance(
         )));
     };
     state.validate()?;
-    if state.identity() != expected_identity {
+    if !state.identity().lineage_matches(expected_identity) {
         return Err(invalid_data(
             "retained chunk target provenance belongs to a different database history",
         ));
@@ -417,7 +426,7 @@ fn ensure_retained_chunk_start_boundary(
         )));
     };
     state.validate()?;
-    if state.identity() != expected_identity {
+    if !state.identity().lineage_matches(expected_identity) {
         return Err(invalid_data(
             "trusted retained chunk boundary belongs to a different database history",
         ));
@@ -493,7 +502,7 @@ fn write_apply_state(
     create_data_dir_secure(&state_dir)?;
     let existing_started = read_apply_state(data_dir)?
         .filter(|existing| {
-            existing.identity() == identity
+            existing.identity().lineage_matches(identity)
                 && existing.from_lsn == from_lsn
                 && existing.through_lsn == through_lsn
         })

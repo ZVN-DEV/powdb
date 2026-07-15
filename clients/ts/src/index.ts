@@ -24,10 +24,12 @@ import {
   MAX_SYNC_PULL_BYTES,
   MAX_SYNC_PULL_UNITS,
   type Message,
+  type NativeJson,
   type SyncRepairAction,
   type WireRetainedUnit,
   type WireParam,
   type WireSyncStatus,
+  type WireValue,
 } from "./protocol.js";
 import { PowDBError, PowDBScriptError, isPowDBError } from "./errors.js";
 import { splitStatements } from "./script.js";
@@ -38,11 +40,74 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.12.0";
+export const CLIENT_VERSION = "0.13.0";
+
+/**
+ * The maximum catalog format version this client can read. State this as the
+ * `catalogVersion` in sync pull requests: the server accepts any replica whose
+ * maximum is at least its active catalog format and rejects an older replica.
+ * When validating a server-reported catalog version, accept anything at or
+ * below this and reject anything newer (the client cannot read it).
+ */
+export const SUPPORTED_CATALOG_VERSION = 6;
+
+/**
+ * Throw when a server-reported catalog format is newer than this client can
+ * read. Accepts `serverCatalogVersion <= SUPPORTED_CATALOG_VERSION`; rejects a
+ * newer server, which requires upgrading the client.
+ */
+export function assertServerCatalogVersionSupported(
+  serverCatalogVersion: number,
+  clientMax: number = SUPPORTED_CATALOG_VERSION,
+): void {
+  if (!Number.isInteger(serverCatalogVersion) || serverCatalogVersion < 1) {
+    throw new Error(
+      `invalid server catalog version ${serverCatalogVersion}`,
+    );
+  }
+  if (serverCatalogVersion > clientMax) {
+    throw new Error(
+      `server catalog format v${serverCatalogVersion} is newer than this client supports (max v${clientMax}); upgrade the client`,
+    );
+  }
+}
 
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
   | { kind: "scalar"; value: string }
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string };
+
+export type { NativeJson } from "./protocol.js";
+
+/** A value returned by the lossless native wire surface. */
+export type NativeValue =
+  | null
+  | number
+  | bigint
+  | boolean
+  | string
+  | Uint8Array
+  | NativeJson;
+
+export type NativeQueryResult =
+  | { kind: "rows"; columns: string[]; rows: NativeValue[][] }
+  | { kind: "scalar"; value: NativeValue }
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string };
+
+/**
+ * The fully lossless result of {@link Client.queryNativeRaw}: every cell is the
+ * raw {@link WireValue} tagged union straight off the wire, with no conversion
+ * to {@link NativeValue}. Use this when you need storage-level identity that the
+ * convenience conversion erases: the raw PJ1 bytes of a JSON cell (`pj1`), or
+ * telling an absent value (`{ type: "empty" }`) apart from the string `"null"`
+ * (`{ type: "str", value: "null" }`) or a JSON null (`{ type: "json", value:
+ * null }`), all of which {@link queryNative} collapses to `null`.
+ */
+export type RawNativeQueryResult =
+  | { kind: "rows"; columns: string[]; rows: WireValue[][] }
+  | { kind: "scalar"; value: WireValue }
   | { kind: "ok"; affected: bigint }
   | { kind: "message"; message: string };
 
@@ -162,6 +227,78 @@ function toWireParam(p: QueryParam): WireParam {
     default:
       throw new PowDBError(
         `unsupported query parameter type: ${typeof p}`,
+        "protocol_error",
+      );
+  }
+}
+
+function fromWireValue(value: WireValue): NativeValue {
+  switch (value.type) {
+    case "empty":
+      return null;
+    case "int":
+      return value.value >= BigInt(Number.MIN_SAFE_INTEGER) &&
+        value.value <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(value.value)
+        : value.value;
+    case "float":
+    case "bool":
+    case "str":
+      return value.value;
+    case "datetime":
+      return value.value;
+    case "uuid": {
+      const hex = Array.from(value.value, (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+    case "bytes":
+      return new Uint8Array(value.value);
+    case "json":
+      return value.value;
+  }
+}
+
+function nativeQueryResult(reply: Message): NativeQueryResult {
+  switch (reply.type) {
+    case "ResultRowsNative":
+      return {
+        kind: "rows",
+        columns: reply.columns,
+        rows: reply.rows.map((row) => row.map(fromWireValue)),
+      };
+    case "ResultScalarNative":
+      return { kind: "scalar", value: fromWireValue(reply.value) };
+    case "ResultOk":
+      return { kind: "ok", affected: reply.affected };
+    case "ResultMessage":
+      return { kind: "message", message: reply.message };
+    case "Error":
+      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+    default:
+      throw new PowDBError(
+        `unexpected reply to native query: ${reply.type}`,
+        "protocol_error",
+      );
+  }
+}
+
+function rawNativeQueryResult(reply: Message): RawNativeQueryResult {
+  switch (reply.type) {
+    case "ResultRowsNative":
+      return { kind: "rows", columns: reply.columns, rows: reply.rows };
+    case "ResultScalarNative":
+      return { kind: "scalar", value: reply.value };
+    case "ResultOk":
+      return { kind: "ok", affected: reply.affected };
+    case "ResultMessage":
+      return { kind: "message", message: reply.message };
+    case "Error":
+      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+    default:
+      throw new PowDBError(
+        `unexpected reply to native query: ${reply.type}`,
         "protocol_error",
       );
   }
@@ -575,6 +712,100 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 
   /**
+   * Run PowQL over the lossless typed wire surface. Unlike {@link query},
+   * cells are not stringified: bytes remain bytes, JSON is recursive data,
+   * and unsafe integers remain bigint. This method never retries as a legacy
+   * query, because replaying a mutation after an ambiguous response is unsafe.
+   */
+  async queryNative(
+    query: string,
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<NativeQueryResult> {
+    const hasParams = Array.isArray(paramsOrOpts);
+    const params = hasParams ? (paramsOrOpts as QueryParam[]) : undefined;
+    const opts = hasParams
+      ? maybeOpts
+      : (paramsOrOpts as { signal?: AbortSignal } | undefined);
+    const start = Date.now();
+    try {
+      const request: Message =
+        params === undefined
+          ? { type: "QueryNative", query }
+          : {
+              type: "QueryWithParamsNative",
+              query,
+              params: params.map(toWireParam),
+            };
+      const result = nativeQueryResult(await this.send(request, opts));
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Like {@link queryNative}, but returns every cell as the raw
+   * {@link WireValue} tagged union with no conversion to {@link NativeValue}.
+   *
+   * Reach for this only when the convenience conversion would erase something
+   * you need: the raw PJ1 bytes of a JSON cell (`pj1`), or the distinction
+   * between an absent value (`{ type: "empty" }`), the string `"null"`, and a
+   * JSON null (all three of which {@link queryNative} maps to `null`). For
+   * ordinary reads, {@link queryNative} is friendlier.
+   */
+  async queryNativeRaw(
+    query: string,
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<RawNativeQueryResult> {
+    const hasParams = Array.isArray(paramsOrOpts);
+    const params = hasParams ? (paramsOrOpts as QueryParam[]) : undefined;
+    const opts = hasParams
+      ? maybeOpts
+      : (paramsOrOpts as { signal?: AbortSignal } | undefined);
+    const start = Date.now();
+    try {
+      const request: Message =
+        params === undefined
+          ? { type: "QueryNative", query }
+          : {
+              type: "QueryWithParamsNative",
+              query,
+              params: params.map(toWireParam),
+            };
+      const result = rawNativeQueryResult(await this.send(request, opts));
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
    * Run a SQL statement through the server-side SQL frontend. The plain
    * {@link query} method remains PowQL for wire compatibility.
    */
@@ -604,6 +835,34 @@ export class Client extends EventEmitter<ClientEvents> {
         default:
           throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
       }
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /** Run SQL through the lossless typed wire surface without legacy replay. */
+  async querySqlNative(
+    query: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<NativeQueryResult> {
+    const start = Date.now();
+    try {
+      const result = nativeQueryResult(
+        await this.send({ type: "QuerySqlNative", query }, opts),
+      );
       this.emit("query", {
         query,
         durationMs: Date.now() - start,
@@ -1425,6 +1684,7 @@ export { encode, tryDecode } from "./protocol.js";
 export type {
   Message,
   SyncRepairAction,
+  WireValue,
   WireParam,
   WireRetainedUnit,
   WireSyncStatus,

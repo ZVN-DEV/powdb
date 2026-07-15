@@ -57,6 +57,12 @@ pub enum QueryDialect {
 /// comfortably in 256. Lookup is O(1), collisions clear the cache (see
 /// `plan_cache::PlanCache::insert`).
 const PLAN_CACHE_CAPACITY: usize = 256;
+const SQL_RAW_CACHE_SALT: u64 = 0x7261_772d_7371_6c01;
+
+#[inline]
+fn sql_raw_cache_hash(hash: u64) -> u64 {
+    hash ^ SQL_RAW_CACHE_SALT
+}
 type WalArchiveHook =
     Arc<dyn Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync>;
 
@@ -64,6 +70,10 @@ type WalArchiveHook =
 /// Prevents Cartesian-product blowups (e.g. `T cross join T` on 10K rows
 /// would produce 100M rows in memory without this cap).
 pub(super) const MAX_JOIN_ROWS: usize = 1_000_000;
+
+/// Maximum candidate pairs allowed for a fallback nested-loop join. This is
+/// grounded in the release benchmark's conservative 250 ms evaluation budget.
+pub(super) const MAX_NESTED_LOOP_PAIRS: usize = 6_400_000;
 
 /// Maximum number of rows that may be materialized for sorting.
 /// Queries that exceed this should add a LIMIT clause to narrow the input
@@ -116,65 +126,57 @@ macro_rules! agg_int_loop {
         let bmp_bit = $bmp_bit;
         let off = $off;
         if let Some(pred) = &$pred {
-            $self
-                .catalog
-                .for_each_row_raw($table, |_rid, data| {
-                    if !pred(data) {
-                        return;
-                    }
-                    let base = row_body_base(data);
-                    let bmp_off = base + 2 + bmp_byte;
-                    let data_off = base + off;
-                    // Bounds guard: skip corrupt/truncated rows that are too
-                    // short to contain the bitmap byte or the 8-byte value.
-                    if bmp_off >= data.len() || data_off + 8 > data.len() {
-                        return;
-                    }
-                    // SAFETY: `bmp_off < data.len()` is checked above.
-                    // The bitmap byte lives at body offset 2..2+bitmap_size in
-                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
-                    // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
-                    if (bmp >> bmp_bit) & 1 == 1 {
-                        return;
-                    }
-                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
-                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
-                    // points to an 8-byte i64 in the fixed-size region of the row.
-                    // The pointer cast is valid because we read exactly 8
-                    // bytes via from_le_bytes. Corrupt rows are rejected by
-                    // the bounds guard.
-                    let $v: i64 = unsafe {
-                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
-                    };
-                    $body
-                })
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            for_each_row_raw_cancellable(&$self.catalog, $table, |_rid, data| {
+                if !pred(data) {
+                    return;
+                }
+                let base = row_body_base(data);
+                let bmp_off = base + 2 + bmp_byte;
+                let data_off = base + off;
+                // Bounds guard: skip corrupt/truncated rows that are too
+                // short to contain the bitmap byte or the 8-byte value.
+                if bmp_off >= data.len() || data_off + 8 > data.len() {
+                    return;
+                }
+                // SAFETY: `bmp_off < data.len()` is checked above.
+                // The bitmap byte lives at body offset 2..2+bitmap_size in
+                // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                // Corrupt rows are rejected by the bounds guard.
+                let bmp = unsafe { *data.get_unchecked(bmp_off) };
+                if (bmp >> bmp_bit) & 1 == 1 {
+                    return;
+                }
+                // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                // points to an 8-byte i64 in the fixed-size region of the row.
+                // The pointer cast is valid because we read exactly 8
+                // bytes via from_le_bytes. Corrupt rows are rejected by
+                // the bounds guard.
+                let $v: i64 =
+                    unsafe { i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8])) };
+                $body
+            })?;
         } else {
-            $self
-                .catalog
-                .for_each_row_raw($table, |_rid, data| {
-                    let base = row_body_base(data);
-                    let bmp_off = base + 2 + bmp_byte;
-                    let data_off = base + off;
-                    // Bounds guard: skip corrupt/truncated rows.
-                    if bmp_off >= data.len() || data_off + 8 > data.len() {
-                        return;
-                    }
-                    // SAFETY: `bmp_off < data.len()` is checked above.
-                    // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
-                    if (bmp >> bmp_bit) & 1 == 1 {
-                        return;
-                    }
-                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
-                    // See the predicate branch for the full invariant.
-                    let $v: i64 = unsafe {
-                        i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
-                    };
-                    $body
-                })
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            for_each_row_raw_cancellable(&$self.catalog, $table, |_rid, data| {
+                let base = row_body_base(data);
+                let bmp_off = base + 2 + bmp_byte;
+                let data_off = base + off;
+                // Bounds guard: skip corrupt/truncated rows.
+                if bmp_off >= data.len() || data_off + 8 > data.len() {
+                    return;
+                }
+                // SAFETY: `bmp_off < data.len()` is checked above.
+                // See the predicate branch for the full invariant.
+                let bmp = unsafe { *data.get_unchecked(bmp_off) };
+                if (bmp >> bmp_bit) & 1 == 1 {
+                    return;
+                }
+                // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                // See the predicate branch for the full invariant.
+                let $v: i64 =
+                    unsafe { i64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8])) };
+                $body
+            })?;
         }
     }};
 }
@@ -189,65 +191,57 @@ macro_rules! agg_float_loop {
         let bmp_bit = $bmp_bit;
         let off = $off;
         if let Some(pred) = &$pred {
-            $self
-                .catalog
-                .for_each_row_raw($table, |_rid, data| {
-                    if !pred(data) {
-                        return;
-                    }
-                    let base = row_body_base(data);
-                    let bmp_off = base + 2 + bmp_byte;
-                    let data_off = base + off;
-                    // Bounds guard: skip corrupt/truncated rows that are too
-                    // short to contain the bitmap byte or the 8-byte value.
-                    if bmp_off >= data.len() || data_off + 8 > data.len() {
-                        return;
-                    }
-                    // SAFETY: `bmp_off < data.len()` is checked above.
-                    // The bitmap byte lives at body offset 2..2+bitmap_size in
-                    // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
-                    // Corrupt rows are rejected by the bounds guard.
-                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
-                    if (bmp >> bmp_bit) & 1 == 1 {
-                        return;
-                    }
-                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
-                    // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
-                    // points to an 8-byte f64 in the fixed-size region of the row.
-                    // The pointer cast is valid because we read exactly 8
-                    // bytes via from_le_bytes. Corrupt rows are rejected by
-                    // the bounds guard.
-                    let $v: f64 = unsafe {
-                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
-                    };
-                    $body
-                })
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            for_each_row_raw_cancellable(&$self.catalog, $table, |_rid, data| {
+                if !pred(data) {
+                    return;
+                }
+                let base = row_body_base(data);
+                let bmp_off = base + 2 + bmp_byte;
+                let data_off = base + off;
+                // Bounds guard: skip corrupt/truncated rows that are too
+                // short to contain the bitmap byte or the 8-byte value.
+                if bmp_off >= data.len() || data_off + 8 > data.len() {
+                    return;
+                }
+                // SAFETY: `bmp_off < data.len()` is checked above.
+                // The bitmap byte lives at body offset 2..2+bitmap_size in
+                // the row encoding, and bmp_byte = col_idx / 8 < bitmap_size.
+                // Corrupt rows are rejected by the bounds guard.
+                let bmp = unsafe { *data.get_unchecked(bmp_off) };
+                if (bmp >> bmp_bit) & 1 == 1 {
+                    return;
+                }
+                // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                // `data_off = base + 2 + bitmap_size + fixed_offsets[col_idx]`
+                // points to an 8-byte f64 in the fixed-size region of the row.
+                // The pointer cast is valid because we read exactly 8
+                // bytes via from_le_bytes. Corrupt rows are rejected by
+                // the bounds guard.
+                let $v: f64 =
+                    unsafe { f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8])) };
+                $body
+            })?;
         } else {
-            $self
-                .catalog
-                .for_each_row_raw($table, |_rid, data| {
-                    let base = row_body_base(data);
-                    let bmp_off = base + 2 + bmp_byte;
-                    let data_off = base + off;
-                    // Bounds guard: skip corrupt/truncated rows.
-                    if bmp_off >= data.len() || data_off + 8 > data.len() {
-                        return;
-                    }
-                    // SAFETY: `bmp_off < data.len()` is checked above.
-                    // See the predicate branch for the full invariant.
-                    let bmp = unsafe { *data.get_unchecked(bmp_off) };
-                    if (bmp >> bmp_bit) & 1 == 1 {
-                        return;
-                    }
-                    // SAFETY: `data_off + 8 <= data.len()` is checked above.
-                    // See the predicate branch for the full invariant.
-                    let $v: f64 = unsafe {
-                        f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8]))
-                    };
-                    $body
-                })
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            for_each_row_raw_cancellable(&$self.catalog, $table, |_rid, data| {
+                let base = row_body_base(data);
+                let bmp_off = base + 2 + bmp_byte;
+                let data_off = base + off;
+                // Bounds guard: skip corrupt/truncated rows.
+                if bmp_off >= data.len() || data_off + 8 > data.len() {
+                    return;
+                }
+                // SAFETY: `bmp_off < data.len()` is checked above.
+                // See the predicate branch for the full invariant.
+                let bmp = unsafe { *data.get_unchecked(bmp_off) };
+                if (bmp >> bmp_bit) & 1 == 1 {
+                    return;
+                }
+                // SAFETY: `data_off + 8 <= data.len()` is checked above.
+                // See the predicate branch for the full invariant.
+                let $v: f64 =
+                    unsafe { f64::from_le_bytes(*(data.as_ptr().add(data_off) as *const [u8; 8])) };
+                $body
+            })?;
         }
     }};
 }
@@ -263,9 +257,11 @@ mod tests;
 pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
-    exec_group_by, execute_window, format_plan_tree, hash_join, lower_unindexed_scans,
-    predicate_column_indices_json, range_matches, synthesize_range_predicate,
-    try_extract_equi_join_keys, validate_json_path_types, validate_no_stray_aggregates,
+    aggregate_rows, aggregate_rows_with_provenance, compare_order_values,
+    cooperative_stable_sort_by, exec_group_by, exec_group_by_with_provenance,
+    execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
+    lower_unindexed_scans, predicate_column_indices_json, range_matches,
+    synthesize_range_predicate, validate_json_path_types, validate_no_stray_aggregates,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -290,6 +286,55 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::DropView(_) => false,
         Statement::Begin | Statement::Commit | Statement::Rollback => false,
         Statement::Explain(inner) => is_read_only_statement(inner),
+    }
+}
+
+/// Return whether executing this read plan would have to refresh a dirty
+/// materialized view. This is intentionally a whole-plan preflight: the server
+/// may retry only this typed condition under exclusive admission, so it must be
+/// raised before any input branch performs row work.
+fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::AliasScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => views.is_dirty(table),
+
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. } => plan_reads_dirty_view(input, views),
+
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            plan_reads_dirty_view(left, views) || plan_reads_dirty_view(right, views)
+        }
+
+        // EXPLAIN formats its input without executing it, so inspecting a plan
+        // that names a dirty view never requires a refresh.
+        PlanNode::Explain { .. }
+        | PlanNode::AlterTable { .. }
+        | PlanNode::DropTable { .. }
+        | PlanNode::Insert { .. }
+        | PlanNode::Upsert { .. }
+        | PlanNode::Update { .. }
+        | PlanNode::Delete { .. }
+        | PlanNode::CreateTable { .. }
+        | PlanNode::ListTypes
+        | PlanNode::Describe { .. }
+        | PlanNode::CreateView { .. }
+        | PlanNode::RefreshView { .. }
+        | PlanNode::DropView { .. }
+        | PlanNode::Begin
+        | PlanNode::Commit
+        | PlanNode::Rollback => false,
     }
 }
 
@@ -329,6 +374,11 @@ pub struct Engine {
     /// Default [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable
     /// via `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
     query_memory_limit: usize,
+    /// Maximum candidate pairs a fallback nested-loop join may evaluate before
+    /// it is rejected. Default [`MAX_NESTED_LOOP_PAIRS`], overridable via
+    /// [`Engine::set_nested_loop_pair_limit`] (server reads
+    /// `POWDB_MAX_NESTED_LOOP_PAIRS`). A plain `usize` so `Engine` stays `Sync`.
+    nested_loop_pair_limit: usize,
     wal_archive_hook: Option<WalArchiveHook>,
 }
 
@@ -397,6 +447,7 @@ impl Engine {
             view_registry,
             in_transaction: false,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
+            nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             wal_archive_hook,
         })
     }
@@ -433,6 +484,19 @@ impl Engine {
     /// Override the per-query memory limit in bytes (builder-style).
     pub fn set_query_memory_limit(&mut self, limit_bytes: usize) {
         self.query_memory_limit = limit_bytes;
+    }
+
+    /// Current fallback nested-loop join candidate-pair cap.
+    pub fn nested_loop_pair_limit(&self) -> usize {
+        self.nested_loop_pair_limit
+    }
+
+    /// Override the fallback nested-loop join candidate-pair cap. Used by the
+    /// server to apply `POWDB_MAX_NESTED_LOOP_PAIRS`, and by tests that need a
+    /// tiny cap to exercise the guard on a small join. A zero limit is clamped
+    /// to 1 so a valid single-pair join is never rejected outright.
+    pub fn set_nested_loop_pair_limit(&mut self, limit: usize) {
+        self.nested_loop_pair_limit = limit.max(1);
     }
 
     /// Set the WAL durability mode (see [`WalSyncMode`]). `Full` (the default)
@@ -545,7 +609,9 @@ impl Engine {
     /// buffer, join build side, GROUP BY hash table, IN-list).
     pub(super) fn charge_rows(&self, rows: &[Vec<Value>]) -> Result<(), QueryError> {
         let mut total = 0usize;
+        let mut cancel = crate::cancel::CancelCheck::new();
         for row in rows {
+            cancel.tick()?;
             total = total.saturating_add(mem_budget::estimate_row_size(row));
         }
         mem_budget::charge(total, self.query_memory_limit)
@@ -558,7 +624,9 @@ impl Engine {
     pub(super) fn charge_in_list(&self, list: &[crate::ast::Expr]) -> Result<(), QueryError> {
         let base = std::mem::size_of::<crate::ast::Expr>();
         let mut total = std::mem::size_of::<Vec<crate::ast::Expr>>();
+        let mut cancel = crate::cancel::CancelCheck::new();
         for item in list {
+            cancel.tick()?;
             total = total.saturating_add(base);
             if let crate::ast::Expr::Literal(crate::ast::Literal::String(s)) = item {
                 total = total.saturating_add(s.capacity());
@@ -632,6 +700,11 @@ impl Engine {
         // `execute_powql` (e.g. a view's source query) does not reset the
         // outer frame's accounting mid-statement.
         let _budget = self.enter_memory_budget();
+        // A token may be cancelled before execution starts (for example, EOF
+        // detected while this job was waiting for the engine lock). Check once
+        // at the statement boundary so even point operations with no long loop
+        // honor cancellation before they can mutate state.
+        crate::cancel::check()?;
         // Hot path: tracing disabled. Zero syscalls, zero formatting.
         if !tracing::enabled!(Level::INFO) {
             // D9: try the plan cache first. Canonicalisation lexes the
@@ -747,11 +820,17 @@ impl Engine {
     /// SQL and PowQL spellings share cached plans.
     pub fn execute_sql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
         let _budget = self.enter_memory_budget();
+        crate::cancel::check()?;
         let parsed = crate::sql::parse_sql_with_canonical(input)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
 
         if !tracing::enabled!(Level::INFO) {
             if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+                let hash = if crate::sql::statement_has_aggregate(&parsed.statement) {
+                    sql_raw_cache_hash(hash)
+                } else {
+                    hash
+                };
                 let cached = self
                     .plan_cache
                     .lock()
@@ -800,6 +879,7 @@ impl Engine {
     /// Read-only variant of [`Engine::execute_sql`].
     pub fn execute_sql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
         let _budget = self.enter_memory_budget();
+        crate::cancel::check()?;
         let parsed = crate::sql::parse_sql_with_canonical(input)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         if !is_read_only_statement(&parsed.statement) {
@@ -807,6 +887,11 @@ impl Engine {
         }
 
         if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+            let hash = if crate::sql::statement_has_aggregate(&parsed.statement) {
+                sql_raw_cache_hash(hash)
+            } else {
+                hash
+            };
             let cached = self
                 .plan_cache
                 .lock()
@@ -845,6 +930,7 @@ impl Engine {
         params: &[crate::ast::ParamValue],
     ) -> Result<QueryResult, QueryError> {
         let _budget = self.enter_memory_budget();
+        crate::cancel::check()?;
         let stmt = crate::parser::parse_with_params(input, params)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan =
@@ -872,6 +958,7 @@ impl Engine {
         params: &[crate::ast::ParamValue],
     ) -> Result<QueryResult, QueryError> {
         let _budget = self.enter_memory_budget();
+        crate::cancel::check()?;
         let stmt = crate::parser::parse_with_params(input, params)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         if !is_read_only_statement(&stmt) {
@@ -881,6 +968,75 @@ impl Engine {
             crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = lower_unindexed_scans(&self.catalog, &plan);
         self.execute_plan_readonly(&plan)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql`]. Installs
+    /// `cancel` as the current thread's cancellation token for the duration of
+    /// the statement, so cancellable read and mutation-target discovery loops
+    /// poll it. Mutation application checks once before its first write, then
+    /// finishes without polling because the engine has no statement savepoint
+    /// with which to undo a written prefix. The base methods also honor an
+    /// already installed token; a caller with no token (embedded/direct use)
+    /// never cancels.
+    pub fn execute_powql_with_cancel(
+        &mut self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_sql`].
+    pub fn execute_sql_with_cancel(
+        &mut self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_sql(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_readonly`].
+    pub fn execute_powql_readonly_with_cancel(
+        &self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_readonly(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_sql_readonly`].
+    pub fn execute_sql_readonly_with_cancel(
+        &self,
+        input: &str,
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_sql_readonly(input)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_with_params`].
+    pub fn execute_powql_with_params_and_cancel(
+        &mut self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_with_params(input, params)
+    }
+
+    /// Cancellation-aware variant of [`Engine::execute_powql_readonly_with_params`].
+    pub fn execute_powql_readonly_with_params_and_cancel(
+        &self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+        cancel: Arc<crate::cancel::ExecCancel>,
+    ) -> Result<QueryResult, QueryError> {
+        let _cancel_guard = crate::cancel::install(cancel);
+        self.execute_powql_readonly_with_params(input, params)
     }
 
     /// Plan cache stats — useful for benches and debugging.
@@ -909,6 +1065,7 @@ impl Engine {
         // allowance. The guard holds the reentrancy depth so a nested
         // `execute_powql*` does not reset the outer frame's accounting.
         let _budget = self.enter_memory_budget();
+        crate::cancel::check()?;
         // Parse the statement first so we can classify read vs. write
         // without touching the catalog. This is the same lex+parse cost
         // the hot path would pay anyway.
@@ -960,11 +1117,29 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        // Detect every dirty materialized-view source before executing any
+        // branch of the plan. Without this preflight, a join could fully scan
+        // its clean left input before discovering a dirty right input, then
+        // repeat that work after the server upgrades to writer admission.
+        // Alias scans also need this centralized check: they do not pass
+        // through the SeqScan arm below.
+        if plan_reads_dirty_view(plan, &self.view_registry) {
+            return Err(QueryError::ReadonlyNeedsWrite);
+        }
         // Mirror the mutable path: reject a stray aggregate FunctionCall before
         // evaluating any row (see execute_plan for the rationale).
         validate_no_stray_aggregates(plan)?;
         validate_json_path_types(&self.catalog, plan)?;
         match plan {
+            PlanNode::ExprIndexScan { .. }
+            | PlanNode::ExprRangeScan { .. }
+            | PlanNode::OrderedExprIndexScan { .. } => {
+                if let Some(result) = self.execute_expression_index_plan(plan, None)? {
+                    return Ok(result);
+                }
+                let fallback = lower_unindexed_scans(&self.catalog, plan);
+                self.execute_plan_readonly(&fallback)
+            }
             PlanNode::SeqScan { table } => {
                 // Dirty view means we'd need to refresh it — can't do that
                 // under `&self`. Escalate to the write path.
@@ -977,12 +1152,14 @@ impl Engine {
                     .ok_or_else(|| QueryError::TableNotFound(table.clone()))?
                     .clone();
                 let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-                let rows: Vec<Vec<Value>> = self
-                    .catalog
-                    .scan(table)
-                    .map_err(|e| e.to_string())?
-                    .map(|(_, row)| row)
-                    .collect();
+                // Cooperative cancellation: a full-table scan of a huge table
+                // must stay stoppable.
+                let mut cancel = crate::cancel::CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                    cancel.tick()?;
+                    rows.push(row);
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -997,12 +1174,12 @@ impl Engine {
                     .iter()
                     .map(|c| format!("{alias}.{}", c.name))
                     .collect();
-                let rows: Vec<Vec<Value>> = self
-                    .catalog
-                    .scan(table)
-                    .map_err(|e| e.to_string())?
-                    .map(|(_, row)| row)
-                    .collect();
+                let mut cancel = crate::cancel::CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                    cancel.tick()?;
+                    rows.push(row);
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -1024,7 +1201,9 @@ impl Engine {
                     // non-unique indexes — returns all matching RowIds.
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                    let mut cancel = crate::cancel::CancelCheck::new();
                     for rid in rids {
+                        cancel.tick()?;
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns (the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value).
@@ -1048,13 +1227,11 @@ impl Engine {
                     if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema)
                     {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                if compiled(data) {
-                                    rows.push(decode_row(&schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        })?;
                         return Ok(QueryResult::Rows { columns, rows });
                     }
                 }
@@ -1067,16 +1244,14 @@ impl Engine {
                             table: String::new(),
                             column: column.clone(),
                         })?;
-                let rows: Vec<Vec<Value>> = tbl
-                    .scan()
-                    .filter_map(|(_, row)| {
-                        if row[col_idx] == key_value {
-                            Some(row)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let mut cancel = crate::cancel::CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in tbl.scan() {
+                    cancel.tick()?;
+                    if row[col_idx] == key_value {
+                        rows.push(row);
+                    }
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -1090,9 +1265,13 @@ impl Engine {
                     .catalog
                     .get_table(table)
                     .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                let columns: Vec<String> =
-                    tbl.schema.columns.iter().map(|c| c.name.clone()).collect();
-                let schema = tbl.schema.clone();
+                let columns: Vec<String> = tbl
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                let schema = tbl.schema().clone();
 
                 let start_val = match start {
                     Some((expr, _)) => Some(literal_to_value(expr)?),
@@ -1116,13 +1295,19 @@ impl Engine {
                             (None, Some(e)) => btree.range_to(e),
                             (None, None) => {
                                 // Unbounded both sides — equivalent to seq scan.
-                                let rows: Vec<Vec<Value>> =
-                                    tbl.scan().map(|(_, row)| row).collect();
+                                let mut cancel = crate::cancel::CancelCheck::new();
+                                let mut rows: Vec<Vec<Value>> = Vec::new();
+                                for (_, row) in tbl.scan() {
+                                    cancel.tick()?;
+                                    rows.push(row);
+                                }
                                 return Ok(QueryResult::Rows { columns, rows });
                             }
                         };
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(hits.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
                         for (key, rid) in hits {
+                            cancel.tick()?;
                             // Filter for exclusive bounds.
                             if !start_inclusive {
                                 if let Some(ref s) = start_val {
@@ -1155,13 +1340,11 @@ impl Engine {
                 if !tbl.has_overflow_rows() {
                     if let Some(compiled) = compile_predicate(&synth, &columns, &fast, &schema) {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
-                        self.catalog
-                            .for_each_row_raw(table, |_rid, data| {
-                                if compiled(data) {
-                                    rows.push(decode_row(&schema, data));
-                                }
-                            })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
+                            if compiled(data) {
+                                rows.push(decode_row(&schema, data));
+                            }
+                        })?;
                         return Ok(QueryResult::Rows { columns, rows });
                     }
                 }
@@ -1174,19 +1357,20 @@ impl Engine {
                             table: String::new(),
                             column: column.clone(),
                         })?;
-                let rows: Vec<Vec<Value>> = tbl
-                    .scan()
-                    .filter(|(_, row)| {
-                        range_matches(
-                            &row[col_idx],
-                            &start_val,
-                            start_inclusive,
-                            &end_val,
-                            end_inclusive,
-                        )
-                    })
-                    .map(|(_, row)| row)
-                    .collect();
+                let mut cancel = crate::cancel::CancelCheck::new();
+                let mut rows: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in tbl.scan() {
+                    cancel.tick()?;
+                    if range_matches(
+                        &row[col_idx],
+                        &start_val,
+                        start_inclusive,
+                        &end_val,
+                        end_inclusive,
+                    ) {
+                        rows.push(row);
+                    }
+                }
                 Ok(QueryResult::Rows { columns, rows })
             }
 
@@ -1209,7 +1393,11 @@ impl Engine {
                     return match result {
                         QueryResult::Rows { columns, rows } => {
                             let mut filtered = Vec::new();
+                            // Cooperative cancellation: this runs a subquery per
+                            // outer row, so a large outer scan must stay stoppable.
+                            let mut cancel = crate::cancel::CancelCheck::new();
                             for row in rows {
+                                cancel.tick()?;
                                 let row_pred = self.materialize_correlated_for_row_readonly(
                                     predicate, &row, &columns,
                                 )?;
@@ -1245,27 +1433,45 @@ impl Engine {
                         let row_layout = RowLayout::new(&schema);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
 
+                        // Cooperative cancellation: full-table compiled/selective
+                        // predicate scan must stay stoppable (see the write-path
+                        // Filter fast path for the same pattern).
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut cancel_err: Option<QueryError> = None;
                         if let Some(compiled) =
                             compile_predicate(predicate, &columns, &fast, &schema)
                         {
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return std::ops::ControlFlow::Break(());
+                                    }
                                     if compiled(data) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    std::ops::ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         } else {
                             let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
-                                .for_each_row_raw(table, |_rid, data| {
+                                .try_for_each_row_raw(table, |_rid, data| {
+                                    if let Err(e) = cancel.tick() {
+                                        cancel_err = Some(e);
+                                        return std::ops::ControlFlow::Break(());
+                                    }
                                     let pred_row =
                                         decode_selective(&schema, &row_layout, data, &pred_cols);
                                     if eval_predicate(predicate, &pred_row, &columns) {
                                         rows.push(decode_row(&schema, data));
                                     }
+                                    std::ops::ControlFlow::Continue(())
                                 })
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        }
+                        if let Some(e) = cancel_err {
+                            return Err(e);
                         }
 
                         return Ok(QueryResult::Rows { columns, rows });
@@ -1276,10 +1482,14 @@ impl Engine {
                 let result = self.execute_plan_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
-                        let filtered: Vec<Vec<Value>> = rows
-                            .into_iter()
-                            .filter(|row| eval_predicate(predicate, row, &columns))
-                            .collect();
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut filtered: Vec<Vec<Value>> = Vec::new();
+                        for row in rows {
+                            cancel.tick()?;
+                            if eval_predicate(predicate, &row, &columns) {
+                                filtered.push(row);
+                            }
+                        }
                         Ok(QueryResult::Rows {
                             columns,
                             rows: filtered,
@@ -1290,6 +1500,16 @@ impl Engine {
             }
 
             PlanNode::Project { input, fields } => {
+                if matches!(
+                    input.as_ref(),
+                    PlanNode::ExprIndexScan { .. }
+                        | PlanNode::ExprRangeScan { .. }
+                        | PlanNode::OrderedExprIndexScan { .. }
+                ) {
+                    if let Some(result) = self.execute_expression_index_plan(input, Some(fields))? {
+                        return Ok(result);
+                    }
+                }
                 // Fast path: Project over IndexScan. Avoids full-row decode
                 // by calling decode_column only for projected fields.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
@@ -1298,7 +1518,7 @@ impl Engine {
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                    let schema = &tbl.schema;
+                    let schema = tbl.schema();
 
                     let proj_columns: Vec<String> = fields
                         .iter()
@@ -1329,7 +1549,9 @@ impl Engine {
                     if tbl.has_index(column) && all_plain_fields {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
                         for rid in rids {
+                            cancel.tick()?;
                             // Overflow safety (P0-3/P0-4): reassemble via
                             // `tbl.get` so spilled projected columns return
                             // their value, not Empty / a wrapped >= 64KB blob.
@@ -1358,32 +1580,33 @@ impl Engine {
                     } = inner.as_ref()
                     {
                         if keys.len() == 1 {
-                            let sort_field = &keys[0].field;
-                            let descending = keys[0].descending;
-                            let limit = match limit_expr {
-                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                _ => usize::MAX,
-                            };
-                            let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
-                                match sort_input.as_ref() {
-                                    PlanNode::SeqScan { table } => (Some(table.as_str()), None),
-                                    PlanNode::Filter {
-                                        input: fi,
-                                        predicate,
-                                    } => {
-                                        if let PlanNode::SeqScan { table } = fi.as_ref() {
-                                            (Some(table.as_str()), Some(predicate))
-                                        } else {
-                                            (None, None)
-                                        }
-                                    }
-                                    _ => (None, None),
+                            if let Expr::Field(sort_field) = &keys[0].expr {
+                                let descending = keys[0].descending;
+                                let limit = match limit_expr {
+                                    Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
+                                    _ => usize::MAX,
                                 };
-                            if let Some(table) = table_opt {
-                                if let Some(result) = self.project_filter_sort_limit_fast(
-                                    table, fields, sort_field, descending, limit, pred_opt,
-                                )? {
-                                    return Ok(result);
+                                let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
+                                    match sort_input.as_ref() {
+                                        PlanNode::SeqScan { table } => (Some(table.as_str()), None),
+                                        PlanNode::Filter {
+                                            input: fi,
+                                            predicate,
+                                        } => {
+                                            if let PlanNode::SeqScan { table } = fi.as_ref() {
+                                                (Some(table.as_str()), Some(predicate))
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        _ => (None, None),
+                                    };
+                                if let Some(table) = table_opt {
+                                    if let Some(result) = self.project_filter_sort_limit_fast(
+                                        table, fields, sort_field, descending, limit, pred_opt,
+                                    )? {
+                                        return Ok(result);
+                                    }
                                 }
                             }
                         }
@@ -1464,15 +1687,17 @@ impl Engine {
                                 })
                             })
                             .collect();
-                        let proj_rows: Vec<Vec<Value>> = rows
-                            .iter()
-                            .map(|row| {
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut proj_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                        for row in &rows {
+                            cancel.tick()?;
+                            proj_rows.push(
                                 fields
                                     .iter()
                                     .map(|f| eval_expr(&f.expr, row, &columns))
-                                    .collect()
-                            })
-                            .collect();
+                                    .collect(),
+                            );
+                        }
                         Ok(QueryResult::Rows {
                             columns: proj_columns,
                             rows: proj_rows,
@@ -1491,29 +1716,51 @@ impl Engine {
                         }
                         // WS2: byte-budget guard on the sort buffer.
                         self.charge_rows(&rows)?;
-                        let key_indices: Vec<(usize, bool)> = keys
+                        let key_specs: Vec<(Option<usize>, &Expr, bool)> = keys
                             .iter()
                             .map(|k| {
-                                columns
-                                    .iter()
-                                    .position(|c| c == &k.field)
-                                    .map(|idx| (idx, k.descending))
-                                    .ok_or_else(|| QueryError::ColumnNotFound {
-                                        table: String::new(),
-                                        column: k.field.clone(),
-                                    })
+                                let stored_name = match &k.expr {
+                                    Expr::Field(name) => Some(name.clone()),
+                                    Expr::QualifiedField { qualifier, field } => {
+                                        Some(format!("{qualifier}.{field}"))
+                                    }
+                                    _ => None,
+                                };
+                                let index = stored_name
+                                    .as_ref()
+                                    .and_then(|name| columns.iter().position(|c| c == name));
+                                if let Some(name) = stored_name {
+                                    if index.is_none() {
+                                        return Err(QueryError::ColumnNotFound {
+                                            table: String::new(),
+                                            column: name,
+                                        });
+                                    }
+                                }
+                                Ok((index, &k.expr, k.descending))
                             })
                             .collect::<Result<_, QueryError>>()?;
-                        rows.sort_by(|a, b| {
-                            for &(col_idx, descending) in &key_indices {
-                                let cmp = a[col_idx].cmp(&b[col_idx]);
-                                let cmp = if descending { cmp.reverse() } else { cmp };
+                        cooperative_stable_sort_by(&mut rows, self.query_memory_limit, |a, b| {
+                            for &(col_idx, expr, descending) in &key_specs {
+                                let (left_value, right_value) = match col_idx {
+                                    Some(index) => (&a[index], &b[index]),
+                                    None => {
+                                        let left = eval_expr(expr, a, &columns);
+                                        let right = eval_expr(expr, b, &columns);
+                                        let cmp = compare_order_values(&left, &right, descending);
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let cmp = compare_order_values(left_value, right_value, descending);
                                 if cmp != std::cmp::Ordering::Equal {
                                     return cmp;
                                 }
                             }
                             std::cmp::Ordering::Equal
-                        });
+                        })?;
                         Ok(QueryResult::Rows { columns, rows })
                     }
                     _ => Err("sort requires row input".into()),
@@ -1527,10 +1774,18 @@ impl Engine {
                     _ => return Err("limit must be integer literal".into()),
                 };
                 match result {
-                    QueryResult::Rows { columns, rows } => Ok(QueryResult::Rows {
-                        columns,
-                        rows: rows.into_iter().take(n).collect(),
-                    }),
+                    QueryResult::Rows { columns, rows } => {
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut limited = Vec::with_capacity(n.min(rows.len()));
+                        for row in rows.into_iter().take(n) {
+                            cancel.tick()?;
+                            limited.push(row);
+                        }
+                        Ok(QueryResult::Rows {
+                            columns,
+                            rows: limited,
+                        })
+                    }
                     _ => Err("limit requires row input".into()),
                 }
             }
@@ -1542,10 +1797,20 @@ impl Engine {
                     _ => return Err("offset must be integer literal".into()),
                 };
                 match result {
-                    QueryResult::Rows { columns, rows } => Ok(QueryResult::Rows {
-                        columns,
-                        rows: rows.into_iter().skip(n).collect(),
-                    }),
+                    QueryResult::Rows { columns, rows } => {
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        let mut offset = Vec::with_capacity(rows.len().saturating_sub(n));
+                        for (index, row) in rows.into_iter().enumerate() {
+                            cancel.tick()?;
+                            if index >= n {
+                                offset.push(row);
+                            }
+                        }
+                        Ok(QueryResult::Rows {
+                            columns,
+                            rows: offset,
+                        })
+                    }
                     _ => Err("offset requires row input".into()),
                 }
             }
@@ -1553,8 +1818,21 @@ impl Engine {
             PlanNode::Aggregate {
                 input,
                 function,
-                field,
+                argument,
+                mode: _,
+                provenance_alias,
             } => {
+                if let Some(provenance_alias) = provenance_alias {
+                    let input = self.materialize_rows_with_provenance(input)?;
+                    self.charge_rows(&input.rows)?;
+                    return aggregate_rows_with_provenance(
+                        *function,
+                        argument.as_ref(),
+                        &input,
+                        provenance_alias,
+                        self.query_memory_limit,
+                    );
+                }
                 // Fast path: count() over SeqScan.
                 // Overflow safety (P0-4): v2-capable tables use the decoded
                 // generic path (raw count drops >= 64KB rows).
@@ -1568,11 +1846,9 @@ impl Engine {
                                 return Err(QueryError::ReadonlyNeedsWrite);
                             }
                             let mut count: i64 = 0;
-                            self.catalog
-                                .for_each_row_raw(table, |_rid, _data| {
-                                    count += 1;
-                                })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            for_each_row_raw_cancellable(&self.catalog, table, |_rid, _data| {
+                                count += 1;
+                            })?;
                             return Ok(QueryResult::Scalar(Value::Int(count)));
                         }
                     }
@@ -1612,20 +1888,24 @@ impl Engine {
                                     compile_predicate(predicate, &columns, &fast, &schema)
                                 {
                                     let mut count: i64 = 0;
-                                    self.catalog
-                                        .for_each_row_raw(table, |_rid, data| {
+                                    for_each_row_raw_cancellable(
+                                        &self.catalog,
+                                        table,
+                                        |_rid, data| {
                                             if compiled(data) {
                                                 count += 1;
                                             }
-                                        })
-                                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                        },
+                                    )?;
                                     return Ok(QueryResult::Scalar(Value::Int(count)));
                                 }
 
                                 let pred_cols = predicate_column_indices_json(predicate, &columns);
                                 let mut count: i64 = 0;
-                                self.catalog
-                                    .for_each_row_raw(table, |_rid, data| {
+                                for_each_row_raw_cancellable(
+                                    &self.catalog,
+                                    table,
+                                    |_rid, data| {
                                         let pred_row = decode_selective(
                                             &schema,
                                             &row_layout,
@@ -1635,8 +1915,8 @@ impl Engine {
                                         if eval_predicate(predicate, &pred_row, &columns) {
                                             count += 1;
                                         }
-                                    })
-                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                    },
+                                )?;
                                 return Ok(QueryResult::Scalar(Value::Int(count)));
                             }
                         }
@@ -1652,7 +1932,7 @@ impl Engine {
                         | AggFunc::Max
                         | AggFunc::CountDistinct
                 ) {
-                    if let Some(col) = field.as_ref() {
+                    if let Some(Expr::Field(col)) = argument.as_ref() {
                         let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
                             match input.as_ref() {
                                 PlanNode::SeqScan { table } => (Some(table.as_str()), None),
@@ -1681,86 +1961,9 @@ impl Engine {
                 // Generic path.
                 let result = self.execute_plan_readonly(input)?;
                 match result {
-                    QueryResult::Rows { columns, rows } => match function {
-                        AggFunc::Count => Ok(QueryResult::Scalar(Value::Int(rows.len() as i64))),
-                        AggFunc::CountDistinct => {
-                            let col = field.as_ref().ok_or("count distinct requires field")?;
-                            let idx = columns
-                                .iter()
-                                .position(|c| c == col)
-                                .ok_or("col not found")?;
-                            let mut seen = std::collections::HashSet::new();
-                            for row in &rows {
-                                let v = &row[idx];
-                                if !v.is_empty() {
-                                    seen.insert(v.clone());
-                                }
-                            }
-                            Ok(QueryResult::Scalar(Value::Int(seen.len() as i64)))
-                        }
-                        AggFunc::Avg => {
-                            let col = field.as_ref().ok_or("avg requires field")?;
-                            let idx = columns
-                                .iter()
-                                .position(|c| c == col)
-                                .ok_or("col not found")?;
-                            let mut count: u64 = 0;
-                            let sum: f64 = rows
-                                .iter()
-                                .filter_map(|r| match &r[idx] {
-                                    Value::Int(v) => Some(*v as f64),
-                                    Value::Float(v) => Some(*v),
-                                    _ => None,
-                                })
-                                .inspect(|_| count += 1)
-                                .sum();
-                            if count == 0 {
-                                Ok(QueryResult::Scalar(Value::Empty))
-                            } else {
-                                Ok(QueryResult::Scalar(Value::Float(sum / count as f64)))
-                            }
-                        }
-                        AggFunc::Sum => {
-                            let col = field.as_ref().ok_or("sum requires field")?;
-                            let idx = columns
-                                .iter()
-                                .position(|c| c == col)
-                                .ok_or("col not found")?;
-                            let mut int_sum: i64 = 0;
-                            let mut float_sum: f64 = 0.0;
-                            let mut saw_float = false;
-                            for r in &rows {
-                                match &r[idx] {
-                                    Value::Int(v) => int_sum += *v,
-                                    Value::Float(v) => {
-                                        float_sum += *v;
-                                        saw_float = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            let result = if saw_float {
-                                Value::Float(float_sum + int_sum as f64)
-                            } else {
-                                Value::Int(int_sum)
-                            };
-                            Ok(QueryResult::Scalar(result))
-                        }
-                        AggFunc::Min | AggFunc::Max => {
-                            let col = field.as_ref().ok_or("min/max requires field")?;
-                            let idx = columns
-                                .iter()
-                                .position(|c| c == col)
-                                .ok_or("col not found")?;
-                            let vals: Vec<&Value> = rows.iter().map(|r| &r[idx]).collect();
-                            let result = if *function == AggFunc::Min {
-                                vals.into_iter().min().cloned()
-                            } else {
-                                vals.into_iter().max().cloned()
-                            };
-                            Ok(QueryResult::Scalar(result.unwrap_or(Value::Empty)))
-                        }
-                    },
+                    QueryResult::Rows { columns, rows } => {
+                        aggregate_rows(*function, argument.as_ref(), &columns, &rows)
+                    }
                     _ => Err("aggregate requires row input".into()),
                 }
             }
@@ -1771,7 +1974,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
                         let mut unique_rows = Vec::new();
+                        let mut cancel = crate::cancel::CancelCheck::new();
                         for row in rows {
+                            cancel.tick()?;
                             if seen.insert(row.clone()) {
                                 unique_rows.push(row);
                             }
@@ -1791,6 +1996,20 @@ impl Engine {
                 aggregates,
                 having,
             } => {
+                if aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.provenance_alias.is_some())
+                {
+                    let input = self.materialize_rows_with_provenance(input)?;
+                    self.charge_rows(&input.rows)?;
+                    return exec_group_by_with_provenance(
+                        input,
+                        keys,
+                        aggregates,
+                        having,
+                        self.query_memory_limit,
+                    );
+                }
                 let result = self.execute_plan_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
@@ -1824,74 +2043,20 @@ impl Engine {
                 self.charge_rows(&left_rows)?;
                 self.charge_rows(&right_rows)?;
 
-                if !matches!(kind, JoinKind::Cross) {
-                    if let Some(pred) = on {
-                        if let Some((l_idx, r_idx)) =
-                            try_extract_equi_join_keys(pred, &left_columns, &right_columns)
-                        {
-                            let result = hash_join(
-                                left_columns,
-                                left_rows,
-                                right_columns,
-                                right_rows,
-                                l_idx,
-                                r_idx,
-                                *kind,
-                            );
-                            if let QueryResult::Rows { ref rows, .. } = result {
-                                check_join_limit(rows.len())?;
-                            }
-                            return Ok(result);
-                        }
-                    }
-                }
-
-                let n_left = left_columns.len();
-                let n_right = right_columns.len();
-                let mut columns = Vec::with_capacity(n_left + n_right);
-                columns.extend(left_columns);
-                columns.extend(right_columns);
-
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(left_rows.len());
-                let mut combined: Vec<Value> = Vec::with_capacity(n_left + n_right);
-
-                for left_row in &left_rows {
-                    let mut matched = false;
-                    for right_row in &right_rows {
-                        combined.clear();
-                        combined.extend_from_slice(left_row);
-                        combined.extend_from_slice(right_row);
-                        let keep = match kind {
-                            JoinKind::Cross => true,
-                            JoinKind::Inner | JoinKind::LeftOuter => match on {
-                                Some(pred) => eval_predicate(pred, &combined, &columns),
-                                None => true,
-                            },
-                            JoinKind::RightOuter => {
-                                unreachable!("planner rewrites RightOuter to LeftOuter")
-                            }
-                        };
-                        if keep {
-                            rows.push(combined.clone());
-                            check_join_limit(rows.len())?;
-                            matched = true;
-                        }
-                    }
-                    if !matched && matches!(kind, JoinKind::LeftOuter) {
-                        let mut row = Vec::with_capacity(n_left + n_right);
-                        row.extend_from_slice(left_row);
-                        row.resize(n_left + n_right, Value::Empty);
-                        rows.push(row);
-                        check_join_limit(rows.len())?;
-                    }
-                }
-
-                Ok(QueryResult::Rows { columns, rows })
+                execute_materialized_join(
+                    left_columns,
+                    left_rows,
+                    right_columns,
+                    right_rows,
+                    on.as_ref(),
+                    *kind,
+                    self.nested_loop_pair_limit,
+                )
             }
 
             PlanNode::Window { input, windows } => {
                 let result = self.execute_plan_readonly(input)?;
-                execute_window(result, windows)
+                execute_window(result, windows, self.query_memory_limit)
             }
 
             PlanNode::Union { left, right, all } => {
@@ -1906,14 +2071,20 @@ impl Engine {
                     _ => return Err("UNION requires query results on right side".into()),
                 };
                 let mut combined = left_rows;
+                let mut cancel = crate::cancel::CancelCheck::new();
                 if *all {
-                    combined.extend(right_rows);
+                    for row in right_rows {
+                        cancel.tick()?;
+                        combined.push(row);
+                    }
                 } else {
                     let mut seen = std::collections::HashSet::new();
                     for row in &combined {
+                        cancel.tick()?;
                         seen.insert(row.clone());
                     }
                     for row in right_rows {
+                        cancel.tick()?;
                         if seen.insert(row.clone()) {
                             combined.push(row);
                         }
@@ -1926,7 +2097,7 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                let text = format_plan_tree(input, 0);
+                let text = format_plan_tree(&self.catalog, input, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text
@@ -1985,16 +2156,17 @@ impl Engine {
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
-                    QueryResult::Rows { rows, .. } => rows
-                        .into_iter()
-                        .filter_map(|mut row| {
-                            if row.is_empty() {
-                                None
-                            } else {
-                                Some(value_to_expr(row.swap_remove(0)))
+                    QueryResult::Rows { rows, .. } => {
+                        let mut values = Vec::with_capacity(rows.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        for mut row in rows {
+                            cancel.tick()?;
+                            if !row.is_empty() {
+                                values.push(value_to_expr(row.swap_remove(0)));
                             }
-                        })
-                        .collect(),
+                        }
+                        values
+                    }
                     _ => Vec::new(),
                 };
                 // WS2: byte-budget guard on the materialized IN-list.
@@ -2079,16 +2251,17 @@ impl Engine {
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
-                    QueryResult::Rows { rows, .. } => rows
-                        .into_iter()
-                        .filter_map(|mut row| {
-                            if row.is_empty() {
-                                None
-                            } else {
-                                Some(value_to_expr(row.swap_remove(0)))
+                    QueryResult::Rows { rows, .. } => {
+                        let mut values = Vec::with_capacity(rows.len());
+                        let mut cancel = crate::cancel::CancelCheck::new();
+                        for mut row in rows {
+                            cancel.tick()?;
+                            if !row.is_empty() {
+                                values.push(value_to_expr(row.swap_remove(0)));
                             }
-                        })
-                        .collect(),
+                        }
+                        values
+                    }
                     _ => Vec::new(),
                 };
                 // WS2: byte-budget guard on the per-row materialized IN-list.

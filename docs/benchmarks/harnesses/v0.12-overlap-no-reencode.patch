@@ -1,0 +1,285 @@
+diff --git a/crates/bench/Cargo.toml b/crates/bench/Cargo.toml
+index 6563c98..fa59723 100644
+--- a/crates/bench/Cargo.toml
++++ b/crates/bench/Cargo.toml
+@@ -8,7 +8,11 @@ publish = false
+ [dependencies]
+ powdb-storage = { path = "../storage" }
+ powdb-query = { path = "../query" }
++powdb-server = { path = "../server" }
++powdb-auth = { path = "../auth" }
+ serde_json = "1"
++tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
++libc = "0.2"
+ 
+ [dev-dependencies]
+ criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+@@ -24,6 +28,10 @@ path = "src/smoke.rs"
+ name = "compare"
+ path = "src/bin/compare.rs"
+ 
++[[bin]]
++name = "phase0-overlap-baseline"
++path = "src/bin/phase0_overlap_baseline.rs"
++
+ # Standalone JSON-path-filter workload (design 4.4, B2). NOT part of the
+ # criterion regression gate or baseline/main.json (Depot-only policy): it just
+ # prints measured latency/throughput for the compiled inline leaf vs the decode
+diff --git a/crates/bench/src/bin/phase0_overlap_baseline.rs b/crates/bench/src/bin/phase0_overlap_baseline.rs
+new file mode 100644
+index 0000000..56c0fd6
+--- /dev/null
++++ b/crates/bench/src/bin/phase0_overlap_baseline.rs
+@@ -0,0 +1,251 @@
++use powdb_auth::UserStore;
++use powdb_query::executor::Engine;
++use powdb_server::handler::{handle_connection, new_tx_gate, ConnOpts};
++use powdb_server::metrics::Metrics;
++use powdb_server::protocol::Message;
++use powdb_storage::types::Value;
++use powdb_storage::wal::WalSyncMode;
++use std::hint::black_box;
++use std::path::PathBuf;
++use std::sync::{Arc, RwLock};
++use std::time::{Duration, Instant};
++use tokio::net::{TcpListener, TcpStream};
++use tokio::sync::{mpsc, watch};
++
++const ROWS: usize = 10_000;
++const PAYLOAD_BYTES: usize = 256;
++const QUERY: &str = "ScanRow filter .bucket >= 0 { .id, .payload }";
++const CLIENTS: [usize; 4] = [1, 2, 5, 10];
++
++struct TempDir(PathBuf);
++
++impl TempDir {
++    fn new() -> Self {
++        let path = std::env::temp_dir().join(format!(
++            "powdb_v012_overlap_{}_{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .expect("system clock")
++                .as_nanos()
++        ));
++        std::fs::create_dir_all(&path).expect("create temp database");
++        Self(path)
++    }
++}
++
++impl Drop for TempDir {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
++struct Server {
++    addr: std::net::SocketAddr,
++    shutdown: watch::Sender<bool>,
++    task: tokio::task::JoinHandle<()>,
++}
++
++impl Server {
++    fn stop(self) {
++        let _ = self.shutdown.send(true);
++        self.task.abort();
++    }
++}
++
++struct Client {
++    stream: TcpStream,
++}
++
++impl Client {
++    async fn connect(addr: std::net::SocketAddr) -> Self {
++        let mut stream = TcpStream::connect(addr).await.expect("connect client");
++        Message::Connect {
++            db_name: "default".into(),
++            password: None,
++            username: None,
++        }
++        .write_to(&mut stream)
++        .await
++        .expect("write connect");
++        assert!(matches!(
++            Message::read_from(&mut stream).await.expect("read connect"),
++            Some(Message::ConnectOk { .. })
++        ));
++        Self { stream }
++    }
++
++    async fn query(&mut self) -> usize {
++        Message::Query {
++            query: QUERY.into(),
++        }
++        .write_to(&mut self.stream)
++        .await
++        .expect("write query");
++        match Message::read_from(&mut self.stream)
++            .await
++            .expect("read response")
++            .expect("server response")
++        {
++            Message::ResultRows { columns, rows } => {
++                assert_eq!(columns, ["id", "payload"]);
++                assert_eq!(rows.len(), ROWS);
++                rows.len()
++            }
++            other => panic!("unexpected response: {other:?}"),
++        }
++    }
++}
++
++fn seed_engine(path: &std::path::Path) -> Engine {
++    let mut engine = Engine::new(path).expect("create engine");
++    engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
++    engine
++        .execute_powql(
++            "type ScanRow { required unique id: int, required bucket: int, payload: str }",
++        )
++        .expect("create table");
++    let payload = "s".repeat(PAYLOAD_BYTES);
++    let table = engine
++        .catalog_mut()
++        .get_table_mut("ScanRow")
++        .expect("scan table");
++    for id in 0..ROWS {
++        table
++            .insert(&vec![
++                Value::Int(id as i64),
++                Value::Int((id % 10) as i64),
++                Value::Str(payload.clone()),
++            ])
++            .expect("insert row");
++    }
++    engine.execute_powql(QUERY).expect("validate query");
++    engine
++}
++
++async fn start_server(engine: Engine) -> Server {
++    let listener = TcpListener::bind("127.0.0.1:0")
++        .await
++        .expect("bind listener");
++    let addr = listener.local_addr().expect("listener address");
++    let engine = Arc::new(RwLock::new(engine));
++    let gate = new_tx_gate();
++    let metrics = Arc::new(Metrics::new());
++    let users = Arc::new(UserStore::new());
++    let (shutdown, mut shutdown_rx) = watch::channel(false);
++    let task = tokio::spawn(async move {
++        loop {
++            tokio::select! {
++                accepted = listener.accept() => {
++                    let (stream, peer) = accepted.expect("accept client");
++                    let engine = Arc::clone(&engine);
++                    let gate = Arc::clone(&gate);
++                    let metrics = Arc::clone(&metrics);
++                    let users = Arc::clone(&users);
++                    let mut connection_shutdown = shutdown_rx.clone();
++                    tokio::spawn(async move {
++                        handle_connection(
++                            stream,
++                            ConnOpts {
++                                engine,
++                                tx_gate: gate,
++                                expected_password: None,
++                                users,
++                                shutdown_rx: &mut connection_shutdown,
++                                idle_timeout: Duration::from_secs(60),
++                                query_timeout: Duration::from_secs(30),
++                                rate_limiter: None,
++                                peer_addr: Some(peer),
++                                metrics,
++                                tx_wait_timeout: Duration::from_secs(30),
++                                db_name: None,
++                            },
++                        ).await;
++                    });
++                }
++                changed = shutdown_rx.changed() => {
++                    if changed.is_err() || *shutdown_rx.borrow() {
++                        break;
++                    }
++                }
++            }
++        }
++    });
++    Server {
++        addr,
++        shutdown,
++        task,
++    }
++}
++
++async fn measure(addr: std::net::SocketAddr, clients: usize, window: Duration) -> serde_json::Value {
++    let (ready_tx, mut ready_rx) = mpsc::channel(clients);
++    let (start_tx, start_rx) = watch::channel(None::<Instant>);
++    let mut tasks = Vec::with_capacity(clients);
++    for _ in 0..clients {
++        let ready_tx = ready_tx.clone();
++        let mut start_rx = start_rx.clone();
++        tasks.push(tokio::spawn(async move {
++            let mut client = Client::connect(addr).await;
++            black_box(client.query().await);
++            ready_tx.send(()).await.expect("ready signal");
++            while start_rx.borrow().is_none() {
++                start_rx.changed().await.expect("start signal");
++            }
++            let deadline = start_rx.borrow().expect("deadline");
++            let mut latencies = Vec::new();
++            while Instant::now() < deadline {
++                let started = Instant::now();
++                black_box(client.query().await);
++                let completed = Instant::now();
++                if completed <= deadline {
++                    latencies.push(completed.duration_since(started));
++                }
++            }
++            latencies
++        }));
++    }
++    drop(ready_tx);
++    for _ in 0..clients {
++        ready_rx.recv().await.expect("client ready");
++    }
++    let deadline = Instant::now() + window;
++    start_tx.send(Some(deadline)).expect("start clients");
++    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
++    let mut latencies = Vec::new();
++    for task in tasks {
++        latencies.extend(task.await.expect("join client"));
++    }
++    latencies.sort_unstable();
++    let p50 = latencies[(latencies.len() - 1) / 2].as_secs_f64() * 1_000_000.0;
++    serde_json::json!({
++        "clients": clients,
++        "completed_inside_window": latencies.len(),
++        "throughput_ops_s": latencies.len() as f64 / window.as_secs_f64(),
++        "latency_p50_us": p50,
++    })
++}
++
++#[tokio::main(flavor = "multi_thread")]
++async fn main() {
++    let temp = TempDir::new();
++    let server = start_server(seed_engine(&temp.0)).await;
++    let window = Duration::from_secs(2);
++    let mut results = Vec::new();
++    for clients in CLIENTS {
++        results.push(measure(server.addr, clients, window).await);
++    }
++    println!(
++        "{}",
++        serde_json::to_string_pretty(&serde_json::json!({
++            "git_commit": "712545435c36accc8e62ba01b0219ec161e6373c",
++            "methodology": "full TCP read and protocol decode; no decoded-response re-encode inside timed samples",
++            "query": QUERY,
++            "rows": ROWS,
++            "payload_bytes": PAYLOAD_BYTES,
++            "results": results,
++        }))
++        .expect("serialize result")
++    );
++    server.stop();
++}
+

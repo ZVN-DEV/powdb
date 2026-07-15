@@ -66,6 +66,7 @@ fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
         Token::DateAdd => ScalarFn::DateAdd,
         Token::DateDiff => ScalarFn::DateDiff,
         Token::JsonType => ScalarFn::JsonType,
+        Token::JsonText => ScalarFn::JsonText,
         _ => unreachable!(),
     }
 }
@@ -787,6 +788,28 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut assignments = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            // A JSON path target (`.data->x := ...` or `data->x := ...`) is a
+            // field/dot-field immediately followed by `->`. Detect it before
+            // the generic ident/`:=` parse so the error names the unsupported
+            // position and the whole-column alternative, instead of a bare
+            // "expected field name" (the `.data` DotIdent case) or "expected
+            // ':='" (the `data` Ident case).
+            if matches!(self.peek(), Token::DotIdent(_) | Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Arrow))
+            {
+                let field = match self.peek() {
+                    Token::DotIdent(n) | Token::Ident(n) => n.clone(),
+                    _ => unreachable!("guarded by the matches! above"),
+                };
+                return Err(ParseError::Unsupported {
+                    feature: format!(
+                        "cannot assign to a JSON path target `.{field}->...` (at token {pos}): \
+                         JSON path assignment targets are not supported; write the whole JSON \
+                         column instead (path mutation such as json_set is not yet available)",
+                        pos = self.pos
+                    ),
+                });
+            }
             let field = self.expect_named_ident("field name")?;
             self.expect(&Token::Assign)?;
             let value = self.parse_expr()?;
@@ -837,22 +860,20 @@ impl Parser {
 
     /// Parse the OVER clause for a window function:
     /// `over (partition .col1, .col2 order .col3 asc, .col4 desc)`
-    fn parse_over_clause(&mut self) -> Result<(Vec<String>, Vec<OrderKey>), ParseError> {
+    fn parse_over_clause(&mut self) -> Result<(Vec<Expr>, Vec<OrderKey>), ParseError> {
         self.expect(&Token::Over)?;
         self.expect(&Token::LParen)?;
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
         if *self.peek() == Token::Partition {
             self.advance();
-            while let Token::DotIdent(name) = self.peek() {
-                let name = name.clone();
-                self.advance();
-                partition_by.push(name);
+            loop {
+                partition_by.push(self.parse_expr()?);
                 if *self.peek() == Token::Comma {
-                    // Only consume comma if the next token is another DotIdent
-                    // (i.e. still in the partition list). If the next meaningful
-                    // token is `order`, `RParen`, etc., stop.
-                    if matches!(self.tokens.get(self.pos + 1), Some(Token::DotIdent(_))) {
+                    if !matches!(
+                        self.tokens.get(self.pos + 1),
+                        Some(Token::Order | Token::RParen)
+                    ) {
                         self.advance();
                     } else {
                         break;
@@ -864,9 +885,8 @@ impl Parser {
         }
         if *self.peek() == Token::Order {
             self.advance();
-            while let Token::DotIdent(name) = self.peek() {
-                let field = name.clone();
-                self.advance();
+            loop {
+                let expr = self.parse_expr()?;
                 let descending = match self.peek() {
                     Token::Desc => {
                         self.advance();
@@ -878,7 +898,7 @@ impl Parser {
                     }
                     _ => false,
                 };
-                order_by.push(OrderKey { field, descending });
+                order_by.push(OrderKey { expr, descending });
                 if *self.peek() == Token::Comma {
                     self.advance();
                 } else {
@@ -915,15 +935,7 @@ impl Parser {
     fn parse_order(&mut self) -> Result<OrderClause, ParseError> {
         let mut keys = Vec::new();
         loop {
-            let field = match self.advance() {
-                Token::DotIdent(name) => name,
-                t => {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: ".field after order".into(),
-                        got: t.display_name(),
-                    })
-                }
-            };
+            let expr = self.parse_expr()?;
             let descending = match self.peek() {
                 Token::Desc => {
                     self.advance();
@@ -935,7 +947,7 @@ impl Parser {
                 }
                 _ => false,
             };
-            keys.push(OrderKey { field, descending });
+            keys.push(OrderKey { expr, descending });
             if *self.peek() == Token::Comma {
                 self.advance();
             } else {
@@ -960,6 +972,12 @@ impl Parser {
             }
         };
         self.expect(&Token::LParen)?;
+        let mode = if *self.peek() == Token::Raw {
+            self.advance();
+            AggregateMode::Raw
+        } else {
+            AggregateMode::Symmetric
+        };
         // count(distinct User ...) → CountDistinct
         if func == AggFunc::Count && *self.peek() == Token::Distinct {
             self.advance();
@@ -986,22 +1004,21 @@ impl Parser {
         //     count(distinct User { .name })
         // We lift that single unaliased `.field` into AggregateExpr.field so
         // the executor's aggregate fast paths can see it.
-        let mut agg_field: Option<String> = None;
+        let mut argument: Option<Expr> = None;
         if func != AggFunc::Count {
             if let Some(proj) = &query.projection {
                 if proj.len() == 1 && proj[0].alias.is_none() {
-                    if let Expr::Field(name) = &proj[0].expr {
-                        agg_field = Some(name.clone());
-                    }
+                    argument = Some(proj[0].expr.clone());
                 }
             }
-            if agg_field.is_some() {
+            if argument.is_some() {
                 query.projection = None;
             }
         }
         query.aggregation = Some(AggregateExpr {
             function: func,
-            field: agg_field,
+            argument,
+            mode,
         });
         Ok(Statement::Query(query))
     }
@@ -1235,36 +1252,18 @@ impl Parser {
         }
     }
 
-    /// Parse `group .field1, alias.field2 [having <expr>]`.
-    ///
-    /// Two key forms are accepted:
-    ///   - `.field` is a bare `DotIdent`, an `Unqualified` key.
-    ///   - `alias.field` is an `Ident` followed by a `DotIdent`, a `Qualified`
-    ///     key (the lexer splits `u.status` into `Ident("u")` + `DotIdent("status")`).
+    /// Parse expression-valued group keys.
     fn parse_group_by(&mut self) -> Result<GroupByClause, ParseError> {
         let mut keys = Vec::new();
         loop {
-            match self.peek().clone() {
-                Token::DotIdent(field) => {
-                    self.advance();
-                    keys.push(GroupKey::Unqualified(field));
+            let expr = self.parse_expr()?;
+            let output_name = match &expr {
+                Expr::Field(_) | Expr::QualifiedField { .. } | Expr::JsonPath { .. } => {
+                    expression_output_name(&expr)
                 }
-                Token::Ident(alias) => {
-                    self.advance();
-                    match self.peek().clone() {
-                        Token::DotIdent(field) => {
-                            self.advance();
-                            keys.push(GroupKey::Qualified { alias, field });
-                        }
-                        _ => {
-                            return Err(ParseError::Syntax {
-                                message: "expected .field after qualifier in group key".into(),
-                            });
-                        }
-                    }
-                }
-                _ => break,
-            }
+                _ => format!("__group_{}", keys.len()),
+            };
+            keys.push(GroupKey { expr, output_name });
             if *self.peek() == Token::Comma {
                 self.advance();
             } else {
@@ -1534,6 +1533,7 @@ impl Parser {
                 Ok(Expr::Window {
                     function: wfunc,
                     args: vec![],
+                    mode: AggregateMode::Symmetric,
                     partition_by,
                     order_by,
                 })
@@ -1555,6 +1555,12 @@ impl Parser {
                     }
                 };
                 self.expect(&Token::LParen)?;
+                let mode = if *self.peek() == Token::Raw {
+                    self.advance();
+                    AggregateMode::Raw
+                } else {
+                    AggregateMode::Symmetric
+                };
                 // count(*) — count all rows including nulls
                 if func == AggFunc::Count && *self.peek() == Token::Star {
                     self.advance();
@@ -1565,6 +1571,7 @@ impl Parser {
                         return Ok(Expr::Window {
                             function: WindowFunc::Count,
                             args: vec![Expr::Field("*".into())],
+                            mode,
                             partition_by,
                             order_by,
                         });
@@ -1572,6 +1579,7 @@ impl Parser {
                     return Ok(Expr::FunctionCall(
                         AggFunc::Count,
                         Box::new(Expr::Field("*".into())),
+                        mode,
                     ));
                 }
                 // count(distinct .field) → CountDistinct
@@ -1599,11 +1607,12 @@ impl Parser {
                     return Ok(Expr::Window {
                         function: wfunc,
                         args: vec![inner],
+                        mode,
                         partition_by,
                         order_by,
                     });
                 }
-                Ok(Expr::FunctionCall(func, Box::new(inner)))
+                Ok(Expr::FunctionCall(func, Box::new(inner), mode))
             }
             Token::Upper
             | Token::Lower
@@ -1621,7 +1630,8 @@ impl Parser {
             | Token::Extract
             | Token::DateAdd
             | Token::DateDiff
-            | Token::JsonType => {
+            | Token::JsonType
+            | Token::JsonText => {
                 let tok = self.advance();
                 let func = token_to_scalar_fn(&tok);
                 self.expect(&Token::LParen)?;
@@ -1685,44 +1695,28 @@ impl Parser {
         match self.peek() {
             Token::Add => {
                 self.advance();
-                // `alter <Table> add index [if not exists] .<column>`
+                // `alter <Table> add index [if not exists] <target>`
                 if *self.peek() == Token::Index {
                     self.advance();
                     let if_not_exists = self.parse_optional_if_not_exists();
-                    let column = match self.advance() {
-                        Token::DotIdent(n) => n,
-                        t => {
-                            return Err(ParseError::UnexpectedToken {
-                                expected: ".<column> after add index".into(),
-                                got: t.display_name(),
-                            })
-                        }
-                    };
+                    let target = self.parse_index_target("add index")?;
                     return Ok(Statement::AlterTable(AlterTableExpr {
                         table,
                         action: AlterAction::AddIndex {
-                            column,
+                            target,
                             if_not_exists,
                         },
                     }));
                 }
-                // `alter <Table> add unique [if not exists] .<column>`
+                // `alter <Table> add unique [if not exists] <target>`
                 if *self.peek() == Token::Unique {
                     self.advance();
                     let if_not_exists = self.parse_optional_if_not_exists();
-                    let column = match self.advance() {
-                        Token::DotIdent(n) => n,
-                        t => {
-                            return Err(ParseError::UnexpectedToken {
-                                expected: ".<column> after add unique".into(),
-                                got: t.display_name(),
-                            })
-                        }
-                    };
+                    let target = self.parse_index_target("add unique")?;
                     return Ok(Statement::AlterTable(AlterTableExpr {
                         table,
                         action: AlterAction::AddUnique {
-                            column,
+                            target,
                             if_not_exists,
                         },
                     }));
@@ -1759,6 +1753,15 @@ impl Parser {
             }
             Token::Drop => {
                 self.advance();
+                if *self.peek() == Token::Index {
+                    self.advance();
+                    let if_exists = self.parse_optional_if_exists();
+                    let target = self.parse_index_target("drop index")?;
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::DropIndex { target, if_exists },
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -1773,6 +1776,78 @@ impl Parser {
             t => Err(ParseError::UnexpectedToken {
                 expected: "add or drop after alter <table>".into(),
                 got: t.display_name(),
+            }),
+        }
+    }
+
+    /// Parse a column target (`.slug`) or a parenthesized, unqualified JSON
+    /// path target (`(.data->slug)`) for ALTER INDEX actions. Parentheses are
+    /// deliberately the syntax boundary between stored-column and expression
+    /// indexes so future expression forms cannot silently change old DDL.
+    fn parse_index_target(&mut self, action: &str) -> Result<IndexTarget, ParseError> {
+        match self.peek() {
+            Token::DotIdent(_) => {
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::Arrow)) {
+                    return Err(ParseError::Syntax {
+                        message: format!(
+                            "JSON path index targets must be parenthesized after {action}; use `(.data->key)`"
+                        ),
+                    });
+                }
+                let Token::DotIdent(column) = self.advance() else {
+                    unreachable!("guarded by DotIdent match")
+                };
+                Ok(IndexTarget::Column(column))
+            }
+            Token::LParen => {
+                self.advance();
+                let expr = self.parse_expr().map_err(|error| match error {
+                    ParseError::NestingDepthExceeded { .. } => error,
+                    _ => ParseError::Syntax {
+                        message: format!(
+                            "invalid expression index target after {action}: expected an unqualified JSON path like `(.data->key)`"
+                        ),
+                    },
+                })?;
+                if *self.peek() != Token::RParen {
+                    return Err(ParseError::Syntax {
+                        message: format!(
+                            "invalid expression index target after {action}: only a direct JSON path is supported"
+                        ),
+                    });
+                }
+                self.advance();
+
+                match JsonPathIdentityV1::from_expr(&expr) {
+                    Some(identity) => identity.bind_table_local(None).map(IndexTarget::JsonPath).ok_or_else(|| {
+                        ParseError::Syntax {
+                            message: format!(
+                                "qualified JSON paths are not valid index targets after {action}; use an unqualified table-local path like `(.data->key)`"
+                            ),
+                        }
+                    }),
+                    None => match expr {
+                        Expr::Field(_) => Err(ParseError::Syntax {
+                            message: format!(
+                                "invalid expression index target after {action}: parentheses are reserved for a direct JSON path like `(.data->key)`; use `.column` for a stored column"
+                            ),
+                        }),
+                        Expr::QualifiedField { .. } => Err(ParseError::Syntax {
+                            message: format!(
+                                "qualified references are not valid index targets after {action}; use a table-local `.column` or `(.data->key)`"
+                            ),
+                        }),
+                        _ => Err(ParseError::Syntax {
+                            message: format!(
+                                "invalid expression index target after {action}: only a direct JSON path is supported"
+                            ),
+                        }),
+                    },
+                }
+            }
+            token => Err(ParseError::UnexpectedToken {
+                expected: format!(".<column> or parenthesized JSON path after {action}"),
+                got: token.display_name(),
             }),
         }
     }
@@ -2087,6 +2162,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Count => out.push_str("count"),
             Token::Avg => out.push_str("avg"),
             Token::Sum => out.push_str("sum"),
+            Token::Raw => out.push_str("raw"),
             Token::Min => out.push_str("min"),
             Token::Max => out.push_str("max"),
             Token::Is => out.push_str("is"),
@@ -2108,6 +2184,7 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::DateAdd => out.push_str("date_add"),
             Token::DateDiff => out.push_str("date_diff"),
             Token::JsonType => out.push_str("json_type"),
+            Token::JsonText => out.push_str("json_text"),
             Token::Cast => out.push_str("cast"),
             Token::Case => out.push_str("case"),
             Token::When => out.push_str("when"),
@@ -2201,7 +2278,7 @@ mod tests {
                 assert!(q.filter.is_some());
                 let order = q.order.unwrap();
                 assert_eq!(order.keys.len(), 1);
-                assert_eq!(order.keys[0].field, "name");
+                assert_eq!(order.keys[0].expr, Expr::Field("name".into()));
                 assert!(order.keys[0].descending);
                 assert!(q.limit.is_some());
             }
@@ -2346,14 +2423,14 @@ mod tests {
 
     #[test]
     fn test_parse_sum_with_field_projection() {
-        // `sum(... { .age })` should lift `.age` into AggregateExpr.field and
+        // `sum(... { .age })` should lift `.age` into AggregateExpr.argument and
         // clear the projection so the executor's aggregate fast path fires.
         let stmt = parse("sum(User filter .age > 30 { .age })").unwrap();
         match stmt {
             Statement::Query(q) => {
                 let agg = q.aggregation.expect("aggregate");
                 assert_eq!(agg.function, AggFunc::Sum);
-                assert_eq!(agg.field.as_deref(), Some("age"));
+                assert_eq!(agg.argument, Some(Expr::Field("age".into())));
                 assert!(
                     q.projection.is_none(),
                     "projection should be lifted into agg.field"
@@ -2361,6 +2438,23 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    #[test]
+    fn test_parse_raw_aggregate_modes() {
+        let Statement::Query(top_level) = parse("sum(raw User { .age })").unwrap() else {
+            panic!("expected query");
+        };
+        assert_eq!(top_level.aggregation.unwrap().mode, AggregateMode::Raw);
+
+        let Statement::Query(grouped) = parse("User group .dept { total: sum(raw .age) }").unwrap()
+        else {
+            panic!("expected query");
+        };
+        assert!(matches!(
+            grouped.projection.unwrap()[0].expr,
+            Expr::FunctionCall(AggFunc::Sum, _, AggregateMode::Raw)
+        ));
     }
 
     #[test]
@@ -2376,8 +2470,8 @@ mod tests {
                     let agg = q.aggregation.unwrap();
                     assert_eq!(agg.function, expected, "func mismatch for {src}");
                     assert_eq!(
-                        agg.field.as_deref(),
-                        Some("age"),
+                        agg.argument,
+                        Some(Expr::Field("age".into())),
                         "field mismatch for {src}"
                     );
                     assert!(
@@ -2399,7 +2493,7 @@ mod tests {
             Statement::Query(q) => {
                 let agg = q.aggregation.unwrap();
                 assert_eq!(agg.function, AggFunc::Count);
-                assert!(agg.field.is_none());
+                assert!(agg.argument.is_none());
                 assert!(q.projection.is_some(), "count must not eat projection");
             }
             _ => panic!("expected query"),
@@ -2695,13 +2789,19 @@ mod tests {
         match stmt {
             Statement::Query(q) => {
                 let gb = q.group_by.unwrap();
-                assert_eq!(gb.keys, vec![GroupKey::Unqualified("status".into())]);
+                assert_eq!(
+                    gb.keys,
+                    vec![GroupKey {
+                        expr: Expr::Field("status".into()),
+                        output_name: "status".into(),
+                    }]
+                );
                 assert!(gb.having.is_none());
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
                 assert!(matches!(
                     &proj[1].expr,
-                    Expr::FunctionCall(AggFunc::Count, _)
+                    Expr::FunctionCall(AggFunc::Count, _, _)
                 ));
                 assert_eq!(proj[1].alias.as_deref(), Some("n"));
             }
@@ -2718,8 +2818,14 @@ mod tests {
                 assert_eq!(
                     gb.keys,
                     vec![
-                        GroupKey::Unqualified("status".into()),
-                        GroupKey::Unqualified("age".into())
+                        GroupKey {
+                            expr: Expr::Field("status".into()),
+                            output_name: "status".into(),
+                        },
+                        GroupKey {
+                            expr: Expr::Field("age".into()),
+                            output_name: "age".into(),
+                        }
                     ]
                 );
             }
@@ -2733,12 +2839,18 @@ mod tests {
         match stmt {
             Statement::Query(q) => {
                 let gb = q.group_by.unwrap();
-                assert_eq!(gb.keys, vec![GroupKey::Unqualified("status".into())]);
+                assert_eq!(
+                    gb.keys,
+                    vec![GroupKey {
+                        expr: Expr::Field("status".into()),
+                        output_name: "status".into(),
+                    }]
+                );
                 assert!(gb.having.is_some());
                 // HAVING is `count(.name) > 1` — BinaryOp(FunctionCall, Gt, Literal)
                 match gb.having.unwrap() {
                     Expr::BinaryOp(l, BinOp::Gt, _) => {
-                        assert!(matches!(*l, Expr::FunctionCall(AggFunc::Count, _)));
+                        assert!(matches!(*l, Expr::FunctionCall(AggFunc::Count, _, _)));
                     }
                     other => panic!("expected BinaryOp, got {other:?}"),
                 }
@@ -2757,9 +2869,12 @@ mod tests {
                 assert_eq!(proj.len(), 3);
                 assert!(matches!(
                     &proj[1].expr,
-                    Expr::FunctionCall(AggFunc::Count, _)
+                    Expr::FunctionCall(AggFunc::Count, _, _)
                 ));
-                assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Sum, _)));
+                assert!(matches!(
+                    &proj[2].expr,
+                    Expr::FunctionCall(AggFunc::Sum, _, _)
+                ));
             }
             _ => panic!("expected query"),
         }
@@ -2775,10 +2890,13 @@ mod tests {
                 assert_eq!(proj[1].alias.as_deref(), Some("total"));
                 assert!(matches!(
                     &proj[1].expr,
-                    Expr::FunctionCall(AggFunc::Count, _)
+                    Expr::FunctionCall(AggFunc::Count, _, _)
                 ));
                 assert_eq!(proj[2].alias.as_deref(), Some("average"));
-                assert!(matches!(&proj[2].expr, Expr::FunctionCall(AggFunc::Avg, _)));
+                assert!(matches!(
+                    &proj[2].expr,
+                    Expr::FunctionCall(AggFunc::Avg, _, _)
+                ));
             }
             _ => panic!("expected query"),
         }
@@ -2865,7 +2983,11 @@ mod tests {
                     Expr::BinaryOp(left, BinOp::Gt, _) => {
                         assert_eq!(
                             *left,
-                            Expr::FunctionCall(AggFunc::Count, Box::new(Expr::Field("*".into())))
+                            Expr::FunctionCall(
+                                AggFunc::Count,
+                                Box::new(Expr::Field("*".into())),
+                                AggregateMode::Symmetric,
+                            )
                         );
                     }
                     _ => panic!("expected comparison"),
@@ -3052,9 +3174,9 @@ mod tests {
             Statement::Query(q) => {
                 let order = q.order.unwrap();
                 assert_eq!(order.keys.len(), 2);
-                assert_eq!(order.keys[0].field, "name");
+                assert_eq!(order.keys[0].expr, Expr::Field("name".into()));
                 assert!(!order.keys[0].descending);
-                assert_eq!(order.keys[1].field, "age");
+                assert_eq!(order.keys[1].expr, Expr::Field("age".into()));
                 assert!(order.keys[1].descending);
             }
             _ => panic!("expected query"),
@@ -3141,7 +3263,10 @@ mod tests {
         match stmt {
             Statement::AlterTable(at) => assert!(matches!(
                 at.action,
-                AlterAction::AddUnique { ref column, .. } if column == "email"
+                AlterAction::AddUnique {
+                    target: IndexTarget::Column(ref column),
+                    ..
+                } if column == "email"
             )),
             other => panic!("expected AlterTable, got {other:?}"),
         }
@@ -3400,7 +3525,7 @@ mod tests {
             Statement::Query(q) => {
                 let agg = q.aggregation.unwrap();
                 assert_eq!(agg.function, AggFunc::CountDistinct);
-                assert_eq!(agg.field.as_deref(), Some("name"));
+                assert_eq!(agg.argument, Some(Expr::Field("name".into())));
             }
             _ => panic!("expected Query"),
         }
@@ -3414,7 +3539,7 @@ mod tests {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
                 match &proj[1].expr {
-                    Expr::FunctionCall(func, _) => {
+                    Expr::FunctionCall(func, _, _) => {
                         assert_eq!(*func, AggFunc::CountDistinct);
                     }
                     _ => panic!("expected FunctionCall"),
@@ -3440,12 +3565,13 @@ mod tests {
                         args,
                         partition_by,
                         order_by,
+                        ..
                     } => {
                         assert_eq!(*function, WindowFunc::RowNumber);
                         assert!(args.is_empty());
                         assert!(partition_by.is_empty());
                         assert_eq!(order_by.len(), 1);
-                        assert_eq!(order_by[0].field, "age");
+                        assert_eq!(order_by[0].expr, Expr::Field("age".into()));
                         assert!(!order_by[0].descending);
                     }
                     other => panic!("expected Window, got {other:?}"),
@@ -3470,13 +3596,14 @@ mod tests {
                         args,
                         partition_by,
                         order_by,
+                        ..
                     } => {
                         assert_eq!(*function, WindowFunc::Sum);
                         assert_eq!(args.len(), 1);
                         assert!(matches!(&args[0], Expr::Field(f) if f == "salary"));
-                        assert_eq!(partition_by, &["dept"]);
+                        assert_eq!(partition_by, &[Expr::Field("dept".into())]);
                         assert_eq!(order_by.len(), 1);
-                        assert_eq!(order_by[0].field, "salary");
+                        assert_eq!(order_by[0].expr, Expr::Field("salary".into()));
                         assert!(!order_by[0].descending);
                     }
                     other => panic!("expected Window, got {other:?}"),
@@ -3503,7 +3630,7 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(*function, WindowFunc::Rank);
-                        assert_eq!(partition_by, &["dept"]);
+                        assert_eq!(partition_by, &[Expr::Field("dept".into())]);
                         assert_eq!(order_by.len(), 1);
                         assert!(order_by[0].descending);
                     }
@@ -3541,7 +3668,7 @@ mod tests {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
                 match &proj[1].expr {
-                    Expr::FunctionCall(AggFunc::Sum, _) => {} // correct
+                    Expr::FunctionCall(AggFunc::Sum, _, _) => {} // correct
                     other => panic!("expected FunctionCall(Sum), got {other:?}"),
                 }
             }
@@ -3801,6 +3928,77 @@ mod dogfood_dx_tests {
     }
 
     #[test]
+    fn expression_index_targets_parse_with_stable_table_local_identity() {
+        use powdb_storage::stored_json_path::{
+            StoredJsonPathSegmentV1 as Segment, StoredJsonPathV1,
+        };
+
+        let expected = StoredJsonPathV1::new(
+            "data",
+            vec![Segment::Key("author".into()), Segment::Index(0)],
+        );
+        for query in [
+            "alter Post add index (.data->author->0)",
+            "alter Post add unique if not exists (.data->\"author\"->0)",
+            "alter Post drop index if exists (.data->author->0)",
+        ] {
+            let Statement::AlterTable(alter) = parse(query).unwrap() else {
+                panic!("expected alter table for {query}");
+            };
+            let (target, flag) = match alter.action {
+                AlterAction::AddIndex {
+                    target,
+                    if_not_exists,
+                }
+                | AlterAction::AddUnique {
+                    target,
+                    if_not_exists,
+                } => (target, if_not_exists),
+                AlterAction::DropIndex { target, if_exists } => (target, if_exists),
+                other => panic!("expected index action, got {other:?}"),
+            };
+            assert_eq!(target, IndexTarget::JsonPath(expected.clone()));
+            assert_eq!(
+                flag,
+                query.contains("if not exists") || query.contains("if exists")
+            );
+        }
+    }
+
+    #[test]
+    fn expression_index_target_rejects_ambiguous_or_non_path_forms() {
+        let cases = [
+            (
+                "alter Post add index .data->author",
+                "must be parenthesized",
+            ),
+            (
+                "alter Post add index (p.data->author)",
+                "qualified JSON paths",
+            ),
+            (
+                "alter Post add index (.data)",
+                "use `.column` for a stored column",
+            ),
+            (
+                "alter Post add index (.data->age + 1)",
+                "only a direct JSON path",
+            ),
+            (
+                "alter Post drop index ({ value := 1 })",
+                "expected an unqualified JSON path",
+            ),
+        ];
+        for (query, expected) in cases {
+            let error = parse(query).expect_err(query).to_string();
+            assert!(
+                error.contains(expected),
+                "`{query}` should mention `{expected}`, got `{error}`"
+            );
+        }
+    }
+
+    #[test]
     fn alter_drop_column_if_exists_parses() {
         match parse("alter Post drop column if exists status").unwrap() {
             Statement::AlterTable(at) => {
@@ -4003,6 +4201,35 @@ mod json_path_tests {
     }
 
     #[test]
+    fn json_path_assignment_target_is_targeted_unsupported() {
+        // `Doc update { .data->x := 5 }` must not die with a generic
+        // "expected field name": it must name the unsupported position and
+        // the whole-column alternative. Both the leading-dot path-target form
+        // and the bare `data->x` form take the targeted branch.
+        for stmt in [
+            "Doc update { .data->x := 5 }",
+            "Doc update { data->x := 5 }",
+        ] {
+            let err = parse(stmt).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Unsupported { .. }),
+                "{stmt}: expected Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("JSON path assignment targets are not supported"),
+                "{stmt}: message must state the unsupported feature: {msg}"
+            );
+            assert!(
+                msg.contains("json_set"),
+                "{stmt}: message must point at the whole-column alternative: {msg}"
+            );
+        }
+        // A normal whole-column update still parses.
+        assert!(parse(r#"Doc update { data := "{}" }"#).is_ok());
+    }
+
+    #[test]
     fn json_type_scalar_parses() {
         let e = filter_of(r#"Post filter json_type(.data->x) = "string""#);
         let Expr::BinaryOp(lhs, _, _) = e else {
@@ -4017,9 +4244,8 @@ mod json_path_tests {
 
     #[test]
     fn path_in_projection() {
-        // Projecting a path to an alias is how order-by/group-by over a path
-        // are expressed (native path group/order keys are a documented
-        // non-goal). Confirm the projection carries the JsonPath expr.
+        // Projection, ordering, and grouping all retain the same structural
+        // JsonPath expression rather than lowering it to an alias string.
         let stmt = parse("Post { author: .data->author }").unwrap();
         let Statement::Query(q) = stmt else {
             panic!("expected query");
@@ -4027,5 +4253,23 @@ mod json_path_tests {
         let proj = q.projection.unwrap();
         assert_eq!(proj[0].alias.as_deref(), Some("author"));
         assert!(matches!(proj[0].expr, Expr::JsonPath { .. }));
+
+        let Statement::Query(ordered) = parse("Post order .data->author { .id }").unwrap() else {
+            panic!("expected query");
+        };
+        assert!(matches!(
+            ordered.order.unwrap().keys[0].expr,
+            Expr::JsonPath { .. }
+        ));
+
+        let Statement::Query(grouped) =
+            parse("Post group .data->author { .data->author }").unwrap()
+        else {
+            panic!("expected query");
+        };
+        assert!(matches!(
+            grouped.group_by.unwrap().keys[0].expr,
+            Expr::JsonPath { .. }
+        ));
     }
 }

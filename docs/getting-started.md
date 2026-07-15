@@ -368,6 +368,20 @@ index on 'User.email' created
 
 Indexed columns are used automatically for point lookups and range scans -- no query hints needed.
 
+JSON paths can be indexed too. Wrap the full path in parentheses so it is
+unambiguous from a stored-column index:
+
+```powql
+type Post { required id: int, data: json }
+alter Post add index (.data->author->name)
+alter Post add unique (.data->external_id)
+```
+
+A path index accelerates equality and range filters and can satisfy a bounded
+sort such as `Post order .data->score desc limit 10`. Indexed path values must
+be scalars; objects and arrays are rejected. Missing paths and JSON null are
+allowed and sort last.
+
 ---
 
 ## 10. Delete
@@ -455,6 +469,18 @@ powql>
 
 From here, the same PowQL statements work as embedded mode -- DDL statements return the same friendly status messages too (e.g. `type User created`). The server handles concurrent readers and uses a write-ahead log for durability.
 
+The TypeScript client also offers `queryNative()` and `querySqlNative()` for
+lossless typed results. Use them when JSON, exact bytes, large integers, or
+Empty-versus-string distinctions should not pass through the legacy string
+result format:
+
+```typescript
+const result = await client.queryNative(
+  "Post filter .id = $1 { .id, .data }",
+  [42],
+);
+```
+
 ### Password authentication
 
 To require a password, set the `POWDB_PASSWORD` environment variable:
@@ -528,6 +554,11 @@ After the admin exists, use `passwd` / `useradd` to manage the rest, and stop
 relying on the bootstrap env vars.
 
 ### Concurrent transactions
+
+Autocommit read-only queries share server admission and can run concurrently.
+Writers and explicit transactions take exclusive admission, so a read observes
+either the complete state before a write or the complete state after it, never
+a partial mutation.
 
 Explicit transactions (`begin` ... `commit`) are **serialized across
 connections**: one process runs one explicit transaction at a time. When a

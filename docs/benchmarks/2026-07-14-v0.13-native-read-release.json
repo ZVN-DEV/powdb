@@ -1,0 +1,1087 @@
+{
+  "schema_version": 3,
+  "artifact_kind": "native_read_release_evidence",
+  "generated_from": {
+    "date": "2026-07-14",
+    "benchmark_binary": "phase0-read-baseline",
+    "command": "POWDB_HISTORICAL_LEGACY_ARTIFACT=docs/benchmarks/2026-07-14-v0.12-read-baseline.json POWDB_HISTORICAL_BASELINE_LABEL=v0.12.0-folded-cancellation-7125454 POWDB_BASELINE_RUN_LABEL=v0.13.0-native-read-release POWDB_BASELINE_REPETITION=<1|2> cargo run --release -p powdb-bench --bin phase0-read-baseline -- --json",
+    "historical_artifact": "docs/benchmarks/2026-07-14-v0.12-read-baseline.json",
+    "historical_harness_patch": "docs/benchmarks/harnesses/v0.12-overlap-no-reencode.patch",
+    "compacting_transform": "Raw point-latency sample arrays were omitted; full distribution statistics, concurrency results, gates, provenance, and limitations are retained."
+  },
+  "release_gate_policy": {
+    "native_document_to_native_typed_p95_maximum_ratio": 1.5,
+    "native_document_p50_must_not_exceed_current_legacy": true,
+    "isolated_render_to_native_frame_minimum_reduction_pct": 90,
+    "native_server_pj1_to_text_calls_per_result_maximum": 0,
+    "overlap_ten_client_minimum_scaling": 5,
+    "overlap_one_client_p50_maximum_regression_pct": 5,
+    "release_profile_required": true,
+    "historical_legacy_to_native_p50_minimum_reduction_pct": 80,
+    "historical_80_percent_gate_release_blocking": false
+  },
+  "retained_historical_diagnostic": {
+    "passed": [
+      false,
+      false
+    ],
+    "observed_pct": [
+      25.66324959303094,
+      26.672972854063094
+    ],
+    "minimum_pct": 80,
+    "release_blocking": false,
+    "conclusion": "The historical 80 percent end-to-end target remains an explicit failed diagnostic and was not used to override the replacement release gates."
+  },
+  "summary": {
+    "cold_start_count": 2,
+    "all_release_gates_passed": true,
+    "current_legacy_p50_us": [
+      39,
+      38.5
+    ],
+    "native_document_p50_us": [
+      33.791999999999994,
+      33.333
+    ],
+    "native_to_typed_p95_ratio": [
+      0.9157360984503191,
+      0.9056517775752052
+    ],
+    "isolated_render_to_frame_p50_reduction_pct": [
+      96.10813330226054,
+      95.64309939994783
+    ],
+    "overlap_ten_client_scaling": [
+      5.367219917012448,
+      5.729787234042553
+    ],
+    "overlap_one_client_p50_us": [
+      3905.417,
+      3984.959
+    ],
+    "historical_overlap_one_client_p50_us": 4507.792,
+    "overlap_one_client_p50_regression_pct": [
+      -13.362972382044255,
+      -11.598427789037306
+    ],
+    "conclusion": "All replacement release gates passed on both fresh-server runs. The retained historical 80 percent diagnostic failed on both and remains nonblocking."
+  },
+  "cold_start_runs": [
+    {
+      "fixture": {
+        "document_json_bytes": 2560,
+        "document_query": "DocumentRow filter .id = 1 { .data }",
+        "fingerprint": "fnv1a64:35aa943504ccb6f8",
+        "logical_equivalence_asserted": true,
+        "overlap_payload_bytes": 256,
+        "overlap_query": "ScanRow filter .bucket >= 0 { .id, .payload }",
+        "overlap_rows": 10000,
+        "typed_query": "TypedRow filter .id = 1 { .id, .status, .title, .score, .active, .payload }"
+      },
+      "historical_legacy_baseline": {
+        "artifact_fingerprint": "fnv1a64:58c7a83f37dc6204",
+        "dirty_tree_fingerprint": "fnv1a64:5a75c8bdfdae8d94",
+        "document_p50_us": 45.458,
+        "document_p95_us": 93.084,
+        "encoded_response_bytes": 2584,
+        "git_commit": "712545435c36accc8e62ba01b0219ec161e6373c",
+        "isolation": "separate git worktree; current branch was not mutated",
+        "label": "v0.12.0-folded-cancellation-7125454",
+        "overlap_one_client_p50_us": 4507.792,
+        "package_version": "0.12.0"
+      },
+      "isolated_conversion_cost": {
+        "fixture_pj1_bytes": 2635,
+        "legacy_pj1_to_canonical_text": {
+          "count": 20000,
+          "max_us": 22.209,
+          "mean_us": 4.234755950000196,
+          "min_us": 3.375,
+          "p50_us": 4.042,
+          "p90_us": 4.667000000000001,
+          "p95_us": 4.9590000000000005,
+          "p99_us": 5.875,
+          "stddev_us": 0.7396327182389891
+        },
+        "legacy_render_and_frame": {
+          "count": 20000,
+          "max_us": 24.125,
+          "mean_us": 4.449944099999591,
+          "min_us": 3.5829999999999997,
+          "p50_us": 4.291,
+          "p90_us": 4.916,
+          "p95_us": 5.25,
+          "p99_us": 6.167000000000001,
+          "stddev_us": 0.7399847971919149
+        },
+        "legacy_render_to_native_frame_p50_reduction_pct": 96.10813330226054,
+        "legacy_text_to_native_clone_p50_reduction_pct": 98.96091044037605,
+        "native_frame": {
+          "count": 20000,
+          "max_us": 8.292,
+          "mean_us": 0.19518889999994807,
+          "min_us": 0.125,
+          "p50_us": 0.167,
+          "p90_us": 0.25,
+          "p95_us": 0.25,
+          "p99_us": 0.375,
+          "stddev_us": 0.07834088215478546
+        },
+        "native_pj1_clone": {
+          "count": 20000,
+          "max_us": 5.2909999999999995,
+          "mean_us": 0.05868390000000428,
+          "min_us": 0,
+          "p50_us": 0.041999999999999996,
+          "p90_us": 0.08399999999999999,
+          "p95_us": 0.125,
+          "p99_us": 0.25,
+          "stddev_us": 0.05757811459912476
+        },
+        "scope": "single-process conversion/copy microbenchmark; excludes query execution, sockets, and scheduling"
+      },
+      "method": {
+        "allocation_metrics": "unavailable",
+        "concurrency_clients": [
+          1,
+          2,
+          5,
+          10
+        ],
+        "concurrency_window_ms": 2000,
+        "conversion_samples_per_shape": 20000,
+        "conversion_warmups_per_shape": 1000,
+        "gate_permits": 1024,
+        "inside_window_completions_only": true,
+        "point_samples_per_shape": 500,
+        "point_warmups_per_shape": 50,
+        "point_wire_paths": [
+          "legacy_text",
+          "native_typed"
+        ],
+        "saturation_inference": "not inferred from throughput alone",
+        "storage_utilization_metrics": "unavailable"
+      },
+      "native_pj1_text_serialization": {
+        "proof_kind": "structural source-path assertion",
+        "proof_scope": "query_result_to_message native rows/scalar branches and encode_typed_value",
+        "runtime_counter_available": false,
+        "server_calls_per_native_result": 0,
+        "timing_distortion": "none; assertion runs before timed measurements"
+      },
+      "overlap_concurrency": {
+        "encoded_response_bytes": 2678919,
+        "results": [
+          {
+            "clients": 1,
+            "completed_inside_window": 482,
+            "drain_time_ms": 4.124084,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 482,
+              "max_us": 5839.625,
+              "mean_us": 3941.080821576764,
+              "min_us": 3611.333,
+              "p50_us": 3905.417,
+              "p90_us": 4105.125,
+              "p95_us": 4236.25,
+              "p99_us": 4792.3330000000005,
+              "stddev_us": 220.16951981442068
+            },
+            "process_cpu_seconds_inside_window": 2.2420340000000003,
+            "process_cpu_utilization_pct": 112.10170000000002,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 241,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 883,
+            "drain_time_ms": 3.959542,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 883,
+              "max_us": 9917.333,
+              "mean_us": 4298.049844847114,
+              "min_us": 3986.916,
+              "p50_us": 4181.583,
+              "p90_us": 4438.667,
+              "p95_us": 4955.125,
+              "p99_us": 6441.75,
+              "stddev_us": 483.83320800340607
+            },
+            "process_cpu_seconds_inside_window": 4.312677,
+            "process_cpu_utilization_pct": 215.63385,
+            "scaling_vs_one_client": 1.8319502074688796,
+            "throughput_ops_s": 441.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 1640,
+            "drain_time_ms": 4.649667,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 1640,
+              "max_us": 9443.208,
+              "mean_us": 5675.950700609759,
+              "min_us": 4370.334,
+              "p50_us": 5657.042,
+              "p90_us": 6164.292,
+              "p95_us": 6364.333,
+              "p99_us": 8147.9169999999995,
+              "stddev_us": 555.2926143786599
+            },
+            "process_cpu_seconds_inside_window": 10.837724,
+            "process_cpu_utilization_pct": 541.8862,
+            "scaling_vs_one_client": 3.4024896265560165,
+            "throughput_ops_s": 820,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 2587,
+            "drain_time_ms": 5.6042499999999995,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 2587,
+              "max_us": 11362.375,
+              "mean_us": 6961.4464928488405,
+              "min_us": 5223.958,
+              "p50_us": 6861.459000000001,
+              "p90_us": 7760.75,
+              "p95_us": 8164.667,
+              "p99_us": 10404.708,
+              "stddev_us": 804.5362583364802
+            },
+            "process_cpu_seconds_inside_window": 21.326799,
+            "process_cpu_utilization_pct": 1066.33995,
+            "scaling_vs_one_client": 5.367219917012448,
+            "throughput_ops_s": 1293.5,
+            "window_ms": 2000
+          }
+        ]
+      },
+      "point_concurrency": {
+        "legacy_document": [
+          {
+            "clients": 1,
+            "completed_inside_window": 51763,
+            "drain_time_ms": 1.3018750000000001,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 51763,
+              "max_us": 240.75,
+              "mean_us": 38.53827739891456,
+              "min_us": 26.041999999999998,
+              "p50_us": 37,
+              "p90_us": 45.625,
+              "p95_us": 49.75,
+              "p99_us": 59.291,
+              "stddev_us": 6.1478282273360145
+            },
+            "process_cpu_seconds_inside_window": 1.923017999999999,
+            "process_cpu_utilization_pct": 96.15089999999995,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 25881.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 85373,
+            "drain_time_ms": 1.38925,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 85373,
+              "max_us": 292.334,
+              "mean_us": 46.745353530975635,
+              "min_us": 29.375,
+              "p50_us": 44.875,
+              "p90_us": 56.916999999999994,
+              "p95_us": 62.58299999999999,
+              "p99_us": 83.667,
+              "stddev_us": 10.003581462635124
+            },
+            "process_cpu_seconds_inside_window": 3.7657099999999915,
+            "process_cpu_utilization_pct": 188.28549999999956,
+            "scaling_vs_one_client": 1.6493054884763247,
+            "throughput_ops_s": 42686.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 152180,
+            "drain_time_ms": 1.8975000000000002,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 152180,
+              "max_us": 222.667,
+              "mean_us": 65.57268339466415,
+              "min_us": 30.958,
+              "p50_us": 62.459,
+              "p90_us": 87.209,
+              "p95_us": 97.375,
+              "p99_us": 121.917,
+              "stddev_us": 16.992150822939063
+            },
+            "process_cpu_seconds_inside_window": 8.172566000000003,
+            "process_cpu_utilization_pct": 408.6283000000002,
+            "scaling_vs_one_client": 2.9399377934045554,
+            "throughput_ops_s": 76090,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 170486,
+            "drain_time_ms": 1.6997920000000002,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 170486,
+              "max_us": 377.75,
+              "mean_us": 117.08571774222254,
+              "min_us": 37.583000000000006,
+              "p50_us": 113.917,
+              "p90_us": 155.541,
+              "p95_us": 170.292,
+              "p99_us": 202.25,
+              "stddev_us": 29.569758185655758
+            },
+            "process_cpu_seconds_inside_window": 13.829279,
+            "process_cpu_utilization_pct": 691.46395,
+            "scaling_vs_one_client": 3.2935880841527734,
+            "throughput_ops_s": 85243,
+            "window_ms": 2000
+          }
+        ],
+        "native_document": [
+          {
+            "clients": 1,
+            "completed_inside_window": 57929,
+            "drain_time_ms": 1.308167,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 57929,
+              "max_us": 2756.4579999999996,
+              "mean_us": 34.431095444422944,
+              "min_us": 23.458000000000002,
+              "p50_us": 32.25,
+              "p90_us": 41.375,
+              "p95_us": 46.542,
+              "p99_us": 69.625,
+              "stddev_us": 15.305911914881804
+            },
+            "process_cpu_seconds_inside_window": 1.9299280000000039,
+            "process_cpu_utilization_pct": 96.4964000000002,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 28964.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 94491,
+            "drain_time_ms": 1.3198750000000001,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 94491,
+              "max_us": 218.833,
+              "mean_us": 42.231557756823406,
+              "min_us": 22,
+              "p50_us": 41.083,
+              "p90_us": 52.333999999999996,
+              "p95_us": 57.042,
+              "p99_us": 72.959,
+              "stddev_us": 9.233960287508792
+            },
+            "process_cpu_seconds_inside_window": 3.7558659999999975,
+            "process_cpu_utilization_pct": 187.79329999999987,
+            "scaling_vs_one_client": 1.6311519273593538,
+            "throughput_ops_s": 47245.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 167087,
+            "drain_time_ms": 1.748,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 167087,
+              "max_us": 234.959,
+              "mean_us": 59.71369751686291,
+              "min_us": 24.625,
+              "p50_us": 56.708,
+              "p90_us": 81.25,
+              "p95_us": 91.75,
+              "p99_us": 115.583,
+              "stddev_us": 16.947471335076923
+            },
+            "process_cpu_seconds_inside_window": 7.993774000000002,
+            "process_cpu_utilization_pct": 399.6887000000001,
+            "scaling_vs_one_client": 2.8843411762674998,
+            "throughput_ops_s": 83543.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 179866,
+            "drain_time_ms": 1.959667,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 179866,
+              "max_us": 370.875,
+              "mean_us": 110.98138271824538,
+              "min_us": 28.75,
+              "p50_us": 107.417,
+              "p90_us": 151.083,
+              "p95_us": 166.542,
+              "p99_us": 201.041,
+              "stddev_us": 30.90824295501955
+            },
+            "process_cpu_seconds_inside_window": 13.68118899999999,
+            "process_cpu_utilization_pct": 684.0594499999995,
+            "scaling_vs_one_client": 3.104938804398488,
+            "throughput_ops_s": 89933,
+            "window_ms": 2000
+          }
+        ]
+      },
+      "point_reads": {
+        "current_legacy_to_native_document_p50_reduction_pct": 13.353846153846169,
+        "historical_legacy_to_native_document_p50_reduction_pct": 25.66324959303094,
+        "legacy_document_current_tree": {
+          "encoded_response_bytes": 2584,
+          "latency": {
+            "count": 500,
+            "max_us": 89.417,
+            "mean_us": 41.87263600000001,
+            "min_us": 32.084,
+            "p50_us": 39,
+            "p90_us": 51.291000000000004,
+            "p95_us": 71.667,
+            "p99_us": 77.91600000000001,
+            "stddev_us": 9.974761949615841
+          },
+          "wire_mode": "legacy_text"
+        },
+        "legacy_typed_current_tree": {
+          "encoded_response_bytes": 2589,
+          "latency": {
+            "count": 500,
+            "max_us": 94.875,
+            "mean_us": 42.10983800000002,
+            "min_us": 30.333,
+            "p50_us": 39.542,
+            "p90_us": 51.666000000000004,
+            "p95_us": 71.375,
+            "p99_us": 79.208,
+            "stddev_us": 10.476347059722489
+          },
+          "wire_mode": "legacy_text"
+        },
+        "native_document": {
+          "encoded_response_bytes": 2660,
+          "latency": {
+            "count": 500,
+            "max_us": 78.584,
+            "mean_us": 36.92077199999998,
+            "min_us": 27.125,
+            "p50_us": 33.791999999999994,
+            "p90_us": 47.333000000000006,
+            "p95_us": 64.292,
+            "p99_us": 69.125,
+            "stddev_us": 9.405064151616191
+          },
+          "wire_mode": "native_typed"
+        },
+        "native_document_to_native_typed_p95_ratio": 0.9157360984503191,
+        "native_typed": {
+          "encoded_response_bytes": 2603,
+          "latency": {
+            "count": 500,
+            "max_us": 87.583,
+            "mean_us": 40.61584199999999,
+            "min_us": 28.458000000000002,
+            "p50_us": 37.625,
+            "p90_us": 51.708,
+            "p95_us": 70.208,
+            "p99_us": 76.959,
+            "stddev_us": 10.445776947888362
+          },
+          "wire_mode": "native_typed"
+        }
+      },
+      "release_gate": {
+        "failure_exit_code": 2,
+        "historical_80_percent_gate_passed": false,
+        "historical_legacy_to_native_p50_reduction_diagnostic": {
+          "minimum_pct": 80,
+          "observed_pct": 25.66324959303094,
+          "passed": false,
+          "release_blocking": false
+        },
+        "isolated_legacy_render_to_native_frame_p50_reduction": {
+          "minimum_pct": 90,
+          "observed_pct": 96.10813330226054,
+          "passed": true
+        },
+        "native_document_to_native_typed_p95_ratio": {
+          "maximum": 1.5,
+          "observed": 0.9157360984503191,
+          "passed": true
+        },
+        "native_e2e_p50_not_worse_than_current_legacy": {
+          "current_legacy_document_p50_us": 39,
+          "native_document_p50_us": 33.791999999999994,
+          "passed": true
+        },
+        "native_server_pj1_to_text_calls": {
+          "maximum_per_result": 0,
+          "observed_per_result": 0,
+          "passed": true,
+          "proof_kind": "structural source-path assertion"
+        },
+        "overlap_one_client_p50_regression": {
+          "current_p50_us": 3905.417,
+          "historical_p50_us": 4507.792,
+          "maximum_pct": 5,
+          "observed_pct": -13.362972382044255,
+          "passed": true
+        },
+        "overlap_ten_client_scaling": {
+          "minimum": 5,
+          "observed": 5.367219917012448,
+          "passed": true
+        },
+        "passed": true,
+        "release_profile": {
+          "passed": true
+        }
+      },
+      "run": {
+        "arch": "aarch64",
+        "dirty_tree_fingerprint": "fnv1a64:9ed08b05e1d97cb8",
+        "dirty_tree_fingerprint_scope": "git diff --binary HEAD plus full contents of every untracked, non-ignored file, sorted by path",
+        "git_commit": "a5c56c4b14629cbace4fbf09e6cfdf2c7c091cf4",
+        "git_dirty": true,
+        "label": "v0.13.0-native-read-release",
+        "logical_cpus": 18,
+        "os": "macos",
+        "package_version": "0.13.0",
+        "profile": "release",
+        "repetition": 1,
+        "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+        "transport": "TCP loopback; server and clients share one process",
+        "unix_time_ns": "1784063102062857000"
+      },
+      "schema_version": 2
+    },
+    {
+      "fixture": {
+        "document_json_bytes": 2560,
+        "document_query": "DocumentRow filter .id = 1 { .data }",
+        "fingerprint": "fnv1a64:35aa943504ccb6f8",
+        "logical_equivalence_asserted": true,
+        "overlap_payload_bytes": 256,
+        "overlap_query": "ScanRow filter .bucket >= 0 { .id, .payload }",
+        "overlap_rows": 10000,
+        "typed_query": "TypedRow filter .id = 1 { .id, .status, .title, .score, .active, .payload }"
+      },
+      "historical_legacy_baseline": {
+        "artifact_fingerprint": "fnv1a64:58c7a83f37dc6204",
+        "dirty_tree_fingerprint": "fnv1a64:5a75c8bdfdae8d94",
+        "document_p50_us": 45.458,
+        "document_p95_us": 93.084,
+        "encoded_response_bytes": 2584,
+        "git_commit": "712545435c36accc8e62ba01b0219ec161e6373c",
+        "isolation": "separate git worktree; current branch was not mutated",
+        "label": "v0.12.0-folded-cancellation-7125454",
+        "overlap_one_client_p50_us": 4507.792,
+        "package_version": "0.12.0"
+      },
+      "isolated_conversion_cost": {
+        "fixture_pj1_bytes": 2635,
+        "legacy_pj1_to_canonical_text": {
+          "count": 20000,
+          "max_us": 54.458,
+          "mean_us": 3.841095950000506,
+          "min_us": 2.8329999999999997,
+          "p50_us": 3.584,
+          "p90_us": 4.625,
+          "p95_us": 4.667000000000001,
+          "p99_us": 4.917,
+          "stddev_us": 0.9894743301590017
+        },
+        "legacy_render_and_frame": {
+          "count": 20000,
+          "max_us": 48.125,
+          "mean_us": 4.069875749999972,
+          "min_us": 3.0410000000000004,
+          "p50_us": 3.833,
+          "p90_us": 4.834,
+          "p95_us": 4.917,
+          "p99_us": 5.208,
+          "stddev_us": 1.0375787237178318
+        },
+        "legacy_render_to_native_frame_p50_reduction_pct": 95.64309939994783,
+        "legacy_text_to_native_clone_p50_reduction_pct": 98.828125,
+        "native_frame": {
+          "count": 20000,
+          "max_us": 3.5829999999999997,
+          "mean_us": 0.1939637999999516,
+          "min_us": 0.125,
+          "p50_us": 0.167,
+          "p90_us": 0.25,
+          "p95_us": 0.25,
+          "p99_us": 0.33299999999999996,
+          "stddev_us": 0.061331150238357716
+        },
+        "native_pj1_clone": {
+          "count": 20000,
+          "max_us": 21.208000000000002,
+          "mean_us": 0.05856055000000316,
+          "min_us": 0,
+          "p50_us": 0.041999999999999996,
+          "p90_us": 0.08399999999999999,
+          "p95_us": 0.125,
+          "p99_us": 0.167,
+          "stddev_us": 0.17294805646117437
+        },
+        "scope": "single-process conversion/copy microbenchmark; excludes query execution, sockets, and scheduling"
+      },
+      "method": {
+        "allocation_metrics": "unavailable",
+        "concurrency_clients": [
+          1,
+          2,
+          5,
+          10
+        ],
+        "concurrency_window_ms": 2000,
+        "conversion_samples_per_shape": 20000,
+        "conversion_warmups_per_shape": 1000,
+        "gate_permits": 1024,
+        "inside_window_completions_only": true,
+        "point_samples_per_shape": 500,
+        "point_warmups_per_shape": 50,
+        "point_wire_paths": [
+          "legacy_text",
+          "native_typed"
+        ],
+        "saturation_inference": "not inferred from throughput alone",
+        "storage_utilization_metrics": "unavailable"
+      },
+      "native_pj1_text_serialization": {
+        "proof_kind": "structural source-path assertion",
+        "proof_scope": "query_result_to_message native rows/scalar branches and encode_typed_value",
+        "runtime_counter_available": false,
+        "server_calls_per_native_result": 0,
+        "timing_distortion": "none; assertion runs before timed measurements"
+      },
+      "overlap_concurrency": {
+        "encoded_response_bytes": 2678919,
+        "results": [
+          {
+            "clients": 1,
+            "completed_inside_window": 470,
+            "drain_time_ms": 4.343625,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 470,
+              "max_us": 5288.833,
+              "mean_us": 4029.718165957447,
+              "min_us": 3795.375,
+              "p50_us": 3984.959,
+              "p90_us": 4242.7919999999995,
+              "p95_us": 4358.542,
+              "p99_us": 4476.959,
+              "stddev_us": 169.98972821683088
+            },
+            "process_cpu_seconds_inside_window": 2.242762,
+            "process_cpu_utilization_pct": 112.1381,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 235,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 713,
+            "drain_time_ms": 4.402584,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 713,
+              "max_us": 10072.042,
+              "mean_us": 5301.580413744741,
+              "min_us": 4152.125,
+              "p50_us": 5192.6669999999995,
+              "p90_us": 5808.4169999999995,
+              "p95_us": 6169,
+              "p99_us": 8399.083,
+              "stddev_us": 688.1827237003981
+            },
+            "process_cpu_seconds_inside_window": 4.37195,
+            "process_cpu_utilization_pct": 218.5975,
+            "scaling_vs_one_client": 1.5170212765957447,
+            "throughput_ops_s": 356.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 1697,
+            "drain_time_ms": 8.761916,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 1697,
+              "max_us": 9082.25,
+              "mean_us": 5464.986724808488,
+              "min_us": 4339.5,
+              "p50_us": 5373.5830000000005,
+              "p90_us": 6111,
+              "p95_us": 6468.125,
+              "p99_us": 7851.7919999999995,
+              "stddev_us": 563.852989588416
+            },
+            "process_cpu_seconds_inside_window": 11.054231999999999,
+            "process_cpu_utilization_pct": 552.7116,
+            "scaling_vs_one_client": 3.6106382978723404,
+            "throughput_ops_s": 848.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 2693,
+            "drain_time_ms": 5.675084,
+            "encoded_response_bytes": 2678919,
+            "latency": {
+              "count": 2693,
+              "max_us": 11694.25,
+              "mean_us": 6815.290221314511,
+              "min_us": 5355.791,
+              "p50_us": 6703.2080000000005,
+              "p90_us": 7488.5,
+              "p95_us": 7869.249999999999,
+              "p99_us": 10262.708,
+              "stddev_us": 775.902583858076
+            },
+            "process_cpu_seconds_inside_window": 21.135383000000004,
+            "process_cpu_utilization_pct": 1056.7691500000003,
+            "scaling_vs_one_client": 5.729787234042553,
+            "throughput_ops_s": 1346.5,
+            "window_ms": 2000
+          }
+        ]
+      },
+      "point_concurrency": {
+        "legacy_document": [
+          {
+            "clients": 1,
+            "completed_inside_window": 53174,
+            "drain_time_ms": 1.3197079999999999,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 53174,
+              "max_us": 239.791,
+              "mean_us": 37.50676922932354,
+              "min_us": 26.25,
+              "p50_us": 36.25,
+              "p90_us": 44.208,
+              "p95_us": 48.334,
+              "p99_us": 58.167,
+              "stddev_us": 6.068451654843947
+            },
+            "process_cpu_seconds_inside_window": 1.9196129999999982,
+            "process_cpu_utilization_pct": 95.98064999999991,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 26587,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 88599,
+            "drain_time_ms": 1.279416,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 88599,
+              "max_us": 256.83299999999997,
+              "mean_us": 45.03437880788698,
+              "min_us": 27.875,
+              "p50_us": 43.458999999999996,
+              "p90_us": 54.666999999999994,
+              "p95_us": 59.708,
+              "p99_us": 75.083,
+              "stddev_us": 8.91976534733478
+            },
+            "process_cpu_seconds_inside_window": 3.7654159999999948,
+            "process_cpu_utilization_pct": 188.27079999999972,
+            "scaling_vs_one_client": 1.6662090495354873,
+            "throughput_ops_s": 44299.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 148354,
+            "drain_time_ms": 1.8122909999999999,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 148354,
+              "max_us": 330.458,
+              "mean_us": 67.26090287420543,
+              "min_us": 31,
+              "p50_us": 63.541999999999994,
+              "p90_us": 91.29100000000001,
+              "p95_us": 102.916,
+              "p99_us": 130.125,
+              "stddev_us": 18.735838122565216
+            },
+            "process_cpu_seconds_inside_window": 8.055990000000001,
+            "process_cpu_utilization_pct": 402.7995000000001,
+            "scaling_vs_one_client": 2.789972542972129,
+            "throughput_ops_s": 74177,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 168800,
+            "drain_time_ms": 1.814208,
+            "encoded_response_bytes": 2584,
+            "latency": {
+              "count": 168800,
+              "max_us": 390.75,
+              "mean_us": 118.2590008886262,
+              "min_us": 38.791999999999994,
+              "p50_us": 115.125,
+              "p90_us": 157.459,
+              "p95_us": 172.042,
+              "p99_us": 204.292,
+              "stddev_us": 30.09027634980495
+            },
+            "process_cpu_seconds_inside_window": 13.777766,
+            "process_cpu_utilization_pct": 688.8883,
+            "scaling_vs_one_client": 3.1744837702636626,
+            "throughput_ops_s": 84400,
+            "window_ms": 2000
+          }
+        ],
+        "native_document": [
+          {
+            "clients": 1,
+            "completed_inside_window": 58526,
+            "drain_time_ms": 1.164208,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 58526,
+              "max_us": 190.292,
+              "mean_us": 34.073202901274634,
+              "min_us": 22.334,
+              "p50_us": 32.5,
+              "p90_us": 41.125,
+              "p95_us": 45.5,
+              "p99_us": 56.208,
+              "stddev_us": 6.433695890844516
+            },
+            "process_cpu_seconds_inside_window": 1.952943999999988,
+            "process_cpu_utilization_pct": 97.6471999999994,
+            "scaling_vs_one_client": 1,
+            "throughput_ops_s": 29263,
+            "window_ms": 2000
+          },
+          {
+            "clients": 2,
+            "completed_inside_window": 94449,
+            "drain_time_ms": 1.234,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 94449,
+              "max_us": 181.75,
+              "mean_us": 42.25076337494441,
+              "min_us": 22,
+              "p50_us": 41.208000000000006,
+              "p90_us": 52.125,
+              "p95_us": 56.666999999999994,
+              "p99_us": 71.29199999999999,
+              "stddev_us": 8.950705183861327
+            },
+            "process_cpu_seconds_inside_window": 3.7691970000000055,
+            "process_cpu_utilization_pct": 188.45985000000027,
+            "scaling_vs_one_client": 1.6137955780336943,
+            "throughput_ops_s": 47224.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 5,
+            "completed_inside_window": 170779,
+            "drain_time_ms": 1.856625,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 170779,
+              "max_us": 323.5,
+              "mean_us": 58.4251636091098,
+              "min_us": 23.917,
+              "p50_us": 56.042,
+              "p90_us": 77.833,
+              "p95_us": 86.375,
+              "p99_us": 106.917,
+              "stddev_us": 15.357376028049766
+            },
+            "process_cpu_seconds_inside_window": 8.109919000000005,
+            "process_cpu_utilization_pct": 405.4959500000002,
+            "scaling_vs_one_client": 2.918002255407853,
+            "throughput_ops_s": 85389.5,
+            "window_ms": 2000
+          },
+          {
+            "clients": 10,
+            "completed_inside_window": 178976,
+            "drain_time_ms": 0.621791,
+            "encoded_response_bytes": 2660,
+            "latency": {
+              "count": 178976,
+              "max_us": 384.167,
+              "mean_us": 111.54358582156122,
+              "min_us": 28.416,
+              "p50_us": 108.125,
+              "p90_us": 151.833,
+              "p95_us": 167.375,
+              "p99_us": 201.875,
+              "stddev_us": 31.057551542576228
+            },
+            "process_cpu_seconds_inside_window": 13.611761000000001,
+            "process_cpu_utilization_pct": 680.5880500000001,
+            "scaling_vs_one_client": 3.0580596657895636,
+            "throughput_ops_s": 89488,
+            "window_ms": 2000
+          }
+        ]
+      },
+      "point_reads": {
+        "current_legacy_to_native_document_p50_reduction_pct": 13.420779220779226,
+        "historical_legacy_to_native_document_p50_reduction_pct": 26.672972854063094,
+        "legacy_document_current_tree": {
+          "encoded_response_bytes": 2584,
+          "latency": {
+            "count": 500,
+            "max_us": 89.458,
+            "mean_us": 42.05081599999997,
+            "min_us": 31.541,
+            "p50_us": 38.5,
+            "p90_us": 53.167,
+            "p95_us": 69.666,
+            "p99_us": 78.292,
+            "stddev_us": 10.222928702976654
+          },
+          "wire_mode": "legacy_text"
+        },
+        "legacy_typed_current_tree": {
+          "encoded_response_bytes": 2589,
+          "latency": {
+            "count": 500,
+            "max_us": 84.583,
+            "mean_us": 42.18350199999996,
+            "min_us": 30.833000000000002,
+            "p50_us": 39.208999999999996,
+            "p90_us": 53.333,
+            "p95_us": 70.375,
+            "p99_us": 76.375,
+            "stddev_us": 10.04246039723314
+          },
+          "wire_mode": "legacy_text"
+        },
+        "native_document": {
+          "encoded_response_bytes": 2660,
+          "latency": {
+            "count": 500,
+            "max_us": 87,
+            "mean_us": 37.12416400000001,
+            "min_us": 28.167,
+            "p50_us": 33.333,
+            "p90_us": 50.083999999999996,
+            "p95_us": 63.584,
+            "p99_us": 68.583,
+            "stddev_us": 9.931585581824487
+          },
+          "wire_mode": "native_typed"
+        },
+        "native_document_to_native_typed_p95_ratio": 0.9056517775752052,
+        "native_typed": {
+          "encoded_response_bytes": 2603,
+          "latency": {
+            "count": 500,
+            "max_us": 83.208,
+            "mean_us": 40.96635399999997,
+            "min_us": 28.875,
+            "p50_us": 37.5,
+            "p90_us": 54.5,
+            "p95_us": 70.208,
+            "p99_us": 76.917,
+            "stddev_us": 10.647918307194322
+          },
+          "wire_mode": "native_typed"
+        }
+      },
+      "release_gate": {
+        "failure_exit_code": 2,
+        "historical_80_percent_gate_passed": false,
+        "historical_legacy_to_native_p50_reduction_diagnostic": {
+          "minimum_pct": 80,
+          "observed_pct": 26.672972854063094,
+          "passed": false,
+          "release_blocking": false
+        },
+        "isolated_legacy_render_to_native_frame_p50_reduction": {
+          "minimum_pct": 90,
+          "observed_pct": 95.64309939994783,
+          "passed": true
+        },
+        "native_document_to_native_typed_p95_ratio": {
+          "maximum": 1.5,
+          "observed": 0.9056517775752052,
+          "passed": true
+        },
+        "native_e2e_p50_not_worse_than_current_legacy": {
+          "current_legacy_document_p50_us": 38.5,
+          "native_document_p50_us": 33.333,
+          "passed": true
+        },
+        "native_server_pj1_to_text_calls": {
+          "maximum_per_result": 0,
+          "observed_per_result": 0,
+          "passed": true,
+          "proof_kind": "structural source-path assertion"
+        },
+        "overlap_one_client_p50_regression": {
+          "current_p50_us": 3984.959,
+          "historical_p50_us": 4507.792,
+          "maximum_pct": 5,
+          "observed_pct": -11.598427789037306,
+          "passed": true
+        },
+        "overlap_ten_client_scaling": {
+          "minimum": 5,
+          "observed": 5.729787234042553,
+          "passed": true
+        },
+        "passed": true,
+        "release_profile": {
+          "passed": true
+        }
+      },
+      "run": {
+        "arch": "aarch64",
+        "dirty_tree_fingerprint": "fnv1a64:9ed08b05e1d97cb8",
+        "dirty_tree_fingerprint_scope": "git diff --binary HEAD plus full contents of every untracked, non-ignored file, sorted by path",
+        "git_commit": "a5c56c4b14629cbace4fbf09e6cfdf2c7c091cf4",
+        "git_dirty": true,
+        "label": "v0.13.0-native-read-release",
+        "logical_cpus": 18,
+        "os": "macos",
+        "package_version": "0.13.0",
+        "profile": "release",
+        "repetition": 2,
+        "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+        "transport": "TCP loopback; server and clients share one process",
+        "unix_time_ns": "1784063138281552000"
+      },
+      "schema_version": 2
+    }
+  ]
+}
+

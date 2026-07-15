@@ -167,7 +167,7 @@ fn retention_candidates(
                 file.start_lsn, file.end_lsn, segment.start_lsn, segment.end_lsn
             )));
         }
-        if segment.identity != expected_identity {
+        if !segment.identity.lineage_matches(expected_identity) {
             return Err(invalid_data(
                 "retained segment identity does not match expected database history",
             ));

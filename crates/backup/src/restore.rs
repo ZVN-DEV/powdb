@@ -50,7 +50,8 @@ pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
     let durable_name = name == "catalog.bin"
         || name == CATALOG_LSN_FILE
         || (name.ends_with(".heap") && name.len() > ".heap".len())
-        || (name.ends_with(".idx") && name.len() > ".idx".len());
+        || (name.ends_with(".idx") && name.len() > ".idx".len())
+        || (name.ends_with(".eidx") && name.len() > ".eidx".len());
     if !is_plain_manifest_name(name) || !durable_name {
         return Err(io::Error::other(format!(
             "invalid backup manifest file name: {name}"
@@ -61,7 +62,7 @@ pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
 
 pub(crate) fn validate_delta_file_name(delta_file: &str, data_file: &str) -> io::Result<()> {
     validate_backup_file_name(data_file)?;
-    if !(data_file.ends_with(".heap") || data_file.ends_with(".idx")) {
+    if !data_file.ends_with(".heap") {
         return Err(io::Error::other(format!(
             "invalid backup manifest delta target file name: {data_file}"
         )));
@@ -170,6 +171,12 @@ pub fn restore_with_sync_mode(
     apply_restore_sync_mode(manifest.sync.as_ref(), dest_data_dir, sync_mode)?;
     // Validate: opening must succeed and reset next_lsn correctly.
     let cat = Catalog::open(dest_data_dir)?;
+    if cat.active_catalog_version() != manifest.catalog_version {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "restored catalog format does not match backup manifest",
+        ));
+    }
     drop(cat);
     Ok(())
 }
@@ -191,6 +198,7 @@ mod tests {
             "..",
             ".heap",
             ".idx",
+            ".eidx",
             "wal.log",
         ] {
             assert!(
@@ -207,6 +215,7 @@ mod tests {
             CATALOG_LSN_FILE,
             "User.heap",
             "User_email.idx",
+            "User_7.eidx",
         ] {
             validate_backup_file_name(good).unwrap();
         }
@@ -215,6 +224,7 @@ mod tests {
     #[test]
     fn delta_file_must_match_paged_file_name() {
         validate_delta_file_name("User.heap.delta", "User.heap").unwrap();
+        assert!(validate_delta_file_name("User_email.idx.delta", "User_email.idx").is_err());
         assert!(validate_delta_file_name("../User.heap.delta", "User.heap").is_err());
         assert!(validate_delta_file_name("Other.heap.delta", "User.heap").is_err());
         assert!(validate_delta_file_name("catalog.bin.delta", "catalog.bin").is_err());

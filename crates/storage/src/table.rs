@@ -1,4 +1,5 @@
 use crate::btree::BTree;
+use crate::catalog::{expression_index_file_name, ExpressionIndexMeta};
 use crate::error::StorageError;
 use crate::heap::HeapFile;
 use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
@@ -6,6 +7,7 @@ use crate::row::{
     decode_column, decode_row, encode_row_into_with_layout, encode_row_v2_into,
     patch_var_column_in_place, plan_spill, OverflowStub, RowLayout, MAX_VALUE_SIZE,
 };
+use crate::stored_json_path::StoredJsonPathSegmentV1;
 use crate::types::*;
 use std::io;
 use std::path::Path;
@@ -42,6 +44,12 @@ pub(crate) struct IndexedCol {
     pub btree: BTree,
 }
 
+pub(crate) struct ExpressionIndexedPath {
+    pub meta: ExpressionIndexMeta,
+    pub root_col_idx: usize,
+    pub btree: BTree,
+}
+
 /// A table combines a heap file, schema, and optional indexes.
 ///
 /// Mission C Phase 17: indexes used to live in a `FxHashMap<String,
@@ -57,7 +65,7 @@ pub(crate) struct IndexedCol {
 /// rows through `insert`/`update` reuse the same allocation across calls,
 /// cutting the allocator traffic to ~zero after the first row.
 pub struct Table {
-    pub schema: Schema,
+    pub(crate) schema: Schema,
     pub heap: HeapFile,
     /// Reusable scratch buffer for row encoding. Cleared on every call.
     encode_scratch: Vec<u8>,
@@ -66,6 +74,7 @@ pub struct Table {
     /// can reach in via the `index()` / `index_mut()` helpers instead
     /// of probing a separate hash map.
     pub(crate) indexed_cols: Vec<IndexedCol>,
+    pub(crate) expression_indexes: Vec<ExpressionIndexedPath>,
     /// Mission C Phase 7: cached row layout so `delete` can decode only
     /// the indexed columns out of the raw page bytes without running the
     /// full per-row offset calculation every call.
@@ -85,6 +94,55 @@ pub struct Table {
     auto_next_ready: bool,
 }
 
+fn expression_unique_error(table: &str, expression: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("unique expression index violation on {table} ({expression})"),
+    )
+}
+
+fn expression_key(meta: &ExpressionIndexMeta, root: &Value) -> io::Result<Value> {
+    let Value::Json(document) = root else {
+        if root.is_empty() {
+            return Ok(Value::Empty);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expression index root value is not JSON",
+        ));
+    };
+    let mut node = document.as_ref();
+    for segment in &meta.json_path.segments {
+        let path_segment = match segment {
+            StoredJsonPathSegmentV1::Key(key) => crate::pj1::PathSeg::Key(key),
+            StoredJsonPathSegmentV1::Index(index) => crate::pj1::PathSeg::Index(*index),
+        };
+        let Some(next) = crate::pj1::pj1_get(node, &path_segment) else {
+            return Ok(Value::Empty);
+        };
+        node = next;
+    }
+    match crate::pj1::pj1_scalar(node).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid PJ1 while extracting expression index key: {error}"),
+        )
+    })? {
+        crate::pj1::Pj1Scalar::Null => Ok(Value::Empty),
+        crate::pj1::Pj1Scalar::Bool(value) => Ok(Value::Bool(value)),
+        crate::pj1::Pj1Scalar::Int(value) => Ok(Value::Int(value)),
+        crate::pj1::Pj1Scalar::Float(value) => Ok(Value::Float(value)),
+        crate::pj1::Pj1Scalar::Str(value) => Ok(Value::Str(value.to_owned())),
+        crate::pj1::Pj1Scalar::NonScalar => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expression index key must be scalar: {}",
+                meta.canonical_text
+            ),
+        )),
+    }
+}
+
 impl Table {
     pub fn create(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
@@ -95,6 +153,7 @@ impl Table {
             heap,
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
+            expression_indexes: Vec::new(),
             row_layout,
             defaults: Vec::new(),
             auto_cols: Vec::new(),
@@ -108,7 +167,7 @@ impl Table {
     /// until `create_index` is called again. Prefer `open_with_indexes` when
     /// the catalog knows which columns are indexed.
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
-        Self::open_with_indexes(schema, data_dir, &[])
+        Self::open_with_indexes(schema, data_dir, &[], &[])
     }
 
     /// Mission 3: reopen an existing table from disk, also rehydrating any
@@ -126,6 +185,7 @@ impl Table {
         schema: Schema,
         data_dir: &Path,
         indexed_col_metas: &[crate::catalog::IndexedColMeta],
+        expression_index_metas: &[ExpressionIndexMeta],
     ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
         let heap = HeapFile::open(&heap_path)?;
@@ -135,6 +195,7 @@ impl Table {
             heap,
             encode_scratch: Vec::new(),
             indexed_cols: Vec::new(),
+            expression_indexes: Vec::new(),
             row_layout,
             defaults: Vec::new(),
             auto_cols: Vec::new(),
@@ -187,6 +248,42 @@ impl Table {
             });
         }
 
+        for meta in expression_index_metas {
+            let root_col_idx = table
+                .schema
+                .column_index(&meta.json_path.column)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expression index root column is absent",
+                    )
+                })?;
+            let idx_path = data_dir.join(expression_index_file_name(
+                &table.schema.table_name,
+                meta.index_id,
+            ));
+            if idx_path.exists() {
+                let btree = BTree::load(&idx_path)?;
+                if btree.format_version() != crate::btree::BTREE_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expression index requires BIDX v2",
+                    ));
+                }
+                table.expression_indexes.push(ExpressionIndexedPath {
+                    meta: meta.clone(),
+                    root_col_idx,
+                    btree,
+                });
+            } else {
+                // Expression indexes were not released before the dedicated
+                // `.eidx` namespace. Rebuild any missing artifact from the
+                // heap instead of probing or deleting an ambiguous legacy
+                // `.idx` pathname that may belong to a live column index.
+                table.install_expression_index(meta.clone(), &idx_path)?;
+            }
+        }
+
         Ok(table)
     }
 
@@ -208,6 +305,239 @@ impl Table {
                 unique: c.unique,
             })
             .collect()
+    }
+
+    pub(crate) fn expression_index_metas(&self) -> Vec<ExpressionIndexMeta> {
+        self.expression_indexes
+            .iter()
+            .map(|index| index.meta.clone())
+            .collect()
+    }
+
+    pub(crate) fn expression_index_btree(&self, index_id: u64) -> Option<&BTree> {
+        self.expression_indexes
+            .iter()
+            .find(|index| index.meta.index_id == index_id)
+            .map(|index| &index.btree)
+    }
+
+    pub(crate) fn expression_index_btree_mut(&mut self, index_id: u64) -> Option<&mut BTree> {
+        self.expression_indexes
+            .iter_mut()
+            .find(|index| index.meta.index_id == index_id)
+            .map(|index| &mut index.btree)
+    }
+
+    pub(crate) fn remove_expression_indexes_for_root(&mut self, root: &str) -> Vec<u64> {
+        let mut removed = Vec::new();
+        self.expression_indexes.retain(|index| {
+            if index.meta.json_path.column == root {
+                removed.push(index.meta.index_id);
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    pub(crate) fn remove_expression_index_by_id(&mut self, index_id: u64) -> bool {
+        let previous_len = self.expression_indexes.len();
+        self.expression_indexes
+            .retain(|index| index.meta.index_id != index_id);
+        self.expression_indexes.len() != previous_len
+    }
+
+    pub(crate) fn take_expression_index(&mut self, index_id: u64) -> Option<ExpressionIndexedPath> {
+        let position = self
+            .expression_indexes
+            .iter()
+            .position(|index| index.meta.index_id == index_id)?;
+        Some(self.expression_indexes.remove(position))
+    }
+
+    pub(crate) fn restore_expression_index(&mut self, index: ExpressionIndexedPath) {
+        self.expression_indexes.push(index);
+    }
+
+    pub(crate) fn expression_index_ids(&self) -> Vec<u64> {
+        self.expression_indexes
+            .iter()
+            .map(|index| index.meta.index_id)
+            .collect()
+    }
+
+    pub(crate) fn install_expression_index(
+        &mut self,
+        meta: ExpressionIndexMeta,
+        path: &Path,
+    ) -> io::Result<()> {
+        let root_col_idx = self
+            .schema
+            .column_index(&meta.json_path.column)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "JSON root column not found"))?;
+        let mut btree = BTree::create_v2(path)?;
+        let rids = self.heap.scan().map(|(rid, _)| rid).collect::<Vec<_>>();
+        for rid in rids {
+            let root = self
+                .get_projected(rid, &[root_col_idx])?
+                .and_then(|mut values| values.pop())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "row disappeared while building expression index",
+                    )
+                })?;
+            let key = expression_key(&meta, &root)?;
+            if key.is_empty() {
+                btree.insert_empty(rid);
+            } else if meta.unique {
+                if btree.lookup(&key).is_some() {
+                    return Err(expression_unique_error(
+                        &self.schema.table_name,
+                        &meta.canonical_text,
+                    ));
+                }
+                btree.insert(key, rid);
+            } else {
+                btree.insert_duplicate(key, rid);
+            }
+        }
+        btree.save()?;
+        self.expression_indexes.push(ExpressionIndexedPath {
+            meta,
+            root_col_idx,
+            btree,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn preflight_insert(&self, values: &Row) -> io::Result<Option<Vec<Value>>> {
+        for entry in &self.indexed_cols {
+            if !entry.unique {
+                continue;
+            }
+            let val = &values[entry.col_idx];
+            if !val.is_empty() && entry.btree.lookup(val).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unique constraint violation on {}.{}",
+                        self.schema.table_name, entry.col_name
+                    ),
+                ));
+            }
+        }
+        // Keep the overwhelmingly common column-only table on the legacy
+        // insert shape. In particular, avoid constructing an expression-key
+        // result and entering a second maintenance loop for every row when no
+        // expression index exists.
+        if self.expression_indexes.is_empty() {
+            return Ok(None);
+        }
+        let keys = self.expression_keys(values)?;
+        for (index, key) in self.expression_indexes.iter().zip(&keys) {
+            if index.meta.unique && !key.is_empty() && index.btree.lookup(key).is_some() {
+                return Err(expression_unique_error(
+                    &self.schema.table_name,
+                    &index.meta.canonical_text,
+                ));
+            }
+        }
+        Ok(Some(keys))
+    }
+
+    pub(crate) fn preflight_update(&self, rid: RowId, values: &Row) -> io::Result<()> {
+        let old_row = if self.indexed_cols.iter().any(|index| index.unique) {
+            self.get(rid)
+        } else {
+            None
+        };
+        for entry in self.indexed_cols.iter().filter(|index| index.unique) {
+            let new_value = &values[entry.col_idx];
+            if new_value.is_empty()
+                || old_row
+                    .as_ref()
+                    .is_some_and(|old| old[entry.col_idx] == *new_value)
+            {
+                continue;
+            }
+            if entry
+                .btree
+                .lookup(new_value)
+                .is_some_and(|existing| existing != rid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unique constraint violation on {}.{}",
+                        self.schema.table_name, entry.col_name
+                    ),
+                ));
+            }
+        }
+
+        let new_keys = self.expression_keys(values)?;
+        let old_keys = self.expression_keys_at(rid)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "row not found for index update")
+        })?;
+        for ((index, old_key), new_key) in
+            self.expression_indexes.iter().zip(old_keys).zip(new_keys)
+        {
+            if !index.meta.unique || new_key.is_empty() || old_key == new_key {
+                continue;
+            }
+            if index
+                .btree
+                .lookup(&new_key)
+                .is_some_and(|existing| existing != rid)
+            {
+                return Err(expression_unique_error(
+                    &self.schema.table_name,
+                    &index.meta.canonical_text,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn expression_keys(&self, values: &Row) -> io::Result<Vec<Value>> {
+        self.expression_indexes
+            .iter()
+            .map(|index| expression_key(&index.meta, &values[index.root_col_idx]))
+            .collect()
+    }
+
+    fn expression_keys_at(&self, rid: RowId) -> io::Result<Option<Vec<Value>>> {
+        if self.expression_indexes.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let roots = self
+            .expression_indexes
+            .iter()
+            .map(|index| index.root_col_idx)
+            .collect::<Vec<_>>();
+        let Some(root_values) = self.get_projected(rid, &roots)? else {
+            return Ok(None);
+        };
+        self.expression_indexes
+            .iter()
+            .zip(root_values)
+            .map(|(index, root)| expression_key(&index.meta, &root))
+            .collect::<io::Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    fn maintain_expression_indexes_on_insert(&mut self, keys: &[Value], rid: RowId) {
+        for (index, key) in self.expression_indexes.iter_mut().zip(keys) {
+            if key.is_empty() {
+                index.btree.insert_empty(rid);
+            } else if index.meta.unique {
+                index.btree.insert(key.clone(), rid);
+            } else {
+                index.btree.insert_duplicate(key.clone(), rid);
+            }
+        }
     }
 
     /// Install the per-column defaults (called at create time and on reopen
@@ -299,8 +629,15 @@ impl Table {
 
     /// Recalculate the cached row layout from the current schema. Must be
     /// called after any schema mutation (add/drop column).
-    pub fn refresh_layout(&mut self) {
+    pub(crate) fn refresh_layout(&mut self) {
         self.row_layout = RowLayout::new(&self.schema);
+    }
+
+    /// Return the table schema without exposing structural mutation.
+    /// Schema changes are catalog-owned so prepared-query metadata is
+    /// invalidated whenever column layout or table identity changes.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
     }
 
     /// Rewrite every live heap row to match a new schema shape.
@@ -484,6 +821,21 @@ impl Table {
             }
         }
 
+        if !self.expression_indexes.is_empty() {
+            for index in &mut self.expression_indexes {
+                index.root_col_idx = self
+                    .schema
+                    .column_index(&index.meta.json_path.column)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "expression index root disappeared during schema rewrite",
+                        )
+                    })?;
+            }
+            self.rebuild_indexes_from_heap()?;
+        }
+
         Ok(())
     }
 
@@ -517,7 +869,7 @@ impl Table {
     /// `true` if this table has no secondary indexes at all.
     #[inline]
     pub fn indexes_is_empty(&self) -> bool {
-        self.indexed_cols.is_empty()
+        self.indexed_cols.is_empty() && self.expression_indexes.is_empty()
     }
 
     /// Mission C Phase 15: the hot insert path used to do two wasted
@@ -536,7 +888,7 @@ impl Table {
     /// straight through `BTree::insert_int` to skip the generic
     /// `Value::Ord` dispatch on every binary-search comparison.
     pub fn insert(&mut self, values: &Row) -> io::Result<RowId> {
-        self.check_unique_on_insert(values)?;
+        let expression_keys = self.preflight_insert(values)?;
         // Common case: the row fits inline (v1) — encode straight into scratch,
         // byte-identical to pre-v0.11. Size it first WITHOUT encoding so a huge
         // value (which the debug v1 encoder would panic on) routes to spill.
@@ -549,6 +901,9 @@ impl Table {
             );
             let rid = self.heap.insert(&self.encode_scratch)?;
             self.maintain_indexes_on_insert(values, rid);
+            if let Some(expression_keys) = expression_keys.as_deref() {
+                self.maintain_expression_indexes_on_insert(expression_keys, rid);
+            }
             return Ok(rid);
         }
         // Otherwise spill the largest var values out of line and store a v2
@@ -558,6 +913,9 @@ impl Table {
         let encoded = self.encode_row_spilling(values)?;
         let rid = self.heap.insert(&encoded)?;
         self.maintain_indexes_on_insert(values, rid);
+        if let Some(expression_keys) = expression_keys.as_deref() {
+            self.maintain_expression_indexes_on_insert(expression_keys, rid);
+        }
         Ok(rid)
     }
 
@@ -697,31 +1055,13 @@ impl Table {
     /// the LOGICAL `values` — extraction happens on the full value before
     /// spill, so indexes never see a stub.
     pub(crate) fn insert_encoded(&mut self, values: &Row, encoded: &[u8]) -> io::Result<RowId> {
-        self.check_unique_on_insert(values)?;
+        let expression_keys = self.preflight_insert(values)?;
         let rid = self.heap.insert(encoded)?;
         self.maintain_indexes_on_insert(values, rid);
-        Ok(rid)
-    }
-
-    /// Unique-constraint pre-check: reject BEFORE touching the heap if any
-    /// unique column already holds the incoming value.
-    fn check_unique_on_insert(&self, values: &Row) -> io::Result<()> {
-        for entry in &self.indexed_cols {
-            if !entry.unique {
-                continue;
-            }
-            let val = &values[entry.col_idx];
-            if !val.is_empty() && entry.btree.lookup(val).is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "unique constraint violation on {}.{}",
-                        self.schema.table_name, entry.col_name
-                    ),
-                ));
-            }
+        if let Some(expression_keys) = expression_keys.as_deref() {
+            self.maintain_expression_indexes_on_insert(expression_keys, rid);
         }
-        Ok(())
+        Ok(rid)
     }
 
     /// Insert the row's indexed columns into every b-tree from the logical
@@ -759,6 +1099,9 @@ impl Table {
         for entry in self.indexed_cols.iter_mut() {
             entry.btree.save_if_dirty()?;
         }
+        for entry in self.expression_indexes.iter_mut() {
+            entry.btree.save_if_dirty()?;
+        }
         Ok(())
     }
 
@@ -770,6 +1113,9 @@ impl Table {
     /// `Heap::discard_dirty` for the heap side.
     pub(crate) fn discard_dirty_indexes(&mut self) {
         for entry in self.indexed_cols.iter_mut() {
+            entry.btree.discard_dirty();
+        }
+        for entry in self.expression_indexes.iter_mut() {
             entry.btree.discard_dirty();
         }
     }
@@ -787,7 +1133,7 @@ impl Table {
     /// After this call, every indexed tree is marked dirty so the
     /// next `Catalog::checkpoint` persists the recovered state.
     pub(crate) fn rebuild_indexes_from_heap(&mut self) -> io::Result<()> {
-        if self.indexed_cols.is_empty() {
+        if self.indexed_cols.is_empty() && self.expression_indexes.is_empty() {
             return Ok(());
         }
 
@@ -842,6 +1188,34 @@ impl Table {
             fresh.mark_dirty();
             entry.btree = fresh;
         }
+        for entry in self.expression_indexes.iter_mut() {
+            let mut fresh = BTree::create_v2(entry.btree.file_path())?;
+            for (rid, raw) in &raw_rows {
+                let row = if crate::row::row_is_v2(raw) {
+                    crate::row::decode_row_v2(schema, layout, raw, |stub| {
+                        heap.read_overflow_value(stub).map_err(io::Error::from)
+                    })?
+                } else {
+                    decode_row(schema, raw)
+                };
+                let key = expression_key(&entry.meta, &row[entry.root_col_idx])?;
+                if key.is_empty() {
+                    fresh.insert_empty(*rid);
+                } else if entry.meta.unique {
+                    if fresh.lookup(&key).is_some() {
+                        return Err(expression_unique_error(
+                            &self.schema.table_name,
+                            &entry.meta.canonical_text,
+                        ));
+                    }
+                    fresh.insert(key, *rid);
+                } else {
+                    fresh.insert_duplicate(key, *rid);
+                }
+            }
+            fresh.mark_dirty();
+            entry.btree = fresh;
+        }
         Ok(())
     }
 
@@ -857,6 +1231,73 @@ impl Table {
         Some(decode_row(&self.schema, &data))
     }
 
+    /// Read only the requested logical columns from one row.
+    ///
+    /// Output order exactly follows `column_indices`, including duplicates.
+    /// Inline values are decoded directly from the row body. For a v2 row,
+    /// an overflow chain is fetched and verified only when its column was
+    /// requested; an unselected spilled value is never touched.
+    pub fn get_projected(
+        &self,
+        rid: RowId,
+        column_indices: &[usize],
+    ) -> io::Result<Option<Vec<Value>>> {
+        for &column_index in column_indices {
+            if column_index >= self.schema.columns.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "projected column index {column_index} out of range for {} columns",
+                        self.schema.columns.len()
+                    ),
+                ));
+            }
+        }
+
+        let Some(data) = self.heap.get(rid) else {
+            return Ok(None);
+        };
+        let mut values: Vec<Value> = Vec::with_capacity(column_indices.len());
+        for (request_position, &column_index) in column_indices.iter().enumerate() {
+            if let Some(previous_position) = column_indices[..request_position]
+                .iter()
+                .position(|&previous| previous == column_index)
+            {
+                values.push(values[previous_position].clone());
+                continue;
+            }
+
+            let value = if let Some(stub) =
+                crate::row::raw_stub(&self.schema, &self.row_layout, &data, column_index)
+            {
+                let bytes = self
+                    .heap
+                    .read_overflow_value(&stub)
+                    .map_err(io::Error::from)?;
+                match self.schema.columns[column_index].type_id {
+                    TypeId::Str => Value::Str(String::from_utf8(bytes).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid UTF-8 in projected string column: {error}"),
+                        )
+                    })?),
+                    TypeId::Bytes => Value::Bytes(bytes),
+                    TypeId::Json => Value::Json(bytes.into()),
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "fixed-width column has an overflow stub",
+                        ));
+                    }
+                }
+            } else {
+                decode_column(&self.schema, &self.row_layout, &data, column_index)
+            };
+            values.push(value);
+        }
+        Ok(Some(values))
+    }
+
     /// Delete a row. Mission C Phase 7: if the table has indexes, we used to
     /// call `decode_row` here — allocating `Row` + every column's `Value`
     /// just to read the two or three columns that actually feed the index.
@@ -870,9 +1311,12 @@ impl Table {
     /// struct-field borrow splitting, so the btree lives alongside the
     /// page borrow inside the closure.
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
-        if self.indexed_cols.is_empty() {
+        if self.indexed_cols.is_empty() && self.expression_indexes.is_empty() {
             return self.heap.delete(rid);
         }
+        let expression_keys = self.expression_keys_at(rid)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "row not found for index deletion")
+        })?;
 
         // Split the borrow so `indexed_cols` (mutable — the btree lives
         // inside each entry now) can be captured by the closure alongside
@@ -941,6 +1385,14 @@ impl Table {
             }
         }
 
+        for (index, key) in self.expression_indexes.iter_mut().zip(&expression_keys) {
+            if key.is_empty() {
+                index.btree.delete_empty(rid);
+            } else {
+                index.btree.delete_pair(key, rid);
+            }
+        }
+
         self.heap.delete(rid)?;
         // Blocker B3: btree mutations above marked the indexes dirty.
         // The actual persist happens at the next `Catalog::checkpoint`
@@ -971,6 +1423,14 @@ impl Table {
     pub fn delete_many(&mut self, rids: &[RowId]) -> io::Result<u64> {
         if rids.is_empty() {
             return Ok(0);
+        }
+        if !self.expression_indexes.is_empty() {
+            let mut count = 0;
+            for &rid in rids {
+                self.delete(rid)?;
+                count += 1;
+            }
+            return Ok(count);
         }
         if self.indexed_cols.is_empty() {
             for &rid in rids {
@@ -1072,13 +1532,26 @@ impl Table {
     /// append path only writes into an in-memory buffer and is safe.
     pub fn scan_delete_matching_with_hook<P, H>(
         &mut self,
-        pred: P,
+        mut pred: P,
         mut user_hook: H,
     ) -> io::Result<u64>
     where
         P: FnMut(&[u8]) -> bool,
         H: FnMut(RowId, &[u8]),
     {
+        if !self.expression_indexes.is_empty() {
+            let victims = self
+                .heap
+                .scan()
+                .filter(|(_, bytes)| pred(bytes))
+                .collect::<Vec<_>>();
+            let count = victims.len() as u64;
+            for (rid, bytes) in victims {
+                user_hook(rid, &bytes);
+                self.delete(rid)?;
+            }
+            return Ok(count);
+        }
         if self.indexed_cols.is_empty() {
             return self.heap.scan_delete_matching(pred, |rid, bytes| {
                 user_hook(rid, bytes);
@@ -1243,6 +1716,7 @@ impl Table {
         values: &Row,
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
+        self.preflight_update(rid, values)?;
         // Size the new row first: if it exceeds the inline cap, an overflow
         // transition takes delete+insert of a v2 stub row (self-contained,
         // no WAL — the WAL path lives in `Catalog::update`). In-place patch
@@ -1288,6 +1762,11 @@ impl Table {
         encoded: &[u8],
         changed_col_indices: Option<&[usize]>,
     ) -> io::Result<RowId> {
+        self.preflight_update(rid, values)?;
+        let old_expression_keys = self.expression_keys_at(rid)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "row not found for index update")
+        })?;
+        let new_expression_keys = self.expression_keys(values)?;
         let touches_index = if self.indexed_cols.is_empty() {
             false
         } else if let Some(changed) = changed_col_indices {
@@ -1300,38 +1779,6 @@ impl Table {
         };
 
         let old_row = if touches_index { self.get(rid) } else { None };
-
-        // Unique constraint pre-check (before any heap mutation): a unique
-        // column's new value must not already exist on a DIFFERENT row.
-        // Updating a row to its own current value is always legal.
-        if touches_index {
-            for entry in &self.indexed_cols {
-                if !entry.unique {
-                    continue;
-                }
-                let new_val = &values[entry.col_idx];
-                if new_val.is_empty() {
-                    continue;
-                }
-                // No change to this column's value → cannot create a dup.
-                if let Some(old) = old_row.as_ref() {
-                    if &old[entry.col_idx] == new_val {
-                        continue;
-                    }
-                }
-                if let Some(existing_rid) = entry.btree.lookup(new_val) {
-                    if existing_rid != rid {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!(
-                                "unique constraint violation on {}.{}",
-                                self.schema.table_name, entry.col_name
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
 
         let new_rid = self.heap.update(rid, encoded)?;
 
@@ -1396,6 +1843,28 @@ impl Table {
                 }
             }
         }
+        for ((index, old_key), new_key) in self
+            .expression_indexes
+            .iter_mut()
+            .zip(old_expression_keys)
+            .zip(new_expression_keys)
+        {
+            if old_key == new_key && rid == new_rid {
+                continue;
+            }
+            if old_key.is_empty() {
+                index.btree.delete_empty(rid);
+            } else {
+                index.btree.delete_pair(&old_key, rid);
+            }
+            if new_key.is_empty() {
+                index.btree.insert_empty(new_rid);
+            } else if index.meta.unique {
+                index.btree.insert(new_key, new_rid);
+            } else {
+                index.btree.insert_duplicate(new_key, new_rid);
+            }
+        }
         // Blocker B3: any mutated btree is now dirty; checkpoint will
         // persist it. No per-row fsync on this hot path.
         Ok(new_rid)
@@ -1433,6 +1902,12 @@ impl Table {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
+        if self.has_indexed_col(col_idx) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot byte-patch an indexed column",
+            ));
+        }
         let layout = &self.row_layout;
         self.heap.patch_row_shrink(rid, |bytes| {
             patch_var_column_in_place(bytes, layout, col_idx, new_value)
@@ -1454,6 +1929,10 @@ impl Table {
     #[inline]
     pub fn has_indexed_col(&self, col_idx: usize) -> bool {
         self.indexed_cols.iter().any(|c| c.col_idx == col_idx)
+            || self
+                .expression_indexes
+                .iter()
+                .any(|index| index.root_col_idx == col_idx)
     }
 
     /// A `is_indexed[col_idx]` mask over all schema columns, for
@@ -1661,5 +2140,109 @@ impl Table {
             btree,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use super::*;
+
+    fn projected_table() -> (tempfile::TempDir, Table, RowId, Vec<Value>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let schema = Schema {
+            table_name: "Projected".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "document".into(),
+                    type_id: TypeId::Json,
+                    required: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "payload".into(),
+                    type_id: TypeId::Bytes,
+                    required: true,
+                    position: 2,
+                },
+            ],
+        };
+        let mut table = Table::create(schema, dir.path()).expect("create table");
+        let json_text = format!(r#"{{"payload":"{}"}}"#, "j".repeat(9_000));
+        let json = crate::pj1::parse_json_text(&json_text).expect("valid JSON");
+        let row = vec![
+            Value::Int(7),
+            Value::Json(json.into_boxed_slice()),
+            Value::Bytes(vec![0xA5; 9_000]),
+        ];
+        let rid = table.insert(&row).expect("insert spilled row");
+        let raw = table.heap.get(rid).expect("raw row");
+        assert!(crate::row::row_is_v2(&raw));
+        assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1).is_some());
+        assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 2).is_some());
+        (dir, table, rid, row)
+    }
+
+    #[test]
+    fn projected_read_preserves_order_duplicates_and_spilled_values() {
+        let (_dir, table, rid, row) = projected_table();
+        let projected = table
+            .get_projected(rid, &[2, 0, 1, 2])
+            .expect("projected read")
+            .expect("row exists");
+        assert_eq!(
+            projected,
+            vec![
+                row[2].clone(),
+                row[0].clone(),
+                row[1].clone(),
+                row[2].clone()
+            ]
+        );
+        assert_eq!(
+            table.get_projected(rid, &[]).expect("empty projection"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            table
+                .get_projected(
+                    RowId {
+                        page_id: u32::MAX,
+                        slot_index: u16::MAX,
+                    },
+                    &[0],
+                )
+                .expect("missing RID"),
+            None
+        );
+        assert!(table.get_projected(rid, &[3]).is_err());
+    }
+
+    #[test]
+    fn projected_read_ignores_unselected_corrupt_spill() {
+        let (_dir, mut table, rid, row) = projected_table();
+        let raw = table.heap.get(rid).expect("raw row");
+        let document_stub = crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1)
+            .expect("document stub");
+        table
+            .heap
+            .write_overflow_page(document_stub.first_page, OVERFLOW_CHAIN_END, b"corrupt", 0)
+            .expect("corrupt selected chain deterministically");
+
+        let healthy_projection = table
+            .get_projected(rid, &[0, 2])
+            .expect("unselected corruption must be untouched")
+            .expect("row exists");
+        assert_eq!(healthy_projection, vec![row[0].clone(), row[2].clone()]);
+
+        let error = table
+            .get_projected(rid, &[1])
+            .expect_err("selected corrupt chain must fail");
+        assert!(error.to_string().contains("overflow value length"));
     }
 }

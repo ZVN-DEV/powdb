@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.13.0] - 2026-07-15
+
+### Added
+
+- **Persistent JSON-path indexes.** Native PowQL can add, add unique, and drop
+  indexes over scalar paths with `alter T add index (.data->key)`. Equality,
+  range, and bounded ordered reads use the path index automatically, while
+  missing indexes retain a sequential fallback. SQL `CREATE INDEX` and
+  `CREATE UNIQUE INDEX` lower direct JSON `->` paths to the same index form.
+- **Expression-valued JSON operations.** JSON paths now work as group keys,
+  aggregate arguments, and order keys, including path-based `HAVING`, limit,
+  and offset shapes.
+- **Lossless native result wire.** Additive typed PowQL, parameterized PowQL,
+  and SQL request/result frames preserve actual cell types. The TypeScript
+  client exposes `queryNative()` and `querySqlNative()` for exact bytes,
+  recursive JSON, and integers outside JavaScript's safe range. Legacy query
+  methods and string result frames remain unchanged.
+- **SQL JSON arrows.** The SQL frontend supports postfix `->` extraction and
+  `->>` canonical text extraction for object keys and array indexes.
+
+### Changed
+
+- **PowQL aggregates over joins are symmetric by default.** `sum`, `count`,
+  and `avg` deduplicate fan-out by source row identity. `raw` restores joined-row
+  evaluation explicitly; SQL aggregates always retain raw SQL semantics.
+- **Concurrent autocommit reads share server admission.** Independent
+  read-only queries can overlap, while writers and explicit transactions remain
+  exclusive and preserve complete before-or-after visibility.
+- **Compound join predicates use hash plus residual evaluation.** An equi-key
+  inside a compound `ON` clause selects a hash join, and oversized pure
+  non-equi nested loops fail before entering an unbounded pair loop.
+
+### Fixed
+
+- **Query deadlines and disconnects cooperatively stop work.** Supported scan,
+  join, group, and mutation-discovery loops release server locks/admission when
+  cancelled. Mutation writes retain statement-atomic boundaries.
+- **Remote result types no longer require lossy string rendering.** Native
+  typed results preserve Empty, strings, raw Bytes, and PJ1 JSON on the wire;
+  `json_type()` can distinguish missing paths from explicit JSON null remotely.
+- **Sync survives the lazy v5-to-v6 catalog format bump.** Because a database
+  stays on catalog format v5 on disk until the first expression index activates
+  v6, segment identity now treats catalog format as a compatibility annotation
+  rather than a strict-equality field. Producers stamp the database's active
+  catalog version (a database that never activated v6 keeps stamping v5, so
+  v0.12 replicas still match), consumers accept an older format and reject a
+  newer one, a catalog-format increase across a segment chain is accepted while
+  a decrease is rejected, and the primary's pull gate accepts any replica whose
+  maximum supported format is at least the database's active format. Database
+  id, primary generation, WAL format, and segment format remain strict.
+
 ## [0.12.0] - 2026-07-14
 
 Native JSON. A new `json` column type stores documents in **PJ1**, a canonical
@@ -45,8 +98,11 @@ faster than the generic decode path.
 ### Known limitations (documented in docs/POWQL.md)
 
 - Aggregating over a path (`sum(.data->price)`) and grouping/ordering BY a
-  path fail with a clear error; both arrive with the expression-index work in
-  a following release.
+  path are unsupported. Correction: earlier notes claimed these fail with "a
+  clear error"; the actual 0.12 parser result was the opaque
+  `unexpected trailing token near token N: '->'` message, not a targeted one.
+  Both the support and the targeted errors arrive with the expression-index
+  work in a following release (v0.13).
 - Over the network, `json_type()` cannot distinguish JSON `null` from a
   missing path (both render as NULL); embedded use distinguishes them. A
   typed wire surface fixes this in a following release.

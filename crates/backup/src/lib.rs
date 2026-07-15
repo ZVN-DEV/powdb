@@ -1,7 +1,8 @@
 //! Physical backup, restore, and point-in-time recovery for PowDB.
 //!
-//! Supports full snapshots ([`full_backup`]) and page-level incremental
-//! (differential) backups against a full base ([`incremental_backup`]).
+//! Supports full snapshots ([`full_backup`]) and incremental (differential)
+//! backups against a full base ([`incremental_backup`]). Heap files use
+//! page-LSN deltas; B+tree index files are copied as opaque whole artifacts.
 //! Restore rebuilds a data directory from a full backup ([`restore()`]), or
 //! chains a full base plus ordered increments for coarse point-in-time
 //! recovery ([`restore_chain`]). [`RestoreSyncMode`] controls whether a

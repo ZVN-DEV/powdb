@@ -64,6 +64,7 @@ pub enum Token {
     Sum,          // sum
     Min,          // min
     Max,          // max
+    Raw,          // raw (aggregate bag semantics)
     Is,           // is
     Null,         // null
 
@@ -91,6 +92,7 @@ pub enum Token {
 
     // JSON functions
     JsonType, // json_type
+    JsonText, // json_text
 
     // Type conversion
     Cast, // cast
@@ -224,6 +226,7 @@ impl Token {
             Token::Sum => "'sum'".into(),
             Token::Min => "'min'".into(),
             Token::Max => "'max'".into(),
+            Token::Raw => "'raw'".into(),
             Token::Is => "'is'".into(),
             Token::Null => "'null'".into(),
 
@@ -245,6 +248,7 @@ impl Token {
             Token::DateAdd => "'date_add'".into(),
             Token::DateDiff => "'date_diff'".into(),
             Token::JsonType => "'json_type'".into(),
+            Token::JsonText => "'json_text'".into(),
             Token::Cast => "'cast'".into(),
             Token::Case => "'case'".into(),
             Token::When => "'when'".into(),
@@ -358,6 +362,7 @@ impl Token {
             Token::Sum => "sum",
             Token::Min => "min",
             Token::Max => "max",
+            Token::Raw => "raw",
             Token::Is => "is",
             Token::Null => "null",
             Token::Upper => "upper",
@@ -377,6 +382,7 @@ impl Token {
             Token::DateAdd => "date_add",
             Token::DateDiff => "date_diff",
             Token::JsonType => "json_type",
+            Token::JsonText => "json_text",
             Token::Cast => "cast",
             Token::Case => "case",
             Token::When => "when",

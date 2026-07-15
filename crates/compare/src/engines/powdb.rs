@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 
-use powdb_query::ast::{AggFunc, Expr, Literal};
+use powdb_query::ast::{AggFunc, AggregateMode, Expr, Literal};
 use powdb_query::executor::{Engine, PreparedQuery};
 use powdb_query::plan::PlanNode;
 use powdb_query::result::QueryResult;
@@ -162,7 +162,9 @@ impl PowdbEngine {
         let plan = PlanNode::Aggregate {
             input: Box::new(input),
             function: func,
-            field: Some(field.to_string()),
+            argument: Some(Expr::Field(field.to_string())),
+            mode: AggregateMode::Raw,
+            provenance_alias: None,
         };
         self.engine
             .borrow_mut()
@@ -267,7 +269,7 @@ impl BenchEngine for PowdbEngine {
                 .create_index_with_unique("id", &data_dir, true)
                 .expect("build id index");
 
-            self.layout = Some(RowLayout::new(&table.schema));
+            self.layout = Some(RowLayout::new(table.schema()));
 
             // Activate mmap for zero-syscall reads.
             table.heap.enable_mmap();
@@ -290,7 +292,7 @@ impl BenchEngine for PowdbEngine {
         let data = tbl.heap.get(rid)?;
         // Columns: id=0, name=1, age=2, status=3, email=4, created_at=5
         let layout = self.layout.as_ref().unwrap();
-        match powdb_storage::row::decode_column(&tbl.schema, layout, &data, 1) {
+        match powdb_storage::row::decode_column(tbl.schema(), layout, &data, 1) {
             Value::Str(s) => Some(s),
             _ => None,
         }

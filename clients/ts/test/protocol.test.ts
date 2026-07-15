@@ -18,10 +18,23 @@ import {
   MAX_COLUMNS,
   MAX_ROWS,
   MAX_SYNC_UNITS,
+  MSG_QUERY_NATIVE,
+  MSG_QUERY_PARAMS_NATIVE,
+  MSG_QUERY_SQL_NATIVE,
+  MSG_RESULT_ROWS_NATIVE,
+  MSG_RESULT_SCALAR_NATIVE,
   type Message,
+  type WireValue,
   type WireSyncStatus,
 } from "../src/protocol.js";
-import { Client, PowDBError, isPowDBError } from "../src/index.js";
+import {
+  Client,
+  PowDBError,
+  isPowDBError,
+  assertServerCatalogVersionSupported,
+  SUPPORTED_CATALOG_VERSION,
+  type WireValue as PublicWireValue,
+} from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -231,6 +244,169 @@ async function main() {
     assert.throws(() => tryDecode(frame), /truncated affected count/);
   });
 
+  console.log("\nNative typed wire surface");
+
+  await test("legacy 0x07 row frame remains byte-identical", () => {
+    assert.equal(
+      encode({ type: "ResultRows", columns: ["x"], rows: [["y"]] }).toString("hex"),
+      "07001000000001000100000078010000000100000079",
+    );
+  });
+
+  const nativeGoldenHex =
+    "16009c000000090001000000650100000069010000006601000000620100000073010000006401000000750100000078010000006a0100000000000000000108000000ffffffffffffdfff02080000000000000000000440030100000001040600000068c3a96c6c6f050800000015615391a61f0600061000000000112233445566778899aabbccddeeff0704000000007f80ff0809000000030100000000002000";
+  const nativeValues: WireValue[] = [
+    { type: "empty" },
+    { type: "int", value: -9007199254740993n },
+    { type: "float", value: 2.5 },
+    { type: "bool", value: true },
+    { type: "str", value: "héllo" },
+    { type: "datetime", value: 1723650123456789n },
+    {
+      type: "uuid",
+      value: Uint8Array.from([
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+      ]),
+    },
+    { type: "bytes", value: Uint8Array.from([0x00, 0x7f, 0x80, 0xff]) },
+    {
+      type: "json",
+      value: 9007199254740993n,
+      pj1: Uint8Array.from([3, 1, 0, 0, 0, 0, 0, 32, 0]),
+    },
+  ];
+
+  await test("native mixed row matches the Rust golden byte-for-byte", () => {
+    const encoded = encode({
+      type: "ResultRowsNative",
+      columns: ["e", "i", "f", "b", "s", "d", "u", "x", "j"],
+      rows: [nativeValues],
+    });
+    assert.equal(encoded.toString("hex"), nativeGoldenHex);
+    const decoded = tryDecode(Buffer.from(nativeGoldenHex, "hex"));
+    assert.ok(decoded);
+    assert.equal(decoded.msg.type, "ResultRowsNative");
+    if (decoded.msg.type === "ResultRowsNative") {
+      assert.deepStrictEqual(decoded.msg.rows, [nativeValues]);
+    }
+  });
+
+  await test("public lossless cells preserve empty, string null, and raw PJ1 null", () => {
+    const values: PublicWireValue[] = [
+      { type: "empty" },
+      { type: "str", value: "null" },
+      {
+        type: "json",
+        value: null,
+        pj1: Uint8Array.from([0]),
+      },
+    ];
+    const decoded = tryDecode(
+      encode({
+        type: "ResultRowsNative",
+        columns: ["missing", "text", "json"],
+        rows: [values],
+      }),
+    );
+    assert.ok(decoded);
+    assert.equal(decoded.msg.type, "ResultRowsNative");
+    if (decoded.msg.type === "ResultRowsNative") {
+      assert.deepStrictEqual(decoded.msg.rows[0], values);
+      const json = decoded.msg.rows[0]?.[2];
+      assert.equal(json?.type, "json");
+      if (json?.type === "json") {
+        assert.deepStrictEqual(json.pj1, Uint8Array.from([0]));
+      }
+    }
+  });
+
+  await test("native request tags round-trip without legacy fallback", () => {
+    const requests: Message[] = [
+      { type: "QueryNative", query: "T" },
+      {
+        type: "QueryWithParamsNative",
+        query: "T filter .x = $1",
+        params: [{ tag: "int", value: 7n }],
+      },
+      { type: "QuerySqlNative", query: "SELECT * FROM T" },
+    ];
+    assert.deepStrictEqual(requests.map((request) => encode(request)[0]), [
+      MSG_QUERY_NATIVE,
+      MSG_QUERY_PARAMS_NATIVE,
+      MSG_QUERY_SQL_NATIVE,
+    ]);
+    for (const request of requests) {
+      assert.deepStrictEqual(tryDecode(encode(request))?.msg, request);
+    }
+  });
+
+  await test("native scalar rejects malformed typed cells", () => {
+    const typedFrame = (cell: Buffer): Buffer => {
+      const out = Buffer.alloc(6 + cell.length);
+      out[0] = MSG_RESULT_SCALAR_NATIVE;
+      out.writeUInt32LE(cell.length, 2);
+      cell.copy(out, 6);
+      return out;
+    };
+    const cell = (tag: number, body: number[]): Buffer => {
+      const out = Buffer.alloc(5 + body.length);
+      out[0] = tag;
+      out.writeUInt32LE(body.length, 1);
+      Buffer.from(body).copy(out, 5);
+      return out;
+    };
+    for (const malformed of [
+      cell(0xff, []),
+      cell(1, [0, 0, 0, 0, 0, 0, 0]),
+      cell(3, [2]),
+      cell(4, [0xff]),
+      cell(8, [0xff]),
+      cell(8, [0, 0]),
+    ]) {
+      assert.throws(() => tryDecode(typedFrame(malformed)));
+    }
+    assert.throws(() => tryDecode(typedFrame(Buffer.concat([cell(0, []), Buffer.from([0])]))), /trailing bytes/);
+  });
+
+  await test("native JSON recursively decodes unsafe integers as bigint", () => {
+    const pj1 = Buffer.from(
+      "070100000011000000160000002c000000010000006106010000000d00000016000000030100000000002000",
+      "hex",
+    );
+    const cell = Buffer.concat([
+      Buffer.from([8]),
+      Buffer.from([pj1.length, 0, 0, 0]),
+      pj1,
+    ]);
+    const frame = Buffer.alloc(6 + cell.length);
+    frame[0] = MSG_RESULT_SCALAR_NATIVE;
+    frame.writeUInt32LE(cell.length, 2);
+    cell.copy(frame, 6);
+    const decoded = tryDecode(frame)?.msg;
+    assert.equal(decoded?.type, "ResultScalarNative");
+    if (decoded?.type === "ResultScalarNative") {
+      assert.deepStrictEqual(decoded.value, {
+        type: "json",
+        value: { a: [9007199254740993n] },
+        pj1: new Uint8Array(pj1),
+      });
+    }
+  });
+
+  await test("native rows reject impossible counts before allocation", () => {
+    const payload = Buffer.alloc(2 + 4 + 1 + 4);
+    payload.writeUInt16LE(1, 0);
+    payload.writeUInt32LE(1, 2);
+    payload[6] = 0x78;
+    payload.writeUInt32LE(MAX_ROWS, 7);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame[0] = MSG_RESULT_ROWS_NATIVE;
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /too short/);
+  });
+
   console.log("\nConnect frame — optional username (multi-user auth)");
 
   // Helper: length-prefixed string, identical to the wire encoding.
@@ -375,6 +551,22 @@ async function main() {
       type: "SyncStatus",
       replicaId: "replica-a",
     });
+  });
+
+  await test("assertServerCatalogVersionSupported accepts <= max, rejects newer", () => {
+    // A server on an older or equal catalog format is readable.
+    assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION - 1);
+    assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION);
+    // A server on a newer catalog format the client cannot read is rejected.
+    assert.throws(
+      () => assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION + 1),
+      /newer than this client supports/,
+    );
+    // An explicit client max is honored.
+    assertServerCatalogVersionSupported(5, 5);
+    assert.throws(() => assertServerCatalogVersionSupported(6, 5), /upgrade the client/);
+    // A nonsense version is rejected.
+    assert.throws(() => assertServerCatalogVersionSupported(0), /invalid server catalog version/);
   });
 
   await test("encode/decode SyncPull request", () => {
@@ -676,6 +868,90 @@ async function main() {
 
     await client.close();
     await new Promise<void>((r) => server.close(() => r()));
+  });
+
+  await test("Client native APIs preserve types and never replay as legacy queries", async () => {
+    let legacyRequests = 0;
+    const server = net.createServer((sock) => {
+      let scratch = Buffer.alloc(0);
+      sock.on("data", (chunk) => {
+        const collected = collectFrames(scratch, Buffer.from(chunk));
+        scratch = collected.rest;
+        for (const msg of collected.messages) {
+          switch (msg.type) {
+            case "Connect":
+              sock.write(encode({ type: "ConnectOk", version: "0.13.0" }));
+              break;
+            case "QueryNative":
+              sock.write(
+                encode({
+                  type: "ResultRowsNative",
+                  columns: ["e", "i", "f", "b", "s", "d", "u", "x", "j"],
+                  rows: [nativeValues],
+                }),
+              );
+              break;
+            case "QueryWithParamsNative":
+              sock.write(
+                encode({
+                  type: "ResultScalarNative",
+                  value: { type: "int", value: 9007199254740993n },
+                }),
+              );
+              break;
+            case "QuerySqlNative":
+              sock.write(
+                encode({
+                  type: "ResultScalarNative",
+                  value: { type: "datetime", value: 1723650123456789n },
+                }),
+              );
+              break;
+            case "Query":
+            case "QueryWithParams":
+            case "QuerySql":
+              legacyRequests++;
+              break;
+            case "Disconnect":
+              sock.end();
+              break;
+          }
+        }
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+
+    const rows = await client.queryNative("T");
+    assert.equal(rows.kind, "rows");
+    if (rows.kind === "rows") {
+      assert.deepStrictEqual(rows.rows[0], [
+        null,
+        -9007199254740993n,
+        2.5,
+        true,
+        "héllo",
+        1723650123456789n,
+        "00112233-4455-6677-8899-aabbccddeeff",
+        Uint8Array.from([0x00, 0x7f, 0x80, 0xff]),
+        9007199254740993n,
+      ]);
+    }
+    const parameterized = await client.queryNative("T filter .x = $1", [7]);
+    assert.deepStrictEqual(parameterized, {
+      kind: "scalar",
+      value: 9007199254740993n,
+    });
+    const sql = await client.querySqlNative("SELECT x FROM T");
+    assert.deepStrictEqual(sql, {
+      kind: "scalar",
+      value: 1723650123456789n,
+    });
+    assert.equal(legacyRequests, 0);
+
+    await client.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   console.log("\nCancellation — abort during in-flight query");

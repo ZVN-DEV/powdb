@@ -961,7 +961,7 @@ fn collect_field_indices(expr: &Expr, columns: &[String], out: &mut Vec<usize>) 
         Expr::UnaryOp(_, inner) => {
             collect_field_indices(inner, columns, out);
         }
-        Expr::FunctionCall(_, inner) => {
+        Expr::FunctionCall(_, inner, _) => {
             collect_field_indices(inner, columns, out);
         }
         Expr::ScalarFunc(_, args) => {

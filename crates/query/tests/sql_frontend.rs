@@ -3,6 +3,100 @@ use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
 
 #[test]
+fn sql_json_arrows_preserve_scalar_and_canonical_text_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type Post { required id: int, data: json }")
+        .unwrap();
+    engine
+        .execute_powql(
+            r#"insert Post { id := 1, data := "{\"arr\":[1,2],\"flag\":true,\"name\":\"alice\",\"nil\":null,\"obj\":{\"b\":2,\"a\":1}}" }"#,
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql(
+            "SELECT data ->> 'name' AS name, data -> 'arr' ->> 0 AS first, data ->> 'flag' AS flag, data ->> 'arr' AS arr, data ->> 'obj' AS obj, data ->> 'nil' AS nil, data ->> 'missing' AS missing, data -> 'arr' -> 1 AS raw_second FROM Post WHERE data ->> 'name' = 'alice'",
+        )
+        .unwrap();
+    let QueryResult::Rows { columns, rows } = result else {
+        panic!("expected rows");
+    };
+    assert_eq!(
+        columns,
+        vec![
+            "name",
+            "first",
+            "flag",
+            "arr",
+            "obj",
+            "nil",
+            "missing",
+            "raw_second",
+        ]
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Str("alice".into()),
+            Value::Str("1".into()),
+            Value::Str("true".into()),
+            Value::Str("[1,2]".into()),
+            Value::Str(r#"{"a":1,"b":2}"#.into()),
+            Value::Empty,
+            Value::Empty,
+            Value::Int(2),
+        ]]
+    );
+}
+
+#[test]
+fn sql_json_arrow_expression_orders_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type Post { required id: int, data: json }")
+        .unwrap();
+    engine
+        .execute_powql(
+            r#"insert Post { id := 1, data := "{\"kind\":\"x\",\"rank\":\"b\"}" }, { id := 2, data := "{\"kind\":\"x\",\"rank\":\"a\"}" }, { id := 3, data := "{\"kind\":\"y\",\"rank\":\"c\"}" }"#,
+        )
+        .unwrap();
+
+    let result = engine
+        .execute_sql("SELECT id FROM Post ORDER BY data ->> 'rank' ASC")
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = result else {
+        panic!("expected rows");
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(2)],
+            vec![Value::Int(1)],
+            vec![Value::Int(3)],
+        ]
+    );
+
+    let grouped = engine
+        .execute_sql(
+            "SELECT data ->> 'kind' AS kind, COUNT(*) AS n FROM Post GROUP BY data ->> 'kind' ORDER BY data ->> 'kind' ASC",
+        )
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = grouped else {
+        panic!("expected grouped rows");
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Str("x".into()), Value::Int(2)],
+            vec![Value::Str("y".into()), Value::Int(1)],
+        ]
+    );
+}
+
+#[test]
 fn sql_select_matches_powql_and_shares_plan_cache() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(dir.path()).unwrap();

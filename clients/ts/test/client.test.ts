@@ -800,6 +800,55 @@ async function main() {
   });
 
   // ──────────────────────────────────────────────────────────
+  console.log("queryNativeRaw: lossless WireValue access");
+  // ──────────────────────────────────────────────────────────
+
+  const rawDoc = tbl("RawDoc");
+  await test("queryNativeRaw exposes raw pj1 bytes and Empty/Str/JSON-null identity", async () => {
+    await client.query(
+      `type ${rawDoc} { required unique id: int, data: json, note: str, extra: str }`,
+    );
+    // note holds the SQL string "null"; extra is omitted (Empty); data holds a
+    // JSON null (a document, stored as PJ1), three values the convenience
+    // conversion would blur into `null`.
+    await client.query(
+      `insert ${rawDoc} { id := 1, data := "null", note := "null" }`,
+    );
+
+    const raw = await client.queryNativeRaw(
+      `${rawDoc} filter .id = 1 { .note, .extra, .data }`,
+    );
+    assert.equal(raw.kind, "rows", `expected raw rows, got ${raw.kind}`);
+    if (raw.kind !== "rows") return;
+    assert.deepStrictEqual(raw.columns, ["note", "extra", "data"]);
+    assert.equal(raw.rows.length, 1);
+    const [note, extra, data] = raw.rows[0];
+
+    // The three cells carry distinct wire type tags.
+    assert.deepStrictEqual(note, { type: "str", value: "null" });
+    assert.deepStrictEqual(extra, { type: "empty" });
+    assert.equal(data.type, "json", `expected a json cell, got ${data.type}`);
+    if (data.type !== "json") return;
+    // The JSON value decodes to null, but the raw PJ1 bytes are preserved.
+    assert.equal(data.value, null);
+    assert.ok(data.pj1 instanceof Uint8Array, "pj1 must be raw bytes");
+    assert.ok(data.pj1.length > 0, "a JSON null still encodes to a PJ1 tag byte");
+
+    // The convenience path collapses Empty and the JSON null to the same
+    // `null`, which is exactly why the raw surface exists.
+    const cooked = await client.queryNative(
+      `${rawDoc} filter .id = 1 { .note, .extra, .data }`,
+    );
+    assert.equal(cooked.kind, "rows");
+    if (cooked.kind !== "rows") return;
+    assert.equal(cooked.rows[0][0], "null"); // Str("null") survives as a string
+    assert.equal(cooked.rows[0][1], null); // Empty -> null
+    assert.equal(cooked.rows[0][2], null); // JSON null -> null (indistinguishable)
+  });
+
+  await client.query(`drop ${rawDoc}`);
+
+  // ──────────────────────────────────────────────────────────
   // Cleanup
   // ──────────────────────────────────────────────────────────
 

@@ -15,7 +15,7 @@ pub(super) fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
             collect_field_refs(r, out);
         }
         Expr::UnaryOp(_, inner) => collect_field_refs(inner, out),
-        Expr::FunctionCall(_, inner) => collect_field_refs(inner, out),
+        Expr::FunctionCall(_, inner, _) => collect_field_refs(inner, out),
         Expr::Coalesce(l, r) => {
             collect_field_refs(l, out);
             collect_field_refs(r, out);
@@ -164,7 +164,7 @@ pub(super) fn contains_subquery(expr: &Expr) -> bool {
         }
         Expr::ScalarFunc(_, args) => args.iter().any(contains_subquery),
         Expr::Cast(inner, _) => contains_subquery(inner),
-        Expr::FunctionCall(_, inner) => contains_subquery(inner),
+        Expr::FunctionCall(_, inner, _) => contains_subquery(inner),
         Expr::Coalesce(l, r) => contains_subquery(l) || contains_subquery(r),
         _ => false,
     }
@@ -434,6 +434,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             if *func == ScalarFn::JsonType {
                 return eval_json_type(args.first(), row, columns);
             }
+            if *func == ScalarFn::JsonText {
+                return eval_json_text(args.first(), row, columns);
+            }
             let vals: Vec<Value> = args.iter().map(|a| eval_expr(a, row, columns)).collect();
             eval_scalar_func(*func, &vals)
         }
@@ -463,9 +466,7 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             eval_cast(val, *cast_type)
         }
         Expr::ValueLit(v) => v.clone(),
-        Expr::FunctionCall(_, _) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => {
-            Value::Empty
-        }
+        Expr::FunctionCall(..) | Expr::Param(_) | Expr::Window { .. } | Expr::Null => Value::Empty,
     }
 }
 
@@ -562,6 +563,37 @@ fn eval_json_type(arg: Option<&Expr>, row: &[Value], columns: &[String]) -> Valu
         Some(6) => Value::Str("array".into()),
         Some(7) => Value::Str("object".into()),
         // Missing path (no node) or a defensive truncated/reserved node.
+        _ => Value::Empty,
+    }
+}
+
+/// SQL `->>` semantics over the raw addressed PJ1 node. Strings are returned
+/// without JSON quotes; numbers and booleans use canonical JSON spelling;
+/// objects and arrays return canonical JSON text. Missing paths and JSON null
+/// both map to `Empty`.
+fn eval_json_text(arg: Option<&Expr>, row: &[Value], columns: &[String]) -> Value {
+    let Some(arg) = arg else {
+        return Value::Empty;
+    };
+    let node: Option<Vec<u8>> = match arg {
+        Expr::JsonPath { base, segments } => {
+            let base_val = eval_expr(base, row, columns);
+            walk_json_path(&base_val, segments).map(|node| node.to_vec())
+        }
+        other => match eval_expr(other, row, columns) {
+            Value::Json(bytes) => Some(bytes.into_vec()),
+            _ => None,
+        },
+    };
+    let Some(node) = node else {
+        return Value::Empty;
+    };
+    match node.first().copied() {
+        Some(0) => Value::Empty,
+        Some(5) => pj1_scalarize(&node),
+        Some(1..=4) | Some(6) | Some(7) => powdb_storage::pj1::pj1_to_text(&node)
+            .map(Value::Str)
+            .unwrap_or(Value::Empty),
         _ => Value::Empty,
     }
 }
@@ -751,7 +783,7 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
         }
         // `json_type` is intercepted in `eval_expr` (it needs the raw PJ1 node,
         // not a scalarized Value); it never reaches this Value-based dispatch.
-        ScalarFn::JsonType => Value::Empty,
+        ScalarFn::JsonType | ScalarFn::JsonText => Value::Empty,
     }
 }
 
