@@ -1,0 +1,587 @@
+{
+  "benchmark": "expression_index_release_gate",
+  "cardinalities": [
+    {
+      "queries": [
+        {
+          "indexed": {
+            "max_ms": 0.002125,
+            "median_ms": 0.001791,
+            "min_ms": 0.0015,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              0.002125,
+              0.0020829999999999998,
+              0.002,
+              0.001917,
+              0.001791,
+              0.001542,
+              0.0015,
+              0.001542,
+              0.001667
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 key=Literal(Int(894558))",
+          "indexed_speedup": 179.36906756002233,
+          "name": "equality",
+          "query": "Doc filter .data->metrics->score = 894558 { .id }",
+          "query_fingerprint": "fnv1a64:ff259d3caf60bb81",
+          "sequential": {
+            "max_ms": 0.341042,
+            "median_ms": 0.32125,
+            "min_ms": 0.310916,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              0.329167,
+              0.341042,
+              0.32125,
+              0.32025,
+              0.311292,
+              0.319375,
+              0.327125,
+              0.310916,
+              0.329459
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Eq, Literal(Int(894558)))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 0.079666,
+            "median_ms": 0.066875,
+            "min_ms": 0.06525,
+            "result_digest_fnv1a64": "8d1d421b59b2bf61",
+            "row_count": 102,
+            "samples_ms": [
+              0.06525,
+              0.066875,
+              0.06625,
+              0.067,
+              0.06674999999999999,
+              0.068125,
+              0.0675,
+              0.079666,
+              0.0655
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprRangeScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 start=Some((Literal(Int(250000)), true)) end=Some((Literal(Int(260000)), false))",
+          "indexed_speedup": 7.991895327102803,
+          "name": "range",
+          "query": "Doc filter .data->metrics->score >= 250000 and .data->metrics->score < 260000 { .id }",
+          "query_fingerprint": "fnv1a64:3009fe7d24fa4d5b",
+          "sequential": {
+            "max_ms": 0.621958,
+            "median_ms": 0.534458,
+            "min_ms": 0.517041,
+            "result_digest_fnv1a64": "8d1d421b59b2bf61",
+            "row_count": 102,
+            "samples_ms": [
+              0.517041,
+              0.599875,
+              0.621958,
+              0.576291,
+              0.529917,
+              0.530459,
+              0.534458,
+              0.532792,
+              0.5363749999999999
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Gte, Literal(Int(250000))), And, BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Lt, Literal(Int(260000))))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 0.0052499999999999995,
+            "median_ms": 0.0050409999999999995,
+            "min_ms": 0.0047079999999999995,
+            "result_digest_fnv1a64": "885ce2dc46434c5f",
+            "row_count": 20,
+            "samples_ms": [
+              0.005167,
+              0.0052499999999999995,
+              0.005125,
+              0.005,
+              0.0047079999999999995,
+              0.0050409999999999995,
+              0.004834,
+              0.0050409999999999995,
+              0.004958
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  OrderedExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 descending=true limit=Literal(Int(20)) offset=None",
+          "indexed_speedup": 3387.538781987701,
+          "name": "order_limit",
+          "query": "Doc order .data->metrics->score desc limit 20 { .id, score: .data->metrics->score }",
+          "query_fingerprint": "fnv1a64:2ac501b20eb24f74",
+          "sequential": {
+            "max_ms": 17.703583,
+            "median_ms": 17.076583,
+            "min_ms": 15.812875,
+            "result_digest_fnv1a64": "885ce2dc46434c5f",
+            "row_count": 20,
+            "samples_ms": [
+              16.604125,
+              16.105791,
+              17.351333,
+              16.144042000000002,
+              15.812875,
+              17.703583,
+              17.46625,
+              17.076583,
+              17.102583000000003
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  Limit count=Literal(Int(20))\n    Sort keys=[v1:.data->\"metrics\"->\"score\" desc]\n      SeqScan table=Doc"
+        }
+      ],
+      "rows": 10000
+    },
+    {
+      "queries": [
+        {
+          "indexed": {
+            "max_ms": 0.001542,
+            "median_ms": 0.0013340000000000001,
+            "min_ms": 0.001291,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              0.001542,
+              0.001375,
+              0.0014169999999999999,
+              0.001333,
+              0.0013340000000000001,
+              0.001333,
+              0.001458,
+              0.0013340000000000001,
+              0.001291
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 key=Literal(Int(894558))",
+          "indexed_speedup": 1114.0367316341828,
+          "name": "equality",
+          "query": "Doc filter .data->metrics->score = 894558 { .id }",
+          "query_fingerprint": "fnv1a64:ff259d3caf60bb81",
+          "sequential": {
+            "max_ms": 1.5927499999999999,
+            "median_ms": 1.4861250000000001,
+            "min_ms": 1.4098750000000002,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              1.4098750000000002,
+              1.4552910000000001,
+              1.5092079999999999,
+              1.4861250000000001,
+              1.5927499999999999,
+              1.4936669999999999,
+              1.5141250000000002,
+              1.479583,
+              1.4607080000000001
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Eq, Literal(Int(894558)))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 0.409208,
+            "median_ms": 0.30520800000000003,
+            "min_ms": 0.260125,
+            "result_digest_fnv1a64": "4a728fc38d43d28d",
+            "row_count": 400,
+            "samples_ms": [
+              0.332084,
+              0.286584,
+              0.271667,
+              0.260125,
+              0.316625,
+              0.409208,
+              0.330584,
+              0.295958,
+              0.30520800000000003
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprRangeScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 start=Some((Literal(Int(250000)), true)) end=Some((Literal(Int(260000)), false))",
+          "indexed_speedup": 7.744308799245104,
+          "name": "range",
+          "query": "Doc filter .data->metrics->score >= 250000 and .data->metrics->score < 260000 { .id }",
+          "query_fingerprint": "fnv1a64:3009fe7d24fa4d5b",
+          "sequential": {
+            "max_ms": 2.47975,
+            "median_ms": 2.363625,
+            "min_ms": 2.230625,
+            "result_digest_fnv1a64": "4a728fc38d43d28d",
+            "row_count": 400,
+            "samples_ms": [
+              2.47975,
+              2.363625,
+              2.393292,
+              2.378334,
+              2.320375,
+              2.230625,
+              2.286166,
+              2.41425,
+              2.3254170000000003
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Gte, Literal(Int(250000))), And, BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Lt, Literal(Int(260000))))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 0.058582999999999996,
+            "median_ms": 0.0048330000000000005,
+            "min_ms": 0.004666,
+            "result_digest_fnv1a64": "baf4d162ee1bf69f",
+            "row_count": 20,
+            "samples_ms": [
+              0.005167,
+              0.0048330000000000005,
+              0.00475,
+              0.004667,
+              0.004666,
+              0.004667,
+              0.058582999999999996,
+              0.005582999999999999,
+              0.004875
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  OrderedExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 descending=true limit=Literal(Int(20)) offset=None",
+          "indexed_speedup": 19094.43740947651,
+          "name": "order_limit",
+          "query": "Doc order .data->metrics->score desc limit 20 { .id, score: .data->metrics->score }",
+          "query_fingerprint": "fnv1a64:2ac501b20eb24f74",
+          "sequential": {
+            "max_ms": 99.209875,
+            "median_ms": 92.28341599999999,
+            "min_ms": 86.4145,
+            "result_digest_fnv1a64": "baf4d162ee1bf69f",
+            "row_count": 20,
+            "samples_ms": [
+              91.96225,
+              91.664541,
+              92.28341599999999,
+              95.019166,
+              99.209875,
+              97.04837500000001,
+              86.578375,
+              92.9735,
+              86.4145
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  Limit count=Literal(Int(20))\n    Sort keys=[v1:.data->\"metrics\"->\"score\" desc]\n      SeqScan table=Doc"
+        }
+      ],
+      "rows": 40000
+    },
+    {
+      "queries": [
+        {
+          "indexed": {
+            "max_ms": 0.001583,
+            "median_ms": 0.0014169999999999999,
+            "min_ms": 0.001375,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              0.001583,
+              0.0015409999999999998,
+              0.001459,
+              0.0014160000000000002,
+              0.001458,
+              0.0014169999999999999,
+              0.0014169999999999999,
+              0.001375,
+              0.0014169999999999999
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 key=Literal(Int(894558))",
+          "indexed_speedup": 5125.029640084686,
+          "name": "equality",
+          "query": "Doc filter .data->metrics->score = 894558 { .id }",
+          "query_fingerprint": "fnv1a64:ff259d3caf60bb81",
+          "sequential": {
+            "max_ms": 11.364416,
+            "median_ms": 7.262167,
+            "min_ms": 6.907875,
+            "result_digest_fnv1a64": "cb6b8a8377f7298b",
+            "row_count": 1,
+            "samples_ms": [
+              6.96925,
+              7.262167,
+              7.050875,
+              6.907875,
+              7.385542,
+              7.201042,
+              7.592,
+              11.364416,
+              7.6602500000000004
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Eq, Literal(Int(894558)))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 1.251083,
+            "median_ms": 1.182625,
+            "min_ms": 1.1252499999999999,
+            "result_digest_fnv1a64": "c337e853e40c761b",
+            "row_count": 1602,
+            "samples_ms": [
+              1.251083,
+              1.189166,
+              1.2168750000000002,
+              1.1344580000000002,
+              1.238959,
+              1.1594170000000001,
+              1.182625,
+              1.1648749999999999,
+              1.1252499999999999
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\")]\n  ExprRangeScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 start=Some((Literal(Int(250000)), true)) end=Some((Literal(Int(260000)), false))",
+          "indexed_speedup": 8.735968713666631,
+          "name": "range",
+          "query": "Doc filter .data->metrics->score >= 250000 and .data->metrics->score < 260000 { .id }",
+          "query_fingerprint": "fnv1a64:3009fe7d24fa4d5b",
+          "sequential": {
+            "max_ms": 10.533582999999998,
+            "median_ms": 10.331375,
+            "min_ms": 10.175082999999999,
+            "result_digest_fnv1a64": "c337e853e40c761b",
+            "row_count": 1602,
+            "samples_ms": [
+              10.347958,
+              10.331375,
+              10.429458,
+              10.228541,
+              10.242750000000001,
+              10.435416,
+              10.310542,
+              10.175082999999999,
+              10.533582999999998
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\")]\n  Filter predicate=BinaryOp(BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Gte, Literal(Int(250000))), And, BinaryOp(JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }, Lt, Literal(Int(260000))))\n    SeqScan table=Doc"
+        },
+        {
+          "indexed": {
+            "max_ms": 0.006459,
+            "median_ms": 0.004625,
+            "min_ms": 0.004541,
+            "result_digest_fnv1a64": "36e7c72997655ead",
+            "row_count": 20,
+            "samples_ms": [
+              0.004791,
+              0.004541,
+              0.004542,
+              0.00475,
+              0.004625,
+              0.004667,
+              0.004625,
+              0.004583,
+              0.006459
+            ]
+          },
+          "indexed_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  OrderedExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 descending=true limit=Literal(Int(20)) offset=None",
+          "indexed_speedup": 101575.7747027027,
+          "name": "order_limit",
+          "query": "Doc order .data->metrics->score desc limit 20 { .id, score: .data->metrics->score }",
+          "query_fingerprint": "fnv1a64:2ac501b20eb24f74",
+          "sequential": {
+            "max_ms": 516.28175,
+            "median_ms": 469.787958,
+            "min_ms": 455.17391699999996,
+            "result_digest_fnv1a64": "36e7c72997655ead",
+            "row_count": 20,
+            "samples_ms": [
+              464.89966599999997,
+              455.17391699999996,
+              497.884833,
+              465.760917,
+              483.98733300000004,
+              469.787958,
+              475.292667,
+              469.415291,
+              516.28175
+            ]
+          },
+          "sequential_plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  Limit count=Literal(Int(20))\n    Sort keys=[v1:.data->\"metrics\"->\"score\" desc]\n      SeqScan table=Doc"
+        }
+      ],
+      "rows": 160000
+    }
+  ],
+  "configuration": {
+    "cardinalities": [
+      10000,
+      40000,
+      160000
+    ],
+    "fixed_seed": 73951,
+    "index_ddl": "alter Doc add index (.data->metrics->score)",
+    "order_limit": 20,
+    "range": {
+      "high_exclusive": 260000,
+      "low_inclusive": 250000
+    },
+    "repetitions": 9,
+    "score_modulus": 1000003,
+    "score_multiplier": 48271,
+    "warmups": 2
+  },
+  "environment": {
+    "architecture": "aarch64",
+    "build_profile": "release",
+    "cpu": "Apple M5 Max",
+    "logical_parallelism": 18,
+    "os": "macos",
+    "process_page_cache_cleared": false,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: aarch64-apple-darwin\nrelease: 1.97.0\nLLVM version: 22.1.6"
+  },
+  "generated_unix_ms": 1784076548366,
+  "methodology": {
+    "comparison": "Identical table and queries measured before and after expression-index creation at each cardinality.",
+    "known_limitations": [
+      "Single-process embedded benchmark; server framing and network latency are out of scope.",
+      "The reopen pass constructs a cold Engine but does not evict the operating-system page cache.",
+      "Results describe this recorded runner and must be refreshed on the release candidate."
+    ],
+    "statistic": "Median wall time across measured repetitions after warmups.",
+    "threshold_policy": "Relative speedup and relative scaling only; no absolute latency threshold."
+  },
+  "overall_pass": true,
+  "queries": {
+    "equality": {
+      "fingerprint": "fnv1a64:ff259d3caf60bb81",
+      "text": "Doc filter .data->metrics->score = 894558 { .id }"
+    },
+    "order_limit": {
+      "fingerprint": "fnv1a64:2ac501b20eb24f74",
+      "text": "Doc order .data->metrics->score desc limit 20 { .id, score: .data->metrics->score }"
+    },
+    "range": {
+      "fingerprint": "fnv1a64:3009fe7d24fa4d5b",
+      "text": "Doc filter .data->metrics->score >= 250000 and .data->metrics->score < 260000 { .id }"
+    }
+  },
+  "release_gates": {
+    "largest_equality_speedup": {
+      "minimum": 3.0,
+      "observed": 5125.029640084686,
+      "pass": true
+    },
+    "largest_order_limit_speedup": {
+      "minimum": 4.0,
+      "observed": 101575.7747027027,
+      "pass": true
+    },
+    "largest_range_speedup": {
+      "minimum": 2.0,
+      "observed": 8.735968713666631,
+      "pass": true
+    },
+    "order_limit_scaling": {
+      "indexed_growth": 0.9174766911327118,
+      "largest_rows": 160000,
+      "maximum_indexed_to_sequential_growth_fraction": 0.65,
+      "observed_indexed_to_sequential_growth_fraction": 0.033349869020467986,
+      "pass": true,
+      "sequential_growth": 27.510653507203404,
+      "smallest_rows": 10000
+    },
+    "plan_shape_and_result_parity": {
+      "enforced_by": "hard assertions before report generation",
+      "pass": true
+    },
+    "reopen_result_parity": {
+      "enforced_by": "hard assertions before report generation",
+      "pass": true
+    }
+  },
+  "reopen": {
+    "cardinality": 160000,
+    "engine_reopened": true,
+    "limitation": "Reopen proves durable index discovery and a cold Engine, but does not evict the operating-system page cache.",
+    "process_page_cache_cleared": false,
+    "queries": [
+      {
+        "first_query_ms": 0.010958,
+        "name": "equality",
+        "plan": "Project fields=[Field(\"id\")]\n  ExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 key=Literal(Int(894558))",
+        "warm": {
+          "max_ms": 0.002084,
+          "median_ms": 0.001916,
+          "min_ms": 0.001834,
+          "result_digest_fnv1a64": "cb6b8a8377f7298b",
+          "row_count": 1,
+          "samples_ms": [
+            0.001916,
+            0.0018750000000000001,
+            0.001917,
+            0.002041,
+            0.002084,
+            0.001917,
+            0.001916,
+            0.0018750000000000001,
+            0.001834
+          ]
+        }
+      },
+      {
+        "first_query_ms": 2.590458,
+        "name": "range",
+        "plan": "Project fields=[Field(\"id\")]\n  ExprRangeScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 start=Some((Literal(Int(250000)), true)) end=Some((Literal(Int(260000)), false))",
+        "warm": {
+          "max_ms": 2.458292,
+          "median_ms": 2.316458,
+          "min_ms": 2.244292,
+          "result_digest_fnv1a64": "c337e853e40c761b",
+          "row_count": 1602,
+          "samples_ms": [
+            2.3873330000000004,
+            2.2935,
+            2.244292,
+            2.458292,
+            2.445584,
+            2.3039169999999998,
+            2.316458,
+            2.363334,
+            2.30925
+          ]
+        }
+      },
+      {
+        "first_query_ms": 0.027375,
+        "name": "order_limit",
+        "plan": "Project fields=[Field(\"id\"), score: JsonPath { base: Field(\"data\"), segments: [Key(\"metrics\"), Key(\"score\")] }]\n  OrderedExprIndexScan table=Doc path=v1:.data->\"metrics\"->\"score\" index_id=1 descending=true limit=Literal(Int(20)) offset=None",
+        "warm": {
+          "max_ms": 0.015458,
+          "median_ms": 0.014917,
+          "min_ms": 0.014457999999999999,
+          "result_digest_fnv1a64": "36e7c72997655ead",
+          "row_count": 20,
+          "samples_ms": [
+            0.015167,
+            0.0145,
+            0.01525,
+            0.014457999999999999,
+            0.014667,
+            0.014792,
+            0.015458,
+            0.014957999999999999,
+            0.014917
+          ]
+        }
+      }
+    ]
+  },
+  "repository": {
+    "commit": "066a497aca840adfdb43f1e7acdfc2fc02d5bfb1",
+    "dirty": true,
+    "fingerprint_inputs": "HEAD commit, porcelain status, tracked binary diff, and untracked file names/contents except the generated output artifact",
+    "working_tree_fingerprint": "fnv1a64:3daf56ecc3c0e455"
+  },
+  "schema_version": 1
+}
