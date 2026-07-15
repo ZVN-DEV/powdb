@@ -30,13 +30,45 @@ pub struct SegmentIdentity {
 }
 
 impl SegmentIdentity {
+    /// Stamp an identity with this binary's maximum supported catalog version.
+    ///
+    /// Use this at *consumer* sites that want "the newest catalog format this
+    /// binary can read" as the expected identity. Producers that publish
+    /// segments must instead stamp the database's *active* catalog version with
+    /// [`Self::with_catalog_version`], so a database that has not yet activated
+    /// v6 keeps stamping v5 (old-replica compatibility).
     pub fn current(database_id: [u8; 16], primary_generation: u64) -> Self {
+        Self::with_catalog_version(database_id, primary_generation, CATALOG_VERSION)
+    }
+
+    /// Stamp an identity with an explicit (active) catalog version.
+    ///
+    /// The catalog version is a *compatibility annotation*, not lineage: it
+    /// records the on-disk catalog format the producing database was running
+    /// when the segment was published. It is deliberately excluded from
+    /// [`Self::lineage_matches`]; consumers accept an older annotation and
+    /// reject a newer one via [`validate_identity`].
+    pub fn with_catalog_version(
+        database_id: [u8; 16],
+        primary_generation: u64,
+        catalog_version: u16,
+    ) -> Self {
         Self {
             database_id,
             primary_generation,
             wal_format_version: WAL_FORMAT_VERSION,
-            catalog_version: CATALOG_VERSION,
+            catalog_version,
         }
+    }
+
+    /// True when the strict lineage fields (database id, primary generation,
+    /// WAL format) match. `catalog_version` is intentionally ignored: it is a
+    /// compatibility annotation that legitimately increases across a segment
+    /// chain when a database activates a newer catalog format mid-stream.
+    pub fn lineage_matches(self, other: SegmentIdentity) -> bool {
+        self.database_id == other.database_id
+            && self.primary_generation == other.primary_generation
+            && self.wal_format_version == other.wal_format_version
     }
 
     pub fn validate(self) -> io::Result<()> {
@@ -390,6 +422,7 @@ pub fn read_units_through(
         return Ok(out);
     };
     let mut have_started = false;
+    let mut chain_catalog_version = 0u16;
 
     for file in list_segment_files(dir)? {
         if file.start_lsn > through_lsn {
@@ -408,11 +441,18 @@ pub fn read_units_through(
                 file.start_lsn, file.end_lsn, segment.start_lsn, segment.end_lsn
             )));
         }
-        if segment.identity != expected_identity {
+        if !segment.identity.lineage_matches(expected_identity) {
             return Err(invalid_data(
                 "retained segment identity does not match expected database history",
             ));
         }
+        if segment.identity.catalog_version < chain_catalog_version {
+            return Err(invalid_data(format!(
+                "retained segment catalog format decreased across chain (v{} then v{}); rebootstrap required",
+                chain_catalog_version, segment.identity.catalog_version
+            )));
+        }
+        chain_catalog_version = segment.identity.catalog_version;
 
         if segment.end_lsn <= since_lsn {
             continue;
@@ -492,6 +532,7 @@ pub fn validate_retained_tail_available(
     let mut units_available = 0usize;
     let mut first_lsn = None;
     let mut have_started = false;
+    let mut chain_catalog_version = 0u16;
 
     for file in list_segment_files(dir)? {
         let segment = read_segment_file(&file.path)?;
@@ -501,11 +542,18 @@ pub fn validate_retained_tail_available(
                 file.start_lsn, file.end_lsn, segment.start_lsn, segment.end_lsn
             )));
         }
-        if segment.identity != expected_identity {
+        if !segment.identity.lineage_matches(expected_identity) {
             return Err(invalid_data(
                 "retained segment identity does not match expected database history",
             ));
         }
+        if segment.identity.catalog_version < chain_catalog_version {
+            return Err(invalid_data(format!(
+                "retained segment catalog format decreased across chain (v{} then v{}); rebootstrap required",
+                chain_catalog_version, segment.identity.catalog_version
+            )));
+        }
+        chain_catalog_version = segment.identity.catalog_version;
 
         if segment.end_lsn < expected_next_lsn {
             continue;
@@ -590,6 +638,7 @@ pub fn retained_tail_progress(
     let mut first_lsn = None;
     let mut last_lsn = None;
     let mut have_started = false;
+    let mut chain_catalog_version = 0u16;
 
     for file in list_segment_files(dir)? {
         if file.end_lsn <= since_lsn {
@@ -606,11 +655,18 @@ pub fn retained_tail_progress(
                 file.start_lsn, file.end_lsn, segment.start_lsn, segment.end_lsn
             )));
         }
-        if segment.identity != expected_identity {
+        if !segment.identity.lineage_matches(expected_identity) {
             return Err(invalid_data(
                 "retained segment identity does not match expected database history",
             ));
         }
+        if segment.identity.catalog_version < chain_catalog_version {
+            return Err(invalid_data(format!(
+                "retained segment catalog format decreased across chain (v{} then v{}); rebootstrap required",
+                chain_catalog_version, segment.identity.catalog_version
+            )));
+        }
+        chain_catalog_version = segment.identity.catalog_version;
         if segment.end_lsn < expected_next_lsn {
             continue;
         }
@@ -725,10 +781,21 @@ fn validate_identity(identity: SegmentIdentity) -> io::Result<()> {
     if identity.wal_format_version != WAL_FORMAT_VERSION {
         return Err(invalid_data("retained segment WAL format is unsupported"));
     }
-    if identity.catalog_version != CATALOG_VERSION {
+    // Catalog version is a compatibility annotation, not a strict-equality
+    // identity field. A producer stamps its *active* catalog version, which may
+    // legitimately be older than this binary's maximum (a database that never
+    // activated v6 still stamps v5). Accept any version this binary can read
+    // (1..=CATALOG_VERSION); reject only a version newer than we understand.
+    if identity.catalog_version == 0 {
         return Err(invalid_data(
-            "retained segment catalog format is unsupported",
+            "retained segment catalog format v0 is invalid",
         ));
+    }
+    if identity.catalog_version > CATALOG_VERSION {
+        return Err(invalid_data(format!(
+            "retained segment catalog format v{} is newer than this binary supports (max v{})",
+            identity.catalog_version, CATALOG_VERSION
+        )));
     }
     Ok(())
 }
@@ -866,6 +933,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use powdb_storage::catalog::LEGACY_CATALOG_VERSION;
     use std::sync::{Arc, Barrier};
 
     fn identity() -> SegmentIdentity {
@@ -1262,6 +1330,80 @@ mod tests {
         let err = RetainedSegment::from_bytes(&bytes).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("record count"));
+    }
+
+    fn identity_v(catalog_version: u16) -> SegmentIdentity {
+        SegmentIdentity::with_catalog_version(*b"0123456789abcdef", 7, catalog_version)
+    }
+
+    #[test]
+    fn validate_identity_accepts_older_and_rejects_newer_catalog_version() {
+        // Legacy (v5) and current (v6) formats both validate on this binary.
+        assert!(identity_v(LEGACY_CATALOG_VERSION).validate().is_ok());
+        assert!(identity_v(CATALOG_VERSION).validate().is_ok());
+        // v0 is invalid.
+        assert!(identity_v(0).validate().is_err());
+        // A version newer than this binary is rejected, naming both versions.
+        let err = identity_v(CATALOG_VERSION + 1).validate().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("v{}", CATALOG_VERSION + 1)), "{msg}");
+        assert!(msg.contains(&format!("max v{CATALOG_VERSION}")), "{msg}");
+    }
+
+    #[test]
+    fn v5_stamped_segment_reads_on_v6_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment_atomic(
+            dir.path(),
+            &RetainedSegment::new(identity_v(LEGACY_CATALOG_VERSION), vec![unit(1), unit(2)])
+                .unwrap(),
+        )
+        .unwrap();
+        // Expected identity stamps this binary's max (v6); lineage matches and
+        // the older annotation is accepted.
+        let units = read_units_since(dir.path(), identity(), 0, 10).unwrap();
+        let lsns: Vec<u64> = units.into_iter().map(|unit| unit.lsn).collect();
+        assert_eq!(lsns, vec![1, 2]);
+    }
+
+    #[test]
+    fn catalog_version_increase_across_chain_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment_atomic(
+            dir.path(),
+            &RetainedSegment::new(identity_v(LEGACY_CATALOG_VERSION), vec![unit(1), unit(2)])
+                .unwrap(),
+        )
+        .unwrap();
+        write_segment_atomic(
+            dir.path(),
+            &RetainedSegment::new(identity_v(CATALOG_VERSION), vec![unit(3), unit(4)]).unwrap(),
+        )
+        .unwrap();
+        // Activation mid-stream (v5 then v6) is a valid, monotonic chain.
+        let units = read_units_since(dir.path(), identity(), 0, 10).unwrap();
+        let lsns: Vec<u64> = units.into_iter().map(|unit| unit.lsn).collect();
+        assert_eq!(lsns, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn catalog_version_decrease_across_chain_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment_atomic(
+            dir.path(),
+            &RetainedSegment::new(identity_v(CATALOG_VERSION), vec![unit(1), unit(2)]).unwrap(),
+        )
+        .unwrap();
+        write_segment_atomic(
+            dir.path(),
+            &RetainedSegment::new(identity_v(LEGACY_CATALOG_VERSION), vec![unit(3), unit(4)])
+                .unwrap(),
+        )
+        .unwrap();
+        let err = read_units_since(dir.path(), identity(), 0, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("decreased across chain"), "{err}");
     }
 
     fn rewrite_footer_crc(bytes: &mut [u8]) {

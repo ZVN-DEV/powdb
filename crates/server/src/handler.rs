@@ -9,7 +9,8 @@ use powdb_storage::types::Value;
 use powdb_sync::{
     acknowledge_replica_apply, read_identity, read_units_through, replica_sync_status,
     retained_segments_dir, validate_retained_tail_available, validate_v1_retained_units_applyable,
-    ReplicaSyncStatus, RetainedUnit, SyncRepairAction, RETAINED_SEGMENT_FORMAT_VERSION,
+    ReplicaSyncStatus, RetainedUnit, SegmentIdentity, SyncRepairAction,
+    RETAINED_SEGMENT_FORMAT_VERSION,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -930,12 +931,26 @@ fn validate_wire_replica_id(replica_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_context(engine: &Arc<RwLock<Engine>>) -> Result<(PathBuf, u64), String> {
+fn sync_context(engine: &Arc<RwLock<Engine>>) -> Result<SyncContext, String> {
     let engine = engine
         .read()
         .map_err(|e| format!("lock poisoned while reading sync context: {e}"))?;
     let catalog = engine.catalog();
-    Ok((catalog.data_dir().to_path_buf(), catalog.max_lsn()))
+    Ok(SyncContext {
+        data_dir: catalog.data_dir().to_path_buf(),
+        remote_lsn: catalog.max_lsn(),
+        active_catalog_version: catalog.active_catalog_version(),
+    })
+}
+
+/// Snapshot of the primary's sync-relevant state captured under the engine lock.
+/// `active_catalog_version` is the database's *active* on-disk catalog format,
+/// used to stamp the expected segment identity a pulling replica is checked
+/// against (a database that never activated v6 keeps expecting v5).
+struct SyncContext {
+    data_dir: PathBuf,
+    remote_lsn: u64,
+    active_catalog_version: u16,
 }
 
 fn wire_repair_action(action: SyncRepairAction) -> WireSyncRepairAction {
@@ -1328,7 +1343,11 @@ fn dispatch_sync_status_decision(
     if let Err(message) = validate_wire_replica_id(&replica_id) {
         return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
     }
-    let (data_dir, remote_lsn) = match sync_context(engine) {
+    let SyncContext {
+        data_dir,
+        remote_lsn,
+        ..
+    } = match sync_context(engine) {
         Ok(context) => context,
         Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
     };
@@ -1377,7 +1396,11 @@ fn dispatch_sync_pull_decision(
         );
     }
 
-    let (data_dir, remote_lsn) = match sync_context(engine) {
+    let SyncContext {
+        data_dir,
+        remote_lsn,
+        active_catalog_version,
+    } = match sync_context(engine) {
         Ok(context) => context,
         Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
     };
@@ -1417,16 +1440,34 @@ fn dispatch_sync_pull_decision(
             return SyncDecision::error(SyncErrorClass::IdentityRead, err.to_string());
         }
     };
-    let expected = identity.segment_identity();
+    // Stamp the expected identity with the database's *active* catalog version,
+    // not this binary's compile-time maximum, so a database that never activated
+    // v6 still expects v5 and accepts a v0.12 replica.
+    let expected = SegmentIdentity::with_catalog_version(
+        identity.database_id,
+        identity.primary_generation,
+        active_catalog_version,
+    );
     if request.database_id != expected.database_id
         || request.primary_generation != expected.primary_generation
         || request.wal_format_version != expected.wal_format_version
-        || request.catalog_version != expected.catalog_version
         || request.segment_format_version != RETAINED_SEGMENT_FORMAT_VERSION
     {
         return SyncDecision::error(
             SyncErrorClass::IdentityOrFormatMismatch,
             "sync pull identity or format version mismatch; rebootstrap required",
+        );
+    }
+    // The request states the maximum catalog format the replica can read. Accept
+    // any replica that can read the active format (>= active); reject a replica
+    // whose maximum is older than the data it would receive.
+    if request.catalog_version < expected.catalog_version {
+        return SyncDecision::error(
+            SyncErrorClass::IdentityOrFormatMismatch,
+            format!(
+                "sync pull replica catalog format v{} cannot read this database's active catalog format v{}; rebootstrap with an upgraded replica required",
+                request.catalog_version, expected.catalog_version
+            ),
         );
     }
 
@@ -1554,7 +1595,11 @@ fn dispatch_sync_ack_decision(
             ),
         );
     }
-    let (data_dir, remote_lsn) = match sync_context(engine) {
+    let SyncContext {
+        data_dir,
+        remote_lsn,
+        ..
+    } = match sync_context(engine) {
         Ok(context) => context,
         Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
     };
@@ -4379,6 +4424,134 @@ mod tests {
         assert_eq!(ack.repair_action, WireSyncRepairAction::None);
         assert!(!ack.stale);
         assert_eq!(ack.lag_lsn, Some(0));
+    }
+
+    fn seed_pullable_replica(engine: &mut Engine) -> u64 {
+        let data_dir = engine.catalog().data_dir().to_path_buf();
+        let remote_lsn = engine.catalog().max_lsn();
+        assert!(remote_lsn > 0);
+        write_sync_identity_and_tail(&data_dir, remote_lsn);
+        powdb_sync::upsert_replica_cursor(&data_dir, ReplicaCursor::active("replica-a", 0))
+            .unwrap();
+        remote_lsn
+    }
+
+    fn pull_request_with_catalog_version(catalog_version: u16) -> SyncPullRequest {
+        let identity = sync_identity().segment_identity();
+        SyncPullRequest {
+            replica_id: "replica-a".into(),
+            since_lsn: 0,
+            max_units: MAX_SYNC_PULL_UNITS,
+            max_bytes: MAX_SYNC_PULL_BYTES,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version,
+            segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+        }
+    }
+
+    #[test]
+    fn fresh_database_expects_legacy_catalog_version_and_accepts_v5_replica() {
+        use powdb_storage::catalog::{CATALOG_VERSION, LEGACY_CATALOG_VERSION};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type Doc { required id: int, data: json }")
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Doc { id := 1, data := "{\"score\":20}" }"#)
+            .unwrap();
+        // No expression index created yet: the database stays at the legacy
+        // catalog format, exactly as a v0.12 database on disk.
+        assert_eq!(
+            engine.catalog().active_catalog_version(),
+            LEGACY_CATALOG_VERSION
+        );
+        let remote_lsn = seed_pullable_replica(&mut engine);
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+
+        // A replica whose maximum is the legacy version (as v0.12 clients state)
+        // is accepted against a legacy-active server.
+        let pull = pull_request_with_catalog_version(LEGACY_CATALOG_VERSION);
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult { units, .. } => {
+                assert_eq!(units.len() as u64, remote_lsn);
+            }
+            other => panic!("expected sync pull result, got {other:?}"),
+        }
+
+        // A newer replica (states this binary's max) is also accepted.
+        let pull = pull_request_with_catalog_version(CATALOG_VERSION);
+        assert!(matches!(
+            dispatch_sync_pull(&engine, pull, true, Some(&principal)),
+            Message::SyncPullResult { .. }
+        ));
+
+        // A replica whose maximum is older than the active format is rejected
+        // with a message naming both versions.
+        let pull = pull_request_with_catalog_version(LEGACY_CATALOG_VERSION - 1);
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::Error { message } => {
+                assert!(message.contains("v4"), "message: {message}");
+                assert!(message.contains("v5"), "message: {message}");
+                assert!(
+                    message.contains("rebootstrap with an upgraded replica required"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected identity mismatch error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activated_database_expects_v6_and_rejects_v5_replica() {
+        use powdb_storage::catalog::{CATALOG_VERSION, LEGACY_CATALOG_VERSION};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type Doc { required id: int, data: json }")
+            .unwrap();
+        engine
+            .execute_powql(r#"insert Doc { id := 1, data := "{\"score\":20}" }"#)
+            .unwrap();
+        // Creating a JSON-path expression index activates the v6 catalog format.
+        engine
+            .execute_powql("alter Doc add index (.data->score)")
+            .unwrap();
+        assert_eq!(engine.catalog().active_catalog_version(), CATALOG_VERSION);
+        let remote_lsn = seed_pullable_replica(&mut engine);
+
+        let engine = Arc::new(RwLock::new(engine));
+        let principal = admin_principal();
+
+        // A v0.12 replica (states catalog_version 5) genuinely cannot read the
+        // now-activated v6 data and is rejected with the targeted message.
+        let pull = pull_request_with_catalog_version(LEGACY_CATALOG_VERSION);
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::Error { message } => {
+                assert!(message.contains("v5"), "message: {message}");
+                assert!(message.contains("v6"), "message: {message}");
+                assert!(
+                    message.contains("rebootstrap with an upgraded replica required"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected identity mismatch error, got {other:?}"),
+        }
+
+        // A v6-capable replica is accepted.
+        let pull = pull_request_with_catalog_version(CATALOG_VERSION);
+        match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
+            Message::SyncPullResult { units, .. } => {
+                assert_eq!(units.len() as u64, remote_lsn);
+            }
+            other => panic!("expected sync pull result, got {other:?}"),
+        }
     }
 
     #[test]

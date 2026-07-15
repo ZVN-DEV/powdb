@@ -31,6 +31,8 @@ import {
   Client,
   PowDBError,
   isPowDBError,
+  assertServerCatalogVersionSupported,
+  SUPPORTED_CATALOG_VERSION,
   type WireValue as PublicWireValue,
 } from "../src/index.js";
 
@@ -549,6 +551,22 @@ async function main() {
       type: "SyncStatus",
       replicaId: "replica-a",
     });
+  });
+
+  await test("assertServerCatalogVersionSupported accepts <= max, rejects newer", () => {
+    // A server on an older or equal catalog format is readable.
+    assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION - 1);
+    assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION);
+    // A server on a newer catalog format the client cannot read is rejected.
+    assert.throws(
+      () => assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION + 1),
+      /newer than this client supports/,
+    );
+    // An explicit client max is honored.
+    assertServerCatalogVersionSupported(5, 5);
+    assert.throws(() => assertServerCatalogVersionSupported(6, 5), /upgrade the client/);
+    // A nonsense version is rejected.
+    assert.throws(() => assertServerCatalogVersionSupported(0), /invalid server catalog version/);
   });
 
   await test("encode/decode SyncPull request", () => {

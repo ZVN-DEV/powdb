@@ -42,6 +42,36 @@ import {
 /** Client library version. Compared to the server's reported version. */
 export const CLIENT_VERSION = "0.13.0";
 
+/**
+ * The maximum catalog format version this client can read. State this as the
+ * `catalogVersion` in sync pull requests: the server accepts any replica whose
+ * maximum is at least its active catalog format and rejects an older replica.
+ * When validating a server-reported catalog version, accept anything at or
+ * below this and reject anything newer (the client cannot read it).
+ */
+export const SUPPORTED_CATALOG_VERSION = 6;
+
+/**
+ * Throw when a server-reported catalog format is newer than this client can
+ * read. Accepts `serverCatalogVersion <= SUPPORTED_CATALOG_VERSION`; rejects a
+ * newer server, which requires upgrading the client.
+ */
+export function assertServerCatalogVersionSupported(
+  serverCatalogVersion: number,
+  clientMax: number = SUPPORTED_CATALOG_VERSION,
+): void {
+  if (!Number.isInteger(serverCatalogVersion) || serverCatalogVersion < 1) {
+    throw new Error(
+      `invalid server catalog version ${serverCatalogVersion}`,
+    );
+  }
+  if (serverCatalogVersion > clientMax) {
+    throw new Error(
+      `server catalog format v${serverCatalogVersion} is newer than this client supports (max v${clientMax}); upgrade the client`,
+    );
+  }
+}
+
 export type QueryResult =
   | { kind: "rows"; columns: string[]; rows: string[][] }
   | { kind: "scalar"; value: string }

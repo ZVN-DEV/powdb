@@ -48,6 +48,16 @@ package, container, tag, or release has been published yet.
 - **Remote result types no longer require lossy string rendering.** Native
   typed results preserve Empty, strings, raw Bytes, and PJ1 JSON on the wire;
   `json_type()` can distinguish missing paths from explicit JSON null remotely.
+- **Sync survives the lazy v5-to-v6 catalog format bump.** Because a database
+  stays on catalog format v5 on disk until the first expression index activates
+  v6, segment identity now treats catalog format as a compatibility annotation
+  rather than a strict-equality field. Producers stamp the database's active
+  catalog version (a database that never activated v6 keeps stamping v5, so
+  v0.12 replicas still match), consumers accept an older format and reject a
+  newer one, a catalog-format increase across a segment chain is accepted while
+  a decrease is rejected, and the primary's pull gate accepts any replica whose
+  maximum supported format is at least the database's active format. Database
+  id, primary generation, WAL format, and segment format remain strict.
 
 ## [0.12.0] - 2026-07-14
 

@@ -8,6 +8,7 @@ use powdb_storage::wal::WalRecord;
 use crate::metadata::{open_or_create_identity, read_identity};
 use crate::segment::{
     read_segment_file, segment_file_name, write_segment_atomic, RetainedSegment, RetainedUnit,
+    SegmentIdentity,
 };
 use crate::DatabaseIdentity;
 
@@ -85,8 +86,20 @@ pub fn archive_wal_records_for_identity(
     if records.is_empty() {
         return Ok(());
     }
+    // Stamp the published segment with the database's *active* catalog version
+    // (read from the on-disk catalog), not this binary's compile-time maximum.
+    // A database that has not activated v6 keeps stamping v5, so a v0.12 replica
+    // that states catalog_version 5 still matches. The catalog file is persisted
+    // before any archive runs (create + activation both persist it), so the
+    // on-disk version is authoritative here.
+    let active_catalog_version = powdb_storage::catalog::read_active_catalog_version(data_dir)?;
+    let segment_identity = SegmentIdentity::with_catalog_version(
+        identity.database_id,
+        identity.primary_generation,
+        active_catalog_version,
+    );
     let units: Vec<RetainedUnit> = records.iter().map(RetainedUnit::from).collect();
-    let segment = RetainedSegment::new(identity.segment_identity(), units)?;
+    let segment = RetainedSegment::new(segment_identity, units)?;
     write_segment_idempotent(&retained_segments_dir(data_dir), &segment).map(|_| ())
 }
 

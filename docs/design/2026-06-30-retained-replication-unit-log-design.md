@@ -29,7 +29,7 @@ retained-<start_lsn>-<end_lsn>.prul
 
 Each file contains:
 
-1. segment header: magic, segment format version, current WAL format, current catalog format, record count, start LSN, end LSN, primary generation, database id,
+1. segment header: magic, segment format version, current WAL format, the producing database's **active** catalog format, record count, start LSN, end LSN, primary generation, database id,
 2. WAL-record units in strict contiguous LSN order,
 3. footer magic plus a segment CRC over every preceding byte.
 
@@ -43,7 +43,8 @@ Each retained unit stores the same logical fields as `WalRecord`:
 The segment validates:
 
 - magic and version,
-- WAL/catalog compatibility,
+- WAL format equality (strict),
+- catalog format compatibility as a **range**, not equality (see below),
 - non-zero database id and primary generation,
 - non-empty unit list,
 - known record type for the current WAL format,
@@ -51,6 +52,29 @@ The segment validates:
 - per-unit CRC,
 - file-level footer CRC,
 - no trailing bytes and no truncated record.
+
+### Catalog format is a compatibility annotation, not identity
+
+The catalog format version is versioned lazily: a database stays on the legacy
+format (v5) on disk until the first expression index activates v6
+(`active_catalog_version`). Segment identity therefore follows one rule:
+
+- **Producers stamp the database's active catalog version**, not the binary's
+  compile-time maximum. A database that never activated v6 keeps stamping v5, so
+  an older replica (a v0.12 client stating catalog format v5) still matches.
+- **Consumers accept older and reject newer.** `validate` accepts any catalog
+  format in `1..=CATALOG_VERSION` and rejects only a version newer than the
+  binary understands, with a message naming both the segment's version and the
+  binary maximum. Segment-chain readers compare the strict lineage fields
+  (database id, primary generation, WAL format) for equality but treat catalog
+  format as a monotonic annotation: an **increase** across a chain (v5 then v6,
+  activation mid-stream) is accepted; a **decrease** is rejected.
+- **The primary's pull gate** checks the replica-stated catalog format against
+  the database's active format: the replica states the maximum format it can
+  read, and the primary accepts `replica_max >= active` and rejects a replica
+  whose maximum is older than the data it would receive (rebootstrap with an
+  upgraded replica required). Database id, primary generation, WAL format, and
+  segment format remain strict-equality checks.
 
 ## Atomic Publish
 

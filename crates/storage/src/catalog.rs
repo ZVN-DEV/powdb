@@ -3460,6 +3460,16 @@ fn read_catalog_file(path: &Path) -> io::Result<CatalogFile> {
     read_catalog_file_with_max_version(path, CATALOG_VERSION)
 }
 
+/// Read the catalog format version currently persisted on disk for `data_dir`
+/// without rehydrating tables. This is the database's *active* catalog version:
+/// a database that has never activated an expression index stays at
+/// [`LEGACY_CATALOG_VERSION`]. Sync producers use it to stamp published segments
+/// with the active version rather than this binary's compile-time maximum.
+pub fn read_active_catalog_version(data_dir: &Path) -> io::Result<u16> {
+    let cat_path = data_dir.join(CATALOG_FILE);
+    Ok(read_catalog_file(&cat_path)?.version)
+}
+
 fn read_catalog_file_with_max_version(
     path: &Path,
     max_supported_version: u16,
