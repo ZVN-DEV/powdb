@@ -70,7 +70,7 @@ export type NativeQueryResult =
  * The fully lossless result of {@link Client.queryNativeRaw}: every cell is the
  * raw {@link WireValue} tagged union straight off the wire, with no conversion
  * to {@link NativeValue}. Use this when you need storage-level identity that the
- * convenience conversion erases — the raw PJ1 bytes of a JSON cell (`pj1`), or
+ * convenience conversion erases: the raw PJ1 bytes of a JSON cell (`pj1`), or
  * telling an absent value (`{ type: "empty" }`) apart from the string `"null"`
  * (`{ type: "str", value: "null" }`) or a JSON null (`{ type: "json", value:
  * null }`), all of which {@link queryNative} collapses to `null`.

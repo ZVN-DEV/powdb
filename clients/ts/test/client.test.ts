@@ -800,7 +800,7 @@ async function main() {
   });
 
   // ──────────────────────────────────────────────────────────
-  console.log("queryNativeRaw — lossless WireValue access");
+  console.log("queryNativeRaw: lossless WireValue access");
   // ──────────────────────────────────────────────────────────
 
   const rawDoc = tbl("RawDoc");
@@ -809,7 +809,7 @@ async function main() {
       `type ${rawDoc} { required unique id: int, data: json, note: str, extra: str }`,
     );
     // note holds the SQL string "null"; extra is omitted (Empty); data holds a
-    // JSON null (a document, stored as PJ1) — three values the convenience
+    // JSON null (a document, stored as PJ1), three values the convenience
     // conversion would blur into `null`.
     await client.query(
       `insert ${rawDoc} { id := 1, data := "null", note := "null" }`,

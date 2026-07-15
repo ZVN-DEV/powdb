@@ -340,18 +340,18 @@ const raw = await client.queryNativeRaw(
 
 if (raw.kind === "rows") {
   const [note, missing, data] = raw.rows[0];
-  // note:    { type: "str", value: "null" }   — the string "null"
-  // missing: { type: "empty" }                — an absent value
-  // data:    { type: "json", value: null, pj1: Uint8Array }  — a JSON null
+  // note:    { type: "str", value: "null" }   : the string "null"
+  // missing: { type: "empty" }                : an absent value
+  // data:    { type: "json", value: null, pj1: Uint8Array }  : a JSON null
 }
 ```
 
 Reach for `queryNativeRaw` when you need:
 
-- **Storage-level identity** — telling an absent value (`{ type: "empty" }`)
+- **Storage-level identity**: telling an absent value (`{ type: "empty" }`)
   apart from the string `"null"` and a JSON `null`, all of which `queryNative`
   collapses to `null`.
-- **Raw PJ1 bytes** — the `pj1: Uint8Array` on a `json` cell is the exact
+- **Raw PJ1 bytes**: the `pj1: Uint8Array` on a `json` cell is the exact
   on-wire binary JSON, for byte-identical storage, hashing, or re-encoding.
 
 It accepts the same `$N` parameter array and `AbortSignal` options as

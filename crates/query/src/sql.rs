@@ -1545,7 +1545,7 @@ mod tests {
     #[test]
     fn json_path_update_target_is_targeted_unsupported() {
         // `UPDATE t SET data->'x' = 5` must not die with a generic
-        // "expected '='" — it must name the unsupported feature and the
+        // "expected '='": it must name the unsupported feature and the
         // whole-column alternative.
         for stmt in [
             "UPDATE Doc SET data->'x' = 5",

@@ -4203,7 +4203,7 @@ mod json_path_tests {
     #[test]
     fn json_path_assignment_target_is_targeted_unsupported() {
         // `Doc update { .data->x := 5 }` must not die with a generic
-        // "expected field name" — it must name the unsupported position and
+        // "expected field name": it must name the unsupported position and
         // the whole-column alternative. Both the leading-dot path-target form
         // and the bare `data->x` form take the targeted branch.
         for stmt in [

@@ -409,7 +409,7 @@ fn path_index_creation_rejects_existing_duplicates_and_non_scalar_nodes() {
 fn update_changing_indexed_path_from_scalar_to_missing_moves_row_to_nulls_last() {
     // Maintaining an expression index across an update that drops the indexed
     // path must relocate the row from its scalar key into the empty set, where
-    // NULLS-LAST ordering still finds it — the row is never lost.
+    // NULLS-LAST ordering still finds it: the row is never lost.
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(dir.path()).unwrap();
     exec(&mut engine, "type Doc { required id: int, data: json }");
