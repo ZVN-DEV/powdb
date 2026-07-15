@@ -20,9 +20,16 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
 - `Database.open(dir)` — open or create a database at `dir`.
 - `Database.openWithMemoryLimit(dir, limitBytes)` — open with an explicit
   per-query memory budget (caps sort/join/GROUP BY materialization).
-- `db.query(powql)` — run a PowQL statement.
+- `db.query(powql)`: run a PowQL statement (string-typed cells).
 - `db.querySql(sql)` — run a SQL statement (lowered to PowQL).
 - `db.queryReadonly(powql)` — run a read-only statement.
+- `db.queryNative(powql)`: run a PowQL statement and get **lossless typed**
+  cells (see [Typed results](#typed-lossless-results)).
+- `db.querySqlNative(sql)`: typed variant of `querySql`.
+- `db.queryReadonlyNative(powql)`: typed variant of `queryReadonly`.
+- `db.queryWithParams(powql, params)`: run PowQL with positional `$1..$N`
+  parameters and get typed cells. Supported param types: `number`, `bigint`,
+  `string`, `boolean`, `null`.
 - `db.applyRetainedUnits(request)` — apply one sync retained-unit chunk from
   `@zvndev/powdb-client` to a bootstrapped embedded replica.
 - `db.setSyncMode(mode)` — set WAL durability: `"full"` | `"normal"` | `"off"`.
@@ -102,11 +109,74 @@ type QueryResult =
   | { kind: "message"; message: string };
 ```
 
-Every cell is a string, using the same wire rendering as the server. `json`
+Every cell here is a string, using the same wire rendering as the server. `json`
 columns come back as canonical JSON text (keys sorted bytewise, no whitespace),
-so `JSON.parse(cell)` reconstructs the document. This addon is an untyped
-passthrough: it does not coerce cells the way `@zvndev/powdb-client`'s
-`queryTyped` does, so parse json cells yourself with `JSON.parse`.
+so `JSON.parse(cell)` reconstructs the document. This string path is lossy by
+design: bytes render as a `<N bytes>` placeholder, and a JSON `null`, an SQL
+NULL, and the string `"null"` all render identically. When those distinctions
+matter, use the typed API below.
+
+## Typed (lossless) results
+
+`queryNative` / `querySqlNative` / `queryReadonlyNative` / `queryWithParams`
+return the same result shape but with **typed** cells (`WireValue`), matching
+the `@zvndev/powdb-client` `WireValue` union so embedded and networked code read
+results the same way:
+
+```ts
+type WireValue =
+  | { type: "empty" } // a missing / absent cell, distinct from a JSON null
+  | { type: "int";      value: bigint }  // full i64 range, never rounded
+  | { type: "float";    value: number }
+  | { type: "bool";     value: boolean }
+  | { type: "str";      value: string }
+  | { type: "datetime"; value: bigint }  // microseconds since the Unix epoch
+  | { type: "uuid";     value: string }  // canonical 8-4-4-4-12 hex
+  | { type: "bytes";    value: Buffer }  // raw bytes, losslessly
+  | { type: "json";     value: NativeJson; pj1: Uint8Array }; // parsed + raw PJ1
+```
+
+```js
+const db = Database.open("./data");
+db.query("type Doc { required id: int, body: json }");
+db.query(`insert Doc { id := 1, body := "null" }`);
+
+const [cell] = db.queryNative("Doc filter .id = 1 { .body }").rows[0];
+// { type: "json", value: null, pj1: <Uint8Array> }: a JSON null,
+// which is NOT { type: "empty" } (a missing cell).
+
+// Positional parameters are substituted as literal tokens before parsing, so
+// untrusted input can never change the query's shape.
+const hits = db.queryWithParams("Doc filter .id = $1 { .id }", [1]);
+```
+
+For a `json` cell, `value` is the parsed document (safe integers as JS numbers,
+out-of-range integers as `bigint`, the same rule the networked client uses) and
+`pj1` is always the raw canonical PJ1 bytes, so a caller that needs exact
+JSON-internal big integers can decode `pj1` directly.
+
+## Embedded and the server run the identical engine
+
+Embedded is not a reduced build. It executes PowQL and SQL through the **same**
+engine as `powdb-server`, so every query feature is available in-process, with
+no network round-trip:
+
+| Capability | Server | Embedded |
+| --- | --- | --- |
+| PowQL + SQL frontends | yes | yes |
+| Indexes, incl. expression indexes | yes | yes |
+| JSON type, `->` path query / order / group / aggregate | yes | yes |
+| Transactions (FIFO admission, zero contended-write loss) | yes | yes |
+| `explain` | yes | yes |
+| WAL durability modes (`full` / `normal` / `off`) | yes | yes |
+| Positional parameters | yes | yes (`queryWithParams`) |
+| Lossless typed results (`WireValue`) | yes (`queryNative`, ...) | yes (`queryNative`, ...) |
+| Retained-unit sync apply (embedded replica) | n/a | yes (`applyRetainedUnits`) |
+
+The only differences are transport, not engine: the server adds the network
+protocol, auth, and the single-writer admission gate that only costs anything
+when many clients funnel through one process. In-process there is no socket and
+no gate on your own handle.
 
 ## When to use embedded vs the server
 
