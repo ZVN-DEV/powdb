@@ -40,6 +40,8 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::result::QueryError;
@@ -93,6 +95,8 @@ pub struct ExecCancel {
     timeout_ms: u64,
     #[cfg(test)]
     checkpoints: AtomicUsize,
+    #[cfg(test)]
+    block_at_checkpoint: AtomicUsize,
 }
 
 impl ExecCancel {
@@ -104,6 +108,8 @@ impl ExecCancel {
             timeout_ms: 0,
             #[cfg(test)]
             checkpoints: AtomicUsize::new(0),
+            #[cfg(test)]
+            block_at_checkpoint: AtomicUsize::new(0),
         }
     }
 
@@ -116,6 +122,8 @@ impl ExecCancel {
             timeout_ms,
             #[cfg(test)]
             checkpoints: AtomicUsize::new(0),
+            #[cfg(test)]
+            block_at_checkpoint: AtomicUsize::new(0),
         }
     }
 
@@ -172,7 +180,23 @@ impl ExecCancel {
     /// query may continue.
     fn error(&self) -> Option<QueryError> {
         #[cfg(test)]
-        self.checkpoints.fetch_add(1, Ordering::Relaxed);
+        {
+            let count = self.checkpoints.fetch_add(1, Ordering::Relaxed) + 1;
+            // Deterministic rendezvous for cancellation tests: once the target
+            // checkpoint is reached, park this executor thread until the test's
+            // observer thread delivers the cancel. Without this, a fast scan can
+            // finish its remaining rows before the observer is scheduled, and
+            // the test flakes on contended CI runners. Bounded so a broken test
+            // cannot hang the suite; on expiry the query simply continues and
+            // the test's own assertion reports the failure.
+            let target = self.block_at_checkpoint.load(Ordering::Relaxed);
+            if target != 0 && count >= target && self.reason().is_none() {
+                let give_up = Instant::now() + Duration::from_secs(3);
+                while self.reason().is_none() && Instant::now() < give_up {
+                    std::thread::yield_now();
+                }
+            }
+        }
         match self.reason()? {
             CancelReason::Timeout => Some(QueryError::Timeout {
                 timeout_ms: self.timeout_ms,
@@ -187,6 +211,14 @@ impl ExecCancel {
     #[cfg(test)]
     pub(crate) fn checkpoint_count(&self) -> usize {
         self.checkpoints.load(Ordering::Relaxed)
+    }
+
+    /// Arm the test-only checkpoint rendezvous: the executor thread parks at
+    /// the first real checkpoint numbered `target` or later until this token
+    /// is cancelled (bounded internally). Must be set before the query runs.
+    #[cfg(test)]
+    pub(crate) fn block_at_checkpoint(&self, target: usize) {
+        self.block_at_checkpoint.store(target, Ordering::Relaxed);
     }
 }
 

@@ -6742,6 +6742,10 @@ fn cancel_after_checkpoint(
     token: CancelArc<ExecCancel>,
     target: usize,
 ) -> std::thread::JoinHandle<()> {
+    // Arm the rendezvous before the query starts: the executor parks at the
+    // target checkpoint until the observer below delivers the cancel, so the
+    // outcome cannot depend on thread scheduling between checkpoint and cancel.
+    token.block_at_checkpoint(target);
     std::thread::spawn(move || {
         let deadline = CancelInstant::now() + CancelDuration::from_secs(3);
         while token.checkpoint_count() < target && CancelInstant::now() < deadline {
