@@ -98,6 +98,11 @@ done <<< "$site_versions"
 grep -qE '^## \[Unreleased\]' CHANGELOG.md \
   || fail "CHANGELOG.md is missing the Unreleased section for v$workspace_version work"
 
+# The npm client ships its CHANGELOG.md in the tarball; it must at least cover
+# the latest published release so package consumers see current release notes.
+grep -qE "^## $current_release" clients/ts/CHANGELOG.md \
+  || fail "clients/ts/CHANGELOG.md has no entry for published release $current_release"
+
 # SECURITY.md must list the published minor series (e.g. 0.12.x) as supported.
 # During development an unreleased workspace series must additionally remain
 # explicitly unsupported until it ships.
