@@ -239,6 +239,32 @@ impl Database {
         })))
     }
 
+    /// Open a database **read-only** over a quiescent directory for snapshot
+    /// serving (a restored backup or a checkpointed replica). Nothing on disk is
+    /// ever mutated: reads work, and every mutating statement (via
+    /// [`Database::query`] / [`Database::query_sql`] / the `*_with_params`
+    /// variants) returns a terminal read-only error instead of writing. N
+    /// read-only handles across processes may serve the same directory
+    /// concurrently. A non-empty WAL is refused with an actionable error: the
+    /// directory must be recovered by a read-write open first.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::open_read_only(dir)
+        })))
+    }
+
+    /// Read-only open with an explicit per-query memory budget (bytes).
+    pub fn open_read_only_with_memory_limit(
+        dir: impl AsRef<Path>,
+        limit_bytes: usize,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::open_read_only_with_memory_limit(dir, limit_bytes)
+        })))
+    }
+
     /// Open with an explicit per-query memory budget (bytes).
     pub fn open_with_memory_limit(
         dir: impl AsRef<Path>,
@@ -828,6 +854,80 @@ mod tests {
             }
             other => panic!("expected rows, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_read_only_serves_reads_and_rejects_mutations() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_ro_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.query("type User { required name: str, age: int }")
+                .unwrap();
+            db.query(r#"insert User { name := "Ada", age := 36 }"#)
+                .unwrap();
+            // Clean drop checkpoints: quiescent (WAL-clean) directory.
+        }
+
+        let mut db = Database::open_read_only(&dir).unwrap();
+        // Reads work through both query() and query_readonly().
+        match db.query("count(User)").unwrap() {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+            other => panic!("expected scalar 1, got {other:?}"),
+        }
+        match db
+            .query_readonly("User filter .age = 36 { .name }")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("Ada".into()))
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // A mutation via query() returns a terminal read-only error, not a panic.
+        let err = db
+            .query(r#"insert User { name := "Bo", age := 20 }"#)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("readonly mode"),
+            "expected a read-only error, got {err}"
+        );
+        assert!(!err.to_string().contains("__POWDB_READONLY_NEEDS_WRITE__"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_read_only_refuses_non_empty_wal() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_facade_ro_dirtywal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            // Leave the WAL non-empty by forgetting the catalog (a crash).
+            let mut catalog = powdb_storage::catalog::Catalog::create(&dir).unwrap();
+            catalog
+                .create_table(powdb_storage::types::Schema {
+                    table_name: "T".into(),
+                    columns: vec![powdb_storage::types::ColumnDef {
+                        name: "id".into(),
+                        type_id: powdb_storage::types::TypeId::Int,
+                        required: true,
+                        position: 0,
+                    }],
+                })
+                .unwrap();
+            catalog.insert("T", &vec![Value::Int(1)]).unwrap();
+            catalog.sync_wal().unwrap();
+            std::mem::forget(catalog);
+        }
+        let err = match Database::open_read_only(&dir) {
+            Ok(_) => panic!("read-only open must refuse a non-empty WAL"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("WAL is not empty"),
+            "expected WAL-not-empty refusal, got {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

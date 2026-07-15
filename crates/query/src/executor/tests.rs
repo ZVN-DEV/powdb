@@ -7369,3 +7369,112 @@ fn conjunction_fast_path_honors_explicit_cancel() {
         QueryResult::Scalar(Value::Int(6000))
     ));
 }
+
+/// Build a quiescent (checkpointed, WAL-clean) data dir with a table, an index,
+/// and rows, then return its path for a read-only reopen.
+fn seed_read_only_dir(tag: &str) -> std::path::PathBuf {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_ro_{tag}_{}_{}", std::process::id(), id));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type User { required name: str, age: int }")
+            .unwrap();
+        engine.execute_powql("alter User add index .age").unwrap();
+        engine
+            .execute_powql(r#"insert User { name := "Ada", age := 36 }"#)
+            .unwrap();
+        engine
+            .execute_powql(r#"insert User { name := "Bo", age := 20 }"#)
+            .unwrap();
+        // Clean drop checkpoints (flush + WAL truncate): quiescent directory.
+    }
+    dir
+}
+
+#[test]
+fn read_only_engine_serves_reads() {
+    let dir = seed_read_only_dir("reads");
+    let engine = Engine::open_read_only(&dir).unwrap();
+    assert!(engine.is_read_only());
+    // count read
+    assert!(matches!(
+        engine.execute_powql_readonly("count(User)").unwrap(),
+        QueryResult::Scalar(Value::Int(2))
+    ));
+    // filter read
+    match engine
+        .execute_powql_readonly("User filter .age > 27 { .name }")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Str("Ada".into()));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_only_engine_explain_works() {
+    let dir = seed_read_only_dir("explain");
+    let mut engine = Engine::open_read_only(&dir).unwrap();
+    // explain is a read; goes through execute_powql, which in read-only mode
+    // routes through the read-only executor.
+    match engine
+        .execute_powql("explain User filter .age = 36")
+        .unwrap()
+    {
+        QueryResult::Rows { .. } | QueryResult::Executed { .. } => {}
+        other => panic!("expected an explain result, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_only_engine_rejects_every_mutation_shape() {
+    let dir = seed_read_only_dir("mut");
+    let mut engine = Engine::open_read_only(&dir).unwrap();
+    for stmt in [
+        r#"insert User { name := "X", age := 1 }"#,
+        "User filter .age = 36 update { age := 99 }",
+        "User filter .age = 20 delete",
+        "type Other { required id: int }",
+        "alter User add index .name",
+        "begin",
+    ] {
+        let err = engine.execute_powql(stmt).unwrap_err();
+        assert_eq!(
+            err,
+            QueryError::ReadonlyMode,
+            "statement {stmt:?} must return the terminal ReadonlyMode error, got {err:?}"
+        );
+        // The internal sentinel must never leak to the operator.
+        assert!(!err.to_string().contains("__POWDB_READONLY_NEEDS_WRITE__"));
+        assert!(err.to_string().contains("readonly mode"));
+    }
+    // Reads still work after a rejected mutation: the engine is not wedged.
+    assert!(matches!(
+        engine.execute_powql("count(User)").unwrap(),
+        QueryResult::Scalar(Value::Int(2))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_only_engine_sql_mutation_is_terminal() {
+    let dir = seed_read_only_dir("sql");
+    let mut engine = Engine::open_read_only(&dir).unwrap();
+    let err = engine
+        .execute_sql("insert into User (name, age) values ('Z', 5)")
+        .unwrap_err();
+    assert_eq!(err, QueryError::ReadonlyMode);
+    // A SQL read still works.
+    match engine.execute_sql("select count(*) from User").unwrap() {
+        QueryResult::Scalar(Value::Int(2)) => {}
+        other => panic!("expected scalar 2, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

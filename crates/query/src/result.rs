@@ -71,6 +71,11 @@ pub enum QueryError {
     StorageError(String),
     /// Readonly path needs write lock (internal sentinel).
     ReadonlyNeedsWrite,
+    /// The engine was opened read-only (snapshot serving) and the statement
+    /// requires a writer. Unlike [`QueryError::ReadonlyNeedsWrite`], this is a
+    /// terminal error with an operator-facing message: there is no writer to
+    /// escalate to in this mode.
+    ReadonlyMode,
     /// The per-query deadline elapsed before execution finished. Returned as a
     /// clean early-return from an unbounded executor loop so the query releases
     /// its locks instead of running to completion. `timeout_ms` is the
@@ -130,6 +135,10 @@ impl fmt::Display for QueryError {
             QueryError::ReadonlyNeedsWrite => {
                 write!(f, "__POWDB_READONLY_NEEDS_WRITE__")
             }
+            QueryError::ReadonlyMode => write!(
+                f,
+                "readonly mode: statement requires a writer (this database was opened read-only for snapshot serving; refresh materialized views before snapshotting a read-only directory)"
+            ),
             QueryError::Timeout { timeout_ms } => {
                 write!(f, "query timeout after {timeout_ms}ms")
             }

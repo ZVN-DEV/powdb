@@ -218,6 +218,24 @@ const result = await client.query("User filter .age > 25 { .name, .age }");
 if (result.kind === "rows") console.table(result.rows);
 ```
 
+### Read-only snapshot serving
+
+Serve a quiescent data directory (a restored backup or a checkpointed replica)
+read-only, with no write gate at all:
+
+```bash
+powdb-server --readonly --data-dir ./serve/current --port 5433
+```
+
+Reads are served; every mutation returns a terminal read-only error. N read-only
+processes can serve the same directory concurrently (a read-write open refuses
+while live readers exist, and vice versa), and a read-only open never mutates the
+directory. Embedded, use `Database.openReadOnly(dir)` (Node) or
+`Database::open_read_only(dir)` (Rust). See
+[Read-only snapshot serving](docs/read-only-serving.md) for the backup to restore
+to serve flow, the swap-directory refresh pattern, and the requirement to refresh
+materialized views before snapshotting.
+
 ### Environment variables
 
 | Variable | Default | Description |
@@ -233,6 +251,7 @@ if (result.kind === "rows") console.table(result.rows);
 | `POWDB_QUERY_TIMEOUT` | `30` | Per-query deadline in seconds; cooperative cancellation stops supported scan, join, group, and mutation-discovery work and releases server admission promptly |
 | `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated** — bind it to localhost or a private network, never the public internet |
+| `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](docs/read-only-serving.md) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
 ### Production checklist

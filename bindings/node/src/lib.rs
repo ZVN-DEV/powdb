@@ -462,6 +462,52 @@ impl Database {
         }
     }
 
+    /// Open a database **read-only** at `dir` for snapshot serving (a restored
+    /// backup or a checkpointed replica). Nothing on disk is ever mutated: reads
+    /// via [`Database::query_native`] / [`Database::query_readonly`] work, and
+    /// every mutating statement throws a terminal read-only error. N read-only
+    /// handles across processes may serve the same directory concurrently. A
+    /// non-empty WAL is refused: recover the directory with a read-write open
+    /// first. Throws if the same directory is already open in this process.
+    #[napi(factory)]
+    pub fn open_read_only(dir: String) -> napi::Result<Database> {
+        let key = canonical_key(&dir);
+        register_open(&key)?;
+        match Inner::open_read_only(&dir) {
+            Ok(inner) => Ok(Database {
+                inner: Some(inner),
+                key,
+            }),
+            Err(e) => {
+                unregister_open(&key);
+                Err(to_napi_err(e))
+            }
+        }
+    }
+
+    /// Read-only open with an explicit per-query memory budget in bytes. Throws
+    /// if the same directory is already open elsewhere in this process.
+    #[napi(factory)]
+    pub fn open_read_only_with_memory_limit(
+        dir: String,
+        limit_bytes: i64,
+    ) -> napi::Result<Database> {
+        let limit = usize::try_from(limit_bytes)
+            .map_err(|_| napi::Error::from_reason("limit_bytes must be a non-negative integer"))?;
+        let key = canonical_key(&dir);
+        register_open(&key)?;
+        match Inner::open_read_only_with_memory_limit(&dir, limit) {
+            Ok(inner) => Ok(Database {
+                inner: Some(inner),
+                key,
+            }),
+            Err(e) => {
+                unregister_open(&key);
+                Err(to_napi_err(e))
+            }
+        }
+    }
+
     fn inner_mut(&mut self) -> napi::Result<&mut Inner> {
         self.inner
             .as_mut()

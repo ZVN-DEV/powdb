@@ -43,3 +43,20 @@ pub fn create_data_dir_secure(data_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(data_dir)
     }
 }
+
+/// Validate that `data_dir` is an existing directory suitable for read-only
+/// snapshot serving, **without mutating it**. Unlike [`create_data_dir_secure`]
+/// this never creates the directory and never calls `set_permissions`: a
+/// read-only open must leave the directory byte-for-byte unchanged. It only
+/// confirms the path exists and is a directory; the actual read access is then
+/// proven by opening the catalog and heap files read-only.
+pub fn validate_data_dir_read_only(data_dir: &Path) -> io::Result<()> {
+    let meta = std::fs::metadata(data_dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", data_dir.display()),
+        ));
+    }
+    Ok(())
+}

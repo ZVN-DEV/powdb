@@ -165,7 +165,19 @@ impl HeapFile {
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut disk = DiskManager::open(path)?;
+        Self::open_disk(DiskManager::open(path)?)
+    }
+
+    /// Reopen a heap file **read-only** for snapshot serving. The underlying
+    /// [`DiskManager`] refuses every write, and the open-time free-space scan
+    /// never reinitializes zero pages in place (that write path is skipped on a
+    /// read-only handle), so opening never mutates the directory.
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        Self::open_disk(DiskManager::open_read_only(path)?)
+    }
+
+    fn open_disk(mut disk: DiskManager) -> io::Result<Self> {
+        let read_only = disk.is_read_only();
         let num_pages = disk.num_pages();
         let (first_data_page, heap_version) = if num_pages == 0 {
             (0, HEAP_FORMAT_VERSION)
@@ -199,6 +211,14 @@ impl HeapFile {
                 // takes `free_start = 0` as the write offset and stomps
                 // on the page header with row bytes.
                 if buf[4] == 0 {
+                    // A read-only handle must never write. A quiescent
+                    // (restored/checkpointed) directory has no half-allocated
+                    // zero pages: those only appear after a crash mid-allocate,
+                    // which read-only serving refuses to open via the WAL check ,
+                    // so skipping the reinit here loses no reachable rows.
+                    if read_only {
+                        continue;
+                    }
                     let mut fresh = Page::new(i, PageType::Data);
                     // WS3: this is a direct write that bypasses the flush
                     // path, so stamp the CRC here — otherwise the page's

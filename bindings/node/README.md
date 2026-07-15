@@ -20,6 +20,14 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
 - `Database.open(dir)` — open or create a database at `dir`.
 - `Database.openWithMemoryLimit(dir, limitBytes)` — open with an explicit
   per-query memory budget (caps sort/join/GROUP BY materialization).
+- `Database.openReadOnly(dir)`: open a **quiescent** directory (a restored
+  backup or a checkpointed replica) read-only for snapshot serving. Reads work;
+  every mutation throws a terminal read-only error, and the directory is never
+  mutated. N read-only handles across processes can serve the same directory
+  concurrently. A non-empty (unrecovered) WAL is refused. See
+  [Read-only snapshot serving](https://github.com/zvndev/powdb/blob/main/docs/read-only-serving.md).
+- `Database.openReadOnlyWithMemoryLimit(dir, limitBytes)`: read-only open with
+  an explicit per-query memory budget.
 - `db.query(powql)`: run a PowQL statement (string-typed cells).
 - `db.querySql(sql)` — run a SQL statement (lowered to PowQL).
 - `db.queryReadonly(powql)` — run a read-only statement.
