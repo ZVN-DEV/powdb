@@ -28,6 +28,9 @@ struct Args {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     query_memory_limit: usize,
+    /// Fallback nested-loop join candidate-pair cap; env-only. `None` keeps the
+    /// engine default (`MAX_NESTED_LOOP_PAIRS`).
+    nested_loop_pair_limit: Option<usize>,
     require_tls: bool,
     /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
     metrics_addr: Option<String>,
@@ -70,6 +73,16 @@ fn parse_query_memory_limit(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
+/// Parse the `POWDB_MAX_NESTED_LOOP_PAIRS` environment value. Accepts a plain
+/// positive candidate-pair count; `None` (unset, empty, unparseable, or zero)
+/// leaves the engine default (`MAX_NESTED_LOOP_PAIRS`) in place. Pulled out as
+/// a free function so it can be unit-tested without spawning the server,
+/// mirroring [`parse_query_memory_limit`].
+fn parse_nested_loop_pair_limit(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Parse `POWDB_SYNC_MODE` (`full` | `normal` | `off`). Defaults to `Full` —
@@ -158,6 +171,9 @@ fn parse_args() -> Args {
     // Per-query memory budget; env-only (no CLI flag).
     let query_memory_limit =
         parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
+    // Fallback nested-loop join candidate-pair cap; env-only (no CLI flag).
+    let nested_loop_pair_limit =
+        parse_nested_loop_pair_limit(std::env::var("POWDB_MAX_NESTED_LOOP_PAIRS").ok().as_deref());
     // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
 
@@ -305,6 +321,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_TX_WAIT_TIMEOUT_MS   Max ms a BEGIN waits for a concurrent explicit transaction (default: 5000)");
                 println!("    POWDB_DB_NAME              Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
+                println!("    POWDB_MAX_NESTED_LOOP_PAIRS  Fallback nested-loop join candidate-pair cap (default: 6,400,000)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
@@ -331,6 +348,7 @@ fn parse_args() -> Args {
         tls_cert,
         tls_key,
         query_memory_limit,
+        nested_loop_pair_limit,
         require_tls,
         metrics_addr,
         socket,
@@ -495,6 +513,13 @@ async fn main() {
         query_memory_limit = args.query_memory_limit,
         "per-query memory budget"
     );
+    if let Some(limit) = args.nested_loop_pair_limit {
+        engine.set_nested_loop_pair_limit(limit);
+        info!(
+            nested_loop_pair_limit = limit,
+            "fallback nested-loop join candidate-pair cap (POWDB_MAX_NESTED_LOOP_PAIRS)"
+        );
+    }
 
     // WAL durability mode (POWDB_SYNC_MODE). Default Full is fully durable.
     let sync_mode = parse_sync_mode(std::env::var("POWDB_SYNC_MODE").ok().as_deref());
@@ -884,6 +909,21 @@ mod tests {
     fn memory_limit_parses_explicit_value() {
         assert_eq!(parse_query_memory_limit(Some("1048576")), 1_048_576);
         assert_eq!(parse_query_memory_limit(Some("  4096  ")), 4096);
+    }
+
+    #[test]
+    fn nested_loop_pair_limit_env_parsing() {
+        // Unset / empty / garbage / zero all leave the engine default (None).
+        assert_eq!(parse_nested_loop_pair_limit(None), None);
+        assert_eq!(parse_nested_loop_pair_limit(Some("")), None);
+        assert_eq!(parse_nested_loop_pair_limit(Some("not-a-number")), None);
+        assert_eq!(parse_nested_loop_pair_limit(Some("0")), None);
+        // A positive count (including a small one for testing) overrides.
+        assert_eq!(parse_nested_loop_pair_limit(Some("4")), Some(4));
+        assert_eq!(
+            parse_nested_loop_pair_limit(Some("  6400000 ")),
+            Some(6_400_000)
+        );
     }
 
     #[test]

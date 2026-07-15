@@ -404,3 +404,109 @@ fn path_index_creation_rejects_existing_duplicates_and_non_scalar_nodes() {
         "a rejected non-scalar index build must leave fallback reads usable"
     );
 }
+
+#[test]
+fn update_changing_indexed_path_from_scalar_to_missing_moves_row_to_nulls_last() {
+    // Maintaining an expression index across an update that drops the indexed
+    // path must relocate the row from its scalar key into the empty set, where
+    // NULLS-LAST ordering still finds it — the row is never lost.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    exec(&mut engine, "type Doc { required id: int, data: json }");
+    insert_doc(&mut engine, 1, r#"{"score":20}"#);
+    insert_doc(&mut engine, 2, r#"{"score":10}"#);
+    insert_doc(&mut engine, 3, r#"{"score":30}"#);
+    exec(&mut engine, "alter Doc add index (.data->score)");
+
+    // Rewrite row 2 so its indexed path is now absent.
+    exec(
+        &mut engine,
+        r#"Doc filter .id = 2 update { data := "{\"label\":\"gone\"}" }"#,
+    );
+
+    // The row survives and sorts last under NULLS-LAST in both directions,
+    // proving it moved into the index's empty set rather than being dropped.
+    assert_eq!(
+        sorted_row_ids(exec(&mut engine, "Doc { .id }")),
+        vec![1, 2, 3],
+        "the updated row must still exist"
+    );
+    assert_eq!(
+        row_ids(exec(&mut engine, "Doc order .data->score asc { .id }",)),
+        vec![1, 3, 2],
+        "ascending: scalar keys first, the now-missing row last"
+    );
+    assert_eq!(
+        row_ids(exec(&mut engine, "Doc order .data->score desc { .id }",)),
+        vec![3, 1, 2],
+        "descending reverses the scalar keys but keeps the missing row last"
+    );
+    // Equality against null/missing finds exactly the relocated row.
+    assert_eq!(
+        row_ids(exec(&mut engine, "Doc filter .data->score = null { .id }",)),
+        vec![2],
+        "the relocated row is findable via the empty-set equality path"
+    );
+}
+
+#[test]
+fn update_violating_unique_path_index_fails_atomically() {
+    // A PowQL update that would collide on a unique expression index must fail
+    // and leave both the heap row and the index untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    exec(&mut engine, "type Doc { required id: int, data: json }");
+    insert_doc(&mut engine, 1, r#"{"code":"a"}"#);
+    insert_doc(&mut engine, 2, r#"{"code":"b"}"#);
+    exec(&mut engine, "alter Doc add unique (.data->code)");
+
+    let error = engine
+        .execute_powql(r#"Doc filter .id = 2 update { data := "{\"code\":\"a\"}" }"#)
+        .expect_err("updating row 2 to a duplicate indexed key must fail");
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("unique") || message.contains("duplicate"),
+        "{error}"
+    );
+
+    // The heap row is unchanged: row 2 still carries code "b".
+    assert_eq!(
+        row_ids(exec(&mut engine, r#"Doc filter .data->code = "b" { .id }"#,)),
+        vec![2],
+        "the failed update must not rewrite the row"
+    );
+    // The index is unchanged: "a" still maps to exactly row 1.
+    assert_eq!(
+        sorted_row_ids(exec(&mut engine, r#"Doc filter .data->code = "a" { .id }"#,)),
+        vec![1],
+        "the failed update must not leave a duplicate in the unique index"
+    );
+}
+
+#[test]
+fn update_writing_non_scalar_into_indexed_path_reports_scalar_key_error() {
+    // Runtime index maintenance (not the build-time scan) must reject a value
+    // whose indexed path resolves to an object/array, with the exact
+    // storage-layer "expression index key must be scalar" message.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    exec(&mut engine, "type Doc { required id: int, data: json }");
+    insert_doc(&mut engine, 1, r#"{"code":"a"}"#);
+    exec(&mut engine, "alter Doc add index (.data->code)");
+
+    let error = engine
+        .execute_powql(r#"Doc filter .id = 1 update { data := "{\"code\":{\"nested\":1}}" }"#)
+        .expect_err("a non-scalar indexed key must be rejected at maintenance time");
+    assert!(
+        error
+            .to_string()
+            .contains("expression index key must be scalar"),
+        "expected the storage-layer scalar-key message, got: {error}"
+    );
+    // The rejected update left the original scalar key intact.
+    assert_eq!(
+        row_ids(exec(&mut engine, r#"Doc filter .data->code = "a" { .id }"#,)),
+        vec![1],
+        "the failed update must not corrupt the existing indexed row"
+    );
+}

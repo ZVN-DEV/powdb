@@ -52,6 +52,13 @@ fn mark_sql_statement_raw(statement: &mut Statement) {
             mark_sql_statement_raw(&mut union.right);
         }
         Statement::Explain(inner) => mark_sql_statement_raw(inner),
+        // Dead arm: the SQL frontend has no CREATE VIEW production (see
+        // `create`, which only builds TABLE and INDEX), so `parse_sql` never
+        // yields a `CreateView`. It is kept only so this match stays total over
+        // the shared AST. WARNING: if SQL views are ever added, a stored view's
+        // canonical PowQL text must spell aggregates `raw` (this is what marks
+        // them so). Dropping this marking would silently flip a stored view's
+        // aggregation semantics on refresh. See the CREATE VIEW rejection test.
         Statement::CreateView(view) => mark_sql_query_raw(&mut view.query),
         _ => {}
     }
@@ -1162,6 +1169,20 @@ impl SqlParser {
             let name = self.expect_ident("column name")?;
             match self.bump() {
                 Some(SqlTok::Op(op)) if op == "=" => {}
+                // A JSON path target (`SET data->'x' = ...`) reads a column name
+                // and then a `->`/`->>` where `=` is expected. Report the
+                // unsupported position precisely instead of a generic
+                // "expected '='" so the user knows path mutation (json_set) is
+                // not yet available and can write the whole JSON column instead.
+                Some(SqlTok::Op(op)) if op == "->" || op == "->>" => {
+                    return Err(ParseError::Unsupported {
+                        feature: format!(
+                            "cannot assign to a JSON path target `{name}{op}...`: JSON path \
+                             assignment targets are not supported; write the whole JSON column \
+                             instead (path mutation such as json_set is not yet available)"
+                        ),
+                    })
+                }
                 Some(t) => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "=".into(),
@@ -1507,6 +1528,47 @@ fn is_reserved_identifier(w: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ast::{AlterAction, IndexTarget};
+
+    #[test]
+    fn sql_frontend_rejects_create_view() {
+        // The SQL frontend has no CREATE VIEW production, so the dead
+        // `Statement::CreateView` arm in `mark_sql_statement_raw` is truly
+        // unreachable. If this ever starts parsing, that arm (and its
+        // `raw`-marking warning) must be revisited before views can round-trip.
+        let result = parse_sql("CREATE VIEW v AS SELECT id FROM Post");
+        assert!(
+            result.is_err(),
+            "CREATE VIEW must be rejected by the SQL frontend, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn json_path_update_target_is_targeted_unsupported() {
+        // `UPDATE t SET data->'x' = 5` must not die with a generic
+        // "expected '='" — it must name the unsupported feature and the
+        // whole-column alternative.
+        for stmt in [
+            "UPDATE Doc SET data->'x' = 5",
+            "UPDATE Doc SET data->>'x' = 5",
+        ] {
+            let err = parse_sql(stmt).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Unsupported { .. }),
+                "{stmt}: expected Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("JSON path assignment targets are not supported"),
+                "{stmt}: message must state the unsupported feature: {msg}"
+            );
+            assert!(
+                msg.contains("json_set"),
+                "{stmt}: message must point at the whole-column alternative: {msg}"
+            );
+        }
+        // A normal whole-column update still parses.
+        assert!(parse_sql("UPDATE Doc SET data = '{}'").is_ok());
+    }
 
     #[test]
     fn json_arrows_lex_longest_token_and_lower_to_powql_paths() {

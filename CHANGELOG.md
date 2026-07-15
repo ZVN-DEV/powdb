@@ -87,8 +87,11 @@ faster than the generic decode path.
 ### Known limitations (documented in docs/POWQL.md)
 
 - Aggregating over a path (`sum(.data->price)`) and grouping/ordering BY a
-  path fail with a clear error; both arrive with the expression-index work in
-  a following release.
+  path are unsupported. Correction: earlier notes claimed these fail with "a
+  clear error"; the actual 0.12 parser result was the opaque
+  `unexpected trailing token near token N: '->'` message, not a targeted one.
+  Both the support and the targeted errors arrive with the expression-index
+  work in a following release (v0.13).
 - Over the network, `json_type()` cannot distinguish JSON `null` from a
   missing path (both render as NULL); embedded use distinguishes them. A
   typed wire surface fixes this in a following release.

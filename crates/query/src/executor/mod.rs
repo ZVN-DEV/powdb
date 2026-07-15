@@ -374,6 +374,11 @@ pub struct Engine {
     /// Default [`mem_budget::DEFAULT_QUERY_MEMORY_LIMIT`] (256 MB); overridable
     /// via `Engine::with_memory_limit` (server reads `POWDB_QUERY_MEMORY_LIMIT`).
     query_memory_limit: usize,
+    /// Maximum candidate pairs a fallback nested-loop join may evaluate before
+    /// it is rejected. Default [`MAX_NESTED_LOOP_PAIRS`], overridable via
+    /// [`Engine::set_nested_loop_pair_limit`] (server reads
+    /// `POWDB_MAX_NESTED_LOOP_PAIRS`). A plain `usize` so `Engine` stays `Sync`.
+    nested_loop_pair_limit: usize,
     wal_archive_hook: Option<WalArchiveHook>,
 }
 
@@ -442,6 +447,7 @@ impl Engine {
             view_registry,
             in_transaction: false,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
+            nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             wal_archive_hook,
         })
     }
@@ -478,6 +484,19 @@ impl Engine {
     /// Override the per-query memory limit in bytes (builder-style).
     pub fn set_query_memory_limit(&mut self, limit_bytes: usize) {
         self.query_memory_limit = limit_bytes;
+    }
+
+    /// Current fallback nested-loop join candidate-pair cap.
+    pub fn nested_loop_pair_limit(&self) -> usize {
+        self.nested_loop_pair_limit
+    }
+
+    /// Override the fallback nested-loop join candidate-pair cap. Used by the
+    /// server to apply `POWDB_MAX_NESTED_LOOP_PAIRS`, and by tests that need a
+    /// tiny cap to exercise the guard on a small join. A zero limit is clamped
+    /// to 1 so a valid single-pair join is never rejected outright.
+    pub fn set_nested_loop_pair_limit(&mut self, limit: usize) {
+        self.nested_loop_pair_limit = limit.max(1);
     }
 
     /// Set the WAL durability mode (see [`WalSyncMode`]). `Full` (the default)
@@ -2031,6 +2050,7 @@ impl Engine {
                     right_rows,
                     on.as_ref(),
                     *kind,
+                    self.nested_loop_pair_limit,
                 )
             }
 

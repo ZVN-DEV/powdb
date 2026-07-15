@@ -1120,8 +1120,13 @@ alter Post add unique (.data->external_id)
 Path indexes support equality and range filters. An index can also provide an
 ascending or descending `order path limit K` scan without sorting the table.
 Missing paths and explicit JSON null are valid indexed values and sort last in
-both directions. Objects and arrays are not valid path-index keys; index
-creation or a later write fails atomically if the indexed path resolves to one.
+both directions. `desc` reverses the ordering of the keys only, never the
+NULLS-LAST placement: rows with a missing or JSON-null key stay at the end in
+both `asc` and `desc`. Rows that share an equal key are not reordered by
+direction either: an equal-key tie keeps its stable insertion (RID) order in
+both `asc` and `desc`, so paging through ties is deterministic. Objects and
+arrays are not valid path-index keys; index creation or a later write fails
+atomically if the indexed path resolves to one.
 Unique path indexes ignore missing and JSON-null values, like nullable unique
 column indexes.
 

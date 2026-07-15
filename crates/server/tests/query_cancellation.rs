@@ -443,6 +443,60 @@ async fn disconnect_rolls_back_an_explicit_transaction_before_gate_release() {
 }
 
 #[tokio::test]
+async fn cancelled_begin_closes_connection_and_frees_the_gate() {
+    // A zero query timeout makes every statement trip the statement-boundary
+    // cancellation checkpoint the instant it enters the executor (the deadline
+    // is already in the past), before a begin can open a transaction. This
+    // drives the begin arm's cancellation path deterministically, with no
+    // scheduler race.
+    let (addr, handle, _metrics) =
+        start_join_server(0, Duration::ZERO, Duration::from_secs(2)).await;
+    let mut client = connect(&addr).await;
+
+    // The begin is cancelled at the statement boundary and returns a typed
+    // timeout error rather than opening a transaction.
+    match query(&mut client, "begin").await {
+        Message::Error { message } => assert_eq!(message, "query timeout after 0ms"),
+        other => panic!("expected the cancelled begin to time out, got {other:?}"),
+    }
+
+    // Parity fix: a cancelled begin closes the connection (like the
+    // commit/rollback and in-transaction arms) instead of leaving it open in
+    // an ambiguous state, so the next frame reads EOF. Before the fix the
+    // begin arm only checked `is_success_response`, so a cancelled begin left
+    // the connection open and this second frame would draw another response.
+    let _ = client
+        .write_all(
+            &Message::Query {
+                query: "begin".into(),
+            }
+            .encode(),
+        )
+        .await;
+    let mut header = [0u8; 6];
+    match tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut header)).await {
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("server kept the connection open after a cancelled begin"),
+        Err(_) => panic!("connection neither closed nor answered after a cancelled begin"),
+    }
+
+    // The transaction gate was fully released, not wedged by the cancelled
+    // begin: a fresh connection is admitted and reaches the same statement
+    // boundary. A leaked permit would instead surface as a transaction gate
+    // timeout after tx_wait_timeout.
+    let mut fresh = connect(&addr).await;
+    match query(&mut fresh, "begin").await {
+        Message::Error { message } => assert_eq!(
+            message, "query timeout after 0ms",
+            "a wedged gate would surface as a transaction gate timeout"
+        ),
+        other => panic!("expected the fresh begin to reach the executor, got {other:?}"),
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn timeout_rolls_back_an_explicit_transaction_before_gate_release() {
     let (addr, handle, _metrics) =
         start_join_server(SLOW_ROWS, Duration::from_millis(75), Duration::from_secs(5)).await;

@@ -324,6 +324,39 @@ would be unsafe for a mutation after an ambiguous response.
 Legacy `query` and `querySql` keep their existing string result shapes for
 wire compatibility.
 
+### Fully lossless access with `queryNativeRaw`
+
+`queryNative` is friendly, but its convenience conversion erases a few
+storage-level distinctions: it maps every empty cell, JSON `null`, and even a
+successful decode to a plain JavaScript `null`, and it drops the raw PJ1 bytes
+that back a JSON value. When you need that fidelity, use `queryNativeRaw`, which
+returns every cell as the raw `WireValue` tagged union straight off the wire:
+
+```typescript
+const raw = await client.queryNativeRaw(
+  "Doc filter .id = $1 { .note, .missing, .data }",
+  [1],
+);
+
+if (raw.kind === "rows") {
+  const [note, missing, data] = raw.rows[0];
+  // note:    { type: "str", value: "null" }   — the string "null"
+  // missing: { type: "empty" }                — an absent value
+  // data:    { type: "json", value: null, pj1: Uint8Array }  — a JSON null
+}
+```
+
+Reach for `queryNativeRaw` when you need:
+
+- **Storage-level identity** — telling an absent value (`{ type: "empty" }`)
+  apart from the string `"null"` and a JSON `null`, all of which `queryNative`
+  collapses to `null`.
+- **Raw PJ1 bytes** — the `pj1: Uint8Array` on a `json` cell is the exact
+  on-wire binary JSON, for byte-identical storage, hashing, or re-encoding.
+
+It accepts the same `$N` parameter array and `AbortSignal` options as
+`queryNative`. For ordinary reads, prefer `queryNative`.
+
 ## Schema-coerced rows
 
 The legacy wire protocol serialises every value as a string. If you want JS
@@ -529,6 +562,13 @@ Runs PowQL through the native typed wire surface and returns a
 including exact bytes and recursively decoded JSON. Parameters and abort
 options match `query()`. The method does not replay through the legacy string
 surface.
+
+### `client.queryNativeRaw(query, params?, opts?)`
+
+Like `queryNative`, but returns every cell as the raw `WireValue` tagged union
+(`Promise<RawNativeQueryResult>`) with no conversion to `NativeValue`. Use it
+for storage-level identity (Empty vs `"null"` vs a JSON null) or the raw PJ1
+bytes of a JSON cell (`pj1`). Parameters and abort options match `queryNative`.
 
 ### `client.querySqlNative(query, opts?)`
 

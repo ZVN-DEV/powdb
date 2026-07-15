@@ -105,11 +105,11 @@ impl fmt::Display for QueryError {
                 match pairs {
                     Some(pairs) => write!(
                         f,
-                        "nested-loop join would evaluate {pairs} candidate pairs, above the {limit} pair limit; add an equi-key to ON, index/filter an input, or reduce the joined row counts"
+                        "nested-loop join would evaluate {pairs} candidate pairs, above the {limit} pair limit; add an equi-key to ON, index/filter an input, reduce the joined row counts, or raise the cap via POWDB_MAX_NESTED_LOOP_PAIRS"
                     ),
                     None => write!(
                         f,
-                        "nested-loop join candidate count overflows usize ({left_rows} x {right_rows}), above the {limit} pair limit; add an equi-key to ON, index/filter an input, or reduce the joined row counts"
+                        "nested-loop join candidate count overflows usize ({left_rows} x {right_rows}), above the {limit} pair limit; add an equi-key to ON, index/filter an input, reduce the joined row counts, or raise the cap via POWDB_MAX_NESTED_LOOP_PAIRS"
                     ),
                 }
             }

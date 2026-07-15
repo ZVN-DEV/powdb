@@ -15,7 +15,7 @@ use std::ops::ControlFlow;
 use super::compiled::*;
 use super::eval::*;
 use super::row_body_base;
-use super::{check_join_limit, mem_budget, Engine, MAX_NESTED_LOOP_PAIRS, MAX_SORT_ROWS};
+use super::{check_join_limit, mem_budget, Engine, MAX_SORT_ROWS};
 use powdb_storage::view::ViewDef;
 
 /// Maximum number of elements sorted by the standard-library stable sort
@@ -745,7 +745,13 @@ impl Engine {
             } => {
                 let left = self.materialize_rows_with_provenance(left)?;
                 let right = self.materialize_rows_with_provenance(right)?;
-                execute_provenance_join(left, right, on.as_ref(), *kind)?
+                execute_provenance_join(
+                    left,
+                    right,
+                    on.as_ref(),
+                    *kind,
+                    self.nested_loop_pair_limit,
+                )?
             }
             _ => {
                 return Err(QueryError::Execution(
@@ -2330,6 +2336,7 @@ impl Engine {
                     right_rows,
                     on.as_ref(),
                     *kind,
+                    self.nested_loop_pair_limit,
                 )
             }
 
@@ -5900,6 +5907,7 @@ fn hash_join(
 pub(super) fn check_nested_loop_pair_limit(
     left_rows: usize,
     right_rows: usize,
+    pair_limit: usize,
 ) -> Result<usize, QueryError> {
     let candidate_pairs =
         left_rows
@@ -5907,13 +5915,13 @@ pub(super) fn check_nested_loop_pair_limit(
             .ok_or(QueryError::NestedLoopPairLimitExceeded {
                 left_rows,
                 right_rows,
-                limit: MAX_NESTED_LOOP_PAIRS,
+                limit: pair_limit,
             })?;
-    if candidate_pairs > MAX_NESTED_LOOP_PAIRS {
+    if candidate_pairs > pair_limit {
         return Err(QueryError::NestedLoopPairLimitExceeded {
             left_rows,
             right_rows,
-            limit: MAX_NESTED_LOOP_PAIRS,
+            limit: pair_limit,
         });
     }
     Ok(candidate_pairs)
@@ -5929,6 +5937,7 @@ pub(super) fn execute_materialized_join(
     right_rows: Vec<Vec<Value>>,
     on: Option<&Expr>,
     kind: JoinKind,
+    pair_limit: usize,
 ) -> Result<QueryResult, QueryError> {
     crate::cancel::check()?;
     if !matches!(kind, JoinKind::Cross) {
@@ -5950,7 +5959,7 @@ pub(super) fn execute_materialized_join(
         }
     }
 
-    check_nested_loop_pair_limit(left_rows.len(), right_rows.len())?;
+    check_nested_loop_pair_limit(left_rows.len(), right_rows.len(), pair_limit)?;
     let n_left = left_columns.len();
     let n_right = right_columns.len();
     let mut columns = Vec::with_capacity(n_left + n_right);
@@ -5998,6 +6007,7 @@ fn execute_provenance_join(
     right: ProvenanceRows,
     on: Option<&Expr>,
     kind: JoinKind,
+    pair_limit: usize,
 ) -> Result<ProvenanceRows, QueryError> {
     let left_width = left.columns.len();
     let right_width = right.columns.len();
@@ -6065,7 +6075,7 @@ fn execute_provenance_join(
         }
     }
 
-    check_nested_loop_pair_limit(left.rows.len(), right.rows.len())?;
+    check_nested_loop_pair_limit(left.rows.len(), right.rows.len(), pair_limit)?;
     for (left_index, left_row) in left.rows.iter().enumerate() {
         let mut matched = false;
         for (right_index, right_row) in right.rows.iter().enumerate() {

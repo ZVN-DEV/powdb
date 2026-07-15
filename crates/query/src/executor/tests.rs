@@ -1529,11 +1529,11 @@ fn test_right_compound_join_preserves_residual_rejections_after_rewrite() {
 #[test]
 fn test_nested_loop_pair_limit_allows_exact_cap_and_rejects_larger_products() {
     assert_eq!(
-        super::plan_exec::check_nested_loop_pair_limit(2_500, 2_560),
+        super::plan_exec::check_nested_loop_pair_limit(2_500, 2_560, super::MAX_NESTED_LOOP_PAIRS),
         Ok(super::MAX_NESTED_LOOP_PAIRS)
     );
     assert!(matches!(
-        super::plan_exec::check_nested_loop_pair_limit(2_501, 2_560),
+        super::plan_exec::check_nested_loop_pair_limit(2_501, 2_560, super::MAX_NESTED_LOOP_PAIRS),
         Err(QueryError::NestedLoopPairLimitExceeded {
             left_rows: 2_501,
             right_rows: 2_560,
@@ -1541,7 +1541,7 @@ fn test_nested_loop_pair_limit_allows_exact_cap_and_rejects_larger_products() {
         })
     ));
     assert!(matches!(
-        super::plan_exec::check_nested_loop_pair_limit(usize::MAX, 2),
+        super::plan_exec::check_nested_loop_pair_limit(usize::MAX, 2, super::MAX_NESTED_LOOP_PAIRS),
         Err(QueryError::NestedLoopPairLimitExceeded { .. })
     ));
 }
@@ -1570,6 +1570,7 @@ fn test_cross_and_non_equi_products_are_bounded_before_iteration() {
         right.clone(),
         Some(&non_equi),
         JoinKind::Inner,
+        super::MAX_NESTED_LOOP_PAIRS,
     );
     assert!(matches!(
         non_equi_result,
@@ -1583,6 +1584,7 @@ fn test_cross_and_non_equi_products_are_bounded_before_iteration() {
         right,
         None,
         JoinKind::Cross,
+        super::MAX_NESTED_LOOP_PAIRS,
     );
     assert!(matches!(
         cross_result,
@@ -1618,6 +1620,43 @@ fn test_non_equi_join_falls_back_to_nested_loop() {
             }
         }
         _ => panic!("expected rows"),
+    }
+}
+
+#[test]
+fn test_nested_loop_pair_limit_env_override_lowers_and_restores_cap() {
+    // A tiny cap rejects a join whose candidate-pair count is small but above
+    // the override; restoring the default cap admits the same join. This is
+    // exactly how POWDB_MAX_NESTED_LOOP_PAIRS reaches the executor: the server
+    // parses the env value and applies it via `set_nested_loop_pair_limit`
+    // (see powdb-server `parse_nested_loop_pair_limit`), so the override is
+    // tested here without racing on a process-global env var.
+    let mut engine = join_engine();
+    // 3 users x 4 orders = 12 candidate pairs on the non-equi nested-loop path.
+    engine.set_nested_loop_pair_limit(4);
+    match engine.execute_powql("User as u join Order as o on u.id < o.user_id") {
+        Err(QueryError::NestedLoopPairLimitExceeded { limit, .. }) => {
+            assert_eq!(limit, 4, "the executor must honor the lowered cap");
+            assert!(
+                QueryError::NestedLoopPairLimitExceeded {
+                    left_rows: 3,
+                    right_rows: 4,
+                    limit: 4,
+                }
+                .to_string()
+                .contains("POWDB_MAX_NESTED_LOOP_PAIRS"),
+                "the pair-limit error must name the env-var remediation"
+            );
+        }
+        other => panic!("expected the tiny cap to reject the join, got {other:?}"),
+    }
+
+    // Raising the cap back to the default admits the same join above the
+    // previous cap.
+    engine.set_nested_loop_pair_limit(super::MAX_NESTED_LOOP_PAIRS);
+    match engine.execute_powql("User as u join Order as o on u.id < o.user_id") {
+        Ok(QueryResult::Rows { rows, .. }) => assert_eq!(rows.len(), 4),
+        other => panic!("expected the raised cap to admit the join, got {other:?}"),
     }
 }
 

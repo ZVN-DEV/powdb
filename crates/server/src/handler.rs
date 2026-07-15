@@ -1748,11 +1748,247 @@ async fn acquire_autocommit_permit(
     }
 }
 
-/// Execute one wire query frame and return the response plus its un-waited
-/// WAL durability ticket. The TxGate permit is managed here and — crucially —
-/// is already released (bare statements, commit/rollback) by the time this
-/// returns, so the caller's `finalize_durability` wait happens OUTSIDE the
-/// gate and overlapping committers can share an fsync.
+/// Run the shared four-arm transaction-routing state machine for one wire
+/// query frame, returning the response plus its un-waited WAL durability
+/// ticket. The TxGate permit is managed here and, crucially, is already
+/// released (bare statements, commit/rollback) by the time this returns, so
+/// the caller's `finalize_durability` wait happens OUTSIDE the gate and
+/// overlapping committers can share an fsync.
+///
+/// The three wire dialects (PowQL, SQL, parameterized PowQL) differ only in
+/// how a frame is parsed and dispatched; they share this routing, so a
+/// behavior fix (e.g. cancellation rollback parity) lands here exactly once.
+/// `parsed_query` is the dialect's already-parsed frame, `tx_control` its
+/// transaction-control classification, `autocommit_admission` the admission
+/// mode for a bare (non-transaction) statement, and `dispatch` the closure
+/// that executes the parsed frame (its `bool` argument is
+/// `allow_readonly_escalation`).
+#[allow(clippy::too_many_arguments)]
+async fn run_wire_query_state_machine<Inner, D, R>(
+    engine: Arc<RwLock<Engine>>,
+    tx_gate: TxGate,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    parsed_query: Arc<Inner>,
+    tx_control: Option<TransactionControl>,
+    autocommit_admission: AdmissionMode,
+    result_mode: WireResultMode,
+    principal: Option<Principal>,
+    query_timeout: Duration,
+    query_deadline: Instant,
+    tx_wait_timeout: Duration,
+    metrics: &Arc<Metrics>,
+    reader: &mut BufReader<R>,
+    wire_read_buffer: &mut Vec<u8>,
+    pending_messages: &mut InFlightReadAhead,
+    dispatch: D,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)
+where
+    Inner: Send + Sync + 'static,
+    D: Fn(Arc<RwLock<Engine>>, Arc<Inner>, Option<Principal>, bool) -> DispatchOutcome
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    R: AsyncRead + Unpin,
+{
+    match tx_control {
+        Some(TransactionControl::Begin) => {
+            if tx_permit.is_some() {
+                return (
+                    Message::Error {
+                        message: sanitize_error(
+                            "cannot begin: a transaction is already active on this connection",
+                        ),
+                    },
+                    None,
+                    None,
+                );
+            }
+            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
+                Ok(permit) => permit,
+                Err(response) => return (response, None, None),
+            };
+            let dispatch_begin = dispatch.clone();
+            let (response, ticket, mut termination, _) = run_blocking_query(
+                engine.clone(),
+                Arc::clone(&parsed_query),
+                principal.clone(),
+                result_mode,
+                query_timeout,
+                query_deadline,
+                metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
+                move |engine, parsed_query, principal| {
+                    dispatch_begin(engine, parsed_query, principal, true)
+                },
+            )
+            .await;
+            if is_success_response(&response) {
+                *tx_permit = Some(permit);
+            } else if is_query_cancellation_response(&response) {
+                // Parity with the commit/rollback and in-transaction arms: a
+                // cancelled begin must not leave the engine's transaction
+                // state ownerless. Install the just-acquired permit so the
+                // shared rollback helper can undo any transaction the begin
+                // opened, then release the permit and close the connection.
+                *tx_permit = Some(permit);
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                termination = Some(ConnectionTermination::Closed);
+            }
+            (response, ticket, termination)
+        }
+        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
+            let standalone_permit = if tx_permit.is_none() {
+                match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => Some(permit),
+                    Err(response) => return (response, None, None),
+                }
+            } else {
+                None
+            };
+            let dispatch_commit = dispatch.clone();
+            let (response, ticket, mut termination, _) = run_blocking_query(
+                engine.clone(),
+                Arc::clone(&parsed_query),
+                principal.clone(),
+                result_mode,
+                query_timeout,
+                query_deadline,
+                metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
+                move |engine, parsed_query, principal| {
+                    dispatch_commit(engine, parsed_query, principal, true)
+                },
+            )
+            .await;
+            if is_success_response(&response) {
+                // Release the gate BEFORE the caller waits on the commit's
+                // ticket: the engine work is done and WAL order is fixed, so
+                // another connection's commit can start (and share the fsync)
+                // while this one waits.
+                tx_permit.take();
+            } else if is_query_cancellation_response(&response) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                termination = Some(ConnectionTermination::Closed);
+            }
+            drop(standalone_permit);
+            (response, ticket, termination)
+        }
+        None if tx_permit.is_some() => {
+            let dispatch_in_tx = dispatch.clone();
+            let mut out = run_blocking_query(
+                engine.clone(),
+                Arc::clone(&parsed_query),
+                principal.clone(),
+                result_mode,
+                query_timeout,
+                query_deadline,
+                metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
+                move |engine, parsed_query, principal| {
+                    dispatch_in_tx(engine, parsed_query, principal, true)
+                },
+            )
+            .await;
+            if is_query_cancellation_response(&out.0) {
+                rollback_connection_transaction(engine, principal, tx_permit).await;
+                out.2 = Some(ConnectionTermination::Closed);
+            }
+            (out.0, out.1, out.2)
+        }
+        None => {
+            let admission = autocommit_admission;
+            let permit = match acquire_autocommit_permit(
+                &tx_gate,
+                admission,
+                tx_wait_timeout,
+                metrics,
+            )
+            .await
+            {
+                Ok(permit) => permit,
+                Err(response) => return (response, None, None),
+            };
+            // The parsed AST can be large. Share the first parse with the
+            // rare dirty-view retry instead of cloning it on every successful
+            // autocommit read.
+            let retry_engine = Arc::clone(&engine);
+            let retry_parsed_query = Arc::clone(&parsed_query);
+            let retry_principal = principal.clone();
+            let allow_readonly_escalation = admission == AdmissionMode::Writer;
+            let dispatch_first = dispatch.clone();
+            let mut out = run_blocking_query(
+                engine,
+                parsed_query,
+                principal,
+                result_mode,
+                query_timeout,
+                query_deadline,
+                metrics,
+                reader,
+                wire_read_buffer,
+                pending_messages,
+                move |engine, parsed_query, principal| {
+                    dispatch_first(engine, parsed_query, principal, allow_readonly_escalation)
+                },
+            )
+            .await;
+            drop(permit);
+            if out.3 {
+                let writer_permit = match acquire_autocommit_permit(
+                    &tx_gate,
+                    AdmissionMode::Writer,
+                    tx_wait_timeout,
+                    metrics,
+                )
+                .await
+                {
+                    Ok(permit) => permit,
+                    Err(response) => return (response, None, None),
+                };
+                let dispatch_retry = dispatch.clone();
+                out = run_blocking_query(
+                    retry_engine,
+                    retry_parsed_query,
+                    retry_principal,
+                    result_mode,
+                    query_timeout,
+                    query_deadline,
+                    metrics,
+                    reader,
+                    wire_read_buffer,
+                    pending_messages,
+                    move |engine, parsed_query, principal| {
+                        dispatch_retry(engine, parsed_query, principal, true)
+                    },
+                )
+                .await;
+                drop(writer_permit);
+            }
+            (out.0, out.1, out.2)
+        }
+    }
+}
+
+/// Execute one PowQL wire query frame. Thin dialect wrapper over
+/// [`run_wire_query_state_machine`].
 #[allow(clippy::too_many_arguments)]
 async fn execute_wire_query<R>(
     engine: Arc<RwLock<Engine>>,
@@ -1782,216 +2018,42 @@ where
     // three separate routing helpers before reaching it.
     let stmt_result = parser::parse(&query).map_err(|e| e.to_string());
     let parsed_query = Arc::new((query, stmt_result));
-    match parsed_transaction_control(&parsed_query.1) {
-        Some(TransactionControl::Begin) => {
-            if tx_permit.is_some() {
-                return (
-                    Message::Error {
-                        message: sanitize_error(
-                            "cannot begin: a transaction is already active on this connection",
-                        ),
-                    },
-                    None,
-                    None,
-                );
-            }
-            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            let (response, ticket, termination, _) = run_blocking_query(
-                engine,
-                Arc::clone(&parsed_query),
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
+    let tx_control = parsed_transaction_control(&parsed_query.1);
+    let autocommit_admission = parsed_query
+        .1
+        .as_ref()
+        .map(statement_admission)
+        .unwrap_or(AdmissionMode::Writer);
+    run_wire_query_state_machine(
+        engine,
+        tx_gate,
+        tx_permit,
+        parsed_query,
+        tx_control,
+        autocommit_admission,
+        result_mode,
+        principal,
+        query_timeout,
+        query_deadline,
+        tx_wait_timeout,
+        metrics,
+        reader,
+        wire_read_buffer,
+        pending_messages,
+        |engine,
+         parsed_query: Arc<(String, Result<powdb_query::ast::Statement, String>)>,
+         principal: Option<Principal>,
+         allow| {
+            dispatch_query_parsed(
+                &engine,
+                &parsed_query.0,
+                &parsed_query.1,
+                principal.as_ref(),
+                allow,
             )
-            .await;
-            if is_success_response(&response) {
-                *tx_permit = Some(permit);
-            }
-            (response, ticket, termination)
-        }
-        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let standalone_permit = if tx_permit.is_none() {
-                match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => Some(permit),
-                    Err(response) => return (response, None, None),
-                }
-            } else {
-                None
-            };
-            let (response, ticket, mut termination, _) = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_success_response(&response) {
-                // Release the gate BEFORE the caller waits on the commit's
-                // ticket: the engine work is done and WAL order is fixed, so
-                // another connection's commit can start (and share the fsync)
-                // while this one waits.
-                tx_permit.take();
-            } else if is_query_cancellation_response(&response) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                termination = Some(ConnectionTermination::Closed);
-            }
-            drop(standalone_permit);
-            (response, ticket, termination)
-        }
-        None if tx_permit.is_some() => {
-            let mut out = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_query_cancellation_response(&out.0) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                out.2 = Some(ConnectionTermination::Closed);
-            }
-            (out.0, out.1, out.2)
-        }
-        None => {
-            let admission = parsed_query
-                .1
-                .as_ref()
-                .map(statement_admission)
-                .unwrap_or(AdmissionMode::Writer);
-            let permit = match acquire_autocommit_permit(
-                &tx_gate,
-                admission,
-                tx_wait_timeout,
-                metrics,
-            )
-            .await
-            {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            // The parsed AST can be large. Share the first parse with the
-            // rare dirty-view retry instead of cloning it on every successful
-            // autocommit read.
-            let retry_engine = Arc::clone(&engine);
-            let retry_parsed_query = Arc::clone(&parsed_query);
-            let retry_principal = principal.clone();
-            let allow_readonly_escalation = admission == AdmissionMode::Writer;
-            let mut out = run_blocking_query(
-                engine,
-                parsed_query,
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                move |engine, parsed_query, principal| {
-                    dispatch_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        allow_readonly_escalation,
-                    )
-                },
-            )
-            .await;
-            drop(permit);
-            if out.3 {
-                let writer_permit = match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => permit,
-                    Err(response) => return (response, None, None),
-                };
-                out = run_blocking_query(
-                    retry_engine,
-                    retry_parsed_query,
-                    retry_principal,
-                    result_mode,
-                    query_timeout,
-                    query_deadline,
-                    metrics,
-                    reader,
-                    wire_read_buffer,
-                    pending_messages,
-                    |engine, parsed_query, principal| {
-                        dispatch_query_parsed(
-                            &engine,
-                            &parsed_query.0,
-                            &parsed_query.1,
-                            principal.as_ref(),
-                            true,
-                        )
-                    },
-                )
-                .await;
-                drop(writer_permit);
-            }
-            (out.0, out.1, out.2)
-        }
-    }
+        },
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2019,211 +2081,42 @@ where
     let query_deadline = Instant::now() + query_timeout;
     let stmt_result = sql::parse_sql(&query).map_err(|e| e.to_string());
     let parsed_query = Arc::new((query, stmt_result));
-    match parsed_transaction_control(&parsed_query.1) {
-        Some(TransactionControl::Begin) => {
-            if tx_permit.is_some() {
-                return (
-                    Message::Error {
-                        message: sanitize_error(
-                            "cannot begin: a transaction is already active on this connection",
-                        ),
-                    },
-                    None,
-                    None,
-                );
-            }
-            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            let (response, ticket, termination, _) = run_blocking_query(
-                engine,
-                Arc::clone(&parsed_query),
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_sql_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
+    let tx_control = parsed_transaction_control(&parsed_query.1);
+    let autocommit_admission = parsed_query
+        .1
+        .as_ref()
+        .map(statement_admission)
+        .unwrap_or(AdmissionMode::Writer);
+    run_wire_query_state_machine(
+        engine,
+        tx_gate,
+        tx_permit,
+        parsed_query,
+        tx_control,
+        autocommit_admission,
+        result_mode,
+        principal,
+        query_timeout,
+        query_deadline,
+        tx_wait_timeout,
+        metrics,
+        reader,
+        wire_read_buffer,
+        pending_messages,
+        |engine,
+         parsed_query: Arc<(String, Result<powdb_query::ast::Statement, String>)>,
+         principal: Option<Principal>,
+         allow| {
+            dispatch_sql_query_parsed(
+                &engine,
+                &parsed_query.0,
+                &parsed_query.1,
+                principal.as_ref(),
+                allow,
             )
-            .await;
-            if is_success_response(&response) {
-                *tx_permit = Some(permit);
-            }
-            (response, ticket, termination)
-        }
-        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let standalone_permit = if tx_permit.is_none() {
-                match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => Some(permit),
-                    Err(response) => return (response, None, None),
-                }
-            } else {
-                None
-            };
-            let (response, ticket, mut termination, _) = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_sql_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_success_response(&response) {
-                // See execute_wire_query: release the gate before the
-                // caller's durability wait so commits can coalesce.
-                tx_permit.take();
-            } else if is_query_cancellation_response(&response) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                termination = Some(ConnectionTermination::Closed);
-            }
-            drop(standalone_permit);
-            (response, ticket, termination)
-        }
-        None if tx_permit.is_some() => {
-            let mut out = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_sql_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_query_cancellation_response(&out.0) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                out.2 = Some(ConnectionTermination::Closed);
-            }
-            (out.0, out.1, out.2)
-        }
-        None => {
-            let admission = parsed_query
-                .1
-                .as_ref()
-                .map(statement_admission)
-                .unwrap_or(AdmissionMode::Writer);
-            let permit = match acquire_autocommit_permit(
-                &tx_gate,
-                admission,
-                tx_wait_timeout,
-                metrics,
-            )
-            .await
-            {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            let retry_engine = Arc::clone(&engine);
-            let retry_parsed_query = Arc::clone(&parsed_query);
-            let retry_principal = principal.clone();
-            let allow_readonly_escalation = admission == AdmissionMode::Writer;
-            let mut out = run_blocking_query(
-                engine,
-                parsed_query,
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                move |engine, parsed_query, principal| {
-                    dispatch_sql_query_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        principal.as_ref(),
-                        allow_readonly_escalation,
-                    )
-                },
-            )
-            .await;
-            drop(permit);
-            if out.3 {
-                let writer_permit = match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => permit,
-                    Err(response) => return (response, None, None),
-                };
-                out = run_blocking_query(
-                    retry_engine,
-                    retry_parsed_query,
-                    retry_principal,
-                    result_mode,
-                    query_timeout,
-                    query_deadline,
-                    metrics,
-                    reader,
-                    wire_read_buffer,
-                    pending_messages,
-                    |engine, parsed_query, principal| {
-                        dispatch_sql_query_parsed(
-                            &engine,
-                            &parsed_query.0,
-                            &parsed_query.1,
-                            principal.as_ref(),
-                            true,
-                        )
-                    },
-                )
-                .await;
-                drop(writer_permit);
-            }
-            (out.0, out.1, out.2)
-        }
-    }
+        },
+    )
+    .await
 }
 
 // One over clippy's default arg limit: the metrics handle was threaded through
@@ -2256,216 +2149,47 @@ where
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
     let stmt_result = parser::parse_with_params(&query, &bound).map_err(|e| e.to_string());
     let parsed_query = Arc::new((query, bound, stmt_result));
-    match parsed_transaction_control(&parsed_query.2) {
-        Some(TransactionControl::Begin) => {
-            if tx_permit.is_some() {
-                return (
-                    Message::Error {
-                        message: sanitize_error(
-                            "cannot begin: a transaction is already active on this connection",
-                        ),
-                    },
-                    None,
-                    None,
-                );
-            }
-            let permit = match acquire_begin_permit(&tx_gate, tx_wait_timeout, metrics).await {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            let (response, ticket, termination, _) = run_blocking_query(
-                engine,
-                Arc::clone(&parsed_query),
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                move |engine, parsed_query, principal| {
-                    dispatch_query_with_bound_params_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        &parsed_query.2,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
+    let tx_control = parsed_transaction_control(&parsed_query.2);
+    let autocommit_admission = parsed_query
+        .2
+        .as_ref()
+        .map(statement_admission)
+        .unwrap_or(AdmissionMode::Writer);
+    run_wire_query_state_machine(
+        engine,
+        tx_gate,
+        tx_permit,
+        parsed_query,
+        tx_control,
+        autocommit_admission,
+        result_mode,
+        principal,
+        query_timeout,
+        query_deadline,
+        tx_wait_timeout,
+        metrics,
+        reader,
+        wire_read_buffer,
+        pending_messages,
+        |engine,
+         parsed_query: Arc<(
+            String,
+            Vec<powdb_query::ast::ParamValue>,
+            Result<powdb_query::ast::Statement, String>,
+        )>,
+         principal: Option<Principal>,
+         allow| {
+            dispatch_query_with_bound_params_parsed(
+                &engine,
+                &parsed_query.0,
+                &parsed_query.1,
+                &parsed_query.2,
+                principal.as_ref(),
+                allow,
             )
-            .await;
-            if is_success_response(&response) {
-                *tx_permit = Some(permit);
-            }
-            (response, ticket, termination)
-        }
-        Some(TransactionControl::Commit | TransactionControl::Rollback) => {
-            let standalone_permit = if tx_permit.is_none() {
-                match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => Some(permit),
-                    Err(response) => return (response, None, None),
-                }
-            } else {
-                None
-            };
-            let (response, ticket, mut termination, _) = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_query_with_bound_params_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        &parsed_query.2,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_success_response(&response) {
-                // See execute_wire_query: release the gate before the
-                // caller's durability wait so commits can coalesce.
-                tx_permit.take();
-            } else if is_query_cancellation_response(&response) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                termination = Some(ConnectionTermination::Closed);
-            }
-            drop(standalone_permit);
-            (response, ticket, termination)
-        }
-        None if tx_permit.is_some() => {
-            let mut out = run_blocking_query(
-                engine.clone(),
-                Arc::clone(&parsed_query),
-                principal.clone(),
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                |engine, parsed_query, principal| {
-                    dispatch_query_with_bound_params_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        &parsed_query.2,
-                        principal.as_ref(),
-                        true,
-                    )
-                },
-            )
-            .await;
-            if is_query_cancellation_response(&out.0) {
-                rollback_connection_transaction(engine, principal, tx_permit).await;
-                out.2 = Some(ConnectionTermination::Closed);
-            }
-            (out.0, out.1, out.2)
-        }
-        None => {
-            let admission = parsed_query
-                .2
-                .as_ref()
-                .map(statement_admission)
-                .unwrap_or(AdmissionMode::Writer);
-            let permit = match acquire_autocommit_permit(
-                &tx_gate,
-                admission,
-                tx_wait_timeout,
-                metrics,
-            )
-            .await
-            {
-                Ok(permit) => permit,
-                Err(response) => return (response, None, None),
-            };
-            let retry_engine = Arc::clone(&engine);
-            let retry_parsed_query = Arc::clone(&parsed_query);
-            let retry_principal = principal.clone();
-            let allow_readonly_escalation = admission == AdmissionMode::Writer;
-            let mut out = run_blocking_query(
-                engine,
-                parsed_query,
-                principal,
-                result_mode,
-                query_timeout,
-                query_deadline,
-                metrics,
-                reader,
-                wire_read_buffer,
-                pending_messages,
-                move |engine, parsed_query, principal| {
-                    dispatch_query_with_bound_params_parsed(
-                        &engine,
-                        &parsed_query.0,
-                        &parsed_query.1,
-                        &parsed_query.2,
-                        principal.as_ref(),
-                        allow_readonly_escalation,
-                    )
-                },
-            )
-            .await;
-            drop(permit);
-            if out.3 {
-                let writer_permit = match acquire_autocommit_permit(
-                    &tx_gate,
-                    AdmissionMode::Writer,
-                    tx_wait_timeout,
-                    metrics,
-                )
-                .await
-                {
-                    Ok(permit) => permit,
-                    Err(response) => return (response, None, None),
-                };
-                out = run_blocking_query(
-                    retry_engine,
-                    retry_parsed_query,
-                    retry_principal,
-                    result_mode,
-                    query_timeout,
-                    query_deadline,
-                    metrics,
-                    reader,
-                    wire_read_buffer,
-                    pending_messages,
-                    |engine, parsed_query, principal| {
-                        dispatch_query_with_bound_params_parsed(
-                            &engine,
-                            &parsed_query.0,
-                            &parsed_query.1,
-                            &parsed_query.2,
-                            principal.as_ref(),
-                            true,
-                        )
-                    },
-                )
-                .await;
-                drop(writer_permit);
-            }
-            (out.0, out.1, out.2)
-        }
-    }
+        },
+    )
+    .await
 }
 
 /// A statement's metric sample whose recording is deferred until its WAL

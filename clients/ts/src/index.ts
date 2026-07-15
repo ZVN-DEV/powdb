@@ -67,6 +67,21 @@ export type NativeQueryResult =
   | { kind: "message"; message: string };
 
 /**
+ * The fully lossless result of {@link Client.queryNativeRaw}: every cell is the
+ * raw {@link WireValue} tagged union straight off the wire, with no conversion
+ * to {@link NativeValue}. Use this when you need storage-level identity that the
+ * convenience conversion erases — the raw PJ1 bytes of a JSON cell (`pj1`), or
+ * telling an absent value (`{ type: "empty" }`) apart from the string `"null"`
+ * (`{ type: "str", value: "null" }`) or a JSON null (`{ type: "json", value:
+ * null }`), all of which {@link queryNative} collapses to `null`.
+ */
+export type RawNativeQueryResult =
+  | { kind: "rows"; columns: string[]; rows: WireValue[][] }
+  | { kind: "scalar"; value: WireValue }
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string };
+
+/**
  * A value bound to a positional `$N` placeholder in {@link Client.query}.
  *
  * The server binds these at the token level — a string is substituted as a
@@ -225,6 +240,26 @@ function nativeQueryResult(reply: Message): NativeQueryResult {
       };
     case "ResultScalarNative":
       return { kind: "scalar", value: fromWireValue(reply.value) };
+    case "ResultOk":
+      return { kind: "ok", affected: reply.affected };
+    case "ResultMessage":
+      return { kind: "message", message: reply.message };
+    case "Error":
+      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+    default:
+      throw new PowDBError(
+        `unexpected reply to native query: ${reply.type}`,
+        "protocol_error",
+      );
+  }
+}
+
+function rawNativeQueryResult(reply: Message): RawNativeQueryResult {
+  switch (reply.type) {
+    case "ResultRowsNative":
+      return { kind: "rows", columns: reply.columns, rows: reply.rows };
+    case "ResultScalarNative":
+      return { kind: "scalar", value: reply.value };
     case "ResultOk":
       return { kind: "ok", affected: reply.affected };
     case "ResultMessage":
@@ -673,6 +708,55 @@ export class Client extends EventEmitter<ClientEvents> {
               params: params.map(toWireParam),
             };
       const result = nativeQueryResult(await this.send(request, opts));
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: true,
+        kind: result.kind,
+      });
+      return result;
+    } catch (err) {
+      this.emit("query", {
+        query,
+        durationMs: Date.now() - start,
+        ok: false,
+        error: err as Error,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Like {@link queryNative}, but returns every cell as the raw
+   * {@link WireValue} tagged union with no conversion to {@link NativeValue}.
+   *
+   * Reach for this only when the convenience conversion would erase something
+   * you need: the raw PJ1 bytes of a JSON cell (`pj1`), or the distinction
+   * between an absent value (`{ type: "empty" }`), the string `"null"`, and a
+   * JSON null (all three of which {@link queryNative} maps to `null`). For
+   * ordinary reads, {@link queryNative} is friendlier.
+   */
+  async queryNativeRaw(
+    query: string,
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<RawNativeQueryResult> {
+    const hasParams = Array.isArray(paramsOrOpts);
+    const params = hasParams ? (paramsOrOpts as QueryParam[]) : undefined;
+    const opts = hasParams
+      ? maybeOpts
+      : (paramsOrOpts as { signal?: AbortSignal } | undefined);
+    const start = Date.now();
+    try {
+      const request: Message =
+        params === undefined
+          ? { type: "QueryNative", query }
+          : {
+              type: "QueryWithParamsNative",
+              query,
+              params: params.map(toWireParam),
+            };
+      const result = rawNativeQueryResult(await this.send(request, opts));
       this.emit("query", {
         query,
         durationMs: Date.now() - start,

@@ -788,6 +788,28 @@ impl Parser {
         self.expect(&Token::LBrace)?;
         let mut assignments = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            // A JSON path target (`.data->x := ...` or `data->x := ...`) is a
+            // field/dot-field immediately followed by `->`. Detect it before
+            // the generic ident/`:=` parse so the error names the unsupported
+            // position and the whole-column alternative, instead of a bare
+            // "expected field name" (the `.data` DotIdent case) or "expected
+            // ':='" (the `data` Ident case).
+            if matches!(self.peek(), Token::DotIdent(_) | Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Arrow))
+            {
+                let field = match self.peek() {
+                    Token::DotIdent(n) | Token::Ident(n) => n.clone(),
+                    _ => unreachable!("guarded by the matches! above"),
+                };
+                return Err(ParseError::Unsupported {
+                    feature: format!(
+                        "cannot assign to a JSON path target `.{field}->...` (at token {pos}): \
+                         JSON path assignment targets are not supported; write the whole JSON \
+                         column instead (path mutation such as json_set is not yet available)",
+                        pos = self.pos
+                    ),
+                });
+            }
             let field = self.expect_named_ident("field name")?;
             self.expect(&Token::Assign)?;
             let value = self.parse_expr()?;
@@ -4176,6 +4198,35 @@ mod json_path_tests {
             err.to_string().to_lowercase().contains("field base"),
             "expected a field-base error, got: {err}"
         );
+    }
+
+    #[test]
+    fn json_path_assignment_target_is_targeted_unsupported() {
+        // `Doc update { .data->x := 5 }` must not die with a generic
+        // "expected field name" — it must name the unsupported position and
+        // the whole-column alternative. Both the leading-dot path-target form
+        // and the bare `data->x` form take the targeted branch.
+        for stmt in [
+            "Doc update { .data->x := 5 }",
+            "Doc update { data->x := 5 }",
+        ] {
+            let err = parse(stmt).unwrap_err();
+            assert!(
+                matches!(err, ParseError::Unsupported { .. }),
+                "{stmt}: expected Unsupported, got {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("JSON path assignment targets are not supported"),
+                "{stmt}: message must state the unsupported feature: {msg}"
+            );
+            assert!(
+                msg.contains("json_set"),
+                "{stmt}: message must point at the whole-column alternative: {msg}"
+            );
+        }
+        // A normal whole-column update still parses.
+        assert!(parse(r#"Doc update { data := "{}" }"#).is_ok());
     }
 
     #[test]
