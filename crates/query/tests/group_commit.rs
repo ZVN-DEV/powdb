@@ -131,74 +131,92 @@ fn test_coalesced_batch_single_fsync_and_crash_recovery() {
 
 /// Concurrent committers through the shared-engine lock pattern the server
 /// uses: append + register under the write lock, drop the lock, wait for a
-/// covering fsync. Overlap must coalesce fsyncs (fewer fsyncs than commits)
-/// and every acknowledged commit must survive a hard crash.
+/// covering fsync. Every acknowledged commit must survive a hard crash on
+/// every attempt (strict), and at least one attempt must show fsync
+/// coalescing (fewer fsyncs than commits). Coalescing per run is a
+/// scheduling-dependent property, not a guarantee: if the durability worker
+/// keeps pace with the producers (observed under AddressSanitizer's uniform
+/// slowdown), every commit legally gets its own fsync. Retrying with a fresh
+/// directory turns the flaky per-run assertion into a stable capability
+/// check without weakening the durability half.
 #[test]
 fn test_concurrent_committers_coalesce_and_survive_crash() {
     const THREADS: usize = 8;
     const PER_THREAD: i64 = 20;
     const TOTAL: i64 = THREADS as i64 * PER_THREAD;
+    const ATTEMPTS: usize = 5;
 
-    let dir = temp_dir("concurrent");
-    std::fs::create_dir_all(&dir).unwrap();
+    let mut fsyncs_seen = Vec::new();
+    for attempt in 0..ATTEMPTS {
+        let dir = temp_dir(&format!("concurrent-{attempt}"));
+        std::fs::create_dir_all(&dir).unwrap();
 
-    {
-        let mut engine = Engine::new(&dir).unwrap();
-        exec(&mut engine, "type C { required id: int, v: int }");
-        let base = engine.wal_fsync_count();
-        let engine = Arc::new(RwLock::new(engine));
+        let fsyncs = {
+            let mut engine = Engine::new(&dir).unwrap();
+            exec(&mut engine, "type C { required id: int, v: int }");
+            let base = engine.wal_fsync_count();
+            let engine = Arc::new(RwLock::new(engine));
 
-        let barrier = Arc::new(Barrier::new(THREADS));
-        let mut handles = Vec::new();
-        for t in 0..THREADS {
-            let engine = Arc::clone(&engine);
-            let barrier = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                for i in 0..PER_THREAD {
-                    let id = t as i64 * PER_THREAD + i;
-                    let (res, ticket) = {
-                        let mut eng = engine.write().unwrap();
-                        eng.run_with_deferred_durability(|e| {
-                            e.execute_powql(&format!("insert C {{ id := {id}, v := {id} }}"))
-                        })
-                    };
-                    res.unwrap();
-                    // The lock is dropped; only now do we wait for coverage —
-                    // exactly the server's acknowledge-after-fsync ordering.
-                    ticket
-                        .expect("Full mode must hand out a durability ticket")
-                        .wait()
-                        .unwrap();
-                }
-            }));
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::new();
+            for t in 0..THREADS {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..PER_THREAD {
+                        let id = t as i64 * PER_THREAD + i;
+                        let (res, ticket) = {
+                            let mut eng = engine.write().unwrap();
+                            eng.run_with_deferred_durability(|e| {
+                                e.execute_powql(&format!("insert C {{ id := {id}, v := {id} }}"))
+                            })
+                        };
+                        res.unwrap();
+                        // The lock is dropped; only now do we wait for
+                        // coverage, exactly the server's
+                        // acknowledge-after-fsync ordering.
+                        ticket
+                            .expect("Full mode must hand out a durability ticket")
+                            .wait()
+                            .unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let mut engine = Arc::try_unwrap(engine)
+                .unwrap_or_else(|_| panic!("engine still shared after join"))
+                .into_inner()
+                .unwrap();
+            let fsyncs = engine.wal_fsync_count() - base;
+            assert_eq!(count(&mut engine, "count(C)"), TOTAL);
+            std::mem::forget(engine); // hard crash: no Drop, no checkpoint
+            fsyncs
+        };
+
+        {
+            let mut engine = Engine::new(&dir).unwrap();
+            assert_eq!(
+                count(&mut engine, "count(C)"),
+                TOTAL,
+                "all acknowledged concurrent commits must survive a hard crash"
+            );
         }
-        for h in handles {
-            h.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        if fsyncs < TOTAL as u64 {
+            return;
         }
-
-        let mut engine = Arc::try_unwrap(engine)
-            .unwrap_or_else(|_| panic!("engine still shared after join"))
-            .into_inner()
-            .unwrap();
-        let fsyncs = engine.wal_fsync_count() - base;
-        assert_eq!(count(&mut engine, "count(C)"), TOTAL);
-        assert!(
-            fsyncs < TOTAL as u64,
-            "{TOTAL} overlapping commits must share fsyncs (got {fsyncs})"
-        );
-        std::mem::forget(engine); // hard crash: no Drop, no checkpoint
+        fsyncs_seen.push(fsyncs);
     }
-
-    {
-        let mut engine = Engine::new(&dir).unwrap();
-        assert_eq!(
-            count(&mut engine, "count(C)"),
-            TOTAL,
-            "all acknowledged concurrent commits must survive a hard crash"
-        );
-    }
-    std::fs::remove_dir_all(&dir).ok();
+    panic!(
+        "{TOTAL} overlapping commits never shared an fsync in {ATTEMPTS} \
+         attempts (fsync counts: {fsyncs_seen:?}); group commit is not \
+         coalescing"
+    );
 }
 
 /// Deferral is scoped: outside `run_with_deferred_durability` the engine
