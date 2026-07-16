@@ -3,8 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Next release: v0.15.0 (unreleased).** Per-index statistics (entry and distinct-key counts on every B-tree, no on-disk format change) feeding cardinality-aware conjunction index choice, explain selectivity annotations, and driver-spec additions (read-only error family, comparison coercion regimes).
-> **Current release: v0.14.0.** Conjunction index selection with residual recheck (multi-condition filters now drive from the best available index), lossless typed results and parameter binding in the embedded Node addon, read-only snapshot serving (powdb-server --readonly, Database.openReadOnly, docs/read-only-serving.md), explain output that reflects the executed plan, and a driver-implementer mapping spec (docs/integrations/powql-for-drivers.md).
+> **Current release: v0.15.0.** Per-index statistics (entry and distinct-key counts on every B-tree, no on-disk format change) feeding cardinality-aware conjunction index choice (a selective index drives the scan regardless of conjunct order), explain selectivity annotations (est_rows/entries/distinct), and driver-spec additions (read-only error family, comparison coercion regimes).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

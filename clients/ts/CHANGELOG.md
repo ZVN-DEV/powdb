@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.0 - 2026-07-16
+
+- Version-alignment release in lockstep with workspace v0.15.0 (per-index
+  statistics and cardinality-aware conjunction index choice). No TypeScript
+  API changes; `explain` result rows now include selectivity tokens
+  (`est_rows=... entries=... distinct=...`) on chosen index-scan lines.
+
 ## 0.14.0 - 2026-07-16
 
 - Version-alignment release in lockstep with workspace v0.14.0 (conjunction
