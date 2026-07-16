@@ -408,9 +408,13 @@ impl BTree {
             for (stored_key, stored_rid) in pairs {
                 let root = self.root;
                 let mut rebuilt_replaced = false;
-                if let Some((mid_key, new_node_id)) =
-                    self.insert_recursive(root, stored_key, stored_rid, false, &mut rebuilt_replaced)
-                {
+                if let Some((mid_key, new_node_id)) = self.insert_recursive(
+                    root,
+                    stored_key,
+                    stored_rid,
+                    false,
+                    &mut rebuilt_replaced,
+                ) {
                     let new_root_id = self.nodes.len();
                     self.nodes.push(Node::Internal {
                         keys: vec![mid_key],
