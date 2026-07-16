@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.15.0] - 2026-07-16
+
 ### Added
 
 - **Per-index statistics.** Every B-tree index now maintains entry and

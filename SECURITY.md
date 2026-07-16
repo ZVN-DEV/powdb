@@ -7,8 +7,8 @@ latest release to stay supported.
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.15.x          | :x: (unreleased)   |
-| 0.14.x          | :white_check_mark: |
+| 0.15.x          | :white_check_mark: |
+| 0.14.x          | :x: (superseded)   |
 | 0.13.x          | :x: (superseded)   |
 | 0.12.x          | :x: (superseded)   |
 | 0.11.x          | :x: (superseded)   |
