@@ -257,7 +257,14 @@ impl Table {
             let idx_path = data_dir.join(format!("{}_{}.idx", table.schema.table_name, col_name));
 
             let btree = if idx_path.exists() {
-                BTree::load(&idx_path)?
+                let mut loaded = BTree::load(&idx_path)?;
+                // Load counts distinct keys in Raw mode; a non-unique column
+                // index stores composite keys, so switch it to count distinct
+                // by value prefix.
+                if !unique {
+                    loaded.mark_composite();
+                }
+                loaded
             } else {
                 // Missing file: rebuild from the heap and save so we
                 // take the fast path next time. Reassemble via `table.scan()`

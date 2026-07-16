@@ -7,6 +7,7 @@ use crate::planner::{
     extract_single_bound, range_scan_for_target, try_extract_eq_index_key, RangeBound, RangeTarget,
 };
 use crate::result::{QueryError, QueryResult};
+use powdb_storage::btree::IndexStats;
 use powdb_storage::catalog::{Catalog, ExpressionIndexMeta, IndexOrderDirection};
 use powdb_storage::row::{decode_column, decode_row, patch_var_column_in_place, RowLayout};
 use powdb_storage::stored_json_path::StoredJsonPathV1;
@@ -6567,6 +6568,67 @@ fn range_candidate_resolves(catalog: &Catalog, scan: &PlanNode) -> bool {
     }
 }
 
+/// Estimate returned when an index resolved for tiering but its stats did not
+/// (should not happen once a candidate's tier resolved; kept defensive). It is
+/// the maximum, so tier and build order decide, matching v0.14 behavior.
+const UNKNOWN_EST: u64 = u64::MAX;
+
+/// Whether an index probe literal targets the empty / missing / JSON-null
+/// sentinel (`Value::Empty`), whose rows live in the tree's separate empty list.
+fn probes_empty_sentinel(key: &Expr) -> bool {
+    matches!(literal_to_value(key), Ok(Value::Empty))
+}
+
+/// Estimated rows an equality probe against `stats` returns. A unique index
+/// returns at most one row; a non-unique probe of the empty/missing sentinel
+/// returns the empty-list length; any other non-unique probe returns the average
+/// rows per key. O(1) over the already-loaded counters. Single source of the
+/// `est_rows` formula, shared by the conjunction chooser and both `explain`
+/// index-scan annotations so the ranking and the printed value never disagree.
+fn eq_est_rows(stats: &IndexStats, unique: bool, empty_probe: bool) -> u64 {
+    if unique {
+        1
+    } else if empty_probe {
+        stats.empty_count
+    } else {
+        stats.total_entries / stats.distinct_keys.max(1)
+    }
+}
+
+/// Estimated rows an equality candidate's index probe returns, used to rank
+/// conjunction drivers by selectivity. `tier == 0` marks a unique index (the
+/// uniqueness source shared with `explain`).
+fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, tier: u8) -> u64 {
+    let (stats, key) = match scan {
+        PlanNode::IndexScan { table, column, key } => (catalog.index_stats(table, column), key),
+        PlanNode::ExprIndexScan { table, path, key } => (
+            resolve_expression_index(catalog, table, path)
+                .and_then(|meta| catalog.expression_index_stats(table, meta.index_id)),
+            key,
+        ),
+        _ => return UNKNOWN_EST,
+    };
+    stats.map_or(UNKNOWN_EST, |stats| {
+        eq_est_rows(&stats, tier == 0, probes_empty_sentinel(key))
+    })
+}
+
+/// Estimated rows a range candidate scans: its index's total entries (range
+/// selectivity estimation is out of scope). Any equality candidate,
+/// whose estimate is reduced by distinct keys, therefore ranks ahead, which
+/// preserves the v0.14 tier ordering.
+fn range_candidate_est(catalog: &Catalog, scan: &PlanNode) -> u64 {
+    let stats = match scan {
+        PlanNode::RangeScan { table, column, .. } => catalog.index_stats(table, column),
+        PlanNode::ExprRangeScan { table, path, .. } => {
+            resolve_expression_index(catalog, table, path)
+                .and_then(|meta| catalog.expression_index_stats(table, meta.index_id))
+        }
+        _ => None,
+    };
+    stats.map_or(UNKNOWN_EST, |stats| stats.total_entries)
+}
+
 /// Declared type of `column` in `table`, if both resolve.
 fn column_type(catalog: &Catalog, table: &str, column: &str) -> Option<TypeId> {
     catalog
@@ -6661,6 +6723,8 @@ fn coerce_candidate_keys(catalog: &Catalog, scan: PlanNode) -> Option<PlanNode> 
 struct ConjunctionCandidate {
     plan: PlanNode,
     consumed: Vec<usize>,
+    /// Estimated rows the driving probe returns (lower is more selective).
+    est: u64,
     tier: u8,
 }
 
@@ -6670,11 +6734,13 @@ struct ConjunctionCandidate {
 /// no conjunct resolves to an existing index, so the caller keeps today's
 /// `Filter(SeqScan)` byte-identical.
 ///
-/// Selection is a zero-stats heuristic: unique equality beats non-unique
-/// equality beats range, first match within a tier wins, and there is no
-/// probing (lowering runs on every execution, so it stays cheap). A wrong pick
-/// is only ever slower, never wrong: the residual re-checks the full
-/// conjunction on each fetched row.
+/// Selection ranks candidates by `(estimated rows, tier, build order)`, reading
+/// coarse per-index stats (O(1) counter fields): a unique equality estimates 1,
+/// a non-unique equality estimates average rows per key, and a range estimates
+/// its index's full size so an equality still wins. Ties fall back to v0.14's
+/// tier order (equality before range) then conjunct order. A wrong pick is only
+/// ever slower, never wrong: the residual re-checks the full conjunction on
+/// each fetched row.
 fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> Option<PlanNode> {
     let mut conjuncts: Vec<&Expr> = Vec::new();
     flatten_and(predicate, &mut conjuncts);
@@ -6692,9 +6758,11 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
             // uncoercible key drops the candidate to the correct scan.
             if let Some(scan) = coerce_candidate_keys(catalog, scan) {
                 if let Some(tier) = eq_candidate_tier(catalog, &scan) {
+                    let est = eq_candidate_est(catalog, &scan, tier);
                     candidates.push(ConjunctionCandidate {
                         plan: scan,
                         consumed: vec![i],
+                        est,
                         tier,
                     });
                 }
@@ -6761,18 +6829,23 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
                 consumed.push(i);
             }
         }
+        let est = range_candidate_est(catalog, &scan);
         candidates.push(ConjunctionCandidate {
             plan: scan,
             consumed,
+            est,
             tier: 2,
         });
     }
 
-    // Best tier wins; `min_by_key` keeps the first element on a tie, which is
-    // the earliest-built candidate (equalities in conjunct order, then ranges).
+    // Lowest estimated rows wins; ties fall back to tier then build order, and
+    // `min_by_key` keeps the first element on a full tie, which is the
+    // earliest-built candidate (equalities in conjunct order, then ranges).
     let winner = candidates
         .into_iter()
-        .min_by_key(|candidate| candidate.tier)?;
+        .enumerate()
+        .min_by_key(|(build_order, candidate)| (candidate.est, candidate.tier, *build_order))?
+        .1;
 
     let mut residual: Vec<Expr> = Vec::new();
     for (i, conjunct) in conjuncts.iter().enumerate() {
@@ -7158,7 +7231,18 @@ pub(super) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             format!("{indent}AliasScan table={table} alias={alias}")
         }
         PlanNode::IndexScan { table, column, key } => {
-            format!("{indent}IndexScan table={table} column={column} key={key:?}")
+            let base = format!("{indent}IndexScan table={table} column={column} key={key:?}");
+            match catalog.index_stats(table, column) {
+                Some(stats) => {
+                    let unique = catalog.is_index_unique(table, column) == Some(true);
+                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
+                    format!(
+                        "{base} est_rows={est} entries={} distinct={}",
+                        stats.total_entries, stats.distinct_keys
+                    )
+                }
+                None => base,
+            }
         }
         PlanNode::RangeScan {
             table,
@@ -7183,13 +7267,29 @@ pub(super) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             format!("{indent}RangeScan table={table} column={column} [{s}, {e}]")
         }
         PlanNode::ExprIndexScan { table, path, key } => {
-            let index_id = resolve_expression_index(catalog, table, path)
+            let meta = resolve_expression_index(catalog, table, path);
+            let index_id = meta
+                .as_ref()
                 .map(|metadata| metadata.index_id.to_string())
                 .unwrap_or_else(|| "unresolved".to_string());
-            format!(
+            let base = format!(
                 "{indent}ExprIndexScan table={table} path={} index_id={index_id} key={key:?}",
                 path.canonical_text()
-            )
+            );
+            match meta.and_then(|m| {
+                catalog
+                    .expression_index_stats(table, m.index_id)
+                    .map(|stats| (m.unique, stats))
+            }) {
+                Some((unique, stats)) => {
+                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
+                    format!(
+                        "{base} est_rows={est} entries={} distinct={}",
+                        stats.total_entries, stats.distinct_keys
+                    )
+                }
+                None => base,
+            }
         }
         PlanNode::ExprRangeScan {
             table,

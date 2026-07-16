@@ -70,6 +70,11 @@
       "ops_per_sec": 4527,
       "source": "depot-run-29463423181-2026-07-16"
     },
+    "conjunction_s4_selective_path": {
+      "ns_per_iter": 2770.82,
+      "ops_per_sec": 360904,
+      "source": "depot-run-29490533258-2026-07-16"
+    },
     "insert_single": {
       "ns_per_iter": 235.78,
       "ops_per_sec": 4241242

@@ -552,6 +552,65 @@ fn bench_conjunction_index_residual(c: &mut Criterion) {
     });
 }
 
+// ───── Workload: conjunction_s4_selective_path ─────────────────────────────
+//
+// The S4 shape the per-index stats target: a CMS-style conjunction whose
+// textually-first indexed conjunct is an unselective 50/50 boolean, while a
+// selective (near-unique) JSON-path index exists on another conjunct. Before
+// per-index stats the boolean drove the scan, materializing half the table plus
+// a per-row residual recheck; the stats-based chooser now drives from the
+// selective path.
+
+/// 20K-document CMS fixture: a 50/50 `is_published` boolean (indexed) and a
+/// per-row-unique `.data->slug` path (indexed).
+fn setup_cms_s4_fixture() -> (Engine, TempDir) {
+    const N_DOCS: usize = 20_000;
+    let tmp = TempDir::new().expect("create tempdir");
+    let mut engine = Engine::new(tmp.path()).expect("engine init");
+    engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
+    engine
+        .execute_powql("type Doc { required id: int, required is_published: bool, data: json }")
+        .expect("create type");
+    for i in 0..N_DOCS {
+        let published = i % 2 == 0;
+        engine
+            .execute_powql(&format!(
+                r#"insert Doc {{ id := {i}, is_published := {published}, data := "{{\"slug\":\"s{i}\"}}" }}"#
+            ))
+            .expect("insert doc");
+    }
+    engine
+        .execute_powql("alter Doc add index .is_published")
+        .expect("build boolean index");
+    engine
+        .execute_powql("alter Doc add index (.data->slug)")
+        .expect("build path index");
+    (engine, tmp)
+}
+
+fn bench_conjunction_s4_selective_path(c: &mut Criterion) {
+    let (mut engine, _tmp) = setup_cms_s4_fixture();
+
+    // The 50/50 boolean is the textually-first conjunct; the selective path is
+    // second. The chooser must drive from the path, not the boolean.
+    let queries = gen_queries(|i| {
+        format!(
+            r#"Doc filter .is_published = true and .data->slug = "s{}" {{ .id }}"#,
+            (i * 2) % 20_000
+        )
+    });
+    warm_plan_cache(&mut engine, &queries);
+
+    let mut idx: usize = 0;
+    c.bench_function("conjunction_s4_selective_path", |b| {
+        b.iter(|| {
+            let q = &queries[idx % queries.len()];
+            idx = idx.wrapping_add(1);
+            black_box(engine.execute_powql(q).expect("query failed"))
+        });
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WRITE BENCHES
 // ═══════════════════════════════════════════════════════════════════════════
@@ -810,6 +869,8 @@ criterion_group! {
         bench_multi_col_and_filter,
         // Lane A: conjunction index selection with residual recheck.
         bench_conjunction_index_residual,
+        // Per-index stats drive the selective conjunct (S4 shape).
+        bench_conjunction_s4_selective_path,
         // Workload 11 (single insert — fast).
         bench_insert_single,
 }

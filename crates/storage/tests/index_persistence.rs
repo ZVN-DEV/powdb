@@ -293,3 +293,59 @@ fn test_index_persists_deletes_across_reopen() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_index_stats_over_existing_heap_rows() {
+    // An index built via create_index over existing heap rows must report
+    // correct statistics, and those stats must survive a reopen (the load path
+    // recomputes them, non-unique via mark_composite).
+    let dir = fresh_dir("index_stats");
+
+    {
+        let mut cat = Catalog::create(&dir).expect("create catalog");
+        cat.create_table(user_schema()).expect("create table");
+
+        // 60 rows, unique id, but only 12 distinct names (5 rows per name),
+        // so the name column is a skewed non-unique index.
+        for i in 0..60i64 {
+            let name = format!("name_{}", i % 12);
+            cat.insert("users", &row(i, &name)).unwrap();
+        }
+
+        // Build the indexes AFTER the rows exist, exercising the
+        // build-from-heap path.
+        cat.create_index_unique("users", "id", true)
+            .expect("create unique index");
+        cat.create_index_unique("users", "name", false)
+            .expect("create non-unique index");
+
+        let id_stats = cat.index_stats("users", "id").expect("id stats");
+        assert_eq!(id_stats.total_entries, 60);
+        assert_eq!(id_stats.distinct_keys, 60);
+        assert_eq!(id_stats.empty_count, 0);
+
+        let name_stats = cat.index_stats("users", "name").expect("name stats");
+        assert_eq!(name_stats.total_entries, 60);
+        assert_eq!(name_stats.distinct_keys, 12);
+        assert_eq!(name_stats.empty_count, 0);
+
+        // Unknown table / column yields None, not a panic.
+        assert!(cat.index_stats("nope", "id").is_none());
+        assert!(cat.index_stats("users", "nope").is_none());
+    }
+
+    // Reopen: stats heal from disk (unique in Raw mode, non-unique switched
+    // to composite by the load path).
+    {
+        let cat = Catalog::open(&dir).expect("reopen catalog");
+        let id_stats = cat.index_stats("users", "id").expect("id stats");
+        assert_eq!(id_stats.total_entries, 60);
+        assert_eq!(id_stats.distinct_keys, 60);
+
+        let name_stats = cat.index_stats("users", "name").expect("name stats");
+        assert_eq!(name_stats.total_entries, 60);
+        assert_eq!(name_stats.distinct_keys, 12);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
