@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Per-index statistics.** Every B-tree index now maintains entry and
+  distinct-key counts in memory (computed during load, kept exact through the
+  write path, healed on reload and rollback). No on-disk format change.
+- **Cardinality-aware conjunction index choice.** The conjunction index
+  chooser ranks candidate indexes by estimated rows per key
+  (entries/distinct) instead of fixed tier order alone, so a selective index
+  drives the scan even when an unselective indexed conjunct appears first in
+  the filter. On a 20K-row json-equality conjunction with a 50/50 boolean
+  index and a selective path index, single-request latency drops about 120x.
+- **Explain selectivity annotations.** Chosen index-scan lines in `explain`
+  now carry `est_rows=... entries=... distinct=...` tokens showing why the
+  index was picked.
+- **Driver spec additions** (shipped to main ahead of this release): the
+  read-only snapshot-mode error family and the equality/range comparison
+  coercion regimes are now documented in
+  `docs/integrations/powql-for-drivers.md`.
 
 ## [0.14.0] - 2026-07-16
 
