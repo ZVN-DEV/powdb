@@ -139,7 +139,7 @@ type WireValue =
   | { type: "bool";     value: boolean }
   | { type: "str";      value: string }
   | { type: "datetime"; value: bigint }  // microseconds since the Unix epoch
-  | { type: "uuid";     value: string }  // canonical 8-4-4-4-12 hex
+  | { type: "uuid";     value: Uint8Array }  // raw 16 bytes (matches the client)
   | { type: "bytes";    value: Buffer }  // raw bytes, losslessly
   | { type: "json";     value: NativeJson; pj1: Uint8Array }; // parsed + raw PJ1
 ```
@@ -158,42 +158,26 @@ const [cell] = db.queryNative("Doc filter .id = 1 { .body }").rows[0];
 const hits = db.queryWithParams("Doc filter .id = $1 { .id }", [1]);
 ```
 
-For a `json` cell, `value` is the parsed document (safe integers as JS numbers,
-out-of-range integers as `bigint`, the same rule the networked client uses) and
-`pj1` is always the raw canonical PJ1 bytes, so a caller that needs exact
-JSON-internal big integers can decode `pj1` directly.
+For a `json` cell, `value` is the parsed document. A JSON-internal integer in
+JS's safe range is a `number`; one outside it (but within i64) widens to
+`bigint`, so its exact value survives, the same rule the networked client uses.
+An integer beyond i64 range is the one lossy case (it decodes to a `number`);
+for that, read `pj1` instead: it is always the raw canonical PJ1 bytes (the
+lossless on-wire form), so a caller can decode the exact value directly.
 
-## Embedded and the server run the identical engine
+A `uuid` cell's `value` is the raw 16 bytes (a `Uint8Array`), byte-identical to
+the networked `@zvndev/powdb-client` `WireValue`. Render the canonical
+`8-4-4-4-12` hex from those bytes if you need the string form.
 
-Embedded is not a reduced build. It executes PowQL and SQL through the **same**
-engine as `powdb-server`, so every query feature is available in-process, with
-no network round-trip:
+## Feature parity with the server
 
-| Capability | Server | Embedded |
-| --- | --- | --- |
-| PowQL + SQL frontends | yes | yes |
-| Indexes, incl. expression indexes | yes | yes |
-| JSON type, `->` path query / order / group / aggregate | yes | yes |
-| Transactions (FIFO admission, zero contended-write loss) | yes | yes |
-| `explain` | yes | yes |
-| WAL durability modes (`full` / `normal` / `off`) | yes | yes |
-| Positional parameters | yes | yes (`queryWithParams`) |
-| Lossless typed results (`WireValue`) | yes (`queryNative`, ...) | yes (`queryNative`, ...) |
-| Retained-unit sync apply (embedded replica) | n/a | yes (`applyRetainedUnits`) |
-
-The only differences are transport, not engine: the server adds the network
-protocol, auth, and the single-writer admission gate that only costs anything
-when many clients funnel through one process. In-process there is no socket and
-no gate on your own handle.
-
-## When to use embedded vs the server
-
-- **Embedded** (this package): one process, in-process speed, local-first apps,
-  CLIs, desktop/mobile, tests. Like SQLite.
-- **Server** (`@zvndev/powdb-client`): many clients over the network, shared
-  database. Like Postgres.
-
-Same engine, two front doors.
+Embedded executes statements through the same engine as `powdb-server`, so
+engine features (indexes including expression indexes, JSON `->` querying and
+ordering/grouping, transactions, `explain`, durability modes, positional
+parameters, typed results) behave identically in-process. The differences are
+transport-level only: the server adds the network protocol, auth, and
+cross-client admission. Use embedded for one-process/local-first workloads and
+`@zvndev/powdb-client` when many clients share a database over the network.
 
 ## Supported platforms
 

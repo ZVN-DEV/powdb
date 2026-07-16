@@ -474,7 +474,7 @@ impl Catalog {
         // that only a read-write open may safely replay. Naming the remedy keeps
         // the operator from guessing.
         let wal_path = data_dir.join(WAL_FILE);
-        if !crate::wal::read_records_at_path(&wal_path)?.is_empty() {
+        if crate::wal::wal_has_committed_records(&wal_path)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "cannot open read-only: the WAL is not empty (the directory has \

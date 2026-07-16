@@ -6,10 +6,20 @@ either through the server (`powdb-server --readonly`) or embedded
 snapshot (a restored backup or a checkpointed replica) with no write gate at all,
 then swap to the next snapshot when you want fresher data.
 
-A read-only open never mutates the directory. Every heap, index, and WAL file is
-opened with a read-only descriptor, no permissions are changed, no WAL is
+A read-only open never mutates a **data file**. Every heap, index, and WAL file
+is opened with a read-only descriptor, no permissions are changed, no WAL is
 replayed or truncated, and nothing is checkpointed on close. That is what lets
 several read-only processes serve the same directory at once.
+
+The one thing a read-only open *does* write is lock **metadata**: on a writable
+directory it drops a short-lived PID file under `readers/` (see
+[Concurrency and locking](#concurrency-and-locking)) so a read-write open knows
+the directory is being served and refuses to start. That file is coordination
+state, not database content, and is removed on close; the never-mutate promise
+covers your data. On a **non-writable** directory (a `0o555` snapshot mount or a
+read-only filesystem) even that metadata cannot be written, so the reader lock
+is skipped entirely and the open is byte-for-byte non-mutating (see
+[Serving a non-writable directory](#serving-a-non-writable-directory)).
 
 ## When to use it
 
@@ -87,19 +97,42 @@ mutates nothing.
 
 ## Concurrency and locking
 
-Read-only handles take a **shared reader lock** (a PID file under `readers/` in
-the data directory):
+Read-only handles take a **shared reader lock** (a PID file named
+`<pid>.<entropy>` under `readers/` in the data directory):
 
 - N read-only processes may serve the same directory concurrently.
 - A read-write open (`powdb-server` without `--readonly`, `Database::open`,
   `powdb-cli backup`) **refuses to start** while a live reader is present, and a
   reader refuses to start while a live writer holds the directory. Cross-process
-  torn reads stay impossible rather than "unlikely".
+  torn reads stay impossible rather than "unlikely": admission is
+  TOCTOU-hardened (each side publishes its own lock file, then re-checks for the
+  opposite party and backs off if it appeared), so a reader and a writer are
+  never both admitted even under a dead-heat race.
 - Crashed readers/writers (dead PIDs) are reclaimed automatically, so a crash
-  never wedges the directory.
+  never wedges the directory. The `<entropy>` in each reader file name keeps a
+  recycled PID from ever colliding with a stale file a crashed predecessor left
+  behind.
 
 Never run a read-write process against a directory that read-only servers are
 using. Serve a **copy** (a restored snapshot), not the primary's live directory.
+
+### Serving a non-writable directory
+
+If the data directory is not writable (a `0o555` snapshot mount, or a read-only
+filesystem), the reader lock cannot be written. Rather than fail the open, the
+engine falls back to a **lock-less** read-only open and logs a warning:
+
+```
+data directory is not writable; reader lock skipped, writer exclusion is not
+enforced for this process
+```
+
+This is safe: a writer cannot start against a non-writable directory either (its
+own `LOCK` write would fail), so there is no writer to exclude in the first
+place. The trade-off is only that this process does not *record* a reader lock;
+because no writer can appear, nothing is lost. The open is also strictly
+non-mutating in this mode: not even the lock metadata is written, so the
+directory stays byte-for-byte identical.
 
 ## What is refused, and why
 

@@ -7274,6 +7274,48 @@ fn delete_conjunction_discovery_scan_is_lowered() {
     }
 }
 
+/// C2: a conjunction update/delete whose discovery scan lowered to
+/// `Filter(IndexScan)` must collect its rids straight from the index and
+/// recheck the residual per rid, never falling into the O(N*M)
+/// `generic_rid_match`. This is asserted deterministically via a call counter
+/// rather than wall-clock timing.
+#[test]
+fn conjunction_mutation_does_not_route_through_generic_rid_match() {
+    let mut engine = rec_engine(&["alter Rec add index .b", "alter Rec add index .c"]);
+    for id in 0..16i64 {
+        engine
+            .execute_powql(&format!(
+                "insert Rec {{ a := {id}, b := {}, c := {} }}",
+                id % 2,
+                id % 4
+            ))
+            .unwrap();
+    }
+
+    // Eq-driven conjunction update: `.b = 1` drives (indexed), `.c = 1` is the
+    // residual recheck.
+    super::plan_exec::reset_generic_rid_match_calls();
+    engine
+        .execute_powql("Rec filter .b = 1 and .c = 1 update { a := 100 }")
+        .unwrap();
+    assert_eq!(
+        super::plan_exec::generic_rid_match_calls(),
+        0,
+        "index-driven conjunction update must not use the quadratic generic matcher"
+    );
+
+    // Eq-driven conjunction delete: same shape, delete side.
+    super::plan_exec::reset_generic_rid_match_calls();
+    engine
+        .execute_powql("Rec filter .b = 0 and .c = 2 delete")
+        .unwrap();
+    assert_eq!(
+        super::plan_exec::generic_rid_match_calls(),
+        0,
+        "index-driven conjunction delete must not use the quadratic generic matcher"
+    );
+}
+
 fn sorted_debug(result: QueryResult) -> Vec<String> {
     match result {
         QueryResult::Rows { rows, .. } => {

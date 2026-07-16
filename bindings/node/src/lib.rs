@@ -194,11 +194,14 @@ fn wire_value_to_js<'env>(env: &'env Env, value: &Value) -> napi::Result<Object<
             obj.set("type", "datetime")?;
             obj.set("value", BigInt::from(*t))?;
         }
-        Value::Uuid(_) => {
+        Value::Uuid(bytes) => {
             obj.set("type", "uuid")?;
-            // Canonical hyphenated form, the same rendering the string surface
-            // and the CLI use.
-            obj.set("value", value.to_wire_string())?;
+            // Raw 16 bytes, matching the `@zvndev/powdb-client` raw `WireValue`
+            // (`{ type: "uuid", value: Uint8Array }`) exactly, so embedded and
+            // networked typed cells are byte-identical. The hyphenated string is
+            // a rendering the caller can derive; the raw bytes are the lossless
+            // wire form (TypeId 6 carries exactly 16 bytes).
+            obj.set("value", Uint8Array::from(bytes.to_vec()))?;
         }
         Value::Bytes(b) => {
             obj.set("type", "bytes")?;
@@ -277,9 +280,16 @@ fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value> {
         ValueType::Number => {
             let n = unsafe { param.cast::<f64>()? };
             // Integral, finite, and inside i64 range binds as an int; anything
-            // else (fractional or huge) binds as a float, matching the
+            // else (fractional or out of range) binds as a float, matching the
             // networked client's number-to-param rule.
-            if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+            //
+            // The upper bound is strict (`n < i64::MAX as f64`): `i64::MAX as f64`
+            // rounds up to 2^63, which is one past i64::MAX and would saturate to
+            // i64::MAX under `as i64`, silently mis-binding exactly-2^63. `<`
+            // rejects 2^63 (and everything above) to the float branch. The lower
+            // bound stays inclusive: `i64::MIN as f64` is exactly -2^63 == i64::MIN,
+            // a value we can bind.
+            if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64 {
                 Ok(Value::Int(n as i64))
             } else {
                 Ok(Value::Float(n))

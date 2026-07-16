@@ -7,7 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+v0.14.0 development (see docs/design/2026-07-15-v0.14-plan.md). No v0.14
+package, container, tag, or release has been published yet.
+
+### Added
+
+- **Conjunction index selection with residual recheck.** A filter whose
+  predicate is an `and` chain now drives its scan from the most selective
+  resolvable indexed conjunct (unique equality, then equality, then range)
+  and rechecks the remaining conjuncts on the fetched rows, instead of
+  sequentially scanning the table. Applies to SELECT-shaped queries and to
+  UPDATE/DELETE row discovery. A residual fast path decodes only the
+  columns the residual references, so non-matching candidates never pay a
+  full-row decode.
+- **`explain` shows the executed plan.** Explain output now reflects
+  runtime lowering, so a conjunction over an available index renders as the
+  index scan plus residual `Filter` that will actually run, not the
+  speculative pre-lowering plan.
+- **Embedded typed results and parameter binding.** The Node addon gains
+  `queryNative`, `querySqlNative`, `queryReadonlyNative`, and
+  `queryWithParams`, returning tagged typed cells at parity with the
+  networked client's native API: 64-bit ints and datetimes as `bigint`,
+  raw bytes as `Buffer`, JSON as the parsed value plus exact PJ1 bytes,
+  and empty distinct from JSON `null`. The `powdb` facade gains
+  `query_with_params` / `query_readonly_with_params`.
+- **Read-only snapshot serving.** A quiescent data directory (restored
+  backup or checkpointed replica) can be opened genuinely read-only:
+  `Engine::open_read_only`, `powdb-server --readonly` /
+  `POWDB_READONLY=1`, and embedded `Database.openReadOnly`. Multiple
+  read-only processes serve the same directory concurrently; readers and
+  writers exclude each other; a non-empty WAL is refused with a
+  recovery-pointing error; mutations return a terminal readonly error.
+  See docs/read-only-serving.md for the supported flow.
+- **Driver-implementer spec.** docs/integrations/powql-for-drivers.md
+  documents the wire protocol, native typed frames, PowQL mapping
+  guidance, null semantics, the explain contract, admission semantics,
+  and quasi-stable error families for driver and ORM authors.
+
+### Fixed
+
+- The npm client's packaged CHANGELOG had been frozen at 0.8.0; it is
+  backfilled through 0.13 and now gated by the version-consistency check.
+- docs/POWQL.md now states datetime units explicitly (epoch microseconds),
+  matching the storage layer and both clients.
 
 ## [0.13.0] - 2026-07-15
 

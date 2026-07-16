@@ -4,7 +4,7 @@
 // positional $N parameters. The legacy string query() path must stay unchanged.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
@@ -47,11 +47,18 @@ test("all nine TypeIds round-trip through queryNative as WireValue cells", () =>
     // Int / DateTime => bigint (TypeId 1, 5).
     assert.deepEqual(id, { type: "int", value: 1n });
     assert.deepEqual(dt, { type: "datetime", value: 1700000000000000n });
-    // Uuid => canonical hyphenated string (TypeId 6).
-    assert.deepEqual(u, {
-      type: "uuid",
-      value: "550e8400-e29b-41d4-a716-446655440000",
-    });
+    // Uuid => raw 16 bytes (TypeId 6), byte-identical to the @zvndev/powdb-client
+    // raw WireValue ({ type: "uuid", value: Uint8Array }). Not a hyphenated
+    // string; a caller renders that from the bytes if needed.
+    assert.equal(u.type, "uuid");
+    assert.ok(u.value instanceof Uint8Array);
+    assert.deepEqual(
+      [...u.value],
+      [
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66,
+        0x55, 0x44, 0x00, 0x00,
+      ],
+    );
     // Bytes => Buffer, raw bytes preserved (TypeId 7).
     assert.equal(b.type, "bytes");
     assert.ok(Buffer.isBuffer(b.value));
@@ -118,6 +125,67 @@ test("i64 beyond Number.MAX_SAFE_INTEGER survives as bigint", () => {
     // 2^53 (9007199254740992), losing the distinction the bigint preserves.
     assert.notEqual(a.value, 9007199254740992n);
     assert.equal(Number(a.value), 9007199254740992); // demonstrates the loss avoided
+  });
+});
+
+test("JSON-internal 2^53+1 widens to a lossless bigint; pj1 is the exact form", () => {
+  withDb((db) => {
+    // Documents the ACTUAL behavior: a JSON-internal integer outside JS's safe
+    // range (but within i64) is decoded to a `bigint`, so its exact value
+    // survives, the same "out-of-range -> bigint" rule the networked
+    // @zvndev/powdb-client uses (clients/ts protocol.ts). It is NOT rounded to a
+    // JS number. The raw PJ1 bytes are the lossless canonical form regardless.
+    db.query("type Doc { required id: int, body: json }");
+    // 2^53 + 1 = 9007199254740993, unrepresentable as a JS double.
+    db.query(`insert Doc { id := 1, body := "{\\"n\\":9007199254740993}" }`);
+
+    const cell = db.queryNative("Doc filter .id = 1 { .body }").rows[0][0];
+    assert.equal(cell.type, "json");
+
+    // What it IS: a bigint carrying the exact value, not a rounded number.
+    assert.equal(typeof cell.value.n, "bigint");
+    assert.equal(cell.value.n, 9007199254740993n);
+    // A JS number would have rounded it to 9007199254740992; the bigint did not.
+    assert.notEqual(cell.value.n, 9007199254740992n);
+
+    // The lossless canonical form: `pj1` carries the raw PJ1 bytes, and the
+    // string path (Value::to_wire_string reads PJ1 directly) renders the exact
+    // integer back, confirming the bytes preserve the true value.
+    assert.ok(cell.pj1 instanceof Uint8Array);
+    assert.ok(cell.pj1.length > 0);
+    const canonical = db.query("Doc filter .id = 1 { .body }").rows[0][0];
+    assert.equal(canonical, `{"n":9007199254740993}`);
+  });
+});
+
+test("a number exactly 2^63 binds as float, never saturating to i64::MAX", () => {
+  withDb((db) => {
+    // i64::MAX as f64 rounds up to 2^63 (one past i64::MAX). A naive `<=` bound
+    // would admit exactly-2^63 into the int branch, where `as i64` saturates to
+    // i64::MAX and silently mis-binds. The documented rule is: out-of-i64-range
+    // numbers bind as float, so 2^63 must bind as Float(2^63), not Int(i64::MAX).
+    db.query("type I { required id: int, v: int }");
+    db.query("insert I { id := 1, v := 9223372036854775807 }"); // i64::MAX, exact
+
+    // A bigint i64::MAX binds as an exact int and matches the row: the column
+    // and filter work.
+    const hit = db.queryWithParams("I filter .v = $1 { .id }", [
+      9223372036854775807n,
+    ]);
+    assert.equal(hit.rows.length, 1);
+    assert.deepEqual(hit.rows[0][0], { type: "int", value: 1n });
+
+    // The number 2^63 must bind as a FLOAT (2^63 != i64::MAX as reals), so it
+    // matches nothing in the int column. Under the old `<=` bug it would have
+    // saturated to Int(i64::MAX) and spuriously matched this same row.
+    const twoPow63 = 9223372036854775808; // === 2 ** 63
+    const miss = db.queryWithParams("I filter .v = $1 { .id }", [twoPow63]);
+    assert.equal(miss.kind, "rows");
+    assert.equal(
+      miss.rows.length,
+      0,
+      "2^63 must bind as a float and not saturate to i64::MAX",
+    );
   });
 });
 
@@ -263,6 +331,47 @@ test("openReadOnly serves queryNative reads and rejects mutations", () => {
       ro.close();
     }
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("openReadOnly serves reads from a non-writable (0o555) snapshot dir", (t) => {
+  // C3: a snapshot mounted read-only (0o555) must still open and serve. The
+  // reader lock is skipped (the directory cannot be written), which is safe: a
+  // writer cannot start against a non-writable directory either. Nothing in the
+  // directory is mutated, the whole point of read-only serving.
+  if (process.platform === "win32") {
+    t.skip("POSIX mode bits only");
+    return;
+  }
+  const dir = freshDir();
+  let frozen = false;
+  try {
+    // Seed a quiescent directory, then close so the WAL is clean.
+    {
+      const db = Database.open(dir);
+      db.query("type User { required name: str, age: int }");
+      db.query(`insert User { name := "Ada", age := 36 }`);
+      db.close();
+    }
+    // Freeze the directory read-only, as a snapshot mount would be.
+    chmodSync(dir, 0o555);
+    frozen = true;
+
+    const ro = Database.openReadOnly(dir);
+    try {
+      const r = ro.queryNative("User { name, age }");
+      assert.equal(r.kind, "rows");
+      assert.equal(r.rows.length, 1);
+      assert.deepEqual(r.rows[0][0], { type: "str", value: "Ada" });
+      // No reader lock file was written into the frozen directory.
+      assert.ok(!existsSync(join(dir, "readers")));
+    } finally {
+      ro.close();
+    }
+  } finally {
+    // Restore write permission so the temp dir can be removed.
+    if (frozen) chmodSync(dir, 0o755);
     rmSync(dir, { recursive: true, force: true });
   }
 });

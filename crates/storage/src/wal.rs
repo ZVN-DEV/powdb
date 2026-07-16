@@ -725,12 +725,32 @@ fn parse_wal_records(path: &Path, max_len: u64) -> io::Result<Vec<WalRecord>> {
     let mut pos = wal_records_start_readonly(&mut file_for_header)?;
     let mut records = Vec::new();
 
-    while pos + WAL_HEADER_SIZE as u64 <= file_len {
+    while let Some((record, next_pos)) = parse_wal_record_at(&mut file, pos, file_len)? {
+        records.push(record);
+        pos = next_pos;
+    }
+
+    Ok(records)
+}
+
+/// Parse the single record starting at `pos`, returning it together with the
+/// position of the next record. Returns `Ok(None)` at end of file or at the
+/// first corrupted/truncated record (the same stop-on-corruption semantics
+/// replay has always had).
+fn parse_wal_record_at(
+    file: &mut File,
+    pos: u64,
+    file_len: u64,
+) -> io::Result<Option<(WalRecord, u64)>> {
+    if pos + WAL_HEADER_SIZE as u64 > file_len {
+        return Ok(None);
+    }
+    {
         file.seek(SeekFrom::Start(pos))?;
 
         let mut header = [0u8; WAL_HEADER_SIZE];
         if file.read_exact(&mut header).is_err() {
-            break;
+            return Ok(None);
         }
 
         // These slice-to-array conversions are infallible (fixed-size
@@ -738,47 +758,47 @@ fn parse_wal_records(path: &Path, max_len: u64) -> io::Result<Vec<WalRecord>> {
         // satisfy the project-wide zero-panic policy.
         let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => return Ok(None),
         };
         let total_len = u32::from_le_bytes(total_len_bytes) as usize;
         let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => return Ok(None),
         };
         let stored_crc = u32::from_le_bytes(stored_crc_bytes);
         let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => return Ok(None),
         };
         let tx_id = u64::from_le_bytes(tx_id_bytes);
         let record_type = match WalRecordType::from_u8(header[16]) {
             Some(rt) => rt,
-            None => break,
+            None => return Ok(None),
         };
         let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
             Ok(b) => b,
-            Err(_) => break,
+            Err(_) => return Ok(None),
         };
         let lsn = u64::from_le_bytes(lsn_bytes);
 
         // TASK-11: Verify the record fits within the file before
         // allocating. Catches truncated writes without any allocation.
         if pos + total_len as u64 > file_len {
-            break; // Record extends beyond file: truncated write
+            return Ok(None); // Record extends beyond file: truncated write
         }
 
         // TASK-09: Use checked_sub to prevent integer underflow when
         // a corrupted WAL has total_len < WAL_HEADER_SIZE.
         let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
             Some(len) => len,
-            None => break, // Corrupted record: stop replay
+            None => return Ok(None), // Corrupted record: stop replay
         };
 
         // TASK-10: Cap allocation size before reading data. A crafted
         // WAL claiming a huge total_len would otherwise allocate
         // gigabytes before the CRC check rejects the record.
         if data_len > MAX_WAL_RECORD_SIZE {
-            break; // Unreasonably large record: treat as corruption
+            return Ok(None); // Unreasonably large record: treat as corruption
         }
 
         let mut data = vec![0u8; data_len];
@@ -795,31 +815,37 @@ fn parse_wal_records(path: &Path, max_len: u64) -> io::Result<Vec<WalRecord>> {
         let computed_crc = crc32fast::hash(&crc_input);
 
         if computed_crc != stored_crc {
-            break; // Corrupted record: stop here
+            return Ok(None); // Corrupted record: stop here
         }
 
-        records.push(WalRecord {
-            tx_id,
-            record_type,
-            lsn,
-            data,
-        });
-        pos += total_len as u64;
+        Ok(Some((
+            WalRecord {
+                tx_id,
+                record_type,
+                lsn,
+                data,
+            },
+            pos + total_len as u64,
+        )))
     }
-
-    Ok(records)
 }
 
-/// Read all committed WAL records directly from `path` without ever opening a
-/// writable handle. Returns an empty vec if the file does not exist. Used by
-/// the read-only catalog open path to decide whether a directory is quiescent
-/// (an empty WAL) before serving it, without creating, appending to, or
-/// truncating the WAL the way [`Wal::open`] would.
-pub fn read_records_at_path(path: &Path) -> io::Result<Vec<WalRecord>> {
+/// Report whether `path` holds at least one committed WAL record, without
+/// ever opening a writable handle. Returns `false` if the file does not
+/// exist. Used by the read-only catalog open path to decide whether a
+/// directory is quiescent before serving it, without creating, appending
+/// to, or truncating the WAL the way [`Wal::open`] would. Only the first
+/// record's header and payload are read; a valid first record is proof
+/// enough that the directory needs recovery.
+pub fn wal_has_committed_records(path: &Path) -> io::Result<bool> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(false);
     }
-    parse_wal_records(path, u64::MAX)
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut file_for_header = File::open(path)?;
+    let pos = wal_records_start_readonly(&mut file_for_header)?;
+    Ok(parse_wal_record_at(&mut file, pos, file_len)?.is_some())
 }
 
 /// Locate the first record byte in a WAL file **without mutating it**. Mirrors

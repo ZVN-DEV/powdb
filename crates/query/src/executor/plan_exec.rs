@@ -26,6 +26,24 @@ use powdb_storage::view::ViewDef;
 /// as bounded stable runs and cooperatively merged below.
 const CANCELLABLE_SORT_RUN: usize = 2_048;
 
+// Test-only instrumentation: counts how often the O(N*M) `generic_rid_match`
+// fallback runs, so a shape test can assert an index-driven mutation never
+// degrades into it. Compiled out entirely in non-test builds.
+#[cfg(test)]
+thread_local! {
+    static GENERIC_RID_MATCH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_generic_rid_match_calls() {
+    GENERIC_RID_MATCH_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn generic_rid_match_calls() -> u64 {
+    GENERIC_RID_MATCH_CALLS.with(std::cell::Cell::get)
+}
+
 /// Compare ORDER BY values with the engine-wide `NULLS LAST` contract.
 ///
 /// `Value::Empty` represents both SQL/PowQL null and a missing JSON path.
@@ -2894,10 +2912,10 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                // Format the plan that actually runs: lower speculative and
-                // conjunction scans first so EXPLAIN reflects execution.
-                let lowered = lower_unindexed_scans(&self.catalog, input);
-                let text = format_plan_tree(&self.catalog, &lowered, 0);
+                // Every execute entry point runs lower_unindexed_scans before
+                // dispatch and lowering recurses into Explain, so `input` is
+                // already the plan that will actually run.
+                let text = format_plan_tree(&self.catalog, input, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text
@@ -4159,6 +4177,248 @@ impl Engine {
         None // no fused path applicable — fall through
     }
 
+    /// Collect the RowIds a lowered index-scan node yields, applying the same
+    /// exclusive-bound and null-skip rechecks the SELECT executor uses, or
+    /// `None` when `scan` is not an index-scan shape the mutation path can
+    /// drive from (the caller then falls back to the generic matcher). This is
+    /// what keeps an index-driven conjunction update/delete off the O(N*M)
+    /// value-rematch path. Every heap fetch goes through `Table::get`, which
+    /// reassembles spilled columns, so it is overflow-safe.
+    fn index_scan_rids(&self, scan: &PlanNode) -> Result<Option<Vec<RowId>>, QueryError> {
+        match scan {
+            PlanNode::IndexScan { table, column, key } => {
+                let Some(tbl) = self.catalog.get_table(table) else {
+                    return Ok(None);
+                };
+                if !tbl.has_index(column) {
+                    return Ok(None);
+                }
+                let key_value = literal_to_value(key)?;
+                Ok(Some(tbl.index_lookup_all(column, &key_value)))
+            }
+            PlanNode::ExprIndexScan { table, path, key } => {
+                let Some(index) = resolve_expression_index(&self.catalog, table, path) else {
+                    return Ok(None);
+                };
+                let key_value = literal_to_value(key)?;
+                let rids = if key_value.is_empty() {
+                    self.catalog
+                        .expression_index_btree(table, index.index_id)
+                        .ok_or_else(|| {
+                            QueryError::Execution("expression index disappeared".to_string())
+                        })?
+                        .empty_rids()
+                        .to_vec()
+                } else {
+                    self.catalog
+                        .expression_index_lookup_all(table, index.index_id, &key_value)
+                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                };
+                Ok(Some(rids))
+            }
+            PlanNode::RangeScan {
+                table,
+                column,
+                start,
+                end,
+            } => {
+                let Some(tbl) = self.catalog.get_table(table) else {
+                    return Ok(None);
+                };
+                let start_val = start
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let end_val = end
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                // Unique and non-unique indexes store keys differently, so their
+                // range walks differ, so mirror the SELECT `RangeScan` executor.
+                match tbl.is_index_unique(column) {
+                    Some(false) => {
+                        let col_idx = tbl.schema().column_index(column).ok_or_else(|| {
+                            QueryError::ColumnNotFound {
+                                table: String::new(),
+                                column: column.clone(),
+                            }
+                        })?;
+                        let Some(btree) = tbl.index(column) else {
+                            return Ok(None);
+                        };
+                        // `range_rids` is inclusive over the composite prefix;
+                        // recheck enforces exclusive bounds and skips nulls
+                        // (never indexed).
+                        let candidates = btree.range_rids(start_val.as_ref(), end_val.as_ref());
+                        let mut rids = Vec::with_capacity(candidates.len());
+                        let mut cancel = CancelCheck::new();
+                        for rid in candidates {
+                            cancel.tick()?;
+                            if let Some(row) = tbl.get(rid) {
+                                if !row[col_idx].is_empty()
+                                    && range_matches(
+                                        &row[col_idx],
+                                        &start_val,
+                                        start_inclusive,
+                                        &end_val,
+                                        end_inclusive,
+                                    )
+                                {
+                                    rids.push(rid);
+                                }
+                            }
+                        }
+                        Ok(Some(rids))
+                    }
+                    Some(true) => {
+                        let Some(btree) = tbl.index(column) else {
+                            return Ok(None);
+                        };
+                        // Unique index: raw column-value keys. An unbounded scan
+                        // is not a range shape the planner emits here, so defer it
+                        // to the generic path rather than a full index walk.
+                        let hits: Vec<(Value, RowId)> = match (&start_val, &end_val) {
+                            (Some(s), Some(e)) => btree.range(s, e).collect(),
+                            (Some(s), None) => btree.range_from(s),
+                            (None, Some(e)) => btree.range_to(e),
+                            (None, None) => return Ok(None),
+                        };
+                        let mut rids = Vec::with_capacity(hits.len());
+                        let mut cancel = CancelCheck::new();
+                        for (key, rid) in hits {
+                            cancel.tick()?;
+                            if !start_inclusive {
+                                if let Some(ref s) = start_val {
+                                    if &key == s {
+                                        continue;
+                                    }
+                                }
+                            }
+                            if !end_inclusive {
+                                if let Some(ref e) = end_val {
+                                    if &key == e {
+                                        continue;
+                                    }
+                                }
+                            }
+                            rids.push(rid);
+                        }
+                        Ok(Some(rids))
+                    }
+                    None => Ok(None),
+                }
+            }
+            PlanNode::ExprRangeScan {
+                table,
+                path,
+                start,
+                end,
+            } => {
+                let Some(index) = resolve_expression_index(&self.catalog, table, path) else {
+                    return Ok(None);
+                };
+                let start_val = start
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let end_val = end
+                    .as_ref()
+                    .map(|(expr, _)| literal_to_value(expr))
+                    .transpose()?;
+                let start_inclusive = start.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let end_inclusive = end.as_ref().map(|(_, inc)| *inc).unwrap_or(true);
+                let candidates = self
+                    .catalog
+                    .expression_index_range_rids(
+                        table,
+                        index.index_id,
+                        start_val.as_ref(),
+                        end_val.as_ref(),
+                    )
+                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                let schema = self
+                    .catalog
+                    .schema(table)
+                    .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                let all_columns: Vec<String> =
+                    schema.columns.iter().map(|c| c.name.clone()).collect();
+                let path_expr = stored_json_path_expr(path);
+                let mut rids = Vec::with_capacity(candidates.len());
+                let mut cancel = CancelCheck::new();
+                for rid in candidates {
+                    cancel.tick()?;
+                    let Some(row) = self.catalog.get(table, rid) else {
+                        continue;
+                    };
+                    let value = eval_expr(&path_expr, &row, &all_columns);
+                    if value.is_empty()
+                        || !range_matches(
+                            &value,
+                            &start_val,
+                            start_inclusive,
+                            &end_val,
+                            end_inclusive,
+                        )
+                    {
+                        continue;
+                    }
+                    rids.push(rid);
+                }
+                Ok(Some(rids))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Rid collection for `Filter(<index scan>)` mutation discovery: narrow to
+    /// the index scan's candidate rids, then recheck the residual predicate
+    /// while decoding only the columns it references (`get_projected`), exactly
+    /// as [`Self::try_filter_index_residual_fast`] does for reads. Returns
+    /// `None` when the inner scan is not an index shape over `table`, or when
+    /// the residual carries a subquery (which cannot be rechecked row-at-a-time
+    /// here), so the caller keeps the correct generic path.
+    fn collect_rids_via_index_residual(
+        &self,
+        inner: &PlanNode,
+        predicate: &Expr,
+        table: &str,
+    ) -> Result<Option<Vec<RowId>>, QueryError> {
+        if contains_subquery(predicate) || scan_table(inner) != Some(table) {
+            return Ok(None);
+        }
+        let Some(candidates) = self.index_scan_rids(inner)? else {
+            return Ok(None);
+        };
+        let schema = self
+            .catalog
+            .schema(table)
+            .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+        let all_columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let residual_indices = predicate_column_indices_json(predicate, &all_columns);
+        let residual_names: Vec<String> = residual_indices
+            .iter()
+            .map(|&index| all_columns[index].clone())
+            .collect();
+        let mut rids = Vec::new();
+        let mut cancel = CancelCheck::new();
+        for rid in candidates {
+            cancel.tick()?;
+            let Some(sparse) = self
+                .catalog
+                .get_projected(table, rid, &residual_indices)
+                .map_err(|error| QueryError::StorageError(error.to_string()))?
+            else {
+                continue;
+            };
+            if eval_predicate(predicate, &sparse, &residual_names) {
+                rids.push(rid);
+            }
+        }
+        Ok(Some(rids))
+    }
+
     /// Mission C Phase 3: schema is looked up via `self.catalog.schema(table)`
     /// inside the branches that actually need it. Previously the caller had
     /// to clone the full Schema (6+ String allocs) before every mutation just
@@ -4282,6 +4542,19 @@ impl Engine {
                 }
                 Ok(rids)
             }
+            PlanNode::RangeScan { table: t, .. }
+            | PlanNode::ExprIndexScan { table: t, .. }
+            | PlanNode::ExprRangeScan { table: t, .. }
+                if t == table =>
+            {
+                // A conjunction whose residual was fully consumed lowers to a
+                // bare index scan (no Filter). Collect its rids from the index
+                // directly instead of the generic value rematch.
+                match self.index_scan_rids(input)? {
+                    Some(rids) => Ok(rids),
+                    None => self.generic_rid_match(input, table),
+                }
+            }
             PlanNode::Filter {
                 input: inner,
                 predicate,
@@ -4345,6 +4618,13 @@ impl Engine {
                     if let Some(e) = cancel_err {
                         return Err(e);
                     }
+                    return Ok(rids);
+                }
+                // Lane A mutation fast path: a conjunction update/delete whose
+                // discovery scan lowered to `Filter(<index scan>)` collects
+                // candidate rids from the index and rechecks the residual per
+                // rid, instead of the O(N*M) generic value rematch.
+                if let Some(rids) = self.collect_rids_via_index_residual(inner, predicate, table)? {
                     return Ok(rids);
                 }
                 self.generic_rid_match(input, table)
@@ -4432,6 +4712,8 @@ impl Engine {
         input: &PlanNode,
         table: &str,
     ) -> Result<Vec<RowId>, QueryError> {
+        #[cfg(test)]
+        GENERIC_RID_MATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
         let result = self.execute_plan(input)?;
         let rows = match result {
             QueryResult::Rows { rows, .. } => rows,
@@ -6285,6 +6567,95 @@ fn range_candidate_resolves(catalog: &Catalog, scan: &PlanNode) -> bool {
     }
 }
 
+/// Declared type of `column` in `table`, if both resolve.
+fn column_type(catalog: &Catalog, table: &str, column: &str) -> Option<TypeId> {
+    catalog
+        .schema(table)?
+        .find_column(column)
+        .map(|col| col.type_id)
+}
+
+/// Rewrite a plain-column index-key literal into the value the index actually
+/// stores for `col_type`, or return `None` when no rewrite makes the indexed
+/// lookup equivalent to the reference `Filter(SeqScan)`.
+///
+/// The reference scan compiles `.col <op> literal` per the column's declared
+/// type: a float column promotes an int literal to `f64` (so `.f = 1` matches a
+/// stored `1.0`), while a non-float column never matches a float literal under
+/// the strict `Value` equality the eval fallback uses. A plain-column B-tree
+/// stores keys under the column's type behind a type tag, so a raw `Int(1)` key
+/// would miss every `Float(1.0)` row. Coercing the literal here keeps the
+/// index-driven path exactly in step with the scan; anything we cannot rewrite
+/// without changing the result set is rejected so the caller falls back to the
+/// always-correct scan.
+fn coerce_column_index_key(col_type: TypeId, key: &Expr) -> Option<Expr> {
+    match (key, col_type) {
+        // Same-typed literal: the index key already matches the stored key.
+        // A datetime column stores an int-literal timestamp as a raw `Int`
+        // (see `coerce_value`), so an int key is correct there too.
+        (Expr::Literal(Literal::Int(_)), TypeId::Int | TypeId::DateTime) => Some(key.clone()),
+        (Expr::Literal(Literal::Float(_)), TypeId::Float) => Some(key.clone()),
+        (Expr::Literal(Literal::String(_)), TypeId::Str) => Some(key.clone()),
+        (Expr::Literal(Literal::Bool(_)), TypeId::Bool) => Some(key.clone()),
+        // Int literal into a float column: widen to `f64`, exactly as the
+        // compiled float leaf does, so the float-typed index key matches.
+        (Expr::Literal(Literal::Int(v)), TypeId::Float) => {
+            Some(Expr::Literal(Literal::Float(*v as f64)))
+        }
+        // Any other pairing either never matches under the reference semantics
+        // or would need a lossy coercion that changes which rows match, so reject.
+        _ => None,
+    }
+}
+
+/// Coerce one optional range bound to `col_type`. The outer `Option` is the
+/// keep/reject signal for the whole candidate; the inner `Option` preserves
+/// "no bound on this side".
+fn coerce_column_index_bound(
+    col_type: TypeId,
+    bound: Option<(Expr, bool)>,
+) -> Option<Option<(Expr, bool)>> {
+    match bound {
+        None => Some(None),
+        Some((expr, inclusive)) => {
+            coerce_column_index_key(col_type, &expr).map(|expr| Some((expr, inclusive)))
+        }
+    }
+}
+
+/// Coerce the literal key(s) of a freshly-extracted candidate scan to the
+/// driving column's declared type, or return `None` to drop the candidate (the
+/// caller then keeps the correct `Filter(SeqScan)`). Expression-index
+/// (json-path) candidates pass through unchanged: they look scalars up by raw
+/// `Value` (`BTree::lookup_all` / `raw_range_rids`), so they already agree with
+/// the sequential scan and need no type-tag coercion.
+fn coerce_candidate_keys(catalog: &Catalog, scan: PlanNode) -> Option<PlanNode> {
+    match scan {
+        PlanNode::IndexScan { table, column, key } => {
+            let col_type = column_type(catalog, &table, &column)?;
+            let key = coerce_column_index_key(col_type, &key)?;
+            Some(PlanNode::IndexScan { table, column, key })
+        }
+        PlanNode::RangeScan {
+            table,
+            column,
+            start,
+            end,
+        } => {
+            let col_type = column_type(catalog, &table, &column)?;
+            let start = coerce_column_index_bound(col_type, start)?;
+            let end = coerce_column_index_bound(col_type, end)?;
+            Some(PlanNode::RangeScan {
+                table,
+                column,
+                start,
+                end,
+            })
+        }
+        other => Some(other),
+    }
+}
+
 /// A conjunct chosen to drive an indexed scan, plus the conjunct indices it
 /// consumes (the rest become the residual Filter).
 struct ConjunctionCandidate {
@@ -6316,12 +6687,17 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
     // Equality candidates, in conjunct order so ties resolve to the first.
     for (i, conjunct) in conjuncts.iter().enumerate() {
         if let Some(scan) = try_extract_eq_index_key(table, conjunct) {
-            if let Some(tier) = eq_candidate_tier(catalog, &scan) {
-                candidates.push(ConjunctionCandidate {
-                    plan: scan,
-                    consumed: vec![i],
-                    tier,
-                });
+            // Coerce the driving literal to the column's type before probing
+            // the index (a raw int key would miss a float-typed index); an
+            // uncoercible key drops the candidate to the correct scan.
+            if let Some(scan) = coerce_candidate_keys(catalog, scan) {
+                if let Some(tier) = eq_candidate_tier(catalog, &scan) {
+                    candidates.push(ConjunctionCandidate {
+                        plan: scan,
+                        consumed: vec![i],
+                        tier,
+                    });
+                }
             }
         }
     }
@@ -6367,6 +6743,12 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
             continue;
         }
         let scan = range_scan_for_target(table, target, lower, upper);
+        // Coerce int bounds to a float column's type (a raw int bound would
+        // miss the float-typed range index); an uncoercible bound drops the
+        // candidate to the correct scan.
+        let Some(scan) = coerce_candidate_keys(catalog, scan) else {
+            continue;
+        };
         if !range_candidate_resolves(catalog, &scan) {
             continue;
         }
@@ -6645,6 +7027,19 @@ pub(super) fn synthesize_range_predicate(
 }
 
 /// Check if a value falls within a range (used in last-resort decoded-row eval).
+/// The table a single index-scan node reads, if it is one of the index-scan
+/// shapes. Used to confirm a lowered discovery scan targets the mutation's own
+/// table before its rids are reused.
+fn scan_table(scan: &PlanNode) -> Option<&str> {
+    match scan {
+        PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. } => Some(table),
+        _ => None,
+    }
+}
+
 pub(super) fn range_matches(
     val: &Value,
     start: &Option<Value>,

@@ -2196,10 +2196,10 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
-                // Format the plan that actually runs: lower speculative and
-                // conjunction scans first so EXPLAIN reflects execution.
-                let lowered = lower_unindexed_scans(&self.catalog, input);
-                let text = format_plan_tree(&self.catalog, &lowered, 0);
+                // Every execute entry point runs lower_unindexed_scans before
+                // dispatch and lowering recurses into Explain, so `input` is
+                // already the plan that will actually run.
+                let text = format_plan_tree(&self.catalog, input, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],
                     rows: text

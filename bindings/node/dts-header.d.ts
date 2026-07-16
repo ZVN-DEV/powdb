@@ -2,9 +2,12 @@
 /* eslint-disable */
 
 /**
- * Recursively decoded JSON from a `json` result cell. Integers outside JS's
- * safe range come back as `bigint`; everything in range is a plain `number`.
- * The same shape the networked `@zvndev/powdb-client` decoder produces.
+ * Recursively decoded JSON from a `json` result cell. A JSON-internal integer
+ * within JS's safe range comes back as a `number`; one outside it (but still
+ * within i64) widens to `bigint`, so its exact value survives. The same rule
+ * the networked `@zvndev/powdb-client` decoder uses. An integer beyond i64
+ * range is the one lossy case (it falls back to a `number`); read the sibling
+ * `pj1` bytes on the `json` WireValue for the exact, lossless form there.
  */
 export type NativeJson =
   | null
@@ -27,7 +30,7 @@ export type WireValue =
   | { type: "bool"; value: boolean }
   | { type: "str"; value: string }
   | { type: "datetime"; value: bigint }
-  | { type: "uuid"; value: string }
+  | { type: "uuid"; value: Uint8Array }
   | { type: "bytes"; value: Buffer }
   | { type: "json"; value: NativeJson; pj1: Uint8Array }
 
