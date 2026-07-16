@@ -252,6 +252,36 @@ String literals use double quotes. Assignment (insert/update/upsert) uses `:=`,
 not `=`. A keyword used as an identifier must be backtick-quoted (`` `order`
 ``); a dotted field reference like `.order` bypasses keyword lookup.
 
+#### Equality is type-strict; range comparison coerces numerically
+
+The comparison operators split into two coercion regimes, and a driver's
+query generator must bind literals with this in mind:
+
+- **`=` and `!=` compare values type-strictly.** `Int(7)`, `Float(7.0)`, and
+  `Str("7")` are three different values; comparing across types is simply
+  `false` (never an error). One softening applies to stored columns only: an
+  int literal against a `float` column is widened to float before comparing
+  (`.price = 7` matches `7.0`), because the widening is lossless. The reverse
+  does not hold (`.qty = 7.0` against an `int` column matches nothing), and
+  strings never compare equal to numbers anywhere.
+- **`< > <= >=` and `between` coerce numerically.** Int and float compare by
+  promoting the int to a float (monotonic even above 2^53, though promotion
+  can lose precision there), against both stored columns and JSON leaves.
+
+JSON path leaves get no schema softening: the extracted scalar keeps the exact
+type in the document (a JSON `7` is int, a JSON `7.0` is float; PJ1 preserves
+the distinction), and `=` compares it strictly. `.data->g = 7` does NOT match
+a document holding `{"g": 7.0}`; `.data->g = 7.0` does. This is the case most
+likely to bite an ORM whose language conflates int and float (JavaScript): a
+driver binding a JS number against a JSON leaf must decide intentionally
+whether to emit `7` or `7.0`, ideally by round-tripping the type it wrote.
+
+The practical rule: bind every literal in the type actually stored. For
+stored columns the declared type is authoritative; for JSON leaves the
+document's own scalar type is. Convert stringly-typed user input before
+binding rather than relying on the engine to coerce, because under `=` it
+will not.
+
 ### JSON path operator `->`
 
 For a `json` column, `->` walks into the document by object key or array index
@@ -451,6 +481,14 @@ because they change how an application should retry and pool connections.
   the wire: the server transparently escalates a read-classified statement that
   turns out to need a write when the connection's role allows it, so you do not
   handle it.
+- **Read-only snapshot mode.** Distinct from RBAC: a database opened read-only
+  for snapshot serving (`powdb-server --readonly`, embedded `openReadOnly`)
+  rejects every mutation and DDL statement with
+  `readonly mode: statement requires a writer` regardless of the connection's
+  role. This refusal is terminal for the statement but the connection stays
+  usable for reads. A driver should classify it separately from the RBAC
+  `permission denied: role` family: RBAC means "this user may not write here",
+  snapshot mode means "nothing can write here; route writes to the primary".
 
 ### Version compatibility
 
@@ -483,7 +521,8 @@ message as opaque and surface it to the caller unparsed.
 | Admission-gate timeout | `transaction gate timeout after` | transient |
 | Bounded join | `nested-loop join would evaluate` / `join result exceeds row limit` | not transient: fix the query |
 | Unique constraint | `unique constraint violation on` | not transient |
-| Permission / read-only | `permission denied: role` | not transient |
+| Permission (RBAC) | `permission denied: role` | not transient |
+| Read-only snapshot mode | `readonly mode: statement requires a writer` | not transient: route writes to the primary |
 
 Match by a stable **substring**, not the whole message: the variable parts
 (millisecond counts, pair counts, table/column/role names) are interpolated and
