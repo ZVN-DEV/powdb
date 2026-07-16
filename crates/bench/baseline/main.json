@@ -66,9 +66,9 @@
       "ops_per_sec": 491
     },
     "conjunction_index_residual": {
-      "ns_per_iter": 229740.0,
-      "ops_per_sec": 4352,
-      "source": "laptop-provisional-2026-07-15; rebaseline from a Depot bench.yml run before this gates"
+      "ns_per_iter": 220853.64,
+      "ops_per_sec": 4527,
+      "source": "depot-run-29463423181-2026-07-16"
     },
     "insert_single": {
       "ns_per_iter": 235.78,
