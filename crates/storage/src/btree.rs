@@ -335,28 +335,19 @@ impl BTree {
         // disk write to the next `save_if_dirty` — typically at
         // `Catalog::checkpoint` or on `Drop`.
         self.dirty = true;
-        // Statistics maintenance. Probe before the recursion mutates the tree so
-        // we know whether this is a new key or a replace, and (in Composite mode)
-        // whether the value prefix already existed.
-        let (added, distinct_delta): (bool, u64) = match self.key_kind {
-            KeyKind::Raw => {
-                if self.lookup(&key).is_some() {
-                    (false, 0)
-                } else {
-                    (true, 1)
-                }
-            }
-            KeyKind::Composite => {
-                let prefix_present = self.composite_prefix_present(&key);
-                // A composite key repeats only if the same (col_val, rid) is
-                // re-inserted; then the prefix is present and the recursion
-                // replaces in place, so neither counter moves.
-                let added = !(prefix_present && self.lookup(&key).is_some());
-                (added, if prefix_present { 0 } else { 1 })
-            }
+        // Statistics maintenance. In Composite mode the value prefix must be
+        // probed before the recursion mutates the tree; new-vs-replace comes
+        // from the recursion itself (the replace branch reports it), which
+        // saves a second descent on the insert hot path.
+        let prefix_present = match self.key_kind {
+            KeyKind::Raw => false,
+            KeyKind::Composite => self.composite_prefix_present(&key),
         };
+        let mut replaced = false;
         let root = self.root;
-        if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, true) {
+        if let Some((mid_key, new_node_id)) =
+            self.insert_recursive(root, key, rid, true, &mut replaced)
+        {
             // Root was split — create new root
             let new_root = Node::Internal {
                 keys: vec![mid_key],
@@ -366,10 +357,19 @@ impl BTree {
             self.nodes.push(new_root);
             self.root = new_root_id;
         }
-        if added {
+        if !replaced {
             self.total_entries += 1;
         }
-        self.distinct_keys += distinct_delta;
+        // Raw mode: a non-replacing insert is a new distinct key. Composite
+        // mode: a replace implies the (value, rid) pair existed, so the prefix
+        // was present; distinct only advances when the prefix was absent.
+        let distinct_added = match self.key_kind {
+            KeyKind::Raw => !replaced,
+            KeyKind::Composite => !prefix_present,
+        };
+        if distinct_added {
+            self.distinct_keys += 1;
+        }
     }
 
     /// Insert a raw key/value pair without replacing an existing equal key.
@@ -407,8 +407,9 @@ impl BTree {
             self.root = 0;
             for (stored_key, stored_rid) in pairs {
                 let root = self.root;
+                let mut rebuilt_replaced = false;
                 if let Some((mid_key, new_node_id)) =
-                    self.insert_recursive(root, stored_key, stored_rid, false)
+                    self.insert_recursive(root, stored_key, stored_rid, false, &mut rebuilt_replaced)
                 {
                     let new_root_id = self.nodes.len();
                     self.nodes.push(Node::Internal {
@@ -431,8 +432,11 @@ impl BTree {
         // leaves, so use the duplicate-aware probe: `last_rid` reflects only the
         // rightmost candidate leaf and would miss copies held in a lower leaf.
         let key_was_present = self.raw_key_present(&key);
+        let mut duplicate_replaced = false;
         let root = self.root;
-        if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, false) {
+        if let Some((mid_key, new_node_id)) =
+            self.insert_recursive(root, key, rid, false, &mut duplicate_replaced)
+        {
             let new_root = Node::Internal {
                 keys: vec![mid_key],
                 children: vec![self.root, new_node_id],
@@ -479,9 +483,13 @@ impl BTree {
         self.dirty = true;
         // Int fast path is only used by unique int column indexes (Raw mode,
         // one entry per key), so a new key advances both counters by one.
-        let is_new = self.lookup_int(key).is_none();
+        // New-vs-replace is reported by the recursion's replace branch; no
+        // separate probe descent.
+        let mut replaced = false;
         let root = self.root;
-        if let Some((mid_key, new_node_id)) = self.insert_recursive_int(root, key, rid) {
+        if let Some((mid_key, new_node_id)) =
+            self.insert_recursive_int(root, key, rid, &mut replaced)
+        {
             let new_root = Node::Internal {
                 keys: vec![Value::Int(mid_key)],
                 children: vec![self.root, new_node_id],
@@ -490,7 +498,7 @@ impl BTree {
             self.nodes.push(new_root);
             self.root = new_root_id;
         }
-        if is_new {
+        if !replaced {
             self.total_entries += 1;
             self.distinct_keys += 1;
         }
@@ -501,6 +509,7 @@ impl BTree {
         node_id: usize,
         key: i64,
         rid: RowId,
+        replaced: &mut bool,
     ) -> Option<(i64, usize)> {
         match &mut self.nodes[node_id] {
             Node::Leaf { keys, values, .. } => {
@@ -517,6 +526,7 @@ impl BTree {
                     if let Value::Int(existing) = &keys[pos] {
                         if *existing == key {
                             values[pos] = rid;
+                            *replaced = true;
                             return None;
                         }
                     }
@@ -564,7 +574,8 @@ impl BTree {
                 let child_id = children[pos];
                 // Drop the borrow on self.nodes[node_id] before recursing.
 
-                let (mid_key, new_child_id) = self.insert_recursive_int(child_id, key, rid)?;
+                let (mid_key, new_child_id) =
+                    self.insert_recursive_int(child_id, key, rid, replaced)?;
 
                 // Re-borrow to insert the promoted key; possibly split.
                 let split_payload = match &mut self.nodes[node_id] {
@@ -608,6 +619,7 @@ impl BTree {
         key: Value,
         rid: RowId,
         replace_duplicate: bool,
+        replaced: &mut bool,
     ) -> Option<(Value, usize)> {
         // Mission C Phase 6: in-place insert.
         //
@@ -648,6 +660,7 @@ impl BTree {
                 // Duplicate key — update in place.
                 if replace_duplicate && pos < keys.len() && keys[pos] == key {
                     values[pos] = rid;
+                    *replaced = true;
                     return None;
                 }
 
@@ -694,7 +707,7 @@ impl BTree {
                 // Borrow on self.nodes[node_id] ends here.
 
                 let (mid_key, new_child_id) =
-                    self.insert_recursive(child_id, key, rid, replace_duplicate)?;
+                    self.insert_recursive(child_id, key, rid, replace_duplicate, replaced)?;
 
                 // Re-borrow to insert the promoted key; possibly split this
                 // internal node. All work that needs the borrow happens
