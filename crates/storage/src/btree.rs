@@ -55,6 +55,46 @@ enum Node {
     },
 }
 
+/// Coarse per-index statistics used by the conjunction index chooser to rank
+/// candidates by estimated rows per key. Read O(1) from in-memory counters via
+/// [`BTree::stats`]; never persisted (recomputed on every load).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Non-empty keys physically stored in the tree (excludes the v2
+    /// `empty_rids` side list).
+    pub total_entries: u64,
+    /// Distinct logical keys. For unique and expression trees this is the
+    /// distinct raw-key count; for non-unique composite trees it is the
+    /// distinct value-prefix count (composite key bytes minus the trailing
+    /// 8-byte rid).
+    pub distinct_keys: u64,
+    /// Length of the v2 `empty_rids` side list (missing / JSON-null results).
+    pub empty_count: u64,
+}
+
+/// How the tree's physical keys map to logical keys for distinct counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// The physical key is the logical key: unique column indexes (one entry
+    /// per key) and expression indexes (duplicate raw keys repeat physically).
+    /// Distinct keys are counted by raw-key transitions along the leaf chain.
+    Raw,
+    /// The physical key is a composite `(col_val, rid)` blob (non-unique
+    /// column indexes). Distinct keys are counted by value-prefix transitions
+    /// (composite bytes minus the trailing 8-byte rid).
+    Composite,
+}
+
+/// Value prefix of a composite key: its bytes minus the trailing 8-byte rid.
+/// Non-Bytes or too-short keys yield an empty slice (they never appear in a
+/// well-formed composite tree, but the fallback keeps counting total-safe).
+fn composite_prefix_bytes(key: &Value) -> &[u8] {
+    match key {
+        Value::Bytes(b) if b.len() >= 8 => &b[..b.len() - 8],
+        _ => &[],
+    }
+}
+
 /// In-memory B+ tree index. Keys are Values, values are RowIds.
 ///
 /// Order 256: each node holds up to 256 keys. For 500K rows with integer keys,
@@ -76,6 +116,19 @@ pub struct BTree {
     /// space so equality/range scans never match them; callers append this
     /// stable RID order for NULLS LAST.
     empty_rids: Vec<RowId>,
+    /// v0.15 statistics: physical (non-empty) key count. Maintained exactly by
+    /// every mutating method and recomputed from the leaf chain on load, so it
+    /// heals at the next reload and can never drift permanently.
+    total_entries: u64,
+    /// v0.15 statistics: distinct logical key count, interpreted per
+    /// `key_kind`. Maintained exactly where the new-vs-replace / prefix signal
+    /// is available; the `insert_duplicate` rebuild fallback recomputes via a
+    /// full leaf walk rather than guess.
+    distinct_keys: u64,
+    /// Distinct-counting mode. Defaults to `Raw`; the non-unique wrappers flip
+    /// it to `Composite`, and `mark_composite` sets it after a load of a
+    /// non-unique column index so the recount uses the value prefix.
+    key_kind: KeyKind,
 }
 
 impl BTree {
@@ -95,7 +148,112 @@ impl BTree {
             dirty: false,
             format_version: LEGACY_BTREE_VERSION,
             empty_rids: Vec::new(),
+            total_entries: 0,
+            distinct_keys: 0,
+            key_kind: KeyKind::Raw,
         })
+    }
+
+    /// v0.15 per-index statistics. O(1) read of in-memory counters; safe to
+    /// call per query execution inside runtime plan lowering.
+    pub fn stats(&self) -> IndexStats {
+        IndexStats {
+            total_entries: self.total_entries,
+            distinct_keys: self.distinct_keys,
+            empty_count: self.empty_rids.len() as u64,
+        }
+    }
+
+    /// Mark this tree as a non-unique composite index and recompute distinct
+    /// keys by value prefix. Called after `load` for a non-unique column index
+    /// (the on-disk format does not record the key kind, so the caller, which
+    /// knows the index is non-unique, supplies it).
+    pub fn mark_composite(&mut self) {
+        self.key_kind = KeyKind::Composite;
+        self.recount();
+    }
+
+    /// Recompute `total_entries` and `distinct_keys` from the leaf chain in the
+    /// current `key_kind`. Used on load and by the `insert_duplicate` rebuild
+    /// fallback, both of which already touch every key.
+    fn recount(&mut self) {
+        let mut total: u64 = 0;
+        let mut distinct: u64 = 0;
+        let mut prev_raw: Option<Value> = None;
+        let mut prev_prefix: Option<Vec<u8>> = None;
+        let mut node_id = self.root;
+        while let Node::Internal { children, .. } = &self.nodes[node_id] {
+            node_id = children[0];
+        }
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let Node::Leaf {
+                keys, next_leaf, ..
+            } = &self.nodes[id]
+            else {
+                break;
+            };
+            for key in keys {
+                total += 1;
+                match self.key_kind {
+                    KeyKind::Raw => {
+                        if prev_raw.as_ref() != Some(key) {
+                            distinct += 1;
+                            prev_raw = Some(key.clone());
+                        }
+                    }
+                    KeyKind::Composite => {
+                        let prefix = composite_prefix_bytes(key);
+                        if prev_prefix.as_deref() != Some(prefix) {
+                            distinct += 1;
+                            prev_prefix = Some(prefix.to_vec());
+                        }
+                    }
+                }
+            }
+            current = *next_leaf;
+        }
+        self.total_entries = total;
+        self.distinct_keys = distinct;
+    }
+
+    /// Whether any physical key shares the value prefix of `composite`
+    /// (composite bytes minus the trailing 8-byte rid). O(tree height): drives
+    /// the Composite-mode distinct maintenance (a new prefix on insert, the
+    /// last one gone on delete). Keys sharing a prefix are contiguous in sort
+    /// order, so inspecting the first key at or after the prefix suffices.
+    fn composite_prefix_present(&self, composite: &Value) -> bool {
+        let Value::Bytes(bytes) = composite else {
+            return false;
+        };
+        if bytes.len() < 8 {
+            return false;
+        }
+        let target_prefix = &bytes[..bytes.len() - 8];
+        let mut start_bytes = Vec::with_capacity(bytes.len());
+        start_bytes.extend_from_slice(target_prefix);
+        start_bytes.extend_from_slice(&0u64.to_be_bytes());
+        let start = Value::Bytes(start_bytes);
+
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            node_id = children[keys.partition_point(|separator| separator < &start)];
+        }
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            let Node::Leaf {
+                keys, next_leaf, ..
+            } = &self.nodes[id]
+            else {
+                return false;
+            };
+            let pos = keys.partition_point(|k| k < &start);
+            if pos < keys.len() {
+                return composite_prefix_bytes(&keys[pos]) == target_prefix;
+            }
+            current = *next_leaf;
+        }
+        false
     }
 
     /// Create the v2 expression-index shape. Legacy column indexes continue
@@ -145,6 +303,28 @@ impl BTree {
         // disk write to the next `save_if_dirty` — typically at
         // `Catalog::checkpoint` or on `Drop`.
         self.dirty = true;
+        // Statistics maintenance (v0.15). Probe before the recursion mutates
+        // the tree so we know whether this is a new key or a replace, and (in
+        // Composite mode) whether the value prefix already existed. The probe
+        // is an extra O(tree height) descent; index descents are cheap next to
+        // the heap write and WAL fsync this insert sits behind.
+        let (added, distinct_delta): (bool, u64) = match self.key_kind {
+            KeyKind::Raw => {
+                if self.lookup(&key).is_some() {
+                    (false, 0)
+                } else {
+                    (true, 1)
+                }
+            }
+            KeyKind::Composite => {
+                let prefix_present = self.composite_prefix_present(&key);
+                // A composite key repeats only if the same (col_val, rid) is
+                // re-inserted; then the prefix is present and the recursion
+                // replaces in place, so neither counter moves.
+                let added = !(prefix_present && self.lookup(&key).is_some());
+                (added, if prefix_present { 0 } else { 1 })
+            }
+        };
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, true) {
             // Root was split — create new root
@@ -156,6 +336,10 @@ impl BTree {
             self.nodes.push(new_root);
             self.root = new_root_id;
         }
+        if added {
+            self.total_entries += 1;
+        }
+        self.distinct_keys += distinct_delta;
     }
 
     /// Insert a raw key/value pair without replacing an existing equal key.
@@ -205,9 +389,16 @@ impl BTree {
                 }
             }
             self.dirty = true;
+            // Whole-tree rebuild fallback: the incremental new-vs-replace
+            // signal is not available here, so recompute both counters from
+            // the freshly built leaf chain rather than guess.
+            self.recount();
             return;
         }
         self.dirty = true;
+        // Normal duplicate insert always adds a physical entry. The raw key is
+        // a new distinct key only when it was absent before (no prior rid).
+        let key_was_present = last_rid.is_some();
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive(root, key, rid, false) {
             let new_root = Node::Internal {
@@ -217,6 +408,10 @@ impl BTree {
             let new_root_id = self.nodes.len();
             self.nodes.push(new_root);
             self.root = new_root_id;
+        }
+        self.total_entries += 1;
+        if !key_was_present {
+            self.distinct_keys += 1;
         }
     }
 
@@ -250,6 +445,9 @@ impl BTree {
     pub fn insert_int(&mut self, key: i64, rid: RowId) {
         // Blocker B3: mark dirty; checkpoint flushes later.
         self.dirty = true;
+        // Int fast path is only used by unique int column indexes (Raw mode,
+        // one entry per key), so a new key advances both counters by one.
+        let is_new = self.lookup_int(key).is_none();
         let root = self.root;
         if let Some((mid_key, new_node_id)) = self.insert_recursive_int(root, key, rid) {
             let new_root = Node::Internal {
@@ -259,6 +457,10 @@ impl BTree {
             let new_root_id = self.nodes.len();
             self.nodes.push(new_root);
             self.root = new_root_id;
+        }
+        if is_new {
+            self.total_entries += 1;
+            self.distinct_keys += 1;
         }
     }
 
@@ -597,6 +799,12 @@ impl BTree {
                     keys.remove(position);
                     values.remove(position);
                 }
+                self.total_entries = self.total_entries.saturating_sub(1);
+                // Raw duplicate tree (expression index): the raw key stays a
+                // distinct key while any other rid under it remains.
+                if self.lookup(key).is_none() {
+                    self.distinct_keys = self.distinct_keys.saturating_sub(1);
+                }
                 return true;
             }
             if passed_key {
@@ -917,6 +1125,9 @@ impl BTree {
                 if let Ok(pos) = result {
                     keys.remove(pos);
                     values.remove(pos);
+                    // Unique int column index (Raw, one entry per key).
+                    self.total_entries = self.total_entries.saturating_sub(1);
+                    self.distinct_keys = self.distinct_keys.saturating_sub(1);
                     return true;
                 }
                 return false;
@@ -1022,6 +1233,10 @@ impl BTree {
             current = next_leaf;
         }
 
+        // Batch int delete is only used by unique int column indexes (Raw,
+        // one entry per key), so each removal drops one distinct key too.
+        self.total_entries = self.total_entries.saturating_sub(total_removed as u64);
+        self.distinct_keys = self.distinct_keys.saturating_sub(total_removed as u64);
         total_removed
     }
 
@@ -1032,18 +1247,19 @@ impl BTree {
         // Deletion does not rebalance: leaves may become underfull but the tree
         // stays valid; lookups and range scans are unaffected.
         let mut node_id = self.root;
-        loop {
+        let removed = loop {
             let is_leaf = matches!(self.nodes[node_id], Node::Leaf { .. });
             if is_leaf {
+                let mut hit = false;
                 if let Node::Leaf { keys, values, .. } = &mut self.nodes[node_id] {
                     // Mission D1: binary search the leaf for an exact match.
                     if let Ok(pos) = keys.binary_search(key) {
                         keys.remove(pos);
                         values.remove(pos);
-                        return true;
+                        hit = true;
                     }
                 }
-                return false;
+                break hit;
             }
             match &self.nodes[node_id] {
                 Node::Internal { keys, children } => {
@@ -1053,7 +1269,20 @@ impl BTree {
                 }
                 _ => unreachable!(),
             }
+        };
+        if removed {
+            self.total_entries = self.total_entries.saturating_sub(1);
+            // Raw: unique column index (one entry per key) drops a distinct
+            // key. Composite: only when no other rid shares the value prefix.
+            let distinct_gone = match self.key_kind {
+                KeyKind::Raw => true,
+                KeyKind::Composite => !self.composite_prefix_present(key),
+            };
+            if distinct_gone {
+                self.distinct_keys = self.distinct_keys.saturating_sub(1);
+            }
         }
+        removed
     }
 
     /// Range scan: returns all (key, rid) pairs where start <= key <= end.
@@ -1355,6 +1584,9 @@ impl BTree {
     /// tree is `make_composite_key(col_val, rid)`, which is unique even
     /// when many rows share the same `col_val`.
     pub fn insert_non_unique(&mut self, col_val: Value, rid: RowId) {
+        // A composite tree counts distinct keys by value prefix; declare the
+        // mode so `insert` maintains the counters correctly (idempotent).
+        self.key_kind = KeyKind::Composite;
         let composite = Self::make_composite_key(&col_val, rid);
         // The composite key is always unique, so the normal insert path
         // will never hit the "duplicate key — update in place" branch.
@@ -1415,6 +1647,8 @@ impl BTree {
     /// Delete a specific (col_val, rid) entry from a non-unique
     /// secondary index.
     pub fn delete_non_unique(&mut self, col_val: &Value, rid: RowId) -> bool {
+        // Ensure `delete` counts distinct keys by value prefix (idempotent).
+        self.key_kind = KeyKind::Composite;
         let composite = Self::make_composite_key(col_val, rid);
         self.delete(&composite)
     }
@@ -1772,7 +2006,7 @@ impl BTree {
             ));
         }
 
-        Ok(BTree {
+        let mut tree = BTree {
             nodes,
             root,
             path: path.to_path_buf(),
@@ -1780,7 +2014,16 @@ impl BTree {
             dirty: false,
             format_version: version,
             empty_rids,
-        })
+            total_entries: 0,
+            distinct_keys: 0,
+            // Load cannot tell a unique/expression (Raw) tree from a
+            // non-unique composite one from the bytes alone. Count in Raw
+            // mode; a non-unique column index caller invokes `mark_composite`
+            // to switch and recount by value prefix.
+            key_kind: KeyKind::Raw,
+        };
+        tree.recount();
+        Ok(tree)
     }
 }
 
@@ -2903,5 +3146,267 @@ mod tests {
             offset_peak_group, 2,
             "buffering tracks the remaining window, not the 600-row tie cardinality"
         );
+    }
+
+    // --- v0.15 per-index statistics ---------------------------------------
+
+    fn stat_rid(page: u32, slot: u16) -> RowId {
+        RowId {
+            page_id: page,
+            slot_index: slot,
+        }
+    }
+
+    fn temp_btree_v2(name: &str) -> BTree {
+        let path = std::env::temp_dir().join(format!(
+            "powdb_btree_v2_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        BTree::create_v2(&path).unwrap()
+    }
+
+    #[test]
+    fn stats_exact_through_insert_replace_delete_int() {
+        let mut bt = temp_btree("stats_int");
+        assert_eq!(bt.stats().total_entries, 0);
+        assert_eq!(bt.stats().distinct_keys, 0);
+
+        for i in 0..50i64 {
+            bt.insert_int(i, stat_rid(0, i as u16));
+        }
+        assert_eq!(bt.stats().total_entries, 50);
+        assert_eq!(bt.stats().distinct_keys, 50);
+
+        // Replacing an existing key must move neither counter.
+        bt.insert_int(10, stat_rid(9, 9));
+        assert_eq!(bt.stats().total_entries, 50);
+        assert_eq!(bt.stats().distinct_keys, 50);
+
+        assert!(bt.delete_int(10));
+        assert_eq!(bt.stats().total_entries, 49);
+        assert_eq!(bt.stats().distinct_keys, 49);
+
+        // Deleting a missing key changes nothing.
+        assert!(!bt.delete_int(10));
+        assert_eq!(bt.stats().total_entries, 49);
+        assert_eq!(bt.stats().distinct_keys, 49);
+    }
+
+    #[test]
+    fn stats_exact_through_insert_replace_delete_str() {
+        let mut bt = temp_btree("stats_str");
+        for i in 0..30 {
+            bt.insert(Value::Str(format!("k{i:02}")), stat_rid(0, i as u16));
+        }
+        assert_eq!(bt.stats().total_entries, 30);
+        assert_eq!(bt.stats().distinct_keys, 30);
+
+        bt.insert(Value::Str("k05".into()), stat_rid(7, 7));
+        assert_eq!(bt.stats().total_entries, 30);
+        assert_eq!(bt.stats().distinct_keys, 30);
+
+        assert!(bt.delete(&Value::Str("k05".into())));
+        assert_eq!(bt.stats().total_entries, 29);
+        assert_eq!(bt.stats().distinct_keys, 29);
+    }
+
+    #[test]
+    fn stats_non_unique_composite_duplicates() {
+        let mut bt = temp_btree("stats_nonuniq");
+        // Same logical key "A" gets three distinct rids.
+        bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 1));
+        bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 2));
+        bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 3));
+        assert_eq!(bt.stats().total_entries, 3);
+        assert_eq!(bt.stats().distinct_keys, 1);
+
+        // A second logical key.
+        bt.insert_non_unique(Value::Str("B".into()), stat_rid(1, 1));
+        assert_eq!(bt.stats().total_entries, 4);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        // Delete one of A's rids: still one distinct A.
+        assert!(bt.delete_non_unique(&Value::Str("A".into()), stat_rid(0, 2)));
+        assert_eq!(bt.stats().total_entries, 3);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        // Delete A's remaining rids: A disappears as a distinct key.
+        assert!(bt.delete_non_unique(&Value::Str("A".into()), stat_rid(0, 1)));
+        assert!(bt.delete_non_unique(&Value::Str("A".into()), stat_rid(0, 3)));
+        assert_eq!(bt.stats().total_entries, 1);
+        assert_eq!(bt.stats().distinct_keys, 1);
+
+        // Re-inserting the same (col_val, rid) is a no-op replace, not a bump.
+        bt.insert_non_unique(Value::Str("B".into()), stat_rid(1, 1));
+        assert_eq!(bt.stats().total_entries, 1);
+        assert_eq!(bt.stats().distinct_keys, 1);
+    }
+
+    #[test]
+    fn stats_non_unique_int_composite() {
+        let mut bt = temp_btree("stats_nonuniq_int");
+        for slot in 0..5u16 {
+            bt.insert_non_unique_int(100, stat_rid(0, slot));
+        }
+        bt.insert_non_unique_int(200, stat_rid(1, 0));
+        assert_eq!(bt.stats().total_entries, 6);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        for slot in 0..5u16 {
+            assert!(bt.delete_non_unique_int(100, stat_rid(0, slot)));
+        }
+        assert_eq!(bt.stats().total_entries, 1);
+        assert_eq!(bt.stats().distinct_keys, 1);
+    }
+
+    #[test]
+    fn stats_empty_values_excluded_and_counted() {
+        let mut bt = temp_btree_v2("stats_empty");
+        bt.insert_duplicate(Value::Int(1), stat_rid(0, 0));
+        bt.insert_duplicate(Value::Int(1), stat_rid(0, 1));
+        bt.insert_duplicate(Value::Int(2), stat_rid(0, 2));
+        // Empty (missing/null) keys route to the side list.
+        bt.insert_duplicate(Value::Empty, stat_rid(9, 0));
+        bt.insert_empty(stat_rid(9, 1));
+
+        let stats = bt.stats();
+        assert_eq!(stats.total_entries, 3, "empties excluded from total");
+        assert_eq!(stats.distinct_keys, 2, "empties excluded from distinct");
+        assert_eq!(stats.empty_count, 2, "both empties counted separately");
+
+        assert!(bt.delete_empty(stat_rid(9, 0)));
+        assert_eq!(bt.stats().empty_count, 1);
+        assert_eq!(bt.stats().total_entries, 3);
+        assert_eq!(bt.stats().distinct_keys, 2);
+    }
+
+    #[test]
+    fn stats_duplicate_raw_tree() {
+        // Expression-index shape: duplicate raw keys repeat physically.
+        let mut bt = temp_btree_v2("stats_dup_raw");
+        bt.insert_duplicate(Value::Int(7), stat_rid(0, 0));
+        bt.insert_duplicate(Value::Int(7), stat_rid(0, 1));
+        bt.insert_duplicate(Value::Int(7), stat_rid(0, 2));
+        bt.insert_duplicate(Value::Int(8), stat_rid(0, 3));
+        assert_eq!(bt.stats().total_entries, 4);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        // Removing one rid of key 7 keeps 7 as a distinct key.
+        assert!(bt.delete_pair(&Value::Int(7), stat_rid(0, 1)));
+        assert_eq!(bt.stats().total_entries, 3);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        // Removing 7's last two rids drops it as a distinct key.
+        assert!(bt.delete_pair(&Value::Int(7), stat_rid(0, 0)));
+        assert!(bt.delete_pair(&Value::Int(7), stat_rid(0, 2)));
+        assert_eq!(bt.stats().total_entries, 1);
+        assert_eq!(bt.stats().distinct_keys, 1);
+    }
+
+    #[test]
+    fn stats_heal_on_reload_unique_and_composite() {
+        let dir = std::env::temp_dir().join(format!("powdb_stats_heal_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Unique tree.
+        let uniq_path = dir.join("uniq.idx");
+        {
+            let mut bt = BTree::create(&uniq_path).unwrap();
+            for i in 0..120i64 {
+                bt.insert(Value::Int(i), stat_rid(0, i as u16));
+            }
+            bt.save_to(&uniq_path).unwrap();
+        }
+        let reloaded = BTree::load(&uniq_path).unwrap();
+        assert_eq!(reloaded.stats().total_entries, 120);
+        assert_eq!(reloaded.stats().distinct_keys, 120);
+
+        // Non-unique composite tree: 40 distinct keys, 3 rids each.
+        let nonuniq_path = dir.join("nonuniq.idx");
+        let (want_total, want_distinct) = {
+            let mut bt = BTree::create(&nonuniq_path).unwrap();
+            for k in 0..40i64 {
+                for slot in 0..3u16 {
+                    bt.insert_non_unique(Value::Int(k), stat_rid(k as u32, slot));
+                }
+            }
+            let s = bt.stats();
+            bt.save_to(&nonuniq_path).unwrap();
+            (s.total_entries, s.distinct_keys)
+        };
+        assert_eq!(want_total, 120);
+        assert_eq!(want_distinct, 40);
+
+        let mut reloaded = BTree::load(&nonuniq_path).unwrap();
+        // Before mark_composite the load counts in Raw mode (all composite
+        // keys physically distinct), so distinct == total.
+        assert_eq!(reloaded.stats().total_entries, 120);
+        assert_eq!(reloaded.stats().distinct_keys, 120);
+        // mark_composite recomputes distinct by value prefix.
+        reloaded.mark_composite();
+        assert_eq!(reloaded.stats().total_entries, want_total);
+        assert_eq!(reloaded.stats().distinct_keys, want_distinct);
+    }
+
+    #[test]
+    fn stats_heal_after_rollback() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_stats_rollback_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("rollback.idx");
+
+        // Committed state on disk: 20 keys.
+        {
+            let mut bt = BTree::create(&path).unwrap();
+            for i in 0..20i64 {
+                bt.insert_int(i, stat_rid(0, i as u16));
+            }
+            bt.save_to(&path).unwrap();
+        }
+        let committed = BTree::load(&path).unwrap().stats();
+        assert_eq!(committed.total_entries, 20);
+        assert_eq!(committed.distinct_keys, 20);
+
+        // Load, mutate in memory, then discard the dirty flag (ROLLBACK): the
+        // uncommitted mutations never reach disk, so a fresh load heals to the
+        // committed counters.
+        {
+            let mut bt = BTree::load(&path).unwrap();
+            for i in 20..40i64 {
+                bt.insert_int(i, stat_rid(1, i as u16));
+            }
+            assert_eq!(bt.stats().total_entries, 40);
+            bt.discard_dirty();
+        }
+        let after_rollback = BTree::load(&path).unwrap().stats();
+        assert_eq!(after_rollback, committed);
+    }
+
+    #[test]
+    fn stats_insert_duplicate_rebuild_fallback() {
+        // Force the out-of-order rebuild branch: insert a smaller rid after a
+        // larger one under the same raw key. The rebuild path recomputes both
+        // counters via a full leaf walk, so they must match a ground-truth
+        // reload.
+        let mut bt = temp_btree_v2("stats_dup_rebuild");
+        bt.insert_duplicate(Value::Int(5), stat_rid(0, 10));
+        bt.insert_duplicate(Value::Int(5), stat_rid(0, 20));
+        // Now insert an out-of-order (smaller) rid for the same key.
+        bt.insert_duplicate(Value::Int(5), stat_rid(0, 1));
+        bt.insert_duplicate(Value::Int(6), stat_rid(0, 30));
+
+        assert_eq!(bt.stats().total_entries, 4);
+        assert_eq!(bt.stats().distinct_keys, 2);
+
+        // Ground truth: reload from a save recomputes independently.
+        let path = std::env::temp_dir().join(format!(
+            "powdb_dup_rebuild_gt_{}",
+            std::process::id()
+        ));
+        bt.save_to(&path).unwrap();
+        let reloaded = BTree::load(&path).unwrap();
+        assert_eq!(reloaded.stats().total_entries, bt.stats().total_entries);
+        assert_eq!(reloaded.stats().distinct_keys, bt.stats().distinct_keys);
     }
 }
