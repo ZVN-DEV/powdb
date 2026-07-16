@@ -296,9 +296,9 @@ fn test_index_persists_deletes_across_reopen() {
 
 #[test]
 fn test_index_stats_over_existing_heap_rows() {
-    // v0.15: an index built via create_index over existing heap rows must
-    // report correct statistics, and those stats must survive a reopen (the
-    // load path recomputes them, non-unique via mark_composite).
+    // An index built via create_index over existing heap rows must report
+    // correct statistics, and those stats must survive a reopen (the load path
+    // recomputes them, non-unique via mark_composite).
     let dir = fresh_dir("index_stats");
 
     {

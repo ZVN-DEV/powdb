@@ -146,7 +146,7 @@ fn explain_shows_index_scan_with_residual_filter_for_conjunction() {
     );
 }
 
-/// When a column and an expression index both apply, v0.15 ranks them by
+/// When a column and an expression index both apply, the chooser ranks them by
 /// estimated rows rather than conjunct order. On the `seed_docs` shape the path
 /// `.data->ns->value` (6 entries over 3 distinct, est 2) is more selective than
 /// `.model_id` (8 entries over 2 distinct, est 4), so the path drives whichever
@@ -471,7 +471,7 @@ fn eq_on_indexed_json_path_matches_seqscan() {
     }
 }
 
-// ── v0.15: per-index statistics rank conjunction drivers by selectivity ──
+// ── Per-index statistics rank conjunction drivers by selectivity ──
 //
 // The chooser now ranks candidates by estimated rows per key (from coarse
 // per-index counters) instead of tier-then-conjunct-order. These tests pin the
@@ -568,6 +568,16 @@ fn selective_index_drives_regardless_of_conjunct_order() {
 /// is only ever a performance bug because the residual rechecks every row.
 #[test]
 fn skewed_conjunction_parity_indexed_vs_unindexed() {
+    // One unindexed reference engine and one indexed engine, driven through the
+    // identical sequence of operations; every step compares the two. Selects
+    // leave state untouched, so the same pair carries through the mutations.
+    let d_ref = tempfile::tempdir().unwrap();
+    let mut reference = Engine::new(d_ref.path()).unwrap();
+    seed_cms(&mut reference, false);
+    let d_idx = tempfile::tempdir().unwrap();
+    let mut indexed = Engine::new(d_idx.path()).unwrap();
+    seed_cms(&mut indexed, true);
+
     let selects = [
         // selective column driver, unselective path residual
         r#"CmsDoc filter .data->ns->value = "a" and .model_id = 5 { .id }"#,
@@ -576,60 +586,35 @@ fn skewed_conjunction_parity_indexed_vs_unindexed() {
         // selective column driver, unselective boolean residual
         r#"CmsDoc filter .is_published = false and .model_id = 7 { .id }"#,
     ];
-
-    let d1 = tempfile::tempdir().unwrap();
-    let mut unindexed = Engine::new(d1.path()).unwrap();
-    seed_cms(&mut unindexed, false);
-    let expected: Vec<_> = selects
-        .iter()
-        .map(|q| sorted_ids(exec(&mut unindexed, q)))
-        .collect();
-
-    let d2 = tempfile::tempdir().unwrap();
-    let mut indexed = Engine::new(d2.path()).unwrap();
-    seed_cms(&mut indexed, true);
-    for (query, want) in selects.iter().zip(&expected) {
+    for query in selects {
         assert_eq!(
-            &sorted_ids(exec(&mut indexed, query)),
-            want,
+            sorted_ids(exec(&mut indexed, query)),
+            sorted_ids(exec(&mut reference, query)),
             "skewed conjunction diverged from the sequential scan for `{query}`"
         );
     }
 
-    // Update mutation driven by the selective path: touch exactly slug s10.
+    // Update driven by the selective path: touch exactly slug s10.
     let update = r#"CmsDoc filter .is_published = true and .data->ns->slug = "s10" update { model_id := 999 }"#;
     let probe = "CmsDoc filter .model_id = 999 { .id }";
-    let d3 = tempfile::tempdir().unwrap();
-    let mut unindexed = Engine::new(d3.path()).unwrap();
-    seed_cms(&mut unindexed, false);
-    exec(&mut unindexed, update);
-    let want_update = sorted_ids(exec(&mut unindexed, probe));
-    assert_eq!(want_update, vec![10], "reference update touched slug s10");
-    let d4 = tempfile::tempdir().unwrap();
-    let mut indexed = Engine::new(d4.path()).unwrap();
-    seed_cms(&mut indexed, true);
+    exec(&mut reference, update);
     exec(&mut indexed, update);
+    let want_update = sorted_ids(exec(&mut reference, probe));
+    assert_eq!(want_update, vec![10], "reference update touched slug s10");
     assert_eq!(
         sorted_ids(exec(&mut indexed, probe)),
         want_update,
         "index-driven skewed update touched the wrong rows"
     );
 
-    // Delete mutation driven by the selective column: remove model_id = 5 rows
-    // that also carry value "a" (a residual recheck on the path).
+    // Delete driven by the selective column: remove model_id = 5 rows that also
+    // carry value "a" (a residual recheck on the path).
     let delete = r#"CmsDoc filter .data->ns->value = "a" and .model_id = 5 delete"#;
-    let d5 = tempfile::tempdir().unwrap();
-    let mut unindexed = Engine::new(d5.path()).unwrap();
-    seed_cms(&mut unindexed, false);
-    exec(&mut unindexed, delete);
-    let want_delete = sorted_ids(exec(&mut unindexed, "CmsDoc { .id }"));
-    let d6 = tempfile::tempdir().unwrap();
-    let mut indexed = Engine::new(d6.path()).unwrap();
-    seed_cms(&mut indexed, true);
+    exec(&mut reference, delete);
     exec(&mut indexed, delete);
     assert_eq!(
         sorted_ids(exec(&mut indexed, "CmsDoc { .id }")),
-        want_delete,
+        sorted_ids(exec(&mut reference, "CmsDoc { .id }")),
         "index-driven skewed delete removed the wrong rows"
     );
 }
@@ -665,5 +650,65 @@ fn plan_cache_hit_relowers_with_current_stats() {
     assert!(
         !after.contains("column=is_published"),
         "the unselective boolean index must no longer drive: {after}"
+    );
+}
+
+/// Regression: deleting a large rid-contiguous slice of an expression index's
+/// duplicates must not drift its `distinct_keys`. The duplicates of a JSON-path
+/// value span many leaves, so the delete's presence probe must be
+/// duplicate-aware; otherwise the explain stats (and the planner decisions they
+/// feed) silently lie after churn. Here every "a" row with id >= 400 is deleted,
+/// but ids < 400 still carry both "a" and "b", so the path index keeps exactly
+/// two distinct values.
+#[test]
+fn expr_index_stats_truthful_after_heavy_delete_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    exec(&mut engine, "type Doc { required id: int, data: json }");
+    for id in 1..=1200i64 {
+        let value = if id % 2 == 0 { "a" } else { "b" };
+        insert_doc_value(&mut engine, id, value);
+    }
+    exec(&mut engine, "alter Doc add index (.data->ns->value)");
+
+    let before = explain_text(
+        &mut engine,
+        r#"explain Doc filter .data->ns->value = "a" and .id >= 1"#,
+    );
+    assert!(before.contains("distinct=2"), "{before}");
+
+    exec(
+        &mut engine,
+        r#"Doc filter .data->ns->value = "a" and .id >= 400 delete"#,
+    );
+
+    let after = explain_text(
+        &mut engine,
+        r#"explain Doc filter .data->ns->value = "a" and .id >= 1"#,
+    );
+    assert!(
+        after.contains("distinct=2"),
+        "path-index stats drifted after heavy delete churn: {after}"
+    );
+
+    // Parity: the surviving "a" rows are exactly the even ids below 400.
+    let surviving_a = sorted_ids(exec(
+        &mut engine,
+        r#"Doc filter .data->ns->value = "a" { .id }"#,
+    ));
+    let expected: Vec<i64> = (1..400).filter(|id| id % 2 == 0).collect();
+    assert_eq!(
+        surviving_a, expected,
+        "surviving rows diverged from the truth after churn"
+    );
+}
+
+/// Insert a `Doc` whose JSON path `.data->ns->value` carries `value`.
+fn insert_doc_value(engine: &mut Engine, id: i64, value: &str) {
+    let data = format!(r#"{{"ns":{{"value":"{value}"}}}}"#);
+    let escaped = data.replace('\\', "\\\\").replace('"', "\\\"");
+    exec(
+        engine,
+        &format!(r#"insert Doc {{ id := {id}, data := "{escaped}" }}"#),
     );
 }

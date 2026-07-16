@@ -6579,11 +6579,16 @@ fn probes_empty_sentinel(key: &Expr) -> bool {
     matches!(literal_to_value(key), Ok(Value::Empty))
 }
 
-/// Average rows a non-unique equality probe returns: the empty-list length when
-/// probing the missing sentinel, otherwise total entries divided by distinct
-/// keys (average rows per key). O(1) over already-loaded counters.
-fn estimate_eq_rows(stats: &IndexStats, empty_probe: bool) -> u64 {
-    if empty_probe {
+/// Estimated rows an equality probe against `stats` returns. A unique index
+/// returns at most one row; a non-unique probe of the empty/missing sentinel
+/// returns the empty-list length; any other non-unique probe returns the average
+/// rows per key. O(1) over the already-loaded counters. Single source of the
+/// `est_rows` formula, shared by the conjunction chooser and both `explain`
+/// index-scan annotations so the ranking and the printed value never disagree.
+fn eq_est_rows(stats: &IndexStats, unique: bool, empty_probe: bool) -> u64 {
+    if unique {
+        1
+    } else if empty_probe {
         stats.empty_count
     } else {
         stats.total_entries / stats.distinct_keys.max(1)
@@ -6591,12 +6596,9 @@ fn estimate_eq_rows(stats: &IndexStats, empty_probe: bool) -> u64 {
 }
 
 /// Estimated rows an equality candidate's index probe returns, used to rank
-/// conjunction drivers by selectivity. A unique probe returns at most one row
-/// (`tier == 0`, no stats read); a non-unique probe reads the per-index stats.
+/// conjunction drivers by selectivity. `tier == 0` marks a unique index (the
+/// uniqueness source shared with `explain`).
 fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, tier: u8) -> u64 {
-    if tier == 0 {
-        return 1;
-    }
     let (stats, key) = match scan {
         PlanNode::IndexScan { table, column, key } => (catalog.index_stats(table, column), key),
         PlanNode::ExprIndexScan { table, path, key } => (
@@ -6607,12 +6609,12 @@ fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, tier: u8) -> u64 {
         _ => return UNKNOWN_EST,
     };
     stats.map_or(UNKNOWN_EST, |stats| {
-        estimate_eq_rows(&stats, probes_empty_sentinel(key))
+        eq_est_rows(&stats, tier == 0, probes_empty_sentinel(key))
     })
 }
 
 /// Estimated rows a range candidate scans: its index's total entries (range
-/// selectivity estimation is out of scope for v0.15). Any equality candidate,
+/// selectivity estimation is out of scope). Any equality candidate,
 /// whose estimate is reduced by distinct keys, therefore ranks ahead, which
 /// preserves the v0.14 tier ordering.
 fn range_candidate_est(catalog: &Catalog, scan: &PlanNode) -> u64 {
@@ -7232,11 +7234,8 @@ pub(super) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             let base = format!("{indent}IndexScan table={table} column={column} key={key:?}");
             match catalog.index_stats(table, column) {
                 Some(stats) => {
-                    let est = if catalog.is_index_unique(table, column) == Some(true) {
-                        1
-                    } else {
-                        estimate_eq_rows(&stats, probes_empty_sentinel(key))
-                    };
+                    let unique = catalog.is_index_unique(table, column) == Some(true);
+                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys
@@ -7283,11 +7282,7 @@ pub(super) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                     .map(|stats| (m.unique, stats))
             }) {
                 Some((unique, stats)) => {
-                    let est = if unique {
-                        1
-                    } else {
-                        estimate_eq_rows(&stats, probes_empty_sentinel(key))
-                    };
+                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys

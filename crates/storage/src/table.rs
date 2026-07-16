@@ -260,7 +260,7 @@ impl Table {
                 let mut loaded = BTree::load(&idx_path)?;
                 // Load counts distinct keys in Raw mode; a non-unique column
                 // index stores composite keys, so switch it to count distinct
-                // by value prefix (v0.15 statistics).
+                // by value prefix.
                 if !unique {
                     loaded.mark_composite();
                 }

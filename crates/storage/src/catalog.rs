@@ -2223,14 +2223,14 @@ impl Catalog {
         self.get_table(table)?.expression_index_btree(index_id)
     }
 
-    /// v0.15 per-index statistics for a column index. O(1) read of the loaded
-    /// tree's in-memory counters; `None` when the table or column index is
-    /// absent. Used by the conjunction index chooser during plan lowering.
+    /// Per-index statistics for a column index. O(1) read of the loaded tree's
+    /// in-memory counters; `None` when the table or column index is absent. Used
+    /// by the conjunction index chooser during plan lowering.
     pub fn index_stats(&self, table: &str, column: &str) -> Option<IndexStats> {
         Some(self.get_table(table)?.index(column)?.stats())
     }
 
-    /// v0.15 per-index statistics for an expression index by id. O(1).
+    /// Per-index statistics for an expression index by id. O(1).
     pub fn expression_index_stats(&self, table: &str, index_id: u64) -> Option<IndexStats> {
         Some(
             self.get_table(table)?

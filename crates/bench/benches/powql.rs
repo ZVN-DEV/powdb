@@ -552,13 +552,14 @@ fn bench_conjunction_index_residual(c: &mut Criterion) {
     });
 }
 
-// ───── Workload: conjunction_s4_selective_path (v0.15) ─────────────────────
+// ───── Workload: conjunction_s4_selective_path ─────────────────────────────
 //
-// The S4 shape v0.15's per-index stats target: a CMS-style conjunction whose
+// The S4 shape the per-index stats target: a CMS-style conjunction whose
 // textually-first indexed conjunct is an unselective 50/50 boolean, while a
-// selective (near-unique) JSON-path index exists on another conjunct. In v0.14
-// the boolean drove the scan, materializing half the table plus a per-row
-// residual recheck; the stats-based chooser now drives from the selective path.
+// selective (near-unique) JSON-path index exists on another conjunct. Before
+// per-index stats the boolean drove the scan, materializing half the table plus
+// a per-row residual recheck; the stats-based chooser now drives from the
+// selective path.
 
 /// 20K-document CMS fixture: a 50/50 `is_published` boolean (indexed) and a
 /// per-row-unique `.data->slug` path (indexed).
@@ -868,7 +869,7 @@ criterion_group! {
         bench_multi_col_and_filter,
         // Lane A: conjunction index selection with residual recheck.
         bench_conjunction_index_residual,
-        // v0.15: per-index stats drive the selective conjunct (S4 shape).
+        // Per-index stats drive the selective conjunct (S4 shape).
         bench_conjunction_s4_selective_path,
         // Workload 11 (single insert — fast).
         bench_insert_single,

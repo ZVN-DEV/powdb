@@ -7154,9 +7154,7 @@ fn driving_column(plan: &PlanNode) -> String {
     }
 }
 
-/// Seed 12 rows so per-index stats are non-degenerate: `a` is unique
-/// (est 1), `b` has 2 distinct values over 12 rows (est ~6), and `c` is unique
-/// so its range index reports 12 total entries.
+/// Seed 12 rows: `a` unique (est 1), `b` 2 distinct over 12 (est ~6), `c` unique.
 fn seed_rec(engine: &mut Engine) {
     for id in 0..12i64 {
         engine
