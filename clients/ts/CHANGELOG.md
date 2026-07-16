@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.0 - 2026-07-16
+
+- Version-alignment release in lockstep with workspace v0.14.0 (conjunction
+  index selection, embedded typed results, read-only snapshot serving). No
+  TypeScript API changes; servers in read-only mode return a terminal
+  "readonly mode: statement requires a writer" error for mutations, which
+  surfaces through the existing error path.
+
 ## 0.13.0 - 2026-07-15
 
 - Added the **lossless native typed result API**: `queryNative(powql)`,

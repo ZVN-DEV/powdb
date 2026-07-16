@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-v0.14.0 development (see docs/design/2026-07-15-v0.14-plan.md). No v0.14
-package, container, tag, or release has been published yet.
+Nothing yet.
+
+## [0.14.0] - 2026-07-16
 
 ### Added
 
