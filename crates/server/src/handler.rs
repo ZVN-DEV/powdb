@@ -390,6 +390,11 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     // See QueryError::{Timeout,Cancelled} in crates/query/src/result.rs.
     "query timeout after",
     "query cancelled",
+    // Read-only snapshot serving refuses mutations (and reads needing a writer,
+    // e.g. a stale materialized view) with an operator-facing message that names
+    // the mode and the fix. It leaks no internal state.
+    // See QueryError::ReadonlyMode in crates/query/src/result.rs.
+    "readonly mode",
 ];
 
 /// Sanitize an error message before sending it to the client.
@@ -676,6 +681,15 @@ fn statement_admission(stmt: &powdb_query::ast::Statement) -> AdmissionMode {
         AdmissionMode::Reader
     } else {
         AdmissionMode::Writer
+    }
+}
+
+/// The terminal error a read-only (snapshot-serving) server returns for a
+/// mutating statement, transaction-control frame, or a read that needs a writer
+/// (a stale materialized view). The connection stays usable afterward.
+fn readonly_terminal_message() -> Message {
+    Message::Error {
+        message: sanitize_error(&QueryError::ReadonlyMode.to_string()),
     }
 }
 
@@ -1840,6 +1854,20 @@ where
         + 'static,
     R: AsyncRead + Unpin,
 {
+    // A read-only (snapshot-serving) engine never takes writer admission and
+    // never runs a mutating statement. The flag is fixed for the engine's
+    // lifetime; reading it costs one uncontended shared lock per frame.
+    let read_only = engine.read().map(|eng| eng.is_read_only()).unwrap_or(false);
+    if read_only {
+        // Transaction control and any write statement require a writer that does
+        // not exist in this mode: return the terminal error without touching the
+        // gate or the engine write lock.
+        let is_write = tx_control.is_some() || autocommit_admission == AdmissionMode::Writer;
+        if is_write {
+            return (readonly_terminal_message(), None, None);
+        }
+    }
+
     match tx_control {
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
@@ -1996,6 +2024,14 @@ where
             )
             .await;
             drop(permit);
+            if read_only && out.3 {
+                // A read reached ReadonlyNeedsWrite (e.g. a stale materialized
+                // view). There is no writer to escalate to in read-only mode:
+                // surface the terminal error telling the operator to refresh
+                // before snapshotting, rather than retrying under a writer.
+                out.0 = readonly_terminal_message();
+                out.3 = false;
+            }
             if out.3 {
                 let writer_permit = match acquire_autocommit_permit(
                     &tx_gate,

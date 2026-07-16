@@ -3,6 +3,8 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Next release: v0.14.0 (unreleased).** Conjunction index selection with residual recheck, embedded typed results and parameter binding, and read-only snapshot serving are in development (see docs/design/2026-07-15-v0.14-plan.md). Package manifests use the next version during development, but no v0.14 package, container, tag, or release is published yet.
+>
 > **Current release: v0.13.0.** Persistent JSON-path (expression) indexes, expression-valued grouping/ordering/aggregation, a lossless typed native wire with `queryNative()` in the TS client, SQL `->`/`->>`, concurrent autocommit read admission, hash-plus-residual compound joins with bounded nested loops, and cooperative query cancellation that makes deadlines and disconnects actually stop work.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See

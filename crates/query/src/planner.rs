@@ -4,13 +4,13 @@ use crate::plan::*;
 use powdb_storage::stored_json_path::StoredJsonPathV1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RangeTarget {
+pub(crate) enum RangeTarget {
     Column(String),
     JsonPath(StoredJsonPathV1),
 }
 
 /// (target, lower_bound, upper_bound) — used by range-index extraction.
-type RangeBound = (RangeTarget, Option<(Expr, bool)>, Option<(Expr, bool)>);
+pub(crate) type RangeBound = (RangeTarget, Option<(Expr, bool)>, Option<(Expr, bool)>);
 
 /// Plan-phase error — wraps ParseError for the full lex→parse→plan chain.
 #[derive(Debug)]
@@ -120,9 +120,12 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     // it transparently falls back to a sequential scan with the same predicate,
     // so this rewrite is always safe.
     //
-    // We only rewrite the *simple* eq case: `filter .col = literal`. Conjunctions
-    // like `filter .col = 1 and .other > 5` fall through to SeqScan + Filter.
-    // Extending this to split conjunctions is a future optimization.
+    // We only rewrite the *simple* eq case here: `filter .col = literal`.
+    // A conjunction like `filter .col = 1 and .other > 5` stays as
+    // SeqScan + Filter in the planner; runtime lowering
+    // (`lower_unindexed_scans`) then picks an indexed conjunct to drive the
+    // scan and re-checks the rest as a residual filter, using real catalog
+    // knowledge the pure planner does not have.
     let ordered_expr_scan = try_extract_ordered_expr_index_scan(&q);
     let (source, filter) = if let Some(scan) = ordered_expr_scan {
         // The ordered expression node owns these clauses and executes them in
@@ -627,7 +630,7 @@ fn plan_create_type(ct: CreateTypeExpr) -> Result<PlanNode, PlanError> {
 /// equality filter on that column. That means this rewrite is always safe
 /// regardless of schema/index state; it just unlocks the fast path when an
 /// index happens to exist.
-fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
+pub(crate) fn try_extract_eq_index_key(table: &str, pred: &Expr) -> Option<PlanNode> {
     let (lhs, op, rhs) = match pred {
         Expr::BinaryOp(lhs, op, rhs) => (lhs.as_ref(), *op, rhs.as_ref()),
         _ => return None,
@@ -666,7 +669,7 @@ fn stored_json_path(expr: &Expr) -> Option<StoredJsonPathV1> {
 
 /// Extract a single range bound from a simple inequality predicate.
 /// Returns `(column, lower_bound, upper_bound)` where at most one bound is set.
-fn extract_single_bound(pred: &Expr) -> Option<RangeBound> {
+pub(crate) fn extract_single_bound(pred: &Expr) -> Option<RangeBound> {
     let (lhs, op, rhs) = match pred {
         Expr::BinaryOp(lhs, op, rhs) => (lhs.as_ref(), *op, rhs.as_ref()),
         _ => return None,
@@ -803,7 +806,7 @@ fn try_extract_range_index_keys(table: &str, pred: &Expr) -> Option<PlanNode> {
     None
 }
 
-fn range_scan_for_target(
+pub(crate) fn range_scan_for_target(
     table: &str,
     target: RangeTarget,
     start: Option<(Expr, bool)>,

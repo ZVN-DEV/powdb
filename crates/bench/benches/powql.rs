@@ -497,6 +497,61 @@ fn bench_multi_col_and_filter(c: &mut Criterion) {
     });
 }
 
+// ───── Workload: conjunction_index_residual (Lane A) ───────────────────────
+//
+// `Doc filter .data->tag = "..." and .model_id = ...` over 20K JSON documents
+// with an expression index on the `.data->tag` path (the driving conjunct) and
+// no index on the residual `model_id` column. This is the CMS-style filter
+// shape Lane A targets: the planner emits `Filter(SeqScan)`, and runtime
+// lowering drives the scan from the indexed path, re-checking the column
+// conjunct as a compiled residual instead of scanning the whole table.
+
+/// 20K-document fixture with a nested JSON `tag` and an expression index on it.
+fn setup_doc_conjunction_fixture() -> (Engine, TempDir) {
+    const N_DOCS: usize = 20_000;
+    let tmp = TempDir::new().expect("create tempdir");
+    let mut engine = Engine::new(tmp.path()).expect("engine init");
+    engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
+    engine
+        .execute_powql("type Doc { required id: int, required model_id: int, data: json }")
+        .expect("create type");
+    for i in 0..N_DOCS {
+        let tag = i % 10;
+        let model_id = i % 4;
+        engine
+            .execute_powql(&format!(
+                r#"insert Doc {{ id := {i}, model_id := {model_id}, data := "{{\"tag\":\"t{tag}\"}}" }}"#
+            ))
+            .expect("insert doc");
+    }
+    engine
+        .execute_powql("alter Doc add index (.data->tag)")
+        .expect("build path index");
+    (engine, tmp)
+}
+
+fn bench_conjunction_index_residual(c: &mut Criterion) {
+    let (mut engine, _tmp) = setup_doc_conjunction_fixture();
+
+    let queries = gen_queries(|i| {
+        format!(
+            r#"Doc filter .data->tag = "t{}" and .model_id = {} {{ .id }}"#,
+            i % 10,
+            i % 4
+        )
+    });
+    warm_plan_cache(&mut engine, &queries);
+
+    let mut idx: usize = 0;
+    c.bench_function("conjunction_index_residual", |b| {
+        b.iter(|| {
+            let q = &queries[idx % queries.len()];
+            idx = idx.wrapping_add(1);
+            black_box(engine.execute_powql(q).expect("query failed"))
+        });
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WRITE BENCHES
 // ═══════════════════════════════════════════════════════════════════════════
@@ -753,6 +808,8 @@ criterion_group! {
         bench_agg_max,
         // Workload 10.
         bench_multi_col_and_filter,
+        // Lane A: conjunction index selection with residual recheck.
+        bench_conjunction_index_residual,
         // Workload 11 (single insert — fast).
         bench_insert_single,
 }

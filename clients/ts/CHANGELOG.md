@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.13.0 - 2026-07-15
+
+- Added the **lossless native typed result API**: `queryNative(powql)`,
+  `querySqlNative(sql)`, and low-level `queryNativeRaw(...)` returning tagged
+  `WireValue` cells. Native results preserve exact cell types: 64-bit ints as
+  `bigint`, raw `bytes`, and JSON documents as parsed values plus the exact
+  PJ1 bytes (`pj1`). Empty (SQL NULL / missing) is distinct from JSON `null`
+  and from the string `"null"` in raw results.
+- Added native parameterized queries over the new typed request frames.
+- Added `SUPPORTED_CATALOG_VERSION` and `assertServerCatalogVersionSupported`
+  so clients fail with a clear error against servers newer than they support.
+- Legacy `query()` / `querySql()` string results are unchanged and remain
+  byte-compatible; see README for when to prefer the native API.
+
+## 0.12.0 - 2026-07-14
+
+- Typed API: `"json"` column kind for the server's native JSON (PJ1) type.
+  JSON cells arrive as canonical JSON text on the legacy protocol.
+- No breaking changes; released in lockstep with workspace v0.12.0.
+
+## 0.11.0 - 2026-07-13
+
+- Version-alignment release in lockstep with workspace v0.11.0 (overflow
+  pages, grouped aggregates). No TypeScript API changes.
+
+## 0.10.0 - 2026-07-13
+
+- Version-alignment release in lockstep with workspace v0.10.0. No
+  TypeScript API changes.
+
+## 0.9.0 - 2026-07-12
+
+- Added `execScript(...)`: transactional, statement-aware script execution
+  with all-or-nothing semantics.
+- Connect is now pipelined and eager, reducing first-query latency.
+
 ## 0.8.0 - 2026-07-02
 
 - Released in lockstep with PowDB workspace v0.8.0 (Embedded Sync Milestone 0).

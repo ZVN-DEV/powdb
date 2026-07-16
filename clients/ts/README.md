@@ -357,6 +357,22 @@ Reach for `queryNativeRaw` when you need:
 It accepts the same `$N` parameter array and `AbortSignal` options as
 `queryNative`. For ordinary reads, prefer `queryNative`.
 
+### Null vs missing: which API sees what
+
+The legacy string protocol renders an absent value, a JSON `null`, and the
+string `"null"` as the identical string `null`. This is frozen wire behavior:
+existing decoders depend on it, so it will not change. If your application
+(or a driver you maintain) needs to tell these apart, migrate reads to
+`queryNativeRaw`, which is the sanctioned lossless surface.
+
+One engine-level caveat applies to every API, native included: extracting a
+scalar with `->` (for example `.data->maybe->leaf`) collapses "path missing"
+and "explicit JSON null at the leaf" into the same empty value before results
+are produced. When that distinction matters, either project the enclosing
+JSON value (a `json` cell preserves `null` exactly) or ask the engine with
+`json_type(.data->maybe->leaf)`, which returns the string `"null"` for an
+explicit JSON null and an empty value for a missing path.
+
 ## Schema-coerced rows
 
 The legacy wire protocol serialises every value as a string. If you want JS

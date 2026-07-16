@@ -709,95 +709,199 @@ impl Wal {
 
     /// Read valid records up to a byte length boundary in the WAL file.
     pub fn read_through_len(&self, max_len: u64) -> io::Result<Vec<WalRecord>> {
-        let mut file = File::open(&self.path)?;
-        let file_len = file.metadata()?.len().min(max_len);
-        let mut file_for_header = File::open(&self.path)?;
-        let mut pos = wal_records_start(&mut file_for_header)?;
-        let mut records = Vec::new();
+        parse_wal_records(&self.path, max_len)
+    }
+}
 
-        while pos + WAL_HEADER_SIZE as u64 <= file_len {
-            file.seek(SeekFrom::Start(pos))?;
+/// Parse valid WAL records from `path` up to `max_len` bytes, opening the file
+/// **read-only**. This is the single record-decoding loop shared by
+/// [`Wal::read_through_len`] and the read-only open path
+/// ([`read_records_at_path`]); neither ever writes to the file, so it is safe on
+/// a directory opened for read-only snapshot serving.
+fn parse_wal_records(path: &Path, max_len: u64) -> io::Result<Vec<WalRecord>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len().min(max_len);
+    let mut file_for_header = File::open(path)?;
+    let mut pos = wal_records_start_readonly(&mut file_for_header)?;
+    let mut records = Vec::new();
 
-            let mut header = [0u8; WAL_HEADER_SIZE];
-            if file.read_exact(&mut header).is_err() {
-                break;
-            }
+    while let Some((record, next_pos)) = parse_wal_record_at(&mut file, pos, file_len)? {
+        records.push(record);
+        pos = next_pos;
+    }
 
-            // These slice-to-array conversions are infallible (fixed-size
-            // sub-slices of a 17-byte array) but we avoid `unwrap` to
-            // satisfy the project-wide zero-panic policy.
-            let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-            let total_len = u32::from_le_bytes(total_len_bytes) as usize;
-            let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-            let stored_crc = u32::from_le_bytes(stored_crc_bytes);
-            let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-            let tx_id = u64::from_le_bytes(tx_id_bytes);
-            let record_type = match WalRecordType::from_u8(header[16]) {
-                Some(rt) => rt,
-                None => break,
-            };
-            let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-            let lsn = u64::from_le_bytes(lsn_bytes);
+    Ok(records)
+}
 
-            // TASK-11: Verify the record fits within the file before
-            // allocating. Catches truncated writes without any allocation.
-            if pos + total_len as u64 > file_len {
-                break; // Record extends beyond file — truncated write
-            }
+/// Parse the single record starting at `pos`, returning it together with the
+/// position of the next record. Returns `Ok(None)` at end of file or at the
+/// first corrupted/truncated record (the same stop-on-corruption semantics
+/// replay has always had).
+fn parse_wal_record_at(
+    file: &mut File,
+    pos: u64,
+    file_len: u64,
+) -> io::Result<Option<(WalRecord, u64)>> {
+    if pos + WAL_HEADER_SIZE as u64 > file_len {
+        return Ok(None);
+    }
+    {
+        file.seek(SeekFrom::Start(pos))?;
 
-            // TASK-09: Use checked_sub to prevent integer underflow when
-            // a corrupted WAL has total_len < WAL_HEADER_SIZE.
-            let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
-                Some(len) => len,
-                None => break, // Corrupted record — stop replay
-            };
+        let mut header = [0u8; WAL_HEADER_SIZE];
+        if file.read_exact(&mut header).is_err() {
+            return Ok(None);
+        }
 
-            // TASK-10: Cap allocation size before reading data. A crafted
-            // WAL claiming a huge total_len would otherwise allocate
-            // gigabytes before the CRC check rejects the record.
-            if data_len > MAX_WAL_RECORD_SIZE {
-                break; // Unreasonably large record — treat as corruption
-            }
+        // These slice-to-array conversions are infallible (fixed-size
+        // sub-slices of a 17-byte array) but we avoid `unwrap` to
+        // satisfy the project-wide zero-panic policy.
+        let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let total_len = u32::from_le_bytes(total_len_bytes) as usize;
+        let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let stored_crc = u32::from_le_bytes(stored_crc_bytes);
+        let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let tx_id = u64::from_le_bytes(tx_id_bytes);
+        let record_type = match WalRecordType::from_u8(header[16]) {
+            Some(rt) => rt,
+            None => return Ok(None),
+        };
+        let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let lsn = u64::from_le_bytes(lsn_bytes);
 
-            let mut data = vec![0u8; data_len];
-            if data_len > 0 {
-                file.read_exact(&mut data)?;
-            }
+        // TASK-11: Verify the record fits within the file before
+        // allocating. Catches truncated writes without any allocation.
+        if pos + total_len as u64 > file_len {
+            return Ok(None); // Record extends beyond file: truncated write
+        }
 
-            // Verify CRC (includes lsn in the hash input)
-            let mut crc_input = Vec::with_capacity(17 + data.len());
-            crc_input.extend_from_slice(&tx_id.to_le_bytes());
-            crc_input.push(record_type as u8);
-            crc_input.extend_from_slice(&lsn.to_le_bytes());
-            crc_input.extend_from_slice(&data);
-            let computed_crc = crc32fast::hash(&crc_input);
+        // TASK-09: Use checked_sub to prevent integer underflow when
+        // a corrupted WAL has total_len < WAL_HEADER_SIZE.
+        let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
+            Some(len) => len,
+            None => return Ok(None), // Corrupted record: stop replay
+        };
 
-            if computed_crc != stored_crc {
-                break; // Corrupted record — stop here
-            }
+        // TASK-10: Cap allocation size before reading data. A crafted
+        // WAL claiming a huge total_len would otherwise allocate
+        // gigabytes before the CRC check rejects the record.
+        if data_len > MAX_WAL_RECORD_SIZE {
+            return Ok(None); // Unreasonably large record: treat as corruption
+        }
 
-            records.push(WalRecord {
+        let mut data = vec![0u8; data_len];
+        if data_len > 0 {
+            file.read_exact(&mut data)?;
+        }
+
+        // Verify CRC (includes lsn in the hash input)
+        let mut crc_input = Vec::with_capacity(17 + data.len());
+        crc_input.extend_from_slice(&tx_id.to_le_bytes());
+        crc_input.push(record_type as u8);
+        crc_input.extend_from_slice(&lsn.to_le_bytes());
+        crc_input.extend_from_slice(&data);
+        let computed_crc = crc32fast::hash(&crc_input);
+
+        if computed_crc != stored_crc {
+            return Ok(None); // Corrupted record: stop here
+        }
+
+        Ok(Some((
+            WalRecord {
                 tx_id,
                 record_type,
                 lsn,
                 data,
-            });
-            pos += total_len as u64;
-        }
+            },
+            pos + total_len as u64,
+        )))
+    }
+}
 
-        Ok(records)
+/// Report whether `path` holds at least one committed WAL record, without
+/// ever opening a writable handle. Returns `false` if the file does not
+/// exist. Used by the read-only catalog open path to decide whether a
+/// directory is quiescent before serving it, without creating, appending
+/// to, or truncating the WAL the way [`Wal::open`] would. Only the first
+/// record's header and payload are read; a valid first record is proof
+/// enough that the directory needs recovery.
+pub fn wal_has_committed_records(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut file_for_header = File::open(path)?;
+    let pos = wal_records_start_readonly(&mut file_for_header)?;
+    Ok(parse_wal_record_at(&mut file, pos, file_len)?.is_some())
+}
+
+/// Locate the first record byte in a WAL file **without mutating it**. Mirrors
+/// [`wal_records_start`] but never writes a header for an empty/headerless file
+/// (the read-only path must not touch the directory): it returns the default
+/// record start instead.
+fn wal_records_start_readonly(file: &mut File) -> io::Result<u64> {
+    let len = file.metadata()?.len();
+    if len >= WAL_FILE_HEADER_SIZE {
+        file.seek(SeekFrom::Start(0))?;
+        let mut hdr = [0u8; WAL_FILE_HEADER_SIZE as usize];
+        file.read_exact(&mut hdr)?;
+        if &hdr[0..4] == WAL_MAGIC {
+            let version = u16::from_le_bytes(hdr[4..6].try_into().expect("2-byte WAL version"));
+            if version != WAL_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported WAL format version: {version}"),
+                ));
+            }
+            return Ok(WAL_FILE_HEADER_SIZE);
+        }
+        // Legacy 0.4.x WAL: no file header; records start at byte 0.
+        return Ok(0);
+    }
+    // Empty or sub-header file: nothing to read, and we must not write a header.
+    Ok(WAL_FILE_HEADER_SIZE.min(len))
+}
+
+impl Wal {
+    /// Open a WAL handle that can never write, for the read-only snapshot-serving
+    /// path. The file is opened read-only (no create, no append, no truncate) and
+    /// the handle carries no writer; every append/flush/commit path is unreachable
+    /// in read-only engine mode. Record reads still work because they reopen the
+    /// file read-only on demand.
+    pub fn open_read_only(path: &Path, batch_size: usize) -> io::Result<Self> {
+        let records_start = if path.exists() {
+            let mut f = File::open(path)?;
+            wal_records_start_readonly(&mut f)?
+        } else {
+            WAL_FILE_HEADER_SIZE
+        };
+        Ok(Wal {
+            path: path.to_path_buf(),
+            writer: None,
+            batch_size,
+            pending: 0,
+            sync_mode: WalSyncMode::Off,
+            next_lsn: 1,
+            records_start,
+            synced_len: records_start,
+            shared: Arc::new(WalSyncShared::new(None)),
+            defer_sync: false,
+            deferred_gen: None,
+            flusher: None,
+        })
     }
 
     /// Truncate the WAL (after checkpoint).

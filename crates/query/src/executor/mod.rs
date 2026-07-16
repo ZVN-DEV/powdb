@@ -289,6 +289,20 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
     }
 }
 
+/// Map a read-only executor result into the read-only-engine surface: the
+/// internal "this statement writes" sentinel ([`QueryError::ReadonlyNeedsWrite`])
+/// becomes the terminal, operator-facing [`QueryError::ReadonlyMode`]. There is
+/// no writer to escalate to in read-only mode, so the sentinel never leaves the
+/// engine.
+fn to_readonly_terminal(
+    result: Result<QueryResult, QueryError>,
+) -> Result<QueryResult, QueryError> {
+    match result {
+        Err(QueryError::ReadonlyNeedsWrite) => Err(QueryError::ReadonlyMode),
+        other => other,
+    }
+}
+
 /// Return whether executing this read plan would have to refresh a dirty
 /// materialized view. This is intentionally a whole-plan preflight: the server
 /// may retry only this typed condition under exclusive admission, so it must be
@@ -380,6 +394,11 @@ pub struct Engine {
     /// `POWDB_MAX_NESTED_LOOP_PAIRS`). A plain `usize` so `Engine` stays `Sync`.
     nested_loop_pair_limit: usize,
     wal_archive_hook: Option<WalArchiveHook>,
+    /// True when opened via [`Engine::open_read_only`] for snapshot serving. In
+    /// this mode the catalog and its files are read-only, the `DirLock` is a
+    /// shared reader lock, and every mutating execute path returns the terminal
+    /// [`QueryError::ReadonlyMode`] instead of ever touching disk.
+    read_only: bool,
 }
 
 impl Engine {
@@ -449,7 +468,64 @@ impl Engine {
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
             nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             wal_archive_hook,
+            read_only: false,
         })
+    }
+
+    /// Open an engine **read-only** over a quiescent data directory for snapshot
+    /// serving (tier 1 of the replica story). This is the supported way to serve
+    /// a restored backup or a checkpointed replica with no write gate at all:
+    ///
+    /// - the catalog and every heap/index/WAL file are opened read-only
+    ///   ([`Catalog::open_read_only`]), so nothing on disk is ever mutated;
+    /// - a **shared reader** [`DirLock`] is taken, so N read-only processes may
+    ///   serve the same directory concurrently, while a read-write open refuses
+    ///   to start against live readers (and readers refuse a live writer);
+    /// - a non-empty WAL is refused with an actionable error rather than replayed
+    ///   (the directory must be recovered by a read-write engine first);
+    /// - every mutating statement returns the terminal [`QueryError::ReadonlyMode`].
+    ///
+    /// Materialized-view refresh must happen before snapshotting: a query over a
+    /// stale (dirty) view is refused in this mode rather than silently escalating.
+    pub fn open_read_only(data_dir: &Path) -> io::Result<Self> {
+        // Validate readability without ever chmod-ing the directory (a read-only
+        // open must leave it byte-identical).
+        powdb_storage::validate_data_dir_read_only(data_dir)?;
+        // A shared reader lock: coexists with other readers, refuses a live writer.
+        let dir_lock = powdb_storage::dir_lock::DirLock::acquire_reader(data_dir)?;
+        let catalog = Catalog::open_read_only(data_dir)?;
+        info!(data_dir = %data_dir.display(), "engine opened read-only for snapshot serving");
+        let view_registry =
+            ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+        Ok(Engine {
+            catalog,
+            _dir_lock: dir_lock,
+            plan_cache: Mutex::new(PlanCache::new(PLAN_CACHE_CAPACITY)),
+            insert_values_scratch: Vec::new(),
+            view_registry,
+            in_transaction: false,
+            query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
+            nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
+            // No WAL-archive hook: a read-only engine never writes, so its Drop
+            // must never checkpoint (the hook is what would drive that).
+            wal_archive_hook: None,
+            read_only: true,
+        })
+    }
+
+    /// Read-only open with an explicit per-query memory budget (bytes).
+    pub fn open_read_only_with_memory_limit(
+        data_dir: &Path,
+        limit_bytes: usize,
+    ) -> io::Result<Self> {
+        let mut engine = Engine::open_read_only(data_dir)?;
+        engine.set_query_memory_limit(limit_bytes);
+        Ok(engine)
+    }
+
+    /// Whether this engine was opened read-only for snapshot serving.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Open or create an engine with an explicit per-query memory limit
@@ -695,6 +771,12 @@ impl Engine {
     /// around 3μs per call on bench workloads. On a miss we plan as before
     /// and insert the plan under its canonical hash.
     pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        if self.read_only {
+            // Snapshot-serving mode: run reads through the read-only executor and
+            // turn the "this statement writes" sentinel into the terminal
+            // ReadonlyMode error. No mutation ever reaches disk.
+            return to_readonly_terminal(self.execute_powql_readonly(input));
+        }
         // WS2: each *outermost* statement starts with the full memory
         // allowance. The guard holds the reentrancy depth so a nested
         // `execute_powql` (e.g. a view's source query) does not reset the
@@ -819,6 +901,9 @@ impl Engine {
     /// The canonical PowQL text is used as the plan-cache key, so equivalent
     /// SQL and PowQL spellings share cached plans.
     pub fn execute_sql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        if self.read_only {
+            return to_readonly_terminal(self.execute_sql_readonly(input));
+        }
         let _budget = self.enter_memory_budget();
         crate::cancel::check()?;
         let parsed = crate::sql::parse_sql_with_canonical(input)
@@ -929,6 +1014,9 @@ impl Engine {
         input: &str,
         params: &[crate::ast::ParamValue],
     ) -> Result<QueryResult, QueryError> {
+        if self.read_only {
+            return to_readonly_terminal(self.execute_powql_readonly_with_params(input, params));
+        }
         let _budget = self.enter_memory_budget();
         crate::cancel::check()?;
         let stmt = crate::parser::parse_with_params(input, params)
@@ -1412,6 +1500,17 @@ impl Engine {
                         }
                         _ => Err("filter requires row input".into()),
                     };
+                }
+
+                // Lane A fast path: Filter over an equality-driven index scan
+                // (mirrors the mutable path). Pure `&self`, so it is shared.
+                if matches!(
+                    input.as_ref(),
+                    PlanNode::IndexScan { .. } | PlanNode::ExprIndexScan { .. }
+                ) {
+                    if let Some(result) = self.try_filter_index_residual_fast(input, predicate)? {
+                        return Ok(result);
+                    }
                 }
 
                 // Fused Filter+SeqScan fast path.
@@ -2097,6 +2196,9 @@ impl Engine {
             }
 
             PlanNode::Explain { input } => {
+                // Every execute entry point runs lower_unindexed_scans before
+                // dispatch and lowering recurses into Explain, so `input` is
+                // already the plan that will actually run.
                 let text = format_plan_tree(&self.catalog, input, 0);
                 Ok(QueryResult::Rows {
                     columns: vec!["plan".to_string()],

@@ -33,15 +33,44 @@
 //! This is the same crash-only contract, scoped to a handle instead of the
 //! process. (`catch_unwind` only catches when the final binary is built with
 //! `panic = "unwind"`, the default for applications and the official Node addon.)
+//!
+//! ## Lossless typed results
+//!
+//! Every query method here ([`Database::query`], [`Database::query_sql`],
+//! [`Database::query_readonly`], and the `*_with_params` variants) returns a
+//! [`QueryResult`] whose rows and scalar are strongly typed [`Value`]s, not
+//! strings. This is the **lossless** surface: an [`Value::Int`] keeps its full
+//! `i64` range, [`Value::Bytes`] keeps its raw bytes, and a JSON `null`
+//! ([`Value::Json`]) stays distinct from a missing/absent cell
+//! ([`Value::Empty`]). String rendering via [`Value::to_wire_string`] is a
+//! separate, deliberately lossy convenience for display and the legacy string
+//! protocol. Prefer the typed [`Value`] directly when a distinction matters.
+//!
+//! ## Parameters
+//!
+//! [`Database::query_with_params`] and
+//! [`Database::query_readonly_with_params`] bind positional `$1..$N`
+//! placeholders. Parameters are substituted as literal *tokens* before parsing,
+//! so an injection-shaped string is inert data that can never change the
+//! query's shape.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use powdb_query::ast::ParamValue;
 pub use powdb_query::executor::{Engine, WalSyncMode};
 pub use powdb_query::result::{QueryError, QueryResult};
-pub use powdb_storage::types::Value;
+pub use powdb_storage::types::{TypeId, Value};
 pub use powdb_sync::RETAINED_SEGMENT_FORMAT_VERSION;
+
+/// Render canonical PJ1 (binary JSON) bytes as canonical JSON text.
+///
+/// Re-exported so callers of the lossless typed surface (see below) can turn a
+/// [`Value::Json`] cell into JSON text without depending on `powdb-storage`
+/// directly. The Node addon uses this to decode a JSON cell into a parsed
+/// JavaScript value while still handing back the raw PJ1 bytes untouched.
+pub use powdb_storage::pj1::pj1_to_text;
 
 fn archive_wal_records_if_sync_enabled(
     data_dir: &Path,
@@ -101,6 +130,29 @@ pub fn parse_sync_mode(mode: &str) -> Option<WalSyncMode> {
         "off" => Some(WalSyncMode::Off),
         _ => None,
     }
+}
+
+/// Convert typed embedded [`Value`] parameters into the query-crate
+/// [`ParamValue`]s the engine binds. Only the five scalar shapes PowQL literals
+/// can take are bindable; a binary shape ([`Value::Bytes`], [`Value::Uuid`],
+/// [`Value::Json`], [`Value::DateTime`]) has no parameter encoding, so it is
+/// rejected with an actionable [`Error::InvalidArgument`] rather than silently
+/// coerced or truncated.
+fn values_to_params(params: &[Value]) -> Result<Vec<ParamValue>, Error> {
+    params
+        .iter()
+        .map(|value| match value {
+            Value::Int(v) => Ok(ParamValue::Int(*v)),
+            Value::Float(v) => Ok(ParamValue::Float(*v)),
+            Value::Bool(v) => Ok(ParamValue::Bool(*v)),
+            Value::Str(v) => Ok(ParamValue::Str(v.clone())),
+            Value::Empty => Ok(ParamValue::Null),
+            other => Err(Error::InvalidArgument(format!(
+                "cannot bind a {:?} value as a query parameter; supported parameter types are int, float, bool, str, and null",
+                other.type_id()
+            ))),
+        })
+        .collect()
 }
 
 impl std::error::Error for Error {
@@ -187,6 +239,32 @@ impl Database {
         })))
     }
 
+    /// Open a database **read-only** over a quiescent directory for snapshot
+    /// serving (a restored backup or a checkpointed replica). Nothing on disk is
+    /// ever mutated: reads work, and every mutating statement (via
+    /// [`Database::query`] / [`Database::query_sql`] / the `*_with_params`
+    /// variants) returns a terminal read-only error instead of writing. N
+    /// read-only handles across processes may serve the same directory
+    /// concurrently. A non-empty WAL is refused with an actionable error: the
+    /// directory must be recovered by a read-write open first.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::open_read_only(dir)
+        })))
+    }
+
+    /// Read-only open with an explicit per-query memory budget (bytes).
+    pub fn open_read_only_with_memory_limit(
+        dir: impl AsRef<Path>,
+        limit_bytes: usize,
+    ) -> Result<Self, Error> {
+        let dir = dir.as_ref();
+        Self::wrap_open(catch_unwind(AssertUnwindSafe(|| {
+            Engine::open_read_only_with_memory_limit(dir, limit_bytes)
+        })))
+    }
+
     /// Open with an explicit per-query memory budget (bytes).
     pub fn open_with_memory_limit(
         dir: impl AsRef<Path>,
@@ -236,6 +314,45 @@ impl Database {
             // rather than leaking the sentinel to embedded callers.
             Err(Error::Query(QueryError::ReadonlyNeedsWrite)) => Err(Error::InvalidArgument(
                 "statement would mutate the database; use query() instead of query_readonly()"
+                    .to_string(),
+            )),
+            other => other,
+        }
+    }
+
+    /// Run a PowQL statement with positional `$1..$N` parameters bound from
+    /// `params`, returning the same lossless typed [`QueryResult`] as
+    /// [`Database::query`]. Parameters are substituted as literal tokens before
+    /// parsing, so untrusted input can never change the query's shape.
+    ///
+    /// Only the five scalar parameter shapes are bindable: [`Value::Int`],
+    /// [`Value::Float`], [`Value::Bool`], [`Value::Str`], and [`Value::Empty`]
+    /// (which binds PowQL `null`). Binary shapes ([`Value::Bytes`],
+    /// [`Value::Uuid`], [`Value::Json`], [`Value::DateTime`]) have no parameter
+    /// encoding and are rejected with [`Error::InvalidArgument`].
+    pub fn query_with_params(
+        &mut self,
+        powql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, Error> {
+        let bound = values_to_params(params)?;
+        self.run_mut(|e| e.execute_powql_with_params(powql, &bound))
+    }
+
+    /// Read-only variant of [`Database::query_with_params`] under a shared
+    /// borrow. Errors with [`Error::InvalidArgument`] if the statement would
+    /// mutate.
+    pub fn query_readonly_with_params(
+        &self,
+        powql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, Error> {
+        let bound = values_to_params(params)?;
+        match self.run_ref(|e| e.execute_powql_readonly_with_params(powql, &bound)) {
+            // Same sentinel translation as `query_readonly`: turn the internal
+            // "this statement writes" marker into an actionable message.
+            Err(Error::Query(QueryError::ReadonlyNeedsWrite)) => Err(Error::InvalidArgument(
+                "statement would mutate the database; use query_with_params() instead of query_readonly_with_params()"
                     .to_string(),
             )),
             other => other,
@@ -619,6 +736,199 @@ mod tests {
             result.is_err(),
             "corrupt heap must return Err, not panic/abort the host"
         );
+    }
+
+    /// The typed surface returns real `Value`s, not strings: an `i64` beyond
+    /// `Number.MAX_SAFE_INTEGER` survives exactly, bytes survive, and a JSON
+    /// `null` stays distinct from a missing (Empty) cell.
+    #[test]
+    fn query_returns_lossless_typed_values() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_typed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type Doc { required id: int, big: int, body: json }")
+            .unwrap();
+        // 9_007_199_254_740_993 = 2^53 + 1, unrepresentable as an f64/JS number.
+        db.query("insert Doc { id := 1, big := 9007199254740993, body := \"null\" }")
+            .unwrap();
+        // Row 2 omits the optional `body`, leaving it Empty (missing), and its
+        // big value is a distinct large int.
+        db.query("insert Doc { id := 2, big := 9223372036854775807 }")
+            .unwrap();
+
+        match db.query("Doc { id, big, body }").unwrap() {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+                // Full i64 range preserved, not rounded through f64.
+                assert_eq!(rows[0][1], Value::Int(9_007_199_254_740_993));
+                assert_eq!(rows[1][1], Value::Int(9_223_372_036_854_775_807));
+                // Whole JSON column carrying `null` is a typed Json value,
+                // distinct from the missing/Empty cell in row 2.
+                assert!(matches!(rows[0][2], Value::Json(_)));
+                assert_eq!(rows[1][2], Value::Empty);
+                assert_ne!(rows[0][2], rows[1][2]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_with_params_binds_positional_values() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_params_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type User { required name: str, age: int }")
+            .unwrap();
+        db.query(r#"insert User { name := "Ada", age := 36 }"#)
+            .unwrap();
+        db.query(r#"insert User { name := "Bo", age := 20 }"#)
+            .unwrap();
+
+        // Bind a str and an int as positional params.
+        match db
+            .query_with_params(
+                "User filter .name = $1 and .age > $2 { .name, .age }",
+                &[Value::Str("Ada".into()), Value::Int(30)],
+            )
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Str("Ada".into()));
+                assert_eq!(rows[0][1], Value::Int(36));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_with_params_rejects_unbindable_shapes() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_facade_badparam_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type T { required id: int }").unwrap();
+        let err = db
+            .query_with_params("T filter .id = $1 { .id }", &[Value::Bytes(vec![1, 2, 3])])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert!(
+            err.to_string().contains("cannot bind"),
+            "expected actionable message, got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_readonly_with_params_rejects_mutation() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_roparam_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type T { required id: int }").unwrap();
+        let err = db
+            .query_readonly_with_params("insert T { id := $1 }", &[Value::Int(1)])
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+        assert!(
+            !err.to_string().contains("__POWDB_READONLY_NEEDS_WRITE__"),
+            "internal sentinel leaked: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_readonly_with_params_reads_under_shared_borrow() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_rords_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Database::open(&dir).unwrap();
+        db.query("type T { required id: int }").unwrap();
+        db.query("insert T { id := 7 }").unwrap();
+        match db
+            .query_readonly_with_params("T filter .id = $1 { .id }", &[Value::Int(7)])
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Int(7)]]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_read_only_serves_reads_and_rejects_mutations() {
+        let dir = std::env::temp_dir().join(format!("powdb_facade_ro_open_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.query("type User { required name: str, age: int }")
+                .unwrap();
+            db.query(r#"insert User { name := "Ada", age := 36 }"#)
+                .unwrap();
+            // Clean drop checkpoints: quiescent (WAL-clean) directory.
+        }
+
+        let mut db = Database::open_read_only(&dir).unwrap();
+        // Reads work through both query() and query_readonly().
+        match db.query("count(User)").unwrap() {
+            QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+            other => panic!("expected scalar 1, got {other:?}"),
+        }
+        match db
+            .query_readonly("User filter .age = 36 { .name }")
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Str("Ada".into()))
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // A mutation via query() returns a terminal read-only error, not a panic.
+        let err = db
+            .query(r#"insert User { name := "Bo", age := 20 }"#)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("readonly mode"),
+            "expected a read-only error, got {err}"
+        );
+        assert!(!err.to_string().contains("__POWDB_READONLY_NEEDS_WRITE__"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_read_only_refuses_non_empty_wal() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_facade_ro_dirtywal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            // Leave the WAL non-empty by forgetting the catalog (a crash).
+            let mut catalog = powdb_storage::catalog::Catalog::create(&dir).unwrap();
+            catalog
+                .create_table(powdb_storage::types::Schema {
+                    table_name: "T".into(),
+                    columns: vec![powdb_storage::types::ColumnDef {
+                        name: "id".into(),
+                        type_id: powdb_storage::types::TypeId::Int,
+                        required: true,
+                        position: 0,
+                    }],
+                })
+                .unwrap();
+            catalog.insert("T", &vec![Value::Int(1)]).unwrap();
+            catalog.sync_wal().unwrap();
+            std::mem::forget(catalog);
+        }
+        let err = match Database::open_read_only(&dir) {
+            Ok(_) => panic!("read-only open must refuse a non-empty WAL"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("WAL is not empty"),
+            "expected WAL-not-empty refusal, got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn seed_apply_boundary(

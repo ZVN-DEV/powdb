@@ -42,6 +42,11 @@ struct Args {
     /// explicitly names a different database is rejected. `None` = accept any
     /// name (0.9.x behavior).
     db_name: Option<String>,
+    /// Serve the data directory **read-only** (snapshot serving). The engine is
+    /// opened read-only, no writer admission is ever taken, and mutating
+    /// statements return a terminal error. Set via `--readonly` or
+    /// `POWDB_READONLY=1`.
+    read_only: bool,
 }
 
 /// Default explicit-transaction gate wait (ms) when `POWDB_TX_WAIT_TIMEOUT_MS`
@@ -176,6 +181,8 @@ fn parse_args() -> Args {
         parse_nested_loop_pair_limit(std::env::var("POWDB_MAX_NESTED_LOOP_PAIRS").ok().as_deref());
     // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
+    // `POWDB_READONLY` reuses the same truthy grammar as `POWDB_REQUIRE_TLS`.
+    let mut read_only = parse_require_tls(std::env::var("POWDB_READONLY").ok().as_deref());
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -285,6 +292,9 @@ fn parse_args() -> Args {
                 }
                 socket = Some(argv[i].clone());
             }
+            "--readonly" => {
+                read_only = true;
+            }
             "--version" | "-V" => {
                 println!("powdb-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -309,6 +319,7 @@ fn parse_args() -> Args {
                 println!("        --tx-wait-timeout-ms <MS>  Max wait for a concurrent explicit transaction before BEGIN fails (default: 5000)");
                 println!("        --db-name <NAME>       Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
+                println!("        --readonly             Serve the data directory read-only (snapshot serving; mutations are refused)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
                 println!();
@@ -325,6 +336,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
+                println!("    POWDB_READONLY             Serve read-only (snapshot serving) when truthy (1/true/yes/on)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
                 std::process::exit(0);
             }
@@ -353,6 +365,7 @@ fn parse_args() -> Args {
         metrics_addr,
         socket,
         db_name,
+        read_only,
     }
 }
 
@@ -498,11 +511,21 @@ async fn main() {
 
     let args = parse_args();
 
-    let mut engine = match Engine::with_memory_limit_and_wal_archive(
-        Path::new(&args.data_dir),
-        args.query_memory_limit,
-        archive_wal_records_if_sync_enabled,
-    ) {
+    let build_engine = || {
+        if args.read_only {
+            Engine::open_read_only_with_memory_limit(
+                Path::new(&args.data_dir),
+                args.query_memory_limit,
+            )
+        } else {
+            Engine::with_memory_limit_and_wal_archive(
+                Path::new(&args.data_dir),
+                args.query_memory_limit,
+                archive_wal_records_if_sync_enabled,
+            )
+        }
+    };
+    let mut engine = match build_engine() {
         Ok(e) => e,
         Err(e) => {
             error!(data_dir = %args.data_dir, error = %e, "failed to initialize storage engine");
@@ -521,19 +544,29 @@ async fn main() {
         );
     }
 
-    // WAL durability mode (POWDB_SYNC_MODE). Default Full is fully durable.
-    let sync_mode = parse_sync_mode(std::env::var("POWDB_SYNC_MODE").ok().as_deref());
-    engine.set_wal_sync_mode(sync_mode);
-    match sync_mode {
-        WalSyncMode::Full => info!("WAL sync mode: full (fsync every commit — fully durable)"),
-        WalSyncMode::Normal => warn!(
-            "WAL sync mode: NORMAL — commits fsync on a background interval; an OS crash or \
-             power loss may lose up to the last ~10ms of writes (process crashes lose nothing)"
-        ),
-        WalSyncMode::Off => warn!(
-            "WAL sync mode: OFF — NO durability; a crash loses all writes since the last \
-             checkpoint. Bench/test use only, never production"
-        ),
+    if args.read_only {
+        info!(
+            data_dir = %args.data_dir,
+            "READ-ONLY snapshot serving: the directory is opened read-only, no writer admission \
+             is taken, and mutating statements are refused. Refresh materialized views before \
+             snapshotting. This mode is stale-by-design between snapshot swaps"
+        );
+    } else {
+        // WAL durability mode (POWDB_SYNC_MODE). Default Full is fully durable.
+        // A read-only engine never writes, so durability configuration is moot.
+        let sync_mode = parse_sync_mode(std::env::var("POWDB_SYNC_MODE").ok().as_deref());
+        engine.set_wal_sync_mode(sync_mode);
+        match sync_mode {
+            WalSyncMode::Full => info!("WAL sync mode: full (fsync every commit: fully durable)"),
+            WalSyncMode::Normal => warn!(
+                "WAL sync mode: NORMAL: commits fsync on a background interval; an OS crash or \
+                 power loss may lose up to the last ~10ms of writes (process crashes lose nothing)"
+            ),
+            WalSyncMode::Off => warn!(
+                "WAL sync mode: OFF: NO durability; a crash loses all writes since the last \
+                 checkpoint. Bench/test use only, never production"
+            ),
+        }
     }
 
     let engine = Arc::new(RwLock::new(engine));

@@ -65,6 +65,11 @@
       "ns_per_iter": 2036365.16,
       "ops_per_sec": 491
     },
+    "conjunction_index_residual": {
+      "ns_per_iter": 220853.64,
+      "ops_per_sec": 4527,
+      "source": "depot-run-29463423181-2026-07-16"
+    },
     "insert_single": {
       "ns_per_iter": 235.78,
       "ops_per_sec": 4241242

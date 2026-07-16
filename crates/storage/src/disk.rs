@@ -82,6 +82,10 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
 pub struct DiskManager {
     file: File,
     num_pages: u32,
+    /// True when the file was opened read-only (snapshot serving). Every write
+    /// entry point refuses in this mode, so a stray mutation surfaces as a clean
+    /// error instead of an OS-level EBADF on a read-only fd.
+    read_only: bool,
 }
 
 impl DiskManager {
@@ -92,18 +96,57 @@ impl DiskManager {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(DiskManager { file, num_pages: 0 })
+        Ok(DiskManager {
+            file,
+            num_pages: 0,
+            read_only: false,
+        })
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len();
         let num_pages = (len / PAGE_SIZE as u64) as u32;
-        Ok(DiskManager { file, num_pages })
+        Ok(DiskManager {
+            file,
+            num_pages,
+            read_only: false,
+        })
+    }
+
+    /// Open a data file **read-only** for snapshot serving. The file is opened
+    /// with `.read(true)` only, so the OS refuses any write to the descriptor;
+    /// the write entry points also refuse in software, so a logic error surfaces
+    /// as a clear message instead of a raw `EBADF`.
+    pub fn open_read_only(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let len = file.metadata()?.len();
+        let num_pages = (len / PAGE_SIZE as u64) as u32;
+        Ok(DiskManager {
+            file,
+            num_pages,
+            read_only: true,
+        })
+    }
+
+    /// Whether this file was opened read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    #[cold]
+    fn read_only_write_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot write: data file was opened read-only for snapshot serving",
+        )
     }
 
     /// Allocate a new page and extend the file. Returns the new page_id.
     pub fn allocate_page(&mut self) -> io::Result<u32> {
+        if self.read_only {
+            return Err(Self::read_only_write_error());
+        }
         let id = self.num_pages;
         let zeros = [0u8; PAGE_SIZE];
         let offset = id as u64 * PAGE_SIZE as u64;
@@ -113,6 +156,9 @@ impl DiskManager {
     }
 
     pub fn write_page(&mut self, page_id: u32, data: &[u8]) -> io::Result<()> {
+        if self.read_only {
+            return Err(Self::read_only_write_error());
+        }
         debug_assert_eq!(data.len(), PAGE_SIZE);
         let offset = page_id as u64 * PAGE_SIZE as u64;
         // pwrite(2): atomic w.r.t. the kernel file offset, so this is safe
@@ -133,6 +179,11 @@ impl DiskManager {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
+        if self.read_only {
+            // Nothing was written, so there is nothing to sync. Returning Ok
+            // keeps a defensive `flush` on a read-only handle a harmless no-op.
+            return Ok(());
+        }
         self.file.sync_data()
     }
 

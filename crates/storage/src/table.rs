@@ -187,8 +187,47 @@ impl Table {
         indexed_col_metas: &[crate::catalog::IndexedColMeta],
         expression_index_metas: &[ExpressionIndexMeta],
     ) -> io::Result<Self> {
+        Self::open_with_indexes_inner(
+            schema,
+            data_dir,
+            indexed_col_metas,
+            expression_index_metas,
+            false,
+        )
+    }
+
+    /// Read-only reopen for snapshot serving: the heap and every persisted index
+    /// are opened without a writable handle. A missing index artifact is rebuilt
+    /// **in memory** but never saved (a read-only directory must not be mutated),
+    /// so index and expression-index reads work without touching disk.
+    pub(crate) fn open_with_indexes_read_only(
+        schema: Schema,
+        data_dir: &Path,
+        indexed_col_metas: &[crate::catalog::IndexedColMeta],
+        expression_index_metas: &[ExpressionIndexMeta],
+    ) -> io::Result<Self> {
+        Self::open_with_indexes_inner(
+            schema,
+            data_dir,
+            indexed_col_metas,
+            expression_index_metas,
+            true,
+        )
+    }
+
+    fn open_with_indexes_inner(
+        schema: Schema,
+        data_dir: &Path,
+        indexed_col_metas: &[crate::catalog::IndexedColMeta],
+        expression_index_metas: &[ExpressionIndexMeta],
+        read_only: bool,
+    ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
-        let heap = HeapFile::open(&heap_path)?;
+        let heap = if read_only {
+            HeapFile::open_read_only(&heap_path)?
+        } else {
+            HeapFile::open(&heap_path)?
+        };
         let row_layout = RowLayout::new(&schema);
         let mut table = Table {
             schema,
@@ -235,7 +274,11 @@ impl Table {
                         }
                     }
                 }
-                bt.save()?;
+                // Read-only serving must not persist the rebuilt tree; it lives
+                // only for this handle's lifetime.
+                if !read_only {
+                    bt.save()?;
+                }
                 bt
             };
 
@@ -279,8 +322,9 @@ impl Table {
                 // Expression indexes were not released before the dedicated
                 // `.eidx` namespace. Rebuild any missing artifact from the
                 // heap instead of probing or deleting an ambiguous legacy
-                // `.idx` pathname that may belong to a live column index.
-                table.install_expression_index(meta.clone(), &idx_path)?;
+                // `.idx` pathname that may belong to a live column index. In
+                // read-only mode the rebuilt tree is kept in memory only.
+                table.build_expression_index(meta.clone(), &idx_path, !read_only)?;
             }
         }
 
@@ -372,6 +416,18 @@ impl Table {
         meta: ExpressionIndexMeta,
         path: &Path,
     ) -> io::Result<()> {
+        self.build_expression_index(meta, path, true)
+    }
+
+    /// Build an expression index from a heap scan. When `save` is false the tree
+    /// is registered in memory but never written to disk: the read-only
+    /// snapshot-serving path, which must not mutate the directory.
+    fn build_expression_index(
+        &mut self,
+        meta: ExpressionIndexMeta,
+        path: &Path,
+        save: bool,
+    ) -> io::Result<()> {
         let root_col_idx = self
             .schema
             .column_index(&meta.json_path.column)
@@ -403,7 +459,9 @@ impl Table {
                 btree.insert_duplicate(key, rid);
             }
         }
-        btree.save()?;
+        if save {
+            btree.save()?;
+        }
         self.expression_indexes.push(ExpressionIndexedPath {
             meta,
             root_col_idx,

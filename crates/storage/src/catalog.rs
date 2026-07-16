@@ -288,6 +288,11 @@ pub struct Catalog {
     /// metadata in O(1). Opening a replacement Catalog (including rollback)
     /// also receives a fresh token.
     structure_generation: u64,
+    /// True when opened via [`Catalog::open_read_only`] for snapshot serving.
+    /// The heap/index/WAL files are read-only handles, no LSN stamping or
+    /// overflow sweep ran at open, and [`Drop`] skips the checkpoint (which would
+    /// otherwise flush pages and truncate the WAL, mutating the directory).
+    read_only: bool,
 }
 
 impl Catalog {
@@ -330,6 +335,7 @@ impl Catalog {
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
             structure_generation: next_structure_generation(),
+            read_only: false,
         };
         cat.persist()?;
         Ok(cat)
@@ -414,6 +420,7 @@ impl Catalog {
             active_catalog_version,
             next_index_id,
             structure_generation: next_structure_generation(),
+            read_only: false,
         };
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
@@ -441,6 +448,87 @@ impl Catalog {
             warn!(error = %e, "post-recovery overflow sweep failed (non-fatal)");
         }
         Ok(cat)
+    }
+
+    /// Open a catalog **read-only** for snapshot serving (tier 1 of the replica
+    /// story). This is for a *quiescent* directory: a restored backup or a
+    /// checkpointed replica, both guaranteed WAL-clean.
+    ///
+    /// Unlike [`Catalog::open`], this path:
+    /// - opens every heap and index file read-only (no writable descriptor);
+    /// - never calls `set_permissions` (it validates the directory instead);
+    /// - **refuses** a non-empty WAL rather than replaying and truncating it ,
+    ///   an unclean directory must be recovered by a read-write engine first;
+    /// - stamps no page LSNs, sweeps no overflow orphans, and truncates nothing.
+    ///
+    /// The result never mutates the directory, so N read-only processes can serve
+    /// the same snapshot concurrently.
+    pub fn open_read_only(data_dir: &Path) -> io::Result<Self> {
+        crate::validate_data_dir_read_only(data_dir)?;
+        let cat_path = data_dir.join(CATALOG_FILE);
+        if !cat_path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
+        }
+
+        // Refuse a non-empty WAL: the directory has un-checkpointed mutations
+        // that only a read-write open may safely replay. Naming the remedy keeps
+        // the operator from guessing.
+        let wal_path = data_dir.join(WAL_FILE);
+        if crate::wal::wal_has_committed_records(&wal_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot open read-only: the WAL is not empty (the directory has \
+                 un-checkpointed writes). Open the directory once with a read-write \
+                 engine to recover, or restore from a backup, then serve it read-only",
+            ));
+        }
+
+        let catalog_file = read_catalog_file(&cat_path)?;
+        let active_catalog_version = catalog_file.version;
+        let next_index_id = catalog_file.next_index_id;
+        let entries = catalog_file.entries;
+        let durable_lsn = read_durable_lsn(data_dir)?;
+        let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
+        let mut name_to_slot =
+            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        for CatalogEntry {
+            schema,
+            indexed_cols,
+            expression_indexes: expression_metas,
+            defaults,
+            auto_cols,
+        } in entries
+        {
+            let name = schema.table_name.clone();
+            let mut table = Table::open_with_indexes_read_only(
+                schema,
+                data_dir,
+                &indexed_cols,
+                &expression_metas,
+            )?;
+            table.set_defaults(defaults);
+            table.set_auto_cols(auto_cols);
+            name_to_slot.insert(name.clone(), tables.len());
+            tables.push(table);
+        }
+        let wal = Wal::open_read_only(&wal_path, WAL_BATCH_SIZE)?;
+        Ok(Catalog {
+            tables,
+            name_to_slot,
+            data_dir: data_dir.to_path_buf(),
+            wal,
+            next_tx_id: 1,
+            active_tx_id: None,
+            tx_start_len: None,
+            pending_autocommit_tx_ids: Vec::new(),
+            pending_free_overflow: Vec::new(),
+            checkpointed: false,
+            durable_lsn,
+            active_catalog_version,
+            next_index_id,
+            structure_generation: next_structure_generation(),
+            read_only: true,
+        })
     }
 
     /// Replay every record currently buffered in the WAL file onto the open
@@ -2622,6 +2710,12 @@ impl Catalog {
 
 impl Drop for Catalog {
     fn drop(&mut self) {
+        // A read-only snapshot handle never wrote anything and holds read-only
+        // file descriptors; checkpointing would try to flush pages and truncate
+        // the WAL, mutating a directory that must stay byte-identical.
+        if self.read_only {
+            return;
+        }
         if self.active_tx_id.is_some() {
             if let Err(e) = self.abandon_active_transaction_for_drop() {
                 warn!(error = %e, "catalog drop active transaction cleanup failed");
@@ -3801,6 +3895,170 @@ mod tests {
     fn temp_catalog(name: &str) -> Catalog {
         let dir = std::env::temp_dir().join(format!("powdb_cat_{name}_{}", std::process::id()));
         Catalog::create(&dir).unwrap()
+    }
+
+    /// Recursively hash every file's path + bytes under `dir` so a test can
+    /// assert a read-only open leaves the directory byte-identical. Lock
+    /// artifacts are not created at the catalog layer (only the engine takes a
+    /// lock), so nothing needs excluding here.
+    fn hash_dir_tree(dir: &std::path::Path) -> String {
+        let mut entries: Vec<std::path::PathBuf> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let mut items: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+            items.sort_by_key(std::fs::DirEntry::path);
+            for item in items {
+                let path = item.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        walk(dir, &mut entries);
+        let mut hasher = crc32fast::Hasher::new();
+        for path in &entries {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(&fs::read(path).unwrap());
+        }
+        format!("{:08x}", hasher.finalize())
+    }
+
+    fn seed_quiescent_dir(dir: &std::path::Path) {
+        let mut catalog = Catalog::create(dir).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "User".into(),
+                columns: vec![
+                    ColumnDef {
+                        name: "name".into(),
+                        type_id: TypeId::Str,
+                        required: true,
+                        position: 0,
+                    },
+                    ColumnDef {
+                        name: "age".into(),
+                        type_id: TypeId::Int,
+                        required: false,
+                        position: 1,
+                    },
+                ],
+            })
+            .unwrap();
+        catalog.create_index("User", "age").unwrap();
+        catalog
+            .insert("User", &vec![Value::Str("Ada".into()), Value::Int(36)])
+            .unwrap();
+        catalog
+            .insert("User", &vec![Value::Str("Bo".into()), Value::Int(20)])
+            .unwrap();
+        // Clean drop checkpoints: flush heaps + truncate the WAL, leaving a
+        // quiescent (WAL-clean) directory.
+        drop(catalog);
+    }
+
+    #[test]
+    fn open_read_only_serves_reads_on_clean_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_quiescent_dir(dir.path());
+
+        let catalog = Catalog::open_read_only(dir.path()).unwrap();
+        let rows: Vec<_> = catalog.scan("User").unwrap().collect();
+        assert_eq!(rows.len(), 2);
+        // Column-index read works read-only.
+        let hit = catalog
+            .index_lookup("User", "age", &Value::Int(36))
+            .unwrap();
+        assert_eq!(hit.unwrap()[0], Value::Str("Ada".into()));
+    }
+
+    #[test]
+    fn open_read_only_never_mutates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_quiescent_dir(dir.path());
+        let before = hash_dir_tree(dir.path());
+
+        {
+            let catalog = Catalog::open_read_only(dir.path()).unwrap();
+            let _ = catalog.scan("User").unwrap().count();
+            let _ = catalog
+                .index_lookup("User", "age", &Value::Int(20))
+                .unwrap();
+            // Drop the read-only catalog: must not checkpoint/truncate.
+        }
+        let after = hash_dir_tree(dir.path());
+        assert_eq!(
+            before, after,
+            "read-only open + queries + drop must leave the directory byte-identical"
+        );
+    }
+
+    #[test]
+    fn open_read_only_refuses_non_empty_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Seed rows but DO NOT checkpoint: keep the WAL non-empty by forgetting
+        // the catalog (a crash), so recovery would be required.
+        {
+            let mut catalog = Catalog::create(dir.path()).unwrap();
+            catalog
+                .create_table(Schema {
+                    table_name: "T".into(),
+                    columns: vec![ColumnDef {
+                        name: "id".into(),
+                        type_id: TypeId::Int,
+                        required: true,
+                        position: 0,
+                    }],
+                })
+                .unwrap();
+            catalog.insert("T", &vec![Value::Int(1)]).unwrap();
+            catalog.sync_wal().unwrap();
+            std::mem::forget(catalog); // leave the WAL non-empty, as a crash would
+        }
+        let err = match Catalog::open_read_only(dir.path()) {
+            Ok(_) => panic!("read-only open must refuse a non-empty WAL"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("WAL is not empty"),
+            "expected a WAL-not-empty refusal naming the remedy, got: {err}"
+        );
+        assert!(err.to_string().contains("read-write engine"));
+    }
+
+    #[test]
+    fn open_read_only_expression_index_reads_work() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut catalog = Catalog::create(dir.path()).unwrap();
+            catalog
+                .create_table(Schema {
+                    table_name: "Doc".into(),
+                    columns: vec![ColumnDef {
+                        name: "data".into(),
+                        type_id: TypeId::Json,
+                        required: false,
+                        position: 0,
+                    }],
+                })
+                .unwrap();
+            let path =
+                StoredJsonPathV1::new("data", vec![StoredJsonPathSegmentV1::Key("author".into())]);
+            catalog
+                .create_expression_index_metadata("Doc", 1, path.canonical_text(), path, false)
+                .unwrap();
+            drop(catalog);
+        }
+        // Opening read-only must load the expression index without writing.
+        let before = hash_dir_tree(dir.path());
+        let catalog = Catalog::open_read_only(dir.path()).unwrap();
+        assert_eq!(catalog.scan("Doc").unwrap().count(), 0);
+        drop(catalog);
+        let after = hash_dir_tree(dir.path());
+        assert_eq!(
+            before, after,
+            "read-only expression-index load must not write"
+        );
     }
 
     #[test]
