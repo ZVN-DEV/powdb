@@ -7154,14 +7154,30 @@ fn driving_column(plan: &PlanNode) -> String {
     }
 }
 
+/// Seed 12 rows so per-index stats are non-degenerate: `a` is unique
+/// (est 1), `b` has 2 distinct values over 12 rows (est ~6), and `c` is unique
+/// so its range index reports 12 total entries.
+fn seed_rec(engine: &mut Engine) {
+    for id in 0..12i64 {
+        engine
+            .execute_powql(&format!(
+                "insert Rec {{ a := {id}, b := {}, c := {id} }}",
+                id % 2
+            ))
+            .unwrap();
+    }
+}
+
 #[test]
 fn unique_eq_beats_non_unique_eq_beats_range() {
-    // All three conjuncts resolve; unique `a` must win.
-    let unique_and_more = rec_engine(&[
+    // All three conjuncts resolve; unique `a` (est 1) is the most selective and
+    // must win over non-unique `b` (est ~6) and the range on `c`.
+    let mut unique_and_more = rec_engine(&[
         "alter Rec add unique .a",
         "alter Rec add index .b",
         "alter Rec add index .c",
     ]);
+    seed_rec(&mut unique_and_more);
     let lowered = lower(&unique_and_more, "Rec filter .c > 5 and .b = 2 and .a = 1");
     assert_eq!(
         driving_column(&lowered),
@@ -7173,7 +7189,8 @@ fn unique_eq_beats_non_unique_eq_beats_range() {
     );
 
     // No index on `a`: non-unique eq `b` beats the range on `c`.
-    let non_unique = rec_engine(&["alter Rec add index .b", "alter Rec add index .c"]);
+    let mut non_unique = rec_engine(&["alter Rec add index .b", "alter Rec add index .c"]);
+    seed_rec(&mut non_unique);
     let lowered = lower(&non_unique, "Rec filter .c > 5 and .b = 2 and .a = 1");
     assert_eq!(
         driving_column(&lowered),
@@ -7182,7 +7199,8 @@ fn unique_eq_beats_non_unique_eq_beats_range() {
     );
 
     // Only the range column is indexed: the range drives the scan.
-    let range_only = rec_engine(&["alter Rec add index .c"]);
+    let mut range_only = rec_engine(&["alter Rec add index .c"]);
+    seed_rec(&mut range_only);
     let lowered = lower(&range_only, "Rec filter .c > 5 and .b = 2 and .a = 1");
     assert_eq!(
         driving_column(&lowered),

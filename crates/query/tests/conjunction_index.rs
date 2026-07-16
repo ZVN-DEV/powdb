@@ -146,34 +146,39 @@ fn explain_shows_index_scan_with_residual_filter_for_conjunction() {
     );
 }
 
-/// When a column and an expression index both apply, the eq column index and
-/// the eq path index are the same tier; the first conjunct wins. Adding the
-/// path index must still never change results.
+/// When a column and an expression index both apply, v0.15 ranks them by
+/// estimated rows rather than conjunct order. On the `seed_docs` shape the path
+/// `.data->ns->value` (6 entries over 3 distinct, est 2) is more selective than
+/// `.model_id` (8 entries over 2 distinct, est 4), so the path drives whichever
+/// conjunct comes first textually. Adding the path index must still never
+/// change results.
 #[test]
-fn column_index_and_path_index_are_both_honored() {
+fn column_index_and_path_index_ranked_by_selectivity() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(dir.path()).unwrap();
     seed_docs(&mut engine);
     exec(&mut engine, "alter Doc add index .model_id");
     exec(&mut engine, "alter Doc add index (.data->ns->value)");
 
-    // model_id is the first conjunct, so it drives; the path is the residual.
+    // model_id is textually first, but the path is more selective and drives.
     let model_first = explain_text(
         &mut engine,
         r#"explain Doc filter .model_id = 1 and .data->ns->value = "x""#,
     );
+    assert!(model_first.contains("ExprIndexScan"), "{model_first}");
     assert!(
-        model_first.contains("IndexScan table=Doc column=model_id"),
-        "{model_first}"
+        !model_first.contains("IndexScan table=Doc column=model_id"),
+        "the less selective column index must not drive: {model_first}"
     );
 
-    // Path is the first conjunct here, so it drives instead.
+    // Path is textually first here too, and still drives (order-independent).
     let path_first = explain_text(
         &mut engine,
         r#"explain Doc filter .data->ns->value = "x" and .model_id = 1"#,
     );
     assert!(path_first.contains("ExprIndexScan"), "{path_first}");
 
+    // Parity: the driver choice never changes the row set.
     assert_eq!(
         sorted_ids(exec(
             &mut engine,
@@ -464,4 +469,201 @@ fn eq_on_indexed_json_path_matches_seqscan() {
             "json-path conjunction diverged from the sequential scan for `{query}`"
         );
     }
+}
+
+// ── v0.15: per-index statistics rank conjunction drivers by selectivity ──
+//
+// The chooser now ranks candidates by estimated rows per key (from coarse
+// per-index counters) instead of tier-then-conjunct-order. These tests pin the
+// S4 shape: a large CMS-shaped table whose textually-first indexed conjunct is
+// unselective while a selective index exists on another conjunct.
+
+/// 200-row CMS-shaped table. Indexed attributes span the full selectivity range:
+/// `is_published` is 50/50 (est ~100), `model_id` has 50 distinct values
+/// (est ~4), the JSON path `ns.value` has 2 distinct values (est ~100), and the
+/// JSON path `ns.slug` is unique per row (est 1). `value` keys off `id % 3` so
+/// it is not perfectly correlated with `model_id`'s groups (every model_id group
+/// still contains mixed values), keeping conjunction results non-trivial.
+fn seed_cms(engine: &mut Engine, with_index: bool) {
+    exec(
+        engine,
+        "type CmsDoc { required id: int, model_id: int, is_published: bool, data: json }",
+    );
+    for id in 1..=200i64 {
+        let model_id = id % 50;
+        let published = id % 2 == 0;
+        let value = if id % 3 == 0 { "a" } else { "b" };
+        let data = format!(r#"{{"ns":{{"value":"{value}","slug":"s{id}"}}}}"#);
+        let escaped = data.replace('\\', "\\\\").replace('"', "\\\"");
+        exec(
+            engine,
+            &format!(
+                r#"insert CmsDoc {{ id := {id}, model_id := {model_id}, is_published := {published}, data := "{escaped}" }}"#
+            ),
+        );
+    }
+    if with_index {
+        exec(engine, "alter CmsDoc add index .is_published");
+        exec(engine, "alter CmsDoc add index .model_id");
+        exec(engine, "alter CmsDoc add index (.data->ns->value)");
+        exec(engine, "alter CmsDoc add index (.data->ns->slug)");
+    }
+}
+
+/// Shape inversion: the selective driver is chosen even when the unselective
+/// conjunct comes first textually, in both directions (a selective column index
+/// beating an unselective JSON-path index, and a selective JSON-path index
+/// beating an unselective boolean column index).
+#[test]
+fn selective_index_drives_regardless_of_conjunct_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    seed_cms(&mut engine, true);
+
+    // Unselective JSON path first, selective column second: the column drives.
+    let path_first = explain_text(
+        &mut engine,
+        r#"explain CmsDoc filter .data->ns->value = "a" and .model_id = 5"#,
+    );
+    assert!(
+        path_first.contains("IndexScan table=CmsDoc column=model_id"),
+        "selective column index should drive: {path_first}"
+    );
+    assert!(
+        !path_first.contains("ExprIndexScan"),
+        "unselective path index must not drive: {path_first}"
+    );
+    // Stats tokens are recomputed from the catalog: 200 entries / 50 distinct.
+    assert!(
+        path_first.contains("est_rows=4")
+            && path_first.contains("entries=200")
+            && path_first.contains("distinct=50"),
+        "explain should annotate the driver's stats: {path_first}"
+    );
+
+    // Unselective boolean first, selective JSON path second: the path drives.
+    let bool_first = explain_text(
+        &mut engine,
+        r#"explain CmsDoc filter .is_published = true and .data->ns->slug = "s6""#,
+    );
+    assert!(
+        bool_first.contains("ExprIndexScan"),
+        "selective path index should drive: {bool_first}"
+    );
+    assert!(
+        !bool_first.contains("column=is_published"),
+        "unselective boolean index must not drive: {bool_first}"
+    );
+    // Unique-per-row slug: 200 entries / 200 distinct, est 1.
+    assert!(
+        bool_first.contains("est_rows=1")
+            && bool_first.contains("entries=200")
+            && bool_first.contains("distinct=200"),
+        "explain should annotate the driver's stats: {bool_first}"
+    );
+}
+
+/// Parity: the skewed conjunctions return the identical row set with and without
+/// the indexes, for selects and for update / delete mutations. A wrong estimate
+/// is only ever a performance bug because the residual rechecks every row.
+#[test]
+fn skewed_conjunction_parity_indexed_vs_unindexed() {
+    let selects = [
+        // selective column driver, unselective path residual
+        r#"CmsDoc filter .data->ns->value = "a" and .model_id = 5 { .id }"#,
+        // selective path driver, unselective boolean residual
+        r#"CmsDoc filter .is_published = true and .data->ns->slug = "s6" { .id }"#,
+        // selective column driver, unselective boolean residual
+        r#"CmsDoc filter .is_published = false and .model_id = 7 { .id }"#,
+    ];
+
+    let d1 = tempfile::tempdir().unwrap();
+    let mut unindexed = Engine::new(d1.path()).unwrap();
+    seed_cms(&mut unindexed, false);
+    let expected: Vec<_> = selects
+        .iter()
+        .map(|q| sorted_ids(exec(&mut unindexed, q)))
+        .collect();
+
+    let d2 = tempfile::tempdir().unwrap();
+    let mut indexed = Engine::new(d2.path()).unwrap();
+    seed_cms(&mut indexed, true);
+    for (query, want) in selects.iter().zip(&expected) {
+        assert_eq!(
+            &sorted_ids(exec(&mut indexed, query)),
+            want,
+            "skewed conjunction diverged from the sequential scan for `{query}`"
+        );
+    }
+
+    // Update mutation driven by the selective path: touch exactly slug s10.
+    let update = r#"CmsDoc filter .is_published = true and .data->ns->slug = "s10" update { model_id := 999 }"#;
+    let probe = "CmsDoc filter .model_id = 999 { .id }";
+    let d3 = tempfile::tempdir().unwrap();
+    let mut unindexed = Engine::new(d3.path()).unwrap();
+    seed_cms(&mut unindexed, false);
+    exec(&mut unindexed, update);
+    let want_update = sorted_ids(exec(&mut unindexed, probe));
+    assert_eq!(want_update, vec![10], "reference update touched slug s10");
+    let d4 = tempfile::tempdir().unwrap();
+    let mut indexed = Engine::new(d4.path()).unwrap();
+    seed_cms(&mut indexed, true);
+    exec(&mut indexed, update);
+    assert_eq!(
+        sorted_ids(exec(&mut indexed, probe)),
+        want_update,
+        "index-driven skewed update touched the wrong rows"
+    );
+
+    // Delete mutation driven by the selective column: remove model_id = 5 rows
+    // that also carry value "a" (a residual recheck on the path).
+    let delete = r#"CmsDoc filter .data->ns->value = "a" and .model_id = 5 delete"#;
+    let d5 = tempfile::tempdir().unwrap();
+    let mut unindexed = Engine::new(d5.path()).unwrap();
+    seed_cms(&mut unindexed, false);
+    exec(&mut unindexed, delete);
+    let want_delete = sorted_ids(exec(&mut unindexed, "CmsDoc { .id }"));
+    let d6 = tempfile::tempdir().unwrap();
+    let mut indexed = Engine::new(d6.path()).unwrap();
+    seed_cms(&mut indexed, true);
+    exec(&mut indexed, delete);
+    assert_eq!(
+        sorted_ids(exec(&mut indexed, "CmsDoc { .id }")),
+        want_delete,
+        "index-driven skewed delete removed the wrong rows"
+    );
+}
+
+/// Stability: the plan cache stores pre-lowering plans, so an identical query
+/// re-lowers against current stats on every execution. Creating a more selective
+/// index between two runs of the same query changes the driver on the cache-hit
+/// path.
+#[test]
+fn plan_cache_hit_relowers_with_current_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    seed_cms(&mut engine, false);
+    // Only the unselective boolean is indexed at first, so it is the sole eq
+    // candidate and drives.
+    exec(&mut engine, "alter CmsDoc add index .is_published");
+
+    let query = r#"explain CmsDoc filter .is_published = true and .model_id = 5"#;
+    let before = explain_text(&mut engine, query);
+    assert!(
+        before.contains("IndexScan table=CmsDoc column=is_published"),
+        "boolean index should drive while it is the only candidate: {before}"
+    );
+
+    // Add the far more selective column index. The cached (pre-lowering) plan is
+    // re-lowered on the next execution and now picks the selective driver.
+    exec(&mut engine, "alter CmsDoc add index .model_id");
+    let after = explain_text(&mut engine, query);
+    assert!(
+        after.contains("IndexScan table=CmsDoc column=model_id"),
+        "the newly-selective column index should drive after re-lowering: {after}"
+    );
+    assert!(
+        !after.contains("column=is_published"),
+        "the unselective boolean index must no longer drive: {after}"
+    );
 }
