@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **Wrong rows from non-unique string indexes on values with embedded NUL
+  bytes.** Composite index keys previously terminated string values with a
+  bare `0x00`, so `"A"` and `"A\0"` could interleave in key order: indexed
+  equality, prefix lookups, and index-driven mutations could return or touch
+  rows belonging to a neighboring value, and distinct statistics miscounted.
+  String values inside composite keys are now escape-encoded (prefix-free
+  and order-preserving). This is an on-disk format change for non-unique
+  column indexes (v3): an old index is rebuilt from the heap automatically
+  on first open and saved in the new format; a read-only open rebuilds in
+  memory on every open until a writable open persists the upgrade. Unique
+  and expression indexes are unchanged.
+
+### Added
+
+- **"What PowDB is for" positioning.** The README now leads with the
+  engine's fit boundary (single-writer embedded state, local agent memory,
+  read-only snapshot serving, per-tenant isolation, CI databases, bulk
+  ingest) and says plainly when to use Postgres, Turso, or DuckDB instead.
+  Benchmark tables are framed as single-request cost.
+- **Concurrency decomposition** (`docs/benchmarks/concurrency-decomposition.md`
+  plus `scripts/bench-concurrency.sh`): reproducible c1-vs-c10 measurements
+  of read/write amplification through the admission gate, including the
+  read-only serving tier.
+- **Edge snapshot serving example** (`examples/edge-snapshot-serving/`): a
+  runnable backup, restore, N read-only servers, incremental refresh, and
+  atomic swap walkthrough with a pass/fail smoke script.
+- **Transaction concurrency guidance** in the PowQL reference: explicit
+  transactions hold the write-admission gate for their lifetime; keep them
+  short and prefer autocommit on read-mostly paths.
 
 ## [0.15.0] - 2026-07-16
 

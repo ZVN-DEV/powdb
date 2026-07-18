@@ -3,6 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Next release: v0.16.0 (unreleased).** NUL-safe composite index keys (fixes wrong rows from non-unique string indexes on values with embedded NUL; old indexes rebuilt on open), honest positioning (what PowDB is for, concurrency decomposition doc), and the edge-snapshot-serving flagship example.
 > **Current release: v0.15.0.** Per-index statistics (entry and distinct-key counts on every B-tree, no on-disk format change) feeding cardinality-aware conjunction index choice (a selective index drives the scan regardless of conjunct order), explain selectivity annotations (est_rows/entries/distinct), and driver-spec additions (read-only error family, comparison coercion regimes).
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
