@@ -256,22 +256,18 @@ impl Table {
             let is_int = table.schema.columns[col_idx].type_id == TypeId::Int;
             let idx_path = data_dir.join(format!("{}_{}.idx", table.schema.table_name, col_name));
 
-            let btree = if idx_path.exists() {
-                let mut loaded = BTree::load(&idx_path)?;
-                // Load counts distinct keys in Raw mode; a non-unique column
-                // index stores composite keys, so switch it to count distinct
-                // by value prefix.
-                if !unique {
-                    loaded.mark_composite();
-                }
-                loaded
-            } else {
-                // Missing file: rebuild from the heap and save so we
-                // take the fast path next time. Reassemble via `table.scan()`
-                // so a spilled (v2) indexed column contributes its true key -- a
-                // v1-only `decode_row` would read it as `Empty` and build a
-                // btree missing that row's key (P2).
-                let mut bt = BTree::create(&idx_path)?;
+            // Rebuild this column index from the heap. Reassemble via
+            // `table.scan()` so a spilled (v2) indexed column contributes its
+            // true key -- a v1-only `decode_row` would read it as `Empty` and
+            // build a btree missing that row's key (P2). Non-unique indexes are
+            // created at v3 (NUL-escaped composite Str keys); unique indexes
+            // stay v1.
+            let build_from_heap = |path: &std::path::Path| -> io::Result<BTree> {
+                let mut bt = if unique {
+                    BTree::create(path)?
+                } else {
+                    BTree::create_non_unique(path)?
+                };
                 for (rid, row) in table.scan() {
                     if !row[col_idx].is_empty() {
                         if unique {
@@ -286,7 +282,31 @@ impl Table {
                 if !read_only {
                     bt.save()?;
                 }
-                bt
+                Ok(bt)
+            };
+
+            let btree = if idx_path.exists() {
+                let loaded = BTree::load(&idx_path)?;
+                if !unique && loaded.format_version() < crate::btree::BTREE_VERSION {
+                    // Migration: an old-format (v1/v2) non-unique column index
+                    // encodes composite Str keys without NUL escaping, so its
+                    // lookups can return wrong rows for embedded-NUL values.
+                    // Never serve it -- rebuild from the heap in the v3 escaped
+                    // format and save (the same machinery crash recovery uses).
+                    build_from_heap(&idx_path)?
+                } else {
+                    // v3 non-unique (or any unique) index: serve as loaded.
+                    // Load counts distinct keys in Raw mode; a non-unique column
+                    // index stores composite keys, so switch it to count
+                    // distinct by value prefix.
+                    let mut loaded = loaded;
+                    if !unique {
+                        loaded.mark_composite();
+                    }
+                    loaded
+                }
+            } else {
+                build_from_heap(&idx_path)?
             };
 
             table.indexed_cols.push(IndexedCol {
@@ -314,10 +334,13 @@ impl Table {
             ));
             if idx_path.exists() {
                 let btree = BTree::load(&idx_path)?;
-                if btree.format_version() != crate::btree::BTREE_VERSION {
+                // Expression indexes need the v2 `empty_rids` side list. They
+                // store raw (never composite Str) keys, so the v3 NUL-escaping
+                // does not apply and pre-existing v2 files load unchanged.
+                if btree.format_version() < crate::btree::EXPRESSION_BTREE_VERSION {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "expression index requires BIDX v2",
+                        "expression index requires BIDX v2 (empty_rids side list)",
                     ));
                 }
                 table.expression_indexes.push(ExpressionIndexedPath {
@@ -1211,7 +1234,13 @@ impl Table {
         let layout = &self.row_layout;
         let heap = &self.heap;
         for entry in self.indexed_cols.iter_mut() {
-            let mut fresh = BTree::create(entry.btree.file_path())?;
+            // Non-unique indexes rebuild at v3 (NUL-escaped composite Str keys);
+            // unique indexes stay v1.
+            let mut fresh = if entry.unique {
+                BTree::create(entry.btree.file_path())?
+            } else {
+                BTree::create_non_unique(entry.btree.file_path())?
+            };
             for (rid, raw) in &raw_rows {
                 let (rid, raw) = (*rid, raw.as_slice());
                 // v2 rows must be reassembled so a spilled indexed column
@@ -2174,7 +2203,13 @@ impl Table {
         }
 
         let idx_path = data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
-        let mut btree = BTree::create(&idx_path)?;
+        // Non-unique indexes use v3 NUL-escaped composite Str keys even when the
+        // table is empty; unique indexes stay v1.
+        let mut btree = if unique {
+            BTree::create(&idx_path)?
+        } else {
+            BTree::create_non_unique(&idx_path)?
+        };
 
         // Build index from existing data.
         for (rid, row) in self.scan() {
@@ -2309,5 +2344,151 @@ mod projected_tests {
             .get_projected(rid, &[1])
             .expect_err("selected corrupt chain must fail");
         assert!(error.to_string().contains("overflow value length"));
+    }
+}
+
+#[cfg(test)]
+mod nul_migration_tests {
+    use super::*;
+    use crate::btree::{BTREE_VERSION, LEGACY_BTREE_VERSION};
+    use crate::catalog::IndexedColMeta;
+
+    fn schema() -> Schema {
+        Schema {
+            table_name: "T".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
+            ],
+        }
+    }
+
+    fn row(id: i64, name: &str) -> Row {
+        vec![Value::Int(id), Value::Str(name.into())]
+    }
+
+    /// Write an OLD-format (v1, unescaped bare-0x00 terminator) non-unique
+    /// composite index file matching the given (value, rid) pairs. This is the
+    /// pre-v0.16 on-disk shape that the migration path must never serve.
+    fn write_old_format_index(path: &std::path::Path, pairs: &[(&str, RowId)]) {
+        let mut bt = BTree::create(path).unwrap(); // v1, Raw
+        let str_tag = Value::Str(String::new()).type_id() as u8;
+        for (val, rid) in pairs {
+            let mut buf = Vec::new();
+            buf.push(str_tag);
+            buf.extend_from_slice(val.as_bytes());
+            buf.push(0); // OLD single bare terminator (the buggy encoding)
+            let rid_bits = ((rid.page_id as u64) << 16) | rid.slot_index as u64;
+            buf.extend_from_slice(&rid_bits.to_be_bytes());
+            bt.insert(Value::Bytes(buf), *rid);
+        }
+        // Never touched insert_non_unique, so it stays v1.
+        assert_eq!(bt.format_version(), LEGACY_BTREE_VERSION);
+        bt.save_to(path).unwrap();
+    }
+
+    #[test]
+    fn old_nonunique_index_rebuilt_to_v3_and_serves_correct_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(schema(), dir.path()).unwrap();
+        let r1 = table.insert(&row(1, "A")).unwrap();
+        let r2 = table.insert(&row(2, "A\0")).unwrap();
+        let r3 = table.insert(&row(3, "A")).unwrap();
+        let r4 = table.insert(&row(4, "B")).unwrap();
+        drop(table);
+
+        let idx_path = dir.path().join("T_name.idx");
+        write_old_format_index(&idx_path, &[("A", r1), ("A\0", r2), ("A", r3), ("B", r4)]);
+
+        // The old file genuinely exhibits the bug it is meant to reproduce:
+        // "A" over-matches the "A\0" row.
+        {
+            let mut old = BTree::load(&idx_path).unwrap();
+            old.mark_composite();
+            assert!(
+                old.lookup_prefix(&Value::Str("A".into())).contains(&r2),
+                "old-format file must exhibit the wrong-rows bug"
+            );
+        }
+
+        // Reopen with the catalog claiming a non-unique index on "name".
+        let metas = vec![IndexedColMeta {
+            name: "name".into(),
+            unique: false,
+        }];
+        let reopened = Table::open_with_indexes(schema(), dir.path(), &metas, &[]).unwrap();
+        let idx = reopened.index("name").expect("index present");
+        assert_eq!(
+            idx.format_version(),
+            BTREE_VERSION,
+            "old non-unique index rebuilt to v3 on open"
+        );
+
+        let mut a = idx.lookup_prefix(&Value::Str("A".into()));
+        a.sort_by_key(|r| (r.page_id, r.slot_index));
+        let mut want = vec![r1, r3];
+        want.sort_by_key(|r| (r.page_id, r.slot_index));
+        assert_eq!(a, want, "\"A\" serves only its own rows after rebuild");
+        assert_eq!(idx.lookup_prefix(&Value::Str("A\0".into())), vec![r2]);
+        assert_eq!(idx.lookup_prefix(&Value::Str("B".into())), vec![r4]);
+
+        // The rebuild was persisted (writable open), so the on-disk file is v3.
+        assert_eq!(
+            BTree::load(&idx_path).unwrap().format_version(),
+            BTREE_VERSION,
+            "rebuilt v3 index saved back to disk"
+        );
+    }
+
+    #[test]
+    fn old_unique_index_loads_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(schema(), dir.path()).unwrap();
+        table.insert(&row(1, "A")).unwrap();
+        table.insert(&row(2, "B")).unwrap();
+        // A real v1 unique index (unique indexes never used composite Str keys).
+        table
+            .create_index_with_unique("name", dir.path(), true)
+            .unwrap();
+        drop(table);
+
+        let idx_path = dir.path().join("T_name.idx");
+        assert_eq!(
+            BTree::load(&idx_path).unwrap().format_version(),
+            LEGACY_BTREE_VERSION,
+            "unique index is v1 on disk"
+        );
+
+        let metas = vec![IndexedColMeta {
+            name: "name".into(),
+            unique: true,
+        }];
+        let reopened = Table::open_with_indexes(schema(), dir.path(), &metas, &[]).unwrap();
+        let idx = reopened.index("name").expect("index present");
+        assert_eq!(
+            idx.format_version(),
+            LEGACY_BTREE_VERSION,
+            "unique index must NOT be rebuilt or version-bumped on open"
+        );
+        assert!(
+            idx.lookup(&Value::Str("A".into())).is_some(),
+            "unique index still serves its keys"
+        );
+        // File on disk still v1: untouched.
+        assert_eq!(
+            BTree::load(&idx_path).unwrap().format_version(),
+            LEGACY_BTREE_VERSION,
+            "unique index file unchanged on disk"
+        );
     }
 }

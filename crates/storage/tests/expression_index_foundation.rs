@@ -1,4 +1,4 @@
-use powdb_storage::btree::{BTree, BTREE_VERSION, LEGACY_BTREE_VERSION};
+use powdb_storage::btree::{BTree, EXPRESSION_BTREE_VERSION, LEGACY_BTREE_VERSION};
 use powdb_storage::catalog::{
     expression_index_file_name, Catalog, IndexKeySource, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
 };
@@ -191,7 +191,7 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
         } if canonical_text == "v1:.data->\"author\"" && json_path == &path
     )));
     let tree = reopened.expression_index_btree("Doc", first).unwrap();
-    assert_eq!(tree.format_version(), BTREE_VERSION);
+    assert_eq!(tree.format_version(), EXPRESSION_BTREE_VERSION);
     assert_eq!(
         tree.lookup_all(&Value::Str("Ada".into())),
         vec![RowId {
@@ -309,7 +309,7 @@ fn btree_v2_raw_duplicates_split_delete_order_and_empty_round_trip() {
     tree.save().unwrap();
 
     let reopened = BTree::load(&path).unwrap();
-    assert_eq!(reopened.format_version(), BTREE_VERSION);
+    assert_eq!(reopened.format_version(), EXPRESSION_BTREE_VERSION);
     assert_eq!(reopened.lookup_all(&key).len(), 700);
     assert_eq!(reopened.empty_rids(), &[empty_b]);
 
