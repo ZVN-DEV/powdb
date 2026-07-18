@@ -21,8 +21,12 @@ between the two.
   on `MIN`, `MAX`, `SUM`, `AVG`, `scan + filter + count`, and similar
   scan-shaped queries.
 - **You are already on tokio.** `powdb-server` is async-native and wraps the
-  engine in `Arc<RwLock<Engine>>` so parallel readers don't block each
-  other.
+  engine in `Arc<RwLock<Engine>>` so parallel readers don't block each other.
+  Note the boundary: there is no MVCC, so a writer (and especially a
+  long-lived explicit transaction) takes the whole admission gate and blocks
+  readers for its lifetime. PowDB fits a single writer with many reads, not
+  many concurrent clients sharing one read-write database; for that, use
+  Postgres.
 - **You want to embed without a C toolchain.** Useful on Wasm-adjacent
   targets, on minimal container images, and in environments where pulling
   `cmake` into the build is friction.

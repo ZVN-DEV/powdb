@@ -37,6 +37,7 @@
     <p class="subtitle">
       From-scratch Rust database with PowQL -- a pipeline query language that reads left to right --
       plus a SQL frontend on the same engine. One engine, two languages. Compiled predicates. Pure-Rust core.
+      Built for single-writer embedded state and read-only snapshot serving, not for many clients sharing one read-write database.
     </p>
     <div class="hero-actions">
       <a href="getting-started.html" class="btn btn-primary">Get Started</a>
@@ -48,11 +49,40 @@
   </div>
 </section>
 
+<!-- Where PowDB fits -->
+<section class="compare-section" id="fit">
+  <div class="container">
+    <h2>Where PowDB fits</h2>
+    <p class="section-subtitle">PowDB is a single-writer embedded engine with truly parallel reads. Every writer takes the whole write-admission gate, and there is no MVCC. That shape decides where it shines.</p>
+    <div class="compare-grid">
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header powql">Reach for PowDB when</div>
+        <ul style="padding-left: 20px; line-height: 1.8; margin: 12px 0 0;">
+          <li>Single-writer embedded app state in Rust or Node (in-process, typed results, injection-inert params)</li>
+          <li>Local agent or tool memory: local-first, single-process, refreshed by swapping in a new snapshot in seconds</li>
+          <li>Read-only edge snapshot serving from N processes, with no write gate at all</li>
+          <li>Per-tenant, process-isolated databases (one writer per tenant)</li>
+          <li>Fast, disposable CI and test databases</li>
+          <li>Bulk ingest feeding read-heavy internal tools and dashboards</li>
+        </ul>
+      </div>
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header sql">Use something else when</div>
+        <ul style="padding-left: 20px; line-height: 1.8; margin: 12px 0 0;">
+          <li>Many concurrent clients share one read-write database -- that is Postgres's home turf; PowDB serializes writers through one gate, so shared read-write concurrency amplifies read latency</li>
+          <li>You need live replication or sync across nodes -- reach for Turso</li>
+          <li>Your workload is analytical column-crunching over one big dataset -- reach for DuckDB</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- Benchmarks -->
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows (M1), both engines in memory-mode — real numbers, no cherry-picking. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows (M1), both engines in memory-mode, real numbers, no cherry-picking. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
     <table>
       <thead>
         <tr>
@@ -332,8 +362,8 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
     <ul style="max-width: 720px; margin: 0 auto; padding-left: 24px; line-height: 1.8;">
       <li><strong>Pre-1.0 format stability</strong> -- the on-disk format may shift across minor versions. Pin versions and expect to re-import on upgrades until 1.0.</li>
       <li><strong>No wire-protocol compatibility</strong> -- PowDB speaks a SQL subset (<a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md" target="_blank" rel="noopener">docs/SQL.md</a>) through its own binary protocol and embedded API, not the Postgres or MySQL wire format. Off-the-shelf ORMs, BI dashboards, JDBC drivers, and DB browsers won't connect over the wire.</li>
-      <li><strong>Effectively single-node</strong> -- no sharding or consensus. Embedded replica sync is <strong>experimental</strong> (milestone 0): a retained-unit log substrate with offline <code>sync-bootstrap</code> / <code>sync-status</code> tooling, not production replication yet.</li>
-      <li><strong>No MVCC, no online backup</strong> -- single writer with parallel readers; backups (full, incremental, PITR) are offline-only today.</li>
+      <li><strong>Effectively single-node</strong> -- no sharding, no consensus, and no live replica tailing. Freshness across processes comes from snapshot refresh (restore a newer snapshot and swap, in seconds), not streaming replication. If you need live replication or sync across nodes, use <a href="https://turso.tech" target="_blank" rel="noopener">Turso</a>.</li>
+      <li><strong>No MVCC, no online backup</strong> -- a single writer takes the whole write-admission gate while parallel readers run; many concurrent clients sharing one read-write database is Postgres's territory. Backups (full, incremental, PITR) are offline-only today.</li>
     </ul>
     <p class="section-subtitle" style="margin-top: 24px;">If any of those are dealbreakers, use SQLite -- and we say so plainly in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/powdb-vs-sqlite.md" target="_blank" rel="noopener">PowDB vs SQLite: when to use which</a>.</p>
   </div>
