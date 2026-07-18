@@ -428,7 +428,7 @@ User delete
 
 ## 11. Server Mode
 
-So far we've been running PowDB in embedded mode -- the CLI talks directly to the storage engine. For multi-client access, run PowDB as a server.
+So far we've been running PowDB in embedded mode -- the CLI talks directly to the storage engine. Run PowDB as a server when a few processes need to share one single-writer database over the wire, or to serve a read-only snapshot to many readers. (For many concurrent clients on one shared read-write database, use Postgres; see "What PowDB is for" in the README.)
 
 ### Start the server
 
