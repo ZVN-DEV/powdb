@@ -163,9 +163,9 @@ impl Table {
     }
 
     /// Reopen an existing table from disk. Caller supplies the schema (loaded
-    /// from the catalog file). Indexes are NOT rebuilt — they live in memory
-    /// until `create_index` is called again. Prefer `open_with_indexes` when
-    /// the catalog knows which columns are indexed.
+    /// from the catalog file). No index columns are supplied, so no index is
+    /// rehydrated or rebuilt here; prefer `open_with_indexes` when the
+    /// catalog knows which columns are indexed.
     pub fn open(schema: Schema, data_dir: &Path) -> io::Result<Self> {
         Self::open_with_indexes(schema, data_dir, &[], &[])
     }
@@ -174,8 +174,12 @@ impl Table {
     /// persisted b-tree indexes.
     ///
     /// For each name in `indexed_col_names`:
-    ///   - If the `{table}_{col}.idx` file exists, load it via
-    ///     `BTree::load` — O(file size) memcpy+decode, no heap scan.
+    ///   - If the `{table}_{col}.idx` file exists at the current format,
+    ///     load it via `BTree::load` — O(file size) memcpy+decode, no heap
+    ///     scan.
+    ///   - If the file is a pre-v3 non-unique index (unescaped composite
+    ///     Str keys), it is never served: it is rebuilt from the heap in
+    ///     the escaped format and, on a writable open, saved as v3.
     ///   - If the file is missing (e.g. first open after upgrading from
     ///     pre-Mission-3 catalogs), fall back to the create-time rebuild
     ///     path: scan the heap and insert every non-empty value. After the
@@ -293,6 +297,15 @@ impl Table {
                     // lookups can return wrong rows for embedded-NUL values.
                     // Never serve it -- rebuild from the heap in the v3 escaped
                     // format and save (the same machinery crash recovery uses).
+                    // A read-only open cannot persist the rebuild, so it pays
+                    // this scan on every open of an old-format directory; do
+                    // one writable open (or re-backup from an upgraded
+                    // primary) to persist v3.
+                    tracing::info!(
+                        index = %idx_path.display(),
+                        read_only,
+                        "rebuilding pre-v3 non-unique index in NUL-safe format"
+                    );
                     build_from_heap(&idx_path)?
                 } else {
                     // v3 non-unique (or any unique) index: serve as loaded.
@@ -880,7 +893,14 @@ impl Table {
                 // moved rows).
                 let idx_path =
                     data_dir.join(format!("{}_{}.idx", self.schema.table_name, col_name));
-                let mut btree = crate::btree::BTree::create(&idx_path)?;
+                let mut btree = if unique {
+                    crate::btree::BTree::create(&idx_path)?
+                } else {
+                    // Match the other rebuild sites: non-unique trees start at
+                    // v3 so an all-empty column cannot persist a v1 file that
+                    // the next open would needlessly re-migrate.
+                    crate::btree::BTree::create_non_unique(&idx_path)?
+                };
                 for (rid, row) in &rebuilt_rows {
                     let (rid, v) = (*rid, &row[col_idx]);
                     if v.is_empty() {

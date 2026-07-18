@@ -3669,8 +3669,8 @@ mod tests {
         truth.get_mut(b"A".as_slice()).unwrap().push(new_rid);
         check(&bt, &truth);
 
-        // Distinct-key stats: 7 remaining distinct values ("A\0" now empty but
-        // still a key... its rids are gone, so it drops out).
+        // Distinct-key stats count only values with live rids; a value whose
+        // rids were all deleted no longer contributes.
         bt.save().unwrap();
         let live: u64 = truth.values().filter(|rids| !rids.is_empty()).count() as u64;
         assert_eq!(bt.stats().distinct_keys, live, "distinct == live values");
