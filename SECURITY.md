@@ -7,8 +7,8 @@ latest release to stay supported.
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.16.x          | :x: (unreleased)   |
-| 0.15.x          | :white_check_mark: |
+| 0.16.x          | :white_check_mark: |
+| 0.15.x          | :x: (superseded)   |
 | 0.14.x          | :x: (superseded)   |
 | 0.13.x          | :x: (superseded)   |
 | 0.12.x          | :x: (superseded)   |
@@ -25,8 +25,8 @@ latest release to stay supported.
 
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for data-loss bugs in crash
 > recovery and were replaced by **v0.4.4**, which added a permanent durability
-> regression suite. If you are on any of those three versions — or any release
-> older than the current minor series — upgrade to the latest 0.12.x release.
+> regression suite. If you are on any of those three versions, or any release
+> older than the current minor series, upgrade to the latest release.
 > See `CHANGELOG.md` for details.
 
 ## Reporting a Vulnerability

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.0 - 2026-07-18
+
+- Version-alignment release in lockstep with workspace v0.16.0 (NUL-safe
+  composite index keys: fixes wrong rows from non-unique string indexes on
+  values with embedded NUL bytes; old-format indexes are rebuilt automatically
+  on open). No TypeScript API changes.
+
 ## 0.15.0 - 2026-07-16
 
 - Version-alignment release in lockstep with workspace v0.15.0 (per-index
