@@ -1303,6 +1303,31 @@ commit
 - Transactions are per-connection. Other connections do not see uncommitted rows.
 - Nesting transactions is not supported -- calling `begin` inside an open transaction is an error.
 
+### Concurrency behavior
+
+Reads run in parallel, but PowDB has no MVCC and serializes writers through a
+single write-admission gate. An **explicit** transaction holds that gate for its
+entire lifetime: from `begin` until `commit` or `rollback`, every other
+connection that needs the gate, readers included, waits. Autocommit is
+different: an autocommit writer releases admission before it waits on the fsync,
+so it does not pin the gate across a slow disk sync.
+
+Two rules follow:
+
+- **Keep explicit transactions short.** Do the writes, `commit`, and get out. A
+  transaction left open (waiting on application logic or a slow client) blocks
+  every reader for as long as it stays open.
+- **Prefer autocommit on read-mostly paths.** Wrap statements in `begin` /
+  `commit` only when you need atomicity or bulk-load throughput. Do not hold a
+  transaction open across reads.
+
+A connection that waits on the gate longer than the server's transaction wait
+timeout (5 seconds by default, set with `POWDB_TX_WAIT_TIMEOUT_MS`) fails
+instead of blocking forever, returning an error like `transaction gate timeout
+after 5000ms`. A client that sees this error is being told another explicit
+transaction is holding the gate; the fix is a shorter transaction on the other
+connection, not a longer timeout.
+
 ### Transactions and write throughput
 
 By default PowDB runs in `WalSyncMode::Full`: every autocommit statement fsyncs the write-ahead log before returning, so each write is durable on its own. That fsync is the bottleneck for single-row writes -- on real disks, autocommit inserts top out around a few hundred rows per second.

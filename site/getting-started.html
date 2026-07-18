@@ -203,7 +203,7 @@ powql> commit</code></pre>
 
     <!-- Step 12: Server Mode -->
     <h2><span class="step-number">12</span>Server Mode</h2>
-    <p>For multi-client access, run PowDB as a server.</p>
+    <p>To reach a database from another process, run PowDB as a server. It fits a single writer with many reads, and read-only snapshot serving (start it with <code>--readonly</code>) scales cleanly across N reader processes. It is not built for many concurrent clients sharing one read-write database; there is no MVCC, so a writer takes the whole admission gate. For that shape, use Postgres.</p>
 
     <h3>Start the server</h3>
     <pre><code class="language-bash">powdb-server --port 5433 --data-dir ./powdb_data</code></pre>

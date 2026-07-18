@@ -14,6 +14,27 @@
 
 Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to use which](docs/powdb-vs-sqlite.md).
 
+## What PowDB is for
+
+PowDB is a single-writer embedded engine with truly parallel reads. Every writer takes the whole write-admission gate; there is no MVCC. That shape (a permanent, deliberate one) decides where the engine shines and where it does not.
+
+**Reach for PowDB when:**
+
+- **Single-writer embedded app state in Rust or Node.** One process owns the data, reads run in parallel, and you want the engine in-process (Rust crate or the `@zvndev/powdb-embedded` Node addon) with lossless typed results and injection-inert parameters.
+- **Local agent or tool memory.** Local-first and single-process. Freshness comes from swapping in a new snapshot in seconds, not from tailing a live feed.
+- **Read-only edge snapshot serving.** Restore a backup and serve the directory read-only from N processes, with no write gate at all; refresh by restoring a newer snapshot beside it and swapping.
+- **Per-tenant, process-isolated databases.** One directory and one writer per tenant, rather than many tenants contending on one shared database.
+- **CI and test databases.** Fast to create, cheap to throw away.
+- **Bulk ingest plus read-heavy internal tools.** Batch-load in a transaction, then serve dashboards and internal queries off a read-mostly database.
+
+**Use something else when:**
+
+- **Many concurrent clients share one read-write database.** That is Postgres's home turf. PowDB serializes writers through one admission gate, so on a shared read-write database at concurrency, read latency amplifies through that gate. Use Postgres.
+- **You need live replication or sync across nodes.** Use Turso.
+- **Your workload is analytical column-crunching over one big dataset.** Use DuckDB.
+
+For the concurrency numbers behind the boundary above (single-request cost versus behavior at concurrency 10), decomposed with a reproducible script, see [docs/benchmarks/concurrency-decomposition.md](docs/benchmarks/concurrency-decomposition.md).
+
 ## How it works
 
 **Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. On scan + filter + aggregate workloads, this is where the 3-10x SQLite wins come from.
@@ -74,7 +95,9 @@ cargo install powdb-server
 
 ## Benchmark: PowDB vs SQLite (100K rows, M1)
 
-PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. For durable write throughput, batch writes in a transaction — see [Write throughput & durability](#write-throughput--durability).
+PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. For durable write throughput, batch writes in a transaction, see [Write throughput & durability](#write-throughput--durability).
+
+These are **single-request latencies**: one query at a time, measuring per-query cost, not throughput under many simultaneous clients. On a shared read-write database at concurrency, reads amplify through the write-admission gate (PowDB has no MVCC); that behavior is decomposed in [docs/benchmarks/concurrency-decomposition.md](docs/benchmarks/concurrency-decomposition.md). See also [What PowDB is for](#what-powdb-is-for).
 
 | Workload | PowDB | SQLite | Result |
 |---|---|---|---|

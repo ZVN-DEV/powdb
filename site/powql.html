@@ -330,6 +330,7 @@ begin
 insert User { name := "Charlie", email := "charlie@example.com", age := 40 }
 rollback  -- discard all changes</code></pre>
     <p>Transactions are per-connection; other connections never see uncommitted rows, and a connection that closes before <code>commit</code> rolls back implicitly. Nested <code>begin</code> is an error. Statements between <code>begin</code> and <code>commit</code> share a single WAL fsync, so bulk loads inside a transaction run roughly 50x faster than autocommit with identical durability.</p>
+    <p><strong>Concurrency:</strong> PowDB has no MVCC. An explicit transaction holds the whole write-admission gate for its lifetime, so from <code>begin</code> until <code>commit</code> or <code>rollback</code> every other connection that needs the gate (readers included) waits. Keep explicit transactions short, and prefer autocommit on read-mostly paths (an autocommit writer releases admission before the fsync wait). A connection that waits past the server timeout (5 seconds by default, <code>POWDB_TX_WAIT_TIMEOUT_MS</code>) fails with a <code>transaction gate timeout</code> error rather than blocking forever.</p>
 
     <!-- DDL -->
     <h2 id="ddl">DDL</h2>

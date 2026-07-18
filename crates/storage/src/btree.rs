@@ -38,7 +38,16 @@ const ORDER: usize = 256;
 //   u32 len + raw bytes. For Empty: no payload.
 const BTREE_MAGIC: &[u8; 4] = b"BIDX";
 pub const LEGACY_BTREE_VERSION: u16 = 1;
-pub const BTREE_VERSION: u16 = 2;
+/// v2 added the `empty_rids` side list. Expression indexes are written at this
+/// version; their keys are raw (never composite Str), so the v3 NUL-escaping
+/// does not apply to them and they keep loading unchanged.
+pub const EXPRESSION_BTREE_VERSION: u16 = 2;
+/// v3 NUL-escapes Str values inside non-unique composite keys (0x00 content
+/// byte -> 0x00 0xFF, terminated by 0x00 0x00). This makes each value's key
+/// range disjoint even for embedded-NUL strings. A non-unique column index in
+/// an older version is never served: it is rebuilt from the heap on open (see
+/// `Table::open`).
+pub const BTREE_VERSION: u16 = 3;
 const NODE_TAG_INTERNAL: u8 = 0;
 const NODE_TAG_LEAF: u8 = 1;
 
@@ -95,6 +104,27 @@ fn composite_prefix_bytes(key: &Value) -> &[u8] {
     }
 }
 
+/// Append a string's bytes to a composite-key buffer with order-preserving NUL
+/// escaping (v3): every 0x00 content byte becomes the pair 0x00 0xFF, and the
+/// string is terminated by 0x00 0x00. An escaped NUL (0x00 0xFF) can never be
+/// confused with the terminator (0x00 0x00), and the terminator can never occur
+/// inside the content, so the encoding is self-delimiting and prefix-free: no
+/// value's encoding is a byte prefix of another's. That is exactly what keeps
+/// each value's `[value|rid_min, value|rid_max]` composite-key range disjoint
+/// once the raw 8-byte rid is appended, and it preserves lexicographic value
+/// order (0x00 0x00 terminator < 0x00 0xFF continuation, so `"A" < "A\0"`).
+/// Worst-case overhead is 2x for an all-NUL value.
+fn encode_str_escaped(buf: &mut Vec<u8>, s: &[u8]) {
+    for &byte in s {
+        buf.push(byte);
+        if byte == 0 {
+            buf.push(0xFF);
+        }
+    }
+    buf.push(0);
+    buf.push(0);
+}
+
 /// In-memory B+ tree index. Keys are Values, values are RowIds.
 ///
 /// Order 256: each node holds up to 256 keys. For 500K rows with integer keys,
@@ -122,10 +152,10 @@ pub struct BTree {
     total_entries: u64,
     /// Distinct logical key count, interpreted per `key_kind`. Maintained
     /// incrementally by every mutating method and recomputed from the leaf chain
-    /// on load and at each `save`. Exact for the ordinary key shapes; embedded-NUL
-    /// string values in a composite (non-unique) index are the one documented
-    /// exception (see `make_composite_key`), and even there a wrong count only
-    /// mis-ranks the conjunction chooser, never a query result.
+    /// on load and at each `save`. Exact for every key shape, including
+    /// embedded-NUL string values in a composite (non-unique) index: the v3
+    /// escaped encoding gives each value a distinct key prefix (see
+    /// `encode_str_escaped`).
     distinct_keys: u64,
     /// Distinct-counting mode. Defaults to `Raw`; the non-unique wrappers flip
     /// it to `Composite`, and `mark_composite` sets it after a load of a
@@ -288,11 +318,23 @@ impl BTree {
         false
     }
 
-    /// Create the v2 expression-index shape. Legacy column indexes continue
-    /// using [`BTree::create`] and remain v1 until explicitly rebuilt.
+    /// Create the v2 expression-index shape. Unique column indexes continue
+    /// using [`BTree::create`] and remain v1; non-unique column indexes use
+    /// [`BTree::create_non_unique`] (v3).
     pub fn create_v2(path: &Path) -> std::io::Result<Self> {
         let mut tree = Self::create(path)?;
+        tree.format_version = EXPRESSION_BTREE_VERSION;
+        Ok(tree)
+    }
+
+    /// Create a v3 non-unique column index: composite keys with NUL-escaped Str
+    /// values (see [`BTREE_VERSION`]). Sets `key_kind` to `Composite` up front
+    /// so a tree that never receives an insert still persists at v3 and is not
+    /// re-migrated on the next open.
+    pub fn create_non_unique(path: &Path) -> std::io::Result<Self> {
+        let mut tree = Self::create(path)?;
         tree.format_version = BTREE_VERSION;
+        tree.key_kind = KeyKind::Composite;
         Ok(tree)
     }
 
@@ -1473,31 +1515,37 @@ impl BTree {
     /// us lexicographic byte comparison, which matches the intended
     /// (column_value, rid) sort order for same-type keys.
     ///
-    /// KNOWN LIMITATION (embedded NUL in string values): a `Str` value is encoded
-    /// as its raw bytes plus a single `0x00` terminator, then the 8-byte rid. A
-    /// value that itself contains `0x00` (e.g. `"A\0"`) therefore produces bytes
-    /// that can order *between* the composite keys of a shorter value (`"A"`),
-    /// because the extra content byte shifts the rid suffix right. This is a
-    /// pre-existing ambiguity of the terminator encoding, not a stats artifact:
-    /// `lookup_prefix`/`delete_non_unique` already scan `[prefix_start,
-    /// prefix_end]` inclusive, so a query on `"A"` can match an `"A\0"` row and
-    /// vice versa. Because the ordering is ambiguous, `distinct_keys` can also
-    /// over- or under-count for such keys (the incremental prefix probe and the
-    /// leaf-chain recount disagree). Fixing this correctly requires an
-    /// unambiguous key encoding, i.e. an on-disk format change, which is out of
-    /// scope here. A wrong `distinct_keys` only mis-ranks the conjunction chooser
-    /// (the residual recheck keeps results correct); the prefix-scan match is the
-    /// real defect and is tracked separately. `stats_composite_embedded_nul`
-    /// pins the current bounded, deterministic behavior.
-    fn make_composite_key(col_val: &Value, rid: RowId) -> Value {
-        // Encode column value into bytes, then append the rid as 8 LE bytes.
-        let mut buf = Vec::with_capacity(32);
-        // Type tag so we can reconstruct the column value on prefix scan.
+    /// Encode a column value into `buf` for a composite non-unique key, up to
+    /// but not including the trailing 8-byte rid. Shared by
+    /// [`BTree::make_composite_key`], [`BTree::make_prefix_start`], and
+    /// [`BTree::make_prefix_end`] so the three encodings can never drift apart.
+    ///
+    /// NUL safety (v3): a `Str` value is written with order-preserving escaping
+    /// (see [`encode_str_escaped`]) so that no value's encoding is a byte
+    /// prefix of another's. That prefix-freeness is what makes each value's
+    /// composite-key range `[value|rid_min, value|rid_max]` disjoint, even when
+    /// a value contains an embedded NUL (`"A\0"`); before v3 the bare-0x00
+    /// terminator let the raw rid suffix bridge `"A"` and `"A\0"`, returning
+    /// wrong rows.
+    ///
+    /// Bytes/Json are length-prefixed (`u32` big-endian length + raw bytes),
+    /// which is already self-delimiting and therefore prefix-free, so they never
+    /// had the embedded-NUL ambiguity and are unchanged. (Length-prefixing is
+    /// not order-preserving across differing lengths, so Bytes/Json range scans
+    /// across distinct values are not ordered; equality lookup, which only needs
+    /// disjoint ranges, is correct. Str keeps the escape encoding precisely
+    /// because it must preserve value order for range scans.)
+    ///
+    /// No decoder unescapes these bytes back into a value: the only readers of a
+    /// composite key are [`BTree::rid_from_composite`] (last 8 bytes, never
+    /// escaped) and [`composite_prefix_bytes`] (everything but the last 8 bytes,
+    /// compared byte-for-byte), both of which are escaping-agnostic.
+    fn encode_composite_value(buf: &mut Vec<u8>, col_val: &Value) {
+        // Type tag so equal-typed keys compare within one lane.
         buf.push(col_val.type_id() as u8);
         match col_val {
             Value::Int(i) => {
-                // Encode as big-endian with sign-flip so byte comparison
-                // matches i64 ordering.
+                // Big-endian with sign-flip so byte comparison matches i64 order.
                 let flipped = (*i as u64) ^ (1u64 << 63);
                 buf.extend_from_slice(&flipped.to_be_bytes());
             }
@@ -1511,12 +1559,7 @@ impl BTree {
                 buf.extend_from_slice(&ordered.to_be_bytes());
             }
             Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
-            Value::Str(s) => {
-                buf.extend_from_slice(s.as_bytes());
-                // Null terminator so "abc" < "abcd" works correctly when
-                // followed by the rid suffix.
-                buf.push(0);
-            }
+            Value::Str(s) => encode_str_escaped(buf, s.as_bytes()),
             Value::DateTime(t) => {
                 let flipped = (*t as u64) ^ (1u64 << 63);
                 buf.extend_from_slice(&flipped.to_be_bytes());
@@ -1526,7 +1569,7 @@ impl BTree {
                 buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
                 buf.extend_from_slice(b);
             }
-            // Json keys are not produced by the v1 index mechanism (path
+            // Json keys are not produced by the column-index mechanism (path
             // indexes extract scalars), but encode reversibly like Bytes so no
             // key path can panic on a Json value.
             Value::Json(b) => {
@@ -1535,6 +1578,11 @@ impl BTree {
             }
             Value::Empty => {}
         }
+    }
+
+    fn make_composite_key(col_val: &Value, rid: RowId) -> Value {
+        let mut buf = Vec::with_capacity(32);
+        Self::encode_composite_value(&mut buf, col_val);
         // Append RowId as big-endian u64 so it sorts correctly.
         let rid_bits = ((rid.page_id as u64) << 16) | rid.slot_index as u64;
         buf.extend_from_slice(&rid_bits.to_be_bytes());
@@ -1544,44 +1592,7 @@ impl BTree {
     /// Build a prefix key for scanning: everything before the RowId suffix.
     fn make_prefix_start(col_val: &Value) -> Value {
         let mut buf = Vec::with_capacity(32);
-        buf.push(col_val.type_id() as u8);
-        match col_val {
-            Value::Int(i) => {
-                let flipped = (*i as u64) ^ (1u64 << 63);
-                buf.extend_from_slice(&flipped.to_be_bytes());
-            }
-            Value::Float(f) => {
-                let bits = f.to_bits();
-                let ordered = if bits >> 63 == 1 {
-                    !bits
-                } else {
-                    bits ^ (1u64 << 63)
-                };
-                buf.extend_from_slice(&ordered.to_be_bytes());
-            }
-            Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
-            Value::Str(s) => {
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(0);
-            }
-            Value::DateTime(t) => {
-                let flipped = (*t as u64) ^ (1u64 << 63);
-                buf.extend_from_slice(&flipped.to_be_bytes());
-            }
-            Value::Uuid(u) => buf.extend_from_slice(u),
-            Value::Bytes(b) => {
-                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                buf.extend_from_slice(b);
-            }
-            // Json keys are not produced by the v1 index mechanism (path
-            // indexes extract scalars), but encode reversibly like Bytes so no
-            // key path can panic on a Json value.
-            Value::Json(b) => {
-                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                buf.extend_from_slice(b);
-            }
-            Value::Empty => {}
-        }
+        Self::encode_composite_value(&mut buf, col_val);
         // Append the smallest possible RowId (all zeros).
         buf.extend_from_slice(&0u64.to_be_bytes());
         Value::Bytes(buf)
@@ -1591,44 +1602,7 @@ impl BTree {
     /// with the maximum possible RowId appended.
     fn make_prefix_end(col_val: &Value) -> Value {
         let mut buf = Vec::with_capacity(32);
-        buf.push(col_val.type_id() as u8);
-        match col_val {
-            Value::Int(i) => {
-                let flipped = (*i as u64) ^ (1u64 << 63);
-                buf.extend_from_slice(&flipped.to_be_bytes());
-            }
-            Value::Float(f) => {
-                let bits = f.to_bits();
-                let ordered = if bits >> 63 == 1 {
-                    !bits
-                } else {
-                    bits ^ (1u64 << 63)
-                };
-                buf.extend_from_slice(&ordered.to_be_bytes());
-            }
-            Value::Bool(b) => buf.push(if *b { 1 } else { 0 }),
-            Value::Str(s) => {
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(0);
-            }
-            Value::DateTime(t) => {
-                let flipped = (*t as u64) ^ (1u64 << 63);
-                buf.extend_from_slice(&flipped.to_be_bytes());
-            }
-            Value::Uuid(u) => buf.extend_from_slice(u),
-            Value::Bytes(b) => {
-                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                buf.extend_from_slice(b);
-            }
-            // Json keys are not produced by the v1 index mechanism (path
-            // indexes extract scalars), but encode reversibly like Bytes so no
-            // key path can panic on a Json value.
-            Value::Json(b) => {
-                buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
-                buf.extend_from_slice(b);
-            }
-            Value::Empty => {}
-        }
+        Self::encode_composite_value(&mut buf, col_val);
         // Append the largest possible RowId.
         buf.extend_from_slice(&u64::MAX.to_be_bytes());
         Value::Bytes(buf)
@@ -1657,6 +1631,12 @@ impl BTree {
         // A composite tree counts distinct keys by value prefix; declare the mode
         // so `insert` maintains the counters correctly.
         self.key_kind = KeyKind::Composite;
+        // Composite Str keys use the v3 NUL-escaped encoding; a tree reaching
+        // this path is a non-unique column index and must persist as v3 so it is
+        // not treated as an old-format index (and rebuilt) on the next open.
+        if self.format_version < BTREE_VERSION {
+            self.format_version = BTREE_VERSION;
+        }
         let composite = Self::make_composite_key(&col_val, rid);
         // The composite key is always unique, so the normal insert path
         // will never hit the "duplicate key — update in place" branch.
@@ -1768,11 +1748,10 @@ impl BTree {
     /// catalog's persist strategy.
     pub fn save(&mut self) -> io::Result<()> {
         // Checkpoint-time heal: recompute both counters from the leaf chain in
-        // the current `key_kind`. Incremental maintenance keeps them exact for
-        // the ordinary key shapes, so this is a belt-and-braces invariant that
-        // also caps the embedded-NUL composite ambiguity (see `make_composite_key`)
-        // and any future drift at one checkpoint interval for a long-lived
-        // process. `save_to` walks every key anyway, so the extra pass is free.
+        // the current `key_kind`. Incremental maintenance keeps them exact, so
+        // this is a belt-and-braces invariant that caps any future drift at one
+        // checkpoint interval for a long-lived process. `save_to` walks every
+        // key anyway, so the extra pass is free.
         self.recount();
         let path = self.path.clone();
         self.save_to(&path)?;
@@ -3422,34 +3401,31 @@ mod tests {
 
     #[test]
     fn stats_composite_embedded_nul() {
-        // Finding 3 (documented limitation): a string value containing an
-        // embedded NUL produces composite keys that can order between a shorter
-        // value's keys, so the incremental distinct probe over-counts. Truth is
-        // 2 distinct values ("A", "A\0"); the live counter reports 3. The
-        // behavior is deterministic and bounded, and a wrong distinct only
-        // mis-ranks the chooser (the residual recheck keeps results correct).
-        // See `make_composite_key`.
+        // v3 escaped encoding: "A" and "A\0" are two distinct values. The live
+        // incremental counter and the leaf-chain recount must agree on 2 both
+        // in memory and after a save/load round trip and a checkpoint recount.
         let mut bt = temp_btree_v2("stats_embedded_nul");
+        bt.key_kind = KeyKind::Composite;
         bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 5));
         bt.insert_non_unique(Value::Str("A\0".into()), stat_rid(0, 3));
         bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 7));
         assert_eq!(bt.stats().total_entries, 3);
         assert_eq!(
             bt.stats().distinct_keys,
-            3,
-            "documented embedded-NUL over-count (truth is 2)"
+            2,
+            "\"A\" and \"A\\0\" are two distinct values under v3 escaping"
         );
 
-        // Checkpoint heal: `save` recomputes both counters from the leaf chain,
-        // capping the drift. The recount treats the physically-sorted prefixes
-        // ("A\0" sorts before both "A" copies here), yielding 2.
+        // Checkpoint recount agrees with the live counter.
         bt.save().unwrap();
         assert_eq!(bt.stats().total_entries, 3);
-        assert_eq!(
-            bt.stats().distinct_keys,
-            2,
-            "the checkpoint recount caps the embedded-NUL drift"
-        );
+        assert_eq!(bt.stats().distinct_keys, 2, "recount agrees: 2 distinct");
+
+        // Reload from disk (v3 file) and switch to composite counting: still 2.
+        let mut reloaded = BTree::load(bt.file_path()).unwrap();
+        reloaded.mark_composite();
+        assert_eq!(reloaded.stats().total_entries, 3);
+        assert_eq!(reloaded.stats().distinct_keys, 2, "2 distinct after reload");
         cleanup(&bt);
     }
 
@@ -3511,5 +3487,193 @@ mod tests {
         assert_eq!(reloaded.stats().total_entries, bt.stats().total_entries);
         assert_eq!(reloaded.stats().distinct_keys, bt.stats().distinct_keys);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── NUL-safe composite keys (v0.16 Workstream 1) ─────────────────────
+
+    /// The three-key repro from the plan: an embedded-NUL value must not
+    /// interleave with the keys of a shorter plain value. Before the escape
+    /// fix, `lookup_prefix("A")` returned the "A\0" rid too, and
+    /// `lookup_prefix("A\0")` returned all three.
+    #[test]
+    fn lookup_prefix_embedded_nul_disjoint() {
+        let mut bt = temp_btree_v2("nul_lookup_prefix");
+        bt.key_kind = KeyKind::Composite;
+        bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 5));
+        bt.insert_non_unique(Value::Str("A\0".into()), stat_rid(0, 3));
+        bt.insert_non_unique(Value::Str("A".into()), stat_rid(0, 7));
+
+        let mut a = bt.lookup_prefix(&Value::Str("A".into()));
+        a.sort_by_key(|r| r.slot_index);
+        assert_eq!(
+            a,
+            vec![stat_rid(0, 5), stat_rid(0, 7)],
+            "\"A\" must not see \"A\\0\""
+        );
+
+        let a_nul = bt.lookup_prefix(&Value::Str("A\0".into()));
+        assert_eq!(
+            a_nul,
+            vec![stat_rid(0, 3)],
+            "\"A\\0\" must see only its own rid"
+        );
+
+        // Same guarantee after a save/load round trip (v3 file).
+        bt.save().unwrap();
+        let mut reloaded = BTree::load(bt.file_path()).unwrap();
+        reloaded.mark_composite();
+        let mut a2 = reloaded.lookup_prefix(&Value::Str("A".into()));
+        a2.sort_by_key(|r| r.slot_index);
+        assert_eq!(a2, vec![stat_rid(0, 5), stat_rid(0, 7)]);
+        assert_eq!(
+            reloaded.lookup_prefix(&Value::Str("A\0".into())),
+            vec![stat_rid(0, 3)]
+        );
+        assert_eq!(reloaded.format_version(), BTREE_VERSION, "v3 file on disk");
+        cleanup(&bt);
+    }
+
+    /// The escape encoding must be prefix-free and order-preserving over
+    /// arbitrary byte content: NUL at start/middle/end, repeated NUL, 0xFF
+    /// adjacency, and the empty string. Prefix-freeness is what makes each
+    /// value's composite-key range disjoint once the raw rid is appended;
+    /// order-preservation is what keeps Str range scans correct.
+    #[test]
+    fn escape_encoding_prefix_free_and_ordered() {
+        let samples: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![0x41],
+            vec![0x41, 0],
+            vec![0, 0x41],
+            vec![0x41, 0, 0x42],
+            vec![0x41, 0x42],
+            vec![0x42],
+            vec![0xFF],
+            vec![0x41, 0xFF],
+            vec![0, 0xFF],
+            vec![0xFF, 0],
+            vec![0x41, 0, 0xFF],
+            vec![0xFF, 0xFF],
+        ];
+        let enc = |s: &[u8]| {
+            let mut b = Vec::new();
+            encode_str_escaped(&mut b, s);
+            b
+        };
+        for a in &samples {
+            for b in &samples {
+                let (ea, eb) = (enc(a), enc(b));
+                assert_eq!(
+                    ea.cmp(&eb),
+                    a.cmp(b),
+                    "order must be preserved for {a:?} vs {b:?}"
+                );
+                if a == b {
+                    assert_eq!(ea, eb);
+                } else {
+                    assert!(
+                        !ea.starts_with(&eb) && !eb.starts_with(&ea),
+                        "encoding must be prefix-free for {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Prefix-freeness turned into the property that actually matters: no
+    /// value's escaped encoding plus any rid can land inside another value's
+    /// [rid_min, rid_max] composite range. The rid's top byte can be 0xFF (the
+    /// original bug's bridge), so probe that corner explicitly.
+    #[test]
+    fn escape_ranges_disjoint_under_any_rid() {
+        let values = [
+            Value::Str("A".into()),
+            Value::Str("A\0".into()),
+            Value::Str("A\0\0".into()),
+            Value::Str("".into()),
+            Value::Str("\0".into()),
+            Value::Str("B".into()),
+        ];
+        // A rid whose big-endian bytes start with 0xFF (page_id high bits set).
+        let hot_rid = RowId {
+            page_id: 0xFFFF_FFFF,
+            slot_index: 0xFFFF,
+        };
+        for target in &values {
+            let lo = BTree::make_prefix_start(target);
+            let hi = BTree::make_prefix_end(target);
+            for other in &values {
+                for rid in [stat_rid(0, 0), hot_rid] {
+                    let key = BTree::make_composite_key(other, rid);
+                    let in_range = key >= lo && key <= hi;
+                    assert_eq!(
+                        in_range,
+                        other == target,
+                        "{other:?} (rid {rid:?}) in range of {target:?}?"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Twin-engine parity: a non-unique index over mixed NUL/plain strings must
+    /// return exactly the ground-truth rids for every value, through inserts,
+    /// deletes, and delete-then-reinsert (the shape index-driven updates take).
+    #[test]
+    fn nonunique_twin_parity_mixed_nul() {
+        use std::collections::BTreeMap;
+
+        let mut bt = temp_btree_v2("twin_nul");
+        bt.key_kind = KeyKind::Composite;
+        // Ground truth: value bytes -> set of rids.
+        let mut truth: BTreeMap<Vec<u8>, Vec<RowId>> = BTreeMap::new();
+
+        let values = ["A", "A\0", "A\0\0", "", "\0", "AB", "A\0B", "B"];
+        let mut n = 0u16;
+        for round in 0..4u16 {
+            for v in values {
+                let rid = stat_rid(round as u32, n);
+                n = n.wrapping_add(1);
+                bt.insert_non_unique(Value::Str(v.into()), rid);
+                truth.entry(v.as_bytes().to_vec()).or_default().push(rid);
+            }
+        }
+
+        let check = |bt: &BTree, truth: &BTreeMap<Vec<u8>, Vec<RowId>>| {
+            for (bytes, expected) in truth {
+                let v = Value::Str(String::from_utf8(bytes.clone()).unwrap());
+                let mut got = bt.lookup_prefix(&v);
+                got.sort_by_key(|r| (r.page_id, r.slot_index));
+                let mut want = expected.clone();
+                want.sort_by_key(|r| (r.page_id, r.slot_index));
+                assert_eq!(got, want, "lookup parity for {bytes:?}");
+            }
+        };
+        check(&bt, &truth);
+
+        // Delete every "A\0" rid (index-driven delete): "A" must be untouched.
+        let a_nul = truth.remove("A\0".as_bytes()).unwrap();
+        for rid in &a_nul {
+            assert!(bt.delete_non_unique(&Value::Str("A\0".into()), *rid));
+        }
+        truth.insert(b"A\0".to_vec(), Vec::new());
+        check(&bt, &truth);
+
+        // Delete-then-reinsert an "A" rid at a fresh rid (update shape).
+        let moved = truth.get_mut(b"A".as_slice()).unwrap().pop().unwrap();
+        assert!(bt.delete_non_unique(&Value::Str("A".into()), moved));
+        let new_rid = stat_rid(99, 1);
+        bt.insert_non_unique(Value::Str("A".into()), new_rid);
+        truth.get_mut(b"A".as_slice()).unwrap().push(new_rid);
+        check(&bt, &truth);
+
+        // Distinct-key stats count only values with live rids; a value whose
+        // rids were all deleted no longer contributes.
+        bt.save().unwrap();
+        let live: u64 = truth.values().filter(|rids| !rids.is_empty()).count() as u64;
+        assert_eq!(bt.stats().distinct_keys, live, "distinct == live values");
+        cleanup(&bt);
     }
 }
