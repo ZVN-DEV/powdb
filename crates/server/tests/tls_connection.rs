@@ -4,52 +4,17 @@
 //! verifies that a TLS-wrapped connection can complete the CONNECT
 //! handshake and execute queries through the encrypted channel.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls;
 
-// ── Wire-protocol helpers (same as integration.rs) ────────────────────
-
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes()); // no password
-    let mut frame = Vec::new();
-    frame.push(0x01); // CONNECT
-    frame.push(0); // flags
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
-    payload.extend_from_slice(q.as_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x03); // QUERY
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-async fn read_response<S: AsyncReadExt + Unpin>(stream: &mut S) -> Vec<u8> {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    let mut full = Vec::new();
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    full
-}
+// Wire helpers come from tests/common; `read_response` is generic over the
+// stream type, so it reads through the TLS-wrapped stream too.
+use common::{encode_connect, encode_query, read_response};
 
 // ── Certificate generation ────────────────────────────────────────────
 

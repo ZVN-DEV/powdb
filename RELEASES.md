@@ -100,10 +100,12 @@ one-time setup and the reusable standard.
 [ ] git tag vX.Y.Z && git push origin vX.Y.Z
 [ ] Verify GitHub Release workflow creates binaries AND auto-publishes npm
     (@zvndev/powdb-client) token-less via release.yml — no manual npm publish
-[ ] Smoke-test the installed crates.io binary: run the README's documented
-    PowQL flow, then kill -9 the server and restart to confirm WAL replay
-    recovers the data (v0.4.1–v0.4.3 shipped data-loss P0s that the
-    pre-publish gates missed because none exercised a real crash + restart)
+[ ] Smoke-test the LIVE registries: run post-publish-smoke.yml with the
+    released version (`gh workflow run post-publish-smoke.yml -f version=X.Y.Z`).
+    It cargo-installs powdb-cli + powdb-server from crates.io and reruns the
+    durability smoke (README PowQL flow + kill -9/restart WAL replay; the gate
+    v0.4.1-v0.4.3 lacked), then npm-installs @zvndev/powdb-client and
+    @zvndev/powdb-embedded and exercises both
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).

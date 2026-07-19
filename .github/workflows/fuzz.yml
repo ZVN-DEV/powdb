@@ -8,6 +8,9 @@ on:
       - "crates/query/src/token.rs"
       - "crates/query/src/canonicalize.rs"
       - "crates/storage/src/pj1.rs"
+      - "crates/server/src/protocol.rs"
+      - "crates/storage/src/wal.rs"
+      - "crates/storage/src/catalog.rs"
       - "crates/query/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -29,7 +32,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_lexer, fuzz_parser, fuzz_roundtrip, fuzz_sql, fuzz_pj1]
+        target:
+          [
+            fuzz_lexer,
+            fuzz_parser,
+            fuzz_roundtrip,
+            fuzz_sql,
+            fuzz_pj1,
+            fuzz_wire,
+            fuzz_wal_replay,
+          ]
         include:
           - target: fuzz_lexer
             budget: 60
@@ -40,6 +52,10 @@ jobs:
           - target: fuzz_sql
             budget: 60
           - target: fuzz_pj1
+            budget: 60
+          - target: fuzz_wire
+            budget: 60
+          - target: fuzz_wal_replay
             budget: 60
     env:
       CARGO_TERM_COLOR: always
@@ -77,10 +93,23 @@ jobs:
       # `cargo fuzz` expects `<crate>/fuzz/Cargo.toml` relative to its cwd,
       # so we run from `crates/query` (the crate under test), not from
       # `crates/query/fuzz` itself.
+      # The corpus dir is cargo-fuzz's default (kept explicit because a second
+      # dir follows); `fuzz/seeds/<target>` holds checked-in valid inputs
+      # (encoded wire frames, real WAL files) that the fuzzer mutates from.
+      # Both dirs are mkdir'd so targets without checked-in seeds still run.
       - name: Run ${{ matrix.target }} for ${{ matrix.budget }}s
         working-directory: crates/query
+        env:
+          # fuzz_wal_replay builds its crashed-database template once via
+          # std::mem::forget (the standard crash-simulation technique, same as
+          # the durability test suite), which LeakSanitizer reports as a
+          # one-time ~13KB leak at exit. Disable leak detection for that
+          # target only; ASan's memory-error detection stays fully on.
+          ASAN_OPTIONS: ${{ matrix.target == 'fuzz_wal_replay' && 'detect_leaks=0' || '' }}
         run: |
-          cargo fuzz run ${{ matrix.target }} -- \
+          mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
             -max_total_time=${{ matrix.budget }} \
             -timeout=5 \
             -max_len=2048 \

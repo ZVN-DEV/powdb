@@ -31,7 +31,12 @@ import {
   type WireSyncStatus,
   type WireValue,
 } from "./protocol.js";
-import { PowDBError, PowDBScriptError, isPowDBError } from "./errors.js";
+import {
+  errorCodeForWireClass,
+  isPowDBError,
+  PowDBError,
+  PowDBScriptError,
+} from "./errors.js";
 import { splitStatements } from "./script.js";
 import {
   coerceRows,
@@ -275,7 +280,11 @@ function nativeQueryResult(reply: Message): NativeQueryResult {
     case "ResultMessage":
       return { kind: "message", message: reply.message };
     case "Error":
-      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+      throw new PowDBError(
+        `query failed: ${reply.message}`,
+        errorCodeForWireClass(reply.errorClass),
+        { wireErrorClass: reply.errorClass },
+      );
     default:
       throw new PowDBError(
         `unexpected reply to native query: ${reply.type}`,
@@ -295,7 +304,11 @@ function rawNativeQueryResult(reply: Message): RawNativeQueryResult {
     case "ResultMessage":
       return { kind: "message", message: reply.message };
     case "Error":
-      throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+      throw new PowDBError(
+        `query failed: ${reply.message}`,
+        errorCodeForWireClass(reply.errorClass),
+        { wireErrorClass: reply.errorClass },
+      );
     default:
       throw new PowDBError(
         `unexpected reply to native query: ${reply.type}`,
@@ -689,7 +702,11 @@ export class Client extends EventEmitter<ClientEvents> {
           result = { kind: "message", message: reply.message };
           break;
         case "Error":
-          throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+          throw new PowDBError(
+            `query failed: ${reply.message}`,
+            errorCodeForWireClass(reply.errorClass),
+            { wireErrorClass: reply.errorClass },
+          );
         default:
           throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
       }
@@ -831,7 +848,11 @@ export class Client extends EventEmitter<ClientEvents> {
           result = { kind: "message", message: reply.message };
           break;
         case "Error":
-          throw new PowDBError(`query failed: ${reply.message}`, "query_failed");
+          throw new PowDBError(
+            `query failed: ${reply.message}`,
+            errorCodeForWireClass(reply.errorClass),
+            { wireErrorClass: reply.errorClass },
+          );
         default:
           throw new PowDBError(`unexpected reply: ${reply.type}`, "protocol_error");
       }
@@ -898,7 +919,8 @@ export class Client extends EventEmitter<ClientEvents> {
       if (reply.type === "Error") {
         throw new PowDBError(
           `sync status failed: ${reply.message}`,
-          "query_failed",
+          errorCodeForWireClass(reply.errorClass),
+          { wireErrorClass: reply.errorClass },
         );
       }
       if (reply.type !== "SyncStatusResult") {
@@ -969,7 +991,8 @@ export class Client extends EventEmitter<ClientEvents> {
       if (reply.type === "Error") {
         throw new PowDBError(
           `sync pull failed: ${reply.message}`,
-          "query_failed",
+          errorCodeForWireClass(reply.errorClass),
+          { wireErrorClass: reply.errorClass },
         );
       }
       if (reply.type !== "SyncPullResult") {
@@ -1024,7 +1047,8 @@ export class Client extends EventEmitter<ClientEvents> {
       if (reply.type === "Error") {
         throw new PowDBError(
           `sync ack failed: ${reply.message}`,
-          "query_failed",
+          errorCodeForWireClass(reply.errorClass),
+          { wireErrorClass: reply.errorClass },
         );
       }
       if (reply.type !== "SyncAckResult") {
@@ -1713,10 +1737,12 @@ export type { PoolOptions } from "./pool.js";
 export { splitStatements } from "./script.js";
 
 export {
+  errorCodeForWireClass,
   PowDBError,
   isPowDBError,
   PowDBScriptError,
   isPowDBScriptError,
+  WIRE_ERROR_CLASS,
 } from "./errors.js";
 export type { PowDBErrorCode } from "./errors.js";
 

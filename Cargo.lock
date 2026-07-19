@@ -1877,10 +1877,14 @@ dependencies = [
  "powdb-server",
  "powdb-storage",
  "powdb-sync",
+ "rcgen",
+ "rustls-pemfile",
  "rustyline",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]

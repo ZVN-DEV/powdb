@@ -191,6 +191,29 @@ struct CliArgs {
     role: Option<String>,
     exec: Option<String>,
     action: Action,
+    tls: TlsOpts,
+}
+
+/// TLS settings for remote mode.
+struct TlsOpts {
+    /// Wrap the remote connection in TLS: `--tls`, implied by the other TLS
+    /// flags, or the `POWDB_TLS` env fallback (truthy).
+    enabled: bool,
+    /// Custom root CA PEM (`--tls-ca` / `POWDB_TLS_CA`) for self-signed
+    /// deployments; default is the built-in webpki (Mozilla) root store.
+    ca_path: Option<String>,
+    /// Certificate name override (`--tls-server-name` /
+    /// `POWDB_TLS_SERVER_NAME`), for connecting by IP to a hostname cert.
+    server_name: Option<String>,
+}
+
+/// Parse the `POWDB_TLS` env value. Truthy on `1`/`true`/`yes`/`on` (any
+/// case), matching the server's `POWDB_REQUIRE_TLS` grammar; default off.
+fn parse_tls_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 fn set_restore_sync_mode(
@@ -225,6 +248,13 @@ fn parse_args() -> CliArgs {
         .filter(|s| !s.is_empty());
     let mut user: Option<String> = None;
     let mut role: Option<String> = None;
+    // TLS for remote mode: env fallbacks first (same POWDB_-prefixed
+    // convention as POWDB_PASSWORD above), overridden by the flags below.
+    let mut tls_enabled = parse_tls_enabled(std::env::var("POWDB_TLS").ok().as_deref());
+    let mut tls_ca: Option<String> = std::env::var("POWDB_TLS_CA").ok().filter(|s| !s.is_empty());
+    let mut tls_server_name: Option<String> = std::env::var("POWDB_TLS_SERVER_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut exec: Option<String> = None;
     let mut exec_file: Option<String> = None;
     let mut action = Action::Default;
@@ -295,6 +325,27 @@ fn parse_args() -> CliArgs {
                 }
                 password = Some(argv[i].clone());
             }
+            "--tls" => {
+                tls_enabled = true;
+            }
+            "--tls-ca" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --tls-ca requires a path");
+                    std::process::exit(2);
+                }
+                tls_ca = Some(argv[i].clone());
+                tls_enabled = true;
+            }
+            "--tls-server-name" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --tls-server-name requires a name");
+                    std::process::exit(2);
+                }
+                tls_server_name = Some(argv[i].clone());
+                tls_enabled = true;
+            }
             "--user" | "-u" => {
                 i += 1;
                 if i >= argv.len() {
@@ -344,6 +395,23 @@ fn parse_args() -> CliArgs {
                 println!("        --db <NAME>            Database name (default: default)");
                 println!("        --password <PW>        Password for remote auth");
                 println!("    -u, --user <NAME>          Username for multi-user remote auth");
+                println!("        --tls                  Encrypt the remote connection with TLS");
+                println!("                               (env fallback: POWDB_TLS=1)");
+                println!(
+                    "        --tls-ca <PATH>        Root CA PEM to trust instead of the built-in"
+                );
+                println!(
+                    "                               web roots; implies --tls. For self-signed"
+                );
+                println!("                               deployments (env fallback: POWDB_TLS_CA)");
+                println!(
+                    "        --tls-server-name <N>  Hostname to verify the server certificate"
+                );
+                println!(
+                    "                               against; implies --tls. Use when connecting"
+                );
+                println!("                               by IP to a cert issued for a hostname");
+                println!("                               (env fallback: POWDB_TLS_SERVER_NAME)");
                 println!(
                     "    -d, --data-dir <PATH>      Embedded data dir (default: ./powdb_data)"
                 );
@@ -678,6 +746,11 @@ fn parse_args() -> CliArgs {
         role,
         exec,
         action,
+        tls: TlsOpts {
+            enabled: tls_enabled,
+            ca_path: tls_ca,
+            server_name: tls_server_name,
+        },
     }
 }
 
@@ -763,6 +836,7 @@ fn main() {
                 args.password.clone(),
                 args.user.clone(),
                 query,
+                &args.tls,
             ));
             std::process::exit(code);
         }
@@ -771,6 +845,7 @@ fn main() {
             args.db.clone(),
             args.password.clone(),
             args.user.clone(),
+            &args.tls,
         ));
     } else if let Some(query) = args.exec {
         std::process::exit(exec_embedded(&args.data_dir, &query));
@@ -1274,6 +1349,94 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
     0
 }
 
+// ─── Remote TLS support ─────────────────────────────────────────────────────
+
+/// A remote connection stream: plaintext TCP or TLS over TCP. The TLS variant
+/// is boxed because `TlsStream` is much larger than `TcpStream`.
+enum RemoteStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Build a rustls client connector on the same tokio-rustls stack the server
+/// uses. With a `--tls-ca` bundle those certificates are the only trust roots
+/// (the self-signed deployment case); otherwise the compiled-in webpki-roots
+/// bundle (Mozilla's CA program) is used.
+fn build_tls_connector(ca_path: Option<&str>) -> Result<tokio_rustls::TlsConnector, String> {
+    use tokio_rustls::rustls;
+
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_path {
+        Some(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("failed to open TLS CA file {path}: {e}"))?;
+            let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("failed to parse TLS CA file {path}: {e}"))?;
+            if certs.is_empty() {
+                return Err(format!("no certificates found in TLS CA file {path}"));
+            }
+            for cert in certs {
+                roots
+                    .add(cert)
+                    .map_err(|e| format!("invalid certificate in TLS CA file {path}: {e}"))?;
+            }
+        }
+        None => {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        config,
+    )))
+}
+
+/// The name the server certificate is verified against: the
+/// `--tls-server-name` override when set, else the host part of `host:port`
+/// (with IPv6 brackets stripped). IP-address names are supported when the
+/// certificate carries an IP SAN; certs issued for a hostname need
+/// `--tls-server-name` when connecting by IP.
+fn resolve_tls_server_name(
+    addr: &str,
+    override_name: Option<&str>,
+) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, String> {
+    let name = match override_name {
+        Some(n) => n.to_string(),
+        None => {
+            let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
+        }
+    };
+    tokio_rustls::rustls::pki_types::ServerName::try_from(name.clone())
+        .map_err(|_| format!("invalid TLS server name: {name}"))
+}
+
+/// Open the remote connection, wrapping it in TLS when requested. With TLS
+/// disabled this is exactly the plaintext `TcpStream::connect` path.
+async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteStream, String> {
+    let stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| format!("connection failed: {e}"))?;
+    if !tls.enabled {
+        return Ok(RemoteStream::Plain(stream));
+    }
+    let connector = build_tls_connector(tls.ca_path.as_deref())?;
+    let server_name = resolve_tls_server_name(addr, tls.server_name.as_deref())?;
+    match connector.connect(server_name, stream).await {
+        Ok(s) => Ok(RemoteStream::Tls(Box::new(s))),
+        Err(e) => Err(format!(
+            "TLS handshake with {addr} failed: {e} \
+             (self-signed server? pass --tls-ca <ca.pem>; connecting by IP to a \
+             hostname certificate? pass --tls-server-name <name>)"
+        )),
+    }
+}
+
 // ─── One-shot execution (remote) ────────────────────────────────────────────
 
 async fn exec_remote(
@@ -1282,15 +1445,29 @@ async fn exec_remote(
     password: Option<String>,
     username: Option<String>,
     query: String,
+    tls: &TlsOpts,
 ) -> i32 {
-    let stream = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: connection failed: {e}");
-            return 1;
+    match connect_remote(&addr, tls).await {
+        Ok(RemoteStream::Plain(s)) => exec_remote_on(s, db, password, username, query).await,
+        Ok(RemoteStream::Tls(s)) => exec_remote_on(*s, db, password, username, query).await,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            1
         }
-    };
-    let (reader, writer) = stream.into_split();
+    }
+}
+
+async fn exec_remote_on<S>(
+    stream: S,
+    db: String,
+    password: Option<String>,
+    username: Option<String>,
+    query: String,
+) -> i32
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
@@ -1312,7 +1489,10 @@ async fn exec_remote(
             return 1;
         }
         _ => {
-            eprintln!("Error: handshake failed");
+            eprintln!(
+                "Error: handshake failed (server may require TLS; try --tls, \
+                 and --tls-ca <ca.pem> for self-signed certificates)"
+            );
             return 1;
         }
     }
@@ -1564,19 +1744,31 @@ fn run_embedded(data_dir: &str) {
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
 
-async fn run_remote(addr: String, db: String, password: Option<String>, username: Option<String>) {
+async fn run_remote(
+    addr: String,
+    db: String,
+    password: Option<String>,
+    username: Option<String>,
+    tls: &TlsOpts,
+) {
     eprintln!("PowDB v{} — remote mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Connecting to {addr} ...");
 
-    let stream = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error: connection failed: {e}");
+    match connect_remote(&addr, tls).await {
+        Ok(RemoteStream::Plain(s)) => run_remote_on(s, db, password, username).await,
+        Ok(RemoteStream::Tls(s)) => run_remote_on(*s, db, password, username).await,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
             std::process::exit(1);
         }
-    };
+    }
+}
 
-    let (reader, writer) = stream.into_split();
+async fn run_remote_on<S>(stream: S, db: String, password: Option<String>, username: Option<String>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
@@ -1895,6 +2087,69 @@ mod tests {
     #[test]
     fn remote_db_default_matches_ts_client() {
         assert_eq!(DEFAULT_DB_NAME, "default");
+    }
+
+    #[test]
+    fn tls_enabled_env_grammar_matches_server() {
+        // Same truthy grammar as the server's POWDB_REQUIRE_TLS.
+        assert!(parse_tls_enabled(Some("1")));
+        assert!(parse_tls_enabled(Some("true")));
+        assert!(parse_tls_enabled(Some("TRUE")));
+        assert!(parse_tls_enabled(Some(" yes ")));
+        assert!(parse_tls_enabled(Some("on")));
+        assert!(!parse_tls_enabled(Some("0")));
+        assert!(!parse_tls_enabled(Some("")));
+        assert!(!parse_tls_enabled(None));
+    }
+
+    #[test]
+    fn tls_server_name_derivation() {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        // Hostname from host:port.
+        assert_eq!(
+            resolve_tls_server_name("db.example.com:5433", None).unwrap(),
+            ServerName::try_from("db.example.com").unwrap()
+        );
+        // IP literal becomes an IP-address name (valid for IP-SAN certs).
+        assert_eq!(
+            resolve_tls_server_name("127.0.0.1:5433", None).unwrap(),
+            ServerName::try_from("127.0.0.1").unwrap()
+        );
+        // Bracketed IPv6 literal is unwrapped.
+        assert_eq!(
+            resolve_tls_server_name("[::1]:5433", None).unwrap(),
+            ServerName::try_from("::1").unwrap()
+        );
+        // Explicit override wins over the address's host part.
+        assert_eq!(
+            resolve_tls_server_name("127.0.0.1:5433", Some("db.example.com")).unwrap(),
+            ServerName::try_from("db.example.com").unwrap()
+        );
+        // Garbage overrides fail with a clear error.
+        assert!(resolve_tls_server_name("127.0.0.1:5433", Some("bad name!")).is_err());
+    }
+
+    #[test]
+    fn tls_connector_ca_error_paths() {
+        // Missing CA file. (TlsConnector is not Debug, so match manually
+        // instead of unwrap_err.)
+        let Err(err) = build_tls_connector(Some("/nonexistent/ca.pem")) else {
+            panic!("missing CA file must fail");
+        };
+        assert!(err.contains("failed to open TLS CA file"), "{err}");
+        // A file with no certificates in it.
+        let dir = std::env::temp_dir().join(format!("powdb_cli_tls_unit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"not a certificate").unwrap();
+        let Err(err) = build_tls_connector(Some(empty.to_str().unwrap())) else {
+            panic!("certificate-free CA file must fail");
+        };
+        assert!(err.contains("no certificates found"), "{err}");
+        // No CA path: the built-in webpki root store builds fine.
+        assert!(build_tls_connector(None).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

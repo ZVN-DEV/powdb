@@ -1,0 +1,45 @@
+# cargo-deny policy. CI runs `cargo deny check bans licenses sources`
+# (ci.yml `deny` job); advisories are gated separately by the `audit` job
+# (rustsec/audit-check), so the [advisories] section here only mirrors the
+# ignore list for anyone running a full `cargo deny check` locally.
+
+[advisories]
+# Keep in sync with .cargo/audit.toml and the ci.yml `audit` job: these
+# advisories are confined to the publish=false benchmark crate powdb-compare
+# (postgres/mysql comparison deps). No shipping crate is affected.
+ignore = [
+  "RUSTSEC-2026-0179",
+  "RUSTSEC-2026-0180",
+  "RUSTSEC-2026-0178",
+]
+
+[licenses]
+# Permissive-only allowlist covering the current dependency tree.
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "BSL-1.0",
+  "Unlicense",
+  "CC0-1.0",
+  # webpki-roots ships the Mozilla CA root store as data under CDLA-Permissive-2.0
+  # (a permissive data license). Pulled by the TLS stack and, under
+  # --all-features, by the publish=false compare crate's mysql tree.
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate crate versions bloat builds but are not worth failing CI over.
+multiple-versions = "warn"
+
+[sources]
+# Every dependency must come from crates.io: no git deps, no alt registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

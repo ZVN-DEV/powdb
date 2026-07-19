@@ -7,10 +7,14 @@
 //! fsyncs — while every reply still arrives in statement order and full-mode
 //! durability semantics are preserved.
 
+mod common;
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+
+use common::{encode_connect, encode_ping, encode_query, read_response, InprocServer};
 
 const MSG_CONNECT_OK: u8 = 0x02;
 const MSG_RESULT_ROWS: u8 = 0x07;
@@ -18,51 +22,7 @@ const MSG_RESULT_SCALAR: u8 = 0x08;
 const MSG_RESULT_OK: u8 = 0x09;
 const MSG_ERROR: u8 = 0x0A;
 const MSG_RESULT_MSG: u8 = 0x0B;
-const MSG_PING: u8 = 0x11;
 const MSG_PONG: u8 = 0x12;
-
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes()); // empty password = None
-    let mut frame = Vec::new();
-    frame.push(0x01); // CONNECT
-    frame.push(0); // flags
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
-    payload.extend_from_slice(q.as_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x03); // QUERY
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-fn encode_ping() -> Vec<u8> {
-    vec![MSG_PING, 0, 0, 0, 0, 0]
-}
-
-async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    let mut full = Vec::new();
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    full
-}
 
 fn assert_success(resp: &[u8], what: &str) {
     assert_ne!(
@@ -80,55 +40,12 @@ async fn spawn_server(
 ) -> (String, Arc<RwLock<powdb_query::executor::Engine>>) {
     let engine = powdb_query::executor::Engine::new(data_dir).unwrap();
     let engine = Arc::new(RwLock::new(engine));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let tx_gate = powdb_server::handler::new_tx_gate();
-    let server_engine = engine.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = server_engine.clone();
-            let tx_gate = tx_gate.clone();
-            // The sender must stay alive for the connection's lifetime: a
-            // dropped sender makes `changed()` resolve immediately forever,
-            // busy-spinning the connection loop and cancelling in-flight
-            // frame reads (which loses partially-read bytes).
-            let (shutdown_tx, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                let _keep_shutdown_alive = shutdown_tx;
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-    (addr, engine)
+    let (addr, _handle) = InprocServer::default().start(engine.clone()).await;
+    (addr.to_string(), engine)
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "powdb_pipeline_{name}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    common::unique_temp_dir(&format!("pipeline_{name}"))
 }
 
 /// The core contract: a pipelined burst of durable writes gets every reply,

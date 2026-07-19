@@ -1,5 +1,7 @@
 use crate::metrics::{Metrics, QueryOutcome, SyncOperation, SyncOutcome, SyncRepairLabel};
-use crate::protocol::{Message, WireParam, WireRetainedUnit, WireSyncRepairAction, WireSyncStatus};
+use crate::protocol::{
+    ErrorClass, Message, WireParam, WireRetainedUnit, WireSyncRepairAction, WireSyncStatus,
+};
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine, WalDurabilityTicket};
 use powdb_query::parser;
@@ -397,6 +399,52 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     "readonly mode",
 ];
 
+/// Build the client-facing error frame: sanitized message plus the stable
+/// 1-byte [`ErrorClass`]. The class is orthogonal to the message text: it is
+/// derived from the typed error (or the call site), never from the message,
+/// so sanitization to a generic string does not degrade it.
+fn error_response(message: impl Into<String>, class: ErrorClass) -> Message {
+    Message::ErrorWithClass {
+        message: message.into(),
+        class,
+    }
+}
+
+/// Map a [`QueryError`] to its stable wire [`ErrorClass`].
+///
+/// [`QueryError::ReadonlyNeedsWrite`] is an internal retry sentinel the
+/// server intercepts before Display; if it ever reaches classification it is
+/// reported as [`ErrorClass::Internal`], matching the generic message the
+/// caller sends for that path.
+fn classify_query_error(e: &QueryError) -> ErrorClass {
+    match e {
+        QueryError::Parse(_) => ErrorClass::Parse,
+        QueryError::Timeout { .. } => ErrorClass::Timeout,
+        QueryError::Cancelled => ErrorClass::Cancelled,
+        QueryError::ReadonlyMode => ErrorClass::ReadonlyRefused,
+        QueryError::ReadonlyNeedsWrite => ErrorClass::Internal,
+        QueryError::JoinLimitExceeded
+        | QueryError::NestedLoopPairLimitExceeded { .. }
+        | QueryError::SortLimitExceeded
+        | QueryError::MemoryLimitExceeded { .. } => ErrorClass::LimitExceeded,
+        QueryError::TableNotFound(_)
+        | QueryError::ColumnNotFound { .. }
+        | QueryError::TypeError(_)
+        | QueryError::IndexError(_)
+        | QueryError::ViewError(_) => ErrorClass::Execution,
+        QueryError::StorageError(_) => ErrorClass::Internal,
+        QueryError::Execution(msg) => {
+            if msg.starts_with("unique constraint violation") {
+                ErrorClass::ConstraintViolation
+            } else if msg.starts_with("result too large") {
+                ErrorClass::LimitExceeded
+            } else {
+                ErrorClass::Execution
+            }
+        }
+    }
+}
+
 /// Sanitize an error message before sending it to the client.
 /// Known safe errors are passed through; everything else is replaced
 /// with a generic message to avoid leaking internal details.
@@ -688,9 +736,10 @@ fn statement_admission(stmt: &powdb_query::ast::Statement) -> AdmissionMode {
 /// mutating statement, transaction-control frame, or a read that needs a writer
 /// (a stale materialized view). The connection stays usable afterward.
 fn readonly_terminal_message() -> Message {
-    Message::Error {
-        message: sanitize_error(&QueryError::ReadonlyMode.to_string()),
-    }
+    error_response(
+        sanitize_error(&QueryError::ReadonlyMode.to_string()),
+        ErrorClass::ReadonlyRefused,
+    )
 }
 
 #[cfg(test)]
@@ -1745,17 +1794,19 @@ async fn acquire_begin_permit(
     .await
     {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(Message::Error {
-            message: "query execution error".into(),
-        }),
+        Ok(Err(_)) => Err(error_response(
+            "query execution error",
+            ErrorClass::Internal,
+        )),
         Err(_) => {
             metrics.inc_tx_gate_timeout();
-            Err(Message::Error {
-                message: format!(
+            Err(error_response(
+                format!(
                     "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
                     tx_wait_timeout.as_millis()
                 ),
-            })
+                ErrorClass::Timeout,
+            ))
         }
     }
 }
@@ -1792,17 +1843,19 @@ async fn acquire_autocommit_permit(
     let acquire = tx_gate.clone().acquire_many_owned(permits);
     match tokio::time::timeout(tx_wait_timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(Message::Error {
-            message: "query execution error".into(),
-        }),
+        Ok(Err(_)) => Err(error_response(
+            "query execution error",
+            ErrorClass::Internal,
+        )),
         Err(_) => {
             metrics.inc_tx_gate_timeout();
-            Err(Message::Error {
-                message: format!(
+            Err(error_response(
+                format!(
                     "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
                     tx_wait_timeout.as_millis()
                 ),
-            })
+                ErrorClass::Timeout,
+            ))
         }
     }
 }
@@ -1872,11 +1925,12 @@ where
         Some(TransactionControl::Begin) => {
             if tx_permit.is_some() {
                 return (
-                    Message::Error {
-                        message: sanitize_error(
+                    error_response(
+                        sanitize_error(
                             "cannot begin: a transaction is already active on this connection",
                         ),
-                    },
+                        ErrorClass::Execution,
+                    ),
                     None,
                     None,
                 );
@@ -2393,9 +2447,7 @@ where
         Ok((Ok(result), ticket)) => match query_result_to_message(result, result_mode) {
             Ok(message) => (message, ticket, QueryOutcome::Ok, false),
             Err(e) => (
-                Message::Error {
-                    message: sanitize_error(&e.to_string()),
-                },
+                error_response(sanitize_error(&e.to_string()), classify_query_error(&e)),
                 ticket,
                 QueryOutcome::Error,
                 false,
@@ -2404,18 +2456,17 @@ where
         Ok((Err(QueryError::ReadonlyNeedsWrite), ticket)) => {
             if exceeded_timeout {
                 (
-                    Message::Error {
-                        message: sanitize_error(&QueryError::Timeout { timeout_ms }.to_string()),
-                    },
+                    error_response(
+                        sanitize_error(&QueryError::Timeout { timeout_ms }.to_string()),
+                        ErrorClass::Timeout,
+                    ),
                     ticket,
                     QueryOutcome::Timeout,
                     true,
                 )
             } else {
                 (
-                    Message::Error {
-                        message: "query execution error".into(),
-                    },
+                    error_response("query execution error", ErrorClass::Internal),
                     ticket,
                     QueryOutcome::Error,
                     true,
@@ -2437,18 +2488,14 @@ where
                 QueryOutcome::Error
             };
             (
-                Message::Error {
-                    message: sanitize_error(&e.to_string()),
-                },
+                error_response(sanitize_error(&e.to_string()), classify_query_error(&e)),
                 ticket,
                 outcome,
                 false,
             )
         }
         Err(e) => (
-            Message::Error {
-                message: format!("internal error: {e}"),
-            },
+            error_response(format!("internal error: {e}"), ErrorClass::Internal),
             None,
             QueryOutcome::Error,
             false,
@@ -2526,7 +2573,7 @@ fn rollback_open_transaction(engine: Arc<RwLock<Engine>>, principal: Option<Prin
 fn is_query_cancellation_response(message: &Message) -> bool {
     matches!(
         message,
-        Message::Error { message }
+        Message::Error { message } | Message::ErrorWithClass { message, .. }
             if message.starts_with("query timeout after")
                 || message == "query cancelled by client disconnect"
     )
@@ -2759,9 +2806,10 @@ where
             if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                 if is_rate_limited(limiter, ip) {
                     warn!(peer = %peer, "rate limited: too many auth failures");
-                    let err = Message::Error {
-                        message: "too many auth failures, try again later".into(),
-                    };
+                    let err = error_response(
+                        "too many auth failures, try again later",
+                        ErrorClass::RateLimited,
+                    );
                     write_msg(&mut writer, &err).await;
                     return;
                 }
@@ -2782,9 +2830,7 @@ where
                     if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
                         record_auth_failure(limiter, ip);
                     }
-                    let err = Message::Error {
-                        message: "authentication failed".into(),
-                    };
+                    let err = error_response("authentication failed", ErrorClass::AuthFailed);
                     write_msg(&mut writer, &err).await;
                     return;
                 }
@@ -2829,7 +2875,7 @@ where
                 }
                 Err(msg) => {
                     warn!(peer = %peer, db = %db_name, "rejected: unknown database");
-                    let err = Message::Error { message: msg };
+                    let err = error_response(msg, ErrorClass::AuthFailed);
                     write_msg(&mut writer, &err).await;
                     return;
                 }
@@ -2844,9 +2890,7 @@ where
         }
         _ => {
             warn!(peer = %peer, "first message was not CONNECT");
-            let err = Message::Error {
-                message: "expected CONNECT".into(),
-            };
+            let err = error_response("expected CONNECT", ErrorClass::Internal);
             write_msg(&mut writer, &err).await;
             return;
         }
@@ -2888,7 +2932,7 @@ where
                         }
                         Err(_) => {
                             info!(peer = %peer, "idle timeout, closing connection");
-                            let err = Message::Error { message: "idle timeout".into() };
+                            let err = error_response("idle timeout", ErrorClass::Timeout);
                             write_msg(&mut writer, &err).await;
                             break;
                         }
@@ -2898,7 +2942,7 @@ where
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!(peer = %peer, "server shutting down, closing connection");
-                        let err = Message::Error { message: "server shutting down".into() };
+                        let err = error_response("server shutting down", ErrorClass::Internal);
                         write_msg(&mut writer, &err).await;
                         break;
                     }
@@ -2955,9 +2999,9 @@ where
                                 .sum::<usize>()
                     }
                     Message::ResultScalarNative { value } => 5 + native_value_body_len(value),
-                    Message::ResultMessage { message } | Message::Error { message } => {
-                        message.len()
-                    }
+                    Message::ResultMessage { message }
+                    | Message::Error { message }
+                    | Message::ErrorWithClass { message, .. } => message.len(),
                     _ => 16,
                 }
             }
@@ -2986,13 +3030,14 @@ where
                     Message::Query { query } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3018,13 +3063,14 @@ where
                     Message::QuerySql { query } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3050,13 +3096,14 @@ where
                     Message::QueryWithParams { query, params } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3083,13 +3130,14 @@ where
                     Message::QueryNative { query } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3115,13 +3163,14 @@ where
                     Message::QuerySqlNative { query } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3147,13 +3196,14 @@ where
                     Message::QueryWithParamsNative { query, params } => {
                         if query.len() > MAX_QUERY_LENGTH {
                             (
-                                Message::Error {
-                                    message: format!(
+                                error_response(
+                                    format!(
                                         "query too large: {} bytes (max {})",
                                         query.len(),
                                         MAX_QUERY_LENGTH
                                     ),
-                                },
+                                    ErrorClass::LimitExceeded,
+                                ),
                                 None,
                                 None,
                             )
@@ -3280,9 +3330,7 @@ where
                     durability_failed = true;
                     for r in responses.iter_mut() {
                         if is_success_response(r) {
-                            *r = Message::Error {
-                                message: message.clone(),
-                            };
+                            *r = error_response(message.clone(), ErrorClass::Internal);
                         }
                     }
                 }
@@ -3434,9 +3482,7 @@ where
                 debug!(peer = %peer, "received DISCONNECT");
                 break;
             }
-            _ => Message::Error {
-                message: "unexpected message type".into(),
-            },
+            _ => error_response("unexpected message type", ErrorClass::Internal),
         };
 
         if !write_msg(&mut writer, &response).await {
@@ -3745,7 +3791,8 @@ mod tests {
             .await
             .expect_err("must time out while the gate is held");
         match err {
-            Message::Error { message } => {
+            Message::ErrorWithClass { message, class } => {
+                assert_eq!(class, ErrorClass::Timeout);
                 assert!(
                     message.contains("transaction gate timeout after 25ms"),
                     "unexpected message: {message}"
@@ -4023,10 +4070,13 @@ mod tests {
         assert!(termination.is_none());
         assert!(!retry, "a timed-out query must never be resurrected");
         match message {
-            Message::Error { message } => assert!(
-                message.contains("query timeout after 20ms"),
-                "timeout must remain client-visible, got {message}"
-            ),
+            Message::ErrorWithClass { message, class } => {
+                assert_eq!(class, ErrorClass::Timeout);
+                assert!(
+                    message.contains("query timeout after 20ms"),
+                    "timeout must remain client-visible, got {message}"
+                );
+            }
             other => panic!("expected timeout error, got {other:?}"),
         }
         let rendered = metrics.render();

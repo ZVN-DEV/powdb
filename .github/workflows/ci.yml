@@ -23,17 +23,10 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      # x86-64-v2 is only valid on Linux x86_64 runners; ARM Macs need the
-      # default target-cpu. The conditional step below sets RUSTFLAGS for
-      # ubuntu only.
 
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Set RUSTFLAGS (Linux)
-        if: runner.os == 'Linux'
-        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -41,15 +34,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ci-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ci-${{ runner.os }}-
+          shared-key: ci
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -84,15 +71,9 @@ jobs:
           components: miri
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: miri-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            miri-${{ runner.os }}-
+          shared-key: miri
 
       - name: Run miri on powdb-storage (non-mmap modules)
         env:
@@ -120,15 +101,9 @@ jobs:
           components: rust-src
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: asan-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            asan-${{ runner.os }}-
+          shared-key: asan
 
       - name: Run tests with AddressSanitizer
         env:
@@ -178,7 +153,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -201,15 +175,9 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: msrv-build-${{ runner.os }}-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            msrv-build-${{ runner.os }}-${{ steps.msrv.outputs.version }}-
+          shared-key: msrv-build-${{ steps.msrv.outputs.version }}
 
       # `--locked` so a newer-than-MSRV language feature (or a Cargo.lock that
       # only resolves on newer Rust) can't slip past the doc-only consistency
@@ -224,10 +192,6 @@ jobs:
     timeout-minutes: 15
     env:
       CARGO_TERM_COLOR: always
-      # dev.sh builds powdb-server, which picks up target-cpu=native from
-      # .cargo/config.toml and SIGILLs on the heterogeneous shared runner.
-      # Override with a portable baseline, same as the other build jobs.
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -236,15 +200,9 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: examples-smoke-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            examples-smoke-${{ runner.os }}-
+          shared-key: examples-smoke
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
@@ -288,7 +246,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -297,15 +254,9 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ts-client-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ts-client-${{ runner.os }}-
+          shared-key: ts-client
 
       - name: Configure pnpm store
         working-directory: clients/ts
@@ -356,9 +307,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      # Portable target so the napi cdylib doesn't SIGILL on shared runners
-      # (mirrors the other Rust jobs).
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -369,15 +317,10 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            bindings/node/target
-          key: node-addon-${{ runner.os }}-${{ hashFiles('bindings/node/Cargo.lock') }}
-          restore-keys: |
-            node-addon-${{ runner.os }}-
+          shared-key: node-addon
+          workspaces: bindings/node
 
       - name: rustfmt
         working-directory: bindings/node
@@ -406,7 +349,6 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
-      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -415,16 +357,12 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cargo cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            bindings/node/target
-          key: embedded-sync-js-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'bindings/node/Cargo.lock') }}
-          restore-keys: |
-            embedded-sync-js-${{ runner.os }}-
+          shared-key: embedded-sync-js
+          workspaces: |
+            .
+            bindings/node
 
       - name: Build release CLI and server
         run: cargo build --release -p powdb-cli -p powdb-server
@@ -564,6 +502,24 @@ jobs:
           fi
           echo "internal-content-guard: clean."
 
+  # Supply-chain policy gate: license allowlist, duplicate-version warnings,
+  # and crates.io-only sources, driven by deny.toml at the repo root.
+  # Advisories are deliberately NOT checked here: the `audit` job (rustsec
+  # audit-check) already gates them, so cargo-deny only covers what audit
+  # doesn't.
+  deny:
+    name: cargo deny (licenses, bans, sources)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses sources
+
   # Single aggregator gate. Make THIS the only required status check on `main`
   # (Settings → Branches → branch protection → require "ci-success"). It depends
   # on every other CI job and fails if any of them did not succeed, so the full
@@ -588,6 +544,7 @@ jobs:
       - embedded-sync-js
       - secret-scan
       - audit
+      - deny
       - internal-content-guard
     steps:
       - name: Verify every required job succeeded
