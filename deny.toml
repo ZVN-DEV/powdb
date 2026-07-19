@@ -28,6 +28,10 @@ allow = [
   "BSL-1.0",
   "Unlicense",
   "CC0-1.0",
+  # webpki-roots ships the Mozilla CA root store as data under CDLA-Permissive-2.0
+  # (a permissive data license). Pulled by the TLS stack and, under
+  # --all-features, by the publish=false compare crate's mysql tree.
+  "CDLA-Permissive-2.0",
 ]
 
 [bans]

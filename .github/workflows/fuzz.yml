@@ -99,6 +99,13 @@ jobs:
       # Both dirs are mkdir'd so targets without checked-in seeds still run.
       - name: Run ${{ matrix.target }} for ${{ matrix.budget }}s
         working-directory: crates/query
+        env:
+          # fuzz_wal_replay builds its crashed-database template once via
+          # std::mem::forget (the standard crash-simulation technique, same as
+          # the durability test suite), which LeakSanitizer reports as a
+          # one-time ~13KB leak at exit. Disable leak detection for that
+          # target only; ASan's memory-error detection stays fully on.
+          ASAN_OPTIONS: ${{ matrix.target == 'fuzz_wal_replay' && 'detect_leaks=0' || '' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
           cargo fuzz run ${{ matrix.target }} \
