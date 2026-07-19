@@ -1,0 +1,3 @@
+# Pin formatting to the workspace edition (see [workspace.package] in
+# Cargo.toml) so rustfmt behaves the same in and out of cargo.
+edition = "2021"

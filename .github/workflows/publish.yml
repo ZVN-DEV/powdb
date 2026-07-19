@@ -52,12 +52,8 @@ jobs:
       id-token: write # mint a short-lived crates.io token via OIDC
     env:
       CARGO_TERM_COLOR: always
-      # The repo's .cargo/config.toml sets `target-cpu=native` for local M1 dev.
-      # On GitHub's heterogeneous shared-runner fleet that flag makes rustc emit
-      # instructions the underlying (often live-migrated) silicon can't execute,
-      # so the verification build dies with SIGILL. Every other workflow
-      # (ci/release/bench) overrides it with a portable baseline; publish.yml was
-      # the one that didn't. Match them so the publish gate is reproducible.
+      # Kept explicit: publish verification builds should use the same portable
+      # baseline as the released binaries, documented here on purpose.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
     steps:

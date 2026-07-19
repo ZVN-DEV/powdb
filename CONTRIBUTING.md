@@ -10,9 +10,23 @@
 ```bash
 git clone https://github.com/zvndev/powdb.git
 cd powdb
+git config core.hooksPath .githooks   # enable the fast pre-commit gate (fmt + version consistency)
 cargo build --workspace
 cargo test --workspace
 ```
+
+### Optional: host-CPU-tuned local builds
+
+The checked-in `.cargo/config.toml` sets no rustflags, so default builds are
+portable. To opt in to host-specific instructions (NEON/AVX, faster WAL CRC)
+for local benchmarking, set `CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"` in
+your shell, or add the flag to an untracked personal config such as
+`~/.cargo/config.toml`. Never commit `target-cpu=native`: it SIGILLs on CI's
+shared runners.
+
+### Watch mode
+
+For an edit-compile loop, `cargo install bacon && bacon` (or `cargo watch -x "check --workspace"`) rechecks the workspace on every save.
 
 ## Build Commands
 

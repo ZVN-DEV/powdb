@@ -25,7 +25,7 @@ run bash scripts/check-version-consistency.sh
 # Validate crates can be packaged without credentials. This is lighter and less
 # network-sensitive than publish --dry-run, while still catching missing files
 # and manifest/package metadata issues before the credentialed publish step.
-for crate in powdb-storage powdb-auth powdb-query powdb-sync powdb-backup powdb-server powdb-cli; do
+for crate in powdb-storage powdb-auth powdb-query powdb-sync powdb-backup powdb-server powdb powdb-cli; do
   run cargo package -p "$crate" --allow-dirty --list >/dev/null
 done
 
