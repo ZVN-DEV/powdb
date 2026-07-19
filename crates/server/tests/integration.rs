@@ -1,112 +1,24 @@
+mod common;
+
+use common::{encode_connect, encode_connect_user, read_response, unique_temp_dir, InprocServer};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    // Empty password (len=0) means None
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x01); // CONNECT
-    frame.push(0); // flags
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-/// Encode a CONNECT frame carrying db_name + password + username, exercising
-/// the real wire encoder so the test depends on the actual protocol.
-fn encode_connect_user(db: &str, password: &str, username: &str) -> Vec<u8> {
-    powdb_server::protocol::Message::Connect {
-        db_name: db.to_string(),
-        password: Some(zeroize::Zeroizing::new(password.to_string())),
-        username: Some(username.to_string()),
-    }
-    .encode()
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
-    payload.extend_from_slice(q.as_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x03); // QUERY
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    let mut full = Vec::new();
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    full
-}
+use common::encode_query;
 
 #[tokio::test]
 async fn test_full_lifecycle() {
-    // Use a unique port and temp dir to avoid conflicts with parallel tests
-    let test_id = std::process::id();
-    let port = 15433 + (test_id % 1000) as u16;
-    let data_dir = std::env::temp_dir().join(format!("powdb_integ_{test_id}"));
+    let data_dir = unique_temp_dir("integ");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
 
-    let addr = format!("127.0.0.1:{port}");
-    let bind_addr = addr.clone();
-
-    // Start server in background
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = std::sync::Arc::new(std::sync::RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            let peer_addr = Some(peer);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users: std::sync::Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr,
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
-    // Give server time to bind
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer::default().start(engine).await;
 
     // Connect
-    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(&encode_connect("testdb")).await.unwrap();
     let resp = read_response(&mut stream).await;
     assert_eq!(resp[0], 0x02, "expected CONNECT_OK");
@@ -181,59 +93,16 @@ async fn test_full_lifecycle() {
 /// back-to-back in a SINGLE TCP write, without waiting for CONNECT_OK in
 /// between. The server reads frames sequentially off one buffered reader, so
 /// it must answer every frame, in order. Eager clients rely on this wire
-/// contract to shave a full round trip off fresh connections — if this test
+/// contract to shave a full round trip off fresh connections; if this test
 /// breaks, pipelined connects break with it.
 #[tokio::test]
 async fn test_connect_and_queries_pipelined_in_single_write() {
-    use std::sync::{Arc, RwLock};
-
-    let unique = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let data_dir = std::env::temp_dir().join(format!("powdb_pipelined_{unique}"));
+    let data_dir = unique_temp_dir("pipelined");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer::default().start(engine).await;
 
     // CONNECT + DDL QUERY in one write: the handshake reply must come first,
     // then the query result.
@@ -286,55 +155,13 @@ async fn test_connect_and_queries_pipelined_in_single_write() {
 #[tokio::test]
 async fn explicit_transaction_blocks_other_connections_until_closed() {
     use powdb_server::protocol::Message;
-    use std::sync::{Arc, RwLock};
 
-    let unique = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let data_dir = std::env::temp_dir().join(format!("powdb_tx_gate_{unique}"));
+    let data_dir = unique_temp_dir("tx_gate");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer::default().start(engine).await;
 
     let mut tx_client = TcpStream::connect(addr).await.unwrap();
     tx_client
@@ -400,55 +227,13 @@ async fn explicit_transaction_blocks_other_connections_until_closed() {
 #[tokio::test]
 async fn dropped_connection_mid_transaction_rolls_back_and_frees_gate() {
     use powdb_server::protocol::Message;
-    use std::sync::{Arc, RwLock};
 
-    let unique = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let data_dir = std::env::temp_dir().join(format!("powdb_tx_drop_{unique}"));
+    let data_dir = unique_temp_dir("tx_drop");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer::default().start(engine).await;
 
     // Connection A: open a transaction, insert an uncommitted row, then drop the
     // socket WITHOUT committing or rolling back.
@@ -513,11 +298,8 @@ async fn dropped_connection_mid_transaction_rolls_back_and_frees_gate() {
 #[tokio::test]
 async fn test_user_auth_handshake() {
     use powdb_auth::UserStore;
-    use std::sync::{Arc, RwLock};
 
-    let test_id = std::process::id();
-    let port = 16500 + (test_id % 1000) as u16;
-    let data_dir = std::env::temp_dir().join(format!("powdb_userauth_{test_id}"));
+    let data_dir = unique_temp_dir("userauth");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Seed a user store with one user.
@@ -525,50 +307,18 @@ async fn test_user_auth_handshake() {
     store.create_user("alice", "pw", "readwrite").unwrap();
     let users = Arc::new(store);
 
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let addr = format!("127.0.0.1:{port}");
-    let bind_addr = addr.clone();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let users = users.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users,
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer {
+        users,
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
 
     // Valid user → CONNECT_OK.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "pw", "alice"))
             .await
@@ -579,7 +329,7 @@ async fn test_user_auth_handshake() {
 
     // Wrong password → ERROR.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "wrong", "alice"))
             .await
@@ -590,7 +340,7 @@ async fn test_user_auth_handshake() {
 
     // Unknown user → ERROR.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "pw", "mallory"))
             .await
@@ -602,7 +352,7 @@ async fn test_user_auth_handshake() {
     // Missing username (old-style connect with password only) → ERROR because
     // the store has users.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         let frame = powdb_server::protocol::Message::Connect {
             db_name: "testdb".into(),
             password: Some(zeroize::Zeroizing::new("pw".into())),
@@ -622,59 +372,21 @@ async fn test_user_auth_handshake() {
 /// password connects, wrong password is rejected.
 #[tokio::test]
 async fn test_empty_store_shared_password_fallback() {
-    use powdb_auth::UserStore;
-    use std::sync::{Arc, RwLock};
-
-    let test_id = std::process::id();
-    let port = 17500 + (test_id % 1000) as u16;
-    let data_dir = std::env::temp_dir().join(format!("powdb_sharedpw_{test_id}"));
+    let data_dir = unique_temp_dir("sharedpw");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let users = Arc::new(UserStore::new()); // empty → fallback
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let addr = format!("127.0.0.1:{port}");
-    let bind_addr = addr.clone();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let users = users.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: Some(zeroize::Zeroizing::new("sekret".into())),
-                        users,
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer {
+        expected_password: Some("sekret".into()),
+        ..Default::default() // empty UserStore → fallback
+    }
+    .start(engine)
+    .await;
 
     // Right shared password, no username → CONNECT_OK.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         let frame = powdb_server::protocol::Message::Connect {
             db_name: "testdb".into(),
             password: Some(zeroize::Zeroizing::new("sekret".into())),
@@ -707,7 +419,7 @@ async fn test_empty_store_shared_password_fallback() {
 
     // Wrong shared password → ERROR.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         let frame = powdb_server::protocol::Message::Connect {
             db_name: "testdb".into(),
             password: Some(zeroize::Zeroizing::new("nope".into())),
@@ -726,17 +438,14 @@ async fn test_empty_store_shared_password_fallback() {
 /// Fix 2 (authorization bypass): the `readonly` role must be enforced at the
 /// server dispatch boundary. A readonly user can run read statements but every
 /// write (insert/update/delete/DDL/transaction control) is rejected with a
-/// clean "permission denied" error — and the connection stays alive.
+/// clean "permission denied" error, and the connection stays alive.
 /// `readwrite` and `admin` users keep full query access.
 #[tokio::test]
 async fn test_readonly_role_enforced_over_tcp() {
     use powdb_auth::UserStore;
     use powdb_server::protocol::Message;
-    use std::sync::{Arc, RwLock};
 
-    let test_id = std::process::id();
-    let port = 18500 + (test_id % 1000) as u16;
-    let data_dir = std::env::temp_dir().join(format!("powdb_rbac_{test_id}"));
+    let data_dir = unique_temp_dir("rbac");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let mut store = UserStore::new();
@@ -745,50 +454,18 @@ async fn test_readonly_role_enforced_over_tcp() {
     store.create_user("ro", "pw", "readonly").unwrap();
     let users = Arc::new(store);
 
-    let data_dir_str = data_dir.to_str().unwrap().to_string();
-    let addr = format!("127.0.0.1:{port}");
-    let bind_addr = addr.clone();
-
-    let handle = tokio::spawn(async move {
-        let engine =
-            powdb_query::executor::Engine::new(std::path::Path::new(&data_dir_str)).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
-        let tx_gate = powdb_server::handler::new_tx_gate();
-        let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let users = users.clone();
-            let (_, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: None,
-                        users,
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout: Duration::from_secs(30),
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let (addr, handle) = InprocServer {
+        users,
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
 
     // Admin seeds the schema + one row.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "pw", "root"))
             .await
@@ -819,7 +496,7 @@ async fn test_readonly_role_enforced_over_tcp() {
 
     // Readonly user: reads OK, every write shape rejected, connection alive.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "pw", "ro"))
             .await
@@ -887,7 +564,7 @@ async fn test_readonly_role_enforced_over_tcp() {
 
     // Readwrite user keeps full write access.
     {
-        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(&encode_connect_user("testdb", "pw", "rw"))
             .await

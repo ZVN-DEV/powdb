@@ -4,81 +4,23 @@
 //! disconnects (the RAII guard wiring in `main.rs`).
 #![cfg(unix)]
 
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
+use std::process::Child;
+use std::time::Duration;
+
+use common::{
+    encode_connect, encode_query, free_port, read_response, spawn_server_bin, wait_for_bind,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x01);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
-    payload.extend_from_slice(q.as_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x03);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    header.to_vec()
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn spawn_server(port: u16, metrics_port: u16, data_dir: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_powdb-server"))
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--metrics-addr")
-        .arg(format!("127.0.0.1:{metrics_port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn powdb-server binary")
-}
-
-async fn wait_for_bind(port: u16, within: Duration) -> TcpStream {
-    let start = Instant::now();
-    loop {
-        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-            return stream;
-        }
-        assert!(
-            start.elapsed() <= within,
-            "nothing listening on port {port} within {within:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    spawn_server_bin(
+        port,
+        data_dir,
+        &["--metrics-addr", &format!("127.0.0.1:{metrics_port}")],
+    )
 }
 
 /// One-shot HTTP GET against the metrics endpoint; returns the full response.

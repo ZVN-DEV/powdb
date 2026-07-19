@@ -5,11 +5,14 @@
 //! coverage uses a 30-second deadline but requires recovery within two seconds,
 //! so passing cannot be explained by eventual deadline cancellation.
 
+mod common;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use common::{encode_connect, InprocServer};
 use powdb_query::executor::Engine;
 use powdb_server::metrics::Metrics;
 use powdb_server::protocol::{Message, WireParam};
@@ -77,31 +80,8 @@ impl QueryRoute {
     }
 }
 
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x01);
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
 async fn read_response(stream: &mut TcpStream) -> Message {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    let mut full = Vec::with_capacity(6 + payload_len);
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    Message::decode(&full).unwrap()
+    common::read_response_message(stream).await
 }
 
 async fn start_join_server(
@@ -141,43 +121,18 @@ async fn start_join_server(
     }
 
     let engine = Arc::new(RwLock::new(engine));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let tx_gate = powdb_server::handler::new_tx_gate();
     let metrics = Arc::new(Metrics::new());
-    let server_metrics = metrics.clone();
 
-    let handle = tokio::spawn(async move {
-        loop {
-            let (stream, peer) = listener.accept().await.unwrap();
-            let engine = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let metrics = server_metrics.clone();
-            let (_tx, mut rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                powdb_server::handler::handle_connection(
-                    stream,
-                    powdb_server::handler::ConnOpts {
-                        tx_wait_timeout,
-                        db_name: None,
-                        engine,
-                        tx_gate,
-                        expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout: Duration::from_secs(300),
-                        query_timeout,
-                        rate_limiter: None,
-                        peer_addr: Some(peer),
-                        metrics,
-                    },
-                )
-                .await;
-            });
-        }
-    });
+    let (addr, handle) = InprocServer {
+        tx_wait_timeout,
+        query_timeout,
+        metrics: metrics.clone(),
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
 
-    (addr, handle, metrics)
+    (addr.to_string(), handle, metrics)
 }
 
 async fn connect(addr: &str) -> TcpStream {
