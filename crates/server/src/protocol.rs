@@ -61,6 +61,95 @@ const MAX_SYNC_UNITS: usize = 4096;
 
 const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
 
+/// Stable 1-byte error classification carried at the tail of a `MSG_ERROR`
+/// payload.
+///
+/// Wire contract: the `MSG_ERROR` payload is a length-prefixed message string,
+/// optionally followed by exactly one trailing class byte. Every first-party
+/// decoder (this module, the TS client, the CLI via this module) reads the
+/// string by its length prefix and ignores trailing payload bytes, so:
+///   - old client + new server: the class byte is silently skipped,
+///   - new client + old server: the byte is absent and decodes as "no class".
+///
+/// The class is orthogonal to message sanitization: it is safe metadata even
+/// when the message text is masked to a generic string.
+///
+/// STABILITY: these numeric values are wire-stable and documented in
+/// docs/errors.md. Never renumber or reuse a value; only append new classes.
+/// Clients must treat unknown values as [`ErrorClass::Internal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ErrorClass {
+    /// Unclassified or internal server error (also the fallback for values a
+    /// client does not recognize).
+    Internal = 0,
+    /// The query text failed to lex or parse.
+    Parse = 1,
+    /// Planning or execution failed (unknown table or column, type
+    /// mismatch, unsupported statement, ...).
+    Execution = 2,
+    /// A time budget elapsed: per-query timeout, transaction-gate wait,
+    /// cooperative deadline cancellation, or idle-connection timeout.
+    Timeout = 3,
+    /// A memory or size limit was exceeded (sort/join row caps, per-query
+    /// memory budget, oversized query text, oversized result).
+    LimitExceeded = 4,
+    /// The server serves a read-only snapshot and the statement requires a
+    /// writer.
+    ReadonlyRefused = 5,
+    /// Authentication or database selection failed at CONNECT time.
+    AuthFailed = 6,
+    /// Too many failed authentication attempts from this address.
+    RateLimited = 7,
+    /// A constraint (e.g. a unique index) rejected the write.
+    ConstraintViolation = 8,
+    /// Execution was cancelled cooperatively (client disconnect).
+    Cancelled = 9,
+}
+
+impl ErrorClass {
+    /// The stable wire byte for this class.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse a wire byte back into a class. Unknown (future) values return
+    /// `None`; callers should treat them as [`ErrorClass::Internal`].
+    pub fn from_u8(raw: u8) -> Option<ErrorClass> {
+        Some(match raw {
+            0 => ErrorClass::Internal,
+            1 => ErrorClass::Parse,
+            2 => ErrorClass::Execution,
+            3 => ErrorClass::Timeout,
+            4 => ErrorClass::LimitExceeded,
+            5 => ErrorClass::ReadonlyRefused,
+            6 => ErrorClass::AuthFailed,
+            7 => ErrorClass::RateLimited,
+            8 => ErrorClass::ConstraintViolation,
+            9 => ErrorClass::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+/// Extract the trailing error-class byte from a full `MSG_ERROR` frame, if
+/// present. Returns `None` for non-error frames, malformed frames, and
+/// legacy error frames that carry only the message string.
+pub fn decode_error_class(frame: &[u8]) -> Option<u8> {
+    if frame.len() < 6 || frame[0] != MSG_ERROR {
+        return None;
+    }
+    let payload_len = u32::from_le_bytes(frame[2..6].try_into().ok()?) as usize;
+    let payload = frame.get(6..6 + payload_len)?;
+    let string_len = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+    // Exactly one byte after the length-prefixed message string.
+    if payload.len() == 4 + string_len + 1 {
+        Some(payload[4 + string_len])
+    } else {
+        None
+    }
+}
+
 /// A positional parameter value carried by [`Message::QueryWithParams`].
 ///
 /// Wire encoding per param: a 1-byte tag followed by the body —
@@ -225,6 +314,15 @@ pub enum Message {
     Error {
         message: String,
     },
+    /// An error carrying its stable [`ErrorClass`] byte after the message
+    /// string. Encodes to the same `MSG_ERROR` tag as [`Message::Error`];
+    /// decoding a `MSG_ERROR` frame deliberately yields [`Message::Error`]
+    /// regardless (the class byte is a trailing extension that legacy
+    /// decoders skip; clients that want it call [`decode_error_class`]).
+    ErrorWithClass {
+        message: String,
+        class: ErrorClass,
+    },
     Disconnect,
     Ping,
     Pong,
@@ -366,6 +464,11 @@ impl Message {
             Message::ResultOk { affected } => (MSG_RESULT_OK, affected.to_le_bytes().to_vec()),
             Message::ResultMessage { message } => (MSG_RESULT_MSG, encode_string(message)),
             Message::Error { message } => (MSG_ERROR, encode_string(message)),
+            Message::ErrorWithClass { message, class } => {
+                let mut buf = encode_string(message);
+                buf.push(class.as_u8());
+                (MSG_ERROR, buf)
+            }
             Message::Disconnect => (MSG_DISCONNECT, Vec::new()),
             Message::Ping => (MSG_PING, Vec::new()),
             Message::Pong => (MSG_PONG, Vec::new()),
@@ -1525,6 +1628,85 @@ mod tests {
             Message::Error { message } => assert_eq!(message, "table not found"),
             _ => panic!("expected Error"),
         }
+    }
+
+    #[test]
+    fn error_with_class_appends_one_trailing_byte() {
+        let plain = Message::Error {
+            message: "table 'users' not found".into(),
+        }
+        .encode();
+        let classed = Message::ErrorWithClass {
+            message: "table 'users' not found".into(),
+            class: ErrorClass::Execution,
+        }
+        .encode();
+        // Same tag, payload one byte longer, identical prefix.
+        assert_eq!(classed[0], plain[0]);
+        assert_eq!(classed.len(), plain.len() + 1);
+        assert_eq!(&classed[6..plain.len()], &plain[6..]);
+        assert_eq!(*classed.last().unwrap(), ErrorClass::Execution.as_u8());
+    }
+
+    #[test]
+    fn old_style_decode_of_classed_error_frame_yields_message() {
+        // An old client's decoder (this decode path, unchanged) must read the
+        // message string by its length prefix and skip the trailing class
+        // byte a new server appends.
+        let frame = Message::ErrorWithClass {
+            message: "query timeout after 75ms".into(),
+            class: ErrorClass::Timeout,
+        }
+        .encode();
+        match Message::decode(&frame).unwrap() {
+            Message::Error { message } => assert_eq!(message, "query timeout after 75ms"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_error_class_reads_trailing_byte_when_present() {
+        let classed = Message::ErrorWithClass {
+            message: "authentication failed".into(),
+            class: ErrorClass::AuthFailed,
+        }
+        .encode();
+        assert_eq!(decode_error_class(&classed), Some(6));
+
+        // Legacy frame from an old server: no trailing byte, no class.
+        let plain = Message::Error {
+            message: "authentication failed".into(),
+        }
+        .encode();
+        assert_eq!(decode_error_class(&plain), None);
+
+        // Non-error frames never yield a class.
+        let ok = Message::ResultOk { affected: 1 }.encode();
+        assert_eq!(decode_error_class(&ok), None);
+    }
+
+    #[test]
+    fn error_class_bytes_are_stable() {
+        // These values are the documented wire contract (docs/errors.md).
+        // Appending new classes is fine; renumbering is a protocol break.
+        let expected: [(ErrorClass, u8); 10] = [
+            (ErrorClass::Internal, 0),
+            (ErrorClass::Parse, 1),
+            (ErrorClass::Execution, 2),
+            (ErrorClass::Timeout, 3),
+            (ErrorClass::LimitExceeded, 4),
+            (ErrorClass::ReadonlyRefused, 5),
+            (ErrorClass::AuthFailed, 6),
+            (ErrorClass::RateLimited, 7),
+            (ErrorClass::ConstraintViolation, 8),
+            (ErrorClass::Cancelled, 9),
+        ];
+        for (class, byte) in expected {
+            assert_eq!(class.as_u8(), byte, "{class:?}");
+            assert_eq!(ErrorClass::from_u8(byte), Some(class));
+        }
+        assert_eq!(ErrorClass::from_u8(10), None, "future bytes must be None");
+        assert_eq!(ErrorClass::from_u8(255), None);
     }
 
     #[test]

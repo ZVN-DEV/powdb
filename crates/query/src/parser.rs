@@ -7,18 +7,28 @@ use crate::token::Token;
 /// parentheses, subqueries, or CASE expressions.
 const MAX_NESTING_DEPTH: usize = 64;
 
-/// Discriminated parse error — callers can match on category.
-#[derive(Debug)]
+/// Discriminated parse error; callers can match on category.
+///
+/// Display strings are wire-visible behavior (the server's egress
+/// sanitization prefix-matches them). Every message is pinned byte-exact by
+/// `tests/error_display.rs`; do not reword one without updating that suite
+/// deliberately.
+#[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// Lexer failed to tokenize the input.
+    #[error("at position {position}: {message}")]
     Lex { message: String, position: usize },
     /// Expected one token but found another.
+    #[error("expected {expected}, got {got}")]
     UnexpectedToken { expected: String, got: String },
     /// Recursive nesting exceeded the safety limit.
+    #[error("query nesting depth exceeds maximum of {max}")]
     NestingDepthExceeded { max: usize },
     /// Syntactically valid construct that the engine doesn't support yet.
+    #[error("{feature}")]
     Unsupported { feature: String },
     /// Catch-all for other syntax errors.
+    #[error("{message}")]
     Syntax { message: String },
 }
 
@@ -28,24 +38,6 @@ impl ParseError {
         self.to_string()
     }
 }
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lex { message, position } => write!(f, "at position {position}: {message}"),
-            Self::UnexpectedToken { expected, got } => {
-                write!(f, "expected {expected}, got {got}")
-            }
-            Self::NestingDepthExceeded { max } => {
-                write!(f, "query nesting depth exceeds maximum of {max}")
-            }
-            Self::Unsupported { feature } => write!(f, "{feature}"),
-            Self::Syntax { message } => write!(f, "{message}"),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 fn token_to_scalar_fn(tok: &Token) -> ScalarFn {
     match tok {
