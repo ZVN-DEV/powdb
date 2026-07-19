@@ -71,6 +71,18 @@ The bundled CLI supports TLS in remote mode (unreleased, lands in the next relea
 
 Without any TLS flags the CLI behaves exactly as before and connects over plaintext TCP. On releases before this lands, the bundled CLI has no TLS support and cannot reach a TLS-required server; use the TS client or a TLS-terminating tunnel instead.
 
+To generate a self-signed certificate for testing (a plain `openssl req -x509` one-liner often produces a CA-flagged certificate that rustls rejects as an end-entity cert; the `-addext` flags below avoid that):
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout server.key -out server.crt -days 365 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=digitalSignature" -addext "extendedKeyUsage=serverAuth"
+# server: POWDB_TLS_CERT=server.crt POWDB_TLS_KEY=server.key powdb-server ...
+# client: powdb-cli --remote 127.0.0.1:5433 --tls --tls-ca server.crt ...
+```
+
 ## Authentication
 
 PowDB supports two authentication modes:

@@ -14,30 +14,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use common::{encode_connect_with_password, fresh_engine, read_message, InprocServer};
+use common::{
+    encode_connect, encode_connect_with_password, encode_query, fresh_engine, read_message,
+    InprocServer,
+};
 use powdb_query::executor::Engine;
 use powdb_server::handler::{handle_connection, new_rate_limiter, new_tx_gate, ConnOpts};
 use powdb_server::protocol::Message;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn encode_connect(db: &str) -> Vec<u8> {
-    Message::Connect {
-        db_name: db.to_string(),
-        password: None,
-        username: None,
-    }
-    .encode()
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    Message::Query {
-        query: q.to_string(),
-    }
-    .encode()
-}
 
 /// Start a server that accepts a single connection with given opts.
 /// Returns the address to connect to.

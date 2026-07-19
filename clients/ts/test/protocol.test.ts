@@ -1211,7 +1211,7 @@ async function main() {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
-  console.log("\nError frames — trailing class byte");
+  console.log("\nError frames: trailing class byte");
 
   // Build a raw MSG_ERROR (0x0a) frame: length-prefixed message string,
   // optionally followed by one class byte (0.17+ servers).

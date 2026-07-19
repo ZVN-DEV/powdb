@@ -37,9 +37,13 @@ jobs:
       # binary, powdb-server installs the `powdb-server` binary. Install both
       # from the LIVE registry (no local build) at the requested version.
       - name: Install powdb-cli and powdb-server from crates.io
+        env:
+          # Pass the input through env rather than interpolating into the
+          # script, so a crafted dispatch input cannot inject shell.
+          SMOKE_VERSION: ${{ inputs.version }}
         run: |
-          cargo install powdb-cli --version "${{ inputs.version }}" --locked
-          cargo install powdb-server --version "${{ inputs.version }}" --locked
+          cargo install powdb-cli --version "$SMOKE_VERSION" --locked
+          cargo install powdb-server --version "$SMOKE_VERSION" --locked
           powdb-cli --version || true
           powdb-server --version || true
 
@@ -63,16 +67,21 @@ jobs:
           node-version: "22"
 
       - name: Install published packages from npm
+        env:
+          # Env passthrough, not inline interpolation (shell-injection hygiene).
+          SMOKE_VERSION: ${{ inputs.version }}
         run: |
           mkdir -p /tmp/npm-smoke && cd /tmp/npm-smoke
           npm init -y >/dev/null
-          npm install "@zvndev/powdb-client@${{ inputs.version }}" \
-                      "@zvndev/powdb-embedded@${{ inputs.version }}"
+          npm install "@zvndev/powdb-client@$SMOKE_VERSION" \
+                      "@zvndev/powdb-embedded@$SMOKE_VERSION"
 
       # Dependency-free node script: import the networked client and check its
       # exported version, then open a real embedded database, insert, and query.
       - name: Exercise client and embedded packages
         working-directory: /tmp/npm-smoke
+        env:
+          SMOKE_VERSION: ${{ inputs.version }}
         run: |
           cat > smoke.mjs <<'EOF'
           import assert from "node:assert/strict";
@@ -101,4 +110,4 @@ jobs:
           db.close();
           console.log("npm embedded smoke OK: count =", res.value);
           EOF
-          SMOKE_VERSION="${{ inputs.version }}" node smoke.mjs
+          node smoke.mjs

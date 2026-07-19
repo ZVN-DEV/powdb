@@ -1489,7 +1489,10 @@ where
             return 1;
         }
         _ => {
-            eprintln!("Error: handshake failed");
+            eprintln!(
+                "Error: handshake failed (server may require TLS; try --tls, \
+                 and --tls-ca <ca.pem> for self-signed certificates)"
+            );
             return 1;
         }
     }
