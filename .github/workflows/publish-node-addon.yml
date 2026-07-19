@@ -52,6 +52,8 @@ jobs:
           # dispatch queued on that job for 24h until the whole run was
           # auto-cancelled (run 28411040225), which is why the 0.7.2 addon
           # never shipped. Intel-mac users build from source, as on 0.7.x.
+          # Kept explicit: the published linux-x64 .node binary must stay
+          # portable across x86-64-v2 CPUs, not tuned to the build host.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             rustflags: "-C target-cpu=x86-64-v2"

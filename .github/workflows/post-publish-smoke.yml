@@ -1,0 +1,104 @@
+name: post-publish-smoke
+
+# Smoke-tests a version that is ALREADY LIVE on the public registries
+# (crates.io + npm), exactly as a new user would install it. Run it after a
+# release lands (RELEASES.md checklist) or on demand for any published version.
+#
+# Deliberately NOT part of the ci-success required-check aggregator: it
+# exercises live registry state, not the code in this repo, so a registry
+# outage or propagation delay must never block merges to main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version to smoke (e.g. 0.16.0)"
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crates-io:
+    name: crates.io install + durability smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (for scripts/smoke-release.sh only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Both binaries ship as separate crates: powdb-cli installs the `powdb-cli`
+      # binary, powdb-server installs the `powdb-server` binary. Install both
+      # from the LIVE registry (no local build) at the requested version.
+      - name: Install powdb-cli and powdb-server from crates.io
+        run: |
+          cargo install powdb-cli --version "${{ inputs.version }}" --locked
+          cargo install powdb-server --version "${{ inputs.version }}" --locked
+          powdb-cli --version || true
+          powdb-server --version || true
+
+      # Same gate as release.yml's durability smoke (README PowQL flow +
+      # unique constraint + kill -9/restart WAL replay), but pointed at the
+      # binaries installed from crates.io instead of a local build.
+      - name: Durability smoke against installed registry binaries
+        env:
+          POWDB_CLI: /home/runner/.cargo/bin/powdb-cli
+          POWDB_SERVER: /home/runner/.cargo/bin/powdb-server
+        run: bash scripts/smoke-release.sh
+
+  npm:
+    name: npm install + import smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Install published packages from npm
+        run: |
+          mkdir -p /tmp/npm-smoke && cd /tmp/npm-smoke
+          npm init -y >/dev/null
+          npm install "@zvndev/powdb-client@${{ inputs.version }}" \
+                      "@zvndev/powdb-embedded@${{ inputs.version }}"
+
+      # Dependency-free node script: import the networked client and check its
+      # exported version, then open a real embedded database, insert, and query.
+      - name: Exercise client and embedded packages
+        working-directory: /tmp/npm-smoke
+        run: |
+          cat > smoke.mjs <<'EOF'
+          import assert from "node:assert/strict";
+          import { mkdtempSync } from "node:fs";
+          import { tmpdir } from "node:os";
+          import { join } from "node:path";
+          import { createRequire } from "node:module";
+          import { Client, CLIENT_VERSION } from "@zvndev/powdb-client";
+
+          const expected = process.env.SMOKE_VERSION;
+          assert.ok(Client, "client: Client export missing");
+          assert.equal(CLIENT_VERSION, expected,
+            `client: CLIENT_VERSION ${CLIENT_VERSION} != ${expected}`);
+          console.log("npm client smoke OK:", CLIENT_VERSION);
+
+          const require = createRequire(import.meta.url);
+          const { Database } = require("@zvndev/powdb-embedded");
+          const dir = mkdtempSync(join(tmpdir(), "powdb-post-publish-"));
+          const db = Database.open(dir);
+          db.query("type Smoke { id: int }");
+          db.query("insert Smoke { id := 1 }");
+          db.query("insert Smoke { id := 2 }");
+          const res = db.query("count(Smoke)");
+          assert.equal(res.kind, "scalar", `embedded: unexpected result ${JSON.stringify(res)}`);
+          assert.equal(String(res.value), "2", `embedded: count was ${res.value}, expected 2`);
+          db.close();
+          console.log("npm embedded smoke OK: count =", res.value);
+          EOF
+          SMOKE_VERSION="${{ inputs.version }}" node smoke.mjs

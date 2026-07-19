@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fast pre-commit gate (target: well under 30s). Enable once per clone with:
+#   git config core.hooksPath .githooks
+#
+# scripts/quality --fast also runs the TypeScript build/tests via pnpm, which
+# is too slow for a commit hook, so this runs only the cheap subset: version
+# consistency + rustfmt. Run `scripts/quality` (or --full) before pushing for
+# the clippy/test/TS coverage.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+echo "pre-commit: version consistency"
+bash scripts/check-version-consistency.sh
+
+echo "pre-commit: cargo fmt --all -- --check"
+cargo fmt --all -- --check || {
+  echo "pre-commit: formatting failed. Run 'cargo fmt --all' and re-stage." >&2
+  exit 1
+}
+
+echo "pre-commit: OK"

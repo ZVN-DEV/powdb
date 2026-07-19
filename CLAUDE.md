@@ -9,6 +9,8 @@ cargo run --release -p powdb-compare  # benchmark vs SQLite (100K rows)
 cargo bench -p powdb-bench         # criterion benchmarks (~60s)
 ```
 
+Watch mode: `bacon` (or `cargo watch -x "check --workspace"`) for a recheck-on-save loop.
+
 ## Architecture
 
 PowDB is a from-scratch database engine. Its native query language is **PowQL** — a left-to-right pipeline syntax whose parser AST is already a plan tree, so there is no cost-based rewriting tier. Since v0.5.0 PowDB also ships a **SQL frontend**: a SQL parser that lowers a supported subset (`crates/query/src/sql.rs`) to the same PowQL AST and shares the plan cache. Both languages run on one planner/executor. The default wire `Query` message stays PowQL for backward compatibility; SQL goes through `Engine::execute_sql(...)` (embedded Rust) or the `QuerySql` wire path. See `docs/SQL.md` for the supported subset.

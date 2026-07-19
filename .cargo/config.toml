@@ -1,11 +1,13 @@
-# Mission F: enable host-CPU-specific instructions (NEON on M1, AVX on x86).
+# Checked-in cargo config deliberately sets NO rustflags: default builds are
+# portable everywhere (laptops, CI shared runners, Docker).
 #
-# crc32fast (used by the WAL) ships SIMD acceleration that's gated on the
-# target CPU. Without target-cpu=native it silently uses the scalar fallback.
+# Host-CPU-specific instructions (NEON on M1, AVX on x86) can speed up
+# crc32fast (used by the WAL), which otherwise falls back to scalar code.
+# If you want that locally, opt in per shell instead of editing this file:
 #
-# IMPORTANT: this produces binaries that won't run on older CPUs than the
-# build host. For local thesis development on M1 → M1 this is fine. CI builds
-# (GitHub Actions) override this with their own profile or unset rustflags so
-# the artifacts remain portable.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+#   export CARGO_BUILD_RUSTFLAGS="-C target-cpu=native"
+#
+# or put the old [build] rustflags block in an UNTRACKED config that outranks
+# this one, e.g. ~/.cargo/config.toml. Never commit target-cpu=native: it
+# produced binaries that SIGILL on CI's heterogeneous shared-runner fleet and
+# forced every workflow to override RUSTFLAGS.
