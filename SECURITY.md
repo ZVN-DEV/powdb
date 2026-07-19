@@ -7,7 +7,8 @@ latest release to stay supported.
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.16.x          | :white_check_mark: |
+| 0.17.x          | :white_check_mark: |
+| 0.16.x          | :x: (superseded)   |
 | 0.15.x          | :x: (superseded)   |
 | 0.14.x          | :x: (superseded)   |
 | 0.13.x          | :x: (superseded)   |
@@ -63,13 +64,13 @@ PowDB supports native TLS for encrypted client-server connections. To enable TLS
 
 When both are set, the server requires TLS for all connections. When unset, the server accepts plaintext TCP connections. For production deployments, always enable TLS or use a reverse proxy / SSH tunnel. Setting `POWDB_REQUIRE_TLS` makes the server refuse to start if authentication is configured without TLS.
 
-The bundled CLI supports TLS in remote mode (unreleased, lands in the next release):
+The bundled CLI supports TLS in remote mode (since v0.17.0):
 
 - `--tls` (or `POWDB_TLS=1`) encrypts the connection, verifying the server certificate against the built-in webpki (Mozilla) root store
 - `--tls-ca <path>` (or `POWDB_TLS_CA`) trusts a custom root CA PEM instead, for self-signed deployments; implies `--tls`
 - `--tls-server-name <name>` (or `POWDB_TLS_SERVER_NAME`) sets the hostname the certificate is verified against, for connecting by IP to a certificate issued for a hostname; implies `--tls`
 
-Without any TLS flags the CLI behaves exactly as before and connects over plaintext TCP. On releases before this lands, the bundled CLI has no TLS support and cannot reach a TLS-required server; use the TS client or a TLS-terminating tunnel instead.
+Without any TLS flags the CLI behaves exactly as before and connects over plaintext TCP. On releases before v0.17.0, the bundled CLI has no TLS support and cannot reach a TLS-required server; use the TS client or a TLS-terminating tunnel instead.
 
 To generate a self-signed certificate for testing (a plain `openssl req -x509` one-liner often produces a CA-flagged certificate that rustls rejects as an end-entity cert; the `-addext` flags below avoid that):
 
