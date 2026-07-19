@@ -1211,6 +1211,63 @@ async function main() {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
+  console.log("\nError frames — trailing class byte");
+
+  // Build a raw MSG_ERROR (0x0a) frame: length-prefixed message string,
+  // optionally followed by one class byte (0.17+ servers).
+  function buildErrorFrame(message: string, errorClass?: number): Buffer {
+    const msgBytes = Buffer.from(message, "utf8");
+    const parts = [Buffer.alloc(4), msgBytes];
+    parts[0]!.writeUInt32LE(msgBytes.length, 0);
+    if (errorClass !== undefined) {
+      parts.push(Buffer.from([errorClass]));
+    }
+    const payload = Buffer.concat(parts);
+    const header = Buffer.alloc(6);
+    header.writeUInt8(0x0a, 0);
+    header.writeUInt32LE(payload.length, 2);
+    return Buffer.concat([header, payload]);
+  }
+
+  await test("decodes the class byte from a new-server Error frame", () => {
+    const frame = buildErrorFrame("query timeout after 75ms", 3);
+    const result = tryDecode(frame);
+    assert.ok(result !== null);
+    assert.equal(result.msg.type, "Error");
+    if (result.msg.type !== "Error") throw new Error("unreachable");
+    assert.equal(result.msg.message, "query timeout after 75ms");
+    assert.equal(result.msg.errorClass, 3);
+  });
+
+  await test("tolerates a legacy Error frame with no class byte", () => {
+    const frame = buildErrorFrame("table 'users' not found");
+    const result = tryDecode(frame);
+    assert.ok(result !== null);
+    assert.equal(result.msg.type, "Error");
+    if (result.msg.type !== "Error") throw new Error("unreachable");
+    assert.equal(result.msg.message, "table 'users' not found");
+    assert.equal(result.msg.errorClass, undefined);
+  });
+
+  await test("carries an unknown future class byte through unchanged", () => {
+    const frame = buildErrorFrame("some future error", 200);
+    const result = tryDecode(frame);
+    assert.ok(result !== null && result.msg.type === "Error");
+    if (result.msg.type !== "Error") throw new Error("unreachable");
+    assert.equal(result.msg.errorClass, 200);
+  });
+
+  await test("class byte does not disturb frame length accounting", () => {
+    const classed = buildErrorFrame("boom", 2);
+    const legacy = buildErrorFrame("boom");
+    const decodedClassed = tryDecode(classed);
+    const decodedLegacy = tryDecode(legacy);
+    assert.ok(decodedClassed !== null && decodedLegacy !== null);
+    assert.equal(decodedClassed.consumed, classed.length);
+    assert.equal(decodedLegacy.consumed, legacy.length);
+    assert.equal(decodedClassed.consumed, decodedLegacy.consumed + 1);
+  });
+
   console.log("\n" + "═".repeat(50));
   console.log(`Results: ${passed} passed, ${failed} failed`);
   if (failures.length > 0) {

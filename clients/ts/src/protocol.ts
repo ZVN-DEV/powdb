@@ -189,7 +189,7 @@ export type Message =
   | { type: "ResultScalarNative"; value: WireValue }
   | { type: "ResultOk"; affected: bigint }
   | { type: "ResultMessage"; message: string }
-  | { type: "Error"; message: string }
+  | { type: "Error"; message: string; errorClass?: number }
   | { type: "Disconnect" }
   | { type: "Ping" }
   | { type: "Pong" };
@@ -720,8 +720,16 @@ function decodePayload(msgType: number, payload: Buffer): Message {
     }
     case MSG_RESULT_MSG:
       return { type: "ResultMessage", message: decodeString(payload, cursor) };
-    case MSG_ERROR:
-      return { type: "Error", message: decodeString(payload, cursor) };
+    case MSG_ERROR: {
+      const message = decodeString(payload, cursor);
+      // 0.17+ servers append one stable error-class byte after the
+      // length-prefixed message (see docs/errors.md). Old servers send only
+      // the string, so absence means "no class".
+      if (cursor.pos < payload.length) {
+        return { type: "Error", message, errorClass: payload[cursor.pos] };
+      }
+      return { type: "Error", message };
+    }
     case MSG_DISCONNECT:
       return { type: "Disconnect" };
     case MSG_PING:

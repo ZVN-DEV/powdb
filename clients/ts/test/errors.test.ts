@@ -7,7 +7,12 @@
  */
 
 import { strict as assert } from "node:assert";
-import { PowDBError, isPowDBError } from "../src/errors.js";
+import {
+  errorCodeForWireClass,
+  isPowDBError,
+  PowDBError,
+  WIRE_ERROR_CLASS,
+} from "../src/errors.js";
 
 let passed = 0;
 let failed = 0;
@@ -148,6 +153,63 @@ async function main() {
       (e) => e.code === "connect_failed" || e.code === "timeout",
     );
     assert.equal(retryable.length, 2);
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nwire error class mapping");
+  // ──────────────────────────────────────────────────────────
+
+  await test("timeout class maps to timeout", () => {
+    assert.equal(errorCodeForWireClass(WIRE_ERROR_CLASS.timeout), "timeout");
+  });
+
+  await test("limit_exceeded class maps to size_exceeded", () => {
+    assert.equal(
+      errorCodeForWireClass(WIRE_ERROR_CLASS.limit_exceeded),
+      "size_exceeded",
+    );
+  });
+
+  await test("auth_failed and rate_limited classes map to auth_failed", () => {
+    assert.equal(
+      errorCodeForWireClass(WIRE_ERROR_CLASS.auth_failed),
+      "auth_failed",
+    );
+    assert.equal(
+      errorCodeForWireClass(WIRE_ERROR_CLASS.rate_limited),
+      "auth_failed",
+    );
+  });
+
+  await test("query-shaped classes map to query_failed", () => {
+    for (const cls of [
+      WIRE_ERROR_CLASS.internal,
+      WIRE_ERROR_CLASS.parse,
+      WIRE_ERROR_CLASS.execution,
+      WIRE_ERROR_CLASS.readonly_refused,
+      WIRE_ERROR_CLASS.constraint_violation,
+      WIRE_ERROR_CLASS.cancelled,
+    ]) {
+      assert.equal(errorCodeForWireClass(cls), "query_failed");
+    }
+  });
+
+  await test("absent class (legacy server) falls back to query_failed", () => {
+    assert.equal(errorCodeForWireClass(undefined), "query_failed");
+  });
+
+  await test("unknown future class byte falls back to query_failed", () => {
+    assert.equal(errorCodeForWireClass(200), "query_failed");
+  });
+
+  await test("wireErrorClass rides on the thrown error when provided", () => {
+    const err = new PowDBError("readonly mode: nope", "query_failed", {
+      wireErrorClass: WIRE_ERROR_CLASS.readonly_refused,
+    });
+    assert.equal(err.wireErrorClass, 5);
+    assert.equal(err.code, "query_failed");
+    const plain = new PowDBError("boom", "query_failed");
+    assert.equal(plain.wireErrorClass, undefined);
   });
 
   // ──────────────────────────────────────────────────────────
