@@ -1848,6 +1848,10 @@ impl BTree {
                 }
             }
         }
+        // v1 trees (unique column indexes, still a current writer version)
+        // persist without the empty_rids section; v2+ trees (expression
+        // indexes since v0.13.0, non-unique column indexes at v3 since
+        // v0.16.0) append it. See docs/FORMAT.md.
         if self.format_version >= 2 {
             buf.extend_from_slice(&(self.empty_rids.len() as u32).to_le_bytes());
             for rid in &self.empty_rids {
@@ -2023,6 +2027,13 @@ impl BTree {
             }
         }
 
+        // Legacy read branch: v1 files (the only version before v0.13.0, and
+        // still written today for unique column indexes) carry no empty_rids
+        // side list. The v1 path is not removable while unique column indexes
+        // write v1. A v1/v2 NON-unique column index is legacy since v0.16.0
+        // and is rebuilt from the heap on open (see `Table::open`); per the
+        // docs/FORMAT.md support policy that rebuild path may be removed in
+        // v0.20.0 at the earliest.
         let mut empty_rids = Vec::new();
         if version >= 2 {
             let count = read_u32(&buf, &mut pos)? as usize;

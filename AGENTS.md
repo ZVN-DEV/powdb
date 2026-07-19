@@ -19,7 +19,7 @@ The measurable result: 3–10× faster than SQLite on aggregate and scan workloa
 - **Embedded / edge / serverless workloads** where query latency is a tight budget and you don't want SQLite's quirks.
 - **Single-node analytics** over tables that fit on disk. The scan path is zero-syscall (mmap) and filters are compiled to byte-level predicates.
 - **You control both sides** (the DB and the app). PowDB has no Postgres wire protocol, no ODBC, no legacy compatibility. The client is a TCP binary protocol or an in-process Engine.
-- **You want to read the code.** Eight crates, ~45K lines, no generated parsers, no plan-language IR.
+- **You want to read the code.** Ten crates, ~100K lines of Rust (~72K outside integration-test files), no generated parsers, no plan-language IR.
 
 ### When it's *not* the right choice
 
@@ -222,9 +222,9 @@ The legacy `query()` and `querySql()` result shapes above remain unchanged.
 
 ---
 
-## What's available in this development tree vs. what's planned
+## What's available vs. what's planned
 
-Available in the v0.13 development tree (not yet released): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL — `docs/SQL.md`).
+Available in released PowDB (v0.16.0 at the time of writing; everything below shipped in v0.13.0 or earlier): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL, see `docs/SQL.md`).
 
 Planned (design doc only — don't use): link navigation (`User.posts`), `let` bindings, UDFs, per-row permissions, replication.
 

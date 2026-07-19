@@ -273,6 +273,11 @@ materialized views before snapshotting.
 | `POWDB_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
 | `POWDB_QUERY_TIMEOUT` | `30` | Per-query deadline in seconds; cooperative cancellation stops supported scan, join, group, and mutation-discovery work and releases server admission promptly |
 | `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
+| `POWDB_TX_WAIT_TIMEOUT_MS` | `5000` | Max milliseconds a `begin` waits for a concurrent explicit transaction before failing with a timeout error instead of queueing indefinitely |
+| `POWDB_DB_NAME` | *(accept any)* | When set, the single database name this server serves; a CONNECT that explicitly names a different database is rejected |
+| `POWDB_MAX_NESTED_LOOP_PAIRS` | `6400000` | Fallback nested-loop join candidate-pair cap; a pure non-equi join whose estimated pair count exceeds it fails before execution |
+| `POWDB_SOCKET` | *(off)* | Path for an additional Unix-domain-socket listener served alongside the TCP listener |
+| `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated** — bind it to localhost or a private network, never the public internet |
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](docs/read-only-serving.md) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
@@ -286,7 +291,7 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network — it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.8.0 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
+- [ ] Pin the version (`cargo install powdb-server --version 0.16.0 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may change on-disk formats.
 - [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 
@@ -348,6 +353,8 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 crates/
   storage/   Heap files, B+tree, WAL, catalog, page cache, row encoding
   query/     Lexer, parser, planner, executor (Engine), plan cache
+  powdb/     Embedded facade crate: the engine in-process, no server
+  sync/      Retained replication-unit substrate (experimental, opt-in)
   auth/      User store, roles, argon2id password hashing
   backup/    Offline backup/restore (full, incremental, PITR)
   server/    Tokio TCP server + binary wire protocol

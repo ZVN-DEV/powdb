@@ -46,6 +46,10 @@ fn heap_superblock_page() -> Page {
 /// 3; a `first_data_page` of 0 signals a legacy pre-superblock (v1) heap.
 fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<(u32, u16)> {
     if buf[4] != PageType::Meta as u8 {
+        // Legacy heap v1 (pre-v0.5.0 writers): no page-0 superblock, data
+        // pages start at page 0. Superseded by the v2 superblock in v0.5.0;
+        // removable since v0.9.0 per the docs/FORMAT.md support policy, kept
+        // deliberately.
         return Ok((0, 1));
     }
     let mut pos = HEAP_SUPERBLOCK_OFFSET;
@@ -511,6 +515,8 @@ impl HeapFile {
     /// chain write. A never-spilling database stays v2 and old-binary
     /// readable; once a chain exists, old binaries must refuse the file
     /// (they would misread Overflow pages), so the version advertises v3.
+    /// v2 (since v0.5.0) and v3 (since v0.11.0) are both current writer
+    /// versions per docs/FORMAT.md; neither is removal-eligible.
     fn ensure_heap_v3(&mut self) -> io::Result<()> {
         // Legacy pre-superblock heaps (first_data_page == 0) have no version
         // word to bump; already-v3 heaps are done.
