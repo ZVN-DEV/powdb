@@ -20,8 +20,19 @@ powdb-auth = { version = "0.16.0", path = "../auth" }
 powdb-sync = { version = "0.16.0", path = "../sync" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+# Built-in trust anchors (Mozilla CA program) for `--tls` without `--tls-ca`.
+# Chosen over rustls-native-certs so verification behaves identically on every
+# platform the CLI ships to, staying on the same rustls stack as the server.
+webpki-roots = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Self-signed certificate generation for the TLS process test, matching the
+# server crate's dev-dependency (crates/server/tests/tls_connection.rs).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 [lints]
 workspace = true
