@@ -61,7 +61,15 @@ PowDB supports native TLS for encrypted client-server connections. To enable TLS
 - `POWDB_TLS_CERT` — path to the PEM-encoded TLS certificate
 - `POWDB_TLS_KEY` — path to the PEM-encoded TLS private key
 
-When both are set, the server requires TLS for all connections. When unset, the server accepts plaintext TCP connections. For production deployments, always enable TLS or use a reverse proxy / SSH tunnel.
+When both are set, the server requires TLS for all connections. When unset, the server accepts plaintext TCP connections. For production deployments, always enable TLS or use a reverse proxy / SSH tunnel. Setting `POWDB_REQUIRE_TLS` makes the server refuse to start if authentication is configured without TLS.
+
+The bundled CLI supports TLS in remote mode (unreleased, lands in the next release):
+
+- `--tls` (or `POWDB_TLS=1`) encrypts the connection, verifying the server certificate against the built-in webpki (Mozilla) root store
+- `--tls-ca <path>` (or `POWDB_TLS_CA`) trusts a custom root CA PEM instead, for self-signed deployments; implies `--tls`
+- `--tls-server-name <name>` (or `POWDB_TLS_SERVER_NAME`) sets the hostname the certificate is verified against, for connecting by IP to a certificate issued for a hostname; implies `--tls`
+
+Without any TLS flags the CLI behaves exactly as before and connects over plaintext TCP. On releases before this lands, the bundled CLI has no TLS support and cannot reach a TLS-required server; use the TS client or a TLS-terminating tunnel instead.
 
 ## Authentication
 
