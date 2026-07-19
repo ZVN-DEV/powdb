@@ -4,14 +4,17 @@
 //! backpressure, graceful shutdown, malformed protocol handling, and
 //! connection reuse after errors.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
+use common::{encode_connect_with_password, fresh_engine, read_message, InprocServer};
 use powdb_query::executor::Engine;
 use powdb_server::handler::{handle_connection, new_rate_limiter, new_tx_gate, ConnOpts};
 use powdb_server::protocol::Message;
@@ -20,25 +23,10 @@ use powdb_server::protocol::Message;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn fresh_engine() -> (Arc<RwLock<Engine>>, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = Arc::new(RwLock::new(Engine::new(tmp.path()).unwrap()));
-    (engine, tmp)
-}
-
 fn encode_connect(db: &str) -> Vec<u8> {
     Message::Connect {
         db_name: db.to_string(),
         password: None,
-        username: None,
-    }
-    .encode()
-}
-
-fn encode_connect_with_password(db: &str, password: &str) -> Vec<u8> {
-    Message::Connect {
-        db_name: db.to_string(),
-        password: Some(zeroize::Zeroizing::new(password.to_string())),
         username: None,
     }
     .encode()
@@ -51,24 +39,6 @@ fn encode_query(q: &str) -> Vec<u8> {
     .encode()
 }
 
-async fn read_message(stream: &mut TcpStream) -> Option<Message> {
-    let mut header = [0u8; 6];
-    match stream.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-        Err(_) => return None,
-    }
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
-        return None;
-    }
-    let mut full = Vec::with_capacity(6 + payload_len);
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    Message::decode(&full).ok()
-}
-
 /// Start a server that accepts a single connection with given opts.
 /// Returns the address to connect to.
 async fn start_single_conn_server(
@@ -79,34 +49,17 @@ async fn start_single_conn_server(
     shutdown_rx: watch::Receiver<bool>,
     rate_limiter: Option<powdb_server::handler::AuthRateLimiter>,
 ) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let tx_gate = new_tx_gate();
-
-    tokio::spawn(async move {
-        let (stream, peer) = listener.accept().await.unwrap();
-        let mut rx = shutdown_rx;
-        let rl = rate_limiter;
-        handle_connection(
-            stream,
-            ConnOpts {
-                tx_wait_timeout: std::time::Duration::from_secs(5),
-                db_name: None,
-                engine,
-                tx_gate,
-                expected_password: expected_password.map(zeroize::Zeroizing::new),
-                users: Arc::new(powdb_auth::UserStore::new()),
-                shutdown_rx: &mut rx,
-                idle_timeout,
-                query_timeout,
-                rate_limiter: rl.as_ref(),
-                peer_addr: Some(peer),
-                metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-            },
-        )
-        .await;
-    });
-
+    let (addr, _handle) = InprocServer {
+        expected_password,
+        idle_timeout,
+        query_timeout,
+        rate_limiter,
+        shutdown_rx: Some(shutdown_rx),
+        single_conn: true,
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
     addr
 }
 
@@ -119,44 +72,16 @@ async fn start_multi_conn_server(
     shutdown_rx: watch::Receiver<bool>,
     rate_limiter: Option<powdb_server::handler::AuthRateLimiter>,
 ) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let tx_gate = new_tx_gate();
-
-    tokio::spawn(async move {
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let eng = engine.clone();
-            let tx_gate = tx_gate.clone();
-            let pw = expected_password.clone();
-            let mut rx = shutdown_rx.clone();
-            let rl = rate_limiter.clone();
-            tokio::spawn(async move {
-                handle_connection(
-                    stream,
-                    ConnOpts {
-                        tx_wait_timeout: std::time::Duration::from_secs(5),
-                        db_name: None,
-                        engine: eng,
-                        tx_gate,
-                        expected_password: pw.map(zeroize::Zeroizing::new),
-                        users: Arc::new(powdb_auth::UserStore::new()),
-                        shutdown_rx: &mut rx,
-                        idle_timeout,
-                        query_timeout,
-                        rate_limiter: rl.as_ref(),
-                        peer_addr: Some(peer),
-                        metrics: std::sync::Arc::new(powdb_server::metrics::Metrics::new()),
-                    },
-                )
-                .await;
-            });
-        }
-    });
-
+    let (addr, _handle) = InprocServer {
+        expected_password,
+        idle_timeout,
+        query_timeout,
+        rate_limiter,
+        shutdown_rx: Some(shutdown_rx),
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
     addr
 }
 

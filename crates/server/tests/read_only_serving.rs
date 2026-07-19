@@ -8,85 +8,18 @@
 //!   - a `kill -9` mid-serve never mutates the directory (verified by hash).
 #![cfg(unix)]
 
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::process::Child;
+use std::time::Duration;
 
-// Wire helpers mirror crates/server/tests/integration.rs so the tests exercise
-// the real framing.
-fn encode_connect(db: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(db.len() as u32).to_le_bytes());
-    payload.extend_from_slice(db.as_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes()); // empty password => None
-    let mut frame = Vec::new();
-    frame.push(0x01); // CONNECT
-    frame.push(0); // flags
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-fn encode_query(q: &str) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&(q.len() as u32).to_le_bytes());
-    payload.extend_from_slice(q.as_bytes());
-    let mut frame = Vec::new();
-    frame.push(0x03); // QUERY
-    frame.push(0);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload);
-    frame
-}
-
-async fn read_response(stream: &mut TcpStream) -> Vec<u8> {
-    let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
-    let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        stream.read_exact(&mut payload).await.unwrap();
-    }
-    let mut full = Vec::new();
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    full
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
+use common::{
+    encode_connect, encode_query, free_port, read_response, spawn_server_bin, wait_for_bind,
+};
+use tokio::io::AsyncWriteExt;
 
 fn spawn_readonly_server(port: u16, data_dir: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_powdb-server"))
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--readonly")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn powdb-server --readonly")
-}
-
-async fn wait_for_bind(port: u16, within: Duration) -> TcpStream {
-    let start = Instant::now();
-    loop {
-        if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
-            return stream;
-        }
-        assert!(
-            start.elapsed() <= within,
-            "server did not accept connections on port {port} within {within:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    spawn_server_bin(port, data_dir, &["--readonly"])
 }
 
 /// Seed a quiescent (checkpointed, WAL-clean) data directory with a table and a
