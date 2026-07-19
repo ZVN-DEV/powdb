@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Typed wire error codes.** Error frames now carry a stable one-byte error
+  class (parse, execution, timeout, limit exceeded, readonly refused, auth
+  failed, rate limited, constraint violation, cancelled, internal) appended
+  after the message, fully backward compatible in both directions: old
+  clients ignore the byte, and new clients treat classless frames from old
+  servers as before. The TS client maps the class onto its existing typed
+  error codes (`timeout`, `size_exceeded`, `auth_failed`, ...) instead of
+  collapsing everything to `query_failed`, and exposes the raw class as
+  `wireErrorClass`. Codes are documented in `docs/errors.md` and pinned by a
+  regression test (append-only, never renumbered).
+- **CLI TLS.** `powdb-cli` remote mode can now speak TLS: `--tls`,
+  `--tls-ca <PATH>` for self-signed roots, and `--tls-server-name <NAME>`
+  for connecting by IP, with `POWDB_TLS`/`POWDB_TLS_CA`/`POWDB_TLS_SERVER_NAME`
+  env fallbacks. Uses the same rustls stack as the server; a server started
+  with `POWDB_REQUIRE_TLS=1` is now reachable with the shipped CLI.
+- **Wire-protocol and WAL-replay fuzzing.** Two new fuzz targets: `fuzz_wire`
+  drives the frame decoder (including the pre-auth CONNECT cap) with
+  arbitrary bytes, and `fuzz_wal_replay` mutates real WAL files inside a
+  staged crashed data directory and requires recovery to succeed or fail
+  cleanly, never panic. Both run in CI with seeded corpora.
+- **SIGKILL durability test.** A process-level test inserts over the wire,
+  lands `kill -9` with a statement in flight, restarts on the same data
+  directory, and asserts every acknowledged write survived WAL replay.
+- **Post-publish registry smoke workflow.** A dispatchable workflow installs
+  the released binaries from live crates.io and the npm packages from the
+  live registry and reruns the durability smoke against them, replacing the
+  manual post-release checklist step.
+- **Format version support policy** (`docs/FORMAT.md`): which on-disk
+  versions each release reads and writes, and the deprecation rules a legacy
+  read path must follow before removal; legacy branches in catalog, B-tree,
+  and heap code are annotated accordingly.
+- **cargo-deny in CI** (license allowlist, duplicate-version warnings,
+  crates.io-only sources) alongside the existing cargo-audit gate, plus an
+  opt-in pre-commit hook (`.githooks/`) and a pinned `rustfmt.toml`.
+
+### Changed
+
+- **Executor internals reorganized.** The monolithic `plan_exec.rs` (7.5K
+  lines) is now a directory of operator-family modules (dispatch, scan,
+  fast paths, mutation, aggregate, join, lowering, validate); pure code
+  motion with no behavior or performance change.
+- `QueryError` and `ParseError` now derive their error implementations via
+  `thiserror` with byte-identical messages, matching the storage and auth
+  crates' convention.
+- Server integration tests share one canonical wire-helper module instead of
+  nine per-file copies.
+- CI Rust jobs use `Swatinem/rust-cache`; the shared cargo config no longer
+  pins `target-cpu=native` (opt in locally via `CARGO_BUILD_RUSTFLAGS`).
+
+### Fixed
+
+- README env-var table now documents `POWDB_SOCKET`, `POWDB_SYNC_MODE`,
+  `POWDB_DB_NAME`, `POWDB_MAX_NESTED_LOOP_PAIRS`, and
+  `POWDB_TX_WAIT_TIMEOUT_MS`; stale version references in README and
+  AGENTS.md corrected; `docs/FORMAT.md` version table matches the code
+  again; `scripts/smoke-package.sh` now validates the `powdb` facade crate.
 
 ## [0.16.0] - 2026-07-18
 
