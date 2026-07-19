@@ -3643,6 +3643,15 @@ fn read_catalog_file_with_max_version(
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "truncated catalog header"))?,
     ) as usize;
     pos += 4;
+    // Additive legacy read branches. Version history: v1 (no index list),
+    // v2 (index names), v3 (uniqueness flag), all written by pre-v0.5.0
+    // builds; v4 (column defaults) and v5 (auto-increment columns), both
+    // introduced in v0.7.0; v6 (expression indexes + next-index-id header),
+    // activated lazily since v0.13.0. v5 is still written today by databases
+    // that never activate an expression index, so only v1-v4 are legacy.
+    // Per the support policy in docs/FORMAT.md (4 minor versions after
+    // superseded), the v1-v4 branches became removable in v0.11.0 at the
+    // earliest; they are retained deliberately.
     let next_index_id = if version >= 6 {
         let id = read_u64(buf, &mut pos)?;
         if id == 0 {
@@ -3653,6 +3662,8 @@ fn read_catalog_file_with_max_version(
         }
         id
     } else {
+        // Legacy v1-v5 (pre-v0.13.0, or v6 never activated): no
+        // next-index-id header field.
         1
     };
 
@@ -3693,7 +3704,9 @@ fn read_catalog_file_with_max_version(
 
         // Version 3 appends indexed column list with uniqueness flag.
         // Version 2 has indexed column names without uniqueness (default
-        // to non-unique). Version 1 has no index info at all.
+        // to non-unique). Version 1 has no index info at all. v1/v2 files
+        // (pre-v0.5.0 writers) are legacy; removable per the docs/FORMAT.md
+        // policy (floor long passed), kept deliberately.
         let indexed_cols: Vec<IndexedColMeta> = if version >= 3 {
             let n = read_u16(buf, &mut pos)? as usize;
             let mut v = Vec::with_capacity(n);
@@ -3720,7 +3733,9 @@ fn read_catalog_file_with_max_version(
             Vec::new()
         };
 
-        // Version 4 appends a column-defaults section after the index list.
+        // Version 4 appends a column-defaults section after the index list
+        // (v0.7.0). Legacy v1-v3 files have none; that branch became
+        // removable in v0.11.0 per docs/FORMAT.md, kept deliberately.
         let defaults = if version >= 4 {
             decode_defaults_section(buf, &mut pos, columns.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "truncated catalog defaults")
@@ -3729,7 +3744,9 @@ fn read_catalog_file_with_max_version(
             Vec::new()
         };
 
-        // Version 5 appends an auto-increment column section after that.
+        // Version 5 appends an auto-increment column section after that
+        // (v0.7.0). Legacy v1-v4 files have none; that branch became
+        // removable in v0.11.0 per docs/FORMAT.md, kept deliberately.
         let auto_cols = if version >= 5 {
             decode_auto_section(buf, &mut pos, columns.len()).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "truncated catalog auto columns")
@@ -3738,6 +3755,9 @@ fn read_catalog_file_with_max_version(
             Vec::new()
         };
 
+        // Version 6 appends an expression-index section (lazily activated
+        // since v0.13.0). v5 is still an active writer version, so the
+        // below-6 branch is NOT legacy and is not removal-eligible.
         let expression_indexes = if version >= 6 {
             decode_expression_indexes(buf, &mut pos)?
         } else {
