@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.16.0.** NUL-safe composite index keys (wrong-rows fix for non-unique string indexes, old indexes rebuilt automatically on open), honest positioning (What PowDB is for, concurrency decomposition), edge-snapshot-serving flagship example, and transaction concurrency guidance.
+> **Current release: v0.17.0.** Typed wire error codes (stable one-byte class on error frames, mapped by the TS client), CLI TLS (--tls / --tls-ca / --tls-server-name), wire-decoder and WAL-replay fuzzing, a SIGKILL-mid-write durability test, executor internals reorganized, and a post-publish live-registry smoke workflow.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

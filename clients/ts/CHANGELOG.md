@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.0 - 2026-07-19
+
+- **Typed wire error codes.** Servers >= 0.17.0 append a stable one-byte error
+  class to error frames; the client maps it onto `PowDBErrorCode` (`timeout`,
+  `size_exceeded`, `auth_failed`, ...) instead of collapsing every server
+  error to `query_failed`, and exposes the raw class as
+  `PowDBError.wireErrorClass`. Fully backward compatible: classless frames
+  from older servers behave exactly as before, and unknown future classes
+  fall back to `query_failed`. See the repo's `docs/errors.md` for the code
+  table.
+
 ## 0.16.0 - 2026-07-18
 
 - Version-alignment release in lockstep with workspace v0.16.0 (NUL-safe

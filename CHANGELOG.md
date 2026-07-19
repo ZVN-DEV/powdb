@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.17.0] - 2026-07-19
+
 ### Added
 
 - **Typed wire error codes.** Error frames now carry a stable one-byte error
