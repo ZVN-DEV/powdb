@@ -544,6 +544,7 @@ fn resolve_nested_projection_inner(
         name,
         table: nested.source,
         alias: nested.alias,
+        parent_alias: parent_alias.to_string(),
         child_key,
         parent_key: if qualify_parent_key {
             format!("{parent_alias}.{parent_key}")

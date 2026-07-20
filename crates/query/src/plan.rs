@@ -258,6 +258,9 @@ pub struct NestedProjection {
     pub table: String,
     /// The child alias from the source text, kept for EXPLAIN and errors.
     pub alias: String,
+    /// The enclosing scope's alias, kept for EXPLAIN (the executor
+    /// correlates through `parent_key` alone).
+    pub parent_alias: String,
     pub child_key: String,
     pub parent_key: String,
     /// Residual filter conditions beyond the correlation predicate,

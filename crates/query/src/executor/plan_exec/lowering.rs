@@ -724,6 +724,52 @@ fn explain_join_strategy(
 
 /// Format a `PlanNode` tree as a human-readable, indented text
 /// representation. Used by the `EXPLAIN` command.
+/// Append one nested projection's EXPLAIN line (and, recursively, its
+/// deeper levels) to `out`, indented under the `NestedProject` node.
+fn format_nested_projection(nested: &NestedProjection, depth: usize, out: &mut String) {
+    use std::fmt::Write;
+    let indent = "  ".repeat(depth);
+    let parent = if nested.parent_key.contains('.') {
+        nested.parent_key.clone()
+    } else {
+        format!("{}.{}", nested.parent_alias, nested.parent_key)
+    };
+    let _ = write!(
+        out,
+        "{indent}nested {}: {} as {} on {}.{} = {}",
+        nested.name, nested.table, nested.alias, nested.alias, nested.child_key, parent
+    );
+    if let Some(residual) = &nested.residual {
+        let _ = write!(out, " residual={residual:?}");
+    }
+    if !nested.order.is_empty() {
+        let keys: Vec<String> = nested
+            .order
+            .iter()
+            .map(|(column, descending)| {
+                format!("{column} {}", if *descending { "desc" } else { "asc" })
+            })
+            .collect();
+        let _ = write!(out, " order [{}]", keys.join(", "));
+    }
+    let bound = |expr: &Expr| match expr {
+        Expr::Literal(crate::ast::Literal::Int(v)) => v.to_string(),
+        other => format!("{other:?}"),
+    };
+    if let Some(limit) = &nested.limit {
+        let _ = write!(out, " limit {}", bound(limit));
+    }
+    if let Some(offset) = &nested.offset {
+        let _ = write!(out, " offset {}", bound(offset));
+    }
+    out.push('\n');
+    for field in &nested.fields {
+        if let NestedField::Nested(inner) = field {
+            format_nested_projection(inner, depth + 1, out);
+        }
+    }
+}
+
 pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     match plan {
@@ -844,17 +890,17 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                         Some(a) => format!("{a}: {:?}", field.expr),
                         None => format!("{:?}", field.expr),
                     },
-                    NestedProjectField::Nested(nested) => format!(
-                        "{}: {}[{} = {}]",
-                        nested.name, nested.table, nested.child_key, nested.parent_key
-                    ),
+                    NestedProjectField::Nested(nested) => nested.name.clone(),
                 })
                 .collect();
-            let child = format_plan_tree(catalog, input, depth + 1);
-            format!(
-                "{indent}NestedProject fields=[{}]\n{child}",
-                names.join(", ")
-            )
+            let mut out = format!("{indent}NestedProject fields=[{}]\n", names.join(", "));
+            for f in fields {
+                if let NestedProjectField::Nested(nested) = f {
+                    format_nested_projection(nested, depth + 1, &mut out);
+                }
+            }
+            out.push_str(&format_plan_tree(catalog, input, depth + 1));
+            out
         }
         PlanNode::Sort { input, keys } => {
             let ks: Vec<String> = keys

@@ -465,6 +465,32 @@ fn explain_handles_nested_projection() {
 }
 
 #[test]
+fn explain_shows_nested_structure_with_correlation_keys() {
+    let mut engine = engine_with_users_and_orders("explain_full");
+    add_items(&mut engine);
+    let result = exec(
+        &mut engine,
+        "explain User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 1.0 \
+         order o.total desc limit 3 { o.total, items: Item as i filter i.order_id = o.id { i.sku } } }",
+    );
+    let text = format!("{result:?}");
+    assert!(text.contains("NestedProject"), "missing node name: {text}");
+    assert!(
+        text.contains("nested orders: Order as o on o.user_id = u.id"),
+        "missing labeled nested child with correlation key: {text}"
+    );
+    assert!(
+        text.contains("order [total desc]") && text.contains("limit 3"),
+        "missing per-parent order/limit: {text}"
+    );
+    assert!(text.contains("residual="), "missing residual: {text}");
+    assert!(
+        text.contains("    nested items: Item as i on i.order_id = o.id"),
+        "missing indented second-level nested child: {text}"
+    );
+}
+
+#[test]
 fn plain_queries_are_unchanged() {
     let mut engine = engine_with_users_and_orders("smoke");
     let QueryResult::Rows { columns, rows } = exec(&mut engine, r#"User filter .id = 1 { .name }"#)
