@@ -381,7 +381,7 @@ fn plan_nested_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
                     PlanError::Semantic("nested projection field requires a name".into())
                 })?;
                 resolve_nested_projection(name, *nested, &parent_alias)
-                    .map(NestedProjectField::Nested)
+                    .map(|nested| NestedProjectField::Nested(Box::new(nested)))
             }
             expr => Ok(NestedProjectField::Plain(ProjectField {
                 alias: pf.alias,
@@ -514,7 +514,7 @@ fn resolve_nested_projection_inner(
                 // The enclosing child scan exposes bare schema columns, so
                 // deeper levels correlate on an unqualified parent key.
                 return resolve_nested_projection_inner(inner_name, *inner, &nested.alias, false)
-                    .map(NestedField::Nested);
+                    .map(|inner| NestedField::Nested(Box::new(inner)));
             }
             let column = match &pf.expr {
                 Expr::Field(field) => field.clone(),

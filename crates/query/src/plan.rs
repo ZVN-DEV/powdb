@@ -243,7 +243,7 @@ pub enum NestedProjectField {
     /// A scalar field, evaluated against the parent row like `Project`.
     Plain(ProjectField),
     /// A nested sub-query field, emitted as a PJ1 JSON array of objects.
-    Nested(NestedProjection),
+    Nested(Box<NestedProjection>),
 }
 
 /// The resolved form of one nested sub-query projection field. Correlation
@@ -286,7 +286,7 @@ pub enum NestedField {
     Scalar { key: String, column: String },
     /// A deeper nested sub-query, correlated to this child table by its
     /// (bare) `parent_key` column.
-    Nested(NestedProjection),
+    Nested(Box<NestedProjection>),
 }
 
 impl NestedProjection {
