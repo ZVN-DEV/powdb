@@ -262,9 +262,8 @@ fn nested_projection_order_ties_keep_scan_order() {
         "insert Order { id := 11, user_id := 1, total := 9.5, product_id := 111 }",
     );
     let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total asc { o.product_id } }";
-    let expected = json(
-        r#"[{"product_id":101},{"product_id":110},{"product_id":111},{"product_id":102}]"#,
-    );
+    let expected =
+        json(r#"[{"product_id":101},{"product_id":110},{"product_id":111},{"product_id":102}]"#);
     for _ in 0..3 {
         let QueryResult::Rows { rows, .. } = exec(&mut engine, q) else {
             panic!("expected rows");
@@ -509,9 +508,7 @@ fn nested_projection_unknown_alias_in_residual_is_rejected() {
 fn nested_projection_without_field_name_is_rejected() {
     let mut engine = engine_with_users_and_orders("unnamed");
     let err = engine
-        .execute_powql(
-            "User as u { u.name, Order as o filter o.user_id = u.id { o.total } }",
-        )
+        .execute_powql("User as u { u.name, Order as o filter o.user_id = u.id { o.total } }")
         .unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -554,14 +551,29 @@ fn perf_probe_nested_vs_flat_join() {
     // cargo test --release -p powdb-query --test nested_results -- --ignored perf_probe
     let mut engine = Engine::new(&temp_dir("perf")).unwrap();
     engine.set_wal_sync_mode(powdb_query::executor::WalSyncMode::Off);
-    exec(&mut engine, "type User { required id: int, required name: str }");
-    exec(&mut engine, "type Order { required id: int, required user_id: int, required total: float }");
+    exec(
+        &mut engine,
+        "type User { required id: int, required name: str }",
+    );
+    exec(
+        &mut engine,
+        "type Order { required id: int, required user_id: int, required total: float }",
+    );
     for i in 0..5000 {
-        exec(&mut engine, &format!(r#"insert User {{ id := {i}, name := "user{i}" }}"#));
+        exec(
+            &mut engine,
+            &format!(r#"insert User {{ id := {i}, name := "user{i}" }}"#),
+        );
     }
     for i in 0..50000 {
         let uid = i % 5000;
-        exec(&mut engine, &format!("insert Order {{ id := {i}, user_id := {uid}, total := {}.5 }}", i % 100));
+        exec(
+            &mut engine,
+            &format!(
+                "insert Order {{ id := {i}, user_id := {uid}, total := {}.5 }}",
+                i % 100
+            ),
+        );
     }
     let nested = "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total } }";
     let flat = "User as u join Order as o on o.user_id = u.id { u.name, o.total }";
@@ -570,7 +582,9 @@ fn perf_probe_nested_vs_flat_join() {
         let start = std::time::Instant::now();
         let mut n = 0usize;
         for _ in 0..5 {
-            if let QueryResult::Rows { rows, .. } = exec(&mut engine, q) { n += rows.len(); }
+            if let QueryResult::Rows { rows, .. } = exec(&mut engine, q) {
+                n += rows.len();
+            }
         }
         println!("{label}: {:?}/run rows={}", start.elapsed() / 5, n / 5);
     }

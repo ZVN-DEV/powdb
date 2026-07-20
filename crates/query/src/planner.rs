@@ -482,9 +482,7 @@ fn resolve_nested_projection_inner(
                 .map(|key| {
                     let column = match &key.expr {
                         Expr::Field(field) => field.clone(),
-                        Expr::QualifiedField { qualifier, field }
-                            if *qualifier == nested.alias =>
-                        {
+                        Expr::QualifiedField { qualifier, field } if *qualifier == nested.alias => {
                             field.clone()
                         }
                         _ => {
@@ -515,13 +513,8 @@ fn resolve_nested_projection_inner(
                 })?;
                 // The enclosing child scan exposes bare schema columns, so
                 // deeper levels correlate on an unqualified parent key.
-                return resolve_nested_projection_inner(
-                    inner_name,
-                    *inner,
-                    &nested.alias,
-                    false,
-                )
-                .map(NestedField::Nested);
+                return resolve_nested_projection_inner(inner_name, *inner, &nested.alias, false)
+                    .map(NestedField::Nested);
             }
             let column = match &pf.expr {
                 Expr::Field(field) => field.clone(),
@@ -582,15 +575,14 @@ fn rewrite_residual_condition(
     child_alias: &str,
     parent_alias: &str,
 ) -> Result<Expr, PlanError> {
-    let rewrite =
-        |inner: Box<Expr>| -> Result<Box<Expr>, PlanError> {
-            Ok(Box::new(rewrite_residual_condition(
-                *inner,
-                name,
-                child_alias,
-                parent_alias,
-            )?))
-        };
+    let rewrite = |inner: Box<Expr>| -> Result<Box<Expr>, PlanError> {
+        Ok(Box::new(rewrite_residual_condition(
+            *inner,
+            name,
+            child_alias,
+            parent_alias,
+        )?))
+    };
     match expr {
         Expr::QualifiedField { qualifier, field } => {
             if qualifier == child_alias {
