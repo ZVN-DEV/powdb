@@ -247,18 +247,30 @@ pub enum NestedProjectField {
 }
 
 /// The resolved form of one nested sub-query projection field. Correlation
-/// columns are pre-split by the planner: `parent_key` is the qualified
-/// parent column name (`u.id`) as produced by an `AliasScan`, `child_key`
-/// is the bare child column name.
+/// columns are pre-split by the planner: at the top level `parent_key` is
+/// the qualified parent column name (`u.id`) as produced by an `AliasScan`;
+/// for a nested-in-nested field it is the bare column name of the enclosing
+/// child table. `child_key` is always the bare child column name.
 #[derive(Debug, Clone)]
 pub struct NestedProjection {
     /// Output column name (the projection field's alias).
     pub name: String,
     pub table: String,
+    /// The child alias from the source text, kept for EXPLAIN and errors.
+    pub alias: String,
     pub child_key: String,
     pub parent_key: String,
-    /// `(output key, child column)` pairs for each object in the array.
-    pub fields: Vec<(String, String)>,
+    /// Residual filter conditions beyond the correlation predicate,
+    /// rewritten by the planner to reference bare child columns.
+    pub residual: Option<Expr>,
+    pub fields: Vec<NestedField>,
+}
+
+/// One entry in a nested projection's output object.
+#[derive(Debug, Clone)]
+pub enum NestedField {
+    /// A scalar child column emitted under `key`.
+    Scalar { key: String, column: String },
 }
 
 #[derive(Debug, Clone)]

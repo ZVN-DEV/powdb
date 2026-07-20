@@ -105,18 +105,90 @@ fn nested_projection_correlation_sides_are_symmetric() {
 }
 
 #[test]
-fn nested_projection_residual_conditions_are_rejected() {
+fn nested_projection_residual_condition_filters_children() {
     let mut engine = engine_with_users_and_orders("residual");
-    // Slice scope: exactly one equi-correlation predicate. AND-ed residuals
-    // must fail with a clear error, not silently misfilter.
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 10.0 { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 3);
+    // alice keeps only the 20.25 order; bob's single 5.5 order is filtered
+    // out, so bob becomes childless-after-residual and still gets [].
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+    assert_eq!(rows[1][1], json("[]"));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_correlation_predicate_position_is_free() {
+    let mut engine = engine_with_users_and_orders("residual_pos");
+    // The correlation predicate may sit anywhere in the AND chain.
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.total > 10.0 and o.user_id = u.id { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+    assert_eq!(rows[1][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_multiple_residual_conditions() {
+    let mut engine = engine_with_users_and_orders("residual_multi");
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 1.0 and o.product_id = 101 { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":9.5}]"#));
+    assert_eq!(rows[1][1], json("[]"));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_outer_alias_in_residual_is_rejected() {
+    let mut engine = engine_with_users_and_orders("residual_outer");
     let err = engine
         .execute_powql(
-            "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 10.0 { o.total } }",
+            "User as u { u.name, orders: Order as o filter o.user_id = u.id and u.id > 0 { o.total } }",
         )
         .unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("correlation"),
-        "expected a clear correlation-predicate error, got: {err}"
+        msg.contains("outer alias") && msg.contains('u'),
+        "expected an outer-alias rejection naming the alias, got: {msg}"
+    );
+}
+
+#[test]
+fn nested_projection_missing_correlation_is_rejected() {
+    let mut engine = engine_with_users_and_orders("residual_nocorr");
+    let err = engine
+        .execute_powql("User as u { u.name, orders: Order as o filter o.total > 1.0 { o.total } }")
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("correlation") && msg.contains("o.<col> = u.<col>"),
+        "expected a correlation-predicate error showing the required shape, got: {msg}"
+    );
+}
+
+#[test]
+fn nested_projection_duplicate_correlation_is_rejected() {
+    let mut engine = engine_with_users_and_orders("residual_dupcorr");
+    let err = engine
+        .execute_powql(
+            "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.id = u.id { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exactly one"),
+        "expected an ambiguous-correlation error, got: {msg}"
     );
 }
 

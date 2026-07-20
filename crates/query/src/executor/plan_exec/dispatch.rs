@@ -2474,8 +2474,19 @@ impl Engine {
             let field_idxs = nested
                 .fields
                 .iter()
-                .map(|(key, column)| Ok((key.as_str(), column_index(column)?)))
+                .map(|field| match field {
+                    NestedField::Scalar { key, column } => {
+                        Ok((key.as_str(), column_index(column)?))
+                    }
+                })
                 .collect::<Result<Vec<_>, QueryError>>()?;
+            // Residual conditions reference bare child columns (rewritten by
+            // the planner), so they evaluate against the full schema row.
+            let schema_cols: Vec<String> = if nested.residual.is_some() {
+                schema.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                Vec::new()
+            };
             // Materialize only the needed child columns (key first), charge
             // them against the query budget like a join build side, then
             // fold into the hash map.
@@ -2490,6 +2501,11 @@ impl Engine {
                 // A NULL correlation value never matches any parent.
                 if row[key_idx] == Value::Empty {
                     continue;
+                }
+                if let Some(residual) = &nested.residual {
+                    if !eval_predicate(residual, &row, &schema_cols) {
+                        continue;
+                    }
                 }
                 let mut narrowed = Vec::with_capacity(1 + field_idxs.len());
                 narrowed.push(row[key_idx].clone());

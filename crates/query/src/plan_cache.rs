@@ -172,6 +172,27 @@ fn plan_contains_nested_project(plan: &PlanNode) -> bool {
     walk(plan)
 }
 
+/// Walk one nested projection's literal slots in source order: the residual
+/// filter (the correlation predicate carries no literals). Shared shape with
+/// [`count_nested_projection`]; both must stay in lockstep.
+fn substitute_nested_projection(
+    nested: &mut crate::plan::NestedProjection,
+    literals: &[Literal],
+    idx: &mut usize,
+) {
+    if let Some(residual) = &mut nested.residual {
+        substitute_expr(residual, literals, idx);
+    }
+}
+
+/// Count one nested projection's literal slots; mirrors
+/// [`substitute_nested_projection`].
+fn count_nested_projection(nested: &crate::plan::NestedProjection, n: &mut usize) {
+    if let Some(residual) = &nested.residual {
+        count_expr(residual, n);
+    }
+}
+
 fn contains_grouped_having(plan: &PlanNode) -> bool {
     match plan {
         PlanNode::GroupBy {
@@ -302,12 +323,20 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             }
         }
         PlanNode::NestedProject { input, fields } => {
-            // Never cached (see `plan_contains_nested_project`); mirrors
-            // `count_plan` for completeness.
+            // Source order: parent pipeline first, then projection fields
+            // left to right. Within a nested field the block reads
+            // `filter <correlation + residuals> { ... }`; the correlation
+            // predicate carries no literals, so walking the residual covers
+            // the block's literal slots in source order.
             substitute_plan(input, literals, idx);
             for field in fields {
-                if let crate::plan::NestedProjectField::Plain(f) = field {
-                    substitute_expr(&mut f.expr, literals, idx);
+                match field {
+                    crate::plan::NestedProjectField::Plain(f) => {
+                        substitute_expr(&mut f.expr, literals, idx);
+                    }
+                    crate::plan::NestedProjectField::Nested(nested) => {
+                        substitute_nested_projection(nested, literals, idx);
+                    }
                 }
             }
         }
@@ -560,13 +589,15 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
             }
         }
         PlanNode::NestedProject { input, fields } => {
-            // Never cached (see `plan_contains_nested_project`); the walk
-            // covers the parent input and plain fields for completeness. The
-            // resolved nested fields carry no expressions at all.
+            // Mirrors the substitute walk: parent pipeline, then fields left
+            // to right, with nested blocks contributing their residual slots.
             count_plan(input, n);
             for field in fields {
-                if let crate::plan::NestedProjectField::Plain(f) = field {
-                    count_expr(&f.expr, n);
+                match field {
+                    crate::plan::NestedProjectField::Plain(f) => count_expr(&f.expr, n),
+                    crate::plan::NestedProjectField::Nested(nested) => {
+                        count_nested_projection(nested, n);
+                    }
                 }
             }
         }
