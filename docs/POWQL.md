@@ -15,22 +15,23 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 5. [Aggregates](#aggregates)
 6. [GROUP BY and HAVING](#group-by-and-having)
 7. [Joins](#joins)
-8. [Set Operations](#set-operations)
-9. [Subqueries](#subqueries)
-10. [Functions](#functions)
-11. [JSON Documents](#json-documents)
-12. [Mutations](#mutations)
-13. [Transactions](#transactions)
-14. [DDL](#ddl)
-15. [Introspection](#introspection)
-16. [Reserved Words and Quoting](#reserved-words-and-quoting)
-17. [Materialized Views](#materialized-views)
-18. [Window Functions](#window-functions)
-19. [UPSERT](#upsert)
-20. [EXPLAIN](#explain)
-21. [Prepared Queries](#prepared-queries)
-22. [Type System](#type-system)
-23. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+8. [Nested Projections (Shaped Results)](#nested-projections-shaped-results)
+9. [Set Operations](#set-operations)
+10. [Subqueries](#subqueries)
+11. [Functions](#functions)
+12. [JSON Documents](#json-documents)
+13. [Mutations](#mutations)
+14. [Transactions](#transactions)
+15. [DDL](#ddl)
+16. [Introspection](#introspection)
+17. [Reserved Words and Quoting](#reserved-words-and-quoting)
+18. [Materialized Views](#materialized-views)
+19. [Window Functions](#window-functions)
+20. [UPSERT](#upsert)
+21. [EXPLAIN](#explain)
+22. [Prepared Queries](#prepared-queries)
+23. [Type System](#type-system)
+24. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -719,6 +720,182 @@ PowQL automatically selects the best join strategy:
 
 No hint syntax is needed. Use `EXPLAIN` to inspect the selected strategy. Query
 deadlines and client disconnects also cooperatively stop allowed join work.
+
+---
+
+## Nested Projections (Shaped Results)
+
+A one-to-many join answers "users and their orders" with one flat row per
+order: the parent's columns repeat once per child, childless parents need an
+outer join and NULL checks, and the client has to regroup the rows by hand. A
+nested projection asks for the shape you actually want -- one row per parent,
+with the matching children assembled into a JSON array inside that row.
+
+### Example Schemas
+
+The examples below assume these table definitions and rows:
+
+```
+type User { required id: int, required name: str, required email: str, age: int }
+type Order { required id: int, required user_id: int, required total: float, product_id: int }
+type Item { required id: int, required order_id: int, required sku: str }
+
+-- Alice (id 1) has two orders, Bob (id 2) has one (with no product_id),
+-- Cara (id 3) has none. Order 1 has items "a" and "b"; order 2 has item "c".
+```
+
+### Syntax
+
+Inside a projection on an aliased table scan, a field may be a whole child
+query bound to a field name:
+
+```
+<Table> as <p> {
+  <parent fields>,
+  <name>: <ChildTable> as <c>
+    filter <correlation> [and <child conditions> ...]
+    [order <c>.<col> [asc|desc], ...] [limit <n>] [offset <n>]
+    { <child fields> }
+}
+```
+
+### Basic Nesting
+
+```
+User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, o.product_id } }
+-- Alice, [{"product_id":101,"total":9.5},{"product_id":102,"total":20.25}]
+-- Bob,   [{"product_id":null,"total":5.5}]
+-- Cara,  []
+```
+
+Every parent row appears exactly once -- there is no join fan-out to undo. A
+parent with zero matching children gets an empty array `[]`, never NULL and
+never a dropped row. A child column that is null (Bob's missing `product_id`)
+maps to JSON `null` inside its object.
+
+The nested field is a native `json` value: an array of objects keyed by the
+child projection names. It follows the canonical JSON semantics described in
+[JSON Documents](#json-documents), so object keys come back bytewise sorted,
+not in projection order.
+
+### The Correlation Rule
+
+The nested `filter` must contain **exactly one** equi-correlation predicate
+linking a child column to a parent column. Either side may be written first:
+
+```
+orders: Order as o filter o.user_id = u.id { o.total }
+orders: Order as o filter u.id = o.user_id { o.total }    -- same query
+```
+
+Zero correlation predicates, or more than one, is an error:
+
+```
+User as u { u.name, orders: Order as o filter o.total > 1.0 { o.total } }
+-- Error: nested projection `orders` requires an equi-correlation predicate
+-- linking `o` to the outer query (o.<col> = u.<col>) somewhere in its filter
+```
+
+### Child Conditions
+
+Beyond the correlation predicate, the filter may chain any number of `and`
+conditions on child columns. The correlation predicate can sit anywhere in the
+`and` chain. Conditions on parent columns belong on the outer query, not
+inside the nested block, and are rejected there:
+
+```
+User as u {
+  u.name,
+  orders: Order as o filter o.user_id = u.id and o.total > 10.0 { o.total }
+}
+-- Alice, [{"total":20.25}]
+-- Bob,   []      -- Bob's only order (5.5) is filtered out; he still gets []
+-- Cara,  []
+```
+
+### Per-Parent order, limit, and offset
+
+`order`, `limit`, and `offset` inside a nested block apply to each parent's
+array independently -- "top N per parent", not N rows overall:
+
+```
+User as u {
+  u.name,
+  orders: Order as o filter o.user_id = u.id and o.total > 10 order o.total desc limit 3 { o.total, o.product_id }
+}
+-- Alice, [{"product_id":102,"total":20.25}]
+-- Bob,   []
+-- Cara,  []
+```
+
+A `limit 1` keeps the single best child for every parent rather than leaving
+all but one parent childless:
+
+```
+User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc limit 1 { o.total } }
+-- Alice, [{"total":20.25}]
+-- Bob,   [{"total":5.5}]
+-- Cara,  []
+```
+
+Order keys must be child columns; rows that compare equal keep their stable
+scan order. Write `limit` before `offset` (the same order as the top-level
+pipeline); the reverse order is accepted and correct, but only the
+`limit ... offset ...` spelling is plan-cacheable.
+
+### Multi-Level Nesting
+
+A nested block may itself contain nested blocks, each with its own
+correlation, child conditions, and per-parent `order`/`limit`/`offset`:
+
+```
+User as u {
+  u.name,
+  orders: Order as o filter o.user_id = u.id {
+    o.total,
+    items: Item as i filter i.order_id = o.id { i.sku }
+  }
+}
+-- Alice, [{"items":[{"sku":"a"},{"sku":"b"}],"total":9.5},{"items":[{"sku":"c"}],"total":20.25}]
+-- Bob,   [{"items":[],"total":5.5}]   -- an order with no items gets [], not a missing key
+-- Cara,  []
+```
+
+Nesting depth is bounded by the parser's shared nesting-depth guard (64
+levels); pathological depth is a clean parse error, not a crash.
+
+### Restrictions
+
+- The parent must be a plain aliased table scan (`User as u { ... }`). A
+  joined parent is rejected; nest instead of joining.
+- Every nested block needs a field name (`orders: Order as o ...`).
+- The outer query composes with its own `filter`/`order`/`limit`/`offset` on
+  parent columns, but not with `group`, `distinct`, or aggregation.
+- Not available through the SQL frontend (see below).
+
+### Execution and EXPLAIN
+
+Execution is hash-based: one pass over the child table to bucket rows by
+correlation key, one pass over the parent table to assemble arrays --
+O(parent + child), never O(parent x child). `EXPLAIN` shows the nested
+structure, one indented line per level:
+
+```
+explain User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 1.0 order o.total desc limit 3 { o.total, o.product_id } }
+```
+
+```
+NestedProject fields=[QualifiedField { qualifier: "u", field: "name" }, orders]
+  nested orders: Order as o on o.user_id = u.id residual=BinaryOp(Field("total"), Gt, Literal(Float(1.0))) order [total desc] limit 3
+  AliasScan table=User alias=u
+```
+
+### PowQL Only
+
+Nested projections are a native PowQL capability with no SQL spelling. The SQL
+frontend deliberately has no equivalent: SQL's `SELECT` list is flat, and
+PowDB does not invent a dialect extension for it. In SQL, use a join and
+regroup client-side, or run the PowQL query directly.
 
 ---
 

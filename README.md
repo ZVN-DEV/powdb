@@ -313,6 +313,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
 - SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](docs/SQL.md))
 - Joins (hash join with compound-`ON` residuals, plus bounded nested-loop fallback)
+- Nested projections (PowQL-only): one row per parent with correlated children as a native JSON array, per-parent order/limit, multi-level nesting ([docs/POWQL.md](docs/POWQL.md#nested-projections-shaped-results))
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
