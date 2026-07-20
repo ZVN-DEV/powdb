@@ -121,10 +121,40 @@ fn nested_projection_residual_conditions_are_rejected() {
 }
 
 #[test]
+fn nested_projection_reexecution_sees_new_children() {
+    let mut engine = engine_with_users_and_orders("reexec");
+    let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, o.product_id } }";
+    assert_nested_shape(exec(&mut engine, q));
+    // Nested plans bypass the plan cache; the second run must replan and
+    // see the new child row.
+    exec(
+        &mut engine,
+        "insert Order { id := 4, user_id := 3, total := 1.5, product_id := 103 }",
+    );
+    let QueryResult::Rows { rows, .. } = exec(&mut engine, q) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[2][1], json(r#"[{"total":1.5,"product_id":103}]"#));
+}
+
+#[test]
+fn explain_handles_nested_projection() {
+    let mut engine = engine_with_users_and_orders("explain");
+    let result = exec(
+        &mut engine,
+        "explain User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total } }",
+    );
+    let text = format!("{result:?}");
+    assert!(
+        text.contains("NestedProject"),
+        "explain output must name the nested plan node, got: {text}"
+    );
+}
+
+#[test]
 fn plain_queries_are_unchanged() {
     let mut engine = engine_with_users_and_orders("smoke");
-    let QueryResult::Rows { columns, rows } =
-        exec(&mut engine, r#"User filter .id = 1 { .name }"#)
+    let QueryResult::Rows { columns, rows } = exec(&mut engine, r#"User filter .id = 1 { .name }"#)
     else {
         panic!("expected rows");
     };

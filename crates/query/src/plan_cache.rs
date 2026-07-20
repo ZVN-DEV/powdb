@@ -79,6 +79,13 @@ impl PlanCache {
         if contains_grouped_having(&plan) {
             return;
         }
+        // Nested-projection plans bypass the cache entirely (language-lab
+        // slice): their nested block's tokens contribute to the canonical
+        // hash but the resolved plan retains no substitutable slots for
+        // them, so the literal-slot walk invariant cannot be guaranteed.
+        if plan_contains_nested_project(&plan) {
+            return;
+        }
         if count_literal_slots(&plan) != source_literal_count {
             return;
         }
@@ -138,6 +145,33 @@ impl PlanCache {
     }
 }
 
+/// True when the plan carries a `NestedProject` anywhere. Such plans are
+/// never inserted into the cache (see `insert`).
+fn plan_contains_nested_project(plan: &PlanNode) -> bool {
+    fn walk(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::NestedProject { .. } => true,
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Sort { input, .. }
+            | PlanNode::Limit { input, .. }
+            | PlanNode::Offset { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input }
+            | PlanNode::GroupBy { input, .. }
+            | PlanNode::Update { input, .. }
+            | PlanNode::Delete { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::Explain { input } => walk(input),
+            PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+                walk(left) || walk(right)
+            }
+            _ => false,
+        }
+    }
+    walk(plan)
+}
+
 fn contains_grouped_having(plan: &PlanNode) -> bool {
     match plan {
         PlanNode::GroupBy {
@@ -154,6 +188,7 @@ fn contains_grouped_having(plan: &PlanNode) -> bool {
         | PlanNode::Update { input, .. }
         | PlanNode::Delete { input, .. }
         | PlanNode::Window { input, .. }
+        | PlanNode::NestedProject { input, .. }
         | PlanNode::Explain { input } => contains_grouped_having(input),
         PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
             contains_grouped_having(left) || contains_grouped_having(right)
@@ -262,6 +297,16 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             } else {
                 substitute_plan(input, literals, idx);
                 for f in fields {
+                    substitute_expr(&mut f.expr, literals, idx);
+                }
+            }
+        }
+        PlanNode::NestedProject { input, fields } => {
+            // Never cached (see `plan_contains_nested_project`); mirrors
+            // `count_plan` for completeness.
+            substitute_plan(input, literals, idx);
+            for field in fields {
+                if let crate::plan::NestedProjectField::Plain(f) = field {
                     substitute_expr(&mut f.expr, literals, idx);
                 }
             }
@@ -514,6 +559,17 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 }
             }
         }
+        PlanNode::NestedProject { input, fields } => {
+            // Never cached (see `plan_contains_nested_project`); the walk
+            // covers the parent input and plain fields for completeness. The
+            // resolved nested fields carry no expressions at all.
+            count_plan(input, n);
+            for field in fields {
+                if let crate::plan::NestedProjectField::Plain(f) = field {
+                    count_expr(&f.expr, n);
+                }
+            }
+        }
         PlanNode::Sort { input, keys } => {
             count_plan(input, n);
             for key in keys {
@@ -751,6 +807,10 @@ fn count_expr(expr: &Expr, n: &mut usize) {
         // reaches the plan cache, and it occupies no source literal slot.
         Expr::ValueLit(_) => {}
         Expr::Null => {}
+        // Plans carrying nested projections are never inserted into the
+        // cache (see `plan_contains_nested_project`), so this node's inner
+        // literal slots are never walked.
+        Expr::NestedQuery(_) => {}
     }
 }
 
@@ -829,6 +889,9 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         // reaches the plan cache, so there is nothing to substitute.
         Expr::ValueLit(_) => {}
         Expr::Null => {}
+        // Never cached (see `plan_contains_nested_project`); nothing to
+        // substitute.
+        Expr::NestedQuery(_) => {}
     }
 }
 
@@ -1251,6 +1314,14 @@ mod tests {
                     collect_expr_literals(&f.expr, out);
                 }
             }
+            PlanNode::NestedProject { input, fields } => {
+                collect_literals_for_test(input, out);
+                for field in fields {
+                    if let crate::plan::NestedProjectField::Plain(f) = field {
+                        collect_expr_literals(&f.expr, out);
+                    }
+                }
+            }
             PlanNode::Sort { input, keys } => {
                 collect_literals_for_test(input, out);
                 for key in keys {
@@ -1420,6 +1491,8 @@ mod tests {
             Expr::JsonPath { base, .. } => collect_expr_literals(base, out),
             Expr::ValueLit(_) => {}
             Expr::Null => {}
+            // Never cached; mirrors count_expr/substitute_expr.
+            Expr::NestedQuery(_) => {}
         }
     }
 }

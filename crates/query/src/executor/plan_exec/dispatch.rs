@@ -1467,6 +1467,20 @@ impl Engine {
                 Ok(QueryResult::Modified(count))
             }
 
+            PlanNode::NestedProject { input, fields } => {
+                // Auto-refresh dirty materialized views among the child
+                // tables before the read-only assembly runs.
+                for field in fields {
+                    if let NestedProjectField::Nested(nested) = field {
+                        if self.view_registry.is_dirty(&nested.table) {
+                            self.refresh_view(&nested.table)?;
+                        }
+                    }
+                }
+                let parent = self.execute_plan(input)?;
+                self.execute_nested_project(parent, fields)
+            }
+
             PlanNode::AliasScan { table, alias } => {
                 // Mission E1.2: scan `table` and rename every output column
                 // to `alias.field`. Used as a join leaf so downstream
@@ -2404,5 +2418,195 @@ impl Engine {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Execute the projection layer of a `NestedProject` (language-lab
+    /// slice): plain fields evaluate against the parent rows like `Project`;
+    /// each nested field is assembled from a single hash-build pass over its
+    /// child table keyed by the correlation column, O(parent + child). Shared
+    /// by the mutable and read-only dispatches (assembly only reads).
+    pub(crate) fn execute_nested_project(
+        &self,
+        parent: QueryResult,
+        fields: &[NestedProjectField],
+    ) -> Result<QueryResult, QueryError> {
+        use rustc_hash::FxHashMap;
+        let QueryResult::Rows {
+            columns: parent_columns,
+            rows: parent_rows,
+        } = parent
+        else {
+            return Err("nested projection requires row input".into());
+        };
+        // Per nested field: the parent-side key column index and the build
+        // side mapping correlation value -> child objects (as canonical JSON
+        // object text, in child scan order).
+        let mut builds: Vec<(usize, FxHashMap<Value, Vec<String>>)> = Vec::new();
+        for field in fields {
+            let NestedProjectField::Nested(nested) = field else {
+                continue;
+            };
+            let parent_idx = parent_columns
+                .iter()
+                .position(|c| c == &nested.parent_key)
+                .ok_or_else(|| {
+                    QueryError::Execution(format!(
+                        "nested projection outer column `{}` not found",
+                        nested.parent_key
+                    ))
+                })?;
+            let schema = self
+                .catalog
+                .schema(&nested.table)
+                .ok_or_else(|| QueryError::TableNotFound(nested.table.clone()))?
+                .clone();
+            let column_index = |name: &str| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == name)
+                    .ok_or_else(|| QueryError::ColumnNotFound {
+                        table: nested.table.clone(),
+                        column: name.to_string(),
+                    })
+            };
+            let key_idx = column_index(&nested.child_key)?;
+            let field_idxs = nested
+                .fields
+                .iter()
+                .map(|(key, column)| Ok((key.as_str(), column_index(column)?)))
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            // Materialize only the needed child columns (key first), charge
+            // them against the query budget like a join build side, then
+            // fold into the hash map.
+            let mut cancel = CancelCheck::new();
+            let mut child_rows: Vec<Vec<Value>> = Vec::new();
+            for (_, row) in self
+                .catalog
+                .scan(&nested.table)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?
+            {
+                cancel.tick()?;
+                // A NULL correlation value never matches any parent.
+                if row[key_idx] == Value::Empty {
+                    continue;
+                }
+                let mut narrowed = Vec::with_capacity(1 + field_idxs.len());
+                narrowed.push(row[key_idx].clone());
+                for (_, idx) in &field_idxs {
+                    narrowed.push(row[*idx].clone());
+                }
+                child_rows.push(narrowed);
+            }
+            self.charge_rows(&child_rows)?;
+            let mut build: FxHashMap<Value, Vec<String>> =
+                FxHashMap::with_capacity_and_hasher(child_rows.len(), Default::default());
+            for mut child in child_rows {
+                cancel.tick()?;
+                let key = child.remove(0);
+                let mut object = String::from("{");
+                for (i, ((name, _), value)) in field_idxs.iter().zip(&child).enumerate() {
+                    if i > 0 {
+                        object.push(',');
+                    }
+                    push_json_string(&mut object, name);
+                    object.push(':');
+                    push_json_value(&mut object, value);
+                }
+                object.push('}');
+                build.entry(key).or_default().push(object);
+            }
+            builds.push((parent_idx, build));
+        }
+
+        let columns: Vec<String> = fields
+            .iter()
+            .map(|field| match field {
+                NestedProjectField::Plain(f) => f
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| expression_output_name(&f.expr)),
+                NestedProjectField::Nested(nested) => nested.name.clone(),
+            })
+            .collect();
+        let mut cancel = CancelCheck::new();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(parent_rows.len());
+        for parent_row in &parent_rows {
+            cancel.tick()?;
+            let mut out = Vec::with_capacity(fields.len());
+            let mut build_iter = builds.iter();
+            for field in fields {
+                match field {
+                    NestedProjectField::Plain(f) => {
+                        out.push(eval_expr(&f.expr, parent_row, &parent_columns));
+                    }
+                    NestedProjectField::Nested(_) => {
+                        let (parent_idx, build) =
+                            build_iter.next().expect("one build side per nested field");
+                        let mut array = String::from("[");
+                        if let Some(objects) = build.get(&parent_row[*parent_idx]) {
+                            array.push_str(&objects.join(","));
+                        }
+                        array.push(']');
+                        // Round-tripping through the text parser yields
+                        // canonical PJ1 (sorted object keys) for free.
+                        let doc = powdb_storage::pj1::parse_json_text(&array).map_err(|e| {
+                            QueryError::Execution(format!(
+                                "nested projection produced invalid JSON: {e}"
+                            ))
+                        })?;
+                        out.push(Value::Json(doc.into()));
+                    }
+                }
+            }
+            rows.push(out);
+        }
+        Ok(QueryResult::Rows { columns, rows })
+    }
+}
+
+/// Append `s` to `out` as a JSON string literal with the required escapes.
+fn push_json_string(out: &mut String, s: &str) {
+    use std::fmt::Write;
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c <= '\u{1f}' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Append a child column value to `out` as a JSON value. Scalars map
+/// naturally (int/float -> number, str -> string, bool -> bool, empty ->
+/// null); JSON columns embed as sub-documents; the remaining types
+/// (datetime, uuid, bytes) fall back to their wire text as a JSON string
+/// (slice scope).
+fn push_json_value(out: &mut String, value: &Value) {
+    use std::fmt::Write;
+    match value {
+        Value::Empty => out.push_str("null"),
+        Value::Int(v) => {
+            let _ = write!(out, "{v}");
+        }
+        Value::Float(v) if v.is_finite() => {
+            let _ = write!(out, "{v}");
+        }
+        // NaN/infinity have no JSON representation.
+        Value::Float(_) => out.push_str("null"),
+        Value::Bool(v) => out.push_str(if *v { "true" } else { "false" }),
+        Value::Str(s) => push_json_string(out, s),
+        Value::Json(doc) => {
+            out.push_str(&powdb_storage::pj1::pj1_to_text(doc).unwrap_or_else(|_| "null".into()))
+        }
+        other => push_json_string(out, &other.to_wire_string()),
     }
 }

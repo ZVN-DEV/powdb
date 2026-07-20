@@ -85,6 +85,16 @@ pub enum PlanNode {
         input: Box<PlanNode>,
         fields: Vec<ProjectField>,
     },
+    /// Language-lab slice: projection with one or more nested sub-query
+    /// fields. `input` is the parent pipeline (AliasScan-based so qualified
+    /// references resolve by column name); each nested field is assembled by
+    /// a single hash-build pass over its child table, O(parent + child).
+    /// Kept separate from `Project` so the single-table fast paths and the
+    /// plan cache never see this shape.
+    NestedProject {
+        input: Box<PlanNode>,
+        fields: Vec<NestedProjectField>,
+    },
     Sort {
         input: Box<PlanNode>,
         keys: Vec<SortKey>,
@@ -225,6 +235,30 @@ pub enum PlanNode {
 pub struct ProjectField {
     pub alias: Option<String>,
     pub expr: Expr,
+}
+
+/// One output column of a `PlanNode::NestedProject`.
+#[derive(Debug, Clone)]
+pub enum NestedProjectField {
+    /// A scalar field, evaluated against the parent row like `Project`.
+    Plain(ProjectField),
+    /// A nested sub-query field, emitted as a PJ1 JSON array of objects.
+    Nested(NestedProjection),
+}
+
+/// The resolved form of one nested sub-query projection field. Correlation
+/// columns are pre-split by the planner: `parent_key` is the qualified
+/// parent column name (`u.id`) as produced by an `AliasScan`, `child_key`
+/// is the bare child column name.
+#[derive(Debug, Clone)]
+pub struct NestedProjection {
+    /// Output column name (the projection field's alias).
+    pub name: String,
+    pub table: String,
+    pub child_key: String,
+    pub parent_key: String,
+    /// `(output key, child column)` pairs for each object in the array.
+    pub fields: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]

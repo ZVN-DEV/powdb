@@ -836,6 +836,26 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             let child = format_plan_tree(catalog, input, depth + 1);
             format!("{indent}Project fields=[{}]\n{child}", names.join(", "))
         }
+        PlanNode::NestedProject { input, fields } => {
+            let names: Vec<String> = fields
+                .iter()
+                .map(|f| match f {
+                    NestedProjectField::Plain(field) => match &field.alias {
+                        Some(a) => format!("{a}: {:?}", field.expr),
+                        None => format!("{:?}", field.expr),
+                    },
+                    NestedProjectField::Nested(nested) => format!(
+                        "{}: {}[{} = {}]",
+                        nested.name, nested.table, nested.child_key, nested.parent_key
+                    ),
+                })
+                .collect();
+            let child = format_plan_tree(catalog, input, depth + 1);
+            format!(
+                "{indent}NestedProject fields=[{}]\n{child}",
+                names.join(", ")
+            )
+        }
         PlanNode::Sort { input, keys } => {
             let ks: Vec<String> = keys
                 .iter()

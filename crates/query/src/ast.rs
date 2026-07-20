@@ -192,6 +192,19 @@ pub struct ProjectionField {
     pub expr: Expr,
 }
 
+/// Language-lab slice: a nested sub-query projection value, e.g.
+/// `orders: Order as o filter o.user_id = u.id { o.total, o.product_id }`.
+/// The filter must be a single equi-correlation predicate between the child
+/// alias and the outer alias (validated by the planner, which knows the
+/// outer alias); the parser stores it as a plain `Expr`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedQuery {
+    pub source: String,
+    pub alias: String,
+    pub filter: Expr,
+    pub fields: Vec<ProjectionField>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderClause {
     pub keys: Vec<OrderKey>,
@@ -426,6 +439,10 @@ pub enum Expr {
     ValueLit(Value),
     /// The `null` literal — produces `Value::Empty`.
     Null,
+    /// A nested sub-query projection value (language-lab slice). Only valid
+    /// directly inside a projection field; the planner turns it into a
+    /// `NestedProject` plan node and it never reaches expression evaluation.
+    NestedQuery(Box<NestedQuery>),
     /// A JSON path access: `base->seg->seg...`. `base` is restricted at parse
     /// time to `Field`, `QualifiedField`, or (nested) `JsonPath`. Evaluating it
     /// walks the base `Value::Json` document and scalarizes the addressed node

@@ -833,7 +833,15 @@ impl Parser {
                     _ => unreachable!("guarded by the matches! above"),
                 };
                 self.advance(); // consume ':'
-                let expr = self.parse_expr()?;
+                                // `alias: Ident as ...` is a nested sub-query projection
+                                // (language-lab slice): `orders: Order as o filter ... { ... }`.
+                let expr = if matches!(self.peek(), Token::Ident(_))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
+                {
+                    Expr::NestedQuery(Box::new(self.parse_nested_query()?))
+                } else {
+                    self.parse_expr()?
+                };
                 fields.push(ProjectionField {
                     alias: Some(alias),
                     expr,
@@ -848,6 +856,55 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(fields)
+    }
+
+    /// Parse a nested sub-query projection value (language-lab slice):
+    /// `<ChildTable> as <alias> filter <predicate> { <fields> }`. The nested
+    /// block accepts plain and aliased scalar fields only; further nesting,
+    /// order, and limit are out of slice scope.
+    fn parse_nested_query(&mut self) -> Result<NestedQuery, ParseError> {
+        let source = self.expect_named_ident("nested source type")?;
+        self.expect(&Token::As)?;
+        let alias = self.expect_named_ident("nested source alias")?;
+        self.expect(&Token::Filter)?;
+        let filter = self.parse_expr()?;
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            let alias = if matches!(self.peek(), Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Colon))
+            {
+                let alias = self.expect_named_ident("field alias")?;
+                self.advance(); // consume ':'
+                Some(alias)
+            } else {
+                None
+            };
+            if matches!(self.peek(), Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
+            {
+                return Err(ParseError::Unsupported {
+                    feature: "nested projections cannot nest further".into(),
+                });
+            }
+            let expr = self.parse_expr()?;
+            fields.push(ProjectionField { alias, expr });
+            if *self.peek() == Token::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        if fields.is_empty() {
+            return Err(ParseError::Syntax {
+                message: "nested projection requires at least one field".into(),
+            });
+        }
+        Ok(NestedQuery {
+            source,
+            alias,
+            filter,
+            fields,
+        })
     }
 
     /// Parse the OVER clause for a window function:

@@ -380,6 +380,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             Literal::String(v) => Value::Str(v.clone()),
             Literal::Bool(v) => Value::Bool(*v),
         },
+        // Nested sub-queries only appear inside a projection; the planner
+        // routes them to `NestedProject`, so they never reach evaluation.
+        Expr::NestedQuery(_) => Value::Empty,
         Expr::BinaryOp(left, op, right) => {
             let l = eval_expr(left, row, columns);
             let r = eval_expr(right, row, columns);

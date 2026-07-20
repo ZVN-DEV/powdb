@@ -106,6 +106,14 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
+    // Language-lab slice: projections carrying a nested sub-query field take
+    // a dedicated path so every other query shape plans exactly as before.
+    if q.projection.as_ref().is_some_and(|proj| {
+        proj.iter()
+            .any(|pf| matches!(pf.expr, Expr::NestedQuery(_)))
+    }) {
+        return plan_nested_query(q);
+    }
     // Mission E1.2: if the query has joins, build a left-deep nested-loop
     // plan. Correctness first — hash-join optimization is E1.3. We also
     // don't try to fold an IndexScan under a joined query yet (the
@@ -311,6 +319,143 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     Ok(node)
+}
+
+/// Build a `NestedProject` plan for a query whose projection carries nested
+/// sub-query fields (language-lab slice). The parent pipeline is an
+/// `AliasScan` (so `alias.field` references resolve by column name) plus the
+/// usual filter/order/offset/limit stack; the projection itself becomes the
+/// `NestedProject` layer. Emitted speculatively like `RangeScan`: the planner
+/// stays catalog-pure and the executor resolves tables/columns at run time.
+fn plan_nested_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+    if !q.joins.is_empty() || q.group_by.is_some() || q.aggregation.is_some() || q.distinct {
+        return Err(PlanError::Semantic(
+            "nested projections require a plain aliased table scan (no joins, \
+             group, distinct, or aggregation)"
+                .into(),
+        ));
+    }
+    let parent_alias = q.alias.unwrap_or_else(|| q.source.clone());
+    let mut node = PlanNode::AliasScan {
+        table: q.source,
+        alias: parent_alias.clone(),
+    };
+    if let Some(pred) = q.filter {
+        node = PlanNode::Filter {
+            input: Box::new(node),
+            predicate: pred,
+        };
+    }
+    if let Some(order) = q.order {
+        node = PlanNode::Sort {
+            input: Box::new(node),
+            keys: order
+                .keys
+                .into_iter()
+                .map(|k| SortKey {
+                    expr: k.expr,
+                    descending: k.descending,
+                })
+                .collect(),
+        };
+    }
+    if let Some(off) = q.offset {
+        node = PlanNode::Offset {
+            input: Box::new(node),
+            count: off,
+        };
+    }
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            count: lim,
+        };
+    }
+    let fields = q
+        .projection
+        .expect("plan_nested_query is only called with a projection")
+        .into_iter()
+        .map(|pf| match pf.expr {
+            Expr::NestedQuery(nested) => {
+                let name = pf.alias.ok_or_else(|| {
+                    PlanError::Semantic("nested projection field requires a name".into())
+                })?;
+                resolve_nested_projection(name, *nested, &parent_alias)
+                    .map(NestedProjectField::Nested)
+            }
+            expr => Ok(NestedProjectField::Plain(ProjectField {
+                alias: pf.alias,
+                expr,
+            })),
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(PlanNode::NestedProject {
+        input: Box::new(node),
+        fields,
+    })
+}
+
+/// Split a parsed `NestedQuery` into the resolved `NestedProjection` form:
+/// exactly one equi-correlation predicate `child.col = outer.col` (either
+/// side order) and a list of scalar child fields.
+fn resolve_nested_projection(
+    name: String,
+    nested: NestedQuery,
+    parent_alias: &str,
+) -> Result<NestedProjection, PlanError> {
+    let correlation_error = || {
+        PlanError::Semantic(format!(
+            "nested projection filter must be a single equi-correlation predicate \
+             ({child}.col = {parent}.col); additional conditions are not supported \
+             in this slice",
+            child = nested.alias,
+            parent = parent_alias,
+        ))
+    };
+    let Expr::BinaryOp(left, BinOp::Eq, right) = &nested.filter else {
+        return Err(correlation_error());
+    };
+    let side = |expr: &Expr| match expr {
+        Expr::QualifiedField { qualifier, field } => Some((qualifier.clone(), field.clone())),
+        _ => None,
+    };
+    let (Some((lq, lf)), Some((rq, rf))) = (side(left), side(right)) else {
+        return Err(correlation_error());
+    };
+    let (child_key, parent_key) = if lq == nested.alias && rq == parent_alias {
+        (lf, rf)
+    } else if rq == nested.alias && lq == parent_alias {
+        (rf, lf)
+    } else {
+        return Err(correlation_error());
+    };
+    let fields = nested
+        .fields
+        .into_iter()
+        .map(|pf| {
+            let column = match &pf.expr {
+                Expr::Field(field) => field.clone(),
+                Expr::QualifiedField { qualifier, field } if *qualifier == nested.alias => {
+                    field.clone()
+                }
+                _ => {
+                    return Err(PlanError::Semantic(format!(
+                        "nested projection fields must be plain columns of `{}` in this slice",
+                        nested.alias
+                    )))
+                }
+            };
+            let key = pf.alias.unwrap_or_else(|| column.clone());
+            Ok((key, column))
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(NestedProjection {
+        name,
+        table: nested.source,
+        child_key,
+        parent_key: format!("{parent_alias}.{parent_key}"),
+        fields,
+    })
 }
 
 /// Build a left-deep nested-loop join plan for a query with 1+ join clauses.
@@ -1187,7 +1332,8 @@ fn collect_expression_sources(
         | Expr::Literal(_)
         | Expr::Param(_)
         | Expr::ValueLit(_)
-        | Expr::Null => {}
+        | Expr::Null
+        | Expr::NestedQuery(_) => {}
     }
 }
 
