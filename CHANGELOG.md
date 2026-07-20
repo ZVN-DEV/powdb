@@ -23,6 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/POWQL.md` (Nested Projections) with a runnable, CI-smoked demo in
   `examples/nested-results/`.
 
+## [0.18.0] - 2026-07-20
+
+### Added
+
+- **Nested projections (shaped results), PowQL-only.** A projection field can
+  now be a whole correlated child query:
+  `User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc limit 3 { o.total } }`
+  returns one row per parent with the matching children assembled into a
+  native JSON array of objects; childless parents get `[]` (never NULL, never
+  a dropped row) and there is no join fan-out to regroup client-side. Nested
+  blocks take one equi-correlation predicate plus optional `and` conditions
+  on child columns, per-parent `order`/`limit`/`offset` (top-N per parent),
+  and nest recursively for multi-level shapes. Execution is hash-based,
+  O(parent + child); plans are cached and `EXPLAIN` shows the nested
+  structure. The SQL frontend deliberately has no equivalent. Documented in
+  `docs/POWQL.md` (Nested Projections) with a runnable, CI-smoked demo in
+  `examples/nested-results/`.
+
 ## [0.17.0] - 2026-07-19
 
 ### Added

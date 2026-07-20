@@ -6,7 +6,7 @@ no static IP needed. Clients connect through Cloudflare's edge.
 
 ## What this example does
 
-- Runs `ghcr.io/zvn-dev/powdb:v0.17.0` on an internal docker network.
+- Runs `ghcr.io/zvn-dev/powdb:v0.18.0` on an internal docker network.
 - Runs `cloudflare/cloudflared` as a sidecar that establishes an
   outbound-only tunnel to Cloudflare.
 - Routes the hostname you own (e.g. `powdb.example.com`) over TCP into

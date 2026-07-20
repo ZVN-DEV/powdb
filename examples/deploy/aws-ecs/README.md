@@ -1,6 +1,6 @@
 # PowDB on AWS ECS Fargate + EFS
 
-A minimal Terraform module that runs `ghcr.io/zvn-dev/powdb:v0.17.0` as a
+A minimal Terraform module that runs `ghcr.io/zvn-dev/powdb:v0.18.0` as a
 single Fargate task with persistent storage on EFS. This is a starting
 point, not a turnkey production deploy — read the trade-offs below before
 you `terraform apply`.
@@ -71,7 +71,7 @@ front for a stable DNS name.
 | Name | Default | Notes |
 |---|---|---|
 | `powdb_password_secret_arn` | _(required)_ | Secrets Manager ARN holding `POWDB_PASSWORD`. |
-| `powdb_image` | `ghcr.io/zvn-dev/powdb:v0.17.0` | Pin to a digest in production. |
+| `powdb_image` | `ghcr.io/zvn-dev/powdb:v0.18.0` | Pin to a digest in production. |
 | `powdb_port` | `5433` | TCP wire protocol port. |
 | `task_cpu` | `512` (0.5 vCPU) | Fargate CPU units. |
 | `task_memory` | `1024` MiB | Must satisfy Fargate cpu↔memory ratios. |
