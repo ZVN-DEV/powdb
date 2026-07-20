@@ -182,7 +182,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -231,7 +231,7 @@ jobs:
           merge-multiple: true
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           generate_release_notes: true
           files: artifacts/*
@@ -254,13 +254,13 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
