@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.17.0.** Typed wire error codes (stable one-byte class on error frames, mapped by the TS client), CLI TLS (--tls / --tls-ca / --tls-server-name), wire-decoder and WAL-replay fuzzing, a SIGKILL-mid-write durability test, executor internals reorganized, and a post-publish live-registry smoke workflow.
+> **Current release: v0.18.0.** Nested projections (shaped results): a PowQL projection field can embed a correlated child query, returning one row per parent with matching children assembled into a native JSON array (per-parent order/limit/offset, residual conditions, multi-level nesting, [] for childless parents). PowQL-only; hash-based O(parent + child) execution.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

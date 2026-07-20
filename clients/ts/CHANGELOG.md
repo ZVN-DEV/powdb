@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.0 - 2026-07-20
+
+- Version-alignment release in lockstep with workspace v0.18.0 (nested
+  projections: a PowQL projection field can embed a correlated child query and
+  return a native JSON array of shaped child objects per parent row). The
+  nested column arrives as an ordinary JSON value, so existing JSON handling
+  applies unchanged. No TypeScript API changes.
+
 ## 0.17.0 - 2026-07-19
 
 - **Typed wire error codes.** Servers >= 0.17.0 append a stable one-byte error
