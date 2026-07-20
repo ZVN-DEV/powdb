@@ -491,6 +491,52 @@ fn explain_shows_nested_structure_with_correlation_keys() {
 }
 
 #[test]
+fn nested_projection_unknown_alias_in_residual_is_rejected() {
+    let mut engine = engine_with_users_and_orders("residual_unknown");
+    let err = engine
+        .execute_powql(
+            "User as u { u.name, orders: Order as o filter o.user_id = u.id and x.total > 1.0 { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown alias") && msg.contains('x'),
+        "expected an unknown-alias error naming the alias, got: {msg}"
+    );
+}
+
+#[test]
+fn nested_projection_without_field_name_is_rejected() {
+    let mut engine = engine_with_users_and_orders("unnamed");
+    let err = engine
+        .execute_powql(
+            "User as u { u.name, Order as o filter o.user_id = u.id { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("needs a field name") && msg.contains("<name>:"),
+        "expected a field-name error showing the required shape, got: {msg}"
+    );
+}
+
+#[test]
+fn nested_projection_on_joined_parent_is_rejected() {
+    let mut engine = engine_with_users_and_orders("joined_parent");
+    let err = engine
+        .execute_powql(
+            "User as u join Order as j on j.user_id = u.id \
+             { u.name, orders: Order as o filter o.user_id = u.id { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("plain aliased table scan"),
+        "expected an unsupported-parent-shape error, got: {msg}"
+    );
+}
+
+#[test]
 fn plain_queries_are_unchanged() {
     let mut engine = engine_with_users_and_orders("smoke");
     let QueryResult::Rows { columns, rows } = exec(&mut engine, r#"User filter .id = 1 { .name }"#)
@@ -499,4 +545,33 @@ fn plain_queries_are_unchanged() {
     };
     assert_eq!(columns, vec!["name".to_string()]);
     assert_eq!(rows, vec![vec![Value::Str("alice".into())]]);
+}
+
+#[test]
+#[ignore]
+fn perf_probe_nested_vs_flat_join() {
+    // Scratch probe, not committed as a gate. Run with:
+    // cargo test --release -p powdb-query --test nested_results -- --ignored perf_probe
+    let mut engine = Engine::new(&temp_dir("perf")).unwrap();
+    engine.set_wal_sync_mode(powdb_query::executor::WalSyncMode::Off);
+    exec(&mut engine, "type User { required id: int, required name: str }");
+    exec(&mut engine, "type Order { required id: int, required user_id: int, required total: float }");
+    for i in 0..5000 {
+        exec(&mut engine, &format!(r#"insert User {{ id := {i}, name := "user{i}" }}"#));
+    }
+    for i in 0..50000 {
+        let uid = i % 5000;
+        exec(&mut engine, &format!("insert Order {{ id := {i}, user_id := {uid}, total := {}.5 }}", i % 100));
+    }
+    let nested = "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total } }";
+    let flat = "User as u join Order as o on o.user_id = u.id { u.name, o.total }";
+    for (label, q) in [("nested", nested), ("flat_join", flat)] {
+        exec(&mut engine, q);
+        let start = std::time::Instant::now();
+        let mut n = 0usize;
+        for _ in 0..5 {
+            if let QueryResult::Rows { rows, .. } = exec(&mut engine, q) { n += rows.len(); }
+        }
+        println!("{label}: {:?}/run rows={}", start.elapsed() / 5, n / 5);
+    }
 }

@@ -847,6 +847,15 @@ impl Parser {
                     expr,
                 });
             } else {
+                if matches!(self.peek(), Token::Ident(_))
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
+                {
+                    return Err(ParseError::Syntax {
+                        message: "a nested projection needs a field name: \
+                                  `<name>: <Table> as <alias> filter ... { ... }`"
+                            .into(),
+                    });
+                }
                 let expr = self.parse_expr()?;
                 fields.push(ProjectionField { alias: None, expr });
             }
