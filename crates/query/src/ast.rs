@@ -202,6 +202,15 @@ pub struct NestedQuery {
     pub source: String,
     pub alias: String,
     pub filter: Expr,
+    /// Per-parent ordering, applied to each parent's child bucket.
+    pub order: Option<OrderClause>,
+    /// Per-parent truncation, applied after ordering.
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+    /// True when the source text wrote `offset` before `limit`. The plan
+    /// cache refuses to cache that form: its source literal order is
+    /// [offset, limit] while the substitution walk visits limit first.
+    pub offset_before_limit: bool,
     pub fields: Vec<ProjectionField>,
 }
 

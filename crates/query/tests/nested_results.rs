@@ -210,6 +210,192 @@ fn nested_projection_reexecution_sees_new_children() {
 }
 
 #[test]
+fn nested_projection_order_sorts_within_each_array() {
+    let mut engine = engine_with_users_and_orders("order");
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25},{"total":9.5}]"#));
+    assert_eq!(rows[1][1], json(r#"[{"total":5.5}]"#));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_limit_is_per_parent() {
+    let mut engine = engine_with_users_and_orders("limit");
+    // A global limit 1 would leave bob childless; per-parent top-N must not.
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc limit 1 { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+    assert_eq!(rows[1][1], json(r#"[{"total":5.5}]"#));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_offset_and_limit_apply_after_per_parent_sort() {
+    let mut engine = engine_with_users_and_orders("offset");
+    let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc offset 1 limit 5 { o.total } }";
+    let QueryResult::Rows { rows, .. } = exec(&mut engine, q) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":9.5}]"#));
+    assert_eq!(rows[1][1], json("[]"));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_order_ties_keep_scan_order() {
+    let mut engine = engine_with_users_and_orders("stable");
+    exec(
+        &mut engine,
+        "insert Order { id := 10, user_id := 1, total := 9.5, product_id := 110 }",
+    );
+    exec(
+        &mut engine,
+        "insert Order { id := 11, user_id := 1, total := 9.5, product_id := 111 }",
+    );
+    let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total asc { o.product_id } }";
+    let expected = json(
+        r#"[{"product_id":101},{"product_id":110},{"product_id":111},{"product_id":102}]"#,
+    );
+    for _ in 0..3 {
+        let QueryResult::Rows { rows, .. } = exec(&mut engine, q) else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows[0][1], expected, "tie order must be stable");
+    }
+}
+
+#[test]
+fn nested_projection_limit_without_order_truncates_scan_order() {
+    let mut engine = engine_with_users_and_orders("limit_noorder");
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id limit 1 { o.total } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":9.5}]"#));
+    assert_eq!(rows[1][1], json(r#"[{"total":5.5}]"#));
+}
+
+#[test]
+fn nested_projection_order_key_must_be_child_column() {
+    let mut engine = engine_with_users_and_orders("order_badkey");
+    let err = engine
+        .execute_powql(
+            "User as u { u.name, orders: Order as o filter o.user_id = u.id order u.id desc { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("order") && msg.contains('o'),
+        "expected an order-key error naming the child alias, got: {msg}"
+    );
+}
+
+#[test]
+fn nested_projection_limit_must_be_non_negative_integer() {
+    let mut engine = engine_with_users_and_orders("limit_neg");
+    let err = engine
+        .execute_powql(
+            "User as u { u.name, orders: Order as o filter o.user_id = u.id limit -1 { o.total } }",
+        )
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("limit") && msg.contains("non-negative"),
+        "expected a non-negative limit error, got: {msg}"
+    );
+}
+
+/// Adds an Item table under Order: order 1 has two items, order 2 has one,
+/// order 3 has none.
+fn add_items(engine: &mut Engine) {
+    exec(
+        engine,
+        "type Item { required id: int, required order_id: int, required sku: str }",
+    );
+    exec(
+        engine,
+        r#"insert Item { id := 1, order_id := 1, sku := "a" }"#,
+    );
+    exec(
+        engine,
+        r#"insert Item { id := 2, order_id := 1, sku := "b" }"#,
+    );
+    exec(
+        engine,
+        r#"insert Item { id := 3, order_id := 2, sku := "c" }"#,
+    );
+}
+
+#[test]
+fn nested_projection_recurses_two_levels() {
+    let mut engine = engine_with_users_and_orders("two_levels");
+    add_items(&mut engine);
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, \
+         items: Item as i filter i.order_id = o.id { i.sku } } }",
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0][1],
+        json(
+            r#"[{"total":9.5,"items":[{"sku":"a"},{"sku":"b"}]},
+                {"total":20.25,"items":[{"sku":"c"}]}]"#
+        )
+    );
+    // bob's only order has no items: empty inner array, not a missing key.
+    assert_eq!(rows[1][1], json(r#"[{"total":5.5,"items":[]}]"#));
+    assert_eq!(rows[2][1], json("[]"));
+}
+
+#[test]
+fn nested_projection_inner_level_supports_residual_order_and_limit() {
+    let mut engine = engine_with_users_and_orders("two_levels_full");
+    add_items(&mut engine);
+    let QueryResult::Rows { rows, .. } = exec(
+        &mut engine,
+        r#"User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, items: Item as i filter i.order_id = o.id and i.sku != "b" order i.sku desc limit 1 { i.sku } } }"#,
+    ) else {
+        panic!("expected rows");
+    };
+    assert_eq!(
+        rows[0][1],
+        json(r#"[{"total":9.5,"items":[{"sku":"a"}]},{"total":20.25,"items":[{"sku":"c"}]}]"#)
+    );
+}
+
+#[test]
+fn nested_projection_depth_guard_rejects_pathological_nesting() {
+    let mut engine = engine_with_users_and_orders("depth");
+    let mut q = String::from("User as u { u.name");
+    for level in 0..80 {
+        q.push_str(&format!(
+            ", n{level}: Order as o{level} filter o{level}.user_id = u.id {{ o{level}.total"
+        ));
+    }
+    q.push_str(&"}".repeat(80));
+    q.push('}');
+    let err = engine.execute_powql(&q).unwrap_err();
+    assert!(
+        err.to_string().contains("nesting depth"),
+        "expected a clean nesting-depth error, got: {err}"
+    );
+}
+
+#[test]
 fn explain_handles_nested_projection() {
     let mut engine = engine_with_users_and_orders("explain");
     let result = exec(

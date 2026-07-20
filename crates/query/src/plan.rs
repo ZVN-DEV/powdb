@@ -263,6 +263,16 @@ pub struct NestedProjection {
     /// Residual filter conditions beyond the correlation predicate,
     /// rewritten by the planner to reference bare child columns.
     pub residual: Option<Expr>,
+    /// Per-parent ordering: `(bare child column, descending)` keys applied
+    /// to each parent's child bucket before truncation.
+    pub order: Vec<(String, bool)>,
+    /// Per-parent truncation bounds, applied after ordering. Must evaluate
+    /// to non-negative integer literals (like top-level limit/offset).
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+    /// Source wrote `offset` before `limit`; the plan cache refuses this
+    /// form (see `plan_cache::nested_projection_defeats_cache`).
+    pub offset_before_limit: bool,
     pub fields: Vec<NestedField>,
 }
 
@@ -271,6 +281,22 @@ pub struct NestedProjection {
 pub enum NestedField {
     /// A scalar child column emitted under `key`.
     Scalar { key: String, column: String },
+    /// A deeper nested sub-query, correlated to this child table by its
+    /// (bare) `parent_key` column.
+    Nested(NestedProjection),
+}
+
+impl NestedProjection {
+    /// Visit this projection's child table and every deeper nested child
+    /// table. Used for dirty-view escalation and auto-refresh.
+    pub fn visit_tables(&self, visit: &mut dyn FnMut(&str)) {
+        visit(&self.table);
+        for field in &self.fields {
+            if let NestedField::Nested(inner) = field {
+                inner.visit_tables(visit);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

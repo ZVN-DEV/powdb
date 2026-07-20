@@ -1469,12 +1469,17 @@ impl Engine {
 
             PlanNode::NestedProject { input, fields } => {
                 // Auto-refresh dirty materialized views among the child
-                // tables before the read-only assembly runs.
+                // tables (at every nesting level) before the read-only
+                // assembly runs.
+                let mut child_tables = Vec::new();
                 for field in fields {
                     if let NestedProjectField::Nested(nested) = field {
-                        if self.view_registry.is_dirty(&nested.table) {
-                            self.refresh_view(&nested.table)?;
-                        }
+                        nested.visit_tables(&mut |table| child_tables.push(table.to_string()));
+                    }
+                }
+                for table in child_tables {
+                    if self.view_registry.is_dirty(&table) {
+                        self.refresh_view(&table)?;
                     }
                 }
                 let parent = self.execute_plan(input)?;
@@ -2420,11 +2425,11 @@ impl Engine {
         }
     }
 
-    /// Execute the projection layer of a `NestedProject` (language-lab
-    /// slice): plain fields evaluate against the parent rows like `Project`;
-    /// each nested field is assembled from a single hash-build pass over its
-    /// child table keyed by the correlation column, O(parent + child). Shared
-    /// by the mutable and read-only dispatches (assembly only reads).
+    /// Execute the projection layer of a `NestedProject`: plain fields
+    /// evaluate against the parent rows like `Project`; each nested field is
+    /// assembled bottom-up by [`Engine::assemble_nested_arrays`], one hash
+    /// build pass per child table keyed by its correlation column. Shared by
+    /// the mutable and read-only dispatches (assembly only reads).
     pub(crate) fn execute_nested_project(
         &self,
         parent: QueryResult,
@@ -2438,10 +2443,9 @@ impl Engine {
         else {
             return Err("nested projection requires row input".into());
         };
-        // Per nested field: the parent-side key column index and the build
-        // side mapping correlation value -> child objects (as canonical JSON
-        // object text, in child scan order).
-        let mut builds: Vec<(usize, FxHashMap<Value, Vec<String>>)> = Vec::new();
+        // Per nested field: the parent-side key column index and the
+        // assembled correlation value -> JSON array text map.
+        let mut builds: Vec<(usize, FxHashMap<Value, String>)> = Vec::new();
         for field in fields {
             let NestedProjectField::Nested(nested) = field else {
                 continue;
@@ -2451,88 +2455,11 @@ impl Engine {
                 .position(|c| c == &nested.parent_key)
                 .ok_or_else(|| {
                     QueryError::Execution(format!(
-                        "nested projection outer column `{}` not found",
-                        nested.parent_key
+                        "nested projection `{}` outer column `{}` not found",
+                        nested.name, nested.parent_key
                     ))
                 })?;
-            let schema = self
-                .catalog
-                .schema(&nested.table)
-                .ok_or_else(|| QueryError::TableNotFound(nested.table.clone()))?
-                .clone();
-            let column_index = |name: &str| {
-                schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name == name)
-                    .ok_or_else(|| QueryError::ColumnNotFound {
-                        table: nested.table.clone(),
-                        column: name.to_string(),
-                    })
-            };
-            let key_idx = column_index(&nested.child_key)?;
-            let field_idxs = nested
-                .fields
-                .iter()
-                .map(|field| match field {
-                    NestedField::Scalar { key, column } => {
-                        Ok((key.as_str(), column_index(column)?))
-                    }
-                })
-                .collect::<Result<Vec<_>, QueryError>>()?;
-            // Residual conditions reference bare child columns (rewritten by
-            // the planner), so they evaluate against the full schema row.
-            let schema_cols: Vec<String> = if nested.residual.is_some() {
-                schema.columns.iter().map(|c| c.name.clone()).collect()
-            } else {
-                Vec::new()
-            };
-            // Materialize only the needed child columns (key first), charge
-            // them against the query budget like a join build side, then
-            // fold into the hash map.
-            let mut cancel = CancelCheck::new();
-            let mut child_rows: Vec<Vec<Value>> = Vec::new();
-            for (_, row) in self
-                .catalog
-                .scan(&nested.table)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?
-            {
-                cancel.tick()?;
-                // A NULL correlation value never matches any parent.
-                if row[key_idx] == Value::Empty {
-                    continue;
-                }
-                if let Some(residual) = &nested.residual {
-                    if !eval_predicate(residual, &row, &schema_cols) {
-                        continue;
-                    }
-                }
-                let mut narrowed = Vec::with_capacity(1 + field_idxs.len());
-                narrowed.push(row[key_idx].clone());
-                for (_, idx) in &field_idxs {
-                    narrowed.push(row[*idx].clone());
-                }
-                child_rows.push(narrowed);
-            }
-            self.charge_rows(&child_rows)?;
-            let mut build: FxHashMap<Value, Vec<String>> =
-                FxHashMap::with_capacity_and_hasher(child_rows.len(), Default::default());
-            for mut child in child_rows {
-                cancel.tick()?;
-                let key = child.remove(0);
-                let mut object = String::from("{");
-                for (i, ((name, _), value)) in field_idxs.iter().zip(&child).enumerate() {
-                    if i > 0 {
-                        object.push(',');
-                    }
-                    push_json_string(&mut object, name);
-                    object.push(':');
-                    push_json_value(&mut object, value);
-                }
-                object.push('}');
-                build.entry(key).or_default().push(object);
-            }
-            builds.push((parent_idx, build));
+            builds.push((parent_idx, self.assemble_nested_arrays(nested)?));
         }
 
         let columns: Vec<String> = fields
@@ -2556,19 +2483,19 @@ impl Engine {
                     NestedProjectField::Plain(f) => {
                         out.push(eval_expr(&f.expr, parent_row, &parent_columns));
                     }
-                    NestedProjectField::Nested(_) => {
+                    NestedProjectField::Nested(nested) => {
                         let (parent_idx, build) =
                             build_iter.next().expect("one build side per nested field");
-                        let mut array = String::from("[");
-                        if let Some(objects) = build.get(&parent_row[*parent_idx]) {
-                            array.push_str(&objects.join(","));
-                        }
-                        array.push(']');
+                        let array = build
+                            .get(&parent_row[*parent_idx])
+                            .map(String::as_str)
+                            .unwrap_or("[]");
                         // Round-tripping through the text parser yields
                         // canonical PJ1 (sorted object keys) for free.
-                        let doc = powdb_storage::pj1::parse_json_text(&array).map_err(|e| {
+                        let doc = powdb_storage::pj1::parse_json_text(array).map_err(|e| {
                             QueryError::Execution(format!(
-                                "nested projection produced invalid JSON: {e}"
+                                "nested projection `{}` produced invalid JSON: {e}",
+                                nested.name
                             ))
                         })?;
                         out.push(Value::Json(doc.into()));
@@ -2578,6 +2505,169 @@ impl Engine {
             rows.push(out);
         }
         Ok(QueryResult::Rows { columns, rows })
+    }
+
+    /// Assemble one nested projection level bottom-up: recursively assemble
+    /// its own nested children first, then scan the child table once, apply
+    /// the residual filter, group rows by correlation value, order and
+    /// truncate each parent's bucket, and serialize each bucket to JSON
+    /// array text. Recursion depth is bounded by the parser's nesting guard.
+    fn assemble_nested_arrays(
+        &self,
+        nested: &NestedProjection,
+    ) -> Result<rustc_hash::FxHashMap<Value, String>, QueryError> {
+        use rustc_hash::FxHashMap;
+        let schema = self
+            .catalog
+            .schema(&nested.table)
+            .ok_or_else(|| QueryError::TableNotFound(nested.table.clone()))?
+            .clone();
+        let column_index = |name: &str| {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == name)
+                .ok_or_else(|| QueryError::ColumnNotFound {
+                    table: nested.table.clone(),
+                    column: name.to_string(),
+                })
+        };
+        let key_idx = column_index(&nested.child_key)?;
+        // One value source per output field: a scalar column, or the
+        // correlation column of a deeper level plus its assembled arrays.
+        enum FieldSource {
+            Column,
+            Arrays(rustc_hash::FxHashMap<Value, String>),
+        }
+        let mut sources: Vec<(&str, usize, FieldSource)> = Vec::with_capacity(nested.fields.len());
+        for field in &nested.fields {
+            match field {
+                NestedField::Scalar { key, column } => {
+                    sources.push((key.as_str(), column_index(column)?, FieldSource::Column));
+                }
+                NestedField::Nested(inner) => {
+                    sources.push((
+                        inner.name.as_str(),
+                        column_index(&inner.parent_key)?,
+                        FieldSource::Arrays(self.assemble_nested_arrays(inner)?),
+                    ));
+                }
+            }
+        }
+        let order_idxs = nested
+            .order
+            .iter()
+            .map(|(column, descending)| Ok((column_index(column)?, *descending)))
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        let bound = |expr: &Option<Expr>, what: &str| -> Result<Option<usize>, QueryError> {
+            match expr {
+                None => Ok(None),
+                Some(Expr::Literal(Literal::Int(v))) if *v >= 0 => Ok(Some(*v as usize)),
+                Some(_) => Err(QueryError::Execution(format!(
+                    "nested projection `{}` {what} must be a non-negative integer literal",
+                    nested.name
+                ))),
+            }
+        };
+        let limit = bound(&nested.limit, "limit")?;
+        let offset = bound(&nested.offset, "offset")?;
+        // Residual conditions reference bare child columns (rewritten by
+        // the planner), so they evaluate against the full schema row.
+        let schema_cols: Vec<String> = if nested.residual.is_some() {
+            schema.columns.iter().map(|c| c.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        // Materialize only the needed child columns (key first), charge
+        // them against the query budget like a join build side, then fold
+        // into per-parent buckets.
+        let mut cancel = CancelCheck::new();
+        let mut child_rows: Vec<Vec<Value>> = Vec::new();
+        for (_, row) in self
+            .catalog
+            .scan(&nested.table)
+            .map_err(|e| QueryError::StorageError(e.to_string()))?
+        {
+            cancel.tick()?;
+            // A NULL correlation value never matches any parent.
+            if row[key_idx] == Value::Empty {
+                continue;
+            }
+            if let Some(residual) = &nested.residual {
+                if !eval_predicate(residual, &row, &schema_cols) {
+                    continue;
+                }
+            }
+            let mut narrowed = Vec::with_capacity(1 + sources.len() + order_idxs.len());
+            narrowed.push(row[key_idx].clone());
+            for (_, idx, _) in &sources {
+                narrowed.push(row[*idx].clone());
+            }
+            for (idx, _) in &order_idxs {
+                narrowed.push(row[*idx].clone());
+            }
+            child_rows.push(narrowed);
+        }
+        self.charge_rows(&child_rows)?;
+        // Bucket entries keep their per-parent sort key values (the
+        // narrowed tail) until ordering and truncation are applied.
+        let mut buckets: FxHashMap<Value, Vec<(Vec<Value>, String)>> =
+            FxHashMap::with_capacity_and_hasher(child_rows.len(), Default::default());
+        let sort_tail = 1 + sources.len();
+        for mut child in child_rows {
+            cancel.tick()?;
+            let sort_values = child.split_off(sort_tail);
+            let mut object = String::from("{");
+            for (i, ((name, _, source), value)) in sources.iter().zip(&child[1..]).enumerate() {
+                if i > 0 {
+                    object.push(',');
+                }
+                push_json_string(&mut object, name);
+                object.push(':');
+                match source {
+                    FieldSource::Column => push_json_value(&mut object, value),
+                    FieldSource::Arrays(arrays) => {
+                        object.push_str(arrays.get(value).map(String::as_str).unwrap_or("[]"));
+                    }
+                }
+            }
+            object.push('}');
+            let key = child.swap_remove(0);
+            buckets.entry(key).or_default().push((sort_values, object));
+        }
+        let mut build: FxHashMap<Value, String> =
+            FxHashMap::with_capacity_and_hasher(buckets.len(), Default::default());
+        for (key, mut bucket) in buckets {
+            cancel.tick()?;
+            if !order_idxs.is_empty() {
+                // Stable sort: ties keep child scan order.
+                bucket.sort_by(|(a, _), (b, _)| {
+                    for (pos, (_, descending)) in order_idxs.iter().enumerate() {
+                        let cmp = compare_order_values(&a[pos], &b[pos], *descending);
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            let kept = bucket
+                .iter()
+                .skip(offset.unwrap_or(0))
+                .take(limit.unwrap_or(usize::MAX));
+            let mut array =
+                String::with_capacity(2 + kept.clone().map(|(_, o)| o.len() + 1).sum::<usize>());
+            array.push('[');
+            for (i, (_, object)) in kept.enumerate() {
+                if i > 0 {
+                    array.push(',');
+                }
+                array.push_str(object);
+            }
+            array.push(']');
+            build.insert(key, array);
+        }
+        Ok(build)
     }
 }
 

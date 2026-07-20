@@ -405,6 +405,18 @@ fn resolve_nested_projection(
     nested: NestedQuery,
     parent_alias: &str,
 ) -> Result<NestedProjection, PlanError> {
+    resolve_nested_projection_inner(name, nested, parent_alias, true)
+}
+
+/// `qualify_parent_key`: at the top level the parent pipeline is an
+/// `AliasScan` whose columns are `alias.field`-qualified; deeper levels
+/// correlate against the enclosing child table's bare schema columns.
+fn resolve_nested_projection_inner(
+    name: String,
+    nested: NestedQuery,
+    parent_alias: &str,
+    qualify_parent_key: bool,
+) -> Result<NestedProjection, PlanError> {
     let mut conjuncts = Vec::new();
     split_and_chain(nested.filter, &mut conjuncts);
 
@@ -461,10 +473,56 @@ fn resolve_nested_projection(
             parent = parent_alias,
         )));
     };
+    let order = nested
+        .order
+        .map(|clause| {
+            clause
+                .keys
+                .into_iter()
+                .map(|key| {
+                    let column = match &key.expr {
+                        Expr::Field(field) => field.clone(),
+                        Expr::QualifiedField { qualifier, field }
+                            if *qualifier == nested.alias =>
+                        {
+                            field.clone()
+                        }
+                        _ => {
+                            return Err(PlanError::Semantic(format!(
+                                "nested projection `{name}` order keys must be plain \
+                                 columns of `{child}` (`{child}.<col>` or `.<col>`)",
+                                child = nested.alias,
+                            )))
+                        }
+                    };
+                    Ok((column, key.descending))
+                })
+                .collect::<Result<Vec<_>, PlanError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let fields = nested
         .fields
         .into_iter()
         .map(|pf| {
+            if let Expr::NestedQuery(inner) = pf.expr {
+                let inner_name = pf.alias.ok_or_else(|| {
+                    PlanError::Semantic(
+                        "nested projection field requires a name \
+                         (`<name>: <Table> as <alias> ...`)"
+                            .into(),
+                    )
+                })?;
+                // The enclosing child scan exposes bare schema columns, so
+                // deeper levels correlate on an unqualified parent key.
+                return resolve_nested_projection_inner(
+                    inner_name,
+                    *inner,
+                    &nested.alias,
+                    false,
+                )
+                .map(NestedField::Nested);
+            }
             let column = match &pf.expr {
                 Expr::Field(field) => field.clone(),
                 Expr::QualifiedField { qualifier, field } if *qualifier == nested.alias => {
@@ -473,7 +531,7 @@ fn resolve_nested_projection(
                 _ => {
                     return Err(PlanError::Semantic(format!(
                         "nested projection `{name}` fields must be plain columns of `{}` \
-                         (`{}.<col>` or `.<col>`)",
+                         (`{}.<col>` or `.<col>`) or a deeper nested projection",
                         nested.alias, nested.alias
                     )))
                 }
@@ -487,8 +545,16 @@ fn resolve_nested_projection(
         table: nested.source,
         alias: nested.alias,
         child_key,
-        parent_key: format!("{parent_alias}.{parent_key}"),
+        parent_key: if qualify_parent_key {
+            format!("{parent_alias}.{parent_key}")
+        } else {
+            parent_key
+        },
         residual,
+        order,
+        limit: nested.limit,
+        offset: nested.offset,
+        offset_before_limit: nested.offset_before_limit,
         fields,
     })
 }

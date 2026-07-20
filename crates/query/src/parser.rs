@@ -858,16 +858,55 @@ impl Parser {
         Ok(fields)
     }
 
-    /// Parse a nested sub-query projection value (language-lab slice):
-    /// `<ChildTable> as <alias> filter <predicate> { <fields> }`. The nested
-    /// block accepts plain and aliased scalar fields only; further nesting,
-    /// order, and limit are out of slice scope.
+    /// Parse a nested sub-query projection value:
+    /// `<ChildTable> as <alias> filter <predicate> [order ...] [limit N]
+    /// [offset M] { <fields> }`. The block accepts plain and aliased scalar
+    /// fields plus further `name: Table as alias ...` nesting.
     fn parse_nested_query(&mut self) -> Result<NestedQuery, ParseError> {
+        // Nested blocks recurse; share the expression nesting-depth guard so
+        // pathological inputs fail cleanly instead of overflowing the stack.
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+        let result = self.parse_nested_query_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_nested_query_inner(&mut self) -> Result<NestedQuery, ParseError> {
         let source = self.expect_named_ident("nested source type")?;
         self.expect(&Token::As)?;
         let alias = self.expect_named_ident("nested source alias")?;
         self.expect(&Token::Filter)?;
         let filter = self.parse_expr()?;
+        let mut order = None;
+        let mut limit = None;
+        let mut offset = None;
+        let mut offset_before_limit = false;
+        loop {
+            match self.peek() {
+                Token::Order => {
+                    self.advance();
+                    order = Some(self.parse_order()?);
+                }
+                Token::Limit => {
+                    self.advance();
+                    if offset.is_some() {
+                        offset_before_limit = true;
+                    }
+                    limit = Some(self.parse_expr()?);
+                }
+                Token::Offset => {
+                    self.advance();
+                    offset = Some(self.parse_expr()?);
+                }
+                _ => break,
+            }
+        }
         self.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(), Token::RBrace | Token::Eof) {
@@ -880,14 +919,20 @@ impl Parser {
             } else {
                 None
             };
-            if matches!(self.peek(), Token::Ident(_))
+            let expr = if matches!(self.peek(), Token::Ident(_))
                 && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
             {
-                return Err(ParseError::Unsupported {
-                    feature: "nested projections cannot nest further".into(),
-                });
-            }
-            let expr = self.parse_expr()?;
+                if alias.is_none() {
+                    return Err(ParseError::Syntax {
+                        message: "a nested projection needs a field name: \
+                                  `<name>: <Table> as <alias> filter ... { ... }`"
+                            .into(),
+                    });
+                }
+                Expr::NestedQuery(Box::new(self.parse_nested_query()?))
+            } else {
+                self.parse_expr()?
+            };
             fields.push(ProjectionField { alias, expr });
             if *self.peek() == Token::Comma {
                 self.advance();
@@ -903,6 +948,10 @@ impl Parser {
             source,
             alias,
             filter,
+            order,
+            limit,
+            offset,
+            offset_before_limit,
             fields,
         })
     }

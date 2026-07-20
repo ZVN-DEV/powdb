@@ -337,7 +337,9 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
             plan_reads_dirty_view(input, views)
                 || fields.iter().any(|field| match field {
                     crate::plan::NestedProjectField::Nested(nested) => {
-                        views.is_dirty(&nested.table)
+                        let mut dirty = false;
+                        nested.visit_tables(&mut |table| dirty |= views.is_dirty(table));
+                        dirty
                     }
                     crate::plan::NestedProjectField::Plain(_) => false,
                 })

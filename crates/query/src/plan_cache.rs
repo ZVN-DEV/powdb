@@ -172,8 +172,11 @@ fn plan_contains_nested_project(plan: &PlanNode) -> bool {
     walk(plan)
 }
 
-/// Walk one nested projection's literal slots in source order: the residual
-/// filter (the correlation predicate carries no literals). Shared shape with
+/// Walk one nested projection's literal slots in source order: residual
+/// filter (the correlation predicate and order keys carry no literals),
+/// then limit, then offset. `limit`-then-`offset` matches source order
+/// because plans whose source wrote `offset` before `limit` are refused at
+/// insert (`offset_before_limit`). Shared shape with
 /// [`count_nested_projection`]; both must stay in lockstep.
 fn substitute_nested_projection(
     nested: &mut crate::plan::NestedProjection,
@@ -183,6 +186,19 @@ fn substitute_nested_projection(
     if let Some(residual) = &mut nested.residual {
         substitute_expr(residual, literals, idx);
     }
+    if let Some(limit) = &mut nested.limit {
+        substitute_expr(limit, literals, idx);
+    }
+    if let Some(offset) = &mut nested.offset {
+        substitute_expr(offset, literals, idx);
+    }
+    // The `{ ... }` block comes last in source; deeper nested blocks
+    // contribute their slots in field order.
+    for field in &mut nested.fields {
+        if let crate::plan::NestedField::Nested(inner) = field {
+            substitute_nested_projection(inner, literals, idx);
+        }
+    }
 }
 
 /// Count one nested projection's literal slots; mirrors
@@ -190,6 +206,17 @@ fn substitute_nested_projection(
 fn count_nested_projection(nested: &crate::plan::NestedProjection, n: &mut usize) {
     if let Some(residual) = &nested.residual {
         count_expr(residual, n);
+    }
+    if let Some(limit) = &nested.limit {
+        count_expr(limit, n);
+    }
+    if let Some(offset) = &nested.offset {
+        count_expr(offset, n);
+    }
+    for field in &nested.fields {
+        if let crate::plan::NestedField::Nested(inner) = field {
+            count_nested_projection(inner, n);
+        }
     }
 }
 
