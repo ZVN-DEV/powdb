@@ -331,6 +331,20 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
             plan_reads_dirty_view(left, views) || plan_reads_dirty_view(right, views)
         }
 
+        // Nested sub-query fields scan their child tables directly, so a
+        // dirty child view needs the same escalation as the parent input.
+        PlanNode::NestedProject { input, fields } => {
+            plan_reads_dirty_view(input, views)
+                || fields.iter().any(|field| match field {
+                    crate::plan::NestedProjectField::Nested(nested) => {
+                        let mut dirty = false;
+                        nested.visit_tables(&mut |table| dirty |= views.is_dirty(table));
+                        dirty
+                    }
+                    crate::plan::NestedProjectField::Plain(_) => false,
+                })
+        }
+
         // EXPLAIN formats its input without executing it, so inspecting a plan
         // that names a dirty view never requires a refresh.
         PlanNode::Explain { .. }
@@ -1269,6 +1283,13 @@ impl Engine {
                     rows.push(row);
                 }
                 Ok(QueryResult::Rows { columns, rows })
+            }
+
+            PlanNode::NestedProject { input, fields } => {
+                // Dirty child views were escalated by the preflight above;
+                // the assembly itself only reads.
+                let parent = self.execute_plan_readonly(input)?;
+                self.execute_nested_project(parent, fields)
             }
 
             PlanNode::IndexScan { table, column, key } => {

@@ -85,6 +85,16 @@ pub enum PlanNode {
         input: Box<PlanNode>,
         fields: Vec<ProjectField>,
     },
+    /// Language-lab slice: projection with one or more nested sub-query
+    /// fields. `input` is the parent pipeline (AliasScan-based so qualified
+    /// references resolve by column name); each nested field is assembled by
+    /// a single hash-build pass over its child table, O(parent + child).
+    /// Kept separate from `Project` so the single-table fast paths and the
+    /// plan cache never see this shape.
+    NestedProject {
+        input: Box<PlanNode>,
+        fields: Vec<NestedProjectField>,
+    },
     Sort {
         input: Box<PlanNode>,
         keys: Vec<SortKey>,
@@ -225,6 +235,71 @@ pub enum PlanNode {
 pub struct ProjectField {
     pub alias: Option<String>,
     pub expr: Expr,
+}
+
+/// One output column of a `PlanNode::NestedProject`.
+#[derive(Debug, Clone)]
+pub enum NestedProjectField {
+    /// A scalar field, evaluated against the parent row like `Project`.
+    Plain(ProjectField),
+    /// A nested sub-query field, emitted as a PJ1 JSON array of objects.
+    Nested(Box<NestedProjection>),
+}
+
+/// The resolved form of one nested sub-query projection field. Correlation
+/// columns are pre-split by the planner: at the top level `parent_key` is
+/// the qualified parent column name (`u.id`) as produced by an `AliasScan`;
+/// for a nested-in-nested field it is the bare column name of the enclosing
+/// child table. `child_key` is always the bare child column name.
+#[derive(Debug, Clone)]
+pub struct NestedProjection {
+    /// Output column name (the projection field's alias).
+    pub name: String,
+    pub table: String,
+    /// The child alias from the source text, kept for EXPLAIN and errors.
+    pub alias: String,
+    /// The enclosing scope's alias, kept for EXPLAIN (the executor
+    /// correlates through `parent_key` alone).
+    pub parent_alias: String,
+    pub child_key: String,
+    pub parent_key: String,
+    /// Residual filter conditions beyond the correlation predicate,
+    /// rewritten by the planner to reference bare child columns.
+    pub residual: Option<Expr>,
+    /// Per-parent ordering: `(bare child column, descending)` keys applied
+    /// to each parent's child bucket before truncation.
+    pub order: Vec<(String, bool)>,
+    /// Per-parent truncation bounds, applied after ordering. Must evaluate
+    /// to non-negative integer literals (like top-level limit/offset).
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+    /// Source wrote `offset` before `limit`; the plan cache refuses this
+    /// form (see `plan_cache::nested_projection_defeats_cache`).
+    pub offset_before_limit: bool,
+    pub fields: Vec<NestedField>,
+}
+
+/// One entry in a nested projection's output object.
+#[derive(Debug, Clone)]
+pub enum NestedField {
+    /// A scalar child column emitted under `key`.
+    Scalar { key: String, column: String },
+    /// A deeper nested sub-query, correlated to this child table by its
+    /// (bare) `parent_key` column.
+    Nested(Box<NestedProjection>),
+}
+
+impl NestedProjection {
+    /// Visit this projection's child table and every deeper nested child
+    /// table. Used for dirty-view escalation and auto-refresh.
+    pub fn visit_tables(&self, visit: &mut dyn FnMut(&str)) {
+        visit(&self.table);
+        for field in &self.fields {
+            if let NestedField::Nested(inner) = field {
+                inner.visit_tables(visit);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

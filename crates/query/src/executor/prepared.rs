@@ -145,6 +145,16 @@ fn restore_taken_strings(fast: &InsertFast, literals: &mut [Literal], values: &m
 impl Engine {
     pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, QueryError> {
         let plan = planner::plan(query).map_err(|e| QueryError::Parse(e.to_string()))?;
+        // Same walk-order restriction as the plan cache: a nested block that
+        // wrote `offset` before `limit` cannot have its slots rebound in
+        // source order.
+        if crate::plan_cache::nested_projection_defeats_cache(&plan) {
+            return Err(QueryError::Execution(
+                "cannot prepare a nested projection that writes `offset` before \
+                 `limit`; write `limit` before `offset` in the nested block"
+                    .into(),
+            ));
+        }
         let param_count = crate::plan_cache::count_literal_slots(&plan);
 
         // Insert fast path: if the template is Insert and every assignment

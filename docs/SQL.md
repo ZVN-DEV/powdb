@@ -29,6 +29,8 @@ Supported expressions include literals, column references, qualified join refere
 
 The SQL frontend returns explicit unsupported-feature parse errors for SQL features that are not yet part of the production subset, including SQL `IN` lists/subqueries, SQL scalar/EXISTS subqueries, table constraints, SQL `BETWEEN`, and column-projected `RETURNING a, b` (only `RETURNING *` is supported, because PowQL's `returning` is all-columns). Use native PowQL for those shapes until the SQL subset is expanded.
 
+Nested projections (shaped, one-row-per-parent results with children as JSON arrays) are PowQL-only by design, not a pending subset gap: SQL's `SELECT` list is flat and PowDB does not add a dialect extension for it. In SQL, use a join and regroup client-side, or run the PowQL query directly. See [Nested Projections (Shaped Results)](POWQL.md#nested-projections-shaped-results) in the PowQL reference.
+
 `CREATE INDEX` and `CREATE UNIQUE INDEX` accept either one stored column or a
 direct JSON `->` path:
 

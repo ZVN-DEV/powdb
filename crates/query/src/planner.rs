@@ -106,6 +106,14 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
+    // Language-lab slice: projections carrying a nested sub-query field take
+    // a dedicated path so every other query shape plans exactly as before.
+    if q.projection.as_ref().is_some_and(|proj| {
+        proj.iter()
+            .any(|pf| matches!(pf.expr, Expr::NestedQuery(_)))
+    }) {
+        return plan_nested_query(q);
+    }
     // Mission E1.2: if the query has joins, build a left-deep nested-loop
     // plan. Correctness first — hash-join optimization is E1.3. We also
     // don't try to fold an IndexScan under a joined query yet (the
@@ -311,6 +319,337 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     Ok(node)
+}
+
+/// Build a `NestedProject` plan for a query whose projection carries nested
+/// sub-query fields (language-lab slice). The parent pipeline is an
+/// `AliasScan` (so `alias.field` references resolve by column name) plus the
+/// usual filter/order/offset/limit stack; the projection itself becomes the
+/// `NestedProject` layer. Emitted speculatively like `RangeScan`: the planner
+/// stays catalog-pure and the executor resolves tables/columns at run time.
+fn plan_nested_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
+    if !q.joins.is_empty() || q.group_by.is_some() || q.aggregation.is_some() || q.distinct {
+        return Err(PlanError::Semantic(
+            "nested projections require a plain aliased table scan (no joins, \
+             group, distinct, or aggregation)"
+                .into(),
+        ));
+    }
+    let parent_alias = q.alias.unwrap_or_else(|| q.source.clone());
+    let mut node = PlanNode::AliasScan {
+        table: q.source,
+        alias: parent_alias.clone(),
+    };
+    if let Some(pred) = q.filter {
+        node = PlanNode::Filter {
+            input: Box::new(node),
+            predicate: pred,
+        };
+    }
+    if let Some(order) = q.order {
+        node = PlanNode::Sort {
+            input: Box::new(node),
+            keys: order
+                .keys
+                .into_iter()
+                .map(|k| SortKey {
+                    expr: k.expr,
+                    descending: k.descending,
+                })
+                .collect(),
+        };
+    }
+    if let Some(off) = q.offset {
+        node = PlanNode::Offset {
+            input: Box::new(node),
+            count: off,
+        };
+    }
+    if let Some(lim) = q.limit {
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            count: lim,
+        };
+    }
+    let fields = q
+        .projection
+        .expect("plan_nested_query is only called with a projection")
+        .into_iter()
+        .map(|pf| match pf.expr {
+            Expr::NestedQuery(nested) => {
+                let name = pf.alias.ok_or_else(|| {
+                    PlanError::Semantic("nested projection field requires a name".into())
+                })?;
+                resolve_nested_projection(name, *nested, &parent_alias)
+                    .map(|nested| NestedProjectField::Nested(Box::new(nested)))
+            }
+            expr => Ok(NestedProjectField::Plain(ProjectField {
+                alias: pf.alias,
+                expr,
+            })),
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(PlanNode::NestedProject {
+        input: Box::new(node),
+        fields,
+    })
+}
+
+/// Split a parsed `NestedQuery` into the resolved `NestedProjection` form.
+/// The filter's AND chain must contain exactly one equi-correlation
+/// predicate `child.col = outer.col` (either side order, any position);
+/// the remaining conjuncts become the residual filter, rewritten to bare
+/// child columns and evaluated per child row by the executor.
+fn resolve_nested_projection(
+    name: String,
+    nested: NestedQuery,
+    parent_alias: &str,
+) -> Result<NestedProjection, PlanError> {
+    resolve_nested_projection_inner(name, nested, parent_alias, true)
+}
+
+/// `qualify_parent_key`: at the top level the parent pipeline is an
+/// `AliasScan` whose columns are `alias.field`-qualified; deeper levels
+/// correlate against the enclosing child table's bare schema columns.
+fn resolve_nested_projection_inner(
+    name: String,
+    nested: NestedQuery,
+    parent_alias: &str,
+    qualify_parent_key: bool,
+) -> Result<NestedProjection, PlanError> {
+    let mut conjuncts = Vec::new();
+    split_and_chain(nested.filter, &mut conjuncts);
+
+    // A correlation conjunct is `child.col = parent.col` (either side order).
+    let correlation_of = |expr: &Expr| -> Option<(String, String)> {
+        let Expr::BinaryOp(left, BinOp::Eq, right) = expr else {
+            return None;
+        };
+        let side = |expr: &Expr| match expr {
+            Expr::QualifiedField { qualifier, field } => Some((qualifier.clone(), field.clone())),
+            _ => None,
+        };
+        let ((lq, lf), (rq, rf)) = (side(left)?, side(right)?);
+        if lq == nested.alias && rq == parent_alias {
+            Some((lf, rf))
+        } else if rq == nested.alias && lq == parent_alias {
+            Some((rf, lf))
+        } else {
+            None
+        }
+    };
+    let mut correlation: Option<(String, String)> = None;
+    let mut residual: Option<Expr> = None;
+    for conjunct in conjuncts {
+        match correlation_of(&conjunct) {
+            Some(keys) if correlation.is_none() => correlation = Some(keys),
+            Some(_) => {
+                return Err(PlanError::Semantic(format!(
+                    "nested projection `{name}` links `{child}` to `{parent}` more than \
+                     once; exactly one correlation predicate \
+                     ({child}.<col> = {parent}.<col>) is supported",
+                    child = nested.alias,
+                    parent = parent_alias,
+                )))
+            }
+            None => {
+                let rewritten =
+                    rewrite_residual_condition(conjunct, &name, &nested.alias, parent_alias)?;
+                residual = Some(match residual {
+                    Some(existing) => {
+                        Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                    }
+                    None => rewritten,
+                });
+            }
+        }
+    }
+    let Some((child_key, parent_key)) = correlation else {
+        return Err(PlanError::Semantic(format!(
+            "nested projection `{name}` requires an equi-correlation predicate linking \
+             `{child}` to the outer query ({child}.<col> = {parent}.<col>) somewhere in \
+             its filter",
+            child = nested.alias,
+            parent = parent_alias,
+        )));
+    };
+    let order = nested
+        .order
+        .map(|clause| {
+            clause
+                .keys
+                .into_iter()
+                .map(|key| {
+                    let column = match &key.expr {
+                        Expr::Field(field) => field.clone(),
+                        Expr::QualifiedField { qualifier, field } if *qualifier == nested.alias => {
+                            field.clone()
+                        }
+                        _ => {
+                            return Err(PlanError::Semantic(format!(
+                                "nested projection `{name}` order keys must be plain \
+                                 columns of `{child}` (`{child}.<col>` or `.<col>`)",
+                                child = nested.alias,
+                            )))
+                        }
+                    };
+                    Ok((column, key.descending))
+                })
+                .collect::<Result<Vec<_>, PlanError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let fields = nested
+        .fields
+        .into_iter()
+        .map(|pf| {
+            if let Expr::NestedQuery(inner) = pf.expr {
+                let inner_name = pf.alias.ok_or_else(|| {
+                    PlanError::Semantic(
+                        "nested projection field requires a name \
+                         (`<name>: <Table> as <alias> ...`)"
+                            .into(),
+                    )
+                })?;
+                // The enclosing child scan exposes bare schema columns, so
+                // deeper levels correlate on an unqualified parent key.
+                return resolve_nested_projection_inner(inner_name, *inner, &nested.alias, false)
+                    .map(|inner| NestedField::Nested(Box::new(inner)));
+            }
+            let column = match &pf.expr {
+                Expr::Field(field) => field.clone(),
+                Expr::QualifiedField { qualifier, field } if *qualifier == nested.alias => {
+                    field.clone()
+                }
+                _ => {
+                    return Err(PlanError::Semantic(format!(
+                        "nested projection `{name}` fields must be plain columns of `{}` \
+                         (`{}.<col>` or `.<col>`) or a deeper nested projection",
+                        nested.alias, nested.alias
+                    )))
+                }
+            };
+            let key = pf.alias.unwrap_or_else(|| column.clone());
+            Ok(NestedField::Scalar { key, column })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    Ok(NestedProjection {
+        name,
+        table: nested.source,
+        alias: nested.alias,
+        parent_alias: parent_alias.to_string(),
+        child_key,
+        parent_key: if qualify_parent_key {
+            format!("{parent_alias}.{parent_key}")
+        } else {
+            parent_key
+        },
+        residual,
+        order,
+        limit: nested.limit,
+        offset: nested.offset,
+        offset_before_limit: nested.offset_before_limit,
+        fields,
+    })
+}
+
+/// Flatten a left-associative AND chain into its conjuncts, in source order.
+fn split_and_chain(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryOp(left, BinOp::And, right) => {
+            split_and_chain(*left, out);
+            split_and_chain(*right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Rewrite one residual conjunct of a nested projection filter so it
+/// evaluates against the bare child schema: `child.col` becomes `col`.
+/// Rejects references to the outer alias (only the correlation predicate
+/// may cross scopes) and constructs the executor cannot evaluate per child
+/// row (subqueries, aggregates, window functions, further nesting).
+fn rewrite_residual_condition(
+    expr: Expr,
+    name: &str,
+    child_alias: &str,
+    parent_alias: &str,
+) -> Result<Expr, PlanError> {
+    let rewrite = |inner: Box<Expr>| -> Result<Box<Expr>, PlanError> {
+        Ok(Box::new(rewrite_residual_condition(
+            *inner,
+            name,
+            child_alias,
+            parent_alias,
+        )?))
+    };
+    match expr {
+        Expr::QualifiedField { qualifier, field } => {
+            if qualifier == child_alias {
+                Ok(Expr::Field(field))
+            } else if qualifier == parent_alias {
+                Err(PlanError::Semantic(format!(
+                    "nested projection `{name}` filter references outer alias \
+                     `{parent_alias}` (`{parent_alias}.{field}`) outside the correlation \
+                     predicate; move that condition to the outer query's filter"
+                )))
+            } else {
+                Err(PlanError::Semantic(format!(
+                    "nested projection `{name}` filter references unknown alias \
+                     `{qualifier}`; only columns of `{child_alias}` may be used"
+                )))
+            }
+        }
+        Expr::Field(_) | Expr::Literal(_) | Expr::Param(_) | Expr::ValueLit(_) | Expr::Null => {
+            Ok(expr)
+        }
+        Expr::BinaryOp(left, op, right) => Ok(Expr::BinaryOp(rewrite(left)?, op, rewrite(right)?)),
+        Expr::UnaryOp(op, inner) => Ok(Expr::UnaryOp(op, rewrite(inner)?)),
+        Expr::Coalesce(left, right) => Ok(Expr::Coalesce(rewrite(left)?, rewrite(right)?)),
+        Expr::Cast(inner, ty) => Ok(Expr::Cast(rewrite(inner)?, ty)),
+        Expr::ScalarFunc(func, args) => Ok(Expr::ScalarFunc(
+            func,
+            args.into_iter()
+                .map(|arg| rewrite_residual_condition(arg, name, child_alias, parent_alias))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Expr::InList {
+            expr: rewrite(expr)?,
+            list: list
+                .into_iter()
+                .map(|item| rewrite_residual_condition(item, name, child_alias, parent_alias))
+                .collect::<Result<Vec<_>, _>>()?,
+            negated,
+        }),
+        Expr::Case { whens, else_expr } => Ok(Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(cond, result)| Ok((rewrite(cond)?, rewrite(result)?)))
+                .collect::<Result<Vec<_>, PlanError>>()?,
+            else_expr: else_expr.map(rewrite).transpose()?,
+        }),
+        Expr::JsonPath { base, segments } => Ok(Expr::JsonPath {
+            base: rewrite(base)?,
+            segments,
+        }),
+        Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => Err(PlanError::Semantic(format!(
+            "nested projection `{name}` filter cannot contain a subquery; \
+             filter the outer query or the child columns directly"
+        ))),
+        Expr::FunctionCall(..) => Err(PlanError::Semantic(format!(
+            "nested projection `{name}` filter cannot contain an aggregate function"
+        ))),
+        Expr::Window { .. } => Err(PlanError::Semantic(format!(
+            "nested projection `{name}` filter cannot contain a window function"
+        ))),
+        Expr::NestedQuery(_) => Err(PlanError::Semantic(format!(
+            "nested projection `{name}` filter cannot contain another nested projection"
+        ))),
+    }
 }
 
 /// Build a left-deep nested-loop join plan for a query with 1+ join clauses.
@@ -1187,7 +1526,8 @@ fn collect_expression_sources(
         | Expr::Literal(_)
         | Expr::Param(_)
         | Expr::ValueLit(_)
-        | Expr::Null => {}
+        | Expr::Null
+        | Expr::NestedQuery(_) => {}
     }
 }
 

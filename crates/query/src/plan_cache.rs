@@ -79,6 +79,15 @@ impl PlanCache {
         if contains_grouped_having(&plan) {
             return;
         }
+        // Nested-projection plans are cacheable: their residual/limit/offset
+        // literal slots are walked in source order by
+        // `substitute_nested_projection`. The one form that walk cannot
+        // rebind is a nested block that wrote `offset` before `limit`
+        // (source literal order [offset, limit], walk order [limit, offset]);
+        // refuse it and replan from source on every call instead.
+        if nested_projection_defeats_cache(&plan) {
+            return;
+        }
         if count_literal_slots(&plan) != source_literal_count {
             return;
         }
@@ -138,6 +147,96 @@ impl PlanCache {
     }
 }
 
+/// True when a nested projection anywhere in the plan wrote `offset` before
+/// `limit` in its source block. The literal-slot walk visits limit before
+/// offset, so that form's source literal order cannot be safely rebound;
+/// both the cache (see `insert`) and `Engine::prepare` refuse it.
+pub(crate) fn nested_projection_defeats_cache(plan: &PlanNode) -> bool {
+    fn nested_defeats(nested: &crate::plan::NestedProjection) -> bool {
+        nested.offset_before_limit
+            || nested.fields.iter().any(|field| match field {
+                crate::plan::NestedField::Nested(inner) => nested_defeats(inner),
+                crate::plan::NestedField::Scalar { .. } => false,
+            })
+    }
+    fn walk(plan: &PlanNode) -> bool {
+        match plan {
+            PlanNode::NestedProject { input, fields } => {
+                walk(input)
+                    || fields.iter().any(|field| match field {
+                        crate::plan::NestedProjectField::Nested(nested) => nested_defeats(nested),
+                        crate::plan::NestedProjectField::Plain(_) => false,
+                    })
+            }
+            PlanNode::Filter { input, .. }
+            | PlanNode::Project { input, .. }
+            | PlanNode::Sort { input, .. }
+            | PlanNode::Limit { input, .. }
+            | PlanNode::Offset { input, .. }
+            | PlanNode::Aggregate { input, .. }
+            | PlanNode::Distinct { input }
+            | PlanNode::GroupBy { input, .. }
+            | PlanNode::Update { input, .. }
+            | PlanNode::Delete { input, .. }
+            | PlanNode::Window { input, .. }
+            | PlanNode::Explain { input } => walk(input),
+            PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+                walk(left) || walk(right)
+            }
+            _ => false,
+        }
+    }
+    walk(plan)
+}
+
+/// Walk one nested projection's literal slots in source order: residual
+/// filter (the correlation predicate and order keys carry no literals),
+/// then limit, then offset. `limit`-then-`offset` matches source order
+/// because plans whose source wrote `offset` before `limit` are refused at
+/// insert (`offset_before_limit`). Shared shape with
+/// [`count_nested_projection`]; both must stay in lockstep.
+fn substitute_nested_projection(
+    nested: &mut crate::plan::NestedProjection,
+    literals: &[Literal],
+    idx: &mut usize,
+) {
+    if let Some(residual) = &mut nested.residual {
+        substitute_expr(residual, literals, idx);
+    }
+    if let Some(limit) = &mut nested.limit {
+        substitute_expr(limit, literals, idx);
+    }
+    if let Some(offset) = &mut nested.offset {
+        substitute_expr(offset, literals, idx);
+    }
+    // The `{ ... }` block comes last in source; deeper nested blocks
+    // contribute their slots in field order.
+    for field in &mut nested.fields {
+        if let crate::plan::NestedField::Nested(inner) = field {
+            substitute_nested_projection(inner, literals, idx);
+        }
+    }
+}
+
+/// Count one nested projection's literal slots; mirrors
+/// [`substitute_nested_projection`].
+fn count_nested_projection(nested: &crate::plan::NestedProjection, n: &mut usize) {
+    if let Some(residual) = &nested.residual {
+        count_expr(residual, n);
+    }
+    if let Some(limit) = &nested.limit {
+        count_expr(limit, n);
+    }
+    if let Some(offset) = &nested.offset {
+        count_expr(offset, n);
+    }
+    for field in &nested.fields {
+        if let crate::plan::NestedField::Nested(inner) = field {
+            count_nested_projection(inner, n);
+        }
+    }
+}
+
 fn contains_grouped_having(plan: &PlanNode) -> bool {
     match plan {
         PlanNode::GroupBy {
@@ -154,6 +253,7 @@ fn contains_grouped_having(plan: &PlanNode) -> bool {
         | PlanNode::Update { input, .. }
         | PlanNode::Delete { input, .. }
         | PlanNode::Window { input, .. }
+        | PlanNode::NestedProject { input, .. }
         | PlanNode::Explain { input } => contains_grouped_having(input),
         PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
             contains_grouped_having(left) || contains_grouped_having(right)
@@ -263,6 +363,24 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                 substitute_plan(input, literals, idx);
                 for f in fields {
                     substitute_expr(&mut f.expr, literals, idx);
+                }
+            }
+        }
+        PlanNode::NestedProject { input, fields } => {
+            // Source order: parent pipeline first, then projection fields
+            // left to right. Within a nested field the block reads
+            // `filter <correlation + residuals> { ... }`; the correlation
+            // predicate carries no literals, so walking the residual covers
+            // the block's literal slots in source order.
+            substitute_plan(input, literals, idx);
+            for field in fields {
+                match field {
+                    crate::plan::NestedProjectField::Plain(f) => {
+                        substitute_expr(&mut f.expr, literals, idx);
+                    }
+                    crate::plan::NestedProjectField::Nested(nested) => {
+                        substitute_nested_projection(nested, literals, idx);
+                    }
                 }
             }
         }
@@ -514,6 +632,19 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                 }
             }
         }
+        PlanNode::NestedProject { input, fields } => {
+            // Mirrors the substitute walk: parent pipeline, then fields left
+            // to right, with nested blocks contributing their residual slots.
+            count_plan(input, n);
+            for field in fields {
+                match field {
+                    crate::plan::NestedProjectField::Plain(f) => count_expr(&f.expr, n),
+                    crate::plan::NestedProjectField::Nested(nested) => {
+                        count_nested_projection(nested, n);
+                    }
+                }
+            }
+        }
         PlanNode::Sort { input, keys } => {
             count_plan(input, n);
             for key in keys {
@@ -751,6 +882,10 @@ fn count_expr(expr: &Expr, n: &mut usize) {
         // reaches the plan cache, and it occupies no source literal slot.
         Expr::ValueLit(_) => {}
         Expr::Null => {}
+        // Plans carrying nested projections are never inserted into the
+        // cache (see `plan_contains_nested_project`), so this node's inner
+        // literal slots are never walked.
+        Expr::NestedQuery(_) => {}
     }
 }
 
@@ -829,6 +964,9 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         // reaches the plan cache, so there is nothing to substitute.
         Expr::ValueLit(_) => {}
         Expr::Null => {}
+        // Never cached (see `plan_contains_nested_project`); nothing to
+        // substitute.
+        Expr::NestedQuery(_) => {}
     }
 }
 
@@ -1251,6 +1389,35 @@ mod tests {
                     collect_expr_literals(&f.expr, out);
                 }
             }
+            PlanNode::NestedProject { input, fields } => {
+                fn collect_nested(nested: &crate::plan::NestedProjection, out: &mut Vec<Literal>) {
+                    if let Some(residual) = &nested.residual {
+                        collect_expr_literals(residual, out);
+                    }
+                    if let Some(limit) = &nested.limit {
+                        collect_expr_literals(limit, out);
+                    }
+                    if let Some(offset) = &nested.offset {
+                        collect_expr_literals(offset, out);
+                    }
+                    for field in &nested.fields {
+                        if let crate::plan::NestedField::Nested(inner) = field {
+                            collect_nested(inner, out);
+                        }
+                    }
+                }
+                collect_literals_for_test(input, out);
+                for field in fields {
+                    match field {
+                        crate::plan::NestedProjectField::Plain(f) => {
+                            collect_expr_literals(&f.expr, out);
+                        }
+                        crate::plan::NestedProjectField::Nested(nested) => {
+                            collect_nested(nested, out);
+                        }
+                    }
+                }
+            }
             PlanNode::Sort { input, keys } => {
                 collect_literals_for_test(input, out);
                 for key in keys {
@@ -1420,6 +1587,8 @@ mod tests {
             Expr::JsonPath { base, .. } => collect_expr_literals(base, out),
             Expr::ValueLit(_) => {}
             Expr::Null => {}
+            // Never cached; mirrors count_expr/substitute_expr.
+            Expr::NestedQuery(_) => {}
         }
     }
 }
