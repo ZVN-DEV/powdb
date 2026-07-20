@@ -79,11 +79,13 @@ impl PlanCache {
         if contains_grouped_having(&plan) {
             return;
         }
-        // Nested-projection plans bypass the cache entirely (language-lab
-        // slice): their nested block's tokens contribute to the canonical
-        // hash but the resolved plan retains no substitutable slots for
-        // them, so the literal-slot walk invariant cannot be guaranteed.
-        if plan_contains_nested_project(&plan) {
+        // Nested-projection plans are cacheable: their residual/limit/offset
+        // literal slots are walked in source order by
+        // `substitute_nested_projection`. The one form that walk cannot
+        // rebind is a nested block that wrote `offset` before `limit`
+        // (source literal order [offset, limit], walk order [limit, offset]);
+        // refuse it and replan from source on every call instead.
+        if nested_projection_defeats_cache(&plan) {
             return;
         }
         if count_literal_slots(&plan) != source_literal_count {
@@ -145,12 +147,27 @@ impl PlanCache {
     }
 }
 
-/// True when the plan carries a `NestedProject` anywhere. Such plans are
-/// never inserted into the cache (see `insert`).
-fn plan_contains_nested_project(plan: &PlanNode) -> bool {
+/// True when a nested projection anywhere in the plan wrote `offset` before
+/// `limit` in its source block. The literal-slot walk visits limit before
+/// offset, so that form's source literal order cannot be safely rebound;
+/// both the cache (see `insert`) and `Engine::prepare` refuse it.
+pub(crate) fn nested_projection_defeats_cache(plan: &PlanNode) -> bool {
+    fn nested_defeats(nested: &crate::plan::NestedProjection) -> bool {
+        nested.offset_before_limit
+            || nested.fields.iter().any(|field| match field {
+                crate::plan::NestedField::Nested(inner) => nested_defeats(inner),
+                crate::plan::NestedField::Scalar { .. } => false,
+            })
+    }
     fn walk(plan: &PlanNode) -> bool {
         match plan {
-            PlanNode::NestedProject { .. } => true,
+            PlanNode::NestedProject { input, fields } => {
+                walk(input)
+                    || fields.iter().any(|field| match field {
+                        crate::plan::NestedProjectField::Nested(nested) => nested_defeats(nested),
+                        crate::plan::NestedProjectField::Plain(_) => false,
+                    })
+            }
             PlanNode::Filter { input, .. }
             | PlanNode::Project { input, .. }
             | PlanNode::Sort { input, .. }
@@ -1373,10 +1390,31 @@ mod tests {
                 }
             }
             PlanNode::NestedProject { input, fields } => {
+                fn collect_nested(nested: &crate::plan::NestedProjection, out: &mut Vec<Literal>) {
+                    if let Some(residual) = &nested.residual {
+                        collect_expr_literals(residual, out);
+                    }
+                    if let Some(limit) = &nested.limit {
+                        collect_expr_literals(limit, out);
+                    }
+                    if let Some(offset) = &nested.offset {
+                        collect_expr_literals(offset, out);
+                    }
+                    for field in &nested.fields {
+                        if let crate::plan::NestedField::Nested(inner) = field {
+                            collect_nested(inner, out);
+                        }
+                    }
+                }
                 collect_literals_for_test(input, out);
                 for field in fields {
-                    if let crate::plan::NestedProjectField::Plain(f) = field {
-                        collect_expr_literals(&f.expr, out);
+                    match field {
+                        crate::plan::NestedProjectField::Plain(f) => {
+                            collect_expr_literals(&f.expr, out);
+                        }
+                        crate::plan::NestedProjectField::Nested(nested) => {
+                            collect_nested(nested, out);
+                        }
                     }
                 }
             }

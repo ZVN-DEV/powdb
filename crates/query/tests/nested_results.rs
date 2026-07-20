@@ -197,8 +197,8 @@ fn nested_projection_reexecution_sees_new_children() {
     let mut engine = engine_with_users_and_orders("reexec");
     let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, o.product_id } }";
     assert_nested_shape(exec(&mut engine, q));
-    // Nested plans bypass the plan cache; the second run must replan and
-    // see the new child row.
+    // The second run may be served from the plan cache; plans carry no
+    // data, so it must still see the new child row.
     exec(
         &mut engine,
         "insert Order { id := 4, user_id := 3, total := 1.5, product_id := 103 }",
@@ -393,6 +393,61 @@ fn nested_projection_depth_guard_rejects_pathological_nesting() {
         err.to_string().contains("nesting depth"),
         "expected a clean nesting-depth error, got: {err}"
     );
+}
+
+#[test]
+fn nested_projection_plan_cache_rebinds_literals() {
+    let mut engine = engine_with_users_and_orders("cache");
+    // Same shape, different residual and limit literals. A stale cached
+    // binding would serve the first call's 10.0/5 to the second call.
+    let q1 = "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 10.0 order o.total desc limit 5 { o.total } }";
+    let q2 = "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 1.0 order o.total desc limit 1 { o.total } }";
+    let QueryResult::Rows { rows, .. } = exec(&mut engine, q1) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+    assert_eq!(rows[1][1], json("[]"));
+    let QueryResult::Rows { rows, .. } = exec(&mut engine, q2) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+    assert_eq!(rows[1][1], json(r#"[{"total":5.5}]"#));
+    // And back: the q1 shape again with its original literals.
+    let QueryResult::Rows { rows, .. } = exec(&mut engine, q1) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows[0][1], json(r#"[{"total":20.25}]"#));
+}
+
+#[test]
+fn nested_projection_plans_are_cached() {
+    let mut engine = engine_with_users_and_orders("cache_hit");
+    let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id and o.total > 10.0 limit 3 { o.total } }";
+    exec(&mut engine, q);
+    let (hits_before, _, _) = engine.plan_cache_stats();
+    exec(&mut engine, q);
+    let (hits_after, _, _) = engine.plan_cache_stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "second execution of a nested projection must hit the plan cache"
+    );
+}
+
+#[test]
+fn nested_projection_offset_before_limit_still_correct() {
+    let mut engine = engine_with_users_and_orders("cache_offlim");
+    // `offset` written before `limit` is legal but never cached (its source
+    // literal order defeats the substitution walk). Both orders must give
+    // the same, correct answer on repeated runs.
+    let q = "User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc offset 1 limit 1 { o.total } }";
+    for _ in 0..2 {
+        let QueryResult::Rows { rows, .. } = exec(&mut engine, q) else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows[0][1], json(r#"[{"total":9.5}]"#));
+        assert_eq!(rows[1][1], json("[]"));
+    }
 }
 
 #[test]
