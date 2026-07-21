@@ -500,3 +500,182 @@ fn sql_grouped_count_star_counts_per_group() {
         other => panic!("expected grouped rows, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Qualified column references in single-table statements (`t.col`).
+//
+// Regression suite for the v0.18.0 P0: in single-table SQL, `table.column`
+// silently lowered to a join-style qualified ref that the executor resolved
+// to Empty, so projections returned Empty, WHERE filters matched nothing
+// (or everything, when negated ranges collapsed), UPDATE affected 0 rows,
+// and DELETE removed every row (data loss). SQLite semantics: the qualifier
+// resolves to the column when it names the (single) table or its alias, and
+// is a hard error otherwise.
+// ---------------------------------------------------------------------------
+
+fn qualified_fixture() -> (tempfile::TempDir, Engine) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type t { required id: int, required v: int }")
+        .unwrap();
+    engine
+        .execute_powql("insert t { id := 1, v := 5 }, { id := 2, v := 50 }")
+        .unwrap();
+    (dir, engine)
+}
+
+#[test]
+fn sql_qualified_projection_single_table_returns_values() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine.execute_sql("SELECT t.id FROM t ORDER BY t.id").unwrap() {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["id"]);
+            assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_where_eq_single_table_matches_row() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine.execute_sql("SELECT id FROM t WHERE t.id = 1").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_where_range_single_table_filters() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine.execute_sql("SELECT id FROM t WHERE t.v < 10").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_update_where_single_table_affects_matching_row() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine
+        .execute_sql("UPDATE t SET v = 99 WHERE t.id = 1")
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1, "UPDATE must affect exactly the matching row"),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+    match engine.execute_sql("SELECT v FROM t WHERE id = 1").unwrap() {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(99)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_update_set_rhs_single_table_reads_column() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine
+        .execute_sql("UPDATE t SET v = t.v + 1 WHERE t.id = 2")
+        .unwrap()
+    {
+        QueryResult::Modified(n) => assert_eq!(n, 1),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+    match engine.execute_sql("SELECT v FROM t WHERE id = 2").unwrap() {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(51)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// The data-loss case: DELETE with a qualified WHERE must delete only the
+/// matching row. The pre-fix behavior deleted BOTH rows.
+#[test]
+fn sql_qualified_delete_where_single_table_keeps_survivor() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine.execute_sql("DELETE FROM t WHERE t.v < 10").unwrap() {
+        QueryResult::Modified(n) => assert_eq!(n, 1, "DELETE must remove only the matching row"),
+        other => panic!("expected Modified, got {other:?}"),
+    }
+    match engine.execute_sql("SELECT id, v FROM t").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![vec![Value::Int(2), Value::Int(50)]],
+                "the non-matching row must survive"
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_order_by_single_table_sorts() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine
+        .execute_sql("SELECT id FROM t ORDER BY t.v DESC")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(2)], vec![Value::Int(1)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_group_by_and_having_single_table() {
+    let (_dir, mut engine) = qualified_fixture();
+    engine
+        .execute_powql("insert t { id := 3, v := 5 }")
+        .unwrap();
+    match engine
+        .execute_sql("SELECT v, count(*) FROM t GROUP BY t.v HAVING t.v < 10 ORDER BY v")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Int(5), Value::Int(2)]]);
+        }
+        other => panic!("expected grouped rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn sql_qualified_expression_over_two_columns_single_table() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine
+        .execute_sql("SELECT t.id + t.v AS s FROM t WHERE t.id + t.v > 10")
+        .unwrap()
+    {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["s"]);
+            assert_eq!(rows, vec![vec![Value::Int(52)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// A qualifier that names no table in the statement must be a hard error
+/// (SQLite: "no such column: x.id"), never a silent Empty.
+#[test]
+fn sql_unknown_qualifier_in_projection_errors() {
+    let (_dir, mut engine) = qualified_fixture();
+    let r = engine.execute_sql("SELECT x.id FROM t");
+    assert!(r.is_err(), "unknown qualifier must error, got: {r:?}");
+}
+
+#[test]
+fn sql_unknown_qualifier_in_where_errors() {
+    let (_dir, mut engine) = qualified_fixture();
+    let r = engine.execute_sql("SELECT id FROM t WHERE x.id = 1");
+    assert!(r.is_err(), "unknown qualifier must error, got: {r:?}");
+    let r = engine.execute_sql("DELETE FROM t WHERE x.v < 10");
+    assert!(r.is_err(), "unknown qualifier in DELETE must error, got: {r:?}");
+    match engine.execute_sql("SELECT id, v FROM t").unwrap() {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2, "no rows may be deleted"),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
