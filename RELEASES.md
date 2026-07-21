@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.18.0.** Nested projections (shaped results): a PowQL projection field can embed a correlated child query, returning one row per parent with matching children assembled into a native JSON array (per-parent order/limit/offset, residual conditions, multi-level nesting, [] for childless parents). PowQL-only; hash-based O(parent + child) execution.
+> **Current release: v0.18.1.** Correctness patch: seven fixes from the first day of the internal audit rotation, including three P0s (SQL single-table qualified refs resolving to Empty with a data-loss DELETE shape, planner dropping the second same-side range bound, plan-cache range-bound swap poisoning warm queries), the live-backup WAL-truncation data-loss fix, typed wire class for unique violations, PowQL `not` precedence, and nested-projection float fidelity.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

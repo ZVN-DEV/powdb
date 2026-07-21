@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.18.1 - 2026-07-21
+
+- Version-alignment release in lockstep with workspace v0.18.1 (engine
+  correctness patch: SQL qualified-ref resolution, planner range bounds,
+  plan-cache literal ordering, live-backup lock, `not` precedence, nested
+  float fidelity). Servers now send error class 8 (constraint_violation) for
+  unique violations, which this client already mapped. No TypeScript API
+  changes.
+
 ## 0.18.0 - 2026-07-20
 
 - Version-alignment release in lockstep with workspace v0.18.0 (nested
