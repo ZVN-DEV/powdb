@@ -307,3 +307,52 @@ async fn readonly_refusal_never_leaks_sentinel_and_carries_readonly_class() {
     child.kill().ok();
     child.wait().ok();
 }
+
+/// Send a query and assert it succeeded (any non-error response frame).
+async fn query_ok(stream: &mut TcpStream, query: &str) {
+    stream.write_all(&encode_query(query)).await.unwrap();
+    let frame = read_response(stream).await;
+    assert_ne!(
+        frame[0], 0x0A,
+        "query {query:?} unexpectedly failed: {}",
+        old_client_error_message(&frame)
+    );
+}
+
+/// docs/errors.md: class 8 (`constraint_violation`) covers "Unique index
+/// violation". A duplicate insert into a `unique` column must therefore
+/// carry class byte 8, not 0 (`internal`).
+///
+/// Currently FAILING (found by the 2026-07-21 driver-writer DX pass, verified
+/// over the wire against the released 0.18.0 binary): the violation is raised
+/// in storage as an `io::Error`, surfaces as `QueryError::StorageError`, and
+/// `classify_query_error` maps every `StorageError` to `ErrorClass::Internal`.
+/// Its `unique constraint violation` prefix branch only inspects
+/// `QueryError::Execution`, which this path never takes, so the wire class is
+/// 0 while the message says "unique constraint violation on ...".
+#[tokio::test]
+async fn unique_violation_carries_constraint_class() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let addr = spawn_server(data_dir.path().to_path_buf(), None).await;
+    let mut stream = connect_ok(&addr).await;
+
+    query_ok(&mut stream, "type UniqWire { unique u: int }").await;
+    query_ok(&mut stream, "insert UniqWire { u := 1 }").await;
+
+    let frame = query_error_frame(&mut stream, "insert UniqWire { u := 1 }").await;
+
+    // The message itself is on the sanitizer allowlist and crosses verbatim.
+    let message = old_client_error_message(&frame);
+    assert!(
+        message.starts_with("unique constraint violation"),
+        "unexpected message: {message}"
+    );
+
+    // The contract under test: the trailing class byte is 8.
+    assert_eq!(
+        decode_error_class(&frame),
+        Some(ErrorClass::ConstraintViolation.as_u8()),
+        "unique constraint violations must carry class byte 8 (constraint_violation), \
+         not 0 (internal); see docs/errors.md"
+    );
+}
