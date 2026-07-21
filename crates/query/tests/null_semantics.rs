@@ -350,6 +350,39 @@ fn empty_equals_empty_in_filter_is_excluded_but_exists_still_works() {
 }
 
 // ---------------------------------------------------------------------------
+// Documented two-valued `not`: because a comparison against a missing value is
+// false (not a third "unknown"), `not (.v > x)` INCLUDES the missing row. Both
+// frontends must agree (they lower to the same predicate). This pins the
+// behavior stated in docs/POWQL.md and docs/SQL.md.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_valued_not_includes_missing_rows_and_frontends_agree() {
+    let (dir, mut engine) = fresh("two_valued_not");
+    // id 1 has v = 5 (5 > 0 is true, so `not (.v > 0)` excludes it); id 2 has a
+    // missing v (`.v > 0` is false, so `not (.v > 0)` includes it).
+    let powql = ids(exec(&mut engine, "T filter not (.v > 0) { .id }"));
+    assert_eq!(
+        powql,
+        vec![2],
+        "two-valued `not (.v > 0)` includes the missing-v row"
+    );
+    let sql = sql_ids(&mut engine, "SELECT id FROM T WHERE NOT (v > 0)");
+    assert_eq!(powql, sql, "PowQL and SQL must agree on two-valued NOT");
+
+    // Guarding presence recovers the stricter (three-valued) intent.
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            "T filter exists .v and not (.v > 0) { .id }"
+        )),
+        Vec::<i64>::new(),
+        "guarding presence excludes the missing-v row again"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
 // JOIN ON equality is unchanged: two rows both missing the key still match on
 // direct Value equality (Empty = Empty), because join key matching is not a
 // filter comparison. See crates/query/src/join.rs.
