@@ -7,21 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+Nothing yet.
 
-- **Nested projections (shaped results), PowQL-only.** A projection field can
-  now be a whole correlated child query:
-  `User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc limit 3 { o.total } }`
-  returns one row per parent with the matching children assembled into a
-  native JSON array of objects; childless parents get `[]` (never NULL, never
-  a dropped row) and there is no join fan-out to regroup client-side. Nested
-  blocks take one equi-correlation predicate plus optional `and` conditions
-  on child columns, per-parent `order`/`limit`/`offset` (top-N per parent),
-  and nest recursively for multi-level shapes. Execution is hash-based,
-  O(parent + child); plans are cached and `EXPLAIN` shows the nested
-  structure. The SQL frontend deliberately has no equivalent. Documented in
-  `docs/POWQL.md` (Nested Projections) with a runnable, CI-smoked demo in
-  `examples/nested-results/`.
+## [0.18.1] - 2026-07-21
+
+### Fixed
+
+- **SQL frontend (P0):** single-table statements with qualified `table.column`
+  references silently resolved the reference to Empty, producing wrong SELECT
+  results, wrong WHERE matches, and UPDATE/DELETE affecting the wrong rows
+  (`DELETE FROM t WHERE t.v < 10` could delete every row). Qualifiers are now
+  resolved against the statement's table (alias-aware); unknown qualifiers are
+  a hard error, matching SQLite.
+- **Planner (P0):** an AND of two same-side range bounds on one column dropped
+  the second bound (`filter .v > 1 and .v >= 9` behaved as `.v > 1`). Only the
+  canonical lower-then-upper conjunct pair merges into an index RangeScan; all
+  other spellings keep the full predicate and still regain index execution at
+  runtime lowering.
+- **Plan cache (P0):** a range conjunction written upper-bound-first cached a
+  plan whose bounds were swapped on every warm execution, silently corrupting
+  results for that query shape for the life of the process.
+- **Backup (data loss):** `powdb-cli backup` and `sweep` against a data dir
+  owned by a live server checkpointed and truncated the live WAL, destroying
+  acknowledged writes while reporting success. Both commands now take the
+  writer lock and refuse when a live owner holds it.
+- **Wire protocol:** unique constraint violations now carry error class 8
+  (constraint_violation) as documented, instead of class 0 (internal).
+- **PowQL parser:** prefix `not` now binds at its documented precedence level,
+  so `filter not .v > 0` means `not (.v > 0)` and agrees with the SQL frontend.
+- **Nested projections:** integral float values (e.g. `3.0`) now stay JSON
+  floats instead of becoming JSON ints, per the documented canonicalization.
 
 ## [0.18.0] - 2026-07-20
 

@@ -24,7 +24,7 @@ Output:
 backed up 3 files (49152 bytes) at lsn 128 -> ./backups/2026-06-06
 ```
 
-> **Back up offline.** `backup` opens the data directory with its own catalog handle and checkpoints it (which truncates the shared `wal.log`). It does **not** coordinate with any other process holding the same directory. Do **not** run `backup` against a `--data-dir` that a live `powdb-server` (or another CLI) currently has open — concurrent access can corrupt **both** the snapshot and the live database. Stop the server first (or snapshot a directory nothing else is using). Online, serve-while-backing-up snapshots are a planned later phase (see [Limitations](#limitations)).
+> **Back up offline.** `backup` opens the data directory with its own catalog handle and checkpoints it (which truncates the shared `wal.log`), so it must be the only process holding the directory. Since v0.18.1 `backup` (and `sweep`) acquire the writer lock first and **refuse** to run against a `--data-dir` that a live `powdb-server` (or another CLI) currently has open, failing with `refusing to back up ...: already open by process <pid>` instead of risking the snapshot or the live database. A stale lock left by a dead process is taken over automatically. Stop the server first, or snapshot a directory nothing else is using. Online, serve-while-backing-up snapshots are a planned later phase (see [Limitations](#limitations)).
 
 ### Restore
 

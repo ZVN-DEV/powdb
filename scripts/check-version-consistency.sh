@@ -98,6 +98,12 @@ done <<< "$site_versions"
 grep -qE '^## \[Unreleased\]' CHANGELOG.md \
   || fail "CHANGELOG.md is missing the Unreleased section for v$workspace_version work"
 
+# The root CHANGELOG must carry an entry for the release being published. A
+# scripted release edit whose anchor drifts can silently no-op (v0.18.1 shipped
+# with no entry this way); this guard catches that before publish.
+grep -qE "^## \[$current_release\]" CHANGELOG.md \
+  || fail "CHANGELOG.md has no [$current_release] entry for the published release"
+
 # The npm client ships its CHANGELOG.md in the tarball; it must at least cover
 # the latest published release so package consumers see current release notes.
 grep -qE "^## $current_release" clients/ts/CHANGELOG.md \
