@@ -187,7 +187,10 @@ fn same_side_bounds_sql_frontend() {
 fn warm_reversed_bound_order_is_not_poisoned_indexed() {
     let (_dir, mut engine) = fresh_signed(true);
     // Cold: caches the shape. Empty range, so 0.
-    assert_eq!(scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"), 0);
+    assert_eq!(
+        scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"),
+        0
+    );
     // Warm: same shape, wide range. Poisoned cache swapped bounds -> 0.
     assert_eq!(
         scalar(&mut engine, "count(R filter .v < 100 and .v > -200)"),
@@ -207,12 +210,18 @@ fn warm_reversed_bound_order_is_not_poisoned_unindexed() {
     // RangeScan is speculative (planner is catalog-pure), so the poisoning
     // is independent of whether the index exists.
     let (_dir, mut engine) = fresh_signed(false);
-    assert_eq!(scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"), 0);
+    assert_eq!(
+        scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"),
+        0
+    );
     assert_eq!(
         scalar(&mut engine, "count(R filter .v < 100 and .v > -200)"),
         4,
     );
-    assert_eq!(scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"), 0);
+    assert_eq!(
+        scalar(&mut engine, "count(R filter .v < -78 and .v > -48)"),
+        0
+    );
 }
 
 #[test]
@@ -231,16 +240,25 @@ fn warm_reversed_bound_order_sql_frontend() {
         }
     };
     assert_eq!(
-        count(&mut engine, "SELECT COUNT(*) FROM R WHERE v < -78 AND v > -48"),
+        count(
+            &mut engine,
+            "SELECT COUNT(*) FROM R WHERE v < -78 AND v > -48"
+        ),
         0
     );
     assert_eq!(
-        count(&mut engine, "SELECT COUNT(*) FROM R WHERE v < 100 AND v > -200"),
+        count(
+            &mut engine,
+            "SELECT COUNT(*) FROM R WHERE v < 100 AND v > -200"
+        ),
         4,
         "SQL frontend shares the plan cache and must not swap bounds warm"
     );
     assert_eq!(
-        count(&mut engine, "SELECT COUNT(*) FROM R WHERE v < -78 AND v > -48"),
+        count(
+            &mut engine,
+            "SELECT COUNT(*) FROM R WHERE v < -78 AND v > -48"
+        ),
         0
     );
 }
@@ -285,7 +303,10 @@ fn normal_two_sided_range_still_index_backed_and_correct() {
         scalar(&mut engine, "count(R filter .v > -200 and .v < 100)"),
         4
     );
-    assert_eq!(scalar(&mut engine, "count(R filter .v > -78 and .v < -48)"), 1);
+    assert_eq!(
+        scalar(&mut engine, "count(R filter .v > -78 and .v < -48)"),
+        1
+    );
     assert_eq!(
         scalar(&mut engine, "count(R filter .v > -200 and .v < 100)"),
         4
