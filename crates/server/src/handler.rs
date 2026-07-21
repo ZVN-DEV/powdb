@@ -432,7 +432,16 @@ fn classify_query_error(e: &QueryError) -> ErrorClass {
         | QueryError::TypeError(_)
         | QueryError::IndexError(_)
         | QueryError::ViewError(_) => ErrorClass::Execution,
-        QueryError::StorageError(_) => ErrorClass::Internal,
+        // Unique violations surface from storage as io::Error text; classify
+        // them by prefix like the Execution arm so the wire class matches
+        // docs/errors.md instead of collapsing to Internal.
+        QueryError::StorageError(err) => {
+            if err.to_string().contains("unique constraint violation") {
+                ErrorClass::ConstraintViolation
+            } else {
+                ErrorClass::Internal
+            }
+        }
         QueryError::Execution(msg) => {
             if msg.starts_with("unique constraint violation") {
                 ErrorClass::ConstraintViolation
