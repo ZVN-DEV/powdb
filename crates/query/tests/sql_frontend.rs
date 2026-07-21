@@ -528,7 +528,10 @@ fn qualified_fixture() -> (tempfile::TempDir, Engine) {
 #[test]
 fn sql_qualified_projection_single_table_returns_values() {
     let (_dir, mut engine) = qualified_fixture();
-    match engine.execute_sql("SELECT t.id FROM t ORDER BY t.id").unwrap() {
+    match engine
+        .execute_sql("SELECT t.id FROM t ORDER BY t.id")
+        .unwrap()
+    {
         QueryResult::Rows { columns, rows } => {
             assert_eq!(columns, vec!["id"]);
             assert_eq!(rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
@@ -540,7 +543,10 @@ fn sql_qualified_projection_single_table_returns_values() {
 #[test]
 fn sql_qualified_where_eq_single_table_matches_row() {
     let (_dir, mut engine) = qualified_fixture();
-    match engine.execute_sql("SELECT id FROM t WHERE t.id = 1").unwrap() {
+    match engine
+        .execute_sql("SELECT id FROM t WHERE t.id = 1")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows, vec![vec![Value::Int(1)]]);
         }
@@ -551,7 +557,10 @@ fn sql_qualified_where_eq_single_table_matches_row() {
 #[test]
 fn sql_qualified_where_range_single_table_filters() {
     let (_dir, mut engine) = qualified_fixture();
-    match engine.execute_sql("SELECT id FROM t WHERE t.v < 10").unwrap() {
+    match engine
+        .execute_sql("SELECT id FROM t WHERE t.v < 10")
+        .unwrap()
+    {
         QueryResult::Rows { rows, .. } => {
             assert_eq!(rows, vec![vec![Value::Int(1)]]);
         }
@@ -673,9 +682,42 @@ fn sql_unknown_qualifier_in_where_errors() {
     let r = engine.execute_sql("SELECT id FROM t WHERE x.id = 1");
     assert!(r.is_err(), "unknown qualifier must error, got: {r:?}");
     let r = engine.execute_sql("DELETE FROM t WHERE x.v < 10");
-    assert!(r.is_err(), "unknown qualifier in DELETE must error, got: {r:?}");
+    assert!(
+        r.is_err(),
+        "unknown qualifier in DELETE must error, got: {r:?}"
+    );
     match engine.execute_sql("SELECT id, v FROM t").unwrap() {
         QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 2, "no rows may be deleted"),
         other => panic!("expected rows, got {other:?}"),
     }
+}
+
+#[test]
+fn sql_qualified_ref_matches_single_table_alias() {
+    let (_dir, mut engine) = qualified_fixture();
+    match engine
+        .execute_sql("SELECT a.id FROM t AS a WHERE a.v < 10")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// Per SQL, an alias hides the table name: `SELECT t.id FROM t AS a` is an
+/// error in SQLite ("no such column: t.id").
+#[test]
+fn sql_table_name_qualifier_hidden_by_alias_errors() {
+    let (_dir, mut engine) = qualified_fixture();
+    let r = engine.execute_sql("SELECT t.id FROM t AS a");
+    assert!(r.is_err(), "alias must hide the table name, got: {r:?}");
+}
+
+/// Qualified refs make no sense in INSERT ... VALUES; they must error rather
+/// than lower to a join-style ref.
+#[test]
+fn sql_qualified_ref_in_insert_values_errors() {
+    let (_dir, mut engine) = qualified_fixture();
+    let r = engine.execute_sql("INSERT INTO t (id, v) VALUES (t.id, 1)");
+    assert!(r.is_err(), "qualified ref in VALUES must error, got: {r:?}");
 }

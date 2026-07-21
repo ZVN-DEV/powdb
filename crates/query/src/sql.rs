@@ -24,6 +24,7 @@ pub fn parse_sql_with_canonical(input: &str) -> Result<ParsedSql, ParseError> {
         toks,
         pos: 0,
         depth: 0,
+        qual_ctx: QualCtx::None,
     };
     let canonical_powql = p.statement()?;
     if !p.at_end() {
@@ -400,6 +401,28 @@ struct SqlParser {
     toks: Vec<SqlTok>,
     pos: usize,
     depth: usize,
+    /// How qualified column references (`t.col`) resolve in the statement
+    /// currently being parsed. Set by SELECT/UPDATE/DELETE before their
+    /// expressions are parsed.
+    qual_ctx: QualCtx,
+}
+
+/// Resolution context for qualified column references.
+///
+/// PowQL only understands the `alias.field` form inside joins; in a
+/// single-table statement it must not reach the PowQL parser (the executor
+/// would resolve it to Empty, silently corrupting projections and filters).
+/// The SQL frontend therefore resolves single-table qualifiers itself.
+#[derive(Clone, PartialEq)]
+enum QualCtx {
+    /// No table in scope (e.g. INSERT ... VALUES): qualified refs are errors.
+    None,
+    /// Single-table statement: a qualifier naming the table (or its alias,
+    /// which per SQL hides the table name) lowers to a bare `.col`; any other
+    /// qualifier is a hard error, matching SQLite's "no such column: x.y".
+    Single { visible_name: String },
+    /// Query with joins: qualifiers pass through for PowQL join resolution.
+    Joined,
 }
 
 /// One item in a SELECT projection, after lowering to canonical PowQL text.
@@ -567,8 +590,56 @@ impl SqlParser {
         }
     }
 
+    /// Establish the qualified-reference context for a SELECT before its
+    /// projection list is parsed. The projection precedes FROM in the token
+    /// stream, so this scans ahead (at paren depth 0; subqueries are
+    /// parenthesized and rejected elsewhere anyway) for the FROM table, its
+    /// optional alias, and whether any join clause follows.
+    fn scan_select_qual_ctx(&self) -> QualCtx {
+        let mut i = self.pos;
+        let mut depth = 0usize;
+        loop {
+            match self.toks.get(i) {
+                None => return QualCtx::None,
+                Some(SqlTok::Symbol('(')) => depth += 1,
+                Some(SqlTok::Symbol(')')) => depth = depth.saturating_sub(1),
+                Some(SqlTok::Word(w)) if depth == 0 && w.eq_ignore_ascii_case("from") => break,
+                Some(_) => {}
+            }
+            i += 1;
+        }
+        let Some(SqlTok::Word(table)) = self.toks.get(i + 1) else {
+            // Malformed FROM; let the main parse produce the error.
+            return QualCtx::None;
+        };
+        let mut visible = table.clone();
+        let mut j = i + 2;
+        // Mirror `table_ref`: an alias is either `AS ident` or a bare word
+        // that is not a clause keyword or join modifier.
+        match self.toks.get(j) {
+            Some(SqlTok::Word(w)) if w.eq_ignore_ascii_case("as") => {
+                if let Some(SqlTok::Word(a)) = self.toks.get(j + 1) {
+                    visible = a.clone();
+                    j += 2;
+                }
+            }
+            Some(SqlTok::Word(w)) if !is_clause_kw(w) && !is_join_modifier(w) => {
+                visible = w.clone();
+                j += 1;
+            }
+            _ => {}
+        }
+        match self.toks.get(j) {
+            Some(SqlTok::Word(w)) if is_join_modifier(w) => QualCtx::Joined,
+            _ => QualCtx::Single {
+                visible_name: visible,
+            },
+        }
+    }
+
     fn select(&mut self) -> Result<String, ParseError> {
         self.expect_kw("select")?;
+        self.qual_ctx = self.scan_select_qual_ctx();
         let distinct = self.eat_kw("distinct");
         let projection = self.projection_list()?;
         self.expect_kw("from")?;
@@ -856,6 +927,9 @@ impl SqlParser {
     fn update(&mut self) -> Result<String, ParseError> {
         self.expect_kw("update")?;
         let table = self.expect_ident("table name")?;
+        self.qual_ctx = QualCtx::Single {
+            visible_name: table.clone(),
+        };
         self.expect_kw("set")?;
         let assigns = self.assignment_list_until(&["where", "returning"])?;
         let filter = if self.eat_kw("where") {
@@ -881,6 +955,9 @@ impl SqlParser {
         self.expect_kw("delete")?;
         self.expect_kw("from")?;
         let table = self.expect_ident("table name")?;
+        self.qual_ctx = QualCtx::Single {
+            visible_name: table.clone(),
+        };
         let filter = if self.eat_kw("where") {
             Some(self.expr_until(&["returning"])?)
         } else {
@@ -1435,7 +1512,26 @@ impl SqlParser {
                 }
                 if self.eat_sym('.') {
                     let f = self.expect_ident("qualified column name")?;
-                    Ok(format!("{w}.{f}"))
+                    match &self.qual_ctx {
+                        QualCtx::Joined => Ok(format!("{w}.{f}")),
+                        QualCtx::Single { visible_name } => {
+                            if w.eq_ignore_ascii_case(visible_name) {
+                                Ok(format!(".{f}"))
+                            } else {
+                                Err(ParseError::Syntax {
+                                    message: format!(
+                                        "no such column: {w}.{f} (the only table in this \
+                                         statement is `{visible_name}`)"
+                                    ),
+                                })
+                            }
+                        }
+                        QualCtx::None => Err(ParseError::Syntax {
+                            message: format!(
+                                "qualified column reference `{w}.{f}` is not allowed here"
+                            ),
+                        }),
+                    }
                 } else {
                     Ok(format!(".{w}"))
                 }
