@@ -1120,18 +1120,35 @@ pub(crate) fn extract_single_bound(pred: &Expr) -> Option<RangeBound> {
 /// If the predicate is an inequality or a conjunction of two inequalities
 /// on the same indexed column, return a RangeScan plan node.
 /// Handles: `.col > lit`, `.col >= lit`, `.col < lit`, `.col <= lit`,
-/// and AND-conjunctions like `.col >= low AND .col <= high` (BETWEEN pattern).
+/// and the canonical AND-conjunction `.col >= low AND .col <= high`
+/// (BETWEEN pattern, lower bound spelled first).
+///
+/// Only the lower-then-upper spelling is merged here. Two other AND shapes
+/// deliberately fall through to `Filter(SeqScan)`:
+///
+/// - Same-side bounds (`.v > 1 and .v >= 9`): a merged RangeScan can only
+///   hold one bound per side, so merging would silently drop the tighter
+///   conjunct (v0.18.0 bug F). The full predicate must survive.
+/// - Upper-bound-first (`.v < B and .v > A`): the merged node would hold
+///   `start` from the *second* source literal and `end` from the *first*,
+///   but the plan cache substitutes literals in source-text order while
+///   `substitute_plan` visits start-then-end, so every warm hit would run
+///   with the bounds swapped (v0.18.0 bug G).
+///
+/// Neither fallback costs the index: `lower_unindexed_scans` re-merges
+/// same-target bounds from the `Filter(SeqScan)` conjuncts at runtime,
+/// after literal substitution, with real catalog knowledge, keeping any
+/// extra bound as a residual recheck.
 fn try_extract_range_index_keys(table: &str, pred: &Expr) -> Option<PlanNode> {
-    // Case 1: AND conjunction — try to merge two bounds on the same column.
+    // Case 1: AND conjunction — merge only `lower AND upper`, the one shape
+    // whose plan literal order (start, end) matches source-text order.
     if let Expr::BinaryOp(lhs, BinOp::And, rhs) = pred {
         if let (Some((col1, s1, e1)), Some((col2, s2, e2))) =
             (extract_single_bound(lhs), extract_single_bound(rhs))
         {
             if col1 == col2 {
-                let start = s1.or(s2);
-                let end = e1.or(e2);
-                if start.is_some() || end.is_some() {
-                    return Some(range_scan_for_target(table, col1, start, end));
+                if let (Some(start), None, None, Some(end)) = (s1, e1, s2, e2) {
+                    return Some(range_scan_for_target(table, col1, Some(start), Some(end)));
                 }
             }
         }
