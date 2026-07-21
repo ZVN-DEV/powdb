@@ -857,6 +857,19 @@ fn main() {
 // ─── Backup / restore ───────────────────────────────────────────────────────
 
 fn run_backup(data_dir: &str, dest: &str, base: Option<&str>) -> i32 {
+    // Backup opens the raw catalog, checkpoints it, and truncates the shared
+    // wal.log. Done to a directory a live powdb-server owns, that destroys
+    // every write the server acknowledged since its last checkpoint (they
+    // exist only in the WAL the checkpoint truncates). Take the same writer
+    // lock the engine takes so a live owner is refused cleanly; a stale lock
+    // from a crashed process is taken over exactly as Engine::open would.
+    let _dir_lock = match powdb_storage::dir_lock::DirLock::acquire(Path::new(data_dir)) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("Error: refusing to back up {data_dir}: {e}");
+            return 1;
+        }
+    };
     let mut catalog = match powdb_sync::open_preserving_retained_segments(Path::new(data_dir)) {
         Ok(c) => c,
         Err(e) => {
@@ -1277,6 +1290,15 @@ fn run_users(data_dir: &str) -> i32 {
 /// overflow-chain pages for one table, or all tables when `table == "all"`.
 fn run_sweep(data_dir: &str, table: &str) -> i32 {
     let dir = Path::new(data_dir);
+    // Sweep rewrites heap pages in place; refuse a directory a live process
+    // (e.g. a running powdb-server) owns, same as `run_backup`.
+    let _dir_lock = match powdb_storage::dir_lock::DirLock::acquire(dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("Error: refusing to sweep {data_dir}: {e}");
+            return 1;
+        }
+    };
     let mut cat = match powdb_storage::catalog::Catalog::open(dir) {
         Ok(c) => c,
         Err(e) => {
