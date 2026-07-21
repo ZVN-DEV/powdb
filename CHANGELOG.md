@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [0.18.1] - 2026-07-21
+## [0.18.2] - 2026-07-21
+
+### Fixed
+
+- **PowQL (P0):** a qualified `alias.column` (or `Table.column`) reference in a
+  single-table query resolved against the join-output column set only, so an
+  aliased single-table query such as `Widget as w filter w.id > 2` failed with
+  an unknown-qualifier error and any `w.col` projection/filter/update/delete
+  target could not be reached. Single-table qualifiers are now rewritten to the
+  bare field when the qualifier matches the table's name or alias, and an
+  unknown qualifier is a hard error. Joins are unaffected.
+- **Query semantics (P0):** a filter comparison against a missing/NULL value
+  used a total order in which `Empty` sorted first, so `filter .f != x` and the
+  ordering comparisons could wrongly match rows whose `.f` is absent. A missing
+  value now never satisfies any filter comparison (`=`, `!=`, `<`, `<=`, `>`,
+  `>=`); presence is required for a row to match, matching the documented and
+  SQL-frontend two-valued behavior. JOIN `ON` equality still treats two absent
+  keys as equal.
 
 ### Fixed
 

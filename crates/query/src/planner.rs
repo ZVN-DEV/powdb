@@ -122,6 +122,37 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     if !q.joins.is_empty() {
         return plan_joined_query(q);
     }
+    // Single-table read: resolve any `alias.col` / `Table.col` qualifiers to
+    // bare `.col` up front. The executor only understands the qualified form
+    // inside joins; leaving it here would silently evaluate to Empty (P0:
+    // wrong rows, empty projections). An unknown qualifier is a hard error.
+    let visible = q.alias.clone().unwrap_or_else(|| q.source.clone());
+    if let Some(filter) = q.filter.as_mut() {
+        resolve_scan_qualifiers(filter, &visible)?;
+    }
+    if let Some(proj) = q.projection.as_mut() {
+        for pf in proj.iter_mut() {
+            resolve_scan_qualifiers(&mut pf.expr, &visible)?;
+        }
+    }
+    if let Some(order) = q.order.as_mut() {
+        for key in order.keys.iter_mut() {
+            resolve_scan_qualifiers(&mut key.expr, &visible)?;
+        }
+    }
+    if let Some(group) = q.group_by.as_mut() {
+        for key in group.keys.iter_mut() {
+            resolve_scan_qualifiers(&mut key.expr, &visible)?;
+        }
+        if let Some(having) = group.having.as_mut() {
+            resolve_scan_qualifiers(having, &visible)?;
+        }
+    }
+    if let Some(agg) = q.aggregation.as_mut() {
+        if let Some(arg) = agg.argument.as_mut() {
+            resolve_scan_qualifiers(arg, &visible)?;
+        }
+    }
     let source_aliases = std::collections::HashSet::from([q.source.clone()]);
     // Try to fold `filter .col = literal` into an IndexScan. The executor
     // decides at run time whether the column actually has an index — if not,
@@ -319,6 +350,96 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     Ok(node)
+}
+
+/// Resolve single-table qualified column references (`alias.col` or, when the
+/// scan is unaliased, `Table.col`) to bare `Field(col)` in place.
+///
+/// PowQL only emits the qualified form for join disambiguation; the executor
+/// resolves it against `alias.field`-named join columns. In a single-table
+/// scan the columns are named bare, so a surviving `QualifiedField` would
+/// resolve to `Value::Empty`: the P0 that silently returned wrong rows,
+/// empty projections, and zero-effect UPDATE/DELETE.
+///
+/// `visible` is the scan alias if present, else the table name (an alias hides
+/// the table name, matching SQL). A qualifier equal to `visible` lowers to the
+/// bare field; **any other qualifier is a hard error**, mirroring the SQL
+/// frontend's "no such column" behavior and closing the silent-wrong-results
+/// enabler. The rule fires only on the qualifier itself: a resolved field that
+/// is genuinely missing (optional/JSON) still yields `Empty` downstream, so
+/// doc-store missing-value semantics are unchanged.
+///
+/// Subquery bodies (`InSubquery` / `ExistsSubquery` / `NestedQuery`) introduce
+/// their own scope and are left untouched: correlated references there are
+/// bare fields, and each subquery is resolved against its own source.
+fn resolve_scan_qualifiers(expr: &mut Expr, visible: &str) -> Result<(), PlanError> {
+    match expr {
+        Expr::QualifiedField { qualifier, field } => {
+            if qualifier == visible {
+                *expr = Expr::Field(std::mem::take(field));
+                Ok(())
+            } else {
+                Err(PlanError::Semantic(format!(
+                    "no such column: `{qualifier}.{field}` (the only table in this \
+                     query is `{visible}`)"
+                )))
+            }
+        }
+        Expr::Field(_) | Expr::Literal(_) | Expr::Param(_) | Expr::ValueLit(_) | Expr::Null => {
+            Ok(())
+        }
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            resolve_scan_qualifiers(left, visible)?;
+            resolve_scan_qualifiers(right, visible)
+        }
+        Expr::UnaryOp(_, inner)
+        | Expr::Cast(inner, _)
+        | Expr::FunctionCall(_, inner, _)
+        | Expr::JsonPath { base: inner, .. } => resolve_scan_qualifiers(inner, visible),
+        Expr::ScalarFunc(_, args) => {
+            for arg in args.iter_mut() {
+                resolve_scan_qualifiers(arg, visible)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr, list, .. } => {
+            resolve_scan_qualifiers(expr, visible)?;
+            for item in list.iter_mut() {
+                resolve_scan_qualifiers(item, visible)?;
+            }
+            Ok(())
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, res) in whens.iter_mut() {
+                resolve_scan_qualifiers(cond, visible)?;
+                resolve_scan_qualifiers(res, visible)?;
+            }
+            if let Some(e) = else_expr {
+                resolve_scan_qualifiers(e, visible)?;
+            }
+            Ok(())
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args.iter_mut() {
+                resolve_scan_qualifiers(a, visible)?;
+            }
+            for p in partition_by.iter_mut() {
+                resolve_scan_qualifiers(p, visible)?;
+            }
+            for k in order_by.iter_mut() {
+                resolve_scan_qualifiers(&mut k.expr, visible)?;
+            }
+            Ok(())
+        }
+        // Own-scope subqueries are resolved separately; nested projections
+        // take the dedicated `plan_nested_query` path and never reach here.
+        Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::NestedQuery(_) => Ok(()),
+    }
 }
 
 /// Build a `NestedProject` plan for a query whose projection carries nested
@@ -876,7 +997,17 @@ fn plan_insert(ins: InsertExpr) -> Result<PlanNode, PlanError> {
     })
 }
 
-fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
+fn plan_update(mut upd: UpdateExpr) -> Result<PlanNode, PlanError> {
+    // Resolve single-table `alias.col` / `Table.col` qualifiers before the
+    // index fold sees the filter (same rule as reads). Without this an aliased
+    // UPDATE filter evaluates to Empty and silently affects zero rows.
+    let visible = upd.alias.clone().unwrap_or_else(|| upd.source.clone());
+    if let Some(filter) = upd.filter.as_mut() {
+        resolve_scan_qualifiers(filter, &visible)?;
+    }
+    for assign in upd.assignments.iter_mut() {
+        resolve_scan_qualifiers(&mut assign.value, &visible)?;
+    }
     // Mirror the read-side IndexScan fold: when the update filter is a simple
     // `.col = literal`, emit `Update(IndexScan)` so the executor's index-lookup
     // mutation fast path fires. The executor falls back to a scan if the
@@ -906,7 +1037,14 @@ fn plan_update(upd: UpdateExpr) -> Result<PlanNode, PlanError> {
     })
 }
 
-fn plan_delete(del: DeleteExpr) -> Result<PlanNode, PlanError> {
+fn plan_delete(mut del: DeleteExpr) -> Result<PlanNode, PlanError> {
+    // Resolve single-table qualifiers before the index fold (same rule as
+    // reads). Without this an aliased DELETE filter evaluates to Empty; a
+    // mismatched-but-nonempty predicate could otherwise delete every row.
+    let visible = del.alias.clone().unwrap_or_else(|| del.source.clone());
+    if let Some(filter) = del.filter.as_mut() {
+        resolve_scan_qualifiers(filter, &visible)?;
+    }
     let source = match del.filter {
         Some(pred) => match try_extract_eq_index_key(&del.source, &pred) {
             Some(index_scan) => index_scan,

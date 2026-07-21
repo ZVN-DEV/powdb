@@ -184,7 +184,7 @@ fn hash_join(
                     combined.extend_from_slice(right_row);
                     if residuals
                         .iter()
-                        .all(|residual| eval_predicate(residual, &combined, &columns))
+                        .all(|residual| eval_join_predicate(residual, &combined, &columns))
                     {
                         rows.push(combined);
                         check_join_limit(rows.len())?;
@@ -282,7 +282,7 @@ pub(crate) fn execute_materialized_join(
             let keep = match kind {
                 JoinKind::Cross => true,
                 JoinKind::Inner | JoinKind::LeftOuter => {
-                    on.is_none_or(|pred| eval_predicate(pred, &combined, &columns))
+                    on.is_none_or(|pred| eval_join_predicate(pred, &combined, &columns))
                 }
                 JoinKind::RightOuter => {
                     unreachable!("planner rewrites RightOuter to LeftOuter")
@@ -347,7 +347,7 @@ pub(super) fn execute_provenance_join(
                             if spec
                                 .residuals
                                 .iter()
-                                .all(|residual| eval_predicate(residual, &row, &columns))
+                                .all(|residual| eval_join_predicate(residual, &row, &columns))
                             {
                                 let mut row_provenance = left.provenance[left_index].clone();
                                 row_provenance.extend_from_slice(&right.provenance[right_index]);
@@ -389,7 +389,7 @@ pub(super) fn execute_provenance_join(
             let keep = match kind {
                 JoinKind::Cross => true,
                 JoinKind::Inner | JoinKind::LeftOuter => {
-                    on.is_none_or(|predicate| eval_predicate(predicate, &row, &columns))
+                    on.is_none_or(|predicate| eval_join_predicate(predicate, &row, &columns))
                 }
                 JoinKind::RightOuter => {
                     unreachable!("planner rewrites RightOuter to LeftOuter")

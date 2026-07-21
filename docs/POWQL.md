@@ -317,6 +317,46 @@ User filter .name = "Alice"
 User filter .score != 0
 ```
 
+#### NULL / missing values in comparisons
+
+A missing (null) field value **never matches a comparison**. A row whose
+compared field is null is excluded from every one of the six comparison
+operators -- `<`, `<=`, `>`, `>=`, `=`, and `!=` -- for any present value on
+the other side. This matches SQL NULL semantics: a comparison against a null
+is neither true nor false, so the row does not pass the filter.
+
+```
+-- rows with a null .age are excluded from ALL of these:
+User filter .age < 30
+User filter .age >= 30
+User filter .age = 30
+User filter .age != 30      -- a null .age is NOT "not equal to 30"; it is excluded
+```
+
+The same rule applies when both sides are fields: `.a = .b` (and `.a != .b`)
+does not match a row where either `.a` or `.b` is missing. To test presence,
+use `is null` / `is not null` (or `exists` / `not exists`), never a comparison:
+
+```
+User filter .age is not null           -- rows where age is present
+User filter .age is null               -- rows where age is missing
+```
+
+This rule holds identically on every execution path (indexed scans, compiled
+predicate fast paths, generic evaluation, JSON `->` path comparisons, and
+nested-projection residual filters) and in both the PowQL and SQL frontends.
+
+**Two-valued `not`.** PowQL filter logic is two-valued: `not (p)` is the plain
+complement of `p`. Because a comparison against a missing value is *false* (not
+a third "unknown" value), `not (.age > 30)` **includes** rows where `.age` is
+missing (the inner `.age > 30` is false, so its complement is true). Standard
+SQL three-valued logic would instead exclude those rows. If you want only rows
+with a present, non-matching value, guard presence explicitly:
+
+```
+User filter .age is not null and not (.age > 30)
+```
+
 ### Arithmetic Operators
 
 | Operator | Meaning | Precedence |

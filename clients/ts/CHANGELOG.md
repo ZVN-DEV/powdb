@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.2 - 2026-07-21
+
+- Version-alignment release in lockstep with workspace v0.18.2 (engine
+  correctness patch: PowQL single-table aliased qualified-ref resolution, and
+  two-valued filter semantics so a missing value never matches a comparison).
+  No TypeScript API changes.
+
 ## 0.18.1 - 2026-07-21
 
 - Version-alignment release in lockstep with workspace v0.18.1 (engine

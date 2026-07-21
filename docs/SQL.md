@@ -44,6 +44,39 @@ extraction, arithmetic expressions, functions, and multi-column indexes remain
 outside the production subset. Native PowQL exposes the same path-index feature
 as `alter T add index (.data->path)`.
 
+## NULL comparison semantics
+
+PowDB follows SQL NULL semantics for comparisons: a `NULL` (missing) value
+**never matches a comparison**. A row whose compared column is `NULL` is
+excluded from `<`, `<=`, `>`, `>=`, `=`, and `!=` against any non-null value,
+including `col != <value>`. Test for presence with `IS NULL` / `IS NOT NULL`,
+not with a comparison. This holds on every execution path (indexed, compiled
+fast path, generic, JSON `->` path comparisons) and matches the PowQL frontend
+exactly, since both lower to the same predicates.
+
+```sql
+-- rows where age IS NULL are excluded from all of these:
+SELECT * FROM User WHERE age < 30;
+SELECT * FROM User WHERE age = 30;
+SELECT * FROM User WHERE age != 30;   -- NULL is excluded, not treated as "!= 30"
+SELECT * FROM User WHERE age IS NOT NULL;   -- use this to select present values
+```
+
+One deliberate divergence from the SQL standard: PowDB filter logic is
+two-valued, so `NOT (expr)` is the plain complement of `expr`. Because a
+comparison against `NULL` evaluates to false (not the SQL "unknown"),
+`WHERE NOT (age > 30)` **includes** rows where `age IS NULL` (the inner
+`age > 30` is false, so `NOT` makes it true), whereas standard three-valued SQL
+would exclude them. Guard presence explicitly when that matters:
+
+```sql
+SELECT * FROM User WHERE age IS NOT NULL AND NOT (age > 30);
+```
+
+`JOIN ... ON` key equality is separate: PowDB deliberately matches two missing
+keys (`Empty = Empty`) so nullable-key rows join, rather than applying the
+filter comparison rule. That behavior is unchanged.
+
 ## JSON path operators
 
 Both SQL arrow operators accept a string object key or a non-negative integer

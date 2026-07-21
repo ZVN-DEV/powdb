@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-sync",
-  "version": "0.18.1",
+  "version": "0.18.2",
   "description": "Embedded PowDB sync orchestration for local reads and primary-authoritative write-forward.",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
@@ -40,8 +40,8 @@
     "node": ">=18"
   },
   "peerDependencies": {
-    "@zvndev/powdb-client": "0.18.1",
-    "@zvndev/powdb-embedded": "0.18.1"
+    "@zvndev/powdb-client": "0.18.2",
+    "@zvndev/powdb-embedded": "0.18.2"
   },
   "peerDependenciesMeta": {
     "@zvndev/powdb-client": { "optional": true },
