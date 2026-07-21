@@ -239,6 +239,9 @@ pub struct InsertExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateExpr {
     pub source: String,
+    /// Optional alias for the source (`Mem as m filter m.x = 1 update ...`).
+    /// Lets the planner resolve `m.col` qualifiers the same way reads do.
+    pub alias: Option<String>,
     pub filter: Option<Expr>,
     pub assignments: Vec<Assignment>,
     /// `true` when the statement ends with `returning` — the executor returns
@@ -249,6 +252,9 @@ pub struct UpdateExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteExpr {
     pub source: String,
+    /// Optional alias for the source (`Mem as m filter m.x = 1 delete`).
+    /// Lets the planner resolve `m.col` qualifiers the same way reads do.
+    pub alias: Option<String>,
     pub filter: Option<Expr>,
     /// `true` when the statement ends with `returning` — the executor returns
     /// the pre-delete rows (all columns) instead of a modified-count.

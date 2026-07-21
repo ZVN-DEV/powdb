@@ -3,23 +3,27 @@
 //!
 //! Before the fix the executor only resolved `alias.field` inside joins; in a
 //! single-table scan the qualifier was dropped and the field fell through to
-//! missing-field `Empty` semantics — silently returning wrong rows, empty
+//! missing-field `Empty` semantics, silently returning wrong rows, empty
 //! projections, and zero-effect UPDATE/DELETE on a normal documented pattern.
 //! This is the native-PowQL twin of the SQL-frontend P0 fixed in v0.18.1.
 
 use powdb_query::executor::Engine;
 use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "powdb_aliasrefs_{tag}_{}_{}",
+        std::process::id(),
+        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 fn engine() -> Engine {
-    let dir = std::env::temp_dir().join(format!(
-        "powdb_aliasrefs_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = temp_dir("mem");
     let mut e = Engine::new(&dir).unwrap();
     e.execute_powql("type Mem { required id: int, required agent_id: int, required score: int }")
         .unwrap();
@@ -115,7 +119,10 @@ fn aliased_group_resolves() {
         "Mem as m group m.agent_id { m.agent_id, n: count(m.score) }",
     ) {
         QueryResult::Rows { rows, columns } => {
-            let aid = columns.iter().position(|c| c.ends_with("agent_id")).unwrap();
+            let aid = columns
+                .iter()
+                .position(|c| c.ends_with("agent_id"))
+                .unwrap();
             let n = columns.iter().position(|c| c == "n").unwrap();
             rows.into_iter()
                 .map(|r| {
@@ -150,7 +157,10 @@ fn aliased_aggregate_argument_resolves() {
 fn unaliased_table_name_qualifier_resolves() {
     let mut e = engine();
     // With no alias, the qualifier may name the table itself.
-    assert_eq!(scalar_int(&mut e, "count(Mem filter Mem.agent_id = 4217)"), 5);
+    assert_eq!(
+        scalar_int(&mut e, "count(Mem filter Mem.agent_id = 4217)"),
+        5
+    );
     let mut vals = int_col(&mut e, "Mem filter Mem.agent_id = 99 { Mem.score }");
     vals.sort();
     assert_eq!(vals, vec![50, 60, 70]);
@@ -194,14 +204,7 @@ fn bare_field_refs_still_work() {
 fn missing_optional_field_still_returns_empty_not_error() {
     // Doc-store semantics: a genuinely missing optional column projects Empty,
     // it does not error. The unknown-qualifier hard error must not leak here.
-    let dir = std::env::temp_dir().join(format!(
-        "powdb_aliasrefs_opt_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = temp_dir("opt");
     let mut e = Engine::new(&dir).unwrap();
     e.execute_powql("type Doc { required id: int, note: str }")
         .unwrap();
@@ -224,7 +227,10 @@ fn missing_optional_field_still_returns_empty_not_error() {
 fn aliased_update_resolves() {
     let mut e = engine();
     // Update the three agent_id=99 rows via the alias.
-    match ok(&mut e, "Mem as m filter m.agent_id = 99 update { score := 1 }") {
+    match ok(
+        &mut e,
+        "Mem as m filter m.agent_id = 99 update { score := 1 }",
+    ) {
         QueryResult::Modified(n) => assert_eq!(n, 3),
         other => panic!("{other:?}"),
     }
@@ -266,8 +272,10 @@ fn joins_still_resolve_qualified_refs() {
     let mut e = engine();
     e.execute_powql("type Ord { required oid: int, required mem_id: int }")
         .unwrap();
-    e.execute_powql("insert Ord { oid := 100, mem_id := 0 }").unwrap();
-    e.execute_powql("insert Ord { oid := 101, mem_id := 5 }").unwrap();
+    e.execute_powql("insert Ord { oid := 100, mem_id := 0 }")
+        .unwrap();
+    e.execute_powql("insert Ord { oid := 101, mem_id := 5 }")
+        .unwrap();
     let rows = match ok(
         &mut e,
         "Mem as m inner join Ord as o on m.id = o.mem_id { m.id, o.oid }",

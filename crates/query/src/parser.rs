@@ -491,6 +491,7 @@ impl Parser {
                     }
                     return Ok(Statement::UpdateQuery(UpdateExpr {
                         source,
+                        alias,
                         filter,
                         assignments,
                         returning,
@@ -510,6 +511,7 @@ impl Parser {
                     }
                     return Ok(Statement::DeleteQuery(DeleteExpr {
                         source,
+                        alias,
                         filter,
                         returning,
                     }));
