@@ -449,14 +449,49 @@ fn json_locate_node<'a>(
     Some(cur)
 }
 
+/// True when the addressed JSON `node` scalarizes to the empty set, mirroring
+/// `eval::pj1_scalarize`: a missing path (`None`), a JSON `null`
+/// (tag 0), or a truncated / invalid scalar. Arrays and objects (tags 6/7)
+/// scalarize to `Value::Json`, so they are NOT empty. A missing value never
+/// matches a comparison, so these must be excluded — the same guard
+/// `eval_binop` applies on the generic path.
+#[inline]
+fn json_node_is_empty(node: Option<&[u8]>) -> bool {
+    let Some(n) = node else {
+        return true;
+    };
+    match n.first() {
+        Some(1) | Some(2) | Some(6) | Some(7) => false, // bool / object / array
+        Some(3) | Some(4) => n.len() < 9,               // int / float (truncated => empty)
+        Some(5) => {
+            if n.len() < 5 {
+                return true;
+            }
+            let len = u32::from_le_bytes(n[1..5].try_into().unwrap()) as usize;
+            match n.get(5..5 + len) {
+                Some(b) => std::str::from_utf8(b).is_err(),
+                None => true,
+            }
+        }
+        // tag 0 (JSON null), reserved / unknown tag, or empty slice.
+        _ => true,
+    }
+}
+
 /// Compare the addressed JSON `node` (None = the empty set) against a
-/// pre-encoded scalar `literal` under `op`, reproducing `eval_binop` exactly:
-/// `Eq`/`Neq` use `Value::PartialEq` (so `Int` never equals `Float`), the
-/// ordering ops use `Value::Ord` (cross-numeric promotion, `Empty` sorts
-/// first, unrelated types by `TypeId`). `And`/`Or`/arithmetic/`Like` never
-/// build a `Json` leaf, so they return `false` here defensively.
+/// pre-encoded scalar `literal` under `op`, reproducing `eval_binop` exactly.
+/// A node that scalarizes to the empty set (missing path, JSON `null`, or a
+/// truncated scalar) never matches a comparison — the row is excluded, matching
+/// the generic path's `Empty` guard. For present scalars, `Eq`/`Neq` use
+/// `Value::PartialEq` (so `Int` never equals `Float`) and the ordering ops use
+/// `Value::Ord` (cross-numeric promotion, unrelated types by `TypeId`).
+/// `And`/`Or`/arithmetic/`Like` never build a `Json` leaf, so they return
+/// `false` here defensively.
 #[inline]
 fn json_compare(node: Option<&[u8]>, op: BinOp, literal: &Value) -> bool {
+    if json_node_is_empty(node) {
+        return false;
+    }
     match op {
         BinOp::Eq => json_scalar_eq(node, literal),
         BinOp::Neq => !json_scalar_eq(node, literal),

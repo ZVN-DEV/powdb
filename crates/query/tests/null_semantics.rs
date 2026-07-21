@@ -134,7 +134,10 @@ fn ordered_and_equality_comparisons_exclude_missing_values() {
 
     // And the positive controls: id 1 shows up when its present value matches.
     assert_eq!(ids(exec(&mut engine, "T filter .v > 0 { .id }")), vec![1]);
-    assert_eq!(ids(exec(&mut engine, "T filter .v != 999 { .id }")), vec![1]);
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v != 999 { .id }")),
+        vec![1]
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -185,6 +188,35 @@ fn compiled_and_generic_paths_agree_on_missing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The oracle's `#[ignore]` repro (finding C), now un-ignored: the same
+/// logical comparison must agree across plan shapes (compiled single atom vs
+/// OR-forced generic vs str atom) on how it treats the missing row.
+#[test]
+fn null_comparisons_agree_across_plan_shapes() {
+    let dir = temp_dir("agree_plan_shapes");
+    let mut engine = Engine::new(&dir).unwrap();
+    exec(&mut engine, "type T { required id: int, s: str, v: int }");
+    exec(&mut engine, r#"insert T { id := 1, s := "a", v := 5 }"#);
+    exec(&mut engine, "insert T { id := 2 }");
+
+    let compiled = scalar(&mut engine, "count(T filter .v < 0)");
+    let generic = scalar(&mut engine, "count(T filter .v < 0 or .id < 0)");
+    assert_eq!(
+        compiled, generic,
+        "`.v < 0` and `.v < 0 or .id < 0` must agree on NULL rows"
+    );
+    let str_single = scalar(&mut engine, r#"count(T filter .s < "a")"#);
+    assert_eq!(
+        compiled, str_single,
+        "int and str single-atom comparisons must treat NULL the same way"
+    );
+    assert_eq!(
+        compiled, 0,
+        "the missing row must be excluded from `.v < 0`"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // A matching sibling of an OR must still include a row even though the other
 // side is a missing-value comparison. (Empty comparison is false, not a hard
@@ -219,7 +251,10 @@ fn powql_and_sql_frontends_agree_on_missing() {
             "T filter .v < 0 or .id < 0 { .id }",
             "SELECT id FROM T WHERE v < 0 OR id < 0",
         ),
-        (r#"T filter .s < "a" { .id }"#, "SELECT id FROM T WHERE s < 'a'"),
+        (
+            r#"T filter .s < "a" { .id }"#,
+            "SELECT id FROM T WHERE s < 'a'",
+        ),
     ];
     for (powql, sql) in cases {
         let p = ids(exec(&mut engine, powql));

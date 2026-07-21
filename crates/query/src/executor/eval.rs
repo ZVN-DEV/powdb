@@ -350,7 +350,33 @@ pub(super) fn literal_value_take(lit: &mut Literal) -> Value {
     }
 }
 
+/// Comparison-semantics mode for the six comparison operators
+/// (`= != < > <= >=`).
+///
+/// - `Filter`: a missing (`Empty`) operand never matches — the row is excluded.
+///   This is SQL NULL semantics and matches the compiled predicate leaves.
+///   Used for every filter, HAVING, CASE, and nested-projection residual.
+/// - `Join`: comparisons keep the raw `Value` order / equality, so a JOIN key
+///   equality still matches `Empty = Empty` (PowDB deliberately joins on
+///   missing keys; see `plan_exec/join.rs`). Used only for JOIN `ON` / residual
+///   conditions so the hash and nested-loop join paths stay identical and
+///   unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CmpMode {
+    Filter,
+    Join,
+}
+
 pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value {
+    eval_expr_mode(expr, row, columns, CmpMode::Filter)
+}
+
+pub(super) fn eval_expr_mode(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    mode: CmpMode,
+) -> Value {
     match expr {
         Expr::Field(name) => columns
             .iter()
@@ -384,14 +410,14 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
         // routes them to `NestedProject`, so they never reach evaluation.
         Expr::NestedQuery(_) => Value::Empty,
         Expr::BinaryOp(left, op, right) => {
-            let l = eval_expr(left, row, columns);
-            let r = eval_expr(right, row, columns);
-            eval_binop(&l, *op, &r)
+            let l = eval_expr_mode(left, row, columns, mode);
+            let r = eval_expr_mode(right, row, columns, mode);
+            eval_binop_mode(&l, *op, &r, mode)
         }
         Expr::Coalesce(left, right) => {
-            let l = eval_expr(left, row, columns);
+            let l = eval_expr_mode(left, row, columns, mode);
             if l.is_empty() {
-                eval_expr(right, row, columns)
+                eval_expr_mode(right, row, columns, mode)
             } else {
                 l
             }
@@ -401,9 +427,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             list,
             negated,
         } => {
-            let val = eval_expr(expr, row, columns);
+            let val = eval_expr_mode(expr, row, columns, mode);
             let found = list.iter().any(|item| {
-                let iv = eval_expr(item, row, columns);
+                let iv = eval_expr_mode(item, row, columns, mode);
                 val == iv
             });
             Value::Bool(if *negated { !found } else { found })
@@ -418,7 +444,7 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             Value::Empty
         }
         Expr::UnaryOp(op, inner) => {
-            let v = eval_expr(inner, row, columns);
+            let v = eval_expr_mode(inner, row, columns, mode);
             match op {
                 UnaryOp::Not => match v {
                     Value::Bool(b) => Value::Bool(!b),
@@ -440,11 +466,14 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
             if *func == ScalarFn::JsonText {
                 return eval_json_text(args.first(), row, columns);
             }
-            let vals: Vec<Value> = args.iter().map(|a| eval_expr(a, row, columns)).collect();
+            let vals: Vec<Value> = args
+                .iter()
+                .map(|a| eval_expr_mode(a, row, columns, mode))
+                .collect();
             eval_scalar_func(*func, &vals)
         }
         Expr::JsonPath { base, segments } => {
-            let base_val = eval_expr(base, row, columns);
+            let base_val = eval_expr_mode(base, row, columns, mode);
             match walk_json_path(&base_val, segments) {
                 // Scalarize the addressed node per design 4.4. JSON `null` and
                 // a missing path both collapse to `Empty` here (use `json_type`
@@ -455,17 +484,17 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
         }
         Expr::Case { whens, else_expr } => {
             for (condition, result) in whens {
-                if eval_predicate(condition, row, columns) {
-                    return eval_expr(result, row, columns);
+                if eval_predicate_mode(condition, row, columns, mode) {
+                    return eval_expr_mode(result, row, columns, mode);
                 }
             }
             match else_expr {
-                Some(e) => eval_expr(e, row, columns),
+                Some(e) => eval_expr_mode(e, row, columns, mode),
                 None => Value::Empty,
             }
         }
         Expr::Cast(inner, cast_type) => {
-            let val = eval_expr(inner, row, columns);
+            let val = eval_expr_mode(inner, row, columns, mode);
             eval_cast(val, *cast_type)
         }
         Expr::ValueLit(v) => v.clone(),
@@ -602,7 +631,24 @@ fn eval_json_text(arg: Option<&Expr>, row: &[Value], columns: &[String]) -> Valu
 }
 
 pub(super) fn eval_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
-    match eval_expr(expr, row, columns) {
+    eval_predicate_mode(expr, row, columns, CmpMode::Filter)
+}
+
+/// Evaluate a JOIN `ON` / residual condition. Join comparisons keep raw `Value`
+/// semantics, so a join key equality still matches `Empty = Empty` (PowDB joins
+/// on missing keys by design) rather than applying the filter Empty guard. See
+/// `plan_exec/join.rs`.
+pub(super) fn eval_join_predicate(expr: &Expr, row: &[Value], columns: &[String]) -> bool {
+    eval_predicate_mode(expr, row, columns, CmpMode::Join)
+}
+
+pub(super) fn eval_predicate_mode(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[String],
+    mode: CmpMode,
+) -> bool {
+    match eval_expr_mode(expr, row, columns, mode) {
         Value::Bool(b) => b,
         _ => false,
     }
@@ -890,7 +936,27 @@ fn eval_cast(val: Value, target: CastType) -> Value {
     }
 }
 
-pub(super) fn eval_binop(left: &Value, op: BinOp, right: &Value) -> Value {
+pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpMode) -> Value {
+    // In `Filter` mode a missing (`Empty`) operand never matches an ordered or
+    // equality / inequality comparison: the comparison is false, so the row is
+    // excluded. This mirrors the compiled predicate leaves (`compiled.rs`:
+    // Int/Float/StrEq/Json null-guard and never match Empty) and SQL NULL
+    // semantics, keeping the generic and compiled paths in agreement regardless
+    // of whether a predicate compiles. Presence is tested with `exists` /
+    // `not exists`, not with a comparison.
+    //
+    // In `Join` mode the guard is skipped so JOIN key equality stays direct
+    // `Value` equality (including `Empty = Empty`) — PowDB deliberately joins on
+    // missing keys, and the hash and nested-loop join paths must agree.
+    if mode == CmpMode::Filter
+        && matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+        )
+        && (left.is_empty() || right.is_empty())
+    {
+        return Value::Bool(false);
+    }
     match op {
         BinOp::Eq => Value::Bool(left == right),
         BinOp::Neq => Value::Bool(left != right),
