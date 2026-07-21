@@ -2704,7 +2704,10 @@ fn push_json_value(out: &mut String, value: &Value) {
             let _ = write!(out, "{v}");
         }
         Value::Float(v) if v.is_finite() => {
-            let _ = write!(out, "{v}");
+            // Rust's shortest Display renders 3.0 as "3", which the
+            // canonicalizing PJ1 re-parse would store as an int. Use the
+            // shared renderer that guarantees a fractional/exponent marker.
+            out.push_str(&powdb_storage::pj1::render_float(*v));
         }
         // NaN/infinity have no JSON representation.
         Value::Float(_) => out.push_str("null"),

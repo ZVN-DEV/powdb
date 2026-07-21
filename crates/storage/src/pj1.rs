@@ -714,8 +714,11 @@ fn write_text(buf: &[u8], start: usize, out: &mut String) -> Result<usize, JsonE
 }
 
 /// Canonical shortest float text with a guaranteed fractional/exponent marker,
-/// so the value re-parses as a float (never as an int).
-fn render_float(v: f64) -> String {
+/// so the value re-parses as a float (never as an int). Public because every
+/// producer of JSON text that will be canonicalized through PJ1 (e.g. the
+/// nested-projection assembler in powdb-query) must render floats the same
+/// way, or integral floats silently collapse to JSON ints.
+pub fn render_float(v: f64) -> String {
     let s = format!("{v}");
     if s.bytes().any(|b| b == b'.' || b == b'e' || b == b'E') {
         s

@@ -1164,6 +1164,35 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        // Prefix `not` lives at precedence level 4 (docs/POWQL.md): looser
+        // than the comparisons parsed below, tighter than `and`/`or`. Consume
+        // the whole prefix chain here so `not .v > 0` means `not (.v > 0)`,
+        // matching the SQL frontend. `not exists` keeps its dedicated
+        // primary-level parse (ExistsSubquery / NotExists), and an explicit
+        // `(not .v) > 0` still reaches parse_primary's `not` through the
+        // parentheses. The chain is counted iteratively (no recursion) and
+        // capped like parse_primary's guard so `not not … .x` cannot
+        // overflow the stack in the wrapping loop below or in later walks.
+        let mut negations = 0usize;
+        while *self.peek() == Token::Not
+            && !matches!(self.tokens.get(self.pos + 1), Some(Token::Exists))
+        {
+            self.advance();
+            negations += 1;
+            if self.depth + negations > MAX_NESTING_DEPTH {
+                return Err(ParseError::NestingDepthExceeded {
+                    max: MAX_NESTING_DEPTH,
+                });
+            }
+        }
+        let mut expr = self.parse_comparison_body()?;
+        for _ in 0..negations {
+            expr = Expr::UnaryOp(UnaryOp::Not, Box::new(expr));
+        }
+        Ok(expr)
+    }
+
+    fn parse_comparison_body(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive()?;
 
         // IS NULL / IS NOT NULL (postfix)
