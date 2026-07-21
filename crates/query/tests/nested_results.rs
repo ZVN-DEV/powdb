@@ -589,3 +589,44 @@ fn perf_probe_nested_vs_flat_join() {
         println!("{label}: {:?}/run rows={}", start.elapsed() / 5, n / 5);
     }
 }
+
+/// v0.18.0 finding D: an integral float (e.g. `total := 3.0`) in a nested
+/// projection was rendered with Rust's shortest `Display` ("3"), and the
+/// canonicalizing re-parse stored a JSON *int*. docs/POWQL.md JSON
+/// canonicalization promises "Numbers keep their int/float distinction";
+/// flat projection already returns Float(3.0).
+#[test]
+fn nested_projection_keeps_integral_float_a_float() {
+    let mut engine = Engine::new(&temp_dir("integral_float")).unwrap();
+    exec(
+        &mut engine,
+        "type User { required id: int, required name: str }",
+    );
+    exec(
+        &mut engine,
+        "type Order { required id: int, required user_id: int, required total: float }",
+    );
+    exec(&mut engine, r#"insert User { id := 1, name := "alice" }"#);
+    exec(
+        &mut engine,
+        "insert Order { id := 1, user_id := 1, total := 3.0 }",
+    );
+
+    let result = exec(
+        &mut engine,
+        "User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total } }",
+    );
+    let QueryResult::Rows { rows, .. } = result else {
+        panic!("expected rows");
+    };
+    assert_eq!(
+        rows[0][1],
+        json(r#"[{"total":3.0}]"#),
+        "integral float must stay a JSON float in nested output"
+    );
+    assert_ne!(
+        rows[0][1],
+        json(r#"[{"total":3}]"#),
+        "PJ1 must distinguish 3.0 from 3 for this test to be meaningful"
+    );
+}
