@@ -313,7 +313,8 @@ async fn query_ok(stream: &mut TcpStream, query: &str) {
     stream.write_all(&encode_query(query)).await.unwrap();
     let frame = read_response(stream).await;
     assert_ne!(
-        frame[0], 0x0A,
+        frame[0],
+        0x0A,
         "query {query:?} unexpectedly failed: {}",
         old_client_error_message(&frame)
     );
