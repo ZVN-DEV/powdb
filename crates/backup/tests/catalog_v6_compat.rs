@@ -137,7 +137,10 @@ fn v6_full_restore_preserves_id_named_expression_index_as_opaque_file() {
 
     powdb_backup::restore(backup.path(), restored.path()).unwrap();
     let restored_catalog = Catalog::open(restored.path()).unwrap();
-    assert_eq!(restored_catalog.active_catalog_version(), EXPRESSION_INDEX_CATALOG_VERSION);
+    assert_eq!(
+        restored_catalog.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     let metadata = restored_catalog
         .expression_index_metadata("Document")
         .unwrap();
@@ -191,7 +194,10 @@ fn v5_base_to_v6_increment_copies_aligned_bidx_whole_and_restores_activation() {
 
     powdb_backup::restore_chain(full.path(), &[increment.path()], restored.path()).unwrap();
     let restored_catalog = Catalog::open(restored.path()).unwrap();
-    assert_eq!(restored_catalog.active_catalog_version(), EXPRESSION_INDEX_CATALOG_VERSION);
+    assert_eq!(
+        restored_catalog.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     assert_eq!(
         restored_catalog
             .expression_index_metadata("Document")
@@ -292,7 +298,10 @@ fn sync_snapshot_metadata_uses_the_active_v6_catalog_version() {
 
     let manifest = powdb_backup::full_backup(&mut catalog, backup.path()).unwrap();
     assert_eq!(manifest.catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
-    assert_eq!(manifest.sync.unwrap().catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
+    assert_eq!(
+        manifest.sync.unwrap().catalog_version,
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
 }
 
 #[test]
