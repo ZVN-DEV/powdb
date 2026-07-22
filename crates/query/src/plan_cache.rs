@@ -153,7 +153,10 @@ impl PlanCache {
 /// both the cache (see `insert`) and `Engine::prepare` refuse it.
 pub(crate) fn nested_projection_defeats_cache(plan: &PlanNode) -> bool {
     fn nested_defeats(nested: &crate::plan::NestedProjection) -> bool {
-        nested.offset_before_limit
+        // Link traversals resolve against the live catalog at execution, so a
+        // cached (unresolved) plan must never be served.
+        nested.via_link.is_some()
+            || nested.offset_before_limit
             || nested.fields.iter().any(|field| match field {
                 crate::plan::NestedField::Nested(inner) => nested_defeats(inner),
                 crate::plan::NestedField::Scalar { .. } => false,
@@ -166,6 +169,9 @@ pub(crate) fn nested_projection_defeats_cache(plan: &PlanNode) -> bool {
                     || fields.iter().any(|field| match field {
                         crate::plan::NestedProjectField::Nested(nested) => nested_defeats(nested),
                         crate::plan::NestedProjectField::Plain(_) => false,
+                        // Scalar link paths resolve against the live catalog at
+                        // execution; never serve them from cache.
+                        crate::plan::NestedProjectField::Link(_) => true,
                     })
             }
             PlanNode::Filter { input, .. }
@@ -270,6 +276,7 @@ fn contains_grouped_having(plan: &PlanNode) -> bool {
         | PlanNode::Insert { .. }
         | PlanNode::Upsert { .. }
         | PlanNode::CreateTable { .. }
+        | PlanNode::CreateLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
         | PlanNode::CreateView { .. }
@@ -381,6 +388,8 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                     crate::plan::NestedProjectField::Nested(nested) => {
                         substitute_nested_projection(nested, literals, idx);
                     }
+                    // Never cached (defeats the cache above); no literals.
+                    crate::plan::NestedProjectField::Link(_) => {}
                 }
             }
         }
@@ -484,6 +493,7 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
             substitute_plan(input, literals, idx);
         }
         PlanNode::CreateTable { .. } => {}
+        PlanNode::CreateLink { .. } => {}
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
@@ -642,6 +652,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
                     crate::plan::NestedProjectField::Nested(nested) => {
                         count_nested_projection(nested, n);
                     }
+                    crate::plan::NestedProjectField::Link(_) => {}
                 }
             }
         }
@@ -737,6 +748,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         }
         PlanNode::Delete { input, .. } => count_plan(input, n),
         PlanNode::CreateTable { .. } => {}
+        PlanNode::CreateLink { .. } => {}
         PlanNode::AlterTable { .. } => {}
         PlanNode::DropTable { .. } => {}
         PlanNode::CreateView { .. } => {}
@@ -886,6 +898,9 @@ fn count_expr(expr: &Expr, n: &mut usize) {
         // cache (see `plan_contains_nested_project`), so this node's inner
         // literal slots are never walked.
         Expr::NestedQuery(_) => {}
+        // Structural only, no literals; plans carrying link paths are never
+        // cached (they resolve against the live catalog).
+        Expr::LinkPath { .. } => {}
     }
 }
 
@@ -967,6 +982,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
         // Never cached (see `plan_contains_nested_project`); nothing to
         // substitute.
         Expr::NestedQuery(_) => {}
+        Expr::LinkPath { .. } => {}
     }
 }
 
@@ -1415,6 +1431,7 @@ mod tests {
                         crate::plan::NestedProjectField::Nested(nested) => {
                             collect_nested(nested, out);
                         }
+                        crate::plan::NestedProjectField::Link(_) => {}
                     }
                 }
             }
@@ -1496,6 +1513,7 @@ mod tests {
             }
             PlanNode::Delete { input, .. } => collect_literals_for_test(input, out),
             PlanNode::CreateTable { .. } => {}
+            PlanNode::CreateLink { .. } => {}
             PlanNode::AlterTable { .. } => {}
             PlanNode::DropTable { .. } => {}
             PlanNode::CreateView { .. } => {}
@@ -1589,6 +1607,7 @@ mod tests {
             Expr::Null => {}
             // Never cached; mirrors count_expr/substitute_expr.
             Expr::NestedQuery(_) => {}
+            Expr::LinkPath { .. } => {}
         }
     }
 }

@@ -279,6 +279,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::UpdateQuery(_)
         | Statement::DeleteQuery(_)
         | Statement::CreateType(_)
+        | Statement::CreateLink(_)
         | Statement::AlterTable(_)
         | Statement::DropTable(_)
         | Statement::CreateView(_)
@@ -339,9 +340,19 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
                     crate::plan::NestedProjectField::Nested(nested) => {
                         let mut dirty = false;
                         nested.visit_tables(&mut |table| dirty |= views.is_dirty(table));
+                        // A block link traversal's child table is a placeholder
+                        // until execution-time catalog resolution, so
+                        // visit_tables cannot see it; escalate conservatively
+                        // whenever any view is dirty.
                         dirty
+                            || (plan_exec::nested_fields_have_via_link(std::slice::from_ref(field))
+                                && any_view_dirty(views))
                     }
                     crate::plan::NestedProjectField::Plain(_) => false,
+                    // Scalar link hop tables are likewise unknown here.
+                    crate::plan::NestedProjectField::Link(link) => {
+                        link.resolved.is_none() && any_view_dirty(views)
+                    }
                 })
         }
 
@@ -355,6 +366,7 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
         | PlanNode::Update { .. }
         | PlanNode::Delete { .. }
         | PlanNode::CreateTable { .. }
+        | PlanNode::CreateLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
         | PlanNode::CreateView { .. }
@@ -364,6 +376,14 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
         | PlanNode::Commit
         | PlanNode::Rollback => false,
     }
+}
+
+/// True when any registered materialized view is currently dirty. Conservative
+/// escalation test for plans whose scanned tables are not knowable before
+/// execution-time catalog resolution (link traversals resolve their child
+/// tables from the persistent catalog at query time).
+fn any_view_dirty(views: &ViewRegistry) -> bool {
+    views.list_views().iter().any(|v| views.is_dirty(v))
 }
 
 pub struct Engine {
@@ -1288,6 +1308,23 @@ impl Engine {
             PlanNode::NestedProject { input, fields } => {
                 // Dirty child views were escalated by the preflight above;
                 // the assembly itself only reads.
+                // Resolve link traversals against the persistent catalog before
+                // assembly (like the mutable dispatch), so child tables and
+                // scalar hop chains are concrete.
+                let resolved;
+                let fields: &[crate::plan::NestedProjectField] =
+                    if plan_exec::nested_fields_have_via_link(fields) {
+                        let outer = plan_exec::scan_source_table(input).ok_or_else(|| {
+                            QueryError::Execution(
+                                "link traversal requires a plain aliased table scan as its parent"
+                                    .into(),
+                            )
+                        })?;
+                        resolved = self.resolve_nested_via_links(fields, outer)?;
+                        &resolved
+                    } else {
+                        fields
+                    };
                 let parent = self.execute_plan_readonly(input)?;
                 self.execute_nested_project(parent, fields)
             }
@@ -2240,6 +2277,7 @@ impl Engine {
             | PlanNode::Delete { .. }
             | PlanNode::Upsert { .. }
             | PlanNode::CreateTable { .. }
+            | PlanNode::CreateLink { .. }
             | PlanNode::AlterTable { .. }
             | PlanNode::DropTable { .. }
             | PlanNode::CreateView { .. }

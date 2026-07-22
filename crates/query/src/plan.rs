@@ -1,5 +1,6 @@
 use crate::ast::{
-    AggFunc, AggregateMode, AlterAction, Assignment, Expr, GroupKey, JoinKind, Literal, WindowFunc,
+    AggFunc, AggregateMode, AlterAction, Assignment, Expr, GroupKey, JoinKind, Literal, ViaLink,
+    WindowFunc,
 };
 use powdb_storage::stored_json_path::StoredJsonPathV1;
 
@@ -189,6 +190,16 @@ pub enum PlanNode {
         /// a no-op instead of an error.
         if_not_exists: bool,
     },
+    /// `link <Owner>.<name> -> <Target> on <local> = <target>`: declare a
+    /// persistent entity link. Lowers to `Catalog::create_link`, which
+    /// validates the tables/columns and derives the cardinality.
+    CreateLink {
+        owner: String,
+        name: String,
+        target: String,
+        local_key: String,
+        target_key: String,
+    },
     /// `schema` — list every type (table) in the catalog. Read-only; reads
     /// live catalog state at execution time, so a cached plan is never stale.
     ListTypes,
@@ -244,6 +255,48 @@ pub enum NestedProjectField {
     Plain(ProjectField),
     /// A nested sub-query field, emitted as a PJ1 JSON array of objects.
     Nested(Box<NestedProjection>),
+    /// A scalar link traversal field (`o.user.name`), emitted as the
+    /// traversed target column's value (or empty when the FK is NULL or
+    /// dangling at any hop).
+    Link(Box<ScalarLinkField>),
+}
+
+/// A scalar link traversal projection field. Like `via_link` on
+/// [`NestedProjection`], the planner cannot resolve link names (it never
+/// touches the catalog), so `resolved` is `None` out of the planner and is
+/// filled in by the executor before assembly.
+#[derive(Debug, Clone)]
+pub struct ScalarLinkField {
+    /// Output column name (the field alias, or the dotted source spelling).
+    pub name: String,
+    /// The outer scan alias the path starts from (`o`).
+    pub outer_alias: String,
+    /// Declared to-one link names in traversal order (`["user", "company"]`).
+    pub links: Vec<String>,
+    /// The column read on the final target (`name`).
+    pub column: String,
+    /// Filled by the executor's catalog resolution; `None` out of the planner.
+    pub resolved: Option<ScalarLinkResolved>,
+}
+
+/// The catalog-resolved form of a scalar link path.
+#[derive(Debug, Clone)]
+pub struct ScalarLinkResolved {
+    /// The FK column on the parent scan, alias-qualified as the parent's
+    /// `AliasScan` emits it (`o.user_id`).
+    pub first_fk: String,
+    /// One hop per link name, in traversal order.
+    pub hops: Vec<ScalarLinkHop>,
+}
+
+/// One resolved hop of a scalar link path: look the incoming FK value up by
+/// `key_col` in `table`, then read `out_col` (the next hop's FK column, or the
+/// final target column on the last hop).
+#[derive(Debug, Clone)]
+pub struct ScalarLinkHop {
+    pub table: String,
+    pub key_col: String,
+    pub out_col: String,
 }
 
 /// The resolved form of one nested sub-query projection field. Correlation
@@ -256,6 +309,13 @@ pub struct NestedProjection {
     /// Output column name (the projection field's alias).
     pub name: String,
     pub table: String,
+    /// Set when this level came from a block link traversal
+    /// (`orders: u.orders { ... }`). While set, `table`/`child_key`/
+    /// `parent_key` are placeholders; the executor resolves them from the
+    /// persistent catalog before assembly (like `RangeScan` late lowering)
+    /// and clears this. The planner never touches the catalog, so it cannot
+    /// resolve it.
+    pub via_link: Option<ViaLink>,
     /// The child alias from the source text, kept for EXPLAIN and errors.
     pub alias: String,
     /// The enclosing scope's alias, kept for EXPLAIN (the executor

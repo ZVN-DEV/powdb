@@ -8,6 +8,9 @@ pub enum Statement {
     UpdateQuery(UpdateExpr),
     DeleteQuery(DeleteExpr),
     CreateType(CreateTypeExpr),
+    /// `link <Owner>.<name> -> <Target> on <local> = <target>`: declare a
+    /// persistent entity link (catalog v7). Lowers to `Catalog::create_link`.
+    CreateLink(CreateLinkExpr),
     AlterTable(AlterTableExpr),
     DropTable(DropTableExpr),
     CreateView(CreateViewExpr),
@@ -31,6 +34,40 @@ pub enum Statement {
 pub struct AlterTableExpr {
     pub table: String,
     pub action: AlterAction,
+}
+
+/// A persistent entity-link declaration, written either as a bare statement
+/// (`link <Owner>.<name> -> <Target> on <local> = <target>`) or as an
+/// `alter <Owner> add link <name> -> <Target> on <local> = <target>` action.
+/// The `on <local> = <target>` clause reads "the owner's `local_key` equals
+/// the target's `target_key`". Cardinality (`ToOne`/`ToMany`) is NOT written
+/// here: it is derived by `Catalog::create_link` from whether `target_key` is
+/// backed by a unique index on the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateLinkExpr {
+    /// The type the link is declared on (traversed as `<alias>.<name>`).
+    pub owner: String,
+    /// Traversal name, unique per owner type.
+    pub name: String,
+    /// Target type the link resolves to.
+    pub target: String,
+    /// Column on the owner supplying the join value.
+    pub local_key: String,
+    /// Column on the target matched against `local_key`.
+    pub target_key: String,
+}
+
+/// An unresolved link traversal on a projection, e.g. `orders: u.orders
+/// { total }` (block) or the parent side of a scalar path. Carried on
+/// [`NestedQuery`]/[`NestedProjection`] so the planner stays catalog-pure; the
+/// executor resolves it against the persistent catalog at query time (the
+/// correlation columns and child table are not known until then).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViaLink {
+    /// The outer scan alias the link hangs off (`u` in `u.orders`).
+    pub outer_alias: String,
+    /// The declared link name (`orders`).
+    pub link_name: String,
 }
 
 /// A persisted index target. Stored JSON paths are table-local and therefore
@@ -77,6 +114,15 @@ pub enum AlterAction {
     DropIndex {
         target: IndexTarget,
         if_exists: bool,
+    },
+    /// `alter <Owner> add link <name> -> <Target> on <local> = <target>`:
+    /// declare a persistent entity link on the altered type. Lowers to
+    /// `Catalog::create_link`; cardinality is derived there.
+    AddLink {
+        name: String,
+        target: String,
+        local_key: String,
+        target_key: String,
     },
 }
 
@@ -201,6 +247,12 @@ pub struct ProjectionField {
 pub struct NestedQuery {
     pub source: String,
     pub alias: String,
+    /// Set when this nested query was written as a block link traversal
+    /// (`orders: u.orders { ... }`) rather than an explicit correlated scan.
+    /// When set, `source` is a placeholder and `filter` holds only the
+    /// residual child conditions; the correlation is resolved from the
+    /// persistent catalog at execution time.
+    pub via_link: Option<ViaLink>,
     pub filter: Expr,
     /// Per-parent ordering, applied to each parent's child bucket.
     pub order: Option<OrderClause>,
@@ -458,6 +510,19 @@ pub enum Expr {
     /// directly inside a projection field; the planner turns it into a
     /// `NestedProject` plan node and it never reaches expression evaluation.
     NestedQuery(Box<NestedQuery>),
+    /// A scalar link traversal projection value: `o.user.name` or the
+    /// multi-hop `o.user.company.name`. Only valid directly inside a
+    /// projection field on an aliased scan; the planner turns it into a
+    /// `NestedProjectField::Link` and it never reaches expression evaluation.
+    LinkPath {
+        /// The outer scan alias (`o`).
+        outer_alias: String,
+        /// One or more declared to-one link names, in traversal order
+        /// (`["user"]`, or `["user", "company"]` for multi-hop).
+        links: Vec<String>,
+        /// The target column read at the end of the chain (`name`).
+        column: String,
+    },
     /// A JSON path access: `base->seg->seg...`. `base` is restricted at parse
     /// time to `Field`, `QualifiedField`, or (nested) `JsonPath`. Evaluating it
     /// walks the base `Value::Json` document and scalarizes the addressed node
