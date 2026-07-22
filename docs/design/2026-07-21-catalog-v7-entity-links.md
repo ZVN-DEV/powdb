@@ -1,7 +1,6 @@
 # Catalog v7: persisted entity links (relationship traversal)
 
 **Status:** design, pending approval before implementation.
-**Author:** rotation (PM) + powql-lab runs 1-3.
 **Scope:** on-disk catalog format bump v6 -> v7 to persist relationship (link)
 metadata, unlocking PowQL relationship traversal in both directions. This is a
 format change and is treated with the highest rigor: design first, TDD, and a
@@ -11,14 +10,13 @@ format change and is treated with the highest rigor: design first, TDD, and a
 
 ## 1. Why
 
-Three independent powql-lab investigations asked "why PowQL over SQL?" Two
-converged on the same answer: **relationship traversal is the differentiator.**
-Run 1 (nested results) already shipped in v0.18.0. Runs 2-3 prototyped the two
-remaining halves and proved them, but they sit on lab branches because the link
-registry is **in-memory only** and cannot survive a restart or serve a second
+PowQL's differentiator over SQL is **relationship traversal**. Nested results
+(the 1:N read surface) already shipped in v0.18.0. The two remaining halves were
+prototyped and proven behind a feature flag, but the prototype keeps its link
+registry **in-memory only**, so it cannot survive a restart or serve a second
 connection. Catalog v7 gives that metadata a durable home. Nothing about the
-language surface is speculative anymore; this doc is about persisting and
-shipping what the lab validated.
+language surface is speculative; this doc is about persisting and shipping the
+validated behavior.
 
 ### The two read surfaces (already prototyped)
 - **N:1 scalar hop** — `Order as o { o.total, o.user.name }` reads one column
@@ -137,10 +135,10 @@ expression index:
 
 ---
 
-## 5. Query surface (from lab prototypes)
+## 5. Query surface (from the prototype)
 
-Parser/AST work already exists on `powql-lab/scalar-links` and
-`powql-lab/entity-links` and is ported, not re-invented:
+Parser/AST work already exists behind the feature flag and is ported, not
+re-invented:
 
 - **DDL:** `link <name> -> <Target> on <local> = <target>` as a bare declaration
   and as an `alter type` action. Declaring a link validates that both tables and
@@ -156,7 +154,7 @@ Parser/AST work already exists on `powql-lab/scalar-links` and
   through a `ToMany` link, is a clean, pinned error message.
 - **Non-unique scalar hop is an error:** the correctness wedge above.
 
-### Nullability (settled by the lab, restated)
+### Nullability (settled, restated)
 Missing at any hop yields an **empty value; rows never drop.** A `ToOne` hop
 whose local key is NULL, or whose target row is absent, evaluates `o.user.name`
 to Empty (the same Empty our v0.18.2 two-valued filter semantics already treat
@@ -214,12 +212,12 @@ Every item is written failing-first.
 
 1. This design approved.
 2. Storage: v7 format + lazy activation + tests (1-5), no query surface yet.
-3. Query: port lab parser/AST/executor, tests (8-9).
+3. Query: port the prototype parser/AST/executor, tests (8-9).
 4. Durability + backup + sync tests (6-7), migration leg.
 5. Docs: POWQL.md links section, on-disk-format note, README differentiation
    line rewritten around traversal.
 6. Ship as **0.19.0** (minor bump: new format + new language surface), full
    release train + post-publish smoke + migration leg.
 
-Estimated core diff ~440 non-test lines per the lab prototype, plus the storage
+Estimated core diff ~440 non-test lines per the prototype, plus the storage
 format layer and the test matrix above.
