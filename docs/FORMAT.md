@@ -9,7 +9,7 @@ compatibility reader exists.
 
 | Structure | Magic | Current writer | Legacy accepted | Unknown behavior |
 | --- | --- | ---: | ---: | --- |
-| Catalog (`catalog.bin`) | `BCAT` | 5; 6 once the first expression index activates it (since v0.13.0) | 1, 2, 3, 4 (and 5 where v6 was never activated) | reject `unsupported catalog version` |
+| Catalog (`catalog.bin`) | `BCAT` | 5; 6 once the first expression index activates it (since v0.13.0); 7 once the first entity link is declared (since v0.19.0) | 1, 2, 3, 4 (and 5/6 where the newer format was never activated) | reject `unsupported catalog version` |
 | Catalog LSN sidecar (`catalog.lsn`) | none (raw `u64` LE) | n/a | absent (durable LSN reads as 0) | n/a (value-only file) |
 | B+tree index (`*.idx`) | `BIDX` | 1 (unique column indexes), 2 (expression indexes, since v0.13.0), 3 (non-unique column indexes, since v0.16.0) | 1, 2; a non-unique column index found below 3 is rebuilt from the heap on open | reject `unsupported btree version` |
 | Heap file (`*.heap`) | `PHEAP` in page-0 superblock | 2; 3 once the first overflow chain is written (since v0.11.0) | 1 (no superblock, pre-v0.5.0) | reject `unsupported heap format version` |
@@ -65,16 +65,19 @@ it is used by production code.
 
 ## Format version support policy
 
-What the current release (v0.16.0) supports:
+What the current release (v0.19.0) supports:
 
 - **Reads:** every on-disk version listed in the table above, which is every
   version any released PowDB has ever written. No released data directory is
   currently unreadable by the current release.
 - **Writes:** always the current version for anything newly written. Some
   version bumps are activated lazily so that untouched databases stay openable
-  by older binaries: catalog v6 on the first expression index (v0.13.0), heap
-  v3 and row v2 on the first overflow spill (v0.11.0), and the b+tree v3
-  rebuild of pre-v3 non-unique column indexes on first writable open (v0.16.0).
+  by older binaries: catalog v6 on the first expression index (v0.13.0),
+  catalog v7 on the first entity link (v0.19.0), heap v3 and row v2 on the
+  first overflow spill (v0.11.0), and the b+tree v3 rebuild of pre-v3
+  non-unique column indexes on first writable open (v0.16.0). A database that
+  never declares an entity link stays at its current catalog version and opens
+  unchanged on an older binary.
 
 The commitment:
 

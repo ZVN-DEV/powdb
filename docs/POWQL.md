@@ -939,6 +939,111 @@ regroup client-side, or run the PowQL query directly.
 
 ---
 
+## Entity Links (Relationship Traversal)
+
+An **entity link** is named relationship metadata declared once on the schema,
+then traversed by name in queries. It is PowQL's answer to the JOIN you write
+over and over just to follow a foreign key. Links are read-only naming metadata
+over columns that already exist: no new storage, no write-time enforcement.
+
+Links are persisted in the catalog (on-disk format v7). A database that never
+declares a link stays at the older format; the first link declaration activates
+v7 automatically. See [docs/FORMAT.md](FORMAT.md).
+
+### Declaring a link
+
+```
+link <Owner>.<name> -> <Target> on <local_key> = <target_key>
+```
+
+The bare statement names its owner explicitly. `on <local_key> = <target_key>`
+means `Owner.local_key = Target.target_key`.
+
+```
+link Order.user -> User on user_id = id
+link User.orders -> Order on id = user_id
+```
+
+You can also add a link to an existing type with `alter`:
+
+```
+alter Order add link user -> User on user_id = id
+```
+
+Declaring a link validates that both types and both columns exist, and that the
+name does not collide with a column or another link on the owner.
+
+### Cardinality is derived, not declared
+
+PowDB infers whether a link is **to-one** or **to-many** from the target key:
+
+- If `target_key` is **unique** on the target type, the link is **to-one** and
+  is traversed as a **scalar path** (`o.user.name`).
+- Otherwise it is **to-many** and is traversed as a **block**
+  (`u.orders { ... }`).
+
+You do not annotate the cardinality; the schema already knows it.
+
+### Scalar path (to-one)
+
+A to-one link reads a column from the related row inline. Multi-hop is
+supported.
+
+```
+Order as o { o.id, o.total, o.user.name }
+Order as o { o.id, o.user.company.name }     -- multi-hop
+```
+
+Result: one value per row, read through the relationship. In SQL this is a JOIN
+written solely to read one column.
+
+### Block (to-many)
+
+A to-many link returns a native JSON array of shaped child rows per parent,
+exactly like a [nested projection](#nested-projections-shaped-results), but the
+correlation predicate comes from the link instead of being written by hand. The
+block accepts the same per-parent `filter` / `order` / `limit` / `offset`.
+
+```
+User as u {
+  u.name,
+  orders: u.orders order total desc limit 3 { total, status }
+}
+```
+
+A parent with no children yields `[]`.
+
+### Correct by default: a scalar hop never silently fans out
+
+Traversing a **to-many** link as a scalar path is an **error**, not a silent
+row multiplication:
+
+```
+Order as o { o.user.name }
+-- if `user`'s target key is not unique:
+-- Error: link `user` on type `Order` is a to-many link (its target key
+--        `name` is not unique); traverse it with a block
+--        (`user: o.user { ... }`), not a scalar path
+```
+
+The reverse (a block through a to-one link) is likewise a clean error. This is
+the guarantee SQL does not make: an inner join through a non-unique key quietly
+duplicates rows. PowDB refuses.
+
+### Missing values
+
+A missing or NULL key at any hop yields **Empty** (the same Empty that never
+matches a filter comparison); rows are never dropped. A childless to-many parent
+yields `[]`. This avoids SQL's three-valued-logic surprises.
+
+### PowQL Only
+
+Entity links are a native PowQL capability with no SQL spelling. The SQL
+frontend has no equivalent declaration or traversal syntax; use an explicit
+join.
+
+---
+
 ## Set Operations
 
 ### UNION

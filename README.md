@@ -51,8 +51,11 @@ For the concurrency numbers behind the boundary above (single-request cost versu
 | Sort + limit | `SELECT * FROM User ORDER BY age DESC LIMIT 10` | `User order .age desc limit 10` |
 | Aggregate with filter | `SELECT AVG(age) FROM User WHERE city = 'NYC'` | `avg(User filter .city = "NYC" { .age })` |
 | Group + having | `SELECT status, COUNT(name) FROM User GROUP BY status HAVING COUNT(name) > 5` | `User group .status having count(.name) > 5 { .status, n: count(.name) }` |
+| Follow a relationship | `SELECT o.total, u.name FROM Order o JOIN User u ON o.user_id = u.id` | `Order as o { o.total, o.user.name }` (after `link Order.user -> User on user_id = id`) |
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
+
+Two capabilities have no SQL spelling at all, and are where PowQL earns its keep over SQL: **nested projections** (correlated children as a native JSON array, one row per parent) and **entity links** (declare a relationship once, then traverse it by name, with a scalar hop through a non-unique key refused as an error instead of silently multiplying rows).
 
 **Already think in SQL?** Since v0.5.0 PowDB also accepts a supported subset of SQL through a frontend that lowers to the same PowQL plan tree (and shares the plan cache) — see [docs/SQL.md](https://github.com/zvndev/powdb/blob/main/docs/SQL.md). PowQL remains the native, fastest path.
 
@@ -314,6 +317,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](docs/SQL.md))
 - Joins (hash join with compound-`ON` residuals, plus bounded nested-loop fallback)
 - Nested projections (PowQL-only): one row per parent with correlated children as a native JSON array, per-parent order/limit, multi-level nesting ([docs/POWQL.md](docs/POWQL.md#nested-projections-shaped-results))
+- Entity links (PowQL-only): declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name -- scalar `o.user.name` or block `u.orders { ... }`. A scalar hop through a non-unique key is a hard error, never a silent fan-out ([docs/POWQL.md](docs/POWQL.md#entity-links-relationship-traversal))
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
