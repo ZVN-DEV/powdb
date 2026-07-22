@@ -36,6 +36,9 @@ scripts/agent-eval/examples/results.json
 # Local orchestration logs
 ITERATION-LOG.md
 PRODUCT-REVIEW.md
+SPRINT-PLAN.md
+SPRINT-LOG.md
+AUDIT-REPORT.md
 
 # Secrets and credentials
 .env*

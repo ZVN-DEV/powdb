@@ -409,6 +409,9 @@ pub(super) fn eval_expr_mode(
         // Nested sub-queries only appear inside a projection; the planner
         // routes them to `NestedProject`, so they never reach evaluation.
         Expr::NestedQuery(_) => Value::Empty,
+        // Scalar link paths likewise route to `NestedProjectField::Link` and
+        // never reach evaluation.
+        Expr::LinkPath { .. } => Value::Empty,
         Expr::BinaryOp(left, op, right) => {
             let l = eval_expr_mode(left, row, columns, mode);
             let r = eval_expr_mode(right, row, columns, mode);

@@ -113,7 +113,7 @@ A backup directory contains a copy of the database's durable files plus a manife
 
 | File | Contents |
 |---|---|
-| `catalog.bin` | Schema registry (tables, columns, indexes). |
+| `catalog.bin` | Schema registry (tables, columns, indexes, entity links). |
 | `catalog.lsn` | Catalog durability high-water-mark sidecar (8-byte LSN, new in 0.8.0). |
 | `*.heap` | One heap file per table — the row data. |
 | `*.idx` | One index file per B+tree index. |

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.0 - 2026-07-22
+
+- Version-alignment release in lockstep with workspace v0.19.0 (entity links:
+  PowQL relationship traversal, persisted via catalog format v7). No TypeScript
+  API changes; link declaration and traversal are PowQL/SQL-text features that
+  flow through the existing `query`/`querySql` paths.
+
 ## 0.18.2 - 2026-07-21
 
 - Version-alignment release in lockstep with workspace v0.18.2 (engine

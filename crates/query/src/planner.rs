@@ -64,6 +64,13 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         Statement::UpdateQuery(upd) => plan_update(upd),
         Statement::DeleteQuery(del) => plan_delete(del),
         Statement::CreateType(ct) => plan_create_type(ct),
+        Statement::CreateLink(cl) => Ok(PlanNode::CreateLink {
+            owner: cl.owner,
+            name: cl.name,
+            target: cl.target,
+            local_key: cl.local_key,
+            target_key: cl.target_key,
+        }),
         Statement::AlterTable(at) => Ok(PlanNode::AlterTable {
             table: at.table,
             action: at.action,
@@ -110,7 +117,7 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     // a dedicated path so every other query shape plans exactly as before.
     if q.projection.as_ref().is_some_and(|proj| {
         proj.iter()
-            .any(|pf| matches!(pf.expr, Expr::NestedQuery(_)))
+            .any(|pf| matches!(pf.expr, Expr::NestedQuery(_) | Expr::LinkPath { .. }))
     }) {
         return plan_nested_query(q);
     }
@@ -436,9 +443,13 @@ fn resolve_scan_qualifiers(expr: &mut Expr, visible: &str) -> Result<(), PlanErr
             }
             Ok(())
         }
-        // Own-scope subqueries are resolved separately; nested projections
-        // take the dedicated `plan_nested_query` path and never reach here.
-        Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::NestedQuery(_) => Ok(()),
+        // Own-scope subqueries are resolved separately; nested projections and
+        // link paths take the dedicated `plan_nested_query` path and never
+        // reach here.
+        Expr::InSubquery { .. }
+        | Expr::ExistsSubquery { .. }
+        | Expr::NestedQuery(_)
+        | Expr::LinkPath { .. } => Ok(()),
     }
 }
 
@@ -504,6 +515,35 @@ fn plan_nested_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
                 resolve_nested_projection(name, *nested, &parent_alias)
                     .map(|nested| NestedProjectField::Nested(Box::new(nested)))
             }
+            Expr::LinkPath {
+                outer_alias,
+                links,
+                column,
+            } => {
+                if outer_alias != parent_alias {
+                    return Err(PlanError::Semantic(format!(
+                        "link path starts at unknown alias `{outer_alias}`; \
+                         the outer scan is aliased `{parent_alias}`"
+                    )));
+                }
+                let name = pf.alias.unwrap_or_else(|| {
+                    let mut n = outer_alias.clone();
+                    for link in &links {
+                        n.push('.');
+                        n.push_str(link);
+                    }
+                    n.push('.');
+                    n.push_str(&column);
+                    n
+                });
+                Ok(NestedProjectField::Link(Box::new(ScalarLinkField {
+                    name,
+                    outer_alias,
+                    links,
+                    column,
+                    resolved: None,
+                })))
+            }
             expr => Ok(NestedProjectField::Plain(ProjectField {
                 alias: pf.alias,
                 expr,
@@ -538,61 +578,89 @@ fn resolve_nested_projection_inner(
     parent_alias: &str,
     qualify_parent_key: bool,
 ) -> Result<NestedProjection, PlanError> {
+    // A block link traversal (`orders: u.orders { ... }`) has no user-written
+    // correlation predicate: its correlation columns and child table live in
+    // the persistent catalog and are resolved at execution time. The planner
+    // stays catalog-pure: it treats the whole filter as residual and leaves
+    // the correlation columns and child table as placeholders.
+    let via_link = nested.via_link.clone();
     let mut conjuncts = Vec::new();
     split_and_chain(nested.filter, &mut conjuncts);
-
-    // A correlation conjunct is `child.col = parent.col` (either side order).
-    let correlation_of = |expr: &Expr| -> Option<(String, String)> {
-        let Expr::BinaryOp(left, BinOp::Eq, right) = expr else {
-            return None;
-        };
-        let side = |expr: &Expr| match expr {
-            Expr::QualifiedField { qualifier, field } => Some((qualifier.clone(), field.clone())),
-            _ => None,
-        };
-        let ((lq, lf), (rq, rf)) = (side(left)?, side(right)?);
-        if lq == nested.alias && rq == parent_alias {
-            Some((lf, rf))
-        } else if rq == nested.alias && lq == parent_alias {
-            Some((rf, lf))
-        } else {
-            None
-        }
-    };
-    let mut correlation: Option<(String, String)> = None;
     let mut residual: Option<Expr> = None;
-    for conjunct in conjuncts {
-        match correlation_of(&conjunct) {
-            Some(keys) if correlation.is_none() => correlation = Some(keys),
-            Some(_) => {
-                return Err(PlanError::Semantic(format!(
-                    "nested projection `{name}` links `{child}` to `{parent}` more than \
-                     once; exactly one correlation predicate \
-                     ({child}.<col> = {parent}.<col>) is supported",
-                    child = nested.alias,
-                    parent = parent_alias,
-                )))
+
+    let (child_key, parent_key) = if via_link.is_some() {
+        for conjunct in conjuncts {
+            // A bare `true` placeholder (no filter was written) is not residual.
+            if matches!(conjunct, Expr::Literal(Literal::Bool(true))) {
+                continue;
             }
-            None => {
-                let rewritten =
-                    rewrite_residual_condition(conjunct, &name, &nested.alias, parent_alias)?;
-                residual = Some(match residual {
-                    Some(existing) => {
-                        Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
-                    }
-                    None => rewritten,
-                });
+            let rewritten =
+                rewrite_residual_condition(conjunct, &name, &nested.alias, parent_alias)?;
+            residual = Some(match residual {
+                Some(existing) => {
+                    Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                }
+                None => rewritten,
+            });
+        }
+        // Placeholders: filled from the catalog at execution.
+        (String::new(), String::new())
+    } else {
+        // A correlation conjunct is `child.col = parent.col` (either side order).
+        let correlation_of = |expr: &Expr| -> Option<(String, String)> {
+            let Expr::BinaryOp(left, BinOp::Eq, right) = expr else {
+                return None;
+            };
+            let side = |expr: &Expr| match expr {
+                Expr::QualifiedField { qualifier, field } => {
+                    Some((qualifier.clone(), field.clone()))
+                }
+                _ => None,
+            };
+            let ((lq, lf), (rq, rf)) = (side(left)?, side(right)?);
+            if lq == nested.alias && rq == parent_alias {
+                Some((lf, rf))
+            } else if rq == nested.alias && lq == parent_alias {
+                Some((rf, lf))
+            } else {
+                None
+            }
+        };
+        let mut correlation: Option<(String, String)> = None;
+        for conjunct in conjuncts {
+            match correlation_of(&conjunct) {
+                Some(keys) if correlation.is_none() => correlation = Some(keys),
+                Some(_) => {
+                    return Err(PlanError::Semantic(format!(
+                        "nested projection `{name}` links `{child}` to `{parent}` more than \
+                         once; exactly one correlation predicate \
+                         ({child}.<col> = {parent}.<col>) is supported",
+                        child = nested.alias,
+                        parent = parent_alias,
+                    )))
+                }
+                None => {
+                    let rewritten =
+                        rewrite_residual_condition(conjunct, &name, &nested.alias, parent_alias)?;
+                    residual = Some(match residual {
+                        Some(existing) => {
+                            Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
+                        }
+                        None => rewritten,
+                    });
+                }
             }
         }
-    }
-    let Some((child_key, parent_key)) = correlation else {
-        return Err(PlanError::Semantic(format!(
-            "nested projection `{name}` requires an equi-correlation predicate linking \
-             `{child}` to the outer query ({child}.<col> = {parent}.<col>) somewhere in \
-             its filter",
-            child = nested.alias,
-            parent = parent_alias,
-        )));
+        let Some(correlation) = correlation else {
+            return Err(PlanError::Semantic(format!(
+                "nested projection `{name}` requires an equi-correlation predicate linking \
+                 `{child}` to the outer query ({child}.<col> = {parent}.<col>) somewhere in \
+                 its filter",
+                child = nested.alias,
+                parent = parent_alias,
+            )));
+        };
+        correlation
     };
     let order = nested
         .order
@@ -654,13 +722,20 @@ fn resolve_nested_projection_inner(
             Ok(NestedField::Scalar { key, column })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
+    let is_via_link = via_link.is_some();
     Ok(NestedProjection {
         name,
         table: nested.source,
+        via_link,
         alias: nested.alias,
         parent_alias: parent_alias.to_string(),
         child_key,
-        parent_key: if qualify_parent_key {
+        // A link traversal's parent key is a placeholder resolved (and
+        // qualified) at execution; only an explicit correlation is qualified
+        // here.
+        parent_key: if is_via_link {
+            parent_key
+        } else if qualify_parent_key {
             format!("{parent_alias}.{parent_key}")
         } else {
             parent_key
@@ -769,6 +844,10 @@ fn rewrite_residual_condition(
         ))),
         Expr::NestedQuery(_) => Err(PlanError::Semantic(format!(
             "nested projection `{name}` filter cannot contain another nested projection"
+        ))),
+        Expr::LinkPath { .. } => Err(PlanError::Semantic(format!(
+            "nested projection `{name}` filter cannot contain a link traversal; \
+             link paths are only valid as projection fields"
         ))),
     }
 }
@@ -1675,6 +1754,10 @@ fn collect_expression_sources(
         }
         Expr::FunctionCall(_, inner, _) => {
             collect_expression_sources(inner, qualified, has_unqualified);
+        }
+        // A link path reads through the outer alias it starts from.
+        Expr::LinkPath { outer_alias, .. } => {
+            qualified.insert(outer_alias.clone());
         }
         Expr::ExistsSubquery { .. }
         | Expr::Field(_)

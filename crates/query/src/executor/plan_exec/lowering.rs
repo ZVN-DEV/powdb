@@ -729,6 +729,21 @@ fn explain_join_strategy(
 fn format_nested_projection(nested: &NestedProjection, depth: usize, out: &mut String) {
     use std::fmt::Write;
     let indent = "  ".repeat(depth);
+    // An unresolved block link traversal has placeholder correlation columns
+    // (EXPLAIN never resolves against the catalog); show the link instead.
+    if let Some(via) = &nested.via_link {
+        let _ = writeln!(
+            out,
+            "{indent}nested {}: via link {}.{} (unresolved)",
+            nested.name, via.outer_alias, via.link_name
+        );
+        for field in &nested.fields {
+            if let NestedField::Nested(inner) = field {
+                format_nested_projection(inner, depth + 1, out);
+            }
+        }
+        return;
+    }
     let parent = if nested.parent_key.contains('.') {
         nested.parent_key.clone()
     } else {
@@ -891,12 +906,26 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                         None => format!("{:?}", field.expr),
                     },
                     NestedProjectField::Nested(nested) => nested.name.clone(),
+                    NestedProjectField::Link(link) => link.name.clone(),
                 })
                 .collect();
             let mut out = format!("{indent}NestedProject fields=[{}]\n", names.join(", "));
             for f in fields {
-                if let NestedProjectField::Nested(nested) = f {
-                    format_nested_projection(nested, depth + 1, &mut out);
+                match f {
+                    NestedProjectField::Nested(nested) => {
+                        format_nested_projection(nested, depth + 1, &mut out);
+                    }
+                    NestedProjectField::Link(link) => {
+                        let pad = "  ".repeat(depth + 1);
+                        out.push_str(&format!(
+                            "{pad}link {}: {}.{}.{} (unresolved scalar link path)\n",
+                            link.name,
+                            link.outer_alias,
+                            link.links.join("."),
+                            link.column
+                        ));
+                    }
+                    NestedProjectField::Plain(_) => {}
                 }
             }
             out.push_str(&format_plan_tree(catalog, input, depth + 1));
@@ -1060,6 +1089,15 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                 })
                 .collect();
             format!("{indent}CreateTable name={name} fields=[{}]", fs.join(", "))
+        }
+        PlanNode::CreateLink {
+            owner,
+            name,
+            target,
+            local_key,
+            target_key,
+        } => {
+            format!("{indent}CreateLink {owner}.{name} -> {target} on {local_key} = {target_key}")
         }
         PlanNode::AlterTable { table, action } => {
             format!("{indent}AlterTable table={table} action={action:?}")

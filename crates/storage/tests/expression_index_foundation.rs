@@ -1,6 +1,7 @@
 use powdb_storage::btree::{BTree, EXPRESSION_BTREE_VERSION, LEGACY_BTREE_VERSION};
 use powdb_storage::catalog::{
-    expression_index_file_name, Catalog, IndexKeySource, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+    expression_index_file_name, Catalog, IndexKeySource, EXPRESSION_INDEX_CATALOG_VERSION,
+    LEGACY_CATALOG_VERSION,
 };
 use powdb_storage::pj1::parse_json_text;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
@@ -153,7 +154,10 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
         .create_expression_index_metadata("Doc", 1, path.canonical_text(), path.clone(), false)
         .unwrap();
     assert_eq!(first, 1);
-    assert_eq!(catalog.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        catalog.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     assert_eq!(catalog.next_index_id(), 2);
     assert!(first_file.exists());
     assert!(dir.path().join("Doc_id.idx").exists());
@@ -174,7 +178,10 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
     std::mem::forget(catalog);
 
     let mut reopened = Catalog::open(dir.path()).unwrap();
-    assert_eq!(reopened.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        reopened.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     assert_eq!(reopened.next_index_id(), 2);
     let metadata = reopened.index_metadata("Doc").unwrap();
     assert!(metadata.iter().any(|index| matches!(
@@ -208,7 +215,10 @@ fn catalog_v6_activates_lazily_and_ids_survive_crash_reopen() {
     );
 
     reopened.create_table(schema("Other")).unwrap();
-    assert_eq!(reopened.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        reopened.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     let second_path =
         StoredJsonPathV1::new("data", vec![StoredJsonPathSegmentV1::Key("score".into())]);
     let second = reopened
@@ -372,7 +382,10 @@ fn expression_index_files_follow_root_and_table_lifecycle_without_reusing_ids() 
     drop(catalog);
 
     let reopened = Catalog::open(dir.path()).unwrap();
-    assert_eq!(reopened.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        reopened.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     assert_eq!(reopened.next_index_id(), 3);
     assert!(reopened
         .expression_index_metadata("Doc")

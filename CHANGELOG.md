@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.19.0] - 2026-07-22
+
+### Added
+
+- **Entity links (PowQL relationship traversal).** Declare a relationship once
+  on the schema and traverse it by name, instead of writing the same JOIN
+  repeatedly.
+  - DDL: `link Order.user -> User on user_id = id` (bare, owner-qualified) and
+    `alter Order add link user -> User on user_id = id`. Declaring validates
+    that both types and both columns exist and that the name does not collide
+    with a column or another link on the owner.
+  - Cardinality is **derived**, not declared: a unique target key makes the link
+    to-one (traversed as a scalar path `o.user.name`, multi-hop supported);
+    otherwise it is to-many (traversed as a block `u.orders { ... }` that
+    desugars onto nested projections, with per-parent filter/order/limit).
+  - **Correct by default:** a scalar hop through a non-unique key is a hard
+    error, never a silent row fan-out. A block through a to-one link and a
+    scalar path through a to-many link are clean, pinned errors. A missing or
+    NULL key at any hop yields Empty and never drops the parent row; a childless
+    to-many parent yields `[]`.
+  - Links are read-only naming metadata over existing columns: no new storage,
+    no write-time enforcement. The planner stays pure; links resolve at
+    execution time. Link-bearing plans are never cached, so no stale-plan or
+    collision hazard.
+  - This is a native PowQL capability with no SQL-frontend equivalent.
+
+### Changed
+
+- **Catalog on-disk format v6 -> v7** to persist entity-link metadata. The bump
+  is **lazily activated**: a database that never declares a link stays at its
+  current catalog version and opens unchanged on an older binary. The first
+  `link` declaration activates v7 atomically (temp-file + rename, with rollback
+  on failure). A pre-v7 catalog reads as a valid v7 catalog with zero links; an
+  old binary opening a v7 catalog fails loudly with `unsupported catalog
+  version: 7`. Full and incremental backup/restore carry links, and links
+  survive a crash via WAL replay. See `docs/FORMAT.md` and `docs/POWQL.md`.
+
 ## [0.18.2] - 2026-07-21
 
 ### Fixed
@@ -27,6 +64,8 @@ Nothing yet.
   `>=`); presence is required for a row to match, matching the documented and
   SQL-frontend two-valued behavior. JOIN `ON` equality still treats two absent
   keys as equal.
+
+## [0.18.1] - 2026-07-21
 
 ### Fixed
 

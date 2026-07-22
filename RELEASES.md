@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.18.2.** Correctness patch: two P0s from the audit rotation. PowQL single-table aliased qualified refs (`Widget as w filter w.id > 2`) failed with an unknown-qualifier error instead of resolving to the table; and filter comparisons against a missing/NULL value used a total order in which `Empty` sorted first, so a missing value could wrongly match `!=` and ordering comparisons. Missing values now never satisfy a filter comparison, matching the documented two-valued semantics.
+> **Current release: v0.19.0.** Entity links (PowQL relationship traversal). Declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name: scalar hop `o.user.name` (to-one, multi-hop) or block `u.orders { ... }` (to-many, on the nested-projection machinery). Cardinality is derived from target-key uniqueness; a scalar hop through a non-unique key is a hard error, never a silent fan-out. Persisted via a lazily-activated catalog format bump v6 -> v7: a database that never declares a link stays at its current version and opens unchanged on an older binary. PowQL-only; no SQL-frontend equivalent.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

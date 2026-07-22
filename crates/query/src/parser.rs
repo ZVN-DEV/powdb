@@ -361,6 +361,7 @@ impl Parser {
             Token::Insert => self.parse_insert(),
             Token::Upsert => self.parse_upsert(),
             Token::Type => self.parse_create_type(),
+            Token::Link => self.parse_create_link(),
             Token::Alter => self.parse_alter_table(),
             Token::Drop => self.parse_drop_or_drop_view(),
             Token::Materialized => self.parse_create_view(),
@@ -841,6 +842,16 @@ impl Parser {
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
                 {
                     Expr::NestedQuery(Box::new(self.parse_nested_query()?))
+                } else if self.at_link_traversal() {
+                    // `orders: u.orders [filter ...] { ... }`: block link
+                    // traversal, sugar over the nested-projection machinery.
+                    // Distinguished from an ordinary `x: u.name` projection by
+                    // the `{`/clause that follows the `alias.ident` (a plain
+                    // qualified field is followed by `,` or `}`).
+                    Expr::NestedQuery(Box::new(self.parse_link_traversal()?))
+                } else if self.at_scalar_link_path() {
+                    // `buyer: o.user.name`: scalar link traversal.
+                    self.parse_scalar_link_path()?
                 } else {
                     self.parse_expr()?
                 };
@@ -858,7 +869,13 @@ impl Parser {
                             .into(),
                     });
                 }
-                let expr = self.parse_expr()?;
+                let expr = if self.at_scalar_link_path() {
+                    // `o.user.name`: scalar link traversal, named by its
+                    // dotted spelling when no alias is written.
+                    self.parse_scalar_link_path()?
+                } else {
+                    self.parse_expr()?
+                };
                 fields.push(ProjectionField { alias: None, expr });
             }
             if *self.peek() == Token::Comma {
@@ -867,6 +884,180 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(fields)
+    }
+
+    /// Conservative lookahead for a block link-traversal projection value:
+    /// `<Ident>.<DotIdent>` immediately followed by `{` or a
+    /// `filter`/`order`/`limit`/`offset` clause. An ordinary qualified-field
+    /// projection (`x: u.name`) is instead followed by `,` or `}`, so it never
+    /// matches here.
+    fn at_link_traversal(&self) -> bool {
+        matches!(self.peek(), Token::Ident(_))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::DotIdent(_)))
+            && matches!(
+                self.tokens.get(self.pos + 2),
+                Some(Token::LBrace | Token::Filter | Token::Order | Token::Limit | Token::Offset)
+            )
+    }
+
+    /// Lookahead for a scalar link-traversal projection value:
+    /// `<Ident>.<DotIdent>.<DotIdent>...`, i.e. three or more dotted parts.
+    /// A plain qualified field (`o.total`) has exactly two parts and never
+    /// matches; a block traversal (`u.orders { ... }`) is caught first by
+    /// `at_link_traversal` (its second part is followed by `{` or a clause,
+    /// never by another `.ident`).
+    fn at_scalar_link_path(&self) -> bool {
+        matches!(self.peek(), Token::Ident(_))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::DotIdent(_)))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::DotIdent(_)))
+    }
+
+    /// Parse a scalar link traversal path: `o.user.name` or
+    /// `o.user.company.name`. All parts but the last are declared to-one link
+    /// names (resolved from the persistent catalog at execution time); the
+    /// last is the target column to read. Only valid as a projection field
+    /// value.
+    fn parse_scalar_link_path(&mut self) -> Result<Expr, ParseError> {
+        let outer_alias = match self.advance() {
+            Token::Ident(n) => n,
+            t => return Err(self.named_ident_error("link path outer alias", &t)),
+        };
+        let mut parts = Vec::new();
+        while let Some(Token::DotIdent(_)) = self.tokens.get(self.pos) {
+            match self.advance() {
+                Token::DotIdent(n) => parts.push(n),
+                _ => unreachable!("peeked DotIdent"),
+            }
+        }
+        debug_assert!(parts.len() >= 2, "guarded by at_scalar_link_path");
+        let column = parts.pop().expect("at least two parts");
+        Ok(Expr::LinkPath {
+            outer_alias,
+            links: parts,
+            column,
+        })
+    }
+
+    /// Parse a block link traversal projection value:
+    /// `<outer_alias>.<link_name> [filter <conds>] [order ...] [limit N]
+    /// [offset M] { <bare child fields> }`. Desugars to a [`NestedQuery`]
+    /// carrying a [`ViaLink`]: the child source table and correlation columns
+    /// are unknown here (they live in the persistent catalog), so `source` is a
+    /// placeholder, the synthetic child alias is the link name itself, and only
+    /// the user's residual conditions land in `filter`. Bare child columns in
+    /// the block, filter, and order are qualified with the synthetic alias so
+    /// downstream planning matches the explicit correlated spelling.
+    fn parse_link_traversal(&mut self) -> Result<NestedQuery, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+        let result = self.parse_link_traversal_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_link_traversal_inner(&mut self) -> Result<NestedQuery, ParseError> {
+        let outer_alias = match self.advance() {
+            Token::Ident(n) => n,
+            t => return Err(self.named_ident_error("link outer alias", &t)),
+        };
+        let link_name = match self.advance() {
+            Token::DotIdent(n) => n,
+            t => {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "link name".into(),
+                    got: t.display_name(),
+                })
+            }
+        };
+        // The synthetic child alias is the link name itself; bare child
+        // references are qualified with it below.
+        let child_alias = link_name.clone();
+
+        // Optional residual filter, then order/limit/offset, matching the
+        // explicit nested-query grammar. No correlation predicate is written
+        // by the user: the whole filter is residual.
+        let mut residual = None;
+        if *self.peek() == Token::Filter {
+            self.advance();
+            residual = Some(qualify_bare_fields(self.parse_expr()?, &child_alias));
+        }
+        let mut order = None;
+        let mut limit = None;
+        let mut offset = None;
+        let mut offset_before_limit = false;
+        loop {
+            match self.peek() {
+                Token::Order => {
+                    self.advance();
+                    let mut clause = self.parse_order()?;
+                    for key in &mut clause.keys {
+                        key.expr = qualify_bare_fields(
+                            std::mem::replace(&mut key.expr, Expr::Null),
+                            &child_alias,
+                        );
+                    }
+                    order = Some(clause);
+                }
+                Token::Limit => {
+                    self.advance();
+                    if offset.is_some() {
+                        offset_before_limit = true;
+                    }
+                    limit = Some(self.parse_expr()?);
+                }
+                Token::Offset => {
+                    self.advance();
+                    offset = Some(self.parse_expr()?);
+                }
+                _ => break,
+            }
+        }
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while !matches!(self.peek(), Token::RBrace | Token::Eof) {
+            let alias = if matches!(self.peek(), Token::Ident(_))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Colon))
+            {
+                let alias = self.expect_named_ident("field alias")?;
+                self.advance(); // consume ':'
+                Some(alias)
+            } else {
+                None
+            };
+            let expr = qualify_bare_fields(self.parse_expr()?, &child_alias);
+            fields.push(ProjectionField { alias, expr });
+            if *self.peek() == Token::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        if fields.is_empty() {
+            return Err(ParseError::Syntax {
+                message: "link traversal requires at least one field".into(),
+            });
+        }
+        Ok(NestedQuery {
+            // Placeholder source: resolved from the catalog at execution.
+            source: String::new(),
+            alias: child_alias,
+            via_link: Some(ViaLink {
+                outer_alias,
+                link_name,
+            }),
+            // A `true` residual is equivalent to no residual; supply `true`
+            // when the user wrote no filter to keep the planner simple.
+            filter: residual.unwrap_or(Expr::Literal(Literal::Bool(true))),
+            order,
+            limit,
+            offset,
+            offset_before_limit,
+            fields,
+        })
     }
 
     /// Parse a nested sub-query projection value:
@@ -958,6 +1149,7 @@ impl Parser {
         Ok(NestedQuery {
             source,
             alias,
+            via_link: None,
             filter,
             order,
             limit,
@@ -1819,6 +2011,54 @@ impl Parser {
 
     /// `alter <Table> add [column] [required] <name>: <type>`
     /// `alter <Table> drop [column] <name>`
+    /// Parse a bare link declaration:
+    /// `link <Owner>.<name> -> <Target> on <local> = <target>`. Called with
+    /// the cursor on the leading `link` token. Lowers to
+    /// `Statement::CreateLink`, which the executor routes to
+    /// `Catalog::create_link`.
+    fn parse_create_link(&mut self) -> Result<Statement, ParseError> {
+        self.expect(&Token::Link)?;
+        let owner = self.expect_named_ident("link owner type")?;
+        let name = match self.advance() {
+            Token::DotIdent(n) => n,
+            t => {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "`.<name>` after the owner type (link <Owner>.<name> -> ...)".into(),
+                    got: t.display_name(),
+                })
+            }
+        };
+        let (target, local_key, target_key) = self.parse_link_tail()?;
+        Ok(Statement::CreateLink(CreateLinkExpr {
+            owner,
+            name,
+            target,
+            local_key,
+            target_key,
+        }))
+    }
+
+    /// Parse the shared tail of a link declaration after its name:
+    /// `-> <Target> on <local> = <target>`. Returns `(target, local, target)`.
+    fn parse_link_tail(&mut self) -> Result<(String, String, String), ParseError> {
+        self.expect(&Token::Arrow)?;
+        let target = self.expect_named_ident("link target type")?;
+        self.expect(&Token::On)?;
+        let local_key = self.parse_link_column("link local key")?;
+        self.expect(&Token::Eq)?;
+        let target_key = self.parse_link_column("link target key")?;
+        Ok((target, local_key, target_key))
+    }
+
+    /// Read a column name written either bare (`user_id`) or dot-prefixed
+    /// (`.user_id`), as used in a link's correlation clause.
+    fn parse_link_column(&mut self, context: &str) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(n) | Token::DotIdent(n) => Ok(n),
+            t => Err(self.named_ident_error(context, &t)),
+        }
+    }
+
     fn parse_alter_table(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Alter)?;
         let table = match self.advance() {
@@ -1856,6 +2096,21 @@ impl Parser {
                         action: AlterAction::AddUnique {
                             target,
                             if_not_exists,
+                        },
+                    }));
+                }
+                // `alter <Owner> add link <name> -> <Target> on <local> = <target>`
+                if *self.peek() == Token::Link {
+                    self.advance();
+                    let name = self.expect_named_ident("link name")?;
+                    let (target, local_key, target_key) = self.parse_link_tail()?;
+                    return Ok(Statement::AlterTable(AlterTableExpr {
+                        table,
+                        action: AlterAction::AddLink {
+                            name,
+                            target,
+                            local_key,
+                            target_key,
                         },
                     }));
                 }
@@ -2218,6 +2473,57 @@ impl Parser {
                 got: t.display_name(),
             }),
         }
+    }
+}
+
+/// Rewrite every bare `Expr::Field(f)` in `expr` into
+/// `Expr::QualifiedField { qualifier: alias, field: f }`, so a block link
+/// traversal's bare child columns (`total`) match the qualified spelling
+/// (`o.total`) the planner expects. Descends through operators but stops at a
+/// nested query (its own scope owns its qualification) and leaves already
+/// qualified references untouched.
+fn qualify_bare_fields(expr: Expr, alias: &str) -> Expr {
+    let recur = |e: Expr| Box::new(qualify_bare_fields(e, alias));
+    match expr {
+        Expr::Field(field) => Expr::QualifiedField {
+            qualifier: alias.to_string(),
+            field,
+        },
+        Expr::BinaryOp(l, op, r) => Expr::BinaryOp(recur(*l), op, recur(*r)),
+        Expr::UnaryOp(op, inner) => Expr::UnaryOp(op, recur(*inner)),
+        Expr::Coalesce(l, r) => Expr::Coalesce(recur(*l), recur(*r)),
+        Expr::Cast(inner, ty) => Expr::Cast(recur(*inner), ty),
+        Expr::ScalarFunc(func, args) => Expr::ScalarFunc(
+            func,
+            args.into_iter()
+                .map(|a| qualify_bare_fields(a, alias))
+                .collect(),
+        ),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: recur(*expr),
+            list: list
+                .into_iter()
+                .map(|a| qualify_bare_fields(a, alias))
+                .collect(),
+            negated,
+        },
+        Expr::Case { whens, else_expr } => Expr::Case {
+            whens: whens
+                .into_iter()
+                .map(|(c, r)| (recur(*c), recur(*r)))
+                .collect(),
+            else_expr: else_expr.map(|e| recur(*e)),
+        },
+        Expr::JsonPath { base, segments } => Expr::JsonPath {
+            base: recur(*base),
+            segments,
+        },
+        // Leaves and cross-scope nodes are left as-is.
+        other => other,
     }
 }
 
