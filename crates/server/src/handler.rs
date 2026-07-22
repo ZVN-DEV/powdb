@@ -4604,7 +4604,7 @@ mod tests {
 
     #[test]
     fn activated_database_expects_v6_and_rejects_v5_replica() {
-        use powdb_storage::catalog::{CATALOG_VERSION, LEGACY_CATALOG_VERSION};
+        use powdb_storage::catalog::{EXPRESSION_INDEX_CATALOG_VERSION, LEGACY_CATALOG_VERSION};
 
         let dir = tempfile::tempdir().unwrap();
         let mut engine = Engine::new(dir.path()).unwrap();
@@ -4618,7 +4618,10 @@ mod tests {
         engine
             .execute_powql("alter Doc add index (.data->score)")
             .unwrap();
-        assert_eq!(engine.catalog().active_catalog_version(), CATALOG_VERSION);
+        assert_eq!(
+            engine.catalog().active_catalog_version(),
+            EXPRESSION_INDEX_CATALOG_VERSION
+        );
         let remote_lsn = seed_pullable_replica(&mut engine);
 
         let engine = Arc::new(RwLock::new(engine));
@@ -4640,7 +4643,7 @@ mod tests {
         }
 
         // A v6-capable replica is accepted.
-        let pull = pull_request_with_catalog_version(CATALOG_VERSION);
+        let pull = pull_request_with_catalog_version(EXPRESSION_INDEX_CATALOG_VERSION);
         match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
             Message::SyncPullResult { units, .. } => {
                 assert_eq!(units.len() as u64, remote_lsn);

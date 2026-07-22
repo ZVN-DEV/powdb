@@ -1,6 +1,6 @@
 use powdb_backup::{ChangedFile, IncrementManifest};
 use powdb_storage::catalog::{
-    expression_index_file_name, Catalog, CATALOG_VERSION, LEGACY_CATALOG_VERSION,
+    expression_index_file_name, Catalog, EXPRESSION_INDEX_CATALOG_VERSION, LEGACY_CATALOG_VERSION,
 };
 use powdb_storage::page::PAGE_SIZE;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
@@ -131,13 +131,13 @@ fn v6_full_restore_preserves_id_named_expression_index_as_opaque_file() {
     );
 
     let manifest = powdb_backup::full_backup(&mut catalog, backup.path()).unwrap();
-    assert_eq!(manifest.catalog_version, CATALOG_VERSION);
+    assert_eq!(manifest.catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
     assert!(manifest.files.iter().any(|file| file.name == index_name));
     drop(catalog);
 
     powdb_backup::restore(backup.path(), restored.path()).unwrap();
     let restored_catalog = Catalog::open(restored.path()).unwrap();
-    assert_eq!(restored_catalog.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(restored_catalog.active_catalog_version(), EXPRESSION_INDEX_CATALOG_VERSION);
     let metadata = restored_catalog
         .expression_index_metadata("Document")
         .unwrap();
@@ -178,7 +178,7 @@ fn v5_base_to_v6_increment_copies_aligned_bidx_whole_and_restores_activation() {
     );
 
     let inc = powdb_backup::incremental_backup(&mut catalog, &base, increment.path()).unwrap();
-    assert_eq!(inc.catalog_version, CATALOG_VERSION);
+    assert_eq!(inc.catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
     assert!(inc.changed.iter().any(|changed| matches!(
         changed,
         ChangedFile::Whole { name, .. } if name == &index_name
@@ -191,7 +191,7 @@ fn v5_base_to_v6_increment_copies_aligned_bidx_whole_and_restores_activation() {
 
     powdb_backup::restore_chain(full.path(), &[increment.path()], restored.path()).unwrap();
     let restored_catalog = Catalog::open(restored.path()).unwrap();
-    assert_eq!(restored_catalog.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(restored_catalog.active_catalog_version(), EXPRESSION_INDEX_CATALOG_VERSION);
     assert_eq!(
         restored_catalog
             .expression_index_metadata("Document")
@@ -291,8 +291,8 @@ fn sync_snapshot_metadata_uses_the_active_v6_catalog_version() {
     powdb_sync::open_or_create_identity(source.path()).unwrap();
 
     let manifest = powdb_backup::full_backup(&mut catalog, backup.path()).unwrap();
-    assert_eq!(manifest.catalog_version, CATALOG_VERSION);
-    assert_eq!(manifest.sync.unwrap().catalog_version, CATALOG_VERSION);
+    assert_eq!(manifest.catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
+    assert_eq!(manifest.sync.unwrap().catalog_version, EXPRESSION_INDEX_CATALOG_VERSION);
 }
 
 #[test]
