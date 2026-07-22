@@ -104,6 +104,42 @@ fn link_survives_simulated_crash_before_checkpoint() {
 }
 
 #[test]
+fn link_and_rows_survive_simulated_crash_before_checkpoint() {
+    // Design doc section 6, item 6 (storage-layer half of the real-binary
+    // `kill -9` smoke): a link declared AND rows inserted with NO clean
+    // checkpoint must both recover on reopen. The sibling
+    // `link_survives_simulated_crash_before_checkpoint` deliberately asserts
+    // only the link and hands row durability to the WAL suite; this test closes
+    // that gap by asserting both halves recover together across one crash.
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = build(dir.path());
+    // Declaring the link persists catalog.bin at v7 through its own activation
+    // fsync + rename, independent of any heap checkpoint.
+    catalog.create_link(user_link()).unwrap();
+    // Insert rows after activation so they live only in the WAL + hot-page
+    // cache; the crash must replay them onto the freshly reopened heap.
+    catalog
+        .insert("User", &vec![Value::Int(1), Value::Str("Ada".into())])
+        .unwrap();
+    catalog.insert("Order", &vec![Value::Int(1)]).unwrap();
+    catalog.insert("Order", &vec![Value::Int(1)]).unwrap();
+    // Flush the WAL but take NO checkpoint, then simulate a crash by skipping
+    // Drop so the hot-page cache holding the rows is lost and recovery runs.
+    catalog.sync_wal().unwrap();
+    std::mem::forget(catalog);
+
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(reopened.active_catalog_version(), CATALOG_VERSION);
+    // The link recovers from catalog.bin.
+    let link = reopened.link("Order", "user").unwrap();
+    assert_eq!(link.kind, LinkKind::ToOne);
+    assert_eq!(&link.target_type, "User");
+    // The rows recover via WAL replay.
+    assert_eq!(row_count(&reopened, "User"), 1);
+    assert_eq!(row_count(&reopened, "Order"), 2);
+}
+
+#[test]
 fn multiple_links_round_trip_in_declaration_order() {
     let dir = tempfile::tempdir().unwrap();
     let mut catalog = build(dir.path());
