@@ -2,6 +2,7 @@
 
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
+use powdb_storage::catalog::{LinkDef, LinkKind};
 use powdb_storage::row::{decode_row, RowLayout};
 use powdb_storage::types::*;
 use std::ops::ControlFlow;
@@ -1468,6 +1469,22 @@ impl Engine {
             }
 
             PlanNode::NestedProject { input, fields } => {
+                // Resolve link traversals against the persistent catalog before
+                // anything else, so child tables are concrete for the
+                // dirty-view refresh and the assembly below.
+                let resolved;
+                let fields: &[NestedProjectField] = if nested_fields_have_via_link(fields) {
+                    let outer = scan_source_table(input).ok_or_else(|| {
+                        QueryError::Execution(
+                            "link traversal requires a plain aliased table scan as its parent"
+                                .into(),
+                        )
+                    })?;
+                    resolved = self.resolve_nested_via_links(fields, outer)?;
+                    &resolved
+                } else {
+                    fields
+                };
                 // Auto-refresh dirty materialized views among the child
                 // tables (at every nesting level) before the read-only
                 // assembly runs.
@@ -1696,6 +1713,19 @@ impl Engine {
                 Ok(QueryResult::Created(name.clone()))
             }
 
+            PlanNode::CreateLink {
+                owner,
+                name,
+                target,
+                local_key,
+                target_key,
+            } => {
+                self.create_link_from_parts(owner, name, target, local_key, target_key)?;
+                Ok(QueryResult::Executed {
+                    message: format!("link '{name}' added to '{owner}'"),
+                })
+            }
+
             PlanNode::AlterTable { table, action } => match action {
                 AlterAction::AddColumn {
                     name,
@@ -1912,6 +1942,17 @@ impl Engine {
                             "expression index {} on '{}' dropped",
                             existing.index_id, table
                         ),
+                    })
+                }
+                AlterAction::AddLink {
+                    name,
+                    target,
+                    local_key,
+                    target_key,
+                } => {
+                    self.create_link_from_parts(table, name, target, local_key, target_key)?;
+                    Ok(QueryResult::Executed {
+                        message: format!("link '{name}' added to '{table}'"),
                     })
                 }
             },
@@ -2425,6 +2466,242 @@ impl Engine {
         }
     }
 
+    /// Route a parsed link declaration to the persistent catalog's
+    /// `create_link`, which validates the tables/columns and derives the
+    /// cardinality from the target key's uniqueness. The `on <local> =
+    /// <target>` clause means "the owner's `local_key` equals the target's
+    /// `target_key`". A caller-supplied `kind` is ignored by the catalog, so
+    /// we pass a placeholder.
+    fn create_link_from_parts(
+        &mut self,
+        owner: &str,
+        name: &str,
+        target: &str,
+        local_key: &str,
+        target_key: &str,
+    ) -> Result<(), QueryError> {
+        self.catalog
+            .create_link(LinkDef {
+                owner_type: owner.to_string(),
+                name: name.to_string(),
+                target_type: target.to_string(),
+                local_key: local_key.to_string(),
+                target_key: target_key.to_string(),
+                // Placeholder: the catalog derives the real cardinality.
+                kind: LinkKind::ToMany,
+            })
+            .map_err(|e| QueryError::StorageError(e.to_string()))
+    }
+
+    /// Resolve every unresolved link traversal among these nested fields
+    /// against the persistent catalog, returning fields whose nested
+    /// projections carry a concrete child table and correlation columns and
+    /// whose scalar link paths carry a resolved hop chain. Runs at execution
+    /// time (the pure planner cannot see the catalog), in the same spirit as
+    /// `RangeScan` late lowering. `outer_table` is the declaring type of the
+    /// parent scan.
+    pub(crate) fn resolve_nested_via_links(
+        &self,
+        fields: &[NestedProjectField],
+        outer_table: &str,
+    ) -> Result<Vec<NestedProjectField>, QueryError> {
+        fields
+            .iter()
+            .map(|field| match field {
+                NestedProjectField::Nested(nested) => Ok(NestedProjectField::Nested(Box::new(
+                    self.resolve_via_link(nested, outer_table, true)?,
+                ))),
+                NestedProjectField::Plain(_) => Ok(field.clone()),
+                NestedProjectField::Link(link) => Ok(NestedProjectField::Link(Box::new(
+                    self.resolve_scalar_link_field(link, outer_table)?,
+                ))),
+            })
+            .collect()
+    }
+
+    /// Resolve one nested projection level (and its deeper levels): if it is a
+    /// block link traversal, look the link up under `(outer_table, link_name)`
+    /// and fill in the child table and correlation columns so execution
+    /// proceeds exactly as for the explicit correlated spelling. A block
+    /// traversal is only valid through a `ToMany` link; a `ToOne` link is a
+    /// pinned kind-mismatch error. `qualify_parent` mirrors the planner: the
+    /// top level correlates against an `AliasScan`'s `alias.col` columns,
+    /// deeper levels against the enclosing child's bare schema columns.
+    fn resolve_via_link(
+        &self,
+        nested: &NestedProjection,
+        outer_table: &str,
+        qualify_parent: bool,
+    ) -> Result<NestedProjection, QueryError> {
+        let mut out = nested.clone();
+        if let Some(via) = &nested.via_link {
+            let link = self.catalog.link(outer_table, &via.link_name).cloned();
+            let link = link.ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "unknown link `{}` on type `{}`; declare it with \
+                     `link {}.{} -> <Target> on <local> = <target>`",
+                    via.link_name, outer_table, outer_table, via.link_name
+                ))
+            })?;
+            if link.kind != LinkKind::ToMany {
+                return Err(QueryError::Execution(format!(
+                    "link `{}` on type `{}` is a to-one link; traverse it as a \
+                     path (`{}.{}.<column>`), not a block",
+                    via.link_name, outer_table, nested.parent_alias, via.link_name
+                )));
+            }
+            // owner.local_key = target.target_key: the child (target) side of
+            // the correlation is `target_key`, the parent (owner) side is
+            // `local_key`.
+            out.table = link.target_type.clone();
+            out.child_key = link.target_key.clone();
+            out.parent_key = if qualify_parent {
+                format!("{}.{}", nested.parent_alias, link.local_key)
+            } else {
+                link.local_key.clone()
+            };
+            out.via_link = None;
+        }
+        // Deeper levels correlate against THIS child table (now concrete) on a
+        // bare parent key.
+        out.fields = nested
+            .fields
+            .iter()
+            .map(|field| match field {
+                NestedField::Nested(inner) => Ok(NestedField::Nested(Box::new(
+                    self.resolve_via_link(inner, &out.table, false)?,
+                ))),
+                NestedField::Scalar { .. } => Ok(field.clone()),
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        Ok(out)
+    }
+
+    /// Resolve a scalar link path (`o.user.company.name`) against the
+    /// persistent catalog: each path segment must name a declared `ToOne`
+    /// link on the type reached so far. Produces one [`ScalarLinkHop`] per
+    /// segment; the first hop's FK column is qualified with the outer alias to
+    /// match the parent `AliasScan`'s column names. A `ToMany` link in the
+    /// chain (a non-unique target key) is a pinned kind-mismatch error, never
+    /// a silent fan-out.
+    fn resolve_scalar_link_field(
+        &self,
+        field: &ScalarLinkField,
+        outer_table: &str,
+    ) -> Result<ScalarLinkField, QueryError> {
+        let mut out = field.clone();
+        if out.resolved.is_some() {
+            return Ok(out);
+        }
+        let mut chain: Vec<LinkDef> = Vec::with_capacity(field.links.len());
+        let mut current = outer_table.to_string();
+        for link_name in &field.links {
+            let link = self.catalog.link(&current, link_name).cloned();
+            let link = link.ok_or_else(|| {
+                QueryError::Execution(format!(
+                    "unknown link `{link_name}` on type `{current}`; declare it with \
+                     `link {current}.{link_name} -> <Target> on <local> = <target>`"
+                ))
+            })?;
+            if link.kind != LinkKind::ToOne {
+                return Err(QueryError::Execution(format!(
+                    "link `{link_name}` on type `{current}` is a to-many link \
+                     (its target key `{target_key}` is not unique); traverse it \
+                     with a block (`{}: {}.{link_name} {{ ... }}`), not a scalar path",
+                    link_name,
+                    field.outer_alias,
+                    target_key = link.target_key
+                )));
+            }
+            current = link.target_type.clone();
+            chain.push(link);
+        }
+        // owner.local_key = target.target_key: the FK on the many side is
+        // `local_key`, the key on the one side is `target_key`.
+        let first_fk = format!("{}.{}", field.outer_alias, chain[0].local_key);
+        let hops = chain
+            .iter()
+            .enumerate()
+            .map(|(i, link)| ScalarLinkHop {
+                table: link.target_type.clone(),
+                key_col: link.target_key.clone(),
+                out_col: match chain.get(i + 1) {
+                    Some(next) => next.local_key.clone(),
+                    None => field.column.clone(),
+                },
+            })
+            .collect();
+        out.resolved = Some(ScalarLinkResolved { first_fk, hops });
+        Ok(out)
+    }
+
+    /// Build one lookup map per hop of a resolved scalar link path: key column
+    /// value -> out column value over the hop's target table. A duplicate key
+    /// value is an error, not a silent pick: a scalar hop through a non-unique
+    /// key is the to-one assumption failing (a `ToOne` link whose unique index
+    /// was later dropped), which in SQL would silently fan the join out.
+    fn build_scalar_link_maps(
+        &self,
+        link: &ScalarLinkField,
+        resolved: &ScalarLinkResolved,
+    ) -> Result<Vec<rustc_hash::FxHashMap<Value, Value>>, QueryError> {
+        use rustc_hash::FxHashMap;
+        let mut cancel = CancelCheck::new();
+        let mut maps = Vec::with_capacity(resolved.hops.len());
+        for hop in &resolved.hops {
+            let schema = self
+                .catalog
+                .schema(&hop.table)
+                .ok_or_else(|| QueryError::TableNotFound(hop.table.clone()))?
+                .clone();
+            let column_index = |name: &str| {
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name == name)
+                    .ok_or_else(|| QueryError::ColumnNotFound {
+                        table: hop.table.clone(),
+                        column: name.to_string(),
+                    })
+            };
+            let key_idx = column_index(&hop.key_col)?;
+            let out_idx = column_index(&hop.out_col)?;
+            // Materialize the two needed columns and charge them against the
+            // query budget like a join build side.
+            let mut narrowed: Vec<Vec<Value>> = Vec::new();
+            for (_, row) in self
+                .catalog
+                .scan(&hop.table)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?
+            {
+                cancel.tick()?;
+                // A NULL key never matches any FK value.
+                if row[key_idx] == Value::Empty {
+                    continue;
+                }
+                narrowed.push(vec![row[key_idx].clone(), row[out_idx].clone()]);
+            }
+            self.charge_rows(&narrowed)?;
+            let mut map: FxHashMap<Value, Value> =
+                FxHashMap::with_capacity_and_hasher(narrowed.len(), Default::default());
+            for mut pair in narrowed {
+                cancel.tick()?;
+                let value = pair.pop().expect("two columns per narrowed row");
+                let key = pair.pop().expect("two columns per narrowed row");
+                if map.insert(key.clone(), value).is_some() {
+                    return Err(QueryError::Execution(format!(
+                        "scalar link `{}`: key column `{}.{}` is not unique \
+                         (duplicate value {key:?}); a scalar link requires a \
+                         unique target key",
+                        link.name, hop.table, hop.key_col
+                    )));
+                }
+            }
+            maps.push(map);
+        }
+        Ok(maps)
+    }
+
     /// Execute the projection layer of a `NestedProject`: plain fields
     /// evaluate against the parent rows like `Project`; each nested field is
     /// assembled bottom-up by [`Engine::assemble_nested_arrays`], one hash
@@ -2443,23 +2720,54 @@ impl Engine {
         else {
             return Err("nested projection requires row input".into());
         };
-        // Per nested field: the parent-side key column index and the
-        // assembled correlation value -> JSON array text map.
-        let mut builds: Vec<(usize, FxHashMap<Value, String>)> = Vec::new();
+        // Per non-plain field: the parent-side key column index and the
+        // assembled build side (JSON array map for a nested block, one
+        // key -> value map per hop for a scalar link path).
+        enum FieldBuild {
+            Nested(usize, FxHashMap<Value, String>),
+            Link(usize, Vec<FxHashMap<Value, Value>>),
+        }
+        let mut builds: Vec<FieldBuild> = Vec::new();
         for field in fields {
-            let NestedProjectField::Nested(nested) = field else {
-                continue;
-            };
-            let parent_idx = parent_columns
-                .iter()
-                .position(|c| c == &nested.parent_key)
-                .ok_or_else(|| {
-                    QueryError::Execution(format!(
-                        "nested projection `{}` outer column `{}` not found",
-                        nested.name, nested.parent_key
-                    ))
-                })?;
-            builds.push((parent_idx, self.assemble_nested_arrays(nested)?));
+            match field {
+                NestedProjectField::Plain(_) => {}
+                NestedProjectField::Nested(nested) => {
+                    let parent_idx = parent_columns
+                        .iter()
+                        .position(|c| c == &nested.parent_key)
+                        .ok_or_else(|| {
+                            QueryError::Execution(format!(
+                                "nested projection `{}` outer column `{}` not found",
+                                nested.name, nested.parent_key
+                            ))
+                        })?;
+                    builds.push(FieldBuild::Nested(
+                        parent_idx,
+                        self.assemble_nested_arrays(nested)?,
+                    ));
+                }
+                NestedProjectField::Link(link) => {
+                    let resolved = link.resolved.as_ref().ok_or_else(|| {
+                        QueryError::Execution(format!(
+                            "scalar link path `{}` was not resolved before execution",
+                            link.name
+                        ))
+                    })?;
+                    let parent_idx = parent_columns
+                        .iter()
+                        .position(|c| c == &resolved.first_fk)
+                        .ok_or_else(|| {
+                            QueryError::Execution(format!(
+                                "scalar link `{}` FK column `{}` not found on the outer scan",
+                                link.name, resolved.first_fk
+                            ))
+                        })?;
+                    builds.push(FieldBuild::Link(
+                        parent_idx,
+                        self.build_scalar_link_maps(link, resolved)?,
+                    ));
+                }
+            }
         }
 
         let columns: Vec<String> = fields
@@ -2470,6 +2778,7 @@ impl Engine {
                     .clone()
                     .unwrap_or_else(|| expression_output_name(&f.expr)),
                 NestedProjectField::Nested(nested) => nested.name.clone(),
+                NestedProjectField::Link(link) => link.name.clone(),
             })
             .collect();
         let mut cancel = CancelCheck::new();
@@ -2484,8 +2793,9 @@ impl Engine {
                         out.push(eval_expr(&f.expr, parent_row, &parent_columns));
                     }
                     NestedProjectField::Nested(nested) => {
-                        let (parent_idx, build) =
-                            build_iter.next().expect("one build side per nested field");
+                        let Some(FieldBuild::Nested(parent_idx, build)) = build_iter.next() else {
+                            unreachable!("one build side per non-plain field, in order");
+                        };
                         let array = build
                             .get(&parent_row[*parent_idx])
                             .map(String::as_str)
@@ -2499,6 +2809,22 @@ impl Engine {
                             ))
                         })?;
                         out.push(Value::Json(doc.into()));
+                    }
+                    NestedProjectField::Link(_) => {
+                        let Some(FieldBuild::Link(parent_idx, maps)) = build_iter.next() else {
+                            unreachable!("one build side per non-plain field, in order");
+                        };
+                        // Walk the hop maps: a NULL or dangling FK at any hop
+                        // yields an empty value (LEFT JOIN semantics); the
+                        // parent row is never dropped.
+                        let mut value = parent_row[*parent_idx].clone();
+                        for map in maps {
+                            if value == Value::Empty {
+                                break;
+                            }
+                            value = map.get(&value).cloned().unwrap_or(Value::Empty);
+                        }
+                        out.push(value);
                     }
                 }
             }
@@ -2668,6 +2994,38 @@ impl Engine {
             build.insert(key, array);
         }
         Ok(build)
+    }
+}
+
+/// True when any nested field (at any depth) is an unresolved link traversal
+/// (a block `via_link` or an unresolved scalar link path) and therefore needs
+/// catalog resolution before assembly.
+pub(crate) fn nested_fields_have_via_link(fields: &[NestedProjectField]) -> bool {
+    fn nested_has(nested: &NestedProjection) -> bool {
+        nested.via_link.is_some()
+            || nested.fields.iter().any(|field| match field {
+                NestedField::Nested(inner) => nested_has(inner),
+                NestedField::Scalar { .. } => false,
+            })
+    }
+    fields.iter().any(|field| match field {
+        NestedProjectField::Nested(nested) => nested_has(nested),
+        NestedProjectField::Plain(_) => false,
+        NestedProjectField::Link(link) => link.resolved.is_none(),
+    })
+}
+
+/// The base table a read plan scans, following the single-input pipeline down
+/// to its `AliasScan`/`SeqScan` leaf. Used to name the declaring type when
+/// resolving a top-level link traversal.
+pub(crate) fn scan_source_table(plan: &PlanNode) -> Option<&str> {
+    match plan {
+        PlanNode::AliasScan { table, .. } | PlanNode::SeqScan { table } => Some(table),
+        PlanNode::Filter { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. } => scan_source_table(input),
+        _ => None,
     }
 }
 

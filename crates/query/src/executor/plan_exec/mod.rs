@@ -286,6 +286,7 @@ pub(crate) use aggregate::{
 };
 #[cfg(test)]
 pub(crate) use aggregate::{compute_group_aggregate, GroupAggregateContext};
+pub(crate) use dispatch::{nested_fields_have_via_link, scan_source_table};
 #[cfg(test)]
 pub(crate) use join::check_nested_loop_pair_limit;
 pub(crate) use join::execute_materialized_join;
