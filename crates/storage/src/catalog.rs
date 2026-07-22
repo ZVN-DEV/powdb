@@ -92,7 +92,16 @@ const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// column list; version 5 appends an auto-increment column section after that.
 /// Older files load cleanly (no defaults / no auto columns).
 pub const LEGACY_CATALOG_VERSION: u16 = 5;
-pub const CATALOG_VERSION: u16 = 6;
+/// Version 6 (activated lazily since v0.13.0) appends the expression-index
+/// section plus a next-index-id header field. A database that declares an
+/// expression index but no relationship link stays at exactly this version.
+pub const EXPRESSION_INDEX_CATALOG_VERSION: u16 = 6;
+/// Version 7 appends a relationship-link section after the table entries (and
+/// after each table's expression indexes) and before the trailing CRC. It
+/// activates lazily on the first `create_link`, mirroring how v6 activates on
+/// the first expression index; a link-free database stays byte-for-byte a v6
+/// (or older) file forever.
+pub const CATALOG_VERSION: u16 = 7;
 
 /// Persisted metadata for a JSON-path expression index. Expression index files
 /// are addressed only by `index_id`; canonical expression text never reaches a
@@ -104,6 +113,60 @@ pub struct ExpressionIndexMeta {
     pub canonical_version: u16,
     pub canonical_text: String,
     pub json_path: StoredJsonPathV1,
+}
+
+/// Cardinality of a relationship link, derived at declare time from whether the
+/// target key is backed by a unique index/constraint and stored explicitly so
+/// query planning never re-derives it. Serialized as a single `u8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// N:1 scalar hop — the target key is unique, so a hop resolves to at most
+    /// one target row (`0` on disk).
+    ToOne,
+    /// 1:N nested block — the target key is non-unique, so a hop can fan out to
+    /// many target rows (`1` on disk).
+    ToMany,
+}
+
+impl LinkKind {
+    fn to_u8(self) -> u8 {
+        match self {
+            LinkKind::ToOne => 0,
+            LinkKind::ToMany => 1,
+        }
+    }
+
+    fn from_u8(tag: u8) -> io::Result<Self> {
+        match tag {
+            0 => Ok(LinkKind::ToOne),
+            1 => Ok(LinkKind::ToMany),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown link kind tag: {other}"),
+            )),
+        }
+    }
+}
+
+/// Persisted relationship-link metadata. A link is a read-only naming layer over
+/// columns that already exist: it names a traversal path (`owner.name -> target`)
+/// resolved through `local_key = target_key`. Links add no storage and enforce no
+/// referential integrity on write; dropping a referenced table or column is
+/// refused while the link exists (the same discipline indexes use).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkDef {
+    /// Owner table the link is declared on. Registry key part 1.
+    pub owner_type: String,
+    /// Traversal name (`o.<name>...`). Unique per owner type. Registry key part 2.
+    pub name: String,
+    /// Target table the link resolves to. Must exist at declare time.
+    pub target_type: String,
+    /// Column on the owner supplying the join value.
+    pub local_key: String,
+    /// Column on the target matched against `local_key`.
+    pub target_key: String,
+    /// Cardinality derived from the target key's uniqueness at declare time.
+    pub kind: LinkKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +346,12 @@ pub struct Catalog {
     active_catalog_version: u16,
     /// Global, durable, monotonically increasing expression-index identity.
     next_index_id: u64,
+    /// Relationship-link registry, in declaration order (so serialization and
+    /// the `links()` iterator are deterministic). Keyed logically by
+    /// `(owner_type, name)`; uniqueness of that pair is enforced in
+    /// `create_link`. Populated from disk on `open`. v7 activates on the first
+    /// entry; a link-free catalog never writes the links section.
+    links: Vec<LinkDef>,
     /// Process-local catalog structure identity. Any table/schema/default/
     /// auto/index DDL replaces this token, invalidating cached prepared
     /// metadata in O(1). Opening a replacement Catalog (including rollback)
@@ -334,6 +403,7 @@ impl Catalog {
             durable_lsn: 0,
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
+            links: Vec::new(),
             structure_generation: next_structure_generation(),
             read_only: false,
         };
@@ -377,6 +447,7 @@ impl Catalog {
         let catalog_file = read_catalog_file(&cat_path)?;
         let active_catalog_version = catalog_file.version;
         let next_index_id = catalog_file.next_index_id;
+        let links = catalog_file.links;
         let entries = catalog_file.entries;
         let durable_lsn = read_durable_lsn(data_dir)?;
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
@@ -419,6 +490,7 @@ impl Catalog {
             durable_lsn,
             active_catalog_version,
             next_index_id,
+            links,
             structure_generation: next_structure_generation(),
             read_only: false,
         };
@@ -486,6 +558,7 @@ impl Catalog {
         let catalog_file = read_catalog_file(&cat_path)?;
         let active_catalog_version = catalog_file.version;
         let next_index_id = catalog_file.next_index_id;
+        let links = catalog_file.links;
         let entries = catalog_file.entries;
         let durable_lsn = read_durable_lsn(data_dir)?;
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
@@ -526,6 +599,7 @@ impl Catalog {
             durable_lsn,
             active_catalog_version,
             next_index_id,
+            links,
             structure_generation: next_structure_generation(),
             read_only: true,
         })
@@ -1454,6 +1528,7 @@ impl Catalog {
             self.active_catalog_version,
             self.next_index_id,
             &entries,
+            &self.links,
         )
         .map_err(CatalogPersistError::BeforeActivation)?;
         #[cfg(test)]
@@ -2421,7 +2496,13 @@ impl Catalog {
 
         let previous_version = self.active_catalog_version;
         let previous_next_id = self.next_index_id;
-        self.active_catalog_version = CATALOG_VERSION;
+        // Activate exactly the format version this feature needs (v6). Using a
+        // `max` (never a bare assign) keeps a database that already declared a
+        // link at v7 from being silently downgraded when it later adds an
+        // expression index.
+        self.active_catalog_version = self
+            .active_catalog_version
+            .max(EXPRESSION_INDEX_CATALOG_VERSION);
         self.next_index_id = next_index_id;
         match self.persist_at_activation_boundary() {
             Ok(()) => {}
@@ -2443,6 +2524,171 @@ impl Catalog {
             }
         }
         Ok(index_id)
+    }
+
+    /// Declare a relationship link on `def.owner_type`. This is the first
+    /// operation that activates catalog format v7; a database that never calls
+    /// it stays at its current (v6-or-older) version.
+    ///
+    /// Validation (all at declare time): both `owner_type` and `target_type`
+    /// must be existing tables, `local_key` must be a column on the owner,
+    /// `target_key` a column on the target, and `name` must collide with neither
+    /// a column on the owner nor an existing link on the same owner. The stored
+    /// `kind` is **derived** here from whether `target_key` is backed by a
+    /// unique index on the target (`ToOne` if unique, else `ToMany`); any `kind`
+    /// supplied by the caller is ignored.
+    ///
+    /// Activation is lazy and crash-safe, mirroring
+    /// [`Self::create_expression_index_metadata`]: on any persist failure before
+    /// the catalog rename, the in-memory registry and the format version both
+    /// revert and no partial state remains.
+    pub fn create_link(&mut self, def: LinkDef) -> io::Result<()> {
+        self.invalidate_structure();
+        validate_table_name(&def.owner_type)?;
+        validate_table_name(&def.target_type)?;
+        validate_column_name(&def.name)?;
+        validate_column_name(&def.local_key)?;
+        validate_column_name(&def.target_key)?;
+
+        // Owner table + local key must exist; the link name must not shadow a
+        // column or an existing link on the owner.
+        {
+            let owner = self.by_name(&def.owner_type)?;
+            if owner.schema.column_index(&def.local_key).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "link local key '{}' is not a column on owner type '{}'",
+                        def.local_key, def.owner_type
+                    ),
+                ));
+            }
+            if owner.schema.column_index(&def.name).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "link name '{}' collides with a column on owner type '{}'",
+                        def.name, def.owner_type
+                    ),
+                ));
+            }
+        }
+        if self
+            .links
+            .iter()
+            .any(|l| l.owner_type == def.owner_type && l.name == def.name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "link '{}' already exists on owner type '{}'",
+                    def.name, def.owner_type
+                ),
+            ));
+        }
+
+        // Target table + target key must exist.
+        {
+            let target = self.by_name(&def.target_type)?;
+            if target.schema.column_index(&def.target_key).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "link target key '{}' is not a column on target type '{}'",
+                        def.target_key, def.target_type
+                    ),
+                ));
+            }
+        }
+
+        // Derive cardinality from the target key's uniqueness and store it
+        // explicitly so query planning never re-derives it.
+        let kind = if self.is_index_unique(&def.target_type, &def.target_key) == Some(true) {
+            LinkKind::ToOne
+        } else {
+            LinkKind::ToMany
+        };
+        let stored = LinkDef { kind, ..def };
+
+        // Lazy activation + proven rollback pattern (see
+        // create_expression_index_metadata). Register, bump the version, persist;
+        // on a pre-rename failure, undo both.
+        self.links.push(stored);
+        let previous_version = self.active_catalog_version;
+        self.active_catalog_version = self.active_catalog_version.max(CATALOG_VERSION);
+        match self.persist_at_activation_boundary() {
+            Ok(()) => {}
+            Err(CatalogPersistError::BeforeActivation(error)) => {
+                self.links.pop();
+                self.active_catalog_version = previous_version;
+                let _ = sync_directory(&self.data_dir);
+                return Err(error);
+            }
+            Err(CatalogPersistError::AfterActivation(error)) => {
+                warn!(
+                    path = %self.data_dir.display(),
+                    error = %error,
+                    "link creation committed but catalog directory sync failed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a link by its `(owner_type, name)` registry key. The returned
+    /// reference borrows the catalog immutably.
+    pub fn link(&self, owner_type: &str, name: &str) -> Option<&LinkDef> {
+        self.links
+            .iter()
+            .find(|l| l.owner_type == owner_type && l.name == name)
+    }
+
+    /// Iterate every declared link in declaration order.
+    pub fn links(&self) -> impl Iterator<Item = &LinkDef> + '_ {
+        self.links.iter()
+    }
+
+    /// Remove a link by its `(owner_type, name)` registry key. Metadata-only:
+    /// it deletes no data and touches no secondary structures. Errors with
+    /// `NotFound` if no such link exists. Does not downgrade the format version
+    /// (consistent with every other drop path — the version floor only rises).
+    pub fn drop_link(&mut self, owner_type: &str, name: &str) -> io::Result<()> {
+        self.invalidate_structure();
+        let idx = self
+            .links
+            .iter()
+            .position(|l| l.owner_type == owner_type && l.name == name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("link '{name}' not found on owner type '{owner_type}'"),
+                )
+            })?;
+        let removed = self.links.remove(idx);
+        if let Err(error) = self.persist() {
+            // Restore the in-memory registry so it matches what is still on disk.
+            self.links.insert(idx, removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// First link that references `table` as either owner or target, if any.
+    /// Used to guard `DROP TABLE` (a referenced table cannot be dropped while a
+    /// link names it, the same discipline indexes use).
+    fn link_referencing_table(&self, table: &str) -> Option<&LinkDef> {
+        self.links
+            .iter()
+            .find(|l| l.owner_type == table || l.target_type == table)
+    }
+
+    /// First link that references `table.column` (owner local key or target
+    /// key), if any. Used to guard `ALTER TABLE DROP COLUMN`.
+    fn link_referencing_column(&self, table: &str, column: &str) -> Option<&LinkDef> {
+        self.links.iter().find(|l| {
+            (l.owner_type == table && l.local_key == column)
+                || (l.target_type == table && l.target_key == column)
+        })
     }
 
     /// Whether `table.column` has a UNIQUE index. Returns `Some(true)` for
@@ -2489,6 +2735,18 @@ impl Catalog {
         let slot = *self.name_to_slot.get(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
         })?;
+        // A live relationship link that names this table (as owner or target)
+        // pins it in place, the same integrity discipline indexes use. The
+        // operator must drop the link first.
+        if let Some(link) = self.link_referencing_table(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot drop table '{name}': link '{}' on '{}' references it (drop the link first)",
+                    link.name, link.owner_type
+                ),
+            ));
+        }
         if !self.wal.is_off() {
             let payload = encode_ddl_drop_table(name);
             self.wal.append(0, WalRecordType::DdlDropTable, &payload)?;
@@ -2662,6 +2920,17 @@ impl Catalog {
                         format!("column '{col_name}' not found in table '{table}'"),
                     )
                 })?;
+        }
+        // A live link that names this column (as owner local key or target key)
+        // pins it in place; the operator must drop the link first.
+        if let Some(link) = self.link_referencing_column(table, col_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot drop column '{col_name}' from '{table}': link '{}' on '{}' references it (drop the link first)",
+                    link.name, link.owner_type
+                ),
+            ));
         }
         let removed_expression_index_ids = self
             .by_name_mut(table)?
@@ -3493,11 +3762,66 @@ fn decode_expression_indexes(data: &[u8], pos: &mut usize) -> io::Result<Vec<Exp
     Ok(indexes)
 }
 
+/// Encode the v7 relationship-link section: a `u32` count followed by that many
+/// records of five length-prefixed strings plus one `u8` kind, matching the
+/// len-prefix conventions the table/column/expression-index codecs use.
+fn encode_links_section(out: &mut Vec<u8>, links: &[LinkDef]) -> io::Result<()> {
+    let count = u32::try_from(links.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many catalog links"))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for link in links {
+        push_catalog_string(out, &link.owner_type)?;
+        push_catalog_string(out, &link.name)?;
+        push_catalog_string(out, &link.target_type)?;
+        push_catalog_string(out, &link.local_key)?;
+        push_catalog_string(out, &link.target_key)?;
+        out.push(link.kind.to_u8());
+    }
+    Ok(())
+}
+
+/// Inverse of [`encode_links_section`]. Bounds-checks the count against the
+/// remaining buffer so a corrupt file fails closed rather than pre-allocating a
+/// huge `Vec` (mirrors the table-count and btree node-count guards).
+fn decode_links_section(data: &[u8], pos: &mut usize) -> io::Result<Vec<LinkDef>> {
+    let count = read_u32(data, pos)? as usize;
+    if count > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("catalog file corrupt: implausible link count {count}"),
+        ));
+    }
+    let mut links = Vec::with_capacity(count);
+    for _ in 0..count {
+        let owner_type = read_len_prefixed_string(data, pos)?;
+        let name = read_len_prefixed_string(data, pos)?;
+        let target_type = read_len_prefixed_string(data, pos)?;
+        let local_key = read_len_prefixed_string(data, pos)?;
+        let target_key = read_len_prefixed_string(data, pos)?;
+        let kind = LinkKind::from_u8(read_u8(data, pos)?)?;
+        links.push(LinkDef {
+            owner_type,
+            name,
+            target_type,
+            local_key,
+            target_key,
+            kind,
+        });
+    }
+    Ok(links)
+}
+
+fn read_len_prefixed_string(data: &[u8], pos: &mut usize) -> io::Result<String> {
+    let len = read_u32(data, pos)? as usize;
+    read_string(data, pos, len)
+}
+
 fn write_catalog_file(
     path: &Path,
     version: u16,
     next_index_id: u64,
     entries: &[CatalogEntryRef<'_>],
+    links: &[LinkDef],
 ) -> io::Result<()> {
     if !(1..=CATALOG_VERSION).contains(&version) {
         return Err(io::Error::new(
@@ -3544,6 +3868,14 @@ fn write_catalog_file(
         }
     }
 
+    // Version 7 appends the relationship-link section after every table entry
+    // and before the CRC. A v6-or-older file omits it entirely (the reader
+    // defaults n_links = 0), so a link-free database stays byte-for-byte
+    // unchanged.
+    if version >= 7 {
+        encode_links_section(&mut buf, links)?;
+    }
+
     // Append a CRC32 checksum of the entire payload so the reader can
     // detect corruption (the WAL and btree .idx files already do this;
     // catalog.bin was the one file missing a checksum).
@@ -3564,6 +3896,7 @@ struct CatalogFile {
     version: u16,
     next_index_id: u64,
     entries: Vec<CatalogEntry>,
+    links: Vec<LinkDef>,
 }
 
 fn read_catalog_file(path: &Path) -> io::Result<CatalogFile> {
@@ -3776,6 +4109,16 @@ fn read_catalog_file_with_max_version(
         });
     }
 
+    // Version 7 appends a relationship-link section after the table entries.
+    // Any pre-v7 file stops here; the reader defaults n_links = 0 (staircase
+    // contract). v6 remains an active writer version, so the below-7 branch is
+    // NOT legacy and is not removal-eligible.
+    let links = if version >= 7 {
+        decode_links_section(buf, &mut pos)?
+    } else {
+        Vec::new()
+    };
+
     let mut seen_index_ids = FxHashMap::default();
     let mut max_index_id = 0;
     for entry in &entries {
@@ -3830,6 +4173,7 @@ fn read_catalog_file_with_max_version(
         version,
         next_index_id,
         entries,
+        links,
     })
 }
 
@@ -4128,6 +4472,58 @@ mod tests {
         assert!(error.to_string().contains("unsupported catalog version: 6"));
     }
 
+    /// A v7 catalog (one that declared a link) must be refused by a reader
+    /// capped at v6, with the same "unsupported catalog version" error the
+    /// version gate already produces — not a crash, not silent corruption.
+    #[test]
+    fn v6_reader_rejects_v7_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "Order".into(),
+                columns: vec![ColumnDef {
+                    name: "user_id".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "User".into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog
+            .create_link(LinkDef {
+                owner_type: "Order".into(),
+                name: "user".into(),
+                target_type: "User".into(),
+                local_key: "user_id".into(),
+                target_key: "id".into(),
+                kind: LinkKind::ToMany,
+            })
+            .unwrap();
+        assert_eq!(catalog.active_catalog_version(), CATALOG_VERSION);
+
+        let result = read_catalog_file_with_max_version(
+            &dir.path().join(CATALOG_FILE),
+            EXPRESSION_INDEX_CATALOG_VERSION,
+        );
+        let error = match result {
+            Ok(_) => panic!("a v6 reader must reject v7 before decoding its payload"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported catalog version: 7"));
+    }
+
     #[test]
     fn expression_index_rolls_back_only_before_catalog_rename() {
         let before_dir = tempfile::tempdir().unwrap();
@@ -4198,7 +4594,10 @@ mod tests {
             .create_expression_index_metadata("Doc", 1, path.canonical_text(), path.clone(), false)
             .unwrap();
         assert_eq!(index_id, 1);
-        assert_eq!(after.active_catalog_version(), CATALOG_VERSION);
+        assert_eq!(
+            after.active_catalog_version(),
+            EXPRESSION_INDEX_CATALOG_VERSION
+        );
         assert_eq!(after.next_index_id(), 2);
         assert!(after.expression_index_btree("Doc", index_id).is_some());
         assert!(after_dir
@@ -4226,6 +4625,76 @@ mod tests {
             .expression_index_metadata("Doc")
             .unwrap()
             .is_empty());
+    }
+
+    /// A pre-rename persist failure during the *first* `create_link` must revert
+    /// the format version 7 -> 6/5, leave the in-memory registry empty, and
+    /// leave no v7 catalog on disk (mirrors the expression-index rollback test).
+    #[test]
+    fn first_create_link_rolls_back_version_and_registry_before_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "Order".into(),
+                columns: vec![ColumnDef {
+                    name: "user_id".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "User".into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog.create_index_unique("User", "id", true).unwrap();
+
+        let version_before = catalog.active_catalog_version();
+        assert_eq!(version_before, LEGACY_CATALOG_VERSION);
+
+        fail_next_catalog_persist_at(1);
+        let error = catalog
+            .create_link(LinkDef {
+                owner_type: "Order".into(),
+                name: "user".into(),
+                target_type: "User".into(),
+                local_key: "user_id".into(),
+                target_key: "id".into(),
+                kind: LinkKind::ToMany,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("before rename"));
+        // Version and registry reverted; nothing persisted.
+        assert_eq!(catalog.active_catalog_version(), version_before);
+        assert!(catalog.link("Order", "user").is_none());
+        assert_eq!(catalog.links().count(), 0);
+        assert_eq!(
+            read_active_catalog_version(dir.path()).unwrap(),
+            version_before
+        );
+
+        // A subsequent clean create_link succeeds and derives ToOne (unique id).
+        catalog
+            .create_link(LinkDef {
+                owner_type: "Order".into(),
+                name: "user".into(),
+                target_type: "User".into(),
+                local_key: "user_id".into(),
+                target_key: "id".into(),
+                kind: LinkKind::ToMany, // ignored; derived from uniqueness
+            })
+            .unwrap();
+        assert_eq!(catalog.active_catalog_version(), CATALOG_VERSION);
+        assert_eq!(catalog.link("Order", "user").unwrap().kind, LinkKind::ToOne);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use powdb_storage::catalog::{
-    expression_index_file_name, Catalog, IndexOrderDirection, CATALOG_VERSION,
+    expression_index_file_name, Catalog, IndexOrderDirection, EXPRESSION_INDEX_CATALOG_VERSION,
     LEGACY_CATALOG_VERSION,
 };
 use powdb_storage::pj1::parse_json_text;
@@ -265,7 +265,10 @@ fn unique_and_non_scalar_fail_before_heap_overflow_or_catalog_activation() {
     let index_id = catalog
         .create_expression_index_metadata("Doc", 1, path.canonical_text(), path, true)
         .unwrap();
-    assert_eq!(catalog.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        catalog.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
 
     let huge = "x".repeat(20_000);
     assert!(catalog
@@ -383,7 +386,10 @@ fn explicit_expression_index_drop_removes_metadata_and_file_without_reusing_id()
     drop(catalog);
 
     let reopened = Catalog::open(dir.path()).unwrap();
-    assert_eq!(reopened.active_catalog_version(), CATALOG_VERSION);
+    assert_eq!(
+        reopened.active_catalog_version(),
+        EXPRESSION_INDEX_CATALOG_VERSION
+    );
     assert_eq!(reopened.next_index_id(), 2);
     assert!(reopened
         .expression_index_metadata("Doc")
