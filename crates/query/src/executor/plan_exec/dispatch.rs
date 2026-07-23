@@ -2640,14 +2640,27 @@ impl Engine {
     /// value is an error, not a silent pick: a scalar hop through a non-unique
     /// key is the to-one assumption failing (a `ToOne` link whose unique index
     /// was later dropped), which in SQL would silently fan the join out.
+    /// `fk_keys` is the set of distinct non-NULL FK values the outer scan
+    /// actually selects. A to-one hop's target key is unique, so a selective
+    /// outer query only needs a point probe per key it references instead of a
+    /// full target-table scan. Each hop restricts to the keys the previous
+    /// hop's map can actually reach, so a selective outer query stays selective
+    /// through a multi-hop path.
     fn build_scalar_link_maps(
         &self,
         link: &ScalarLinkField,
         resolved: &ScalarLinkResolved,
+        fk_keys: &rustc_hash::FxHashSet<Value>,
     ) -> Result<Vec<rustc_hash::FxHashMap<Value, Value>>, QueryError> {
-        use rustc_hash::FxHashMap;
+        use rustc_hash::{FxHashMap, FxHashSet};
         let mut cancel = CancelCheck::new();
         let mut maps = Vec::with_capacity(resolved.hops.len());
+        // Keys the executor will look up at this hop: the outer FK values for
+        // the first hop, then the non-NULL outputs the previous map produced
+        // for those keys. The executor only ever consults `map.get(v)` for
+        // `v` in this set, so a map restricted to it is byte-identical for
+        // every lookup that actually happens.
+        let mut needed_keys: FxHashSet<Value> = fk_keys.clone();
         for hop in &resolved.hops {
             let schema = self
                 .catalog
@@ -2666,37 +2679,87 @@ impl Engine {
             };
             let key_idx = column_index(&hop.key_col)?;
             let out_idx = column_index(&hop.out_col)?;
-            // Materialize the two needed columns and charge them against the
-            // query budget like a join build side.
-            let mut narrowed: Vec<Vec<Value>> = Vec::new();
-            for (_, row) in self
-                .catalog
-                .scan(&hop.table)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?
-            {
-                cancel.tick()?;
-                // A NULL key never matches any FK value.
-                if row[key_idx] == Value::Empty {
-                    continue;
+            // Probe only when the key column has a UNIQUE index: uniqueness
+            // makes the full-scan duplicate check moot (at most one row per
+            // key), so a per-key point probe is byte-identical to the scan.
+            // A non-unique or absent index falls through to the full scan,
+            // which still raises the hard duplicate-key error even for keys no
+            // parent references (the "to-one link whose unique index was
+            // dropped" corruption case).
+            let use_probes = self.catalog.is_index_unique(&hop.table, &hop.key_col) == Some(true)
+                && self.child_index_probe_pays_off(&hop.table, &hop.key_col, needed_keys.len());
+            let mut map: FxHashMap<Value, Value> = FxHashMap::default();
+            if use_probes {
+                let tbl = self
+                    .catalog
+                    .get_table(&hop.table)
+                    .ok_or_else(|| QueryError::TableNotFound(hop.table.clone()))?;
+                // Strict-type gate mirrors the scan-built map: its keys are all
+                // the column's own type, and Value equality is typed, so a
+                // cross-type FK never matches under either strategy.
+                let col_type = schema.columns[key_idx].type_id;
+                let mut narrowed: Vec<Vec<Value>> = Vec::with_capacity(needed_keys.len());
+                for key in &needed_keys {
+                    cancel.tick()?;
+                    if key.type_id() != col_type {
+                        continue;
+                    }
+                    if let Some((_, row)) = tbl.index_lookup(&hop.key_col, key) {
+                        // A NULL key never matches any FK value.
+                        if row[key_idx] == Value::Empty {
+                            continue;
+                        }
+                        narrowed.push(vec![row[key_idx].clone(), row[out_idx].clone()]);
+                    }
                 }
-                narrowed.push(vec![row[key_idx].clone(), row[out_idx].clone()]);
-            }
-            self.charge_rows(&narrowed)?;
-            let mut map: FxHashMap<Value, Value> =
-                FxHashMap::with_capacity_and_hasher(narrowed.len(), Default::default());
-            for mut pair in narrowed {
-                cancel.tick()?;
-                let value = pair.pop().expect("two columns per narrowed row");
-                let key = pair.pop().expect("two columns per narrowed row");
-                if map.insert(key.clone(), value).is_some() {
-                    return Err(QueryError::Execution(format!(
-                        "scalar link `{}`: key column `{}.{}` is not unique \
-                         (duplicate value {key:?}); a scalar link requires a \
-                         unique target key",
-                        link.name, hop.table, hop.key_col
-                    )));
+                self.charge_rows(&narrowed)?;
+                for mut pair in narrowed {
+                    cancel.tick()?;
+                    let value = pair.pop().expect("two columns per narrowed row");
+                    let key = pair.pop().expect("two columns per narrowed row");
+                    map.insert(key, value);
+                }
+            } else {
+                // Materialize the two needed columns and charge them against
+                // the query budget like a join build side.
+                let mut narrowed: Vec<Vec<Value>> = Vec::new();
+                for (_, row) in self
+                    .catalog
+                    .scan(&hop.table)
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                {
+                    cancel.tick()?;
+                    // A NULL key never matches any FK value.
+                    if row[key_idx] == Value::Empty {
+                        continue;
+                    }
+                    narrowed.push(vec![row[key_idx].clone(), row[out_idx].clone()]);
+                }
+                self.charge_rows(&narrowed)?;
+                map.reserve(narrowed.len());
+                for mut pair in narrowed {
+                    cancel.tick()?;
+                    let value = pair.pop().expect("two columns per narrowed row");
+                    let key = pair.pop().expect("two columns per narrowed row");
+                    if map.insert(key.clone(), value).is_some() {
+                        return Err(QueryError::Execution(format!(
+                            "scalar link `{}`: key column `{}.{}` is not unique \
+                             (duplicate value {key:?}); a scalar link requires a \
+                             unique target key",
+                            link.name, hop.table, hop.key_col
+                        )));
+                    }
                 }
             }
+            // The next hop only needs arrays for the non-NULL values this hop
+            // produces for the keys we care about; anything else the executor
+            // will never consult.
+            needed_keys = needed_keys
+                .iter()
+                .filter_map(|k| map.get(k))
+                .filter(|v| **v != Value::Empty)
+                .cloned()
+                .collect();
             maps.push(map);
         }
         Ok(maps)
@@ -2741,9 +2804,14 @@ impl Engine {
                                 nested.name, nested.parent_key
                             ))
                         })?;
+                    // Distinct non-NULL correlation values actually present on
+                    // the parent side. Assembly only ever needs child rows for
+                    // these keys, which is what lets a selective parent avoid
+                    // paying for the whole child table.
+                    let parent_keys = distinct_non_null(&parent_rows, parent_idx);
                     builds.push(FieldBuild::Nested(
                         parent_idx,
-                        self.assemble_nested_arrays(nested)?,
+                        self.assemble_nested_arrays(nested, &parent_keys)?,
                     ));
                 }
                 NestedProjectField::Link(link) => {
@@ -2762,9 +2830,14 @@ impl Engine {
                                 link.name, resolved.first_fk
                             ))
                         })?;
+                    // Distinct non-NULL FK values the outer scan actually
+                    // selects: a to-one hop's target key is unique, so a
+                    // selective outer query only needs point probes for these
+                    // keys instead of scanning the whole target table.
+                    let fk_keys = distinct_non_null(&parent_rows, parent_idx);
                     builds.push(FieldBuild::Link(
                         parent_idx,
-                        self.build_scalar_link_maps(link, resolved)?,
+                        self.build_scalar_link_maps(link, resolved, &fk_keys)?,
                     ));
                 }
             }
@@ -2833,14 +2906,23 @@ impl Engine {
         Ok(QueryResult::Rows { columns, rows })
     }
 
-    /// Assemble one nested projection level bottom-up: recursively assemble
-    /// its own nested children first, then scan the child table once, apply
-    /// the residual filter, group rows by correlation value, order and
-    /// truncate each parent's bucket, and serialize each bucket to JSON
-    /// array text. Recursion depth is bounded by the parser's nesting guard.
+    /// Assemble one nested projection level bottom-up: gather this level's
+    /// child rows (full scan, or per-parent-key index probes when the parent
+    /// side is selective and the correlation column is indexed), apply the
+    /// residual filter, recursively assemble deeper levels restricted to the
+    /// correlation values actually gathered, group rows by correlation
+    /// value, order and truncate each parent's bucket, and serialize each
+    /// bucket to JSON array text. Recursion depth is bounded by the parser's
+    /// nesting guard.
+    ///
+    /// `parent_keys` is the set of distinct non-NULL correlation values the
+    /// enclosing level will look up: the assembled map never needs any other
+    /// key, so a small set with an index on `child_key` skips the child
+    /// table scan entirely.
     fn assemble_nested_arrays(
         &self,
         nested: &NestedProjection,
+        parent_keys: &rustc_hash::FxHashSet<Value>,
     ) -> Result<rustc_hash::FxHashMap<Value, String>, QueryError> {
         use rustc_hash::FxHashMap;
         let schema = self
@@ -2860,22 +2942,21 @@ impl Engine {
         };
         let key_idx = column_index(&nested.child_key)?;
         // One value source per output field: a scalar column, or the
-        // correlation column of a deeper level plus its assembled arrays.
-        enum FieldSource {
-            Column,
-            Arrays(rustc_hash::FxHashMap<Value, String>),
-        }
-        let mut sources: Vec<(&str, usize, FieldSource)> = Vec::with_capacity(nested.fields.len());
+        // correlation column of a deeper level (whose arrays are assembled
+        // after this level's rows are gathered, so the recursion can be
+        // restricted to the keys those rows actually reference).
+        let mut field_specs: Vec<(&str, usize, Option<&NestedProjection>)> =
+            Vec::with_capacity(nested.fields.len());
         for field in &nested.fields {
             match field {
                 NestedField::Scalar { key, column } => {
-                    sources.push((key.as_str(), column_index(column)?, FieldSource::Column));
+                    field_specs.push((key.as_str(), column_index(column)?, None));
                 }
                 NestedField::Nested(inner) => {
-                    sources.push((
+                    field_specs.push((
                         inner.name.as_str(),
                         column_index(&inner.parent_key)?,
-                        FieldSource::Arrays(self.assemble_nested_arrays(inner)?),
+                        Some(inner),
                     ));
                 }
             }
@@ -2897,6 +2978,17 @@ impl Engine {
         };
         let limit = bound(&nested.limit, "limit")?;
         let offset = bound(&nested.offset, "offset")?;
+        // No parent will consult the map: skip the data work, but only
+        // after the validation above, and still validate deeper levels so
+        // schema errors do not appear and disappear with the data.
+        if parent_keys.is_empty() {
+            for (_, _, inner) in &field_specs {
+                if let Some(inner) = inner {
+                    self.assemble_nested_arrays(inner, parent_keys)?;
+                }
+            }
+            return Ok(FxHashMap::default());
+        }
         // Residual conditions reference bare child columns (rewritten by
         // the planner), so they evaluate against the full schema row.
         let schema_cols: Vec<String> = if nested.residual.is_some() {
@@ -2907,34 +2999,114 @@ impl Engine {
         // Materialize only the needed child columns (key first), charge
         // them against the query budget like a join build side, then fold
         // into per-parent buckets.
+        //
+        // Row gathering has two strategies:
+        //   1. Index probes: when the parent side is selective and
+        //      `child_key` is indexed, probe the btree once per parent key
+        //      and fetch only matching rows. Probe results come back in rid
+        //      order per key, which is exactly the heap scan order the
+        //      unordered-array contract promises.
+        //   2. Full scan: the fleet-shaped default. When the parent key set
+        //      is small in absolute terms, non-matching correlation values
+        //      are skipped before narrowing so unrelated buckets are never
+        //      materialized or serialized.
+        let use_index_probes =
+            self.child_index_probe_pays_off(&nested.table, &nested.child_key, parent_keys.len());
+        // Membership pre-filter for the scan strategy: cheap insurance for
+        // selective parents without an index, skipped for large parent sets
+        // (fleet shape) where nearly every child row matches anyway.
+        const SCAN_KEY_FILTER_MAX_KEYS: usize = 1024;
+        let scan_key_filter = !use_index_probes && parent_keys.len() <= SCAN_KEY_FILTER_MAX_KEYS;
         let mut cancel = CancelCheck::new();
         let mut child_rows: Vec<Vec<Value>> = Vec::new();
-        for (_, row) in self
-            .catalog
-            .scan(&nested.table)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?
-        {
-            cancel.tick()?;
-            // A NULL correlation value never matches any parent.
-            if row[key_idx] == Value::Empty {
-                continue;
-            }
-            if let Some(residual) = &nested.residual {
-                if !eval_predicate(residual, &row, &schema_cols) {
+        let narrow_into =
+            |row: &[Value], child_rows: &mut Vec<Vec<Value>>| -> Result<(), QueryError> {
+                // A NULL correlation value never matches any parent.
+                if row[key_idx] == Value::Empty {
+                    return Ok(());
+                }
+                if scan_key_filter && !parent_keys.contains(&row[key_idx]) {
+                    return Ok(());
+                }
+                if let Some(residual) = &nested.residual {
+                    if !eval_predicate(residual, row, &schema_cols) {
+                        return Ok(());
+                    }
+                }
+                let mut narrowed = Vec::with_capacity(1 + field_specs.len() + order_idxs.len());
+                narrowed.push(row[key_idx].clone());
+                for (_, idx, _) in &field_specs {
+                    narrowed.push(row[*idx].clone());
+                }
+                for (idx, _) in &order_idxs {
+                    narrowed.push(row[*idx].clone());
+                }
+                child_rows.push(narrowed);
+                Ok(())
+            };
+        if use_index_probes {
+            let tbl = self
+                .catalog
+                .get_table(&nested.table)
+                .ok_or_else(|| QueryError::TableNotFound(nested.table.clone()))?;
+            // Strict-type gate: the hash build this path replaces uses
+            // strictly-typed Value equality (Int(4) never equals Float(4.0)),
+            // but the btree's Ord is cross-type numeric. Only probe with
+            // keys of the column's own type; any other key can never match
+            // and correctly falls through to the [] default.
+            let col_type = schema.columns[key_idx].type_id;
+            for key in parent_keys {
+                cancel.tick()?;
+                if key.type_id() != col_type {
                     continue;
                 }
+                for rid in tbl.index_lookup_all(&nested.child_key, key) {
+                    cancel.tick()?;
+                    // `tbl.get` reassembles spilled/overflow columns and
+                    // tolerates a stale rid (None) like the IndexScan path.
+                    if let Some(row) = tbl.get(rid) {
+                        narrow_into(&row, &mut child_rows)?;
+                    }
+                }
             }
-            let mut narrowed = Vec::with_capacity(1 + sources.len() + order_idxs.len());
-            narrowed.push(row[key_idx].clone());
-            for (_, idx, _) in &sources {
-                narrowed.push(row[*idx].clone());
+        } else {
+            for (_, row) in self
+                .catalog
+                .scan(&nested.table)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?
+            {
+                cancel.tick()?;
+                narrow_into(&row, &mut child_rows)?;
             }
-            for (idx, _) in &order_idxs {
-                narrowed.push(row[*idx].clone());
-            }
-            child_rows.push(narrowed);
         }
         self.charge_rows(&child_rows)?;
+        // Deeper levels only need arrays for correlation values that
+        // actually appear in the gathered rows; collecting them here is what
+        // lets a selective parent stay selective all the way down.
+        enum FieldSource {
+            Column,
+            Arrays(FxHashMap<Value, String>),
+        }
+        let mut sources: Vec<(&str, FieldSource)> = Vec::with_capacity(field_specs.len());
+        for (i, (name, _, inner)) in field_specs.iter().enumerate() {
+            match inner {
+                None => sources.push((name, FieldSource::Column)),
+                Some(inner) => {
+                    let mut inner_keys: rustc_hash::FxHashSet<Value> =
+                        rustc_hash::FxHashSet::default();
+                    for child in &child_rows {
+                        let value = &child[1 + i];
+                        if *value != Value::Empty {
+                            inner_keys.insert(value.clone());
+                        }
+                    }
+                    sources.push((
+                        name,
+                        FieldSource::Arrays(self.assemble_nested_arrays(inner, &inner_keys)?),
+                    ));
+                }
+            }
+        }
         // Bucket entries keep their per-parent sort key values (the
         // narrowed tail) until ordering and truncation are applied.
         let mut buckets: FxHashMap<Value, Vec<(Vec<Value>, String)>> =
@@ -2944,7 +3116,7 @@ impl Engine {
             cancel.tick()?;
             let sort_values = child.split_off(sort_tail);
             let mut object = String::from("{");
-            for (i, ((name, _, source), value)) in sources.iter().zip(&child[1..]).enumerate() {
+            for (i, ((name, source), value)) in sources.iter().zip(&child[1..]).enumerate() {
                 if i > 0 {
                     object.push(',');
                 }
@@ -2995,6 +3167,31 @@ impl Engine {
         }
         Ok(build)
     }
+
+    /// Whether per-parent-key index probes beat a full child-table scan for
+    /// one nested projection level. Mirrors the range chooser's use of live
+    /// `catalog.index_stats`: estimate the fetched row count as
+    /// `parent keys * average bucket size` and require it to undercut the
+    /// scan by 4x, pricing in the btree probe plus the random-access
+    /// `tbl.get` per rid versus the sequential mmap scan. A fleet-shaped
+    /// read (every parent selected) estimates at ~total entries and stays
+    /// on the scan; a selective parent estimates tiny and probes.
+    fn child_index_probe_pays_off(&self, table: &str, column: &str, n_keys: usize) -> bool {
+        if !self.catalog.has_index(table, column) {
+            return false;
+        }
+        let Some(stats) = self.catalog.index_stats(table, column) else {
+            return false;
+        };
+        if stats.distinct_keys == 0 {
+            // Empty index: every probe is a no-op and the scan has nothing
+            // indexable either (Empty keys never correlate).
+            return true;
+        }
+        let avg_bucket = stats.total_entries.div_ceil(stats.distinct_keys);
+        let estimated_fetch = (n_keys as u64).saturating_mul(avg_bucket);
+        estimated_fetch.saturating_mul(4) <= stats.total_entries
+    }
 }
 
 /// True when any nested field (at any depth) is an unresolved link traversal
@@ -3027,6 +3224,21 @@ pub(crate) fn scan_source_table(plan: &PlanNode) -> Option<&str> {
         | PlanNode::Offset { input, .. } => scan_source_table(input),
         _ => None,
     }
+}
+
+/// Distinct non-NULL values at column `idx` across `rows`. This is the set of
+/// correlation / FK keys a nested block or scalar link will ever look up, so
+/// threading it into the build side lets a selective parent skip child rows no
+/// parent references.
+fn distinct_non_null(rows: &[Vec<Value>], idx: usize) -> rustc_hash::FxHashSet<Value> {
+    let mut keys: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
+    for row in rows {
+        let key = &row[idx];
+        if *key != Value::Empty {
+            keys.insert(key.clone());
+        }
+    }
+    keys
 }
 
 /// Append `s` to `out` as a JSON string literal with the required escapes.
