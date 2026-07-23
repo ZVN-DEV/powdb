@@ -7210,6 +7210,140 @@ fn unique_eq_beats_non_unique_eq_beats_range() {
     );
 }
 
+/// PLAN-AUDIT 2026-07-23 (powdb-plan-quality-audit) regression, now FIXED and
+/// un-ignored. The old estimator modeled a non-unique equality as the UNIFORM
+/// average `total_entries / distinct_keys`, which is literal-blind. On a Zipfian
+/// column where one hot value covers most rows, the average is dragged down by
+/// the many rare keys, so a probe of the HOT literal was estimated far too low
+/// and the chooser drove the scan from the hot conjunct instead of the genuinely
+/// selective one. `eq_candidate_est` now counts the actual literal (bounded), so
+/// the selective conjunct `b` (~100 rows) drives over the hot `a = 0` (~1900).
+#[test]
+fn skew_hot_literal_should_not_drive_conjunction_over_selective_column() {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type T { required a: int, b: int, id: int }")
+        .unwrap();
+    engine.execute_powql("alter T add index .a").unwrap();
+    engine.execute_powql("alter T add index .b").unwrap();
+    // 1900 hot rows (a = 0), 100 rows with a unique `a`. `b` is uniform 0..=19.
+    engine.execute_powql("begin").unwrap();
+    for id in 0..2000i64 {
+        let a = if id < 1900 { 0 } else { id - 1899 }; // 1..=100 for the tail
+        let b = id % 20;
+        engine
+            .execute_powql(&format!("insert T {{ a := {a}, b := {b}, id := {id} }}"))
+            .unwrap();
+    }
+    engine.execute_powql("commit").unwrap();
+
+    let lowered = lower(&engine, "T filter .a = 0 and .b = 5");
+    assert_eq!(
+        driving_column(&lowered),
+        "b",
+        "the selective conjunct `b` (~100 rows) should drive, not the hot `a = 0` \
+         (~1900 rows): {lowered:?}"
+    );
+}
+
+/// `Skew { s, id }` with `s` indexed: `hot` of the `hot_rows` rows carry `s = 0`,
+/// the rest carry a distinct `s`. Total rows = `hot_rows + tail`.
+fn skew_engine(hot_rows: i64, tail: i64) -> Engine {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type Skew { required s: int, id: int }")
+        .unwrap();
+    engine.execute_powql("alter Skew add index .s").unwrap();
+    engine.execute_powql("begin").unwrap();
+    for id in 0..(hot_rows + tail) {
+        let s = if id < hot_rows { 0 } else { id - hot_rows + 1 };
+        engine
+            .execute_powql(&format!("insert Skew {{ s := {s}, id := {id} }}"))
+            .unwrap();
+    }
+    engine.execute_powql("commit").unwrap();
+    engine
+}
+
+/// A lone equality on a HOT literal (> half the table) must NOT stay a naive
+/// index scan: the compiled `Filter(SeqScan)` is faster. Correctness is
+/// unchanged (the compiled predicate matches the same rows).
+#[test]
+fn single_hot_equality_falls_back_to_seq_scan() {
+    let engine = skew_engine(90, 10); // s = 0 matches 90 of 100 rows
+    let lowered = lower(&engine, "Skew filter .s = 0");
+    assert!(
+        matches!(&lowered, PlanNode::Filter { input, .. } if matches!(input.as_ref(), PlanNode::SeqScan { .. })),
+        "a hot lone equality should lower to a compiled Filter(SeqScan): {lowered:?}"
+    );
+}
+
+/// A lone equality on a RARE literal (<= half the table) must STILL use the
+/// index -- the guard must not over-correct selective point lookups off it.
+#[test]
+fn rare_lone_equality_still_uses_index() {
+    let engine = skew_engine(90, 10); // s = 3 matches exactly 1 of 100 rows
+    let lowered = lower(&engine, "Skew filter .s = 3");
+    assert!(
+        matches!(&lowered, PlanNode::IndexScan { column, .. } if column == "s"),
+        "a rare lone equality must keep its index scan: {lowered:?}"
+    );
+}
+
+/// A NULL-heavy column: a real, rare value keeps the index (its non-null side is
+/// tiny), and `= null` is left exactly as before (the empty/missing sentinel is
+/// never treated as hot).
+#[test]
+fn null_heavy_column_selective_value_keeps_index_and_eq_null_unchanged() {
+    let mut engine = engine_only();
+    engine
+        .execute_powql("type N { required id: int, opt: int }")
+        .unwrap();
+    engine.execute_powql("alter N add index .opt").unwrap();
+    engine.execute_powql("begin").unwrap();
+    for id in 0..100i64 {
+        if id < 90 {
+            // opt omitted -> missing/null; lands in the index's empty side list.
+            engine
+                .execute_powql(&format!("insert N {{ id := {id} }}"))
+                .unwrap();
+        } else {
+            // 10 distinct real values 1..=10, each matching exactly one row.
+            engine
+                .execute_powql(&format!("insert N {{ id := {id}, opt := {} }}", id - 89))
+                .unwrap();
+        }
+    }
+    engine.execute_powql("commit").unwrap();
+
+    // Rare real value: 1 of 10 non-null entries -> keeps the index.
+    let real = lower(&engine, "N filter .opt = 5");
+    assert!(
+        matches!(&real, PlanNode::IndexScan { column, .. } if column == "opt"),
+        "a rare real value in a null-heavy column must keep its index: {real:?}"
+    );
+
+    // `= null` is the planner's own null path (`Filter(SeqScan)` with an
+    // `IsNull` predicate), not an equality index probe. The hot guard only ever
+    // rewrites a countable `Field = literal` into an `Eq`-predicated seq scan, so
+    // the null path must stay exactly as the planner emitted it: an `IsNull`
+    // predicate, never the guard's `Eq` rewrite.
+    let null = lower(&engine, "N filter .opt = null");
+    match &null {
+        PlanNode::Filter { input, predicate } => {
+            assert!(
+                matches!(input.as_ref(), PlanNode::SeqScan { .. }),
+                "`= null` keeps the planner's SeqScan: {null:?}"
+            );
+            assert!(
+                matches!(predicate, Expr::UnaryOp(crate::ast::UnaryOp::IsNull, _)),
+                "`= null` must keep the planner's IsNull predicate, not the guard's Eq: {null:?}"
+            );
+        }
+        other => panic!("expected the planner's Filter(SeqScan) null path: {other:?}"),
+    }
+}
+
 #[test]
 fn same_column_between_pair_merges_and_empties_the_residual() {
     // A hand-built `Filter(SeqScan)` whose predicate is a same-column
