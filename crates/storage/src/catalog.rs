@@ -2314,6 +2314,43 @@ impl Catalog {
         )
     }
 
+    /// Capped count of column-index entries equal to `key`, or `None` when
+    /// `column` has no index. `O(min(count, cap))` allocation-free leaf walk used
+    /// by the planner's skew guard to detect a hot literal without materialising
+    /// its (possibly huge) RowId list. Routes to the raw-key counter for a unique
+    /// index and the composite-prefix counter for a non-unique one.
+    pub fn index_key_count_capped(
+        &self,
+        table: &str,
+        column: &str,
+        key: &Value,
+        cap: usize,
+    ) -> Option<usize> {
+        let unique = self.is_index_unique(table, column)?;
+        let tree = self.get_table(table)?.index(column)?;
+        Some(if unique {
+            tree.count_key_capped(key, cap)
+        } else {
+            tree.count_prefix_capped(key, cap)
+        })
+    }
+
+    /// Capped count of expression-index entries equal to `key` (a raw-key tree
+    /// whose duplicate keys repeat physically). `O(min(count, cap))`.
+    pub fn expression_index_key_count_capped(
+        &self,
+        table: &str,
+        index_id: u64,
+        key: &Value,
+        cap: usize,
+    ) -> Option<usize> {
+        Some(
+            self.get_table(table)?
+                .expression_index_btree(index_id)?
+                .count_key_capped(key, cap),
+        )
+    }
+
     pub fn expression_index_btree_mut(&mut self, table: &str, index_id: u64) -> Option<&mut BTree> {
         self.get_table_mut(table)?
             .expression_index_btree_mut(index_id)
