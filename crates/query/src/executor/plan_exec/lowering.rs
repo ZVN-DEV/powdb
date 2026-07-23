@@ -72,6 +72,100 @@ fn range_candidate_resolves(catalog: &Catalog, scan: &PlanNode) -> bool {
 /// the maximum, so tier and build order decide, matching v0.14 behavior.
 const UNKNOWN_EST: u64 = u64::MAX;
 
+/// Fraction-of-total skew guard. An equality driver whose probe returns more
+/// than `total_entries / HOT_DIVISOR` rows is not selective: one sequential pass
+/// (a compiled `Filter(SeqScan)`) beats reading that many rows by random rid and
+/// re-checking the residual per row. `2` (half the table) is deliberately
+/// conservative -- it only rejects a driver that is provably worse than a full
+/// scan, so a rare / selective equality is never pushed off its index. This
+/// replaces the old skew-BLIND uniform average (`total_entries / distinct_keys`),
+/// which estimated a hot Zipfian literal at the rare-key average and drove the
+/// wrong conjunct; the guard counts the actual literal instead.
+const HOT_DIVISOR: u64 = 2;
+
+/// Rows above which an equality probe is treated as "hot" (not selective).
+fn hot_threshold(total_entries: u64) -> u64 {
+    total_entries / HOT_DIVISOR
+}
+
+/// Counting cap for a skew probe: one past the hot threshold, so a hot literal
+/// saturates exactly when we can already conclude it is hot. Bounds each leaf
+/// walk to `O(total_entries / HOT_DIVISOR)`.
+fn probe_cap(total_entries: u64) -> usize {
+    hot_threshold(total_entries).saturating_add(1) as usize
+}
+
+/// Skew-aware rows an equality probe of `key` returns against the plain-column
+/// index `(table, column)`. Unique -> 1; the empty/missing sentinel -> its exact
+/// side-list length; a concrete non-empty literal -> the EXACT index count
+/// capped at `probe_cap` (a hot literal saturates at the cap). Falls back to the
+/// uniform average only when `key` is not a countable literal (e.g. an
+/// unsubstituted parameter), preserving prior behavior there. Single skew-aware
+/// source shared by the conjunction chooser and the `explain` annotation so the
+/// ranking and the printed value never disagree.
+fn column_eq_est(catalog: &Catalog, table: &str, column: &str, key: &Expr, unique: bool) -> u64 {
+    let Some(stats) = catalog.index_stats(table, column) else {
+        return UNKNOWN_EST;
+    };
+    if unique {
+        return 1;
+    }
+    match literal_to_value(key) {
+        Ok(Value::Empty) => stats.empty_count,
+        Ok(value) => catalog
+            .index_key_count_capped(table, column, &value, probe_cap(stats.total_entries))
+            .map_or_else(|| eq_est_rows(&stats, false, false), |count| count as u64),
+        Err(_) => eq_est_rows(&stats, false, false),
+    }
+}
+
+/// Whether a lone plain-column equality `column = key` is "hot": its literal
+/// matches more than half the indexed rows, so a compiled sequential scan beats
+/// the index scan. False for unique indexes, the empty/missing sentinel, a
+/// non-literal key, or an unindexed / statless column -- all of which keep the
+/// index unchanged. Bounded `O(threshold)` index walk.
+fn hot_lone_equality(catalog: &Catalog, table: &str, column: &str, key: &Expr) -> bool {
+    if catalog.is_index_unique(table, column) != Some(false) {
+        return false; // unique, or column not resolvable as an index
+    }
+    if probes_empty_sentinel(key) {
+        return false; // `= null` keeps its existing empty-list semantics
+    }
+    let Some(stats) = catalog.index_stats(table, column) else {
+        return false;
+    };
+    let Ok(value) = literal_to_value(key) else {
+        return false; // non-literal (e.g. parameter) probe: leave unchanged
+    };
+    match catalog.index_key_count_capped(table, column, &value, probe_cap(stats.total_entries)) {
+        Some(count) => count as u64 > hot_threshold(stats.total_entries),
+        None => false,
+    }
+}
+
+/// Skew-aware equality estimate for an expression (JSON-path) index, mirroring
+/// `column_eq_est`.
+fn expr_eq_est(catalog: &Catalog, table: &str, index_id: u64, unique: bool, key: &Expr) -> u64 {
+    let Some(stats) = catalog.expression_index_stats(table, index_id) else {
+        return UNKNOWN_EST;
+    };
+    if unique {
+        return 1;
+    }
+    match literal_to_value(key) {
+        Ok(Value::Empty) => stats.empty_count,
+        Ok(value) => catalog
+            .expression_index_key_count_capped(
+                table,
+                index_id,
+                &value,
+                probe_cap(stats.total_entries),
+            )
+            .map_or_else(|| eq_est_rows(&stats, false, false), |count| count as u64),
+        Err(_) => eq_est_rows(&stats, false, false),
+    }
+}
+
 /// Whether an index probe literal targets the empty / missing / JSON-null
 /// sentinel (`Value::Empty`), whose rows live in the tree's separate empty list.
 fn probes_empty_sentinel(key: &Expr) -> bool {
@@ -96,20 +190,21 @@ fn eq_est_rows(stats: &IndexStats, unique: bool, empty_probe: bool) -> u64 {
 
 /// Estimated rows an equality candidate's index probe returns, used to rank
 /// conjunction drivers by selectivity. `tier == 0` marks a unique index (the
-/// uniqueness source shared with `explain`).
+/// uniqueness source shared with `explain`). Skew-aware: a non-unique probe
+/// counts the actual literal (capped) instead of the old uniform average.
 fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, tier: u8) -> u64 {
-    let (stats, key) = match scan {
-        PlanNode::IndexScan { table, column, key } => (catalog.index_stats(table, column), key),
-        PlanNode::ExprIndexScan { table, path, key } => (
-            resolve_expression_index(catalog, table, path)
-                .and_then(|meta| catalog.expression_index_stats(table, meta.index_id)),
-            key,
-        ),
-        _ => return UNKNOWN_EST,
-    };
-    stats.map_or(UNKNOWN_EST, |stats| {
-        eq_est_rows(&stats, tier == 0, probes_empty_sentinel(key))
-    })
+    match scan {
+        PlanNode::IndexScan { table, column, key } => {
+            column_eq_est(catalog, table, column, key, tier == 0)
+        }
+        PlanNode::ExprIndexScan { table, path, key } => {
+            match resolve_expression_index(catalog, table, path) {
+                Some(meta) => expr_eq_est(catalog, table, meta.index_id, meta.unique, key),
+                None => UNKNOWN_EST,
+            }
+        }
+        _ => UNKNOWN_EST,
+    }
 }
 
 /// Estimated rows a range candidate scans: its index's total entries (range
@@ -233,13 +328,14 @@ struct ConjunctionCandidate {
 /// no conjunct resolves to an existing index, so the caller keeps today's
 /// `Filter(SeqScan)` byte-identical.
 ///
-/// Selection ranks candidates by `(estimated rows, tier, build order)`, reading
-/// coarse per-index stats (O(1) counter fields): a unique equality estimates 1,
-/// a non-unique equality estimates average rows per key, and a range estimates
-/// its index's full size so an equality still wins. Ties fall back to v0.14's
-/// tier order (equality before range) then conjunct order. A wrong pick is only
-/// ever slower, never wrong: the residual re-checks the full conjunction on
-/// each fetched row.
+/// Selection ranks candidates by `(tier, estimated rows, build order)`: a
+/// unique equality estimates 1, a non-unique equality estimates the EXACT count
+/// of its literal (capped via a bounded `O(threshold)` index walk, so a hot
+/// Zipfian value no longer hides behind the uniform average), and a range
+/// estimates its index's full size so an equality still wins. Ranking is
+/// tier-first (equality before range, unique before non-unique) then estimate
+/// then conjunct order. A wrong pick is only ever slower, never wrong: the
+/// residual re-checks the full conjunction on each fetched row.
 fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> Option<PlanNode> {
     let mut conjuncts: Vec<&Expr> = Vec::new();
     flatten_and(predicate, &mut conjuncts);
@@ -337,13 +433,18 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
         });
     }
 
-    // Lowest estimated rows wins; ties fall back to tier then build order, and
-    // `min_by_key` keeps the first element on a full tie, which is the
-    // earliest-built candidate (equalities in conjunct order, then ranges).
+    // Rank by (tier, estimated rows, build order): a unique equality (tier 0)
+    // beats any non-unique probe, a non-unique equality (tier 1) beats a range
+    // (tier 2), and within a tier the lower skew-aware estimate wins. Tier leads
+    // so that a non-unique literal that happens to match zero rows never
+    // leapfrogs a guaranteed-<=1-row unique index. `min_by_key` keeps the first
+    // element on a full tie (earliest-built: equalities in conjunct order, then
+    // ranges). A wrong pick is only ever slower, never wrong: the residual
+    // re-checks the full conjunction on each fetched row.
     let winner = candidates
         .into_iter()
         .enumerate()
-        .min_by_key(|(build_order, candidate)| (candidate.est, candidate.tier, *build_order))?
+        .min_by_key(|(build_order, candidate)| (candidate.tier, candidate.est, *build_order))?
         .1;
 
     let mut residual: Vec<Expr> = Vec::new();
@@ -506,7 +607,27 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
         PlanNode::IndexScan { table, column, key } => {
             if let Some(tbl) = catalog.get_table(table) {
                 if tbl.has_index(column) {
-                    return plan.clone();
+                    // Skew guard: a lone equality on a HOT literal (one that
+                    // matches more than half the table) runs faster as a
+                    // compiled `Filter(SeqScan)` -- one sequential pass with the
+                    // compiled predicate -- than as an index scan that reads most
+                    // rows by random rid. Rare / selective literals (<= half) keep
+                    // the index. Unique indexes (<=1 row) and the empty/missing
+                    // sentinel (`= null`, its own side list) are never hot, so
+                    // they are left exactly as before.
+                    if !hot_lone_equality(catalog, table, column, key) {
+                        return plan.clone();
+                    }
+                    return PlanNode::Filter {
+                        input: Box::new(PlanNode::SeqScan {
+                            table: table.clone(),
+                        }),
+                        predicate: Expr::BinaryOp(
+                            Box::new(Expr::Field(column.clone())),
+                            BinOp::Eq,
+                            Box::new(key.clone()),
+                        ),
+                    };
                 }
             }
             PlanNode::Filter {
@@ -797,7 +918,7 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             match catalog.index_stats(table, column) {
                 Some(stats) => {
                     let unique = catalog.is_index_unique(table, column) == Some(true);
-                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
+                    let est = column_eq_est(catalog, table, column, key, unique);
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys
@@ -841,10 +962,10 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             match meta.and_then(|m| {
                 catalog
                     .expression_index_stats(table, m.index_id)
-                    .map(|stats| (m.unique, stats))
+                    .map(|stats| (m.index_id, m.unique, stats))
             }) {
-                Some((unique, stats)) => {
-                    let est = eq_est_rows(&stats, unique, probes_empty_sentinel(key));
+                Some((index_id, unique, stats)) => {
+                    let est = expr_eq_est(catalog, table, index_id, unique, key);
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys

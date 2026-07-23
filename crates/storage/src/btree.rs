@@ -1668,6 +1668,63 @@ impl BTree {
         self.lookup_prefix(&Value::Int(col_val))
     }
 
+    /// Count entries whose non-unique composite value-prefix equals `col_val`,
+    /// stopping once `cap` matches are seen (the return value never exceeds
+    /// `cap`). Allocation-free leaf walk mirroring `lookup_prefix`; the planner's
+    /// skew guard uses it to detect a hot literal in `O(min(count, cap))` without
+    /// materialising the (possibly huge) RowId list.
+    pub fn count_prefix_capped(&self, col_val: &Value, cap: usize) -> usize {
+        let start = Self::make_prefix_start(col_val);
+        let end = Self::make_prefix_end(col_val);
+        self.count_range_capped(&start, &end, cap)
+    }
+
+    /// Count entries whose raw key equals `key`, capped at `cap`. Mirrors
+    /// `lookup_all` for unique / expression (raw-key) trees, where equal keys
+    /// repeat physically along the leaf chain.
+    pub fn count_key_capped(&self, key: &Value, cap: usize) -> usize {
+        self.count_range_capped(key, key, cap)
+    }
+
+    /// Shared allocation-free counter for `count_prefix_capped` /
+    /// `count_key_capped`: descend to the leaf holding the first key `>= start`,
+    /// then walk the leaf chain counting keys in `[start, end]`, stopping as soon
+    /// as `cap` is reached. Never clones a key or allocates.
+    fn count_range_capped(&self, start: &Value, end: &Value, cap: usize) -> usize {
+        if cap == 0 {
+            return 0;
+        }
+        let mut node_id = self.root;
+        while let Node::Internal { keys, children } = &self.nodes[node_id] {
+            let pos = keys.partition_point(|k| k <= start);
+            node_id = children[pos];
+        }
+        let mut count = 0usize;
+        let mut current = Some(node_id);
+        while let Some(nid) = current {
+            match &self.nodes[nid] {
+                Node::Leaf {
+                    keys, next_leaf, ..
+                } => {
+                    for k in keys {
+                        if k > end {
+                            return count;
+                        }
+                        if k >= start {
+                            count += 1;
+                            if count >= cap {
+                                return count;
+                            }
+                        }
+                    }
+                    current = *next_leaf;
+                }
+                _ => break,
+            }
+        }
+        count
+    }
+
     /// Range scan over a NON-unique index: return RowIds for all entries
     /// whose column value lies in [start, end] (inclusive; pass None for
     /// an unbounded side). Composite-key bounds reuse the prefix encoding:
@@ -3241,6 +3298,45 @@ mod tests {
             tmp.push(".tmp");
             let _ = std::fs::remove_file(path.with_file_name(tmp));
         }
+    }
+
+    #[test]
+    fn count_prefix_capped_is_exact_below_cap_and_saturates_above() {
+        // Skew-shaped non-unique index: value 0 is hot (30 rows), value 7 rare
+        // (1 row). The planner's skew guard relies on exact-below-cap counting
+        // and saturation at the cap.
+        let mut bt = temp_btree("count_prefix_capped");
+        for slot in 0..30u16 {
+            bt.insert_non_unique_int(0, stat_rid(0, slot));
+        }
+        bt.insert_non_unique_int(7, stat_rid(1, 0));
+
+        // Below the cap: the exact count is returned.
+        assert_eq!(bt.count_prefix_capped(&Value::Int(7), 100), 1);
+        assert_eq!(bt.count_prefix_capped(&Value::Int(0), 100), 30);
+        // A missing value counts zero.
+        assert_eq!(bt.count_prefix_capped(&Value::Int(999), 100), 0);
+        // At/above the cap: the walk stops and the return never exceeds the cap.
+        assert_eq!(bt.count_prefix_capped(&Value::Int(0), 10), 10);
+        assert_eq!(bt.count_prefix_capped(&Value::Int(0), 30), 30);
+        // A zero cap short-circuits.
+        assert_eq!(bt.count_prefix_capped(&Value::Int(0), 0), 0);
+        cleanup(&bt);
+    }
+
+    #[test]
+    fn count_key_capped_counts_duplicate_raw_keys() {
+        // Raw-key (expression-style) tree: equal keys repeat physically.
+        let mut bt = temp_btree("count_key_capped");
+        for slot in 0..5u16 {
+            bt.insert_duplicate(Value::Int(42), stat_rid(0, slot));
+        }
+        bt.insert_duplicate(Value::Int(99), stat_rid(1, 0));
+        assert_eq!(bt.count_key_capped(&Value::Int(42), 100), 5);
+        assert_eq!(bt.count_key_capped(&Value::Int(42), 3), 3); // saturates at cap
+        assert_eq!(bt.count_key_capped(&Value::Int(99), 100), 1);
+        assert_eq!(bt.count_key_capped(&Value::Int(0), 100), 0);
+        cleanup(&bt);
     }
 
     #[test]
