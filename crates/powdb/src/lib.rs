@@ -20,6 +20,18 @@
 //! # Ok::<(), powdb::Error>(())
 //! ```
 //!
+//! ## Concurrency
+//!
+//! The embedded facade is single-writer at **compile time**, not via a
+//! runtime lock: [`Database::query`] takes `&mut self`, so the borrow checker
+//! guarantees a writer never runs concurrently with any other call on the
+//! same handle. There is no internal mutex to contend on and no admission
+//! gate (that exists only in `powdb-server`). Read-only fan-out works through
+//! `&self` ([`Database::query_readonly`]), so shared references can read in
+//! parallel. To share a writable handle across threads, supply your own
+//! synchronization (e.g. `Arc<RwLock<Database>>`); handing out `&mut` without
+//! it will not compile, which is the point.
+//!
 //! ## Panic safety
 //!
 //! The server crate is built crash-only (`panic = "abort"`): a panic exits the

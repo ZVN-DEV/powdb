@@ -337,7 +337,7 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 **DDL**
 - `type` (create table), `drop` (drop table)
 - `alter <T> add column`, `alter <T> drop column` (with full heap rewrite)
-- `alter <T> add index` / `add unique` / `drop index` for stored columns and scalar JSON paths
+- `alter <T> add index` / `add unique` for stored columns and scalar JSON paths; `drop index` for JSON-path (expression) indexes only
 
 **Server**
 - Tokio async TCP with `Arc<RwLock<Engine>>` for parallel readers

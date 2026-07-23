@@ -308,13 +308,14 @@ alter User add index .email                     -- column index
 alter User add unique .email                    -- unique column index
 alter Post add index (.data->author->name)      -- expression (JSON path) index
 alter Post add unique (.data->external_id)       -- unique expression index
-alter User drop index .email
 alter Post drop index (.data->author->name)
 ```
 
 Parentheses are required for a path index and are reserved for that syntax.
 `add index`/`add unique` accept `if not exists`; `drop index` accepts `if
-exists`. Point lookups and range filters use an index automatically: there is
+exists`. `drop index` only supports expression (JSON path) indexes: dropping a
+stored-column index (`alter User drop index .email`) returns an error, so a
+migration layer must model column indexes as create-only. Point lookups and range filters use an index automatically: there is
 no hint syntax. Expression indexes cover equality, range, and ordered
 `order path limit K` scans.
 
@@ -448,13 +449,16 @@ human-readable.
 A driver should surface these behaviors to its users rather than hide them,
 because they change how an application should retry and pool connections.
 
-- **Single-writer, FIFO admission.** Writes on one server process funnel through
-  a fair admission gate: a write acquires exclusive admission, readers do not.
-  Contended writes **queue** behind the in-flight writer rather than failing , 
-  the gate is fair, so a queued writer is not starved by later readers. A
-  contended write is a wait, not an error. (The gate exists only in the server;
-  it disappears for the in-process embedded addon, where your single handle owns
-  the engine.)
+- **Single-writer admission.** Writes on one server process funnel through an
+  admission gate: a write acquires exclusive admission, readers do not.
+  Contended writes **queue** behind the in-flight writer rather than failing;
+  a contended write is a wait, not an error. In the current implementation the
+  gate admits in FIFO order, so a queued writer is not starved by later
+  readers, but that ordering is **observed behavior, not a documented
+  guarantee**: the contract is only that a wait is bounded by the configured
+  timeout (below). Do not build a driver feature that depends on admission
+  order. (The gate exists only in the server; it disappears for the in-process
+  embedded addon, where your single handle owns the engine.)
 - **Concurrent reads.** Read-classified statements admit concurrently and scan
   in parallel; they never take the writer's exclusive admission.
 - **Bounded autocommit wait.** A bare (non-transaction) write that waits too

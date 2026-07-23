@@ -586,6 +586,11 @@ powdb-server --tx-wait-timeout-ms 2000
 The `powdb_tx_gate_timeouts_total` metric counts these timeouts from both the
 explicit-`begin` and autocommit paths (see `--metrics-addr`).
 
+> **Note on admission order:** in the current implementation the gate admits
+> waiters in FIFO order, so a queued writer is not starved by later readers.
+> That ordering is observed behavior, not a documented guarantee; the
+> contract is only that any wait is bounded by the timeout above.
+
 ### Serving a named database
 
 One server process serves a single database. By default it accepts any

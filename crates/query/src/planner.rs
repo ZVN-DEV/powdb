@@ -113,6 +113,22 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
 }
 
 fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
+    // The parser lifts a single unaliased projection field into the aggregate
+    // argument (`sum(Order as o { o.user.name })`), so a link path or nested
+    // block can arrive here as the argument itself. Aggregating over one used
+    // to silently produce 0; reject it like the projection-level case below.
+    if let Some(agg) = q.aggregation.as_ref() {
+        if matches!(
+            agg.argument,
+            Some(Expr::LinkPath { .. }) | Some(Expr::NestedQuery(_))
+        ) {
+            return Err(PlanError::Semantic(
+                "aggregates over a nested or link projection are not supported: \
+                 aggregate a plain column instead (e.g. `sum(Order { .total })`)"
+                    .into(),
+            ));
+        }
+    }
     // Language-lab slice: projections carrying a nested sub-query field take
     // a dedicated path so every other query shape plans exactly as before.
     if q.projection.as_ref().is_some_and(|proj| {
@@ -460,7 +476,19 @@ fn resolve_scan_qualifiers(expr: &mut Expr, visible: &str) -> Result<(), PlanErr
 /// `NestedProject` layer. Emitted speculatively like `RangeScan`: the planner
 /// stays catalog-pure and the executor resolves tables/columns at run time.
 fn plan_nested_query(q: QueryExpr) -> Result<PlanNode, PlanError> {
-    if !q.joins.is_empty() || q.group_by.is_some() || q.aggregation.is_some() || q.distinct {
+    if q.aggregation.is_some() {
+        // Correct-by-default: an aggregate cannot see a nested or link
+        // projection, so `count(Order as o { o.user.name })` would silently
+        // count parent rows. Reject instead of ignoring the projection.
+        return Err(PlanError::Semantic(
+            "aggregates over a nested or link projection are not supported: the \
+             aggregate would ignore the projection and count parent rows; \
+             aggregate the parent table directly (e.g. `count(Order)`) or run \
+             the projection without an aggregate"
+                .into(),
+        ));
+    }
+    if !q.joins.is_empty() || q.group_by.is_some() || q.distinct {
         return Err(PlanError::Semantic(
             "nested projections require a plain aliased table scan (no joins, \
              group, distinct, or aggregation)"

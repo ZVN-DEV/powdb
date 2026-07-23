@@ -850,12 +850,14 @@ fn explain_join_strategy(
 fn format_nested_projection(nested: &NestedProjection, depth: usize, out: &mut String) {
     use std::fmt::Write;
     let indent = "  ".repeat(depth);
-    // An unresolved block link traversal has placeholder correlation columns
-    // (EXPLAIN never resolves against the catalog); show the link instead.
+    // A block link traversal has placeholder correlation columns until the
+    // executor resolves the link from the catalog (the planner never touches
+    // the catalog), so show what IS known at plan time: the declared path.
     if let Some(via) = &nested.via_link {
         let _ = writeln!(
             out,
-            "{indent}nested {}: via link {}.{} (unresolved)",
+            "{indent}nested {}: to-many link {}.{} (child table + correlation \
+             resolved from catalog at execution)",
             nested.name, via.outer_alias, via.link_name
         );
         for field in &nested.fields {
@@ -1037,12 +1039,19 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                         format_nested_projection(nested, depth + 1, &mut out);
                     }
                     NestedProjectField::Link(link) => {
+                        // Links resolve at execution time (the planner never
+                        // touches the catalog), so EXPLAIN shows the declared
+                        // hop path rather than faking a resolved target.
                         let pad = "  ".repeat(depth + 1);
                         out.push_str(&format!(
-                            "{pad}link {}: {}.{}.{} (unresolved scalar link path)\n",
+                            "{pad}link {}: scalar to-one path {}.{}.{} \
+                             (hops [{}] -> column {}; targets resolved from \
+                             catalog at execution)\n",
                             link.name,
                             link.outer_alias,
                             link.links.join("."),
+                            link.column,
+                            link.links.join(", "),
                             link.column
                         ));
                     }
