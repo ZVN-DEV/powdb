@@ -910,7 +910,10 @@ levels); pathological depth is a clean parse error, not a crash.
   joined parent is rejected; nest instead of joining.
 - Every nested block needs a field name (`orders: Order as o ...`).
 - The outer query composes with its own `filter`/`order`/`limit`/`offset` on
-  parent columns, but not with `group`, `distinct`, or aggregation.
+  parent columns, but not with `group`, `distinct`, or aggregation. Wrapping
+  the whole projection in an aggregate (`count(Order as o { o.user.name })`)
+  is likewise an error, never a silent parent-row count; aggregate the parent
+  directly (`count(Order)`) instead.
 - Not available through the SQL frontend (see below).
 
 ### Execution and EXPLAIN
@@ -996,6 +999,11 @@ Order as o { o.id, o.user.company.name }     -- multi-hop
 
 Result: one value per row, read through the relationship. In SQL this is a JOIN
 written solely to read one column.
+
+The outer alias is required. A bare dotted path (`Order { .user.name }`) is a
+parse error, not a link traversal: without an alias the spelling is ambiguous
+with two comma-less fields (`.user, .name`), so PowDB asks you to alias the
+table and qualify the path (`Order as o { o.user.name }`).
 
 ### Block (to-many)
 
@@ -1762,14 +1770,17 @@ The command first scans the existing data — if any duplicate (non-null) value 
 
 #### Drop Index
 
-Remove a column or JSON-path index:
+Remove a JSON-path (expression) index:
 
 ```powql
-alter User drop index .email
-alter User drop index if exists .email
 alter Post drop index (.data->author->name)
 alter Post drop index if exists (.data->author->name)
 ```
+
+Dropping a **stored-column** index (`alter User drop index .email`) is not
+supported and returns an error (`dropping stored-column indexes is not
+supported`), with or without `if exists`. To remove a column index, drop and
+recreate the table.
 
 ### DROP TABLE
 

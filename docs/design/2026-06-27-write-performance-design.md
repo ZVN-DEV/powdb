@@ -261,6 +261,17 @@ item. Targets: `create`/`update` p50 < 0.3 ms in NORMAL mode; durable-write thro
 client concurrency in FULL mode. Add a concurrent-writer throughput bench (current suite is
 single-connection and therefore *understates* the lock-serialisation problem).
 
+**Future work (testing): loom model of the WAL `sync_until` path.** The group-commit
+leader/follower scheme (`WalSyncShared::sync_until`, `crates/storage/src/wal.rs`) is the
+concurrency-critical core of the write path: double-checked `synced_gen` loads around the
+`sync_file` leader lock, a `dirty_gen` snapshot before the fsync, and `fetch_max` publication.
+When loom is introduced to this codebase, model this path first: it is small enough to model
+exhaustively, and a missed ordering here silently weakens the durability acknowledgment
+contract (commit acked only after a covering fsync). A loom test would also pin the
+write-gate admission-ordering assumptions that today rest on tokio semaphore internals, so a
+future tokio upgrade that changes `try_acquire` barging behavior fails CI instead of shipping
+a reader-starves-writer regression.
+
 ---
 
 ## Appendix — measurement method

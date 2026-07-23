@@ -836,8 +836,9 @@ impl Parser {
                     _ => unreachable!("guarded by the matches! above"),
                 };
                 self.advance(); // consume ':'
-                                // `alias: Ident as ...` is a nested sub-query projection
-                                // (language-lab slice): `orders: Order as o filter ... { ... }`.
+                self.reject_bare_dotted_path()?;
+                // `alias: Ident as ...` is a nested sub-query projection
+                // (language-lab slice): `orders: Order as o filter ... { ... }`.
                 let expr = if matches!(self.peek(), Token::Ident(_))
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::As))
                 {
@@ -869,6 +870,7 @@ impl Parser {
                             .into(),
                     });
                 }
+                self.reject_bare_dotted_path()?;
                 let expr = if self.at_scalar_link_path() {
                     // `o.user.name`: scalar link traversal, named by its
                     // dotted spelling when no alias is written.
@@ -884,6 +886,28 @@ impl Parser {
         }
         self.expect(&Token::RBrace)?;
         Ok(fields)
+    }
+
+    /// Reject a projection slot that starts with two adjacent dotted parts
+    /// (`.user.name`). The token stream cannot distinguish an intended link
+    /// path from two comma-less bare fields (`.user .name` lexes identically),
+    /// and a link path needs the aliased form to name its outer scan, so this
+    /// used to silently parse as TWO separate fields and project Empty
+    /// columns. A hard error with guidance beats the silent wrong shape.
+    fn reject_bare_dotted_path(&self) -> Result<(), ParseError> {
+        if let (Token::DotIdent(first), Some(Token::DotIdent(second))) =
+            (self.peek(), self.tokens.get(self.pos + 1))
+        {
+            return Err(ParseError::Syntax {
+                message: format!(
+                    "`.{first}.{second}` is ambiguous in a projection: for a link \
+                     path, alias the table and qualify the path \
+                     (`Order as o {{ o.{first}.{second} }}`); for separate fields, \
+                     separate them with commas (`.{first}, .{second}`)"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Conservative lookahead for a block link-traversal projection value:
@@ -1029,6 +1053,7 @@ impl Parser {
             } else {
                 None
             };
+            self.reject_bare_dotted_path()?;
             let expr = qualify_bare_fields(self.parse_expr()?, &child_alias);
             fields.push(ProjectionField { alias, expr });
             if *self.peek() == Token::Comma {
@@ -1133,6 +1158,7 @@ impl Parser {
                 }
                 Expr::NestedQuery(Box::new(self.parse_nested_query()?))
             } else {
+                self.reject_bare_dotted_path()?;
                 self.parse_expr()?
             };
             fields.push(ProjectionField { alias, expr });
@@ -2709,6 +2735,49 @@ mod tests {
             Statement::Query(q) => {
                 let proj = q.projection.unwrap();
                 assert_eq!(proj.len(), 2);
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_bare_dotted_path_projection_is_a_parse_error() {
+        // `.user.name` without an outer alias is token-identical to two
+        // comma-less fields, so it is rejected with alias guidance instead of
+        // silently parsing as two fields (2026-07-23 plan-quality audit P3).
+        for q in [
+            "Order { .user.name }",
+            "Order { .id, uname: .user.name }",
+            "Order { uname: .user.company.name }",
+        ] {
+            let err = parse(q).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("alias the table"),
+                "`{q}` should error with alias guidance, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aliased_scalar_link_path_parses_as_one_field() {
+        let stmt = parse("Order as o { uname: o.user.name }").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let proj = q.projection.unwrap();
+                assert_eq!(proj.len(), 1);
+                match &proj[0].expr {
+                    Expr::LinkPath {
+                        outer_alias,
+                        links,
+                        column,
+                    } => {
+                        assert_eq!(outer_alias, "o");
+                        assert_eq!(links, &["user".to_string()]);
+                        assert_eq!(column, "name");
+                    }
+                    other => panic!("expected LinkPath, got {other:?}"),
+                }
             }
             _ => panic!("expected query"),
         }
