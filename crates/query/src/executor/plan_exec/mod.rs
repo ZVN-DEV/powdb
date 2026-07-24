@@ -12,6 +12,15 @@ use std::ops::ControlFlow;
 use super::compiled::*;
 use super::mem_budget;
 
+/// Whether a `count` aggregate counts every row rather than the non-null
+/// values of a target column. `count(T)` carries no argument and `count(*)`
+/// carries the `*` sentinel field; anything else names a column, and
+/// `count(T { .col })` must then skip nulls (the grouped path and SQL's
+/// `COUNT(col)` both do).
+pub(crate) fn counts_every_row(argument: Option<&Expr>) -> bool {
+    argument.is_none_or(|argument| matches!(argument, Expr::Field(name) if name == "*"))
+}
+
 /// Maximum number of elements sorted by the standard-library stable sort
 /// without an intervening cancellation checkpoint. Larger inputs are sorted
 /// as bounded stable runs and cooperatively merged below.
@@ -294,5 +303,6 @@ pub(crate) use lowering::{
     format_plan_tree, lower_unindexed_scans, range_matches, synthesize_range_predicate,
 };
 pub(crate) use validate::{
-    predicate_column_indices_json, validate_json_path_types, validate_no_stray_aggregates,
+    predicate_column_indices_json, validate_column_references, validate_json_path_types,
+    validate_no_stray_aggregates, validate_slice_counts,
 };

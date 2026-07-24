@@ -721,3 +721,91 @@ fn sql_qualified_ref_in_insert_values_errors() {
     let r = engine.execute_sql("INSERT INTO t (id, v) VALUES (t.id, 1)");
     assert!(r.is_err(), "qualified ref in VALUES must error, got: {r:?}");
 }
+
+// ---------------------------------------------------------------------------
+// COUNT(col) counts non-null values, not rows
+// ---------------------------------------------------------------------------
+
+/// Three rows, one of which has a NULL `v`.
+fn count_fixture() -> (tempfile::TempDir, Engine) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type T { required g: int, v: int }")
+        .unwrap();
+    engine
+        .execute_powql("insert T { g := 1, v := 10 }")
+        .unwrap();
+    engine
+        .execute_powql("insert T { g := 1, v := 20 }")
+        .unwrap();
+    engine.execute_powql("insert T { g := 2 }").unwrap();
+    (dir, engine)
+}
+
+fn scalar_int(result: QueryResult) -> i64 {
+    match result {
+        QueryResult::Scalar(Value::Int(v)) => v,
+        other => panic!("expected an int scalar, got {other:?}"),
+    }
+}
+
+/// `SELECT COUNT(v)` used to lower to PowQL's `count(T)` (a row count), so the
+/// two frontends answered the same question differently.
+#[test]
+fn sql_count_column_skips_nulls() {
+    let (_dir, mut engine) = count_fixture();
+    assert_eq!(
+        scalar_int(engine.execute_sql("SELECT COUNT(v) FROM T").unwrap()),
+        2,
+        "COUNT(col) must not count the NULL row"
+    );
+    assert_eq!(
+        scalar_int(engine.execute_sql("SELECT COUNT(*) FROM T").unwrap()),
+        3,
+        "COUNT(*) still counts rows"
+    );
+}
+
+#[test]
+fn sql_and_powql_count_agree_on_nulls() {
+    let (_dir, mut engine) = count_fixture();
+    for (sql, powql) in [
+        ("SELECT COUNT(v) FROM T", "count(T { .v })"),
+        ("SELECT COUNT(*) FROM T", "count(T)"),
+        (
+            "SELECT COUNT(v) FROM T WHERE g = 1",
+            "count(T filter .g = 1 { .v })",
+        ),
+        (
+            "SELECT COUNT(v) FROM T WHERE g = 2",
+            "count(T filter .g = 2 { .v })",
+        ),
+    ] {
+        assert_eq!(
+            scalar_int(engine.execute_sql(sql).unwrap()),
+            scalar_int(engine.execute_powql(powql).unwrap()),
+            "frontends disagree: `{sql}` vs `{powql}`"
+        );
+    }
+}
+
+/// The grouped path already counted non-nulls; pin it so the ungrouped fix
+/// cannot drift away from it.
+#[test]
+fn sql_grouped_count_column_skips_nulls() {
+    let (_dir, mut engine) = count_fixture();
+    match engine
+        .execute_sql("SELECT g, COUNT(v) AS n FROM T GROUP BY g ORDER BY g")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(2)],
+                vec![Value::Int(2), Value::Int(0)],
+            ]
+        ),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

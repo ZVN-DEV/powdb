@@ -389,12 +389,19 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
     Ok(out)
 }
 
-/// Bound on SQL expression-parser recursion. The from-scratch SQL pre-parser
-/// recurses on parentheses / `NOT` / operator right-hand sides before the
-/// canonical text is handed to the PowQL parser, so its own guard must match
-/// PowQL's `MAX_NESTING_DEPTH` (64). Without it, a deeply nested SQL string
-/// arriving over the wire overflows the stack and — with panic=abort — aborts
-/// the whole server process.
+/// Bound on the nesting the SQL frontend may produce. The from-scratch SQL
+/// pre-parser recurses on parentheses / `NOT` / operator right-hand sides
+/// before the canonical text is handed to the PowQL parser, so its own guard
+/// must match PowQL's `MAX_NESTING_DEPTH` (64). Without it, a deeply nested SQL
+/// string arriving over the wire overflows the stack and, with panic=abort,
+/// aborts the whole server process.
+///
+/// The infix loop in `expr_bp` needs the same bound even though it recurses
+/// only on right-hand sides: it appends left-associatively to a flat string
+/// (`a AND b AND c ...`), and the PowQL parse of that canonical text builds one
+/// AST level per appended operator. Counting loop iterations here keeps the
+/// produced tree bounded (and stops the O(n^2) string rebuild) instead of
+/// leaving the whole load on PowQL's own chain guard.
 const MAX_SQL_NESTING_DEPTH: usize = 64;
 
 struct SqlParser {
@@ -461,14 +468,14 @@ impl AggCall {
 }
 
 /// Lower a single ungrouped aggregate over `inner` (an already-lowered PowQL
-/// source pipeline, e.g. `T filter .x > 3`) into PowQL's aggregate form.
-/// `count(*)`/`count(col)` both count rows; the non-null nuance of SQL
-/// `count(col)` is not yet modeled. The other aggregates carry their column in
-/// a trailing PowQL projection (`sum(T { .x })`).
+/// source pipeline, e.g. `T filter .x > 3`) into PowQL's aggregate form. Every
+/// aggregate carries its column in a trailing PowQL projection
+/// (`sum(T { .x })`); only `COUNT(*)` has no column and counts rows.
+/// `COUNT(col)` counts non-null values, like the grouped path and like SQL.
 fn build_ungrouped_aggregate(agg: &AggCall, inner: &str) -> Result<String, ParseError> {
     match agg.func.as_str() {
-        "count" => Ok(format!("count({inner})")),
-        "sum" | "avg" | "min" | "max" => match &agg.arg {
+        "count" if matches!(agg.arg, AggArg::Star) => Ok(format!("count({inner})")),
+        "count" | "sum" | "avg" | "min" | "max" => match &agg.arg {
             AggArg::Field(f) => Ok(format!("{}({inner} {{ {f} }})", agg.func)),
             AggArg::Star => Err(ParseError::Unsupported {
                 feature: format!("{0}(*) is not valid; {0}() needs a column", agg.func),
@@ -1365,12 +1372,21 @@ impl SqlParser {
             self.primary_expr()?
         };
 
+        // Every iteration below appends one more level to `lhs`, which becomes
+        // one more AST level once the canonical text is re-parsed as PowQL.
+        let mut chain = 0usize;
         loop {
             if self.next_is_stop(stop)
                 || self.at_end()
                 || matches!(self.peek(), Some(SqlTok::Symbol(')' | ',')))
             {
                 break;
+            }
+            chain += 1;
+            if self.depth + chain > MAX_SQL_NESTING_DEPTH {
+                return Err(ParseError::NestingDepthExceeded {
+                    max: MAX_SQL_NESTING_DEPTH,
+                });
             }
             if matches!(self.peek(), Some(SqlTok::Op(op)) if op == "->" || op == "->>") {
                 let text = matches!(self.bump(), Some(SqlTok::Op(op)) if op == "->>");

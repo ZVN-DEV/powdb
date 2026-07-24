@@ -105,6 +105,19 @@ not PostgreSQL's JSON-value-preserving behavior, and direct `->` does not
 distinguish a missing path from explicit JSON null. Use `json_type()` when that
 distinction matters.
 
+## COUNT and NULL
+
+`COUNT(*)` counts rows. `COUNT(col)` counts rows where `col` is not NULL, per
+the SQL standard, and lowers to PowQL's `count(T { .col })`, so both frontends
+return the same number for the same question. Every other aggregate
+(`SUM`/`AVG`/`MIN`/`MAX`) also skips NULL values.
+
+```sql
+-- 3 rows, one of which has a NULL nickname:
+SELECT COUNT(*) FROM User;          -- 3
+SELECT COUNT(nickname) FROM User;   -- 2
+```
+
 ## Aggregate semantics over joins
 
 SQL aggregates evaluate the joined rows directly, including join fan-out. For
