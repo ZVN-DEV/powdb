@@ -50,6 +50,33 @@ export const MAX_ROWS = 10_000_000;
 /** Maximum number of columns allowed in a result set. */
 export const MAX_COLUMNS = 4096;
 
+/**
+ * Maximum number of decoded cells (rows x columns) in one result frame.
+ *
+ * MAX_ROWS and the per-frame byte-shape check are not enough on their own: a
+ * cell costs 4 bytes on the wire at minimum (an empty string's length prefix)
+ * but far more than that in JS heap, since every row is its own array. A
+ * hostile or MITM'd server could therefore declare 10M single-column rows,
+ * back them with a ~40 MB frame of empty cells, and make the client allocate
+ * roughly 1.9 GB (measured) before anything downstream could react. The
+ * default transport is plaintext, so this is reachable by anyone on the path.
+ *
+ * This cap bounds that allocation absolutely instead of trusting the declared
+ * count: a result frame can never expand past a few hundred MB whatever the
+ * server claims. Results genuinely larger than this must be paged with
+ * `limit`/`offset`.
+ */
+export const MAX_RESULT_CELLS = 2_000_000;
+
+/** Reject a declared result shape whose cell count exceeds MAX_RESULT_CELLS. */
+function checkResultCells(rowCount: number, colCount: number): void {
+  if (rowCount * colCount > MAX_RESULT_CELLS) {
+    throw new Error(
+      `result too large: ${rowCount * colCount} cells (${rowCount} rows x ${colCount} columns, max ${MAX_RESULT_CELLS})`,
+    );
+  }
+}
+
 /** Maximum number of bound parameters in a QueryWithParams message. */
 export const MAX_PARAMS = 4096;
 
@@ -664,6 +691,7 @@ function decodePayload(msgType: number, payload: Buffer): Message {
           `row data too short for declared shape: ${rowCount} rows x ${colCount} columns`,
         );
       }
+      checkResultCells(rowCount, colCount);
       const rows: string[][] = [];
       for (let r = 0; r < rowCount; r++) {
         const row: string[] = [];
@@ -698,6 +726,7 @@ function decodePayload(msgType: number, payload: Buffer): Message {
           `native row data too short for declared shape: ${rowCount} rows x ${colCount} columns`,
         );
       }
+      checkResultCells(rowCount, colCount);
       const rows: WireValue[][] = [];
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
         const row: WireValue[] = [];

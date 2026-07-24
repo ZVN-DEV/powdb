@@ -10,9 +10,13 @@ import { strict as assert } from "node:assert";
 import {
   escapeIdent,
   escapeLiteral,
+  escapeSqlIdent,
+  escapeSqlLiteral,
   ident,
   powql,
   PowqlIdent,
+  sql,
+  sqlIdent,
 } from "../src/escape.js";
 
 let passed = 0;
@@ -315,6 +319,64 @@ async function main() {
     // 3 internal quotes → each becomes \" (2 chars) → 6 chars inside,
     // plus 2 outer quotes = 8 total.
     assert.equal(escapeLiteral('"""'), `"\\"\\"\\""`);
+  });
+
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nSQL frontend escaping");
+  // ──────────────────────────────────────────────────────────
+
+  await test("escapeSqlLiteral quotes strings with '' doubling", () => {
+    assert.equal(escapeSqlLiteral("ada"), "'ada'");
+    assert.equal(escapeSqlLiteral("o'neil"), "'o''neil'");
+    assert.equal(escapeSqlLiteral(""), "''");
+  });
+
+  await test("escapeSqlLiteral escapes backslash before quote doubling", () => {
+    // PowDB's SQL lexer treats a backslash as an escape inside strings
+    // (standard SQL does not), so a lone trailing backslash would otherwise
+    // swallow the closing quote and let the value escape its literal.
+    assert.equal(escapeSqlLiteral("a\\b"), "'a\\\\b'");
+    assert.equal(escapeSqlLiteral("end\\"), "'end\\\\'");
+  });
+
+  await test("escapeSqlLiteral handles non-strings like escapeLiteral", () => {
+    assert.equal(escapeSqlLiteral(42), "42");
+    assert.equal(escapeSqlLiteral(-1.5), "-1.5");
+    assert.equal(escapeSqlLiteral(9007199254740993n), "9007199254740993");
+    assert.equal(escapeSqlLiteral(true), "true");
+    assert.equal(escapeSqlLiteral(false), "false");
+    assert.equal(escapeSqlLiteral(null), "null");
+    assert.throws(() => escapeSqlLiteral(NaN), TypeError);
+    assert.throws(() => escapeSqlLiteral(Infinity), TypeError);
+    assert.throws(() => escapeSqlLiteral(undefined as any), TypeError);
+    assert.throws(() => escapeSqlLiteral({} as any), TypeError);
+  });
+
+  await test("escapeSqlIdent validates instead of quoting", () => {
+    // PowDB's SQL lexer reads a double-quoted run as a string, so there is no
+    // identifier-quoting syntax to fall back on: invalid names must throw.
+    assert.equal(escapeSqlIdent("User"), "User");
+    assert.equal(escapeSqlIdent("_x1"), "_x1");
+    assert.throws(() => escapeSqlIdent("users; drop table x"), TypeError);
+    assert.throws(() => escapeSqlIdent('u"'), TypeError);
+    assert.throws(() => escapeSqlIdent(""), TypeError);
+    assert.throws(() => escapeSqlIdent("1abc"), TypeError);
+    assert.throws(() => escapeSqlIdent(7 as any), TypeError);
+  });
+
+  await test("sql template escapes literals and identifiers", () => {
+    const q = sql`SELECT * FROM ${sqlIdent("User")} WHERE name = ${"o'neil"} AND age > ${25}`;
+    assert.equal(q, "SELECT * FROM User WHERE name = 'o''neil' AND age > 25");
+  });
+
+  await test("sql template traps a classic injection payload in one literal", () => {
+    const payload = "'); drop table users; --";
+    assert.equal(sql`${payload}`, "'''); drop table users; --'");
+  });
+
+  await test("sql template rejects a PowQL ident wrapper", () => {
+    assert.throws(() => sql`SELECT * FROM ${ident("User")}`, TypeError);
   });
 
   // ──────────────────────────────────────────────────────────

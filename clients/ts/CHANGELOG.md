@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **Security (medium): bounded result allocation.** A hostile or MITM'd server
+  could declare 10,000,000 single-column rows backed by a ~40 MB frame of empty
+  cells and make the client allocate roughly 1.9 GB (measured), since a cell
+  costs 4 bytes on the wire but far more as a JS value. Result decoding now
+  enforces `MAX_RESULT_CELLS` (2,000,000 cells per frame) on both the legacy and
+  native paths. Results larger than that must be paged with `limit`/`offset`.
+- `queryTyped` is now generic and takes positional `$N` parameters:
+  `queryTyped<User>(q, schema, params?, opts?)`. Typed rows and injection-safe
+  binding were previously mutually exclusive. The old
+  `queryTyped(q, schema, opts?)` form is unchanged.
+- New `queryObjects<Row>(query, params?, opts?)`: object rows keyed by column
+  name on the LOSSLESS native path, so no schema is needed (bytes stay bytes,
+  JSON stays recursive data, out-of-range integers stay `bigint`).
+  `querySqlObjects<Row>(query, opts?)` is the SQL counterpart. New `NativeRow`
+  type.
+- New SQL composition helpers in `escape.ts`: `sql` tagged template,
+  `sqlIdent`, `escapeSqlLiteral`, `escapeSqlIdent`. PowDB's SQL frontend has NO
+  parameter binding on any wire frame, so string concatenation was previously
+  the only way to build SQL with user input. These escape for PowDB's own SQL
+  lexer (`''` doubling plus backslash escaping, identifiers validated rather
+  than quoted). Escaping is weaker than binding: prefer PowQL `$N` parameters
+  for untrusted input.
+
 ## 0.19.1 - 2026-07-24
 
 - `SUPPORTED_CATALOG_VERSION` raised from 6 to 7: sync/replica clients are now

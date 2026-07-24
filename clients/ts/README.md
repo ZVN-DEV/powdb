@@ -60,6 +60,24 @@ escapeIdent("User");        // → "User" (throws on invalid)
 
 `escapeLiteral` accepts `string | number | bigint | boolean | null`. It rejects `NaN`/`Infinity`, `undefined`, objects, arrays, symbols, and `Date` — convert those yourself before passing them in.
 
+### SQL composition (`sql`, `sqlIdent`, `escapeSqlLiteral`)
+
+**The SQL frontend has no parameter binding.** `querySql`, `querySqlNative`, and `querySqlObjects` take a statement and nothing else: there is no `QuerySqlParams` wire frame, so `$N` placeholders cannot be bound on the SQL path. Prefer PowQL with `$N` parameters for anything built from untrusted input.
+
+When you must build SQL, use the `sql` tagged template rather than concatenation. It escapes for PowDB's own SQL lexer: `'` is doubled and a backslash is escaped (PowDB's SQL lexer honours backslash escapes, unlike standard SQL). Identifiers are validated, not quoted, because the lexer reads a double-quoted run as a string literal.
+
+```typescript
+import { sql, sqlIdent, escapeSqlLiteral, escapeSqlIdent } from "@zvndev/powdb-client";
+
+const q = sql`SELECT name FROM ${sqlIdent("User")} WHERE name = ${userName}`;
+await client.querySql(q);
+
+escapeSqlLiteral("o'neil");   // → "'o''neil'"
+escapeSqlIdent("User");       // → "User" (throws on anything else)
+```
+
+Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and it cannot make an identifier or keyword safe. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
+
 ### Parameter binding (`$N`)
 
 For the strongest separation between code and data, pass values as positional `$N` parameters instead of interpolating them. The server binds each placeholder at the **token level** — a string becomes a literal token, never interpolated text — so an injection-shaped value is inert and can never change the query's shape. Placeholders are 1-based (`?` is not a placeholder; `??` is the COALESCE operator).
@@ -412,6 +430,45 @@ output always parses, so this fallback is inert in normal use).
 Bytes columns are intentionally unsupported by `queryTyped` because the
 legacy wire format renders `<N bytes>`. Use `queryNative` for exact bytes.
 
+## Object rows on the lossless path (`queryObjects`)
+
+`queryTyped` coerces the legacy stringly-typed path with a caller-supplied
+schema. `queryObjects` needs no schema: it runs on the **native** wire surface,
+where the server states each cell's type, and returns objects keyed by column
+name. It accepts `$N` parameters and an abort signal exactly like `query`.
+
+```typescript
+interface User {
+  name: string;
+  age: number;
+  prefs: unknown;
+}
+
+const users = await client.queryObjects<User>(
+  "User filter .age > $1 { .name, .age, .prefs }",
+  [25],
+);
+
+users[0].age;    // number (bigint when outside the safe integer range)
+users[0].prefs;  // recursively decoded JSON, not a string
+```
+
+`querySqlObjects<Row>(sql, opts?)` is the SQL counterpart. `queryTyped` is also
+generic and takes parameters, so typed rows and injection-safe binding compose:
+
+```typescript
+const rows = await client.queryTyped<User>(
+  "User filter .age > $1 { .name, .age }",
+  { name: "str", age: "int" },
+  [25],
+);
+```
+
+The generic is an unchecked assertion about the query's shape, like a SQL
+driver's row type: nothing validates it at runtime. Duplicate column names
+collapse (last one wins), so alias them in the projection. A non-rows result
+(a count, a write) throws `PowDBError(code="query_failed")`.
+
 ## Structured errors
 
 Every error thrown by the client is a `PowDBError` with a stable `.code`:
@@ -592,10 +649,26 @@ Runs SQL through the native typed wire surface and returns a
 `Promise<NativeQueryResult>`. It has the same no-replay guarantee as
 `queryNative()`.
 
-### `client.queryTyped(query, schema, opts?)`
+### `client.queryTyped<Row>(query, schema, params?, opts?)`
 
 Like `query()`, but coerces each row's string values to JS types using the
-supplied schema and returns `Promise<TypedRow[]>`. See Typed rows above.
+supplied schema and returns `Promise<Row[]>` (`TypedRow[]` when no generic is
+given). Accepts positional `$N` parameters in the same third-argument position
+as `query()`, so typed rows and parameter binding compose. The legacy
+`queryTyped(q, schema, { signal })` form still works. See Schema-coerced rows
+above.
+
+### `client.queryObjects<Row>(query, params?, opts?)`
+
+Runs PowQL on the lossless native surface and returns object rows keyed by
+column name (`Promise<Row[]>`, default `NativeRow[]`). No schema needed.
+Parameters and abort options match `query()`. Throws
+`PowDBError(code="query_failed")` if the result is not rows-shaped.
+
+### `client.querySqlObjects<Row>(query, opts?)`
+
+SQL counterpart of `queryObjects`. The SQL path cannot bind parameters: build
+statements with the `sql` tagged template (see SQL composition above).
 
 ### `client.execScript(script, opts?)`
 
@@ -655,6 +728,10 @@ Getters: `size`, `idle`, `closed`.
 - `ident(name)` — wrap a string so `powql` treats it as an identifier
 - `escapeLiteral(value)` — render a JS value as a PowQL literal
 - `escapeIdent(name)` — validate an identifier (throws `TypeError` on invalid)
+- `sql`: tagged template for the SQL frontend; escapes literals, validates identifiers
+- `sqlIdent(name)`: wrap a string so `sql` treats it as a SQL identifier
+- `escapeSqlLiteral(value)`: render a JS value as a PowDB SQL literal
+- `escapeSqlIdent(name)`: validate a SQL identifier (throws `TypeError` on invalid)
 - `splitStatements(script)` — the statement-aware script splitter used by `execScript`
 
 ## Limits
@@ -664,6 +741,11 @@ The client enforces the same frame limits as the server and throws on violation:
 - `MAX_PAYLOAD_SIZE` — 64 MiB per frame
 - `MAX_ROWS` — 10,000,000 rows per result
 - `MAX_COLUMNS` — 4,096 columns per result
+- `MAX_RESULT_CELLS`: 2,000,000 cells (rows x columns) per result frame. This
+  caps how much heap a server-declared result shape can force the client to
+  allocate: a cell is only 4 bytes on the wire but costs far more as a JS
+  value, so without the cap a ~40 MB frame could expand to roughly 1.9 GB. Page
+  larger results with `limit`/`offset`.
 
 ## Requirements
 

@@ -120,8 +120,151 @@ export function powql(
 }
 
 // ──────────────────────────────────────────────────────────
+// SQL frontend
+// ──────────────────────────────────────────────────────────
+
+/**
+ * SQL composition helpers for PowDB's SQL frontend.
+ *
+ * READ THIS FIRST. PowDB's SQL surface has NO parameter binding on any wire
+ * frame: `querySql`/`querySqlNative` take a statement and nothing else, and
+ * there is no `QuerySqlParams` message. The PowQL surface does have real `$N`
+ * binding (`client.query(q, [values])`), where the server substitutes a literal
+ * TOKEN and injection-shaped input is inert.
+ *
+ * So: **prefer PowQL with `$N` parameters for anything built from untrusted
+ * input.** These helpers exist because the SQL path would otherwise leave
+ * string concatenation as the only option, which is strictly worse. They escape
+ * correctly for PowDB's own SQL lexer (`crates/query/src/sql.rs`), but escaping
+ * is a weaker guarantee than binding: it depends on the value landing in a
+ * string/number position, and it cannot make an identifier or a keyword safe.
+ *
+ * PowDB SQL string rules (verified against `lex_sql` in `crates/query/src/sql.rs`):
+ *   - Strings are delimited by `'`.
+ *   - `''` inside a single-quoted string is a literal `'`.
+ *   - A backslash also escapes the next character (`\n`, `\t`, and `\X` → `X`),
+ *     which standard SQL does NOT do, so a literal backslash must be doubled.
+ *   - `"` also opens a string in this lexer, so double quotes cannot be used to
+ *     quote an identifier. Identifiers are therefore validated, never quoted.
+ */
+
+/**
+ * Render a JS value as a PowDB SQL literal. Same accepted types as
+ * {@link escapeLiteral}: `string`, `number`, `bigint`, `boolean`, `null`.
+ *
+ * - string → `'...'` with `\` doubled and `'` doubled
+ * - number → decimal; rejects `NaN`/`±Infinity`
+ * - bigint → decimal digits
+ * - boolean → `true` / `false`
+ * - null → `null`
+ */
+export function escapeSqlLiteral(
+  value: string | number | bigint | boolean | null
+): string {
+  if (value === null) return "null";
+
+  const t = typeof value;
+
+  if (t === "string") {
+    // Backslash first: this lexer treats `\` as an escape inside strings, so a
+    // lone backslash would otherwise swallow the quote doubling that follows.
+    const escaped = (value as string)
+      .replace(/\\/g, "\\\\")
+      .replace(/'/g, "''");
+    return `'${escaped}'`;
+  }
+
+  if (t === "number") {
+    const n = value as number;
+    if (!Number.isFinite(n)) {
+      throw new TypeError(
+        `escapeSqlLiteral: non-finite number ${String(n)} cannot be represented as a SQL literal`
+      );
+    }
+    return String(n);
+  }
+
+  if (t === "bigint") {
+    return (value as bigint).toString(10);
+  }
+
+  if (t === "boolean") {
+    return value ? "true" : "false";
+  }
+
+  throw new TypeError(`escapeSqlLiteral: unsupported type ${describe(value)}`);
+}
+
+/**
+ * Validate a SQL identifier (table, column, alias). Returns it unchanged on
+ * success and throws `TypeError` otherwise.
+ *
+ * Identifiers are validated rather than quoted because PowDB's SQL lexer reads
+ * `"..."` as a string literal, so there is no identifier-quoting syntax to fall
+ * back on. Only `^[A-Za-z_][A-Za-z0-9_]*$` is accepted.
+ */
+export function escapeSqlIdent(name: string): string {
+  if (typeof name !== "string") {
+    throw new TypeError(`escapeSqlIdent: expected string, got ${typeof name}`);
+  }
+  if (name.length === 0) {
+    throw new TypeError("escapeSqlIdent: identifier must not be empty");
+  }
+  if (!IDENT_RE.test(name)) {
+    throw new TypeError(
+      `escapeSqlIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)`
+    );
+  }
+  return name;
+}
+
+/** Wrapper marking a string as a SQL identifier for the `sql` tagged template. */
+export class SqlIdent {
+  constructor(public readonly name: string) {}
+}
+
+/** Factory for {@link SqlIdent}. */
+export function sqlIdent(name: string): SqlIdent {
+  return new SqlIdent(name);
+}
+
+/**
+ * Tagged template for SQL composition. Interpolated values are escaped as SQL
+ * literals; wrap one in `sqlIdent(...)` to interpolate an identifier.
+ *
+ *     const q = sql`SELECT name FROM ${sqlIdent(table)} WHERE name = ${userName}`;
+ *     await client.querySql(q);
+ *
+ * Escaping, not binding: see the section note above, and prefer PowQL's `$N`
+ * parameters when the input is untrusted.
+ */
+export function sql(
+  strings: TemplateStringsArray,
+  ...values: unknown[]
+): string {
+  let out = strings[0] ?? "";
+  for (let i = 0; i < values.length; i++) {
+    out += renderSqlInterpolation(values[i]);
+    out += strings[i + 1] ?? "";
+  }
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────
 // internals
 // ──────────────────────────────────────────────────────────
+
+function renderSqlInterpolation(value: unknown): string {
+  if (value instanceof SqlIdent) {
+    return escapeSqlIdent(value.name);
+  }
+  if (value instanceof PowqlIdent) {
+    throw new TypeError(
+      "sql: use sqlIdent(...) for SQL identifiers, not ident(...)"
+    );
+  }
+  return escapeSqlLiteral(value as string | number | bigint | boolean | null);
+}
 
 function renderInterpolation(value: unknown): string {
   if (value instanceof PowqlIdent) {
