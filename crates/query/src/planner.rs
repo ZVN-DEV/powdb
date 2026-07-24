@@ -90,6 +90,7 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
         }),
         Statement::ListTypes => Ok(PlanNode::ListTypes),
         Statement::Describe(table) => Ok(PlanNode::Describe { table }),
+        Statement::ListLinks => Ok(PlanNode::ListLinks),
         Statement::Union(u) => {
             let left = plan_statement(*u.left)?;
             let right = plan_statement(*u.right)?;

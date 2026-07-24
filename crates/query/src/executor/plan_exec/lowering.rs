@@ -1238,6 +1238,7 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
         PlanNode::DropView { name, .. } => format!("{indent}DropView name={name}"),
         PlanNode::ListTypes => format!("{indent}ListTypes"),
         PlanNode::Describe { table } => format!("{indent}Describe table={table}"),
+        PlanNode::ListLinks => format!("{indent}ListLinks"),
         PlanNode::Window { input, windows } => {
             let ws: Vec<String> = windows
                 .iter()
