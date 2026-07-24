@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
+## [0.19.1] - 2026-07-24
+
+### Added
+
+- **Link introspection.** `schema links` lists every declared entity link as
+  ordinary result rows (`owner`, `name`, `target`, `local_key`, `target_key`,
+  `cardinality`), sorted by owner then name; an empty catalog returns zero rows.
+  `describe T` (and its `schema T` alias) keeps its existing four columns
+  byte-identical and appends link rows: outgoing (`-> Target (to-one,
+  local_key -> target_key)`) and incoming (`Owner.name` / `<- Owner ...`).
+  Note: `links` is contextual, so only the exact spelling `schema links` is the
+  listing; a table literally named `links` is still reachable via
+  `describe links`.
+- **Entity-links driver contract.** `docs/integrations/powql-for-drivers.md`
+  gains a full entity-links section for client/ORM authors: DDL grammar,
+  derived-cardinality rules, scalar vs block traversal, required aliasing,
+  missing-value semantics, the link-misuse error table, and the plan-cache
+  exclusion for link-bearing queries.
+- **Per-operator missing-value table.** `docs/POWQL.md` now documents the
+  behavior of every filter operator against a missing value in one normative
+  table (`=`, `!=`, ranges, `in`/`not in`, `between`, `like`/`not like`,
+  `not ( ... )`, `is null`/`is not null`, `??`).
+
+### Fixed
+
+- **`not in` never matches missing values.** `not in (list)` and
+  `not in (subquery)` are operator forms and now exclude rows whose tested
+  value is missing, consistent with `!=` under the two-valued semantics
+  established in 0.18.2. Explicit `not ( ... )` remains the documented plain
+  complement. (`not like` remains complement sugar; guard with
+  `is not null`, see the new operator table.)
+- **Skew-aware driver selection.** The cardinality estimator previously
+  modeled a non-unique equality as the uniform average
+  (`total_entries / distinct_keys`), so a hot value was treated as
+  average-rare: a lone hot equality index-scanned most of the table (~7x
+  slower than a scan) and a conjunction drove from the hot column instead of
+  the selective one (~5-12x, widening with table size). Non-unique equality
+  probes on concrete literals now count the actual literal via a bounded,
+  allocation-free capped B-tree walk; a lone equality matching more than half
+  the table lowers to a compiled sequential scan; conjunction ranking is
+  tier-first, then the exact count. Plan choice only, never results; EXPLAIN
+  estimates route through the same function.
+- **Parent-selectivity for nested blocks and scalar links.** Nested-block
+  assembly (`u.orders { ... }`) only materializes children for surviving
+  parents (index-probe vs scan chosen by measured stats), and scalar link
+  hops (`o.user.name`) point-probe the target under a unique index instead of
+  building maps over the whole target table when the outer query is
+  selective. Up to ~200x on selective parents over large child tables.
+- **Bare dotted link paths are a clear parse error.** An un-aliased
+  `.user.name` projection field previously mis-parsed into two separate
+  fields silently (it is token-identical to two comma-less bare fields). It
+  is now a hard error directing you to alias the table
+  (`Order as o { o.user.name }`) or comma-separate the fields.
+- **Aggregates over or inside nested/link projections are rejected.**
+  `count(Order { .user.name })` previously returned the parent-row count and
+  `sum(Order as o { o.user.name })` returned 0, both silently; aggregates in
+  a nested block yielded per-row Empty. All now fail with clear typed errors.
+- **EXPLAIN names link paths.** Plans containing link fields print the
+  declared hop path (scalar hops and to-many blocks) instead of the opaque
+  `(unresolved)` marker.
+
+### Client
+
+- **TypeScript client catalog ceiling raised to v7.**
+  `SUPPORTED_CATALOG_VERSION` is now 7, so sync/replica clients are accepted
+  by servers whose catalog activated v7 (entity links). The client treats
+  catalog payloads as opaque bytes, so no decoding change is involved.
+
+### Docs
+
+- Embedded facade concurrency documented precisely: single-writer is enforced
+  at compile time by ownership (`&mut`), not a runtime lock; write-gate FIFO
+  fairness is observed behavior, not a contract (only the bounded-wait
+  timeout is contractual); stored-column indexes cannot be dropped
+  (`drop index` is JSON-path/expression indexes only), fixed in three places.
+
 ## [0.19.0] - 2026-07-22
 
 ### Added

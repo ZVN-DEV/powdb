@@ -45,7 +45,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.19.0";
+export const CLIENT_VERSION = "0.19.1";
 
 /**
  * The maximum catalog format version this client can read. State this as the
