@@ -91,15 +91,30 @@ RUN . /cross-env \
  && cp "target/$(cat /rust-target)/release/powdb-server" /powdb-server
 
 # ─── Runtime ────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+# Pinned by digest (multi-arch index digest for debian:bookworm-slim as of
+# 2026-07-24) so the runtime layer is reproducible and cannot be swapped under
+# us by a tag repoint. Refresh deliberately with:
+#   docker buildx imagetools inspect debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 # tini reaps zombies and forwards signals so SIGTERM from fly cleanly stops the server
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-# Persistent data dir; fly volume will be mounted here
-RUN mkdir -p /data
+# Run as an unprivileged user: the server needs no root capability (it binds
+# 5433, well above the privileged range) and a database process should not be
+# able to write outside its data dir. Fixed uid/gid 10001 so a host bind mount
+# can be chowned to a stable, known id.
+RUN groupadd --system --gid 10001 powdb \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /data --shell /usr/sbin/nologin powdb
+
+# Persistent data dir; fly volume will be mounted here.
+# NOTE: an EMPTY named/anonymous volume inherits this ownership at creation, so
+# `docker run -v powdb_data:/data` works unprivileged. A HOST BIND MOUNT or a
+# pre-existing root-owned volume does NOT: chown it to 10001:10001 on the host,
+# or run the container with `--user 0:0` to restore the previous behaviour.
+RUN mkdir -p /data && chown powdb:powdb /data
 VOLUME ["/data"]
 
 COPY --from=builder /powdb-server /usr/local/bin/powdb-server
@@ -109,6 +124,8 @@ ENV RUST_LOG=info \
     POWDB_PORT=5433
 
 EXPOSE 5433
+
+USER 10001:10001
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/powdb-server"]

@@ -5,6 +5,9 @@ on:
     paths:
       - "crates/query/src/lexer.rs"
       - "crates/query/src/parser.rs"
+      # The SQL frontend is wire-reachable (QuerySql) and has already shipped a
+      # parser DoS, so `fuzz_sql` must run when this file changes.
+      - "crates/query/src/sql.rs"
       - "crates/query/src/token.rs"
       - "crates/query/src/canonicalize.rs"
       - "crates/storage/src/pj1.rs"
@@ -14,7 +17,8 @@ on:
       - "crates/query/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
-    # Nightly smoke at 07:00 UTC — longer budget than PR runs.
+    # Nightly smoke at 07:00 UTC. Nightly (and manual) runs get a longer
+    # per-target budget than PR runs, see FUZZ_BUDGET below.
     - cron: "0 7 * * *"
   workflow_dispatch:
 
@@ -26,9 +30,9 @@ concurrency:
 
 jobs:
   fuzz-smoke:
-    name: fuzz ${{ matrix.target }} (${{ matrix.budget }}s)
+    name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -42,24 +46,15 @@ jobs:
             fuzz_wire,
             fuzz_wal_replay,
           ]
-        include:
-          - target: fuzz_lexer
-            budget: 60
-          - target: fuzz_parser
-            budget: 60
-          - target: fuzz_roundtrip
-            budget: 60
-          - target: fuzz_sql
-            budget: 60
-          - target: fuzz_pj1
-            budget: 60
-          - target: fuzz_wire
-            budget: 60
-          - target: fuzz_wal_replay
-            budget: 60
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      # PR runs stay a fast 60s-per-target smoke so they do not slow reviews.
+      # The nightly cron (and manual dispatches) run 5 minutes per target, which
+      # is what the header means by "longer budget": paired with the cached
+      # corpus below, each nightly starts from the accumulated corpus and pushes
+      # coverage further instead of re-exploring shallow inputs every time.
+      FUZZ_BUDGET: ${{ github.event_name == 'pull_request' && '60' || '300' }}
 
     steps:
       - name: Checkout
@@ -91,6 +86,20 @@ jobs:
           restore-keys: |
             fuzz-${{ runner.os }}-
 
+      # The corpus is gitignored, so without this cache every run restarts from
+      # an empty corpus and relearns the same shallow inputs. The key carries
+      # the run id so each run saves a fresh entry, and restore-keys pulls the
+      # newest previous corpus for this target: the standard append-only cache
+      # pattern. Caches saved on main are visible to PR runs, so nightly runs
+      # (long budget) feed the corpus that PR runs start from.
+      - name: Fuzz corpus cache (${{ matrix.target }})
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/query/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
@@ -101,7 +110,7 @@ jobs:
       # dir follows); `fuzz/seeds/<target>` holds checked-in valid inputs
       # (encoded wire frames, real WAL files) that the fuzzer mutates from.
       # Both dirs are mkdir'd so targets without checked-in seeds still run.
-      - name: Run ${{ matrix.target }} for ${{ matrix.budget }}s
+      - name: Run ${{ matrix.target }}
         working-directory: crates/query
         env:
           # fuzz_wal_replay builds its crashed-database template once via
@@ -112,9 +121,11 @@ jobs:
           ASAN_OPTIONS: ${{ matrix.target == 'fuzz_wal_replay' && 'detect_leaks=0' || '' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
+          echo "budget: ${FUZZ_BUDGET}s (event: ${{ github.event_name }})"
+          echo "restored corpus entries: $(find fuzz/corpus/${{ matrix.target }} -type f | wc -l)"
           cargo fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
-            -max_total_time=${{ matrix.budget }} \
+            -max_total_time="${FUZZ_BUDGET}" \
             -timeout=5 \
             -max_len=2048 \
             -print_final_stats=1

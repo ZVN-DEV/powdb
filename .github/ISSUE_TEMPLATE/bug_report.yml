@@ -32,7 +32,7 @@ body:
     attributes:
       label: PowDB version
       description: Output of `powdb-cli --version` (or crate version).
-      placeholder: powdb-cli 0.4.4
+      placeholder: powdb-cli 0.19.1
     validations:
       required: true
 
