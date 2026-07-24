@@ -4,7 +4,7 @@
 
 ```bash
 cargo build --workspace            # build everything
-cargo test --workspace             # run all tests (~30s)
+cargo test --workspace             # run all tests (tens of minutes: roughly 35-45 on an M-series laptop, longer cold)
 cargo run --release -p powdb-compare  # benchmark vs SQLite (100K rows)
 cargo bench -p powdb-bench         # criterion benchmarks (~60s)
 ```

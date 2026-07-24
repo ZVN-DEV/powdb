@@ -34,8 +34,18 @@ When cutting a release, follow the checklist at the bottom.
 | `powdb-server-macos-aarch64` | macOS ARM64 |
 
 These two platforms (Linux x86_64, macOS ARM64) are the **only** prebuilt
-`powdb-cli` / `powdb-server` binaries. All other targets — Windows, Intel macOS,
-Linux ARM64 — build from source (`cargo install` / `cargo build --release`).
+`powdb-cli` / `powdb-server` binaries. Intel macOS and Linux ARM64 have no
+prebuilt binary but do build from source (`cargo install` / `cargo build
+--release`).
+
+**Windows is not supported and does not build from source.** The heap's
+memory-mapped scan path (`crates/storage/src/heap.rs`) uses `libc::mmap` /
+`libc::munmap` and `std::os::unix::io::AsRawFd` with no platform gate, so
+`cargo check -p powdb-storage --target x86_64-pc-windows-msvc` fails to
+compile. This is why `publish-node-addon.yml` also omits the
+`x86_64-pc-windows-msvc` addon target. Do not tell Windows users to build from
+source; there is nothing for them to build until the mmap path gains a Windows
+backend.
 Binary artifacts are built automatically by `.github/workflows/release.yml`
 when a `v*` tag is pushed.
 

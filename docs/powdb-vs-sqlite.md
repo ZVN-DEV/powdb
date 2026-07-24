@@ -3,8 +3,8 @@
 SQLite is the default embedded database for very good reasons: 25+ years of
 battle-testing, billions of deployments, and a SQL surface every tool on the
 planet understands. PowDB is a newer, pure-Rust embedded database built around
-a compiled query execution engine that delivers 3-10x speedups on aggregate
-and scan workloads. This guide is written so an evaluator can decide honestly
+a compiled query execution engine that delivers 3-7x speedups on aggregate
+and scan workloads, and loses to SQLite on indexed point lookups. This guide is written so an evaluator can decide honestly
 between the two.
 
 ## When to choose PowDB
@@ -13,13 +13,15 @@ between the two.
   storage and query engines are 100% Rust with no `libsqlite3-sys`, no
   `bindgen`, no C toolchain in the build path (TLS in `powdb-server` is the
   one optional exception via `aws-lc-sys`, and the `tls` feature can be
-  disabled for a C-free build). `cargo install powdb-cli` works on every
-  platform Rust supports.
+  disabled for a C-free build). `cargo install powdb-cli` works on Linux and
+  macOS. **Windows is not supported** and does not compile: the heap's mmap
+  scan path is Unix-only. SQLite has no such gap, and if you ship on Windows
+  that alone decides this evaluation.
 - **Your workload is read-heavy or aggregate-heavy.** The compiled predicate
   engine compiles filter expressions into byte-level operations that skip
-  full row decoding. On the benchmarks below, that translates to 3-10x wins
+  full row decoding. On the benchmarks below, that translates to 3-7x wins
   on `MIN`, `MAX`, `SUM`, `AVG`, `scan + filter + count`, and similar
-  scan-shaped queries.
+  scan-shaped queries. It does not help point lookups, where SQLite wins.
 - **You are already on tokio.** `powdb-server` is async-native and wraps the
   engine in `Arc<RwLock<Engine>>` so parallel readers don't block each other.
   Note the boundary: there is no MVCC, so a writer (and especially a
@@ -65,6 +67,7 @@ between the two.
 | Capability                | PowDB                                                | SQLite                                                |
 |---------------------------|------------------------------------------------------|-------------------------------------------------------|
 | Implementation language   | 100% Rust core                                       | C                                                     |
+| Platform support          | Linux + macOS (Windows does not compile)             | Everywhere, including Windows                         |
 | Build dependencies        | Cargo only (TLS optional `aws-lc-sys`)               | C toolchain                                           |
 | Query language            | PowQL (pipeline) + supported SQL subset via frontend | SQL (industry standard)                               |
 | Storage model             | Slotted-page heap + B+tree indexes                   | B-tree of B-trees                                     |
@@ -89,36 +92,53 @@ visible in `crates/storage/src/wal.rs`, `crates/storage/src/heap.rs`, and
 ## Benchmarks
 
 Numbers below are from `cargo run --release -p powdb-compare` against the
-same dataset (100K rows) on an Apple M1, with PowDB in `WalSyncMode::Off`
-and SQLite in `:memory:` -- both engines running entirely in RAM. This is
-the methodology disclosed in the project README. It favors both engines'
-in-memory paths equally; on-disk durable comparisons will move the numbers
-and are tracked separately.
+same dataset (100K rows), with PowDB in `WalSyncMode::Off` and SQLite in
+`:memory:` -- both engines running entirely in RAM. This is the methodology
+disclosed in the project README. It favors both engines' in-memory paths
+equally; on-disk durable comparisons will move the numbers and are tracked
+separately.
 
-| Workload                            | PowDB    | SQLite   | Result            |
-|-------------------------------------|----------|----------|-------------------|
-| Aggregate MIN                       | 236 us   | 2,340 us | PowDB 9.9x faster |
-| Aggregate MAX                       | 236 us   | 2,100 us | PowDB 8.9x faster |
-| Aggregate SUM                       | 231 us   | 1,870 us | PowDB 8.1x faster |
-| Update by primary key               | 55 ns    | 412 ns   | PowDB 7.5x faster |
-| Aggregate AVG                       | 401 us   | 2,300 us | PowDB 5.7x faster |
-| Scan + filter + count               | 381 us   | 1,950 us | PowDB 5.1x faster |
-| Scan + filter + sort + limit 10     | 2.66 ms  | 9.77 ms  | PowDB 3.7x faster |
-| Update by filter (10K rows)         | 2.16 ms  | 6.77 ms  | PowDB 3.1x faster |
-| Indexed point lookup                | 93 ns    | 282 ns   | PowDB 3.0x faster |
-| Multi-column AND filter             | 2.22 ms  | 4.70 ms  | PowDB 2.1x faster |
-| Insert batch (1K rows)              | 238 ns   | 320 ns   | PowDB 1.3x faster |
-| Delete by filter (10K rows)         | 1.76 ms  | 2.35 ms  | roughly tied      |
-| Scan + filter + project top 100     | 9.6 us   | 12.7 us  | roughly tied      |
-| Non-indexed point lookup            | 350 us   | 432 us   | roughly tied      |
+Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0),
+commit `a090568`. **Laptop numbers, not CI numbers.** Full methodology and
+per-run spread: [2026-07-24 snapshot](benchmarks/2026-07-24-wide-bench-snapshot.md).
+
+| Workload                            | PowDB    | SQLite   | Result                 |
+|-------------------------------------|----------|----------|------------------------|
+| Update by primary key               | 66 ns    | 500 ns   | PowDB 7.6x faster      |
+| Aggregate MIN                       | 266 us   | 1.77 ms  | PowDB 6.7x faster      |
+| Aggregate MAX                       | 271 us   | 1.54 ms  | PowDB 5.7x faster      |
+| Aggregate SUM                       | 281 us   | 1.57 ms  | PowDB 5.6x faster      |
+| Aggregate AVG                       | 516 us   | 1.82 ms  | PowDB 3.5x faster      |
+| Scan + filter + count               | 481 us   | 1.47 ms  | PowDB 3.1x faster      |
+| Non-indexed point lookup            | 117 us   | 321 us   | PowDB 2.7x faster      |
+| Scan + filter + sort + limit 10     | 2.68 ms  | 6.73 ms  | PowDB 2.5x faster      |
+| Insert single row                   | 394 ns   | 790 ns   | PowDB 2.0x faster      |
+| Multi-column AND filter             | 1.75 ms  | 3.46 ms  | PowDB 2.0x faster      |
+| Update by filter (10K rows)         | 2.66 ms  | 5.08 ms  | PowDB 1.9x faster      |
+| Delete by filter (10K rows)         | 1.65 ms  | 1.95 ms  | roughly tied           |
+| Scan + filter + project top 100     | 8.0 us   | 8.9 us   | roughly tied           |
+| Insert batch (1K rows)              | 232 ns   | 257 ns   | roughly tied           |
+| **Indexed point lookup**            | **1.65 us** | **208 ns** | **SQLite 7.9x faster** |
 
 The headline wins are exactly where the compiled-predicate engine is
 designed to win: aggregates and filtered scans where avoiding full row
-decoding pays off. On `insert_batch_1k`, PowDB is faster after Phase 1
-stabilization but not by an order of magnitude -- SQLite's writer is
-mature. On `delete_by_filter` and the smallest projection workloads the
-two are effectively tied; an honest comparison should not pretend
-otherwise.
+decoding pays off. On `insert_batch_1k` and `delete_by_filter` and the
+smallest projection workloads the two are effectively tied; an honest
+comparison should not pretend otherwise.
+
+**Read the point-lookup row before you decide.** PowDB is 7.9x *slower* than
+SQLite at fetching one row by indexed id. Almost all of that 1.65 us is
+PowDB's own front end (lex, parse, canonicalize, plan-cache lookup); the
+B-tree probe underneath is tens of nanoseconds. SQLite pays roughly 208 ns
+end to end because a prepared statement amortizes its parser away. If your
+application's hot path is single-row fetches, that is the number that should
+decide this evaluation, and it points at SQLite.
+
+Two of these workloads used to be measured through a code path a user could
+not reach (the aggregates hand-built a plan node; the indexed point lookup
+called the B-tree directly), which is why previously published figures were
+40-60% higher and why the point lookup was previously, wrongly, reported as a
+3.0x win. That is fixed; see the snapshot doc for the before-and-after.
 
 ### A note on durable writes
 
@@ -144,9 +164,12 @@ Results land in `crates/compare/results.csv`.
 
 ## Caveats and roadmap
 
-- **PowDB is pre-1.0.** The on-disk format may shift across minor versions.
-  Pin a version (`cargo install powdb-cli --version 0.8.0 --locked`) and
-  expect to re-bench / re-import on upgrades until 1.0.
+- **PowDB is pre-1.0.** New on-disk format versions appear across minor
+  versions, though every release still reads everything earlier releases
+  wrote. Pin a version (`cargo install powdb-cli --version 0.19.1 --locked`)
+  and expect to re-bench on upgrades until 1.0. What a minor version may and
+  may not break is spelled out in [STABILITY.md](STABILITY.md); the
+  version/magic mechanics are in [FORMAT.md](FORMAT.md).
 - **SQLite is the safe default.** Decades of production exposure, an
   enormous test suite, and tools everywhere. If you're not sure, you
   probably want SQLite.
