@@ -357,6 +357,29 @@ with a present, non-matching value, guard presence explicitly:
 User filter .age is not null and not (.age > 30)
 ```
 
+**Per-operator contract.** The complete rule set, one line per operator, for a
+row whose tested value is missing:
+
+| Operator form | When the tested value is missing |
+|---|---|
+| `= x` | Never matches. |
+| `!= x` | Never matches (missing is not "not equal"). |
+| `< x`, `<= x`, `> x`, `>= x` | Never matches. |
+| `in (v1, v2, ...)` | Never matches. |
+| `not in (v1, v2, ...)` | Never matches (operator form, parity with `!=`). Applies to the subquery form `not in (Table { .col })` too. |
+| `between lo and hi` | Never matches (sugar for `>= lo and <= hi`). |
+| `not between lo and hi` | Never matches (sugar for `< lo or > hi`). |
+| `like "pat"` | Never matches. |
+| `not like "pat"` | **Matches.** `not like` is sugar for `not (x like "pat")`, the two-valued complement below. Guard with `is not null` to exclude missing rows. |
+| `not ( p )` | Matches whenever `p` is false, so a missing value inside `p`'s comparison makes the complement match. |
+| `is null` | Matches (this is the presence test for missing). |
+| `is not null` | Never matches. |
+| `x ?? y` (coalesce) | Not a predicate: evaluates to `y` when `x` is missing. A comparison on the result then follows that comparison's rule. |
+
+In short: every operator-level form except `not like` never matches a missing
+value; explicit `not ( ... )` (and its `not like` sugar) is the plain
+complement and does match missing rows.
+
 ### Arithmetic Operators
 
 | Operator | Meaning | Precedence |
