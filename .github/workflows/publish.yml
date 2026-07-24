@@ -117,92 +117,38 @@ jobs:
       # sleep gives the index time to propagate.
 
       - name: Publish powdb-storage
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-storage --dry-run
-          else
-            cargo publish -p powdb-storage
-            echo "Waiting for crates.io to index powdb-storage..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-storage "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       # powdb-auth is a leaf (argon2 etc., no powdb deps) but powdb-server
       # depends on it, so publish it before query/server to match RELEASES.md.
       - name: Publish powdb-auth
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-auth --dry-run
-          else
-            cargo publish -p powdb-auth
-            echo "Waiting for crates.io to index powdb-auth..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-auth "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       - name: Publish powdb-query
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-query --dry-run
-          else
-            cargo publish -p powdb-query
-            echo "Waiting for crates.io to index powdb-query..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-query "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       # powdb-sync (experimental sync substrate) depends only on powdb-storage,
       # but backup/server/powdb/cli all depend on it, so it must precede them.
       - name: Publish powdb-sync
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-sync --dry-run
-          else
-            cargo publish -p powdb-sync
-            echo "Waiting for crates.io to index powdb-sync..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-sync "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       # powdb-backup depends on storage+query+sync (all already published above)
       # and powdb-cli depends on backup, so it must precede the cli.
       - name: Publish powdb-backup
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-backup --dry-run
-          else
-            cargo publish -p powdb-backup
-            echo "Waiting for crates.io to index powdb-backup..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-backup "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       - name: Publish powdb-server
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-server --dry-run
-          else
-            cargo publish -p powdb-server
-            echo "Waiting for crates.io to index powdb-server..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb-server "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       # powdb (embedded facade) depends on powdb-query + powdb-storage (both
       # published above). It is a publishable crate with full crates.io metadata
       # (docs.rs/powdb) — the SQLite-shaped in-process front door — so it must be
       # released alongside the rest.
       - name: Publish powdb (embedded facade)
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb --dry-run
-          else
-            cargo publish -p powdb
-            echo "Waiting for crates.io to index powdb..."
-            sleep 30
-          fi
+        run: bash scripts/publish-crate.sh powdb "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       - name: Publish powdb-cli
-        run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p powdb-cli --dry-run
-          else
-            cargo publish -p powdb-cli
-          fi
+        run: bash scripts/publish-crate.sh powdb-cli "${{ inputs.version }}" "${{ inputs.dry_run }}"
 
       - name: Summary
         run: |
