@@ -554,6 +554,9 @@ async function main() {
   });
 
   await test("assertServerCatalogVersionSupported accepts <= max, rejects newer", () => {
+    // The ceiling is the entity-links catalog format (v7, since 0.19): a
+    // client stating an older ceiling is refused by any v7-activated server.
+    assert.equal(SUPPORTED_CATALOG_VERSION, 7);
     // A server on an older or equal catalog format is readable.
     assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION - 1);
     assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION);
