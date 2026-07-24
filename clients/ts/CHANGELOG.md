@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.1 - 2026-07-24
+
+- `SUPPORTED_CATALOG_VERSION` raised from 6 to 7: sync/replica clients are now
+  accepted by servers whose catalog activated v7 (entity links, appended links
+  section before the CRC). The client treats catalog payloads as opaque bytes,
+  so no decoding change; `assertServerCatalogVersionSupported` simply accepts
+  v7. Engine-side 0.19.1 also ships link introspection (`schema links`,
+  extended `describe`) whose results flow through the existing `query` path.
+
 ## 0.19.0 - 2026-07-22
 
 - Version-alignment release in lockstep with workspace v0.19.0 (entity links:
