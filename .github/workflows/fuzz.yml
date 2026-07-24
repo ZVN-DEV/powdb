@@ -74,7 +74,11 @@ jobs:
           # this explicit input the action installs *stable* and every fuzz
           # build fails with "the option `Z` is only accepted on nightly".
           # Setting it explicitly keeps fuzz working across dependabot SHA bumps.
-          toolchain: nightly
+          # Pinned 2026-07-24: nightly-2026-07-23 (89c61a754) ICEs in
+          # rustc_codegen_ssa while compiling tokio, killing every fuzz target
+          # at build time. nightly-2026-07-22 is the last known-good. Re-float
+          # to plain "nightly" once the upstream ICE is fixed.
+          toolchain: nightly-2026-07-22
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
