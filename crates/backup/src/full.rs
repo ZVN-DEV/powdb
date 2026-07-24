@@ -19,7 +19,7 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
     let catalog_version = catalog.active_catalog_version();
     let src = catalog.data_dir().to_path_buf();
     let sync = current_sync_snapshot_metadata(&src, source_lsn, catalog_version)?;
-    std::fs::create_dir_all(dest)?;
+    crate::secure::create_dir_secure(dest)?;
 
     let mut files = Vec::new();
     for name in active_durable_file_names(catalog) {
@@ -44,7 +44,7 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
         }
         let bytes = std::fs::read(source_path)?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        std::fs::write(dest.join(&name), &bytes)?;
+        crate::secure::write_file_secure(&dest.join(&name), &bytes)?;
         files.push(FileEntry {
             name,
             len: bytes.len() as u64,

@@ -47,28 +47,13 @@ fn test_disk_corruption_detected_on_read() {
         // drop flushes again, but the page is already stamped.
     }
 
-    // Corrupt one byte deep in page 0's data region, directly on disk,
-    // bypassing the heap entirely. Offset 40 is past the 20-byte header and
-    // CRC field but well before the bottom slot directory.
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let corrupt_at = (rid.page_id as u64) * PAGE_SIZE as u64 + 40;
-        f.seek(SeekFrom::Start(corrupt_at)).unwrap();
-        let mut byte = [0u8; 1];
-        f.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xFF;
-        f.seek(SeekFrom::Start(corrupt_at)).unwrap();
-        f.write_all(&byte).unwrap();
-        f.flush().unwrap();
-    }
-
-    // Reopen and force a disk read of the corrupted page. `delete` routes
-    // through `ensure_hot`, which reads + verifies the page from disk.
-    let mut heap = HeapFile::open(&path).unwrap();
+    // Force a disk read of the corrupted page. `delete` routes through
+    // `ensure_hot`, which reads + verifies the page from disk.
+    //
+    // TASK-08: the open path itself now verifies page CRCs, so the heap is
+    // opened BEFORE the corruption is written (see `open_then_corrupt` below)
+    // to keep this test focused on the read path rather than the open path.
+    let mut heap = open_then_corrupt(&path, rid.page_id);
     let err = heap
         .delete(rid)
         .expect_err("reading a corrupted page must error");
@@ -81,6 +66,15 @@ fn test_disk_corruption_detected_on_read() {
 
     drop(heap);
     let _ = std::fs::remove_file(&path);
+}
+
+/// Open the heap, then corrupt one byte of `page_id` on disk. The open must
+/// happen first: the open path verifies every page's CRC (TASK-08), so a file
+/// corrupted beforehand no longer opens at all.
+fn open_then_corrupt(path: &std::path::Path, page_id: u32) -> HeapFile {
+    let heap = HeapFile::open(path).unwrap();
+    corrupt_page_data_byte(path, page_id);
+    heap
 }
 
 /// Flip one byte of page 0's data region directly on disk, bypassing the
@@ -123,10 +117,9 @@ fn test_mmap_scan_does_not_detect_corruption_by_design() {
         heap.flush().unwrap();
     }
 
-    // Corrupt on disk, then reopen and activate the mmap fast path.
-    corrupt_page_data_byte(&path, rid.page_id);
-
-    let mut heap = HeapFile::open(&path).unwrap();
+    // Open first (the open path verifies CRCs), corrupt on disk, then
+    // activate the mmap fast path so the mapping observes the corrupt bytes.
+    let mut heap = open_then_corrupt(&path, rid.page_id);
     heap.enable_mmap();
 
     // The zero-copy scan reads through the mmap with no per-read CRC check.
@@ -180,9 +173,8 @@ fn test_verify_integrity_detects_corruption() {
     }
 
     // Corrupt and detect, mmap NOT active.
-    corrupt_page_data_byte(&path, rid.page_id);
     {
-        let heap = HeapFile::open(&path).unwrap();
+        let heap = open_then_corrupt(&path, rid.page_id);
         let err = heap
             .verify_integrity()
             .expect_err("corrupted page must fail integrity check (no mmap)");
@@ -190,9 +182,19 @@ fn test_verify_integrity_detects_corruption() {
     }
 
     // Corrupt and detect, mmap ACTIVE — verify_integrity reads off disk, not
-    // the mmap snapshot, so it still catches it.
+    // the mmap snapshot, so it still catches it. A fresh file is used because
+    // the one above is already corrupt and no longer opens (TASK-08).
+    let mmap_path = tmp_path("verify_mmap");
+    let mmap_rid;
     {
-        let mut heap = HeapFile::open(&path).unwrap();
+        let mut heap = HeapFile::create(&mmap_path).unwrap();
+        mmap_rid = heap
+            .insert(&encode_row(&schema, &[Value::Str("important_data".into())]))
+            .unwrap();
+        heap.flush().unwrap();
+    }
+    {
+        let mut heap = open_then_corrupt(&mmap_path, mmap_rid.page_id);
         heap.enable_mmap();
         let err = heap
             .verify_integrity()
@@ -201,6 +203,7 @@ fn test_verify_integrity_detects_corruption() {
     }
 
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&mmap_path);
 }
 
 #[test]

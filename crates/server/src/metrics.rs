@@ -11,6 +11,7 @@
 //! concurrent observers. At quiescence every counter is exact.
 
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +34,16 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// A scrape must be snappy — do NOT reuse the 300s connection idle timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on directory entries walked when sizing the data directory, so a scrape
+/// stays bounded no matter how many files a data dir accumulates.
+const MAX_SIZED_ENTRIES: usize = 10_000;
+
+/// Name of the write-ahead log inside the data directory. Sized separately
+/// from the rest of the database: WAL growth and database growth are different
+/// operational signals (a WAL that stops shrinking means checkpoints are not
+/// completing).
+const WAL_FILE_NAME: &str = "wal.log";
 
 /// How a finished query is classified for metrics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +149,9 @@ impl SyncRepairLabel {
 pub struct Metrics {
     start: Instant,
     version: &'static str,
+    /// Data directory to size at scrape time; `None` disables the storage
+    /// size gauges (they are the only metrics that touch the filesystem).
+    data_dir: Option<PathBuf>,
 
     connections_active: AtomicU64,
     connections_accepted_total: AtomicU64,
@@ -177,6 +191,7 @@ impl Metrics {
         Self {
             start: Instant::now(),
             version: env!("CARGO_PKG_VERSION"),
+            data_dir: None,
             connections_active: AtomicU64::new(0),
             connections_accepted_total: AtomicU64::new(0),
             tls_handshake_failures_total: AtomicU64::new(0),
@@ -203,6 +218,18 @@ impl Metrics {
             }),
             sync_ack_advanced_total: AtomicU64::new(0),
         }
+    }
+
+    /// Sample the data directory's size on each scrape. Without this the
+    /// storage-size gauges are omitted from the exposition.
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
+        self
+    }
+
+    /// The server version reported by `/health` and `powdb_build_info`.
+    pub fn version(&self) -> &'static str {
+        self.version
     }
 
     /// Record a finished query: its result class and execution time.
@@ -402,6 +429,45 @@ impl Metrics {
         let _ = writeln!(out, "powdb_query_duration_seconds_sum {sum_secs}");
         let _ = writeln!(out, "powdb_query_duration_seconds_count {cumulative}");
 
+        // Storage. The two gauges stat the data directory at scrape time; the
+        // fsync counters are lock-free reads of the storage layer's
+        // process-wide accounting. Neither touches the engine `RwLock`.
+        if let Some(dir) = &self.data_dir {
+            let sizes = DataDirSizes::sample(dir);
+            gauge_u64(
+                &mut out,
+                "powdb_database_size_bytes",
+                "Size on disk of the data directory excluding the write-ahead log.",
+                sizes.database_bytes,
+            );
+            gauge_u64(
+                &mut out,
+                "powdb_wal_size_bytes",
+                "Size on disk of the write-ahead log.",
+                sizes.wal_bytes,
+            );
+        }
+
+        let fsync = powdb_storage::wal::wal_fsync_stats();
+        counter(
+            &mut out,
+            "powdb_wal_fsync_total",
+            "Total WAL fsyncs issued (group-commit leaders plus background flushes).",
+            fsync.count,
+        );
+        counter_f64(
+            &mut out,
+            "powdb_wal_fsync_seconds_total",
+            "Total seconds spent inside WAL fsync. Divide its rate by the rate of powdb_wal_fsync_total for mean fsync latency.",
+            fsync.nanos as f64 / 1e9,
+        );
+        counter(
+            &mut out,
+            "powdb_wal_fsync_failures_total",
+            "Total WAL fsyncs that returned an error (commits may not be durable).",
+            fsync.failures,
+        );
+
         out.push_str("# HELP powdb_sync_operations_total Total private sync protocol operations, by operation and result.\n");
         out.push_str("# TYPE powdb_sync_operations_total counter\n");
         for operation in SyncOperation::ALL {
@@ -485,6 +551,56 @@ impl Metrics {
     }
 }
 
+/// Bytes on disk under the data directory, split into the write-ahead log and
+/// everything else (heaps, indexes, catalog, sync segments).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DataDirSizes {
+    database_bytes: u64,
+    wal_bytes: u64,
+}
+
+impl DataDirSizes {
+    /// Walk `dir` and total the file sizes. Unreadable entries are skipped
+    /// rather than failing the scrape: a metrics endpoint that 500s because a
+    /// file was being renamed is worse than a gauge that is briefly low. The
+    /// walk is bounded by `MAX_SIZED_ENTRIES` so the scrape cost stays flat.
+    fn sample(dir: &Path) -> Self {
+        let mut sizes = DataDirSizes::default();
+        let mut stack = vec![dir.to_path_buf()];
+        let mut visited = 0usize;
+        while let Some(current) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > MAX_SIZED_ENTRIES {
+                    return sizes;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    stack.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if entry.file_name() == WAL_FILE_NAME {
+                    sizes.wal_bytes += meta.len();
+                } else {
+                    sizes.database_bytes += meta.len();
+                }
+            }
+        }
+        sizes
+    }
+}
+
 /// Decrements `connections_active` when dropped.
 pub struct ActiveGuard(Arc<Metrics>);
 impl Drop for ActiveGuard {
@@ -502,6 +618,12 @@ impl Drop for InFlightGuard {
 }
 
 fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(out, "{name} {value}");
+}
+
+fn counter_f64(out: &mut String, name: &str, help: &str, value: f64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} counter");
     let _ = writeln!(out, "{name} {value}");
@@ -598,6 +720,14 @@ where
             &body,
         )
         .await;
+    } else if method == "GET" && (path == "/health" || path == "/healthz") {
+        // Liveness probe for k8s/Fly/Docker. Unauthenticated and deliberately
+        // cheap: it answers from the metrics task alone and never touches the
+        // engine lock, so a long-running query cannot make the process look
+        // dead and get it restarted mid-write. `/healthz` is accepted as the
+        // conventional Kubernetes spelling.
+        let body = format!("ok powdb {}\n", metrics.version());
+        let _ = respond(&mut stream, 200, "text/plain; charset=utf-8", &body).await;
     } else {
         let _ = respond(&mut stream, 404, "text/plain", "not found\n").await;
     }
@@ -665,6 +795,9 @@ mod tests {
             "powdb_sync_ack_advanced_total",
             "powdb_sync_repair_actions_total",
             "powdb_sync_operation_duration_seconds",
+            "powdb_wal_fsync_total",
+            "powdb_wal_fsync_seconds_total",
+            "powdb_wal_fsync_failures_total",
         ] {
             assert!(
                 out.contains(&format!("# HELP {name}")),
@@ -861,6 +994,68 @@ mod tests {
         client.read_to_string(&mut resp).await.unwrap();
         task.await.unwrap();
         assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "resp: {resp}");
+    }
+
+    #[test]
+    fn storage_size_gauges_appear_only_with_a_data_dir() {
+        let m = Metrics::new();
+        let out = m.render();
+        assert!(
+            !out.contains("powdb_database_size_bytes"),
+            "size gauges must be omitted when no data dir is configured"
+        );
+
+        let dir = std::env::temp_dir().join(format!("powdb_metrics_size_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T.heap"), vec![7u8; 4096]).unwrap();
+        std::fs::write(dir.join(WAL_FILE_NAME), vec![7u8; 100]).unwrap();
+
+        let m = Metrics::new().with_data_dir(&dir);
+        let out = m.render();
+        assert!(out.contains("powdb_database_size_bytes 4096"), "out: {out}");
+        assert!(out.contains("powdb_wal_size_bytes 100"), "out: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_dir_sizes_split_wal_from_the_rest_and_recurse() {
+        let dir = std::env::temp_dir().join(format!("powdb_metrics_walk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sync")).unwrap();
+        std::fs::write(dir.join("catalog.bin"), vec![0u8; 10]).unwrap();
+        std::fs::write(dir.join(WAL_FILE_NAME), vec![0u8; 20]).unwrap();
+        std::fs::write(dir.join("sync").join("segment-1"), vec![0u8; 30]).unwrap();
+
+        let sizes = DataDirSizes::sample(&dir);
+        assert_eq!(sizes.wal_bytes, 20);
+        assert_eq!(sizes.database_bytes, 40, "catalog plus nested sync segment");
+
+        // A missing directory must not panic or fail the scrape.
+        assert_eq!(
+            DataDirSizes::sample(&dir.join("nope")),
+            DataDirSizes::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn handle_scrape_serves_health_for_liveness_probes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for path in ["/health", "/healthz"] {
+            let (mut client, server) = tokio::io::duplex(8192);
+            let m = Arc::new(Metrics::new());
+            let task = tokio::spawn(handle_scrape(server, m));
+            client
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).await.unwrap();
+            task.await.unwrap();
+            assert!(resp.starts_with("HTTP/1.1 200 OK"), "{path} resp: {resp}");
+            assert!(resp.contains("ok powdb "), "{path} resp: {resp}");
+        }
     }
 
     #[tokio::test]

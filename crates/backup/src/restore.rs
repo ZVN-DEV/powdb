@@ -30,7 +30,7 @@ pub(crate) fn ensure_empty_dir(dest_data_dir: &Path) -> io::Result<()> {
             dest_data_dir.display()
         )));
     }
-    std::fs::create_dir_all(dest_data_dir)?;
+    crate::secure::create_dir_secure(dest_data_dir)?;
     Ok(())
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn verify_and_copy_full(
                 f.name
             )));
         }
-        std::fs::write(dest_data_dir.join(&f.name), &bytes)?;
+        crate::secure::write_file_secure(&dest_data_dir.join(&f.name), &bytes)?;
     }
     Ok(())
 }

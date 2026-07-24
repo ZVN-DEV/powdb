@@ -14,6 +14,15 @@ use zeroize::Zeroizing;
 /// Maximum number of concurrent connections.
 const MAX_CONNECTIONS: usize = 1024;
 
+/// Hard deadline for the TLS handshake. A connection permit is held from the
+/// moment the socket is accepted, so a peer that connects over TLS and then
+/// stalls would otherwise pin one of the `MAX_CONNECTIONS` permits forever:
+/// 1024 silent sockets take the server offline before a single byte of the
+/// wire protocol is read. Ten seconds is far beyond any real handshake
+/// (typically a few round trips) and far below the 300s connection idle
+/// timeout, which does not start until the handshake returns.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct Args {
     port: u16,
     bind: String,
@@ -439,6 +448,36 @@ fn build_tls_acceptor(
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Perform the TLS handshake under a hard deadline.
+///
+/// The connection permit is taken before the handshake runs, and neither the
+/// idle timeout (which only starts once a connection is running) nor the
+/// per-IP auth rate limiter (which lives inside `run_connection`) applies yet.
+/// Without a deadline, `MAX_CONNECTIONS` peers that connect and then send a
+/// single byte, or nothing at all, hold every permit forever and the server
+/// stops accepting: pre-auth connection-slot exhaustion that costs the
+/// attacker nothing and hits exactly the deployments that enabled TLS.
+///
+/// A timed-out handshake returns `ErrorKind::TimedOut`; the caller counts it in
+/// the TLS handshake failure metric and drops the permit like any other failed
+/// handshake.
+async fn accept_tls_with_timeout<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    timeout: std::time::Duration,
+) -> io::Result<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TLS handshake did not complete within {timeout:?}"),
+        )),
+    }
+}
+
 /// Resolve when the process receives a termination signal: SIGINT (Ctrl-C) or,
 /// on Unix, SIGTERM — the signal Docker (`docker stop`), Kubernetes (pod
 /// termination), and systemd send on stop. Awaiting only `ctrl_c()` would let
@@ -662,7 +701,7 @@ async fn main() {
     // Optional metrics endpoint. Construct the registry now (handlers always
     // hold an Arc<Metrics>) and bind eagerly so a port conflict fails fast at
     // startup, consistent with the main listener above.
-    let metrics = Arc::new(Metrics::new());
+    let metrics = Arc::new(Metrics::new().with_data_dir(&args.data_dir));
     let metrics_listener = match args.metrics_addr.as_deref() {
         Some(maddr) => match TcpListener::bind(maddr).await {
             Ok(l) => Some(l),
@@ -755,7 +794,7 @@ async fn main() {
                             // on an early return or panic.
                             let _active = m.active_guard();
                             if let Some(acceptor) = tls {
-                                match acceptor.accept(stream).await {
+                                match accept_tls_with_timeout(&acceptor, stream, TLS_HANDSHAKE_TIMEOUT).await {
                                     Ok(tls_stream) => {
                                         run_connection(
                                             tls_stream, peer_addr, eng, tx_gate, pw, users, rx,
@@ -861,6 +900,111 @@ async fn main() {
 mod tests {
     use super::*;
     use powdb_query::executor::Engine;
+
+    /// Build a self-signed acceptor for handshake tests.
+    fn test_acceptor() -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der().to_vec())
+                .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// TASK-04: a peer that opens a TLS connection and then says nothing must
+    /// not pin its connection permit. Without the deadline this future never
+    /// resolves and the test hangs (the permit is held for the process's life).
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_a_silent_peer() {
+        // Witness the bug first: the bare acceptor never resolves against a
+        // silent peer, so the connection permit it holds is never released.
+        let (_bug_client, bug_server) = tokio::io::duplex(4096);
+        let acceptor = test_acceptor();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                acceptor.accept(bug_server)
+            )
+            .await
+            .is_err(),
+            "an unbounded handshake against a silent peer must not resolve"
+        );
+
+        let (_client, server) = tokio::io::duplex(4096);
+        let started = std::time::Instant::now();
+        let err = accept_tls_with_timeout(
+            &test_acceptor(),
+            server,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a silent peer must not complete the handshake");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "err: {err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the handshake must give up promptly, took {:?}",
+            started.elapsed()
+        );
+        // The client half is still open: the timeout, not an EOF, ended it.
+        drop(_client);
+    }
+
+    /// A peer that dribbles one byte and stalls is the same attack with a
+    /// pulse: the partial handshake must still hit the deadline.
+    #[tokio::test]
+    async fn tls_handshake_times_out_on_a_one_byte_peer() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(&[0x16]).await.unwrap();
+        let err = accept_tls_with_timeout(
+            &test_acceptor(),
+            server,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a stalled partial handshake must not complete");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "err: {err}");
+    }
+
+    /// The deadline must not break a real handshake.
+    #[tokio::test]
+    async fn tls_handshake_succeeds_within_the_deadline() {
+        use tokio_rustls::rustls;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der().to_vec())
+                .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            accept_tls_with_timeout(&acceptor, server, TLS_HANDSHAKE_TIMEOUT).await
+        });
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let client_result = connector.connect(name, client).await;
+        assert!(client_result.is_ok(), "client handshake failed");
+        assert!(
+            server_task.await.unwrap().is_ok(),
+            "server handshake must succeed inside the deadline"
+        );
+    }
 
     #[test]
     fn require_tls_rejects_password_without_tls() {
