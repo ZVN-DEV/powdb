@@ -17,6 +17,7 @@ import {
   MAX_PAYLOAD_SIZE,
   MAX_COLUMNS,
   MAX_ROWS,
+  MAX_RESULT_CELLS,
   MAX_SYNC_UNITS,
   MSG_QUERY_NATIVE,
   MSG_QUERY_PARAMS_NATIVE,
@@ -213,6 +214,55 @@ async function main() {
     frame.writeUInt32LE(payload.length, 2);
     payload.copy(frame, 6);
     assert.throws(() => tryDecode(frame), /row data too short/);
+  });
+
+  // A hostile (or MITM'd) server can declare a huge narrow result whose wire
+  // cost is tiny: every empty cell is 4 bytes on the wire but costs an order of
+  // magnitude more JS heap (a row array plus a slot). Before MAX_RESULT_CELLS a
+  // ~40 MB frame decoded into ~1.9 GB of heap. The cell cap bounds it.
+  await test("tryDecode rejects a result whose declared cells exceed MAX_RESULT_CELLS", () => {
+    const rowCount = MAX_RESULT_CELLS + 1;
+    // colCount = 1 with an empty column name, then rowCount empty-string cells:
+    // the byte-shape check passes, so only the cell cap can reject this.
+    const payloadLen = 2 + 4 + 4 + rowCount * 4;
+    const frame = Buffer.alloc(6 + payloadLen);
+    frame.writeUInt8(0x07, 0); // MSG_RESULT_ROWS
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payloadLen, 2);
+    frame.writeUInt16LE(1, 6);
+    frame.writeUInt32LE(0, 8);
+    frame.writeUInt32LE(rowCount, 12);
+    assert.throws(() => tryDecode(frame), /result too large/);
+  });
+
+  await test("tryDecode rejects a wide native result that exceeds MAX_RESULT_CELLS", () => {
+    // Wide rather than tall, and backed by enough bytes to clear the native
+    // byte-shape check, so only the cell cap can reject it.
+    const colCount = 8;
+    const rowCount = Math.ceil((MAX_RESULT_CELLS + 1) / colCount);
+    const header = 2 + colCount * 4 + 4;
+    const payload = Buffer.alloc(header + rowCount * colCount * 5);
+    payload.writeUInt16LE(colCount, 0);
+    for (let i = 0; i < colCount; i++) payload.writeUInt32LE(0, 2 + i * 4);
+    payload.writeUInt32LE(rowCount, 2 + colCount * 4);
+    const frame = Buffer.alloc(6 + payload.length);
+    frame.writeUInt8(MSG_RESULT_ROWS_NATIVE, 0);
+    frame.writeUInt8(0, 1);
+    frame.writeUInt32LE(payload.length, 2);
+    payload.copy(frame, 6);
+    assert.throws(() => tryDecode(frame), /result too large/);
+  });
+
+  await test("tryDecode still accepts an ordinary result under the cell cap", () => {
+    const columns = ["name", "age"];
+    const rows = [
+      ["ada", "36"],
+      ["bob", "24"],
+    ];
+    const frame = encode({ type: "ResultRows", columns, rows });
+    const decoded = tryDecode(frame);
+    assert.ok(decoded);
+    assert.deepEqual(decoded!.msg, { type: "ResultRows", columns, rows });
   });
 
   await test("tryDecode throws intentional error on truncated ResultRows column count", () => {

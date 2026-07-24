@@ -20,7 +20,54 @@ use tracing_subscriber::EnvFilter;
 
 const CLI_COMMANDS: &[&str] = &["exec", "prepare"];
 const DEFAULT_DB_NAME: &str = "default";
-const META_COMMANDS: &[&str] = &[".exit", ".help", ".quit", ".schema", ".tables", ".timing"];
+const META_COMMANDS: &[&str] = &[
+    ".cancel", ".exit", ".help", ".mode", ".powql", ".quit", ".schema", ".sql", ".tables",
+    ".timing",
+];
+
+/// Which query language a statement is written in. PowQL is the native
+/// language; SQL goes through the server-side/embedded SQL frontend
+/// (`docs/SQL.md`), which lowers a supported subset onto the same planner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dialect {
+    Powql,
+    Sql,
+}
+
+impl Dialect {
+    fn prompt(self) -> &'static str {
+        match self {
+            Dialect::Powql => "powql> ",
+            Dialect::Sql => "sql> ",
+        }
+    }
+}
+
+/// How results are rendered. `Table` is the human-readable default; `Json` and
+/// `Csv` are the machine-readable modes that make the CLI scriptable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputMode {
+    Table,
+    Json,
+    Csv,
+}
+
+/// The language + rendering pair chosen on the command line. Bundled so the
+/// remote entry points stay under the argument-count lint.
+#[derive(Clone, Copy)]
+struct SessionOpts {
+    dialect: Dialect,
+    output: OutputMode,
+}
+
+fn parse_output_mode(name: &str) -> Option<OutputMode> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "table" => Some(OutputMode::Table),
+        "json" => Some(OutputMode::Json),
+        "csv" => Some(OutputMode::Csv),
+        _ => None,
+    }
+}
 
 fn archive_wal_records_if_sync_enabled(
     data_dir: &Path,
@@ -190,6 +237,11 @@ struct CliArgs {
     /// Role for the `useradd` subcommand (defaults to "readwrite").
     role: Option<String>,
     exec: Option<String>,
+    /// Language `--exec` / `--exec-file` statements are written in, and the
+    /// dialect the REPL starts in. Selected with `--sql` (default PowQL).
+    dialect: Dialect,
+    /// Result rendering for one-shot mode and the REPL's initial `.mode`.
+    output: OutputMode,
     action: Action,
     tls: TlsOpts,
 }
@@ -257,6 +309,8 @@ fn parse_args() -> CliArgs {
         .filter(|s| !s.is_empty());
     let mut exec: Option<String> = None;
     let mut exec_file: Option<String> = None;
+    let mut dialect = Dialect::Powql;
+    let mut output = OutputMode::Table;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
     // the subcommand and its positionals.
@@ -300,6 +354,26 @@ fn parse_args() -> CliArgs {
                     std::process::exit(2);
                 }
                 exec_file = Some(argv[i].clone());
+            }
+            "--sql" => {
+                dialect = Dialect::Sql;
+            }
+            "--format" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --format requires one of table, json, csv");
+                    std::process::exit(2);
+                }
+                match parse_output_mode(&argv[i]) {
+                    Some(mode) => output = mode,
+                    None => {
+                        eprintln!(
+                            "Error: unknown --format '{}' (want table, json, or csv)",
+                            argv[i]
+                        );
+                        std::process::exit(2);
+                    }
+                }
             }
             "--remote" | "-r" => {
                 i += 1;
@@ -390,7 +464,13 @@ fn parse_args() -> CliArgs {
                 println!();
                 println!("OPTIONS:");
                 println!("    -c, --exec <QUERY>         Run one or more `;`-separated PowQL statements and exit");
+                println!("                               (statements are separated by `;`, never by newlines)");
                 println!("        --exec-file <PATH>     Run PowQL read from a file ('-' for stdin) and exit");
+                println!("                               (same `;` rule: a newline continues a statement)");
+                println!("        --sql                  Treat --exec / --exec-file input as SQL, and start");
+                println!("                               the REPL in SQL mode (see docs/SQL.md for the subset)");
+                println!("        --format <FMT>         Result rendering: table (default), json, or csv.");
+                println!("                               json and csv make the CLI scriptable");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
                 println!("        --db <NAME>            Database name (default: default)");
                 println!("        --password <PW>        Password for remote auth");
@@ -426,6 +506,10 @@ fn parse_args() -> CliArgs {
                 println!("    One-shot:            powdb-cli --exec 'count(User)'");
                 println!("    Load a file:         powdb-cli --data-dir ./sandbox --exec-file dump.powql");
                 println!("    One-shot (remote):   powdb-cli -r 127.0.0.1:5433 -c 'User filter .age > 25 limit 5'");
+                println!(
+                    "    One-shot SQL:        powdb-cli --sql -c 'SELECT name FROM User LIMIT 5'"
+                );
+                println!("    Scriptable output:   powdb-cli --format json -c 'count(User)'");
                 println!();
                 println!("SUBCOMMANDS:");
                 println!("    backup <DEST_DIR> [--base <FULL_DIR>]");
@@ -745,6 +829,8 @@ fn parse_args() -> CliArgs {
         user,
         role,
         exec,
+        dialect,
+        output,
         action,
         tls: TlsOpts {
             enabled: tls_enabled,
@@ -818,6 +904,11 @@ fn main() {
         Action::Default => {}
     }
 
+    let session = SessionOpts {
+        dialect: args.dialect,
+        output: args.output,
+    };
+
     if let Some(remote_addr) = &args.remote {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -836,6 +927,7 @@ fn main() {
                 args.password.clone(),
                 args.user.clone(),
                 query,
+                session,
                 &args.tls,
             ));
             std::process::exit(code);
@@ -845,12 +937,13 @@ fn main() {
             args.db.clone(),
             args.password.clone(),
             args.user.clone(),
+            session,
             &args.tls,
         ));
     } else if let Some(query) = args.exec {
-        std::process::exit(exec_embedded(&args.data_dir, &query));
+        std::process::exit(exec_embedded(&args.data_dir, &query, session));
     } else {
-        run_embedded(&args.data_dir);
+        run_embedded(&args.data_dir, session);
     }
 }
 
@@ -1335,7 +1428,7 @@ fn run_sweep(data_dir: &str, table: &str) -> i32 {
 
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
 
-fn exec_embedded(data_dir: &str, query: &str) -> i32 {
+fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -> i32 {
     let mut engine = match Engine::new_with_wal_archive(
         Path::new(data_dir),
         archive_wal_records_if_sync_enabled,
@@ -1358,17 +1451,54 @@ fn exec_embedded(data_dir: &str, query: &str) -> i32 {
             );
             return 1;
         }
-        match engine.execute_powql(stmt) {
+        let executed = match session.dialect {
+            Dialect::Powql => engine.execute_powql(stmt),
+            Dialect::Sql => engine.execute_sql(stmt),
+        };
+        match executed {
             Ok(result) => {
-                print_local_result(&result);
+                print_local_result(&result, session.output);
             }
             Err(e) => {
                 eprintln!("Error: {e}");
+                if let Some(hint) = missing_separator_hint(query, statements.len()) {
+                    eprintln!("{hint}");
+                }
                 return 1;
             }
         }
     }
     0
+}
+
+/// Explain the single most common `--exec-file` mistake instead of leaving the
+/// user with a bare parser error.
+///
+/// `--exec` and `--exec-file` separate statements with `;`; a newline only
+/// continues the current statement (PowQL pipelines legitimately span lines, so
+/// newlines cannot be treated as separators without breaking them). A file of
+/// newline-separated statements therefore parses as ONE statement and fails
+/// with an opaque "unexpected trailing token" error. Detect that exact shape,
+/// i.e. several non-empty lines and not a single `;`, and say so.
+fn missing_separator_hint(source: &str, statement_count: usize) -> Option<String> {
+    if statement_count != 1 || source.contains(';') {
+        return None;
+    }
+    let lines = source
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .count();
+    if lines < 2 {
+        return None;
+    }
+    Some(format!(
+        "note: this input has {lines} non-empty lines and no `;`, so it was parsed as ONE statement.\n\
+         note: statements are separated by `;`, not by newlines (a newline continues a statement,\n\
+         \x20     which is what lets a PowQL pipeline span several lines). End each statement with `;`."
+    ))
 }
 
 // ─── Remote TLS support ─────────────────────────────────────────────────────
@@ -1467,11 +1597,16 @@ async fn exec_remote(
     password: Option<String>,
     username: Option<String>,
     query: String,
+    session: SessionOpts,
     tls: &TlsOpts,
 ) -> i32 {
     match connect_remote(&addr, tls).await {
-        Ok(RemoteStream::Plain(s)) => exec_remote_on(s, db, password, username, query).await,
-        Ok(RemoteStream::Tls(s)) => exec_remote_on(*s, db, password, username, query).await,
+        Ok(RemoteStream::Plain(s)) => {
+            exec_remote_on(s, db, password, username, query, session).await
+        }
+        Ok(RemoteStream::Tls(s)) => {
+            exec_remote_on(*s, db, password, username, query, session).await
+        }
         Err(msg) => {
             eprintln!("Error: {msg}");
             1
@@ -1485,6 +1620,7 @@ async fn exec_remote_on<S>(
     password: Option<String>,
     username: Option<String>,
     query: String,
+    session: SessionOpts,
 ) -> i32
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1522,7 +1658,9 @@ where
     // The wire protocol carries one statement per `Query` message, so split
     // client-side (#150) and send each in turn, stopping on the first error.
     let mut code = 0;
-    for stmt in split_statements(&query) {
+    let statements = split_statements(&query);
+    let statement_count = statements.len();
+    for stmt in statements {
         if stmt.starts_with('.') {
             let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
             eprintln!(
@@ -1533,8 +1671,13 @@ where
             break;
         }
 
-        let q = Message::Query {
-            query: stmt.to_string(),
+        let q = match session.dialect {
+            Dialect::Powql => Message::Query {
+                query: stmt.to_string(),
+            },
+            Dialect::Sql => Message::QuerySql {
+                query: stmt.to_string(),
+            },
         };
         if q.write_to(&mut writer).await.is_err()
             || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
@@ -1547,8 +1690,11 @@ where
         match Message::read_from(&mut reader).await {
             Ok(Some(msg)) => {
                 let is_error = matches!(msg, Message::Error { .. });
-                print_remote_result(&msg);
+                print_remote_result(&msg, session.output);
                 if is_error {
+                    if let Some(hint) = missing_separator_hint(&query, statement_count) {
+                        eprintln!("{hint}");
+                    }
                     code = 1;
                     break;
                 }
@@ -1598,9 +1744,142 @@ fn needs_continuation(buffer: &str) -> bool {
     depth > 0 || in_str
 }
 
+/// Mutable REPL settings shared by embedded and remote mode.
+struct ReplState {
+    timing: bool,
+    dialect: Dialect,
+    output: OutputMode,
+}
+
+/// What the caller must do after a meta-command line.
+enum MetaOutcome {
+    /// Fully handled; read the next line.
+    Handled,
+    /// Leave the REPL.
+    Quit,
+    /// Run this text once as SQL, whatever the current dialect is (`.sql <STMT>`).
+    RunSql(String),
+    /// Not one of the shared meta-commands; mode-specific handling applies.
+    Unhandled,
+}
+
+/// Handle the meta-commands that mean the same thing in embedded and remote
+/// mode. Mode-specific ones (`.tables`, `.schema`, `.help`) stay with their
+/// REPL loop.
+fn handle_shared_meta(trimmed: &str, state: &mut ReplState) -> MetaOutcome {
+    match trimmed {
+        ".quit" | ".exit" => MetaOutcome::Quit,
+        ".timing" => {
+            state.timing = !state.timing;
+            println!("Timing is {}.", if state.timing { "on" } else { "off" });
+            MetaOutcome::Handled
+        }
+        ".powql" => {
+            state.dialect = Dialect::Powql;
+            println!("Query language is PowQL.");
+            MetaOutcome::Handled
+        }
+        ".sql" => {
+            state.dialect = Dialect::Sql;
+            println!("Query language is SQL (see docs/SQL.md for the supported subset).");
+            println!("Type .powql to switch back.");
+            MetaOutcome::Handled
+        }
+        _ if trimmed.starts_with(".sql ") => {
+            let stmt = trimmed[".sql ".len()..].trim().to_string();
+            if stmt.is_empty() {
+                MetaOutcome::Handled
+            } else {
+                MetaOutcome::RunSql(stmt)
+            }
+        }
+        ".mode" => {
+            println!(
+                "Output mode is {}.",
+                match state.output {
+                    OutputMode::Table => "table",
+                    OutputMode::Json => "json",
+                    OutputMode::Csv => "csv",
+                }
+            );
+            println!("Usage: .mode <table|json|csv>");
+            MetaOutcome::Handled
+        }
+        _ if trimmed.starts_with(".mode ") => {
+            let want = &trimmed[".mode ".len()..];
+            match parse_output_mode(want) {
+                Some(mode) => {
+                    state.output = mode;
+                    println!("Output mode is {}.", want.trim().to_ascii_lowercase());
+                }
+                None => eprintln!(
+                    "Error: unknown output mode '{}' (want table, json, or csv)",
+                    want.trim()
+                ),
+            }
+            MetaOutcome::Handled
+        }
+        _ => MetaOutcome::Unhandled,
+    }
+}
+
+/// True when the line is the continuation escape hatch. Recognized anywhere,
+/// including in the middle of an unterminated statement, which is the whole
+/// point: without it an unbalanced `(` swallows every later line, meta-commands
+/// included, until EOF.
+fn is_cancel_line(line: &str) -> bool {
+    matches!(line.trim(), ".cancel" | "\\c")
+}
+
+/// Discard a partial statement, reporting what was thrown away.
+fn cancel_buffer(buffer: &mut String) {
+    if buffer.trim().is_empty() {
+        buffer.clear();
+        println!("(nothing to cancel)");
+    } else {
+        let lines = buffer.lines().count();
+        buffer.clear();
+        println!(
+            "(discarded {lines} line{} of unterminated input)",
+            if lines == 1 { "" } else { "s" }
+        );
+    }
+}
+
+/// Warn about input abandoned at EOF. Without this an unbalanced delimiter
+/// silently eats the rest of a piped session and exits 0.
+fn warn_unterminated_at_eof(buffer: &str) {
+    if buffer.trim().is_empty() {
+        return;
+    }
+    let lines = buffer.lines().count();
+    eprintln!(
+        "Warning: {lines} line{} of unterminated input were discarded at end of input.",
+        if lines == 1 { "" } else { "s" }
+    );
+    eprintln!(
+        "Warning: an unbalanced '(' , '{{' or '\"' put the session into a continuation, so \
+         everything after it (meta-commands included) was buffered and never run. \
+         Use .cancel to escape a continuation."
+    );
+}
+
+/// One-time note when a piped (non-terminal) session enters a continuation.
+/// On a terminal the `  ...> ` prompt already makes this visible.
+fn note_continuation_when_piped(interactive: bool, already_noted: &mut bool) {
+    if interactive || *already_noted {
+        return;
+    }
+    *already_noted = true;
+    eprintln!(
+        "note: unterminated statement (unbalanced '(' , '{{' or '\"'); \
+         reading continuation lines. Send .cancel to discard it."
+    );
+}
+
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
-fn run_embedded(data_dir: &str) {
+fn run_embedded(data_dir: &str, session: SessionOpts) {
     eprintln!("PowDB v{} — embedded mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Data directory: {data_dir}");
     eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
@@ -1628,12 +1907,21 @@ fn run_embedded(data_dir: &str) {
     let hist = history_path();
     rl.load_history(&hist).ok();
 
-    let mut timing_enabled = false;
+    let mut state = ReplState {
+        timing: false,
+        dialect: session.dialect,
+        output: session.output,
+    };
     let mut buffer = String::new();
+    let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
+    let mut continuation_noted = false;
+    // A `.sql <STMT>` meta-command runs one statement outside the current
+    // dialect; `None` means "use `state.dialect`".
+    let mut one_off_sql: Option<String>;
 
     loop {
         let prompt = if buffer.is_empty() {
-            "powql> "
+            state.dialect.prompt()
         } else {
             "  ...> "
         };
@@ -1643,6 +1931,7 @@ fn run_embedded(data_dir: &str) {
             Err(rustyline::error::ReadlineError::Interrupted) => {
                 // Abandon any partial multi-line statement.
                 buffer.clear();
+                continuation_noted = false;
                 continue;
             }
             Err(e) => {
@@ -1650,6 +1939,17 @@ fn run_embedded(data_dir: &str) {
                 break;
             }
         };
+
+        // `.cancel` works mid-continuation; every other meta-command needs an
+        // empty buffer so a `.` inside a statement stays part of the statement.
+        if is_cancel_line(&line) {
+            rl.add_history_entry(line.trim()).ok();
+            cancel_buffer(&mut buffer);
+            continuation_noted = false;
+            continue;
+        }
+
+        one_off_sql = None;
 
         // Meta-commands are only recognized at the start of a statement.
         if buffer.is_empty() {
@@ -1660,94 +1960,49 @@ fn run_embedded(data_dir: &str) {
             // ── Meta-commands ──────────────────────────────────────────
             if trimmed.starts_with('.') {
                 rl.add_history_entry(trimmed).ok();
-                match trimmed {
-                    ".quit" | ".exit" => break,
-                    ".help" => {
-                        println!("Meta-commands:");
-                        println!("  .tables          List all tables");
-                        println!("  .schema <TABLE>  Show columns and types for a table");
-                        println!("  .timing          Toggle query timing on/off");
-                        println!("  .help            Show this help");
-                        println!("  .quit / .exit    Exit the REPL");
-                    }
-                    ".tables" => {
-                        let tables = engine.catalog().list_tables();
-                        if tables.is_empty() {
-                            println!("(no tables)");
-                        } else {
-                            for t in &tables {
-                                println!("  {t}");
-                            }
-                            println!(
-                                "({} table{})",
-                                tables.len(),
-                                if tables.len() == 1 { "" } else { "s" }
-                            );
-                        }
-                    }
-                    ".timing" => {
-                        timing_enabled = !timing_enabled;
-                        println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
-                    }
-                    cmd if cmd.starts_with(".schema") => {
-                        let table_name = cmd.strip_prefix(".schema").unwrap().trim();
-                        if table_name.is_empty() {
-                            eprintln!("Usage: .schema <TABLE_NAME>");
-                        } else if let Some(schema) = engine.catalog().schema(table_name) {
-                            println!("Table: {}", schema.table_name);
-                            println!("  {:<20} {:<12} Required", "Column", "Type");
-                            println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
-                            for col in &schema.columns {
-                                println!(
-                                    "  {:<20} {:<12} {}",
-                                    col.name,
-                                    match col.type_id {
-                                        powdb_storage::types::TypeId::Int => "int",
-                                        powdb_storage::types::TypeId::Float => "float",
-                                        powdb_storage::types::TypeId::Bool => "bool",
-                                        powdb_storage::types::TypeId::Str => "str",
-                                        powdb_storage::types::TypeId::DateTime => "datetime",
-                                        powdb_storage::types::TypeId::Uuid => "uuid",
-                                        powdb_storage::types::TypeId::Bytes => "bytes",
-                                        powdb_storage::types::TypeId::Json => "json",
-                                        powdb_storage::types::TypeId::Empty => "empty",
-                                    },
-                                    if col.required { "yes" } else { "no" }
-                                );
-                            }
-                        } else {
-                            eprintln!("Error: table '{table_name}' not found");
-                        }
-                    }
-                    other => {
-                        eprintln!("Unknown meta-command: {other}");
-                        eprintln!("Type .help for available commands.");
+                match handle_shared_meta(trimmed, &mut state) {
+                    MetaOutcome::Quit => break,
+                    MetaOutcome::Handled => continue,
+                    MetaOutcome::RunSql(stmt) => one_off_sql = Some(stmt),
+                    MetaOutcome::Unhandled => {
+                        run_embedded_meta(trimmed, &engine);
+                        continue;
                     }
                 }
-                continue;
             }
         }
 
         // Accumulate input until braces/parens balance outside strings.
-        buffer.push_str(&line);
-        buffer.push('\n');
-        if needs_continuation(&buffer) {
-            continue;
-        }
+        let (statement, statement_dialect) = match one_off_sql {
+            Some(stmt) => (stmt, Dialect::Sql),
+            None => {
+                buffer.push_str(&line);
+                buffer.push('\n');
+                if needs_continuation(&buffer) {
+                    note_continuation_when_piped(interactive, &mut continuation_noted);
+                    continue;
+                }
+                continuation_noted = false;
+                let statement = buffer.trim().to_string();
+                buffer.clear();
+                if statement.is_empty() {
+                    continue;
+                }
+                rl.add_history_entry(&statement).ok();
+                (statement, state.dialect)
+            }
+        };
 
-        let statement = buffer.trim().to_string();
-        buffer.clear();
-        if statement.is_empty() {
-            continue;
-        }
-        rl.add_history_entry(&statement).ok();
-
-        // ── Execute PowQL query ────────────────────────────────────────
+        // ── Execute the statement ──────────────────────────────────────
         let start = Instant::now();
-        match engine.execute_powql(&statement) {
+        let executed = match statement_dialect {
+            Dialect::Powql => engine.execute_powql(&statement),
+            Dialect::Sql => engine.execute_sql(&statement),
+        };
+        match executed {
             Ok(result) => {
-                print_local_result(&result);
-                if timing_enabled {
+                print_local_result(&result, state.output);
+                if state.timing {
                     let elapsed = start.elapsed();
                     if elapsed.as_secs() >= 1 {
                         println!("Time: {:.2}s", elapsed.as_secs_f64());
@@ -1760,8 +2015,76 @@ fn run_embedded(data_dir: &str) {
         }
     }
 
+    warn_unterminated_at_eof(&buffer);
     rl.save_history(&hist).ok();
     eprintln!("\nBye!");
+}
+
+/// Meta-commands that only exist in embedded mode, where the catalog is local.
+fn run_embedded_meta(trimmed: &str, engine: &Engine) {
+    match trimmed {
+        ".help" => {
+            println!("Meta-commands:");
+            println!("  .tables          List all tables");
+            println!("  .schema <TABLE>  Show columns and types for a table");
+            println!("  .sql [STMT]      Run STMT as SQL, or switch the REPL to SQL");
+            println!("  .powql           Switch the REPL back to PowQL");
+            println!("  .mode <FMT>      Render results as table (default), json, or csv");
+            println!("  .cancel          Discard an unterminated multi-line statement");
+            println!("  .timing          Toggle query timing on/off");
+            println!("  .help            Show this help");
+            println!("  .quit / .exit    Exit the REPL");
+        }
+        ".tables" => {
+            let tables = engine.catalog().list_tables();
+            if tables.is_empty() {
+                println!("(no tables)");
+            } else {
+                for t in &tables {
+                    println!("  {t}");
+                }
+                println!(
+                    "({} table{})",
+                    tables.len(),
+                    if tables.len() == 1 { "" } else { "s" }
+                );
+            }
+        }
+        cmd if cmd.starts_with(".schema") => {
+            let table_name = cmd.strip_prefix(".schema").unwrap().trim();
+            if table_name.is_empty() {
+                eprintln!("Usage: .schema <TABLE_NAME>");
+            } else if let Some(schema) = engine.catalog().schema(table_name) {
+                println!("Table: {}", schema.table_name);
+                println!("  {:<20} {:<12} Required", "Column", "Type");
+                println!("  {:-<20} {:-<12} {:-<8}", "", "", "");
+                for col in &schema.columns {
+                    println!(
+                        "  {:<20} {:<12} {}",
+                        col.name,
+                        match col.type_id {
+                            powdb_storage::types::TypeId::Int => "int",
+                            powdb_storage::types::TypeId::Float => "float",
+                            powdb_storage::types::TypeId::Bool => "bool",
+                            powdb_storage::types::TypeId::Str => "str",
+                            powdb_storage::types::TypeId::DateTime => "datetime",
+                            powdb_storage::types::TypeId::Uuid => "uuid",
+                            powdb_storage::types::TypeId::Bytes => "bytes",
+                            powdb_storage::types::TypeId::Json => "json",
+                            powdb_storage::types::TypeId::Empty => "empty",
+                        },
+                        if col.required { "yes" } else { "no" }
+                    );
+                }
+            } else {
+                eprintln!("Error: table '{table_name}' not found");
+            }
+        }
+        other => {
+            eprintln!("Unknown meta-command: {other}");
+            eprintln!("Type .help for available commands.");
+        }
+    }
 }
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
@@ -1771,14 +2094,15 @@ async fn run_remote(
     db: String,
     password: Option<String>,
     username: Option<String>,
+    session: SessionOpts,
     tls: &TlsOpts,
 ) {
     eprintln!("PowDB v{} — remote mode", env!("CARGO_PKG_VERSION"));
     eprintln!("Connecting to {addr} ...");
 
     match connect_remote(&addr, tls).await {
-        Ok(RemoteStream::Plain(s)) => run_remote_on(s, db, password, username).await,
-        Ok(RemoteStream::Tls(s)) => run_remote_on(*s, db, password, username).await,
+        Ok(RemoteStream::Plain(s)) => run_remote_on(s, db, password, username, session).await,
+        Ok(RemoteStream::Tls(s)) => run_remote_on(*s, db, password, username, session).await,
         Err(msg) => {
             eprintln!("Error: {msg}");
             std::process::exit(1);
@@ -1786,8 +2110,13 @@ async fn run_remote(
     }
 }
 
-async fn run_remote_on<S>(stream: S, db: String, password: Option<String>, username: Option<String>)
-where
+async fn run_remote_on<S>(
+    stream: S,
+    db: String,
+    password: Option<String>,
+    username: Option<String>,
+    session: SessionOpts,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (reader, writer) = tokio::io::split(stream);
@@ -1845,12 +2174,19 @@ where
     let hist = history_path();
     rl.load_history(&hist).ok();
 
-    let mut timing_enabled = false;
+    let mut state = ReplState {
+        timing: false,
+        dialect: session.dialect,
+        output: session.output,
+    };
     let mut buffer = String::new();
+    let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
+    let mut continuation_noted = false;
+    let mut one_off_sql: Option<String>;
 
     loop {
         let prompt = if buffer.is_empty() {
-            "powql> "
+            state.dialect.prompt()
         } else {
             "  ...> "
         };
@@ -1859,6 +2195,7 @@ where
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(rustyline::error::ReadlineError::Interrupted) => {
                 buffer.clear();
+                continuation_noted = false;
                 continue;
             }
             Err(e) => {
@@ -1866,6 +2203,16 @@ where
                 break;
             }
         };
+
+        // `.cancel` works mid-continuation, unlike every other meta-command.
+        if is_cancel_line(&line) {
+            rl.add_history_entry(line.trim()).ok();
+            cancel_buffer(&mut buffer);
+            continuation_noted = false;
+            continue;
+        }
+
+        one_off_sql = None;
 
         // Meta-commands are only recognized at the start of a statement.
         if buffer.is_empty() {
@@ -1876,46 +2223,61 @@ where
             // Handle local-only meta-commands in remote mode
             if trimmed.starts_with('.') {
                 rl.add_history_entry(trimmed).ok();
-                match trimmed {
-                    ".quit" | ".exit" => break,
-                    ".timing" => {
-                        timing_enabled = !timing_enabled;
-                        println!("Timing is {}.", if timing_enabled { "on" } else { "off" });
-                    }
-                    ".help" => {
-                        println!("Meta-commands (remote mode):");
-                        println!("  .timing          Toggle query timing on/off");
-                        println!("  .help            Show this help");
-                        println!("  .quit / .exit    Exit the REPL");
-                        println!();
-                        println!("Note: .tables and .schema are only available in embedded mode.");
-                    }
-                    _ => {
-                        eprintln!(
-                            "Meta-commands (.tables, .schema) are not supported in remote mode."
-                        );
-                        eprintln!("Type .help for available commands.");
+                match handle_shared_meta(trimmed, &mut state) {
+                    MetaOutcome::Quit => break,
+                    MetaOutcome::Handled => continue,
+                    MetaOutcome::RunSql(stmt) => one_off_sql = Some(stmt),
+                    MetaOutcome::Unhandled => {
+                        if trimmed == ".help" {
+                            println!("Meta-commands (remote mode):");
+                            println!("  .sql [STMT]      Run STMT as SQL, or switch to SQL mode");
+                            println!("  .powql           Switch back to PowQL");
+                            println!("  .mode <FMT>      Render results as table, json, or csv");
+                            println!("  .cancel          Discard an unterminated statement");
+                            println!("  .timing          Toggle query timing on/off");
+                            println!("  .help            Show this help");
+                            println!("  .quit / .exit    Exit the REPL");
+                            println!();
+                            println!(
+                                "Note: .tables and .schema are only available in embedded mode."
+                            );
+                        } else {
+                            eprintln!(
+                                "Meta-commands (.tables, .schema) are not supported in remote mode."
+                            );
+                            eprintln!("Type .help for available commands.");
+                        }
+                        continue;
                     }
                 }
-                continue;
             }
         }
 
         // Accumulate input until braces/parens balance outside strings.
-        buffer.push_str(&line);
-        buffer.push('\n');
-        if needs_continuation(&buffer) {
-            continue;
-        }
+        let (statement, statement_dialect) = match one_off_sql {
+            Some(stmt) => (stmt, Dialect::Sql),
+            None => {
+                buffer.push_str(&line);
+                buffer.push('\n');
+                if needs_continuation(&buffer) {
+                    note_continuation_when_piped(interactive, &mut continuation_noted);
+                    continue;
+                }
+                continuation_noted = false;
+                let statement = buffer.trim().to_string();
+                buffer.clear();
+                if statement.is_empty() {
+                    continue;
+                }
+                rl.add_history_entry(&statement).ok();
+                (statement, state.dialect)
+            }
+        };
 
-        let statement = buffer.trim().to_string();
-        buffer.clear();
-        if statement.is_empty() {
-            continue;
-        }
-        rl.add_history_entry(&statement).ok();
-
-        let q = Message::Query { query: statement };
+        let q = match statement_dialect {
+            Dialect::Powql => Message::Query { query: statement },
+            Dialect::Sql => Message::QuerySql { query: statement },
+        };
         if q.write_to(&mut writer).await.is_err() {
             eprintln!("Error: write failed — disconnected");
             break;
@@ -1928,8 +2290,8 @@ where
         let start = Instant::now();
         match Message::read_from(&mut reader).await {
             Ok(Some(msg)) => {
-                print_remote_result(&msg);
-                if timing_enabled {
+                print_remote_result(&msg, state.output);
+                if state.timing {
                     let elapsed = start.elapsed();
                     if elapsed.as_secs() >= 1 {
                         println!("Time: {:.2}s", elapsed.as_secs_f64());
@@ -1953,13 +2315,22 @@ where
     let _ = Message::Disconnect.write_to(&mut writer).await;
     let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
 
+    warn_unterminated_at_eof(&buffer);
     rl.save_history(&hist).ok();
     eprintln!("\nBye!");
 }
 
 // ─── Output formatting ──────────────────────────────────────────────────────
 
-fn print_local_result(result: &QueryResult) {
+fn print_local_result(result: &QueryResult, mode: OutputMode) {
+    match mode {
+        OutputMode::Table => print_local_result_table(result),
+        OutputMode::Json => print_local_result_json(result),
+        OutputMode::Csv => print_local_result_csv(result),
+    }
+}
+
+fn print_local_result_table(result: &QueryResult) {
     match result {
         QueryResult::Rows { columns, rows } => {
             if rows.is_empty() {
@@ -1987,6 +2358,107 @@ fn print_local_result(result: &QueryResult) {
     }
 }
 
+/// One JSON document per statement, on one line, so `--format json` output can
+/// be piped straight into `jq` (and read line by line for multi-statement runs).
+fn print_local_result_json(result: &QueryResult) {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            let cols = columns
+                .iter()
+                .map(|c| json_string(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = rows
+                .iter()
+                .map(|row| {
+                    let cells = row.iter().map(value_to_json).collect::<Vec<_>>().join(",");
+                    format!("[{cells}]")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("{{\"columns\":[{cols}],\"rows\":[{body}]}}");
+        }
+        QueryResult::Scalar(val) => println!("{{\"value\":{}}}", value_to_json(val)),
+        QueryResult::Modified(n) => println!("{{\"affected\":{n}}}"),
+        QueryResult::Created(name) => println!("{{\"created\":{}}}", json_string(name)),
+        QueryResult::Executed { message } => {
+            println!("{{\"message\":{}}}", json_string(message))
+        }
+    }
+}
+
+fn print_local_result_csv(result: &QueryResult) {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            println!(
+                "{}",
+                columns
+                    .iter()
+                    .map(|c| csv_field(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            for row in rows {
+                println!(
+                    "{}",
+                    row.iter()
+                        .map(|v| csv_field(&format_value(v)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        QueryResult::Scalar(val) => println!("{}", csv_field(&format_value(val))),
+        QueryResult::Modified(n) => println!("{n}"),
+        QueryResult::Created(name) => println!("{}", csv_field(name)),
+        QueryResult::Executed { message } => println!("{}", csv_field(message)),
+    }
+}
+
+/// Render a string as a JSON string literal (RFC 8259 escaping).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render one typed cell as JSON. Ints, floats, and bools keep their JSON type;
+/// a json cell is emitted as the document itself (already canonical JSON text);
+/// everything else, including datetimes (microseconds since epoch) and uuids,
+/// is a string, matching how the table renderer displays it.
+fn value_to_json(v: &Value) -> String {
+    match v {
+        Value::Int(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Float(n) if n.is_finite() => format!("{n}"),
+        Value::Empty => "null".to_string(),
+        Value::Json(b) => powdb_storage::pj1::pj1_to_text(b).unwrap_or_else(|_| "null".into()),
+        other => json_string(&format_value(other)),
+    }
+}
+
+/// RFC 4180 CSV field: quote when the value contains a comma, quote, CR, or LF,
+/// doubling any embedded quote.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// Render one wire cell for display. The server serializes NULL as the
 /// bareword "null" (the sentinel the TS client's typed decoder matches);
 /// remote mode renders it as `NULL`, matching the embedded REPL. A string
@@ -2000,7 +2472,90 @@ fn render_remote_cell(cell: &str) -> String {
     }
 }
 
-fn print_remote_result(msg: &Message) {
+fn print_remote_result(msg: &Message, mode: OutputMode) {
+    match mode {
+        OutputMode::Table => print_remote_result_table(msg),
+        OutputMode::Json => print_remote_result_json(msg),
+        OutputMode::Csv => print_remote_result_csv(msg),
+    }
+}
+
+/// Remote results arrive on the legacy stringly-typed wire path, so machine
+/// readable output is string-valued: every cell is a JSON string except the
+/// NULL sentinel, which becomes JSON `null`. (The typed wire frames exist, but
+/// the CLI speaks the legacy `Query` frame for backward compatibility.)
+fn print_remote_result_json(msg: &Message) {
+    match msg {
+        Message::ResultRows { columns, rows } => {
+            let cols = columns
+                .iter()
+                .map(|c| json_string(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = rows
+                .iter()
+                .map(|row| {
+                    let cells = row
+                        .iter()
+                        .map(|c| remote_cell_to_json(c))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("[{cells}]")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("{{\"columns\":[{cols}],\"rows\":[{body}]}}");
+        }
+        Message::ResultScalar { value } => {
+            println!("{{\"value\":{}}}", remote_cell_to_json(value))
+        }
+        Message::ResultOk { affected } => println!("{{\"affected\":{affected}}}"),
+        Message::ResultMessage { message } => {
+            println!("{{\"message\":{}}}", json_string(message))
+        }
+        Message::Error { message } => eprintln!("{{\"error\":{}}}", json_string(message)),
+        other => eprintln!("Error: unexpected response: {other:?}"),
+    }
+}
+
+fn remote_cell_to_json(cell: &str) -> String {
+    if cell == "null" {
+        "null".to_string()
+    } else {
+        json_string(cell)
+    }
+}
+
+fn print_remote_result_csv(msg: &Message) {
+    match msg {
+        Message::ResultRows { columns, rows } => {
+            println!(
+                "{}",
+                columns
+                    .iter()
+                    .map(|c| csv_field(c))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            for row in rows {
+                println!(
+                    "{}",
+                    row.iter()
+                        .map(|c| csv_field(&render_remote_cell(c)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        Message::ResultScalar { value } => println!("{}", csv_field(&render_remote_cell(value))),
+        Message::ResultOk { affected } => println!("{affected}"),
+        Message::ResultMessage { message } => println!("{}", csv_field(message)),
+        Message::Error { message } => eprintln!("Error: {message}"),
+        other => eprintln!("Error: unexpected response: {other:?}"),
+    }
+}
+
+fn print_remote_result_table(msg: &Message) {
     match msg {
         Message::ResultRows { columns, rows } => {
             if rows.is_empty() {
@@ -2195,6 +2750,134 @@ mod tests {
             );
         }
         assert!(CLI_COMMANDS.contains(&"exec"));
+    }
+
+    #[test]
+    fn cancel_line_grammar() {
+        assert!(is_cancel_line(".cancel"));
+        assert!(is_cancel_line("  .cancel  "));
+        assert!(is_cancel_line("\\c"));
+        assert!(!is_cancel_line(".cancelled"));
+        assert!(!is_cancel_line("count(User) # .cancel"));
+        assert!(is_cancel_line(".cancel"));
+        assert!(META_COMMANDS.contains(&".cancel"));
+        assert!(META_COMMANDS.contains(&".sql"));
+        assert!(META_COMMANDS.contains(&".mode"));
+    }
+
+    #[test]
+    fn shared_meta_switches_dialect_and_mode() {
+        let mut state = ReplState {
+            timing: false,
+            dialect: Dialect::Powql,
+            output: OutputMode::Table,
+        };
+        assert!(matches!(
+            handle_shared_meta(".sql", &mut state),
+            MetaOutcome::Handled
+        ));
+        assert_eq!(state.dialect, Dialect::Sql);
+        assert_eq!(state.dialect.prompt(), "sql> ");
+        assert!(matches!(
+            handle_shared_meta(".powql", &mut state),
+            MetaOutcome::Handled
+        ));
+        assert_eq!(state.dialect, Dialect::Powql);
+
+        // `.sql <STMT>` is a one-off: it must not change the mode.
+        match handle_shared_meta(".sql SELECT 1", &mut state) {
+            MetaOutcome::RunSql(stmt) => assert_eq!(stmt, "SELECT 1"),
+            _ => panic!("`.sql <STMT>` must run one statement as SQL"),
+        }
+        assert_eq!(state.dialect, Dialect::Powql);
+
+        assert!(matches!(
+            handle_shared_meta(".mode json", &mut state),
+            MetaOutcome::Handled
+        ));
+        assert_eq!(state.output, OutputMode::Json);
+        // An unknown mode is reported and leaves the current mode alone.
+        assert!(matches!(
+            handle_shared_meta(".mode yaml", &mut state),
+            MetaOutcome::Handled
+        ));
+        assert_eq!(state.output, OutputMode::Json);
+
+        assert!(matches!(
+            handle_shared_meta(".timing", &mut state),
+            MetaOutcome::Handled
+        ));
+        assert!(state.timing);
+        assert!(matches!(
+            handle_shared_meta(".quit", &mut state),
+            MetaOutcome::Quit
+        ));
+        // Mode-specific commands fall through to the caller.
+        assert!(matches!(
+            handle_shared_meta(".tables", &mut state),
+            MetaOutcome::Unhandled
+        ));
+    }
+
+    #[test]
+    fn output_mode_parsing() {
+        assert_eq!(parse_output_mode("table"), Some(OutputMode::Table));
+        assert_eq!(parse_output_mode(" JSON "), Some(OutputMode::Json));
+        assert_eq!(parse_output_mode("csv"), Some(OutputMode::Csv));
+        assert_eq!(parse_output_mode("yaml"), None);
+    }
+
+    #[test]
+    fn separator_hint_only_fires_on_the_real_mistake() {
+        // Several newline-separated statements with no `;`: the exact shape a
+        // user gets by copying a REPL session into a file.
+        let hint = missing_separator_hint("insert U { a := 1 }\ninsert U { a := 2 }\n", 1)
+            .expect("hint expected");
+        assert!(hint.contains("separated by `;`"), "{hint}");
+        assert!(hint.contains("2 non-empty lines"), "{hint}");
+
+        // A single statement spanning lines is legitimate: no hint.
+        assert!(missing_separator_hint("User\n", 1).is_none());
+        // `;`-separated input that failed for some other reason: no hint.
+        assert!(missing_separator_hint("insert U { a := 1 };\nbogus\n", 2).is_none());
+        // Comments and blank lines do not count toward the line total.
+        assert!(missing_separator_hint("# note\n\ncount(User)\n", 1).is_none());
+    }
+
+    #[test]
+    fn json_and_csv_rendering() {
+        assert_eq!(json_string("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(json_string("line\n\ttab"), r#""line\n\ttab""#);
+        assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
+
+        assert_eq!(value_to_json(&Value::Int(-7)), "-7");
+        assert_eq!(value_to_json(&Value::Bool(true)), "true");
+        assert_eq!(value_to_json(&Value::Empty), "null");
+        assert_eq!(value_to_json(&Value::Str("x\"y".into())), r#""x\"y""#);
+        // A string that happens to be `null` stays a JSON string.
+        assert_eq!(value_to_json(&Value::Str("null".into())), r#""null""#);
+        // Remote cells are stringly typed; only the NULL sentinel is JSON null.
+        assert_eq!(remote_cell_to_json("null"), "null");
+        assert_eq!(remote_cell_to_json("42"), r#""42""#);
+
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn eof_warning_only_for_unterminated_input() {
+        // Purely a shape check: the helper must ignore an empty or
+        // whitespace-only buffer, which is the normal end of a session.
+        warn_unterminated_at_eof("");
+        warn_unterminated_at_eof("   \n");
+
+        let mut buffer = String::from("count(User\n");
+        cancel_buffer(&mut buffer);
+        assert!(buffer.is_empty());
+        cancel_buffer(&mut buffer);
+        assert!(buffer.is_empty());
     }
 
     #[test]
