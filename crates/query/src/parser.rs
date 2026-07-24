@@ -2,9 +2,19 @@ use crate::ast::*;
 use crate::lexer::lex;
 use crate::token::Token;
 
-/// Maximum nesting depth for recursive descent parsing.
-/// Prevents stack exhaustion from crafted inputs with deeply nested
-/// parentheses, subqueries, or CASE expressions.
+/// Maximum nesting depth for the AST the parser produces.
+///
+/// Recursive descent (parentheses, subqueries, CASE) bumps `Parser::depth` on
+/// the way down, so the limit falls out of the call stack there. Binary,
+/// arithmetic and `having` chains are parsed ITERATIVELY, and a loop that
+/// re-wraps its accumulator (`left = BinaryOp(left, op, right)`) grows the AST
+/// one level per iteration without ever touching the call stack. Those loops
+/// therefore count their own iterations against this same limit (see
+/// [`Parser::check_chain_depth`]): what has to stay bounded is the SHAPE OF THE
+/// PRODUCED TREE, not just parser recursion. Every later walk of that tree
+/// (planner, canonicalizer, executor, and the recursive `Drop` of the boxed
+/// expression itself) is recursive, so an unbounded chain overflows the stack
+/// well after the parse returned, aborting the process under `panic = "abort"`.
 const MAX_NESTING_DEPTH: usize = 64;
 
 /// Discriminated parse error; callers can match on category.
@@ -429,6 +439,10 @@ impl Parser {
         let mut projection = None;
         let mut distinct = false;
         let mut group_by = None;
+        // Repeated `having` clauses stack `And` nodes onto one predicate, so
+        // the pipeline loop grows the AST the same way a binary chain does and
+        // needs the same bound.
+        let mut having_chain = 0usize;
 
         loop {
             match self.peek() {
@@ -472,6 +486,8 @@ impl Parser {
                     };
                     group.having = Some(match group.having.take() {
                         Some(existing) => {
+                            having_chain += 1;
+                            self.check_chain_depth(having_chain)?;
                             Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
                         }
                         None => rewritten,
@@ -551,6 +567,10 @@ impl Parser {
         let mut projection = None;
         let mut distinct = false;
         let mut group_by = None;
+        // Repeated `having` clauses stack `And` nodes onto one predicate, so
+        // the pipeline loop grows the AST the same way a binary chain does and
+        // needs the same bound.
+        let mut having_chain = 0usize;
 
         loop {
             match self.peek() {
@@ -598,6 +618,8 @@ impl Parser {
                     };
                     group.having = Some(match group.having.take() {
                         Some(existing) => {
+                            having_chain += 1;
+                            self.check_chain_depth(having_chain)?;
                             Expr::BinaryOp(Box::new(existing), BinOp::And, Box::new(rewritten))
                         }
                         None => rewritten,
@@ -1325,22 +1347,26 @@ impl Parser {
         let mut query = self.parse_query_tail(source)?;
         self.expect(&Token::RParen)?;
 
-        // For non-count aggregates (and count distinct), the caller typically
-        // writes the target column via the trailing projection form:
+        // The caller writes the aggregate's target column via the trailing
+        // projection form:
         //     sum(User filter .age > 30 { .age })
         //     count(distinct User { .name })
+        //     count(User { .nickname })
         // We lift that single unaliased `.field` into AggregateExpr.field so
-        // the executor's aggregate fast paths can see it.
+        // the executor's aggregate fast paths can see it. Plain `count` is
+        // included: an argument makes it a non-null count of that column
+        // (matching the grouped `count(.col)` path and SQL's `COUNT(col)`),
+        // while the argument-less `count(User)` stays a row count. Ignoring
+        // the projection here used to make `count(User { .nickname })` silently
+        // return the row count.
         let mut argument: Option<Expr> = None;
-        if func != AggFunc::Count {
-            if let Some(proj) = &query.projection {
-                if proj.len() == 1 && proj[0].alias.is_none() {
-                    argument = Some(proj[0].expr.clone());
-                }
+        if let Some(proj) = &query.projection {
+            if proj.len() == 1 && proj[0].alias.is_none() {
+                argument = Some(proj[0].expr.clone());
             }
-            if argument.is_some() {
-                query.projection = None;
-            }
+        }
+        if argument.is_some() {
+            query.projection = None;
         }
         query.aggregation = Some(AggregateExpr {
             function: func,
@@ -1363,9 +1389,25 @@ impl Parser {
         result
     }
 
+    /// Guard for a loop that stacks `chain` levels of AST on top of the
+    /// current recursion depth. `chain` is the number of levels this loop has
+    /// already added; the caller counts it locally rather than mutating
+    /// `self.depth` so sibling expressions each get the full budget.
+    fn check_chain_depth(&self, chain: usize) -> Result<(), ParseError> {
+        if self.depth + chain > MAX_NESTING_DEPTH {
+            return Err(ParseError::NestingDepthExceeded {
+                max: MAX_NESTING_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
     fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_and_expr()?;
+        let mut chain = 0usize;
         while *self.peek() == Token::Or {
+            chain += 1;
+            self.check_chain_depth(chain)?;
             self.advance();
             let right = self.parse_and_expr()?;
             left = Expr::BinaryOp(Box::new(left), BinOp::Or, Box::new(right));
@@ -1375,7 +1417,10 @@ impl Parser {
 
     fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_comparison()?;
+        let mut chain = 0usize;
         while *self.peek() == Token::And {
+            chain += 1;
+            self.check_chain_depth(chain)?;
             self.advance();
             let right = self.parse_comparison()?;
             left = Expr::BinaryOp(Box::new(left), BinOp::And, Box::new(right));
@@ -1399,11 +1444,7 @@ impl Parser {
         {
             self.advance();
             negations += 1;
-            if self.depth + negations > MAX_NESTING_DEPTH {
-                return Err(ParseError::NestingDepthExceeded {
-                    max: MAX_NESTING_DEPTH,
-                });
-            }
+            self.check_chain_depth(negations)?;
         }
         let mut expr = self.parse_comparison_body()?;
         for _ in 0..negations {
@@ -1642,11 +1683,14 @@ impl Parser {
 
     fn parse_additive(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_multiplicative()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
                 Token::Coalesce => {
+                    chain += 1;
+                    self.check_chain_depth(chain)?;
                     self.advance();
                     let right = self.parse_multiplicative()?;
                     left = Expr::Coalesce(Box::new(left), Box::new(right));
@@ -1654,6 +1698,8 @@ impl Parser {
                 }
                 _ => break,
             };
+            chain += 1;
+            self.check_chain_depth(chain)?;
             self.advance();
             let right = self.parse_multiplicative()?;
             left = Expr::BinaryOp(Box::new(left), op, Box::new(right));
@@ -1663,12 +1709,15 @@ impl Parser {
 
     fn parse_multiplicative(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_primary()?;
+        let mut chain = 0usize;
         loop {
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
                 Token::Slash => BinOp::Div,
                 _ => break,
             };
+            chain += 1;
+            self.check_chain_depth(chain)?;
             self.advance();
             let right = self.parse_primary()?;
             left = Expr::BinaryOp(Box::new(left), op, Box::new(right));
@@ -3002,16 +3051,32 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_count_leaves_projection_alone() {
-        // count() doesn't need a target field, so the projection (if any)
-        // stays intact. It's silly to project inside a count, but it's legal.
+    fn test_parse_count_lifts_projection_into_argument() {
+        // A projected column names what to count: `count(User { .age })` is a
+        // non-null count of `.age`, matching the grouped `count(.age)` path and
+        // SQL's `COUNT(age)`. Leaving the projection in place (the previous
+        // behavior) silently made it a row count.
         let stmt = parse("count(User { .age })").unwrap();
         match stmt {
             Statement::Query(q) => {
                 let agg = q.aggregation.unwrap();
                 assert_eq!(agg.function, AggFunc::Count);
+                assert_eq!(agg.argument, Some(Expr::Field("age".into())));
+                assert!(q.projection.is_none(), "projection should be lifted");
+            }
+            _ => panic!("expected query"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_without_projection_has_no_argument() {
+        // `count(User)` stays a row count.
+        let stmt = parse("count(User)").unwrap();
+        match stmt {
+            Statement::Query(q) => {
+                let agg = q.aggregation.unwrap();
+                assert_eq!(agg.function, AggFunc::Count);
                 assert!(agg.argument.is_none());
-                assert!(q.projection.is_some(), "count must not eat projection");
             }
             _ => panic!("expected query"),
         }
