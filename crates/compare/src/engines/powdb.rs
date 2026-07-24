@@ -9,26 +9,26 @@
 //! - The inner [`Engine`] lives inside a [`RefCell`] because `execute_powql`
 //!   requires `&mut self` while the read methods on [`BenchEngine`] take
 //!   `&self`. This is safe for single-threaded bench harnesses.
-//! - `point_lookup_indexed` bypasses PowQL parsing and walks the B-tree
-//!   directly; this mirrors the existing fast-path pattern established in
-//!   PR #1 and what a real client SDK would do with a cached plan.
-//! - All other reads go through `execute_powql()` so we measure the full
-//!   parse → plan → execute pipeline end-to-end. For the four non-count
-//!   aggregates we temporarily bypass the parser and build a `PlanNode`
-//!   by hand (see §1 fallback clause in PLAN-MISSION-A.md) because the
-//!   parser extension for `sum(User { .col })` has not landed in this
-//!   worktree.
+//! - **Every read goes through `execute_powql()`**, so every published number
+//!   is reachable by a user typing PowQL. This is deliberate: two workload
+//!   families used to bypass the front end (`point_lookup_indexed` walked the
+//!   B-tree directly, and the four non-count aggregates hand-built a
+//!   `PlanNode`), which inflated their ratios by the whole parse + plan cost
+//!   that SQLite's comparator still paid. The parser gained field-bearing
+//!   aggregates (`sum(User { .age })`, see `parser.rs`
+//!   `test_parse_sum_with_field_projection`), so the fallback is gone.
+//!   PowDB's plan cache with literal substitution is the fair counterpart to
+//!   SQLite's `prepare_cached`, and both engines now pay their real front-end
+//!   cost.
 //! - Writes go through `execute_powql()` with one query string per call,
 //!   with batched writes wrapped in a tight loop (PowQL has no batch-insert
 //!   syntax today).
 
 use std::cell::RefCell;
 
-use powdb_query::ast::{AggFunc, AggregateMode, Expr, Literal};
+use powdb_query::ast::Literal;
 use powdb_query::executor::{Engine, PreparedQuery};
-use powdb_query::plan::PlanNode;
 use powdb_query::result::QueryResult;
-use powdb_storage::row::RowLayout;
 use powdb_storage::types::Value;
 use powdb_storage::wal::WalSyncMode;
 use tempfile::TempDir;
@@ -38,8 +38,6 @@ use super::{gen_row, BenchEngine};
 /// Comparison-bench wrapper around the PowDB query engine.
 pub struct PowdbEngine {
     engine: RefCell<Engine>,
-    /// Cached layout for zero-alloc column decode on point lookups.
-    layout: Option<RowLayout>,
     /// Mission C Phase 5: prepared insert statement reused across every
     /// `insert_batch` / `insert_single` row. SQLite's comparator uses
     /// `prepare_cached`; this is the fair equivalent on the PowDB side.
@@ -64,7 +62,6 @@ impl PowdbEngine {
         engine.catalog_mut().set_wal_sync_mode(WalSyncMode::Off);
         PowdbEngine {
             engine: RefCell::new(engine),
-            layout: None,
             insert_prep: RefCell::new(None),
             update_pk_prep: RefCell::new(None),
             _tmp: tmp,
@@ -139,37 +136,19 @@ impl PowdbEngine {
         }
     }
 
-    /// Build and execute an `Aggregate(function, ...)` plan directly.
+    /// Run a PowQL query through the full lex → parse → plan → execute
+    /// pipeline and return the raw result.
     ///
-    /// The PowQL parser currently hard-codes `AggregateExpr.field` to `None`
-    /// (see PLAN-MISSION-A.md §1 "How we resolve the aggregate-column gap"),
-    /// so until FASTPATH lands the parser extension we hand-build the plan
-    /// node and feed it to `execute_plan` directly.
-    ///
-    /// This bypasses the parser and planner entirely but still exercises the
-    /// full executor — a fair representation of a "compiled plan" access
-    /// pattern until the parser catches up.
-    fn exec_agg_with_field(&self, func: AggFunc, field: &str, filter: Option<Expr>) -> QueryResult {
-        let mut input = PlanNode::SeqScan {
-            table: "User".to_string(),
-        };
-        if let Some(pred) = filter {
-            input = PlanNode::Filter {
-                input: Box::new(input),
-                predicate: pred,
-            };
-        }
-        let plan = PlanNode::Aggregate {
-            input: Box::new(input),
-            function: func,
-            argument: Some(Expr::Field(field.to_string())),
-            mode: AggregateMode::Raw,
-            provenance_alias: None,
-        };
+    /// Used by the aggregate workloads. These used to hand-build a
+    /// `PlanNode::Aggregate` and call `execute_plan` directly, skipping the
+    /// parser and planner that SQLite's comparator never got to skip. The
+    /// parser now lifts a trailing single-field projection into the aggregate
+    /// argument, so the honest query string works and is what we measure.
+    fn powql_scalar(&self, query: &str) -> QueryResult {
         self.engine
             .borrow_mut()
-            .execute_plan(&plan)
-            .expect("aggregate plan execution failed")
+            .execute_powql(query)
+            .expect("aggregate query failed")
     }
 
     fn scalar_int(r: QueryResult) -> i64 {
@@ -215,7 +194,6 @@ impl BenchEngine for PowdbEngine {
                 .catalog_mut()
                 .set_wal_sync_mode(WalSyncMode::Off);
             self.engine = RefCell::new(fresh_engine);
-            self.layout = None;
             // Mission C Phase 5: a fresh engine means a fresh catalog,
             // fresh schema, fresh plan cache. The cached prepared-plan
             // templates reference the *old* engine's parsed plan trees —
@@ -269,8 +247,6 @@ impl BenchEngine for PowdbEngine {
                 .create_index_with_unique("id", &data_dir, true)
                 .expect("build id index");
 
-            self.layout = Some(RowLayout::new(table.schema()));
-
             // Activate mmap for zero-syscall reads.
             table.heap.enable_mmap();
         }
@@ -279,23 +255,13 @@ impl BenchEngine for PowdbEngine {
     // ── Reads ─────────────────────────────────────────────────────────
 
     fn point_lookup_indexed(&self, id: i64) -> Option<String> {
-        // Direct B-tree lookup — bypasses the PowQL parser entirely. This
-        // is the "cached plan / direct API" path a real client SDK would
-        // use. See §4 FASTPATH→BENCH in PLAN-MISSION-A.md.
-        //
-        // Mission D7: use the int-specialized `lookup_int` path to skip
-        // the `<Value as Ord>::cmp` discriminant dispatch (5-10ns × ~24
-        // comparisons per lookup on an order-256 tree).
-        let engine = self.engine.borrow();
-        let tbl = engine.catalog().get_table("User")?;
-        let rid = tbl.index("id")?.lookup_int(id)?;
-        let data = tbl.heap.get(rid)?;
-        // Columns: id=0, name=1, age=2, status=3, email=4, created_at=5
-        let layout = self.layout.as_ref().unwrap();
-        match powdb_storage::row::decode_column(tbl.schema(), layout, &data, 1) {
-            Value::Str(s) => Some(s),
-            _ => None,
-        }
+        // Goes through PowQL, like every other read here. This used to be a
+        // raw `tbl.index("id").lookup_int(id)` B-tree probe, which skipped
+        // the parse + plan work SQLite's `prepare_cached` comparator still
+        // performed. The `id` index is still used: the planner emits an
+        // IndexScan for an equality on an indexed column.
+        let query = format!("User filter .id = {id} limit 1 {{ .name }}");
+        self.powql_first_string(&query)
     }
 
     fn point_lookup_nonindexed(&self, created_at: i64) -> Option<String> {
@@ -373,26 +339,20 @@ impl BenchEngine for PowdbEngine {
     }
 
     fn agg_sum(&self) -> i64 {
-        // FALLBACK path: parser cannot attach a column to a non-count
-        // aggregate until FASTPATH lands. Hand-build the plan instead.
-        Self::scalar_int(self.exec_agg_with_field(AggFunc::Sum, "age", None))
+        Self::scalar_int(self.powql_scalar("sum(User { .age })"))
     }
 
     fn agg_avg(&self, age_threshold: i64) -> f64 {
-        let filter = Expr::BinaryOp(
-            Box::new(Expr::Field("age".to_string())),
-            powdb_query::ast::BinOp::Gt,
-            Box::new(Expr::Literal(Literal::Int(age_threshold))),
-        );
-        Self::scalar_float(self.exec_agg_with_field(AggFunc::Avg, "age", Some(filter)))
+        let query = format!("avg(User filter .age > {age_threshold} {{ .age }})");
+        Self::scalar_float(self.powql_scalar(&query))
     }
 
     fn agg_min(&self) -> i64 {
-        Self::scalar_int(self.exec_agg_with_field(AggFunc::Min, "created_at", None))
+        Self::scalar_int(self.powql_scalar("min(User { .created_at })"))
     }
 
     fn agg_max(&self) -> i64 {
-        Self::scalar_int(self.exec_agg_with_field(AggFunc::Max, "age", None))
+        Self::scalar_int(self.powql_scalar("max(User { .age })"))
     }
 
     fn multi_col_and_filter(&self, age_threshold: i64, status: &str) -> Vec<(String, i64)> {

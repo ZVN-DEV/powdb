@@ -168,10 +168,10 @@ powdb-cli --data-dir ./powdb_data_restored
 
 Full snapshots, incremental (differential) backups, and coarse point-in-time restore are available today. The following limits are real today:
 
-- **Offline / single-writer only.** Backup has no cross-process locking. The target directory must not be open in a live `powdb-server` or another CLI while you back it up. Online (serve-while-backing-up) snapshots are a future phase.
+- **Offline / single-writer only.** The target directory must not be open in a live `powdb-server` or another CLI while you back it up. Since v0.18.1 this is enforced, not merely advised: `backup` takes the writer lock first and refuses a directory another process holds (see [Back up](#back-up)). Online (serve-while-backing-up) snapshots are a future phase.
 - **Whole-database only.** Backup snapshots every table. There is no per-table backup.
 - **Restore is offline and needs a fresh destination.** Restore writes into a fresh or empty directory; it does not merge into a running database. If a restore fails partway, the destination may be left partial — discard it and restore again into a clean directory.
-- **Same engine version.** A backup is restorable by the same PowDB engine version that wrote it. There is no cross-version on-disk format guarantee yet. (The manifest carries a format version and refuses an unrecognized one.)
+- **Restore forward, not backward.** A backup is restorable by the release that wrote it and by any **later** release: a backup holds the same durable files a data directory holds, and every release reads every on-disk version an earlier release could write (the commitment and its deprecation mechanism are in [FORMAT.md](FORMAT.md#format-version-support-policy), and the promise a minor version makes is in [STABILITY.md](STABILITY.md)). What is *not* supported is restoring a **newer** backup with an **older** binary: an unrecognized catalog, heap, row, or WAL version fails loudly rather than being misread. The `manifest.json` carries its own `format_version` (currently 1) and refuses an unrecognized one outright.
 - **Coarse PITR only.** Point-in-time restore lands you at the state captured by an increment, so its granularity is your increment cadence. **Fine-grained (sub-increment) PITR** — replaying to an arbitrary instant via WAL archiving — and **cloud sync** are not in this release.
 
 The design for the upcoming incremental / PITR / cloud-sync phases lives in [`docs/design/2026-06-05-backup-pitr-sync-migrations-plan.md`](design/2026-06-05-backup-pitr-sync-migrations-plan.md).

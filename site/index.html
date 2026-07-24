@@ -3,11 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PowDB — A database engine 3-10x faster than SQLite</title>
-  <meta name="description" content="PowDB is a from-scratch Rust database engine with PowQL, a pipeline query language that beats SQLite on every benchmarked workload.">
+  <title>PowDB: Pure-Rust embedded database with native nested results</title>
+  <meta name="description" content="PowDB is a from-scratch pure-Rust embedded database. PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Faster than SQLite on aggregate and scan workloads, slower on indexed point lookups.">
+  <link rel="canonical" href="https://zvn-dev.github.io/powdb/">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="PowDB">
+  <meta property="og:title" content="PowDB: Pure-Rust embedded database with native nested results">
+  <meta property="og:description" content="PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Faster than SQLite on aggregate and scan workloads, slower on indexed point lookups.">
+  <meta property="og:url" content="https://zvn-dev.github.io/powdb/">
+  <meta property="og:image" content="https://zvn-dev.github.io/powdb/favicon.svg">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="PowDB: Pure-Rust embedded database with native nested results">
+  <meta name="twitter:description" content="PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Honest benchmarks, including where PowDB loses.">
+  <meta name="twitter:image" content="https://zvn-dev.github.io/powdb/favicon.svg">
+
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css"
+        integrity="sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A"
+        crossorigin="anonymous" referrerpolicy="no-referrer">
 </head>
 <body>
 
@@ -19,6 +37,7 @@
     <div class="nav-links">
       <a href="getting-started.html">Getting Started</a>
       <a href="powql.html">PowQL Reference</a>
+      <a href="#shaped-results">Shaped Results</a>
       <a href="#benchmarks">Benchmarks</a>
       <a href="https://github.com/ZVN-DEV/powdb/releases" target="_blank" rel="noopener">Releases</a>
       <a href="https://github.com/ZVN-DEV/powdb/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
@@ -33,10 +52,11 @@
 <!-- Hero -->
 <section class="hero">
   <div class="container">
-    <h1>A database engine that's<br><span class="highlight">3-10x faster</span> than SQLite</h1>
+    <h1>The embedded database that returns<br><span class="highlight">shaped results</span>, not flat rows</h1>
     <p class="subtitle">
-      From-scratch Rust database with PowQL -- a pipeline query language that reads left to right --
-      plus a SQL frontend on the same engine. One engine, two languages. Compiled predicates. Pure-Rust core.
+      From-scratch pure-Rust database with PowQL -- a pipeline query language that reads left to right --
+      plus a SQL frontend on the same engine. Ask for a parent and its children and get exactly that:
+      one row per parent, children as a native nested value, no join fan-out to undo and no JSON text to re-parse.
       Built for single-writer embedded state and read-only snapshot serving, not for many clients sharing one read-write database.
     </p>
     <div class="hero-actions">
@@ -46,6 +66,112 @@
     <div class="install-block">
       <span class="prompt">$</span> cargo install powdb-cli
     </div>
+  </div>
+</section>
+
+<!-- What PowQL does that SQL cannot -->
+<section class="compare-section" id="shaped-results">
+  <div class="container">
+    <h2>What PowQL does that SQL cannot</h2>
+    <p class="section-subtitle">
+      Speed is not the interesting part of PowDB, and the benchmarks below are honest about where it loses.
+      These three capabilities are the part that has no SQL spelling at all.
+    </p>
+
+    <!-- Nested projections -->
+    <div class="compare-example">
+      <p class="compare-label">Nested projections: one row per parent, children nested inside it</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">SELECT u.name, o.total, o.product_id
+FROM User u
+LEFT JOIN "Order" o ON o.user_id = u.id;
+-- Alice repeats once per order.
+-- Cara (no orders) comes back as a row of NULLs.
+-- The client regroups by hand.</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>User as u {
+  u.name,
+  orders: Order as o filter o.user_id = u.id
+    { o.total, o.product_id }
+}
+-- Alice, [{"product_id":101,"total":9.5},
+--         {"product_id":102,"total":20.25}]
+-- Bob,   [{"product_id":null,"total":5.5}]
+-- Cara,  []</code></pre>
+        </div>
+      </div>
+      <p class="section-subtitle" style="margin-top: 16px;">
+        Every parent appears exactly once, so there is no fan-out to undo. A parent with no children gets
+        an empty array, never NULL and never a dropped row. Children take their own <code>order</code>,
+        <code>limit</code>, and <code>offset</code>, and nesting goes more than one level deep.
+      </p>
+    </div>
+
+    <!-- Entity links -->
+    <div class="compare-example">
+      <p class="compare-label">Entity links: declare the relationship once, then traverse it by name</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">-- Rewrite the join condition every time
+SELECT o.total, u.name
+FROM "Order" o
+JOIN User u ON o.user_id = u.id;</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>link Order.user -> User on user_id = id
+
+Order as o { o.total, o.user.name }
+User  as u { u.name, u.orders { .total } }</code></pre>
+        </div>
+      </div>
+      <p class="section-subtitle" style="margin-top: 16px;">
+        A scalar hop through a non-unique key is refused as a hard error rather than silently multiplying
+        your rows. That is the failure mode a join gives you quietly and a link gives you loudly.
+      </p>
+    </div>
+
+    <!-- JSON -->
+    <div class="compare-example">
+      <p class="compare-label">Native JSON: a real binary type, and paths you can index</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>-- Filter, group, aggregate and order on a path
+Post group .data->category {
+  .data->category,
+  total: sum(.data->amount)
+}
+
+-- Index a scalar JSON path like any other column
+alter Post add index (.data->published_at)</code></pre>
+        </div>
+      </div>
+      <p class="section-subtitle" style="margin-top: 16px;">
+        JSON is stored as PJ1, a binary document type, not as text that gets re-parsed on every read.
+        Paths can be filtered, grouped, aggregated, ordered, and indexed.
+      </p>
+    </div>
+
+    <p class="section-subtitle" style="margin-top: 32px;">
+      <strong>Why this is structural, not syntax.</strong> Returning a tree normally costs a serialization
+      step: engines that can express it build the nested value and hand you JSON <em>text</em>, which your
+      client then parses back into objects. The engines that nest natively (DuckDB, BigQuery) are columnar
+      OLAP systems, and query compilers that target another database never own the result format at all.
+      PowDB owns the storage engine, the query executor, and the wire protocol, so a nested field stays a
+      native value from the heap to your client. There is no text round-trip to pay for because no text is
+      ever produced.
+    </p>
+    <p class="section-subtitle" style="margin-top: 12px;">
+      Full detail: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#nested-projections-shaped-results" target="_blank" rel="noopener">Nested projections</a>,
+      <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#entity-links-relationship-traversal" target="_blank" rel="noopener">entity links</a>,
+      and <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md" target="_blank" rel="noopener">the PowQL reference</a>.
+    </p>
   </div>
 </section>
 
@@ -82,7 +208,11 @@
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows (M1), both engines in memory-mode, real numbers, no cherry-picking. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows, both engines in memory-mode. All 15 workloads are listed, including the one PowDB loses. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
+    <div class="install-block" style="margin-bottom: 24px;">
+      <span class="prompt">$</span> cargo run --release -p powdb-compare
+    </div>
+    <p class="section-subtitle">Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0), commit <code>a090568</code>. <strong>Laptop numbers, not CI numbers.</strong> Full methodology, per-run spread, and what changed in the harness: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md" target="_blank" rel="noopener">the 2026-07-24 snapshot</a>.</p>
     <table>
       <thead>
         <tr>
@@ -94,88 +224,94 @@
       </thead>
       <tbody>
         <tr>
+          <td>update_by_pk</td>
+          <td>66ns</td>
+          <td>500ns</td>
+          <td class="speedup">7.6x</td>
+        </tr>
+        <tr>
           <td>agg_min</td>
-          <td>236&micro;s</td>
-          <td>2.34ms</td>
-          <td class="speedup">9.9x</td>
+          <td>266&micro;s</td>
+          <td>1.77ms</td>
+          <td class="speedup">6.7x</td>
         </tr>
         <tr>
           <td>agg_max</td>
-          <td>236&micro;s</td>
-          <td>2.10ms</td>
-          <td class="speedup">8.9x</td>
-        </tr>
-        <tr>
-          <td>agg_sum</td>
-          <td>231&micro;s</td>
-          <td>1.87ms</td>
-          <td class="speedup">8.1x</td>
-        </tr>
-        <tr>
-          <td>update_by_pk</td>
-          <td>55ns</td>
-          <td>412ns</td>
-          <td class="speedup">7.5x</td>
-        </tr>
-        <tr>
-          <td>agg_avg</td>
-          <td>401&micro;s</td>
-          <td>2.30ms</td>
+          <td>271&micro;s</td>
+          <td>1.54ms</td>
           <td class="speedup">5.7x</td>
         </tr>
         <tr>
+          <td>agg_sum</td>
+          <td>281&micro;s</td>
+          <td>1.57ms</td>
+          <td class="speedup">5.6x</td>
+        </tr>
+        <tr>
+          <td>agg_avg</td>
+          <td>516&micro;s</td>
+          <td>1.82ms</td>
+          <td class="speedup">3.5x</td>
+        </tr>
+        <tr>
           <td>scan_filter_count</td>
-          <td>381&micro;s</td>
-          <td>1.95ms</td>
-          <td class="speedup">5.1x</td>
-        </tr>
-        <tr>
-          <td>scan_filter_sort_limit</td>
-          <td>2.66ms</td>
-          <td>9.77ms</td>
-          <td class="speedup">3.7x</td>
-        </tr>
-        <tr>
-          <td>update_by_filter</td>
-          <td>2.16ms</td>
-          <td>6.77ms</td>
+          <td>481&micro;s</td>
+          <td>1.47ms</td>
           <td class="speedup">3.1x</td>
         </tr>
         <tr>
-          <td>point_lookup_indexed</td>
-          <td>93ns</td>
-          <td>282ns</td>
-          <td class="speedup">3.0x</td>
+          <td>point_lookup_nonindexed</td>
+          <td>117&micro;s</td>
+          <td>321&micro;s</td>
+          <td class="speedup">2.7x</td>
+        </tr>
+        <tr>
+          <td>scan_filter_sort_limit</td>
+          <td>2.68ms</td>
+          <td>6.73ms</td>
+          <td class="speedup">2.5x</td>
+        </tr>
+        <tr>
+          <td>insert_single</td>
+          <td>394ns</td>
+          <td>790ns</td>
+          <td class="speedup">2.0x</td>
         </tr>
         <tr>
           <td>multi_col_and_filter</td>
-          <td>2.22ms</td>
-          <td>4.70ms</td>
-          <td class="speedup">2.1x</td>
+          <td>1.75ms</td>
+          <td>3.46ms</td>
+          <td class="speedup">2.0x</td>
         </tr>
         <tr>
-          <td>insert_batch_1k</td>
-          <td>238ns</td>
-          <td>320ns</td>
-          <td class="speedup">1.3x</td>
+          <td>update_by_filter</td>
+          <td>2.66ms</td>
+          <td>5.08ms</td>
+          <td class="speedup">1.9x</td>
         </tr>
         <tr>
           <td>delete_by_filter</td>
-          <td>1.76ms</td>
-          <td>2.35ms</td>
-          <td class="speedup">1.3x</td>
+          <td>1.65ms</td>
+          <td>1.95ms</td>
+          <td>tied</td>
         </tr>
         <tr>
           <td>scan_filter_project_top100</td>
-          <td>9.6&micro;s</td>
-          <td>12.7&micro;s</td>
-          <td class="speedup">1.3x</td>
+          <td>8.0&micro;s</td>
+          <td>8.9&micro;s</td>
+          <td>tied</td>
         </tr>
         <tr>
-          <td>point_lookup_nonindexed</td>
-          <td>350&micro;s</td>
-          <td>432&micro;s</td>
-          <td class="speedup">1.2x</td>
+          <td>insert_batch_1k</td>
+          <td>232ns</td>
+          <td>257ns</td>
+          <td>tied</td>
+        </tr>
+        <tr>
+          <td><strong>point_lookup_indexed</strong></td>
+          <td>1.65&micro;s</td>
+          <td>208ns</td>
+          <td><strong>7.9x slower</strong></td>
         </tr>
       </tbody>
     </table>
@@ -312,11 +448,31 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
     <div class="features-grid">
       <div class="feature-card">
         <h3>Compiled Predicates</h3>
-        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads run up to 10x faster than SQLite.</p>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads measure 3-6x SQLite while point lookups do not.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Nested Projections</h3>
+        <p>PowQL-only. One row per parent with correlated children assembled into a native JSON array, with per-parent <code>order</code> and <code>limit</code> and multi-level nesting. No join fan-out to undo.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Entity Links</h3>
+        <p>PowQL-only. Declare a relationship once with <code>link Order.user -&gt; User on user_id = id</code>, then traverse it by name. A scalar hop through a non-unique key is a hard error, never a silent fan-out.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Native JSON (PJ1)</h3>
+        <p>JSON is a first-class binary document type, not text. Filter, group, aggregate, and order on <code>-&gt;</code> paths, and build B+tree indexes over scalar JSON paths.</p>
+      </div>
+      <div class="feature-card">
+        <h3>EXPLAIN</h3>
+        <p>Inspect the plan PowDB chose, including link paths and index selection, so a slow query is diagnosable instead of mysterious.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Prometheus Metrics</h3>
+        <p>Opt-in <code>/metrics</code> endpoint (<code>POWDB_METRICS_ADDR</code>) exposing connection, query, and auth-failure counts. Unauthenticated by design, so keep it on a private network.</p>
       </div>
       <div class="feature-card">
         <h3>B+ Tree Indexes</h3>
-        <p>Disk-persisted B+ tree indexes in a custom BIDX binary format. Indexed point lookups resolve in under 100ns. Indexes survive restarts and are used automatically.</p>
+        <p>Disk-persisted B+ tree indexes in a custom BIDX binary format, including scalar JSON-path indexes. Indexes survive restarts and are chosen automatically using collected statistics.</p>
       </div>
       <div class="feature-card">
         <h3>WAL + Crash Recovery</h3>
@@ -344,7 +500,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
       </div>
       <div class="feature-card">
         <h3>Zero C Dependencies</h3>
-        <p>Pure Rust, end to end. No C FFI, no <code>libsqlite3-sys</code>, no bindgen. Single <code>cargo install</code> on any platform Rust supports.</p>
+        <p>Pure Rust, end to end. No C FFI, no <code>libsqlite3-sys</code>, no bindgen. Single <code>cargo install</code> on Linux and macOS. Windows is not supported: the mmap scan path is Unix-only.</p>
       </div>
       <div class="feature-card">
         <h3>Pipeline Query Language</h3>
@@ -360,7 +516,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
     <h2>When PowDB is not the right fit</h2>
     <p class="section-subtitle">PowDB is pre-1.0 and deliberately scoped. Be honest with yourself before adopting it:</p>
     <ul style="max-width: 720px; margin: 0 auto; padding-left: 24px; line-height: 1.8;">
-      <li><strong>Pre-1.0 format stability</strong> -- the on-disk format may shift across minor versions. Pin versions and expect to re-import on upgrades until 1.0.</li>
+      <li><strong>Pre-1.0 format stability</strong> -- new on-disk format versions appear across minor versions. An older data directory always opens on a newer release (and upgrades lazily, without a rewrite), but a newer directory will not open on an older binary. Pin versions, and read <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md" target="_blank" rel="noopener">the stability policy</a> before upgrading.</li>
       <li><strong>No wire-protocol compatibility</strong> -- PowDB speaks a SQL subset (<a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md" target="_blank" rel="noopener">docs/SQL.md</a>) through its own binary protocol and embedded API, not the Postgres or MySQL wire format. Off-the-shelf ORMs, BI dashboards, JDBC drivers, and DB browsers won't connect over the wire.</li>
       <li><strong>Effectively single-node</strong> -- no sharding, no consensus, and no live replica tailing. Freshness across processes comes from snapshot refresh (restore a newer snapshot and swap, in seconds), not streaming replication. If you need live replication or sync across nodes, use <a href="https://turso.tech" target="_blank" rel="noopener">Turso</a>.</li>
       <li><strong>No MVCC, no online backup</strong> -- a single writer takes the whole write-admission gate while parallel readers run; many concurrent clients sharing one read-write database is Postgres's territory. Backups (full, incremental, PITR) are offline-only today.</li>
@@ -376,8 +532,14 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
   </div>
 </footer>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"
+        integrity="sha384-06z5D//U/xpvxZHuUz92xBvq3DqBBFi7Up53HRrbV7Jlv7Yvh/MZ7oenfUe9iCEt"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"
+        integrity="sha384-/MKWdycCDliku23mP5sYXbZNuXrzgmQO/jsVxwPFn99dVOaXRyKsqDjarqpueGAp"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"
+        integrity="sha384-PeOqKNW/piETaCg8rqKFy+Pm6KEk7e36/5YZE5XO/OaFdO+/Aw3O8qZ9qDPKVUgx"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 </body>
 </html>
