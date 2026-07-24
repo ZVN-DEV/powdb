@@ -234,14 +234,20 @@ impl HeapFile {
                     in_free_list[i as usize] = true;
                     continue;
                 }
-                if let Some(page) = Page::from_bytes(&buf) {
-                    for (_slot, row) in iter_page_slots(&buf) {
-                        validate_row_format(row)?;
-                    }
-                    if page.free_space() > 64 {
-                        pages_with_space.push(i);
-                        in_free_list[i as usize] = true;
-                    }
+                // TASK-08: verify the CRC here (validate-if-present) instead
+                // of trusting the bytes. The open path runs before WAL replay,
+                // so a corrupt page that slips through and later panics in a
+                // release build (`panic = "abort"`) would abort again on every
+                // supervisor restart: a permanent crash loop. A typed
+                // `PageCorrupt` error, by contrast, is reportable and
+                // recoverable from a backup.
+                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
+                for (_slot, row) in iter_page_slots(&buf) {
+                    validate_row_format(row)?;
+                }
+                if page.free_space() > 64 {
+                    pages_with_space.push(i);
+                    in_free_list[i as usize] = true;
                 }
             }
         }
@@ -894,40 +900,27 @@ impl HeapFile {
                 let page_bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), PAGE_SIZE) };
                 // Bounds check: validate slot_index against the page's
                 // actual slot count to prevent OOB reads from stale/invalid
-                // RowIds.
-                let slot_count = u16::from_le_bytes(
-                    page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
-                        .try_into()
-                        .expect("2-byte slice"),
-                );
-                if rid.slot_index >= slot_count {
+                // RowIds. `slot_count_from_page` clamps a corrupt count to
+                // what the page can physically hold, and
+                // `slot_bytes_from_page` refuses a slot entry whose
+                // offset/length runs off the page, so neither a wild count
+                // nor a wild entry can underflow into an out-of-range slice
+                // (which in a release build with `panic = "abort"` would kill
+                // the process). This path deliberately does NOT verify the
+                // page CRC: that is the documented mmap performance tradeoff.
+                if rid.slot_index >= crate::page::slot_count_from_page(page_bytes) {
                     return None;
                 }
-                let entry_off = PAGE_SIZE - 2 - ((rid.slot_index as usize + 1) * 4);
-                if entry_off + 4 > PAGE_SIZE {
-                    return None;
-                }
-                let slot_offset = u16::from_le_bytes(
-                    page_bytes[entry_off..entry_off + 2]
-                        .try_into()
-                        .expect("2-byte slice"),
-                );
-                let slot_length = u16::from_le_bytes(
-                    page_bytes[entry_off + 2..entry_off + 4]
-                        .try_into()
-                        .expect("2-byte slice"),
-                );
-                if slot_length == 0xFFFF {
-                    return None; // deleted
-                }
-                let start = slot_offset as usize;
-                let end = start + slot_length as usize;
-                return Some(page_bytes[start..end].to_vec());
+                return crate::page::slot_bytes_from_page(page_bytes, rid.slot_index)
+                    .map(|row| row.to_vec());
             }
         }
 
         let buf = self.disk.read_page(rid.page_id).ok()?;
-        let page = Page::from_bytes(&buf)?;
+        // TASK-08: the disk point-lookup path consults the CRC
+        // (validate-if-present) rather than trusting the bytes, so a corrupt
+        // page reads as absent instead of yielding garbage or panicking.
+        let page = Page::from_bytes_verified(&buf).ok()?;
         page.get(rid.slot_index).map(|d| d.to_vec())
     }
 

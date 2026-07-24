@@ -13,6 +13,7 @@ pub mod full;
 pub mod incremental;
 pub mod manifest;
 pub mod restore;
+mod secure;
 pub use bootstrap::{bootstrap_replica_from_full_backup, ReplicaBootstrapSummary};
 pub use full::full_backup;
 pub use incremental::{incremental_backup, restore_chain, restore_chain_with_sync_mode};

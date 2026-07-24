@@ -101,7 +101,7 @@ impl BackupManifest {
 
     pub fn write(&self, dir: &Path) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        std::fs::write(dir.join(Self::FILE_NAME), json)
+        crate::secure::write_file_secure(&dir.join(Self::FILE_NAME), &json)
     }
 
     pub fn read(dir: &Path) -> io::Result<Self> {
@@ -241,7 +241,7 @@ impl IncrementManifest {
 
     pub fn write(&self, dir: &Path) -> io::Result<()> {
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        std::fs::write(dir.join(Self::FILE_NAME), json)
+        crate::secure::write_file_secure(&dir.join(Self::FILE_NAME), &json)
     }
 
     pub fn read(dir: &Path) -> io::Result<Self> {

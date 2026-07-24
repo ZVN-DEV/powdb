@@ -467,6 +467,36 @@ fn sanitize_error(e: &str) -> String {
     "query execution error".into()
 }
 
+/// Log a received query with every literal value redacted.
+///
+/// Query text is user data: `filter .email = "ada@example.com"` would otherwise
+/// put a real address into a log that is shipped and retained. We log the
+/// literal-free shape plus the plan-cache canonical hash, which is enough to
+/// identify the query, correlate repeats, and match it to a cached plan, and
+/// carries no values. See [`crate::redact`].
+fn log_received_query(peer: &str, query: &str, message: &'static str) {
+    debug!(
+        peer = %peer,
+        query_shape = %crate::redact::redact_query_literals(query),
+        query_hash = ?crate::redact::query_shape_hash(query),
+        query_len = query.len(),
+        message
+    );
+}
+
+/// [`log_received_query`] for the parameterized paths, where the bound values
+/// travel outside the text and are never logged at all.
+fn log_received_query_with_params(peer: &str, query: &str, n_params: usize, message: &'static str) {
+    debug!(
+        peer = %peer,
+        query_shape = %crate::redact::redact_query_literals(query),
+        query_hash = ?crate::redact::query_shape_hash(query),
+        query_len = query.len(),
+        n_params,
+        message
+    );
+}
+
 /// Write a message to the client with a timeout. Returns false if the
 /// write failed or timed out (caller should close the connection).
 async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Message) -> bool {
@@ -3051,7 +3081,7 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, "received query");
+                            log_received_query(&peer, &query, "received query");
                             execute_wire_query(
                                 engine.clone(),
                                 tx_gate.clone(),
@@ -3084,7 +3114,7 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, "received SQL query");
+                            log_received_query(&peer, &query, "received SQL query");
                             execute_wire_query_sql(
                                 engine.clone(),
                                 tx_gate.clone(),
@@ -3117,7 +3147,12 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, n_params = params.len(), "received parameterized query");
+                            log_received_query_with_params(
+                                &peer,
+                                &query,
+                                params.len(),
+                                "received parameterized query",
+                            );
                             execute_wire_query_with_params(
                                 engine.clone(),
                                 tx_gate.clone(),
@@ -3151,7 +3186,7 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, "received native query");
+                            log_received_query(&peer, &query, "received native query");
                             execute_wire_query(
                                 engine.clone(),
                                 tx_gate.clone(),
@@ -3184,7 +3219,7 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, "received native SQL query");
+                            log_received_query(&peer, &query, "received native SQL query");
                             execute_wire_query_sql(
                                 engine.clone(),
                                 tx_gate.clone(),
@@ -3217,7 +3252,12 @@ where
                                 None,
                             )
                         } else {
-                            debug!(peer = %peer, query = %query, n_params = params.len(), "received native parameterized query");
+                            log_received_query_with_params(
+                                &peer,
+                                &query,
+                                params.len(),
+                                "received native parameterized query",
+                            );
                             execute_wire_query_with_params(
                                 engine.clone(),
                                 tx_gate.clone(),

@@ -34,6 +34,20 @@ const DELETED_MARKER: u16 = 0xFFFF;
 pub const MAX_ROW_DATA_SIZE: usize =
     PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_COUNT_SIZE - SLOT_ENTRY_SIZE;
 
+/// The most slot-directory entries a 4KB page can physically hold: the whole
+/// page below the legacy header, minus the slot-count word, divided by the
+/// entry size. A page written by this engine can never exceed it (every row
+/// costs at least one entry plus its own bytes).
+///
+/// A corrupt or bit-rotted `slot_count` word can, though: it is two raw bytes
+/// at the bottom of the page and is read before any bounds check. Clamping
+/// every read of it to this ceiling is what keeps the slot-entry offset
+/// computation (`PAGE_SIZE - SLOT_COUNT_SIZE - (i + 1) * SLOT_ENTRY_SIZE`)
+/// from underflowing into a ~2^64 slice index, which in a release build with
+/// `panic = "abort"` is a process kill rather than an error.
+const MAX_SLOT_COUNT: u16 =
+    ((PAGE_SIZE - LEGACY_HEADER_SIZE - SLOT_COUNT_SIZE) / SLOT_ENTRY_SIZE) as u16;
+
 /// Overflow-page chunk header (door D3). An overflow page carries the
 /// standard 20-byte page header (type=Overflow, checksum flag + LSN for
 /// idempotent replay), then this 8-byte chunk header, then the payload:
@@ -246,13 +260,18 @@ impl Page {
         self.data[6..8].copy_from_slice(&v.to_le_bytes());
     }
 
+    /// Number of slot-directory entries on this page, clamped to what the page
+    /// can physically hold ([`MAX_SLOT_COUNT`]). The clamp is a no-op for every
+    /// page this engine writes and turns a corrupt count into a bounded walk
+    /// instead of an out-of-range slot-entry offset.
     pub fn slot_count(&self) -> u16 {
         // Infallible: slice is exactly 2 bytes from a fixed-size array.
-        u16::from_le_bytes(
+        let raw = u16::from_le_bytes(
             self.data[PAGE_SIZE - 2..PAGE_SIZE]
                 .try_into()
                 .expect("slot_count: 2-byte slice"),
-        )
+        );
+        raw.min(MAX_SLOT_COUNT)
     }
 
     fn set_slot_count(&mut self, v: u16) {
@@ -391,8 +410,7 @@ impl Page {
         if length == DELETED_MARKER {
             return None;
         }
-        let start = offset as usize;
-        let end = start + length as usize;
+        let (start, end) = slot_data_range(offset, length)?;
         Some(&self.data[start..end])
     }
 
@@ -414,8 +432,7 @@ impl Page {
         if length == DELETED_MARKER {
             return None;
         }
-        let start = offset as usize;
-        let end = start + length as usize;
+        let (start, end) = slot_data_range(offset, length)?;
         Some(&mut self.data[start..end])
     }
 
@@ -588,6 +605,83 @@ fn checksum_with_crc_zeroed(page_bytes: &[u8]) -> u32 {
     hasher.finalize()
 }
 
+/// Byte range of a slot's row data, or `None` when the recorded
+/// offset/length pair cannot describe a region inside the page.
+///
+/// `offset` and `length` are raw u16s read from the slot directory, so a
+/// corrupt entry can describe a range ending at ~131k against a 4096-byte
+/// page. Slicing that panics, and with `panic = "abort"` in release builds a
+/// panic on a read path is a process kill. The lower bound is the *legacy*
+/// header size so pre-WS3 pages (row data from byte 16) still read.
+#[inline]
+fn slot_data_range(offset: u16, length: u16) -> Option<(usize, usize)> {
+    let start = offset as usize;
+    let end = start.checked_add(length as usize)?;
+    if start < LEGACY_HEADER_SIZE || end > PAGE_SIZE {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Byte offset of slot-directory entry `i`, or `None` if the entry would sit
+/// outside the page. Mirrors `Page::slot_entry_offset` for the raw-slice
+/// (mmap / zero-copy) paths, minus the panic.
+#[inline]
+pub fn slot_entry_offset_checked(i: u16) -> Option<usize> {
+    let from_bottom = (i as usize).checked_add(1)?.checked_mul(SLOT_ENTRY_SIZE)?;
+    let entry_off = PAGE_SIZE
+        .checked_sub(SLOT_COUNT_SIZE)?
+        .checked_sub(from_bottom)?;
+    if entry_off < LEGACY_HEADER_SIZE {
+        return None;
+    }
+    Some(entry_off)
+}
+
+/// Read slot entry `i` (offset, length) from a raw page-sized slice, or
+/// `None` if the entry lies outside the page.
+#[inline]
+pub fn read_slot_entry_from_bytes(page_bytes: &[u8], i: u16) -> Option<(u16, u16)> {
+    let entry_off = slot_entry_offset_checked(i)?;
+    // Infallible: `slot_entry_offset_checked` guarantees 4 bytes remain.
+    let offset = u16::from_le_bytes(
+        page_bytes[entry_off..entry_off + 2]
+            .try_into()
+            .expect("slot offset: 2-byte slice"),
+    );
+    let length = u16::from_le_bytes(
+        page_bytes[entry_off + 2..entry_off + 4]
+            .try_into()
+            .expect("slot length: 2-byte slice"),
+    );
+    Some((offset, length))
+}
+
+/// Row bytes for slot `i` in a raw page-sized slice, or `None` if the slot is
+/// deleted, out of range, or describes a region outside the page.
+#[inline]
+pub fn slot_bytes_from_page(page_bytes: &[u8], i: u16) -> Option<&[u8]> {
+    let (offset, length) = read_slot_entry_from_bytes(page_bytes, i)?;
+    if length == DELETED_MARKER {
+        return None;
+    }
+    let (start, end) = slot_data_range(offset, length)?;
+    Some(&page_bytes[start..end])
+}
+
+/// Slot count of a raw page-sized slice, clamped to what the page can
+/// physically hold. See [`MAX_SLOT_COUNT`].
+#[inline]
+pub fn slot_count_from_page(page_bytes: &[u8]) -> u16 {
+    // SAFETY: slice is exactly 2 bytes, try_into is infallible.
+    let raw = u16::from_le_bytes(
+        page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
+            .try_into()
+            .expect("slot_count: 2-byte slice"),
+    );
+    raw.min(MAX_SLOT_COUNT)
+}
+
 #[inline]
 pub fn page_lsn(page_bytes: &[u8]) -> u64 {
     u64::from_le_bytes(
@@ -606,46 +700,60 @@ pub fn iter_page_slots(page_bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> 
     let slot_count = if page_bytes[4] == PageType::Overflow as u8 {
         0
     } else {
-        // SAFETY: slice is exactly 2 bytes, try_into is infallible.
-        u16::from_le_bytes(
-            page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
-                .try_into()
-                .expect("slot_count: 2-byte slice"),
-        )
+        // Clamped: a corrupt bottom-of-page count must not drive the
+        // slot-entry offset below the header (and, unclamped, into an
+        // underflowed ~2^64 slice index).
+        slot_count_from_page(page_bytes)
     };
-    (0..slot_count).filter_map(move |i| {
-        let entry_off = PAGE_SIZE - SLOT_COUNT_SIZE - ((i as usize + 1) * SLOT_ENTRY_SIZE);
-        // SAFETY: slices are exactly 2 bytes each, try_into is infallible.
-        let offset = u16::from_le_bytes(
-            page_bytes[entry_off..entry_off + 2]
-                .try_into()
-                .expect("slot offset: 2-byte slice"),
-        );
-        let length = u16::from_le_bytes(
-            page_bytes[entry_off + 2..entry_off + 4]
-                .try_into()
-                .expect("slot length: 2-byte slice"),
-        );
-        if length == DELETED_MARKER {
-            return None;
-        }
-        let start = offset as usize;
-        let end = start + length as usize;
-        // Task 3: bounds validation — a corrupt page could have slot
-        // offset/length that point outside the data region. Return None
-        // instead of panicking on an out-of-bounds slice. Use the legacy
-        // header size as the lower bound so pre-WS3 pages (data from byte
-        // 16) still read.
-        if end > PAGE_SIZE || start < LEGACY_HEADER_SIZE {
-            return None;
-        }
-        Some((i, &page_bytes[start..end]))
-    })
+    (0..slot_count).filter_map(move |i| slot_bytes_from_page(page_bytes, i).map(|row| (i, row)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_count_is_clamped_to_what_the_page_can_hold() {
+        let mut page = Page::new(1, PageType::Data);
+        page.insert(b"row").unwrap();
+        // Forge a wild bottom-of-page slot count, as bit-rot would.
+        page.data[PAGE_SIZE - 2..PAGE_SIZE].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(page.slot_count(), MAX_SLOT_COUNT);
+        // Walking every slot must terminate without an out-of-range index.
+        let walked = page.iter().count();
+        assert!(walked <= MAX_SLOT_COUNT as usize);
+    }
+
+    #[test]
+    fn get_rejects_a_slot_entry_pointing_outside_the_page() {
+        let mut page = Page::new(1, PageType::Data);
+        let slot = page.insert(b"row").unwrap();
+        // offset + length = 131_068, far past the 4096-byte page.
+        page.write_slot_entry(slot, u16::MAX - 1, u16::MAX - 1);
+        assert_eq!(page.get(slot), None);
+        assert!(page.slot_bytes_mut(slot).is_none());
+    }
+
+    #[test]
+    fn iter_page_slots_survives_a_wild_slot_count() {
+        let mut page = Page::new(1, PageType::Data);
+        page.insert(b"row").unwrap();
+        page.stamp_checksum();
+        let mut bytes = *page.as_bytes();
+        bytes[PAGE_SIZE - 2..PAGE_SIZE].copy_from_slice(&u16::MAX.to_le_bytes());
+        // Every entry past the real one is garbage, but the walk must be
+        // bounded and must never index outside the page.
+        let rows: Vec<_> = iter_page_slots(&bytes).collect();
+        assert!(rows.len() <= MAX_SLOT_COUNT as usize);
+        assert!(rows.iter().all(|(_, row)| row.len() <= PAGE_SIZE));
+    }
+
+    #[test]
+    fn slot_entry_offset_checked_rejects_indices_past_the_directory() {
+        assert!(slot_entry_offset_checked(0).is_some());
+        assert!(slot_entry_offset_checked(MAX_SLOT_COUNT - 1).is_some());
+        assert!(slot_entry_offset_checked(u16::MAX).is_none());
+    }
 
     #[test]
     fn test_new_page() {
