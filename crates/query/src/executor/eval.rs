@@ -431,6 +431,14 @@ pub(super) fn eval_expr_mode(
             negated,
         } => {
             let val = eval_expr_mode(expr, row, columns, mode);
+            // Operator-level rule (Filter mode): a missing tested value never
+            // matches `in` OR `not in`, exactly like `!=` and the six
+            // comparisons above. Only the explicit `not ( ... )` form is the
+            // two-valued complement. Join mode keeps raw `Value` semantics for
+            // parity with join-mode comparisons (which skip the Empty guard).
+            if mode == CmpMode::Filter && val.is_empty() {
+                return Value::Bool(false);
+            }
             let found = list.iter().any(|item| {
                 let iv = eval_expr_mode(item, row, columns, mode);
                 val == iv

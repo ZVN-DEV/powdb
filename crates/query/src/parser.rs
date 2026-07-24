@@ -2467,11 +2467,15 @@ impl Parser {
         }))
     }
 
-    /// `schema` — list all types. `schema <Type>` is an alias for
-    /// `describe <Type>`.
+    /// `schema`: list all types. `schema links` lists every declared entity
+    /// link. Any other `schema <Type>` is an alias for `describe <Type>`.
     fn parse_schema(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Schema)?;
-        if let Token::Ident(_) = self.peek() {
+        if let Token::Ident(name) = self.peek() {
+            if name == "links" {
+                self.advance();
+                return Ok(Statement::ListLinks);
+            }
             let table = self.expect_named_ident("type name")?;
             return Ok(Statement::Describe(table));
         }
@@ -4547,6 +4551,21 @@ mod dogfood_dx_tests {
         assert_eq!(
             parse("schema Post").unwrap(),
             Statement::Describe("Post".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_links_parses_to_list_links() {
+        assert_eq!(parse("schema links").unwrap(), Statement::ListLinks);
+    }
+
+    #[test]
+    fn describe_links_still_names_a_table() {
+        // Only the `schema links` spelling is the link listing; `describe`
+        // keeps treating `links` as an ordinary type name.
+        assert_eq!(
+            parse("describe links").unwrap(),
+            Statement::Describe("links".to_string())
         );
     }
 }

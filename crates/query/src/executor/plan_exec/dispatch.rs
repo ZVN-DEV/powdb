@@ -1975,6 +1975,8 @@ impl Engine {
 
             PlanNode::Describe { table } => self.introspect_describe(table),
 
+            PlanNode::ListLinks => self.introspect_list_links(),
+
             PlanNode::CreateView { name, query_text } => {
                 self.create_view(name, query_text)?;
                 Ok(QueryResult::Executed {

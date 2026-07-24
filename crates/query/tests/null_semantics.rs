@@ -409,3 +409,210 @@ fn join_on_equality_with_missing_keys_unchanged() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Operator-level `in` / `not in` (list and subquery forms) follow the operator
+// rule: a missing tested value NEVER matches, exactly like `!=`. Only the
+// explicit `not ( ... )` form is the plain two-valued complement.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_list_never_matches_missing_values() {
+    let (dir, mut engine) = fresh("in_list_missing");
+    // id 1 (v = 5) matches the list; id 2 (missing v) never matches `in`.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v in (5, 6) { .id }")),
+        vec![1]
+    );
+    // Nothing in the list matches either row; missing v stays excluded.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v in (1, 2) { .id }")),
+        Vec::<i64>::new()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn not_in_list_never_matches_missing_values() {
+    let (dir, mut engine) = fresh("not_in_list_missing");
+    // id 1 (v = 5) is in the list, so `not in` excludes it. id 2 has a missing
+    // v: operator-level `not in` must exclude it too (parity with `!=`).
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v not in (5, 6) { .id }")),
+        Vec::<i64>::new(),
+        "`not in` must never match a missing value"
+    );
+    // id 1 (v = 5, not in the list) matches; the missing row still does not.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v not in (1, 2) { .id }")),
+        vec![1],
+        "`not in` matches present non-members only, never the missing row"
+    );
+    // Str column, same rule.
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            r#"T filter .s not in ("x", "y") { .id }"#
+        )),
+        vec![1],
+        "`not in` on a str column must exclude the missing-s row"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn not_in_subquery_never_matches_missing_values() {
+    let (dir, mut engine) = fresh("not_in_subquery_missing");
+    exec(&mut engine, "type Src { required sid: int, sv: int }");
+    exec(&mut engine, "insert Src { sid := 1, sv := 1 }");
+    exec(&mut engine, "insert Src { sid := 2, sv := 2 }");
+
+    // Subquery yields (1, 2). id 1 (v = 5) is a present non-member: matches.
+    // id 2 (missing v) must NOT match `not in`.
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            "T filter .v not in (Src { .sv }) { .id }"
+        )),
+        vec![1],
+        "`not in (subquery)` must never match a missing value"
+    );
+    // Positive control: `in (subquery)` with a matching member.
+    exec(&mut engine, "insert Src { sid := 3, sv := 5 }");
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v in (Src { .sv }) { .id }")),
+        vec![1]
+    );
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            "T filter .v not in (Src { .sv }) { .id }"
+        )),
+        Vec::<i64>::new(),
+        "member row excluded by not-in, missing row excluded by the operator rule"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn explicit_not_of_in_list_is_the_plain_complement() {
+    let (dir, mut engine) = fresh("not_paren_in_list");
+    // `not (.v in (1, 2))`: id 1 (v = 5, not a member -> inner false -> not
+    // true) matches; id 2 (missing v -> inner false -> not true) ALSO matches.
+    // This is the documented two-valued `not ( ... )` complement, unchanged.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter not (.v in (1, 2)) { .id }")),
+        vec![1, 2],
+        "explicit `not ( ... )` stays the plain complement and includes the missing row"
+    );
+    // The operator form of the same predicate excludes the missing row.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v not in (1, 2) { .id }")),
+        vec![1],
+        "`not in` (operator) and `not (in)` (complement) are deliberately different"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn not_in_agrees_across_plain_prepared_sql_and_indexed_paths() {
+    use powdb_query::ast::Literal;
+
+    let (dir, mut engine) = fresh("not_in_all_paths");
+
+    // Plain scan path.
+    let plain = ids(exec(&mut engine, "T filter .v not in (1, 2) { .id }"));
+    assert_eq!(plain, vec![1]);
+
+    // Prepared path: same canonical plan, literals substituted at execute.
+    let prep = engine
+        .prepare("T filter .v not in (1, 2) { .id }")
+        .expect("prepare not-in filter");
+    let prepared = ids(engine
+        .execute_prepared(&prep, &[Literal::Int(1), Literal::Int(2)])
+        .expect("execute_prepared"));
+    assert_eq!(
+        prepared, plain,
+        "prepared `not in` must agree with the plain scan path"
+    );
+
+    // The SQL frontend rejects IN lists/subqueries ("SQL IN lists/subqueries
+    // are not supported yet"), so there is no SQL leg to compare here.
+
+    // With an index on the column, the answer must not change.
+    engine
+        .catalog_mut()
+        .create_index_unique("T", "v", false)
+        .expect("create index on v");
+    let indexed = ids(exec(&mut engine, "T filter .v not in (1, 2) { .id }"));
+    assert_eq!(
+        indexed, plain,
+        "an index on .v must not change `not in` rows"
+    );
+    let indexed_in = ids(exec(&mut engine, "T filter .v in (5, 6) { .id }"));
+    assert_eq!(
+        indexed_in,
+        vec![1],
+        "an index on .v must not change `in` rows"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// `between` / `not between` are parser sugar for comparison chains, and `like`
+// evaluates false on a non-str (missing) operand, so all of these already
+// follow the operator rule for the positive and `not between` forms. `not
+// like` is parser sugar for `not (like)`, so it keeps the documented
+// complement semantics. These tests pin all of that.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn between_and_like_negated_forms_pin_missing_behavior() {
+    let (dir, mut engine) = fresh("between_like_missing");
+
+    // `between` desugars to `>= and <=`: missing never matches.
+    assert_eq!(
+        ids(exec(&mut engine, "T filter .v between 1 and 10 { .id }")),
+        vec![1]
+    );
+    // `not between` desugars to `< or >`: missing never matches either side.
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            "T filter .v not between 1 and 10 { .id }"
+        )),
+        Vec::<i64>::new(),
+        "`not between` (comparison sugar) must never match a missing value"
+    );
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            "T filter .v not between 10 and 20 { .id }"
+        )),
+        vec![1]
+    );
+
+    // `like`: a missing operand never matches.
+    assert_eq!(
+        ids(exec(&mut engine, r#"T filter .s like "a%" { .id }"#)),
+        vec![1]
+    );
+    // `not like` is sugar for `not (.s like ...)`, the documented two-valued
+    // complement, so it INCLUDES the missing-s row.
+    assert_eq!(
+        ids(exec(&mut engine, r#"T filter .s not like "z%" { .id }"#)),
+        vec![1, 2],
+        "`not like` is `not ( ... )` sugar and keeps complement semantics"
+    );
+    // Guarding presence recovers the operator-style intent.
+    assert_eq!(
+        ids(exec(
+            &mut engine,
+            r#"T filter .s is not null and .s not like "z%" { .id }"#
+        )),
+        vec![1]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

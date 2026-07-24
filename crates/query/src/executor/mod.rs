@@ -272,7 +272,7 @@ use self::plan_exec::{
 pub fn is_read_only_statement(stmt: &Statement) -> bool {
     match stmt {
         Statement::Query(_) => true,
-        Statement::ListTypes | Statement::Describe(_) => true,
+        Statement::ListTypes | Statement::Describe(_) | Statement::ListLinks => true,
         Statement::Union(u) => is_read_only_statement(&u.left) && is_read_only_statement(&u.right),
         Statement::Insert(_)
         | Statement::Upsert(_)
@@ -369,6 +369,7 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
         | PlanNode::CreateLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
+        | PlanNode::ListLinks
         | PlanNode::CreateView { .. }
         | PlanNode::RefreshView { .. }
         | PlanNode::DropView { .. }
@@ -2270,6 +2271,8 @@ impl Engine {
             PlanNode::ListTypes => self.introspect_list_types(),
 
             PlanNode::Describe { table } => self.introspect_describe(table),
+
+            PlanNode::ListLinks => self.introspect_list_links(),
 
             // All write variants — caller must escalate to the write lock.
             PlanNode::Insert { .. }
