@@ -18,6 +18,14 @@ name: publish
 #   - Trigger manually via workflow_dispatch with a version string
 #   - Set dry_run to true (default) to validate without publishing
 #   - Set dry_run to false to publish for real
+#
+# GOTCHA: `dry_run` DEFAULTS TO TRUE on purpose (a real publish is
+# irreversible: crates.io versions cannot be replaced, only yanked). A CLI
+# dispatch therefore needs the flag spelled out or nothing is published:
+#
+#   gh workflow run publish.yml -f version=0.19.1 -f dry_run=false
+#
+# Do not change that default to make dispatches shorter.
 
 on:
   workflow_dispatch:
@@ -59,9 +67,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Full history + tags: the tag verification step below needs to
+          # resolve v<version> and compare it against the dispatched commit.
+          fetch-depth: 0
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -87,6 +101,42 @@ jobs:
 
       - name: Check repository version consistency
         run: bash scripts/check-version-consistency.sh
+
+      # This workflow publishes whatever ref was dispatched, so without this a
+      # real publish could ship an arbitrary commit (a feature branch, an
+      # unmerged fix) under a released version number. Require that the commit
+      # being published is exactly the one the v<version> tag points at, which
+      # is also the commit release.yml built the binaries and Docker image from.
+      # Dry runs only warn: they are used before tagging.
+      - name: Verify tag v${{ inputs.version }} points at this commit
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          head_sha="$(git rev-parse HEAD)"
+          if ! tag_sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
+            msg="tag ${tag} does not exist in this repository"
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}"
+            exit 1
+          fi
+          if [ "$tag_sha" != "$head_sha" ]; then
+            msg="tag ${tag} points at ${tag_sha}, but this run is on ${head_sha}"
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}. Dispatch this workflow on the tag."
+            exit 1
+          fi
+          echo "tag ${tag} matches HEAD (${head_sha})"
+
+      # Same gate CI enforces on every PR. Publishing skipped it entirely, so a
+      # hand-dispatched publish could ship code that would never pass ci.yml.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Enable pnpm from packageManager
         run: |
