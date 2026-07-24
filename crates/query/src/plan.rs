@@ -207,7 +207,7 @@ pub enum PlanNode {
     Describe {
         table: String,
     },
-    /// `schema links` — list every declared entity link. Read-only; reads
+    /// `schema links`: list every declared entity link. Read-only; reads
     /// live catalog state at execution time, so a cached plan is never stale.
     ListLinks,
     /// Create a materialized view: execute query, store results, register.

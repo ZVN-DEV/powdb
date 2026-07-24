@@ -2467,7 +2467,7 @@ impl Parser {
         }))
     }
 
-    /// `schema` — list all types. `schema links` lists every declared entity
+    /// `schema`: list all types. `schema links` lists every declared entity
     /// link. Any other `schema <Type>` is an alias for `describe <Type>`.
     fn parse_schema(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Schema)?;

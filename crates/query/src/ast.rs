@@ -27,7 +27,7 @@ pub enum Statement {
     /// `describe <Type>` / `schema <Type>` — introspection: the columns and
     /// indexes of one type.
     Describe(String),
-    /// `schema links` — introspection: list every declared entity link.
+    /// `schema links`: introspection: list every declared entity link.
     ListLinks,
 }
 

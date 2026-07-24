@@ -1831,7 +1831,7 @@ schema links
 | User  | orders | Order   | id         | user_id    | to-many     |
 
 - **cardinality** is `to-one` when the target key is unique, `to-many`
-  otherwise — the same derivation the link was declared with.
+  otherwise: the same derivation the link was declared with.
 - An empty catalog (or one with no links) returns zero rows, not an error.
 - `links` is matched contextually, not reserved: `describe links` still
   describes a table named `links`, and only the exact spelling `schema links`
@@ -1879,7 +1879,7 @@ describe User
 - The direction marker in **index** is `->` for the type's own (outgoing)
   links and `<-` for links targeting it; the keys shown are always the
   owner's `local_key -> target_key` as declared.
-- **nullable** is the empty value (`{}`) on link rows — nullability does not
+- **nullable** is the empty value (`{}`) on link rows: nullability does not
   apply to a link.
 
 Describing a type that does not exist is an error (`table 'Ghost' not found`).

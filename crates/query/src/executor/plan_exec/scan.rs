@@ -722,7 +722,7 @@ impl Engine {
         })
     }
 
-    /// `schema links` — one result row per declared entity link, ordered by
+    /// `schema links`: one result row per declared entity link, ordered by
     /// owner then link name so output is stable across runs and restarts.
     /// Read-only; reads live catalog state, so a cached plan is never stale.
     pub(crate) fn introspect_list_links(&self) -> Result<QueryResult, QueryError> {
