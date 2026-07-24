@@ -319,6 +319,90 @@ migration layer must model column indexes as create-only. Point lookups and rang
 no hint syntax. Expression indexes cover equality, range, and ordered
 `order path limit K` scans.
 
+### Entity links (relationship traversal)
+
+**As of v0.19**, PowQL has declared relationships: an ORM's `belongsTo` /
+`hasMany` metadata can lower to a link declaration once, and its relation
+reads can lower to a traversal instead of a hand-written join. Links are
+read-only naming metadata over columns that already exist: no new storage, no
+write-time enforcement. See the
+[Entity Links section of POWQL.md](../POWQL.md#entity-links-relationship-traversal)
+for the full language treatment; this section covers what a driver must know.
+
+**Declaration DDL.** Two accepted spellings, both meaning
+`Owner.local_key = Target.target_key`:
+
+```
+link Order.user -> User on user_id = id
+alter Order add link user -> User on user_id = id
+```
+
+Declaring a link validates that both types and both columns exist and that the
+name does not collide with a column or an existing link on the owner. There is
+no `if not exists` form for links (redeclaring is an error), and there is no
+drop-link statement yet, so a migration layer must model links as create-only,
+like column indexes. While a link exists, dropping the table or column it
+references is refused (`... (drop the link first)`). The DDL reply is an
+ordinary `ResultMessage`: `link '<name>' added to '<owner>'`.
+
+**Cardinality is derived, not declared.** If `target_key` is unique on the
+target type at declare time, the link is stored as **to-one**; otherwise it is
+**to-many**. A driver's relation metadata should not ask the user for
+cardinality; it falls out of the schema. The derived kind then gates which
+traversal spelling is legal, and a scalar hop's uniqueness is re-checked at
+execution time (see the error table below), so a to-one read can never
+silently fan out.
+
+**Traversal spellings.** A to-one link is read as a **scalar path**, including
+multi-hop; a to-many link is read as a **block** that yields a native JSON
+array of shaped child rows per parent and accepts per-parent
+`filter` / `order` / `limit` / `offset`:
+
+```
+Order as o { o.id, o.user.name, o.user.company.name }
+User as u { u.name, orders: u.orders order total desc limit 3 { total, status } }
+```
+
+**The outer alias is required.** A generated projection must qualify the path
+with the table alias. A bare dotted path (`Order { .user.name }`) is a hard
+parse error, because without an alias it is ambiguous with two comma-less bare
+fields; the message is pinned:
+
+```
+`.user.name` is ambiguous in a projection: for a link path, alias the table
+and qualify the path (`Order as o { o.user.name }`); for separate fields,
+separate them with commas (`.user, .name`)
+```
+
+**Missing values never drop rows.** A NULL or dangling key at any hop of a
+scalar path yields Empty (native `type_id 0`) for that field; the parent row
+survives. A to-many parent with no children yields `[]`, not a missing row.
+The normative contract for how Empty then behaves in comparisons is the
+[NULL / missing values section of POWQL.md](../POWQL.md#null--missing-values-in-comparisons);
+surface it per [Null semantics](#3-null-semantics) rather than restating it.
+
+**Link errors a driver should map.** All arrive as ordinary `Error` frames;
+match on the leading substring, the interpolated names vary:
+
+| Misuse | Message starts with | Nature |
+|---|---|---|
+| Undeclared link name | `unknown link` (suggests the `link ...` DDL to declare it) | fix the schema or query |
+| Scalar path through a to-many link | ``link `<name>` on type `<T>` is a to-many link`` (says to use a block) | fix the query |
+| Block through a to-one link | ``link `<name>` on type `<T>` is a to-one link`` (says to use a path) | fix the query |
+| Aggregate over a link projection | `aggregates over a nested or link projection are not supported` | fix the query |
+| Runtime uniqueness re-check failed | ``scalar link `<name>`: key column `<T>.<col>` is not unique`` | integrity: the engine refuses rather than silently picking one row |
+
+**No prepared-plan reuse.** Link-bearing statements (scalar paths and block
+traversals) resolve against the live catalog at execution and are excluded
+from the plan cache: they are neither inserted nor served from it. Do not
+build a driver optimization that assumes cached-plan hits for relation reads;
+every other statement shape caches as before.
+
+**No introspection yet.** `describe <Table>` and the type listing do not
+report links today; a driver cannot yet discover declared links from the
+server. A link-listing introspection surface is landing in an upcoming
+release and will be noted here when it ships.
+
 ### Upsert
 
 ```
@@ -502,12 +586,13 @@ client's, but does not refuse to connect: a driver should follow the same
 best-effort posture rather than hard-gating on the version string.
 
 A separate ceiling governs on-disk/sync format compatibility:
-`SUPPORTED_CATALOG_VERSION` in the reference client (currently `6`) is the
-highest catalog format the client can read. The reference behavior a driver
-should copy: accept a reported catalog version at or below your maximum, and
-refuse a newer one (you cannot read a format from the future). This ceiling is
-carried in the sync-bootstrap metadata, not in the ordinary query handshake, so
-most drivers only need the advisory semver check above.
+`SUPPORTED_CATALOG_VERSION` in the reference client (currently `7`; v7 is the
+entity-links catalog format, activated lazily by the first `link` declaration)
+is the highest catalog format the client can read. The reference behavior a
+driver should copy: accept a reported catalog version at or below your maximum,
+and refuse a newer one (you cannot read a format from the future). This ceiling
+is carried in the sync-bootstrap metadata, not in the ordinary query handshake,
+so most drivers only need the advisory semver check above.
 
 ---
 
@@ -544,6 +629,13 @@ This document is versioned with the PowDB workspace, and behavior added in a
 given release is called out inline (for example, `explain` reflecting the
 lowered plan "as of v0.14"). When a release changes anything on this surface,
 the change is noted here per release.
+
+Driver-visible surface changes in **v0.19.0**: entity links
+([Section 2](#entity-links-relationship-traversal)): new link DDL and
+traversal syntax, pinned link-misuse error messages, plan-cache exclusion for
+link-bearing statements, and the catalog format ceiling moving from `6` to `7`
+(v7 activates lazily on the first link declaration; a link-free database stays
+on its current format). No wire frame changed shape.
 
 The wire protocol evolves **additively only**. New capability is added as a new
 message tag or as fields appended to the end of an existing frame's payload

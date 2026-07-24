@@ -53,8 +53,14 @@ export const CLIENT_VERSION = "0.19.0";
  * maximum is at least its active catalog format and rejects an older replica.
  * When validating a server-reported catalog version, accept anything at or
  * below this and reject anything newer (the client cannot read it).
+ *
+ * v7 is the entity-links format: it appends a relationship-link section
+ * before the trailing CRC, staircase-defaulted so every older file still
+ * loads (a pre-v7 file simply has zero links). It activates lazily on the
+ * first `link` declaration. The client treats catalog payloads as opaque
+ * bytes and only states this ceiling in the sync handshake.
  */
-export const SUPPORTED_CATALOG_VERSION = 6;
+export const SUPPORTED_CATALOG_VERSION = 7;
 
 /**
  * Throw when a server-reported catalog format is newer than this client can
