@@ -279,6 +279,7 @@ fn contains_grouped_having(plan: &PlanNode) -> bool {
         | PlanNode::CreateLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
+        | PlanNode::ListLinks
         | PlanNode::CreateView { .. }
         | PlanNode::RefreshView { .. }
         | PlanNode::DropView { .. }
@@ -518,7 +519,7 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         PlanNode::Explain { input } => {
             substitute_plan(input, literals, idx);
         }
-        PlanNode::ListTypes | PlanNode::Describe { .. } => {}
+        PlanNode::ListTypes | PlanNode::Describe { .. } | PlanNode::ListLinks => {}
         PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
     }
 }
@@ -775,7 +776,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::Explain { input } => {
             count_plan(input, n);
         }
-        PlanNode::ListTypes | PlanNode::Describe { .. } => {}
+        PlanNode::ListTypes | PlanNode::Describe { .. } | PlanNode::ListLinks => {}
         PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
     }
 }
@@ -1540,7 +1541,7 @@ mod tests {
             PlanNode::Explain { input } => {
                 collect_literals_for_test(input, out);
             }
-            PlanNode::ListTypes | PlanNode::Describe { .. } => {}
+            PlanNode::ListTypes | PlanNode::Describe { .. } | PlanNode::ListLinks => {}
             PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
         }
     }

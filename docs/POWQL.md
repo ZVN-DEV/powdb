@@ -985,7 +985,9 @@ PowDB infers whether a link is **to-one** or **to-many** from the target key:
 - Otherwise it is **to-many** and is traversed as a **block**
   (`u.orders { ... }`).
 
-You do not annotate the cardinality; the schema already knows it.
+You do not annotate the cardinality; the schema already knows it. To see the
+declared links (and their derived cardinality), use
+[`schema links`](#schema-links) or [`describe <Type>`](#describe).
 
 ### Scalar path (to-one)
 
@@ -1814,6 +1816,27 @@ schema
 | User | 3       |
 | Post | 2       |
 
+### schema links
+
+List every declared [entity link](#entity-links-relationship-traversal). One row per link, ordered by
+owner then link name, so output is stable across runs and restarts.
+
+```
+schema links
+```
+
+| owner | name   | target  | local_key  | target_key | cardinality |
+|-------|--------|---------|------------|------------|-------------|
+| Order | user   | User    | user_id    | id         | to-one      |
+| User  | orders | Order   | id         | user_id    | to-many     |
+
+- **cardinality** is `to-one` when the target key is unique, `to-many`
+  otherwise — the same derivation the link was declared with.
+- An empty catalog (or one with no links) returns zero rows, not an error.
+- `links` is matched contextually, not reserved: `describe links` still
+  describes a table named `links`, and only the exact spelling `schema links`
+  is the link listing.
+
 ### describe
 
 Describe one type: its columns with type and nullability, plus which columns are
@@ -1833,6 +1856,31 @@ schema User        -- alias for `describe User`
 - **nullable** is `false` for `required` columns, `true` otherwise.
 - **index** is `unique` for a unique index, `index` for a plain index, empty
   when the column is not indexed.
+
+Entity links touching the type are **appended after the column rows** with
+`type = "link"`, so the column rows stay byte-identical to a link-free
+catalog. Outgoing links come first, ordered by name; links declared on other
+types that target this one follow, ordered by owner then name and written as
+`Owner.name`:
+
+```
+describe User
+```
+
+| column      | type | nullable | index                             |
+|-------------|------|----------|-----------------------------------|
+| id          | int  | false    | unique                            |
+| name        | str  | false    |                                   |
+| company_id  | int  | true     |                                   |
+| company     | link | {}       | -> Company (to-one, company_id -> id) |
+| orders      | link | {}       | -> Order (to-many, id -> user_id) |
+| Order.user  | link | {}       | <- Order (to-one, user_id -> id)  |
+
+- The direction marker in **index** is `->` for the type's own (outgoing)
+  links and `<-` for links targeting it; the keys shown are always the
+  owner's `local_key -> target_key` as declared.
+- **nullable** is the empty value (`{}`) on link rows — nullability does not
+  apply to a link.
 
 Describing a type that does not exist is an error (`table 'Ghost' not found`).
 Introspection always reflects the **current** schema — it is never served from a

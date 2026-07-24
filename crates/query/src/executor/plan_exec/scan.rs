@@ -4,7 +4,7 @@
 use crate::ast::*;
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
-use powdb_storage::catalog::IndexOrderDirection;
+use powdb_storage::catalog::{IndexOrderDirection, LinkDef, LinkKind};
 use powdb_storage::types::*;
 use std::collections::HashSet;
 
@@ -641,13 +641,17 @@ impl Engine {
     }
 
     /// `describe <Type>` — one result row per column: name, type, nullability,
-    /// and index kind (`unique` / `index` / empty). Read-only.
+    /// and index kind (`unique` / `index` / empty). Entity links touching the
+    /// type are appended after the column rows with `type = "link"`: outgoing
+    /// links first (named bare, detail `-> Target (...)`), then links from
+    /// other types targeting it (named `Owner.name`, detail `<- Owner (...)`).
+    /// Column rows are byte-identical to a link-free catalog. Read-only.
     pub(crate) fn introspect_describe(&self, table: &str) -> Result<QueryResult, QueryError> {
         let schema = self
             .catalog
             .schema(table)
             .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
-        let rows: Vec<Vec<Value>> = schema
+        let mut rows: Vec<Vec<Value>> = schema
             .columns
             .iter()
             .map(|c| {
@@ -667,6 +671,46 @@ impl Engine {
                 ]
             })
             .collect();
+        let mut outgoing: Vec<&LinkDef> = self
+            .catalog
+            .links()
+            .filter(|l| l.owner_type == table)
+            .collect();
+        outgoing.sort_by(|a, b| a.name.cmp(&b.name));
+        for link in outgoing {
+            rows.push(vec![
+                Value::Str(link.name.clone()),
+                Value::Str("link".to_string()),
+                Value::Empty,
+                Value::Str(format!(
+                    "-> {} ({}, {} -> {})",
+                    link.target_type,
+                    link_cardinality(link.kind),
+                    link.local_key,
+                    link.target_key
+                )),
+            ]);
+        }
+        let mut incoming: Vec<&LinkDef> = self
+            .catalog
+            .links()
+            .filter(|l| l.target_type == table && l.owner_type != table)
+            .collect();
+        incoming.sort_by(|a, b| (&a.owner_type, &a.name).cmp(&(&b.owner_type, &b.name)));
+        for link in incoming {
+            rows.push(vec![
+                Value::Str(format!("{}.{}", link.owner_type, link.name)),
+                Value::Str("link".to_string()),
+                Value::Empty,
+                Value::Str(format!(
+                    "<- {} ({}, {} -> {})",
+                    link.owner_type,
+                    link_cardinality(link.kind),
+                    link.local_key,
+                    link.target_key
+                )),
+            ]);
+        }
         Ok(QueryResult::Rows {
             columns: vec![
                 "column".to_string(),
@@ -676,5 +720,45 @@ impl Engine {
             ],
             rows,
         })
+    }
+
+    /// `schema links` — one result row per declared entity link, ordered by
+    /// owner then link name so output is stable across runs and restarts.
+    /// Read-only; reads live catalog state, so a cached plan is never stale.
+    pub(crate) fn introspect_list_links(&self) -> Result<QueryResult, QueryError> {
+        let mut links: Vec<&LinkDef> = self.catalog.links().collect();
+        links.sort_by(|a, b| (&a.owner_type, &a.name).cmp(&(&b.owner_type, &b.name)));
+        let rows: Vec<Vec<Value>> = links
+            .iter()
+            .map(|l| {
+                vec![
+                    Value::Str(l.owner_type.clone()),
+                    Value::Str(l.name.clone()),
+                    Value::Str(l.target_type.clone()),
+                    Value::Str(l.local_key.clone()),
+                    Value::Str(l.target_key.clone()),
+                    Value::Str(link_cardinality(l.kind).to_string()),
+                ]
+            })
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "owner".to_string(),
+                "name".to_string(),
+                "target".to_string(),
+                "local_key".to_string(),
+                "target_key".to_string(),
+                "cardinality".to_string(),
+            ],
+            rows,
+        })
+    }
+}
+
+/// Human-readable cardinality label used by both link-introspection surfaces.
+fn link_cardinality(kind: LinkKind) -> &'static str {
+    match kind {
+        LinkKind::ToOne => "to-one",
+        LinkKind::ToMany => "to-many",
     }
 }
