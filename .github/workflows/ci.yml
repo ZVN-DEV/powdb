@@ -53,7 +53,11 @@ jobs:
   miri:
     name: miri (powdb-storage)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # miri interprets rather than executes, so this job is slow by nature: runs on
+    # main sat at 16 to 20 minutes against a 20 minute cap, which meant a green run
+    # had seconds of headroom and any added storage test tipped it into a timeout
+    # that reads like a failure. 30 gives it room without hiding a real hang.
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       # miri cannot interpret libc::mmap, so we skip modules that touch the
