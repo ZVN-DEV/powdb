@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.20.0 - 2026-07-25
+
 - **Security (medium): bounded result allocation.** A hostile or MITM'd server
   could declare 10,000,000 single-column rows backed by a ~40 MB frame of empty
   cells and make the client allocate roughly 1.9 GB (measured), since a cell
