@@ -1202,7 +1202,7 @@ export class Client extends EventEmitter<ClientEvents> {
    * surface and returns object rows keyed by column name.
    *
    * The SQL frontend cannot bind parameters on any wire frame yet, so build SQL
-   * with {@link escapeSqlLiteral} / {@link sqlIdent} (or the `sqlQuery` tagged
+   * with {@link escapeSqlLiteral} / {@link sqlIdent} (or the `sql` tagged
    * template) rather than string concatenation. For parameter binding, use the
    * PowQL surface, which has real `$N` placeholders.
    */

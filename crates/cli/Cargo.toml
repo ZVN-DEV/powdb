@@ -1,6 +1,6 @@
 [package]
 name = "powdb-cli"
-description = "Interactive REPL and CLI for PowDB — 3-10x faster than SQLite on aggregates"
+description = "Interactive REPL and CLI for PowDB, an embedded database with a pipeline query language and nested results"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

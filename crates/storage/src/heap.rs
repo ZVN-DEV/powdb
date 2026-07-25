@@ -234,7 +234,7 @@ impl HeapFile {
                     in_free_list[i as usize] = true;
                     continue;
                 }
-                // TASK-08: verify the CRC here (validate-if-present) instead
+                // Verify the CRC here (validate-if-present) instead
                 // of trusting the bytes. The open path runs before WAL replay,
                 // so a corrupt page that slips through and later panics in a
                 // release build (`panic = "abort"`) would abort again on every
@@ -917,7 +917,7 @@ impl HeapFile {
         }
 
         let buf = self.disk.read_page(rid.page_id).ok()?;
-        // TASK-08: the disk point-lookup path consults the CRC
+        // The disk point-lookup path consults the CRC
         // (validate-if-present) rather than trusting the bytes, so a corrupt
         // page reads as absent instead of yielding garbage or panicking.
         let page = Page::from_bytes_verified(&buf).ok()?;
@@ -1881,7 +1881,7 @@ impl HeapFile {
     /// `try_for_each_row*` scan path — deliberately read page bytes through
     /// the mmap **without** per-read CRC verification. Verifying every page on
     /// every scan would re-hash 4KB per page on the critical path and erase
-    /// the 3-10x scan/agg wins that are PowDB's headline numbers. So the
+    /// the scan and aggregate wins that are PowDB's headline numbers. So the
     /// checksum guarantee is scoped, not universal:
     ///
     /// * The **write path** stamps a CRC on every flushed page

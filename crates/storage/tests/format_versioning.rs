@@ -126,7 +126,7 @@ fn heap_open_rejects_unknown_row_version_before_decode() {
         .position(|w| w == ROW_MAGIC)
         .expect("row magic written into heap");
     bytes[pos + 4..pos + 6].copy_from_slice(&u16::MAX.to_le_bytes());
-    // TASK-08: the open path now verifies the page CRC before walking rows, so
+    // The open path now verifies the page CRC before walking rows, so
     // re-stamp the tampered page. Without this the CRC gate fires first and
     // the row-version gate under test is never reached.
     restamp_page_crc(&mut bytes, (pos / powdb_storage::page::PAGE_SIZE) as u32);

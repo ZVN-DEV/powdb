@@ -1,4 +1,4 @@
-//! TASK-03: a backup is a byte-for-byte copy of every row plus the catalog, so
+//! A backup is a byte-for-byte copy of every row plus the catalog, so
 //! it must be created with the same owner-only posture the live data directory
 //! gets from `powdb_storage::create_data_dir_secure` (0700 dirs, 0600 files).
 //! Under a typical umask, plain `create_dir_all` / `fs::write` would leave

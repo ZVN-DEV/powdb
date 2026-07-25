@@ -8,7 +8,7 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/zvndev/powdb.git
+git clone https://github.com/ZVN-DEV/powdb.git
 cd powdb
 git config core.hooksPath .githooks   # enable the fast pre-commit gate (fmt + version consistency)
 cargo build --workspace

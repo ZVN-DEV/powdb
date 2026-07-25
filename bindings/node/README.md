@@ -25,7 +25,7 @@ const count = db.querySql("SELECT count(*) FROM User"); // SQL frontend too
   every mutation throws a terminal read-only error, and the directory is never
   mutated. N read-only handles across processes can serve the same directory
   concurrently. A non-empty (unrecovered) WAL is refused. See
-  [Read-only snapshot serving](https://github.com/zvndev/powdb/blob/main/docs/read-only-serving.md).
+  [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md).
 - `Database.openReadOnlyWithMemoryLimit(dir, limitBytes)`: read-only open with
   an explicit per-query memory budget.
 - `db.query(powql)`: run a PowQL statement (string-typed cells).

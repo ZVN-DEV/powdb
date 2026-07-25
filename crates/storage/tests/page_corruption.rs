@@ -1,4 +1,4 @@
-//! TASK-08: a corrupt page must produce a typed error, never a process abort.
+//! A corrupt page must produce a typed error, never a process abort.
 //!
 //! `panic = "abort"` is set for release builds (crash-only design), so any
 //! reachable panic in the open path or the point-lookup path is worse than a

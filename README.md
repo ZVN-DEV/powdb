@@ -61,7 +61,7 @@ Two capabilities have no SQL spelling at all, and are where PowQL earns its keep
 
 **Already think in SQL?** Since v0.5.0 PowDB also accepts a supported subset of SQL through a frontend that lowers to the same PowQL plan tree (and shares the plan cache), see [docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md). PowQL remains the native, fastest path.
 
-Full language reference: [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md) | SQL frontend: [docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md) | Getting started: [docs/getting-started.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/backup-and-restore.md) | Driver/ORM implementers: [docs/integrations/powql-for-drivers.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/integrations/powql-for-drivers.md) | Wire error codes: [docs/errors.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/errors.md)
+Full language reference: [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md) | SQL frontend: [docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md) | Getting started: [docs/getting-started.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md) | Backup &amp; restore: [docs/backup-and-restore.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/backup-and-restore.md) | Driver/ORM implementers: [docs/integrations/powql-for-drivers.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/integrations/powql-for-drivers.md) | Wire error codes: [docs/errors.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/errors.md) | CLI reference (`--exec`, `--exec-file`, `--sql`, `--format`, REPL meta-commands): [crates/cli/README.md](https://github.com/ZVN-DEV/powdb/blob/main/crates/cli/README.md) | Stability and upgrade policy: [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md)
 
 ## Install
 
@@ -184,7 +184,8 @@ type User {
   required name: str,
   required email: str,
   status: str default "active",
-  age: int
+  age: int,
+  city: str
 }
 
 -- Insert (single row)

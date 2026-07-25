@@ -1,6 +1,6 @@
 # @zvndev/powdb-client
 
-TypeScript client for [PowDB](https://github.com/zvndev/powdb) — speaks the native binary wire protocol over TCP (or TLS).
+TypeScript client for [PowDB](https://github.com/ZVN-DEV/powdb). Speaks the native binary wire protocol over TCP (or TLS).
 
 ## Install
 

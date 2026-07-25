@@ -916,7 +916,7 @@ mod tests {
         tokio_rustls::TlsAcceptor::from(Arc::new(config))
     }
 
-    /// TASK-04: a peer that opens a TLS connection and then says nothing must
+    /// A peer that opens a TLS connection and then says nothing must
     /// not pin its connection permit. Without the deadline this future never
     /// resolves and the test hangs (the permit is held for the process's life).
     #[tokio::test]

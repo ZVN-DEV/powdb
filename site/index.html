@@ -408,7 +408,7 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
 <section class="compare-section" id="embedded">
   <div class="container">
     <h2>Embedded in Node — no server</h2>
-    <p class="section-subtitle">The same engine, in-process. <code>@zvndev/powdb-embedded</code> is a native Node addon: open a database, run PowQL or SQL, no TCP, no daemon. It beats SQLite on writes once you pick a durability mode.</p>
+    <p class="section-subtitle">The same engine, in-process. <code>@zvndev/powdb-embedded</code> is a native Node addon: open a database, run PowQL or SQL, no TCP, no daemon. Durability is a mode you pick, so batched writes can be made fast without giving up crash safety.</p>
 
     <div class="install-block" style="margin-bottom: 24px;">
       <span class="prompt">$</span> npm install @zvndev/powdb-embedded
@@ -448,7 +448,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
     <div class="features-grid">
       <div class="feature-card">
         <h3>Compiled Predicates</h3>
-        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads measure 3-6x SQLite while point lookups do not.</p>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why aggregate and scan workloads measure 3-7x SQLite while point lookups do not.</p>
       </div>
       <div class="feature-card">
         <h3>Nested Projections</h3>
@@ -488,7 +488,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
       </div>
       <div class="feature-card">
         <h3>Embedded in Node</h3>
-        <p>Native in-process addon (<code>@zvndev/powdb-embedded</code>): <code>Database.open</code>, then PowQL or SQL with no server. <code>setSyncMode("normal")</code> is what beats SQLite on writes.</p>
+        <p>Native in-process addon (<code>@zvndev/powdb-embedded</code>): <code>Database.open</code>, then PowQL or SQL with no server. <code>setSyncMode("normal")</code> trades per-commit fsync for OS-level durability, which is what makes writes fast.</p>
       </div>
       <div class="feature-card">
         <h3>TypeScript Client</h3>

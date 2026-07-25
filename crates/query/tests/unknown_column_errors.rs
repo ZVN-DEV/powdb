@@ -152,8 +152,10 @@ fn sql_frontend_reports_unknown_columns() {
 }
 
 /// `{ alias: expr } order alias` plans the sort BELOW the projection, so the
-/// alias does not exist yet at sort time. That used to evaluate to NULL for
-/// every row and silently return unsorted output; it is now a clean error.
+/// alias does not exist yet at sort time and the query is an error. This is
+/// pre-existing behavior (the executor's Sort arm already rejected an unknown
+/// sort key); the case is pinned here so the new column validation, which sees
+/// the alias as a known name, does not accidentally start accepting it.
 /// Sorting by an alias produced by grouping (where the sort sits above the
 /// projection) is unaffected.
 #[test]

@@ -50,7 +50,7 @@ fn test_disk_corruption_detected_on_read() {
     // Force a disk read of the corrupted page. `delete` routes through
     // `ensure_hot`, which reads + verifies the page from disk.
     //
-    // TASK-08: the open path itself now verifies page CRCs, so the heap is
+    // The open path itself now verifies page CRCs, so the heap is
     // opened BEFORE the corruption is written (see `open_then_corrupt` below)
     // to keep this test focused on the read path rather than the open path.
     let mut heap = open_then_corrupt(&path, rid.page_id);
@@ -69,7 +69,7 @@ fn test_disk_corruption_detected_on_read() {
 }
 
 /// Open the heap, then corrupt one byte of `page_id` on disk. The open must
-/// happen first: the open path verifies every page's CRC (TASK-08), so a file
+/// happen first: the open path verifies every page CRC, so a file
 /// corrupted beforehand no longer opens at all.
 fn open_then_corrupt(path: &std::path::Path, page_id: u32) -> HeapFile {
     let heap = HeapFile::open(path).unwrap();
@@ -183,7 +183,7 @@ fn test_verify_integrity_detects_corruption() {
 
     // Corrupt and detect, mmap ACTIVE — verify_integrity reads off disk, not
     // the mmap snapshot, so it still catches it. A fresh file is used because
-    // the one above is already corrupt and no longer opens (TASK-08).
+    // the one above is already corrupt and no longer opens.
     let mmap_path = tmp_path("verify_mmap");
     let mmap_rid;
     {
