@@ -187,8 +187,12 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # Pinned, not `npm@latest`: this step runs in the job that mints the npm
+      # publish credential via OIDC, and it was the only unpinned dependency
+      # fetch in an otherwise fully SHA-pinned pipeline. 11.5.1 is the first
+      # release that supports trusted publishing. Bump deliberately.
       - name: Upgrade npm (trusted publishing requires npm >= 11.5.1)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - name: Verify git tag matches package.json version
         working-directory: clients/ts
@@ -230,6 +234,17 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Integrity manifest for the downloadable binaries. Users can verify a
+      # download with `sha256sum -c SHA256SUMS`. Generated from inside the
+      # artifacts dir so the file lists bare names, not `artifacts/` paths.
+      - name: Generate SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          sha256sum -- * > SHA256SUMS.tmp
+          mv SHA256SUMS.tmp SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
@@ -238,7 +253,12 @@ jobs:
 
   docker:
     name: docker image
-    needs: test
+    # The container channel ships the same engine as the tarball binaries, so it
+    # must clear the same durability gate. PowDB yanked v0.4.1 through v0.4.3 for
+    # data loss and `smoke-release` (kill -9 plus WAL replay) exists because of
+    # that incident: publishing the image on `test` alone left Docker users
+    # unguarded against the exact failure mode that already happened once.
+    needs: [test, smoke-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

@@ -120,8 +120,12 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # Pinned, not `npm@latest`: this step runs in the job that mints the npm
+      # publish credential via OIDC, and it was the only unpinned dependency
+      # fetch in an otherwise fully SHA-pinned pipeline. 11.5.1 is the first
+      # release that supports trusted publishing. Bump deliberately.
       - name: Upgrade npm (trusted publishing requires npm >= 11.5.1)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - name: Verify version matches input
         working-directory: bindings/node

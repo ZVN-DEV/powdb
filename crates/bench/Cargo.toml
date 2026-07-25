@@ -23,10 +23,12 @@ powdb-query = { path = "../query" }
 [[bin]]
 name = "smoke-bench"
 path = "src/smoke.rs"
+test = false
 
 [[bin]]
 name = "compare"
 path = "src/bin/compare.rs"
+test = false
 
 # Standalone JSON-path-filter workload (design 4.4, B2). NOT part of the
 # criterion regression gate or baseline/main.json (Depot-only policy): it just
@@ -35,6 +37,7 @@ path = "src/bin/compare.rs"
 [[bin]]
 name = "json-filter"
 path = "src/bin/json_filter.rs"
+test = false
 
 # Synthetic Phase 0 read baseline. This is intentionally separate from the
 # Criterion regression gate: it starts a real TCP server and reports observed
@@ -42,6 +45,7 @@ path = "src/bin/json_filter.rs"
 [[bin]]
 name = "phase0-read-baseline"
 path = "src/bin/phase0_read_baseline.rs"
+test = false
 
 # Fixed-seed release proof for JSON-path equality/range indexes and bounded
 # ordered expression-index scans. Emits machine-readable JSON and enforces
@@ -49,6 +53,14 @@ path = "src/bin/phase0_read_baseline.rs"
 [[bin]]
 name = "expression-index-release-gate"
 path = "src/bin/expression_index_release_gate.rs"
+test = false
+
+# Declared explicitly (rather than auto-discovered) so it can opt out of being
+# built as a test target: it is a benchmark driver with no #[test] functions.
+[[bin]]
+name = "compound_join_scaling"
+path = "src/bin/compound_join_scaling.rs"
+test = false
 
 [[bench]]
 name = "storage"

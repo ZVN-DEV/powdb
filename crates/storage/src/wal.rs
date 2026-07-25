@@ -7,6 +7,60 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::debug;
 
+/// Process-wide WAL fsync accounting.
+///
+/// PowDB is a single-writer, fsync-bound engine: how long an fsync takes, and
+/// how many are issued, is the single most useful signal an operator has for
+/// write-path health. These are plain relaxed atomics updated at the two
+/// places that call `sync_data` (the group-commit leader and the Normal-mode
+/// background flusher), so a reader (the server's `/metrics` endpoint) can
+/// sample them without taking any lock, including the engine lock.
+///
+/// Process-global rather than per-`Wal` because a PowDB server process serves
+/// exactly one data directory, and the metrics endpoint must not reach through
+/// the engine `RwLock` to read them.
+static FSYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSYNC_NANOS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSYNC_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the process-wide WAL fsync counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalFsyncStats {
+    /// Successful `sync_data` calls issued against a WAL file.
+    pub count: u64,
+    /// Total nanoseconds spent inside those calls.
+    pub nanos: u64,
+    /// `sync_data` calls that returned an error.
+    pub failures: u64,
+}
+
+/// Read the process-wide WAL fsync counters. Lock-free.
+pub fn wal_fsync_stats() -> WalFsyncStats {
+    WalFsyncStats {
+        count: FSYNC_TOTAL.load(Ordering::Relaxed),
+        nanos: FSYNC_NANOS_TOTAL.load(Ordering::Relaxed),
+        failures: FSYNC_FAILURES_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Run `sync_data` on `file`, recording its duration in the process-wide
+/// counters. Every WAL fsync goes through here so the accounting cannot drift
+/// from the actual calls.
+fn timed_sync_data(file: &File) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    let result = file.sync_data();
+    match &result {
+        Ok(()) => {
+            FSYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+            FSYNC_NANOS_TOTAL.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        Err(_) => {
+            FSYNC_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
@@ -201,7 +255,7 @@ impl WalSyncShared {
         // Snapshot BEFORE the fsync: every generation registered by now has
         // its bytes in the OS file already, so this one fsync covers them all.
         let cover = self.dirty_gen.load(Ordering::Acquire);
-        file.sync_data()?;
+        timed_sync_data(file)?;
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         self.synced_gen.fetch_max(cover, Ordering::AcqRel);
         Ok(())
@@ -317,7 +371,7 @@ impl Flusher {
                     // fsync if the writer has buffered new bytes since last sync.
                     let d = shared.dirty_gen.load(Ordering::Acquire);
                     if d > shared.synced_gen.load(Ordering::Acquire) {
-                        match file.sync_data() {
+                        match timed_sync_data(&file) {
                             Ok(()) => {
                                 shared.fsync_count.fetch_add(1, Ordering::Relaxed);
                                 // fetch_max, not store: a Full-mode group

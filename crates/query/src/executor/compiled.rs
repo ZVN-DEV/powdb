@@ -757,9 +757,18 @@ fn build_int_leaf(
     };
 
     let col_idx = columns.iter().position(|c| c == field_name)?;
-    // Guard: the compiled Int leaf reads the column's 8 bytes as i64.
-    // Only valid when the column is actually an Int column.
-    if schema.columns[col_idx].type_id != TypeId::Int {
+    // Guard: the compiled Int leaf reads the column's 8 bytes as i64. That is
+    // valid for an Int column and equally valid for a DateTime column, which
+    // stores i64 micros in the same fixed 8 bytes (`row.rs` encodes both with
+    // `to_le_bytes`). A timestamp literal has no distinct spelling in PowQL, so
+    // `.created_at > 1700000000000000` is an Int literal against a DateTime
+    // column: the shape an ORM emits constantly. Compiling it here keeps the
+    // fast path in step with the generic comparison and with the index path,
+    // all three of which compare the raw micros.
+    if !matches!(
+        schema.columns[col_idx].type_id,
+        TypeId::Int | TypeId::DateTime
+    ) {
         return None;
     }
     let byte_offset = layout.fixed_offsets[col_idx]?;

@@ -189,6 +189,17 @@ impl Ord for Value {
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             (Value::Str(a), Value::Str(b)) => a.cmp(b),
             (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
+            // A timestamp literal has no distinct spelling in PowQL: it is the
+            // raw micros integer, so a datetime predicate or index bound is an
+            // Int against a stored DateTime. Without these two arms the pair
+            // falls to the type-discriminant fallback below, making every
+            // DateTime compare greater than every Int whatever the timestamps
+            // are: `filter .created_at > <ts>` then matched every non-null row
+            // on a scan, and a datetime index range scan returned every entry.
+            // Same reasoning as the Int/Float arms above, and the same
+            // deliberate asymmetry with `PartialEq` documented there.
+            (Value::DateTime(a), Value::Int(b)) => a.cmp(b),
+            (Value::Int(a), Value::DateTime(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
             // Json uses the PJ1 total order (null < false < true < numbers <
@@ -405,5 +416,38 @@ mod tests {
         assert_eq!(schema.column_index("b"), Some(1));
         assert_eq!(schema.column_index("c"), None);
         assert_eq!(schema.null_bitmap_size(), 1);
+    }
+
+    /// A timestamp literal is written as a plain integer, so a DateTime can be
+    /// compared against an Int. Without an explicit arm this pair falls to the
+    /// type-discriminant fallback, which orders by tag rather than by value and
+    /// makes every DateTime sort above every Int. That produced wrong query
+    /// results before it was fixed, so the ordering is pinned here.
+    ///
+    /// Note the deliberate asymmetry with `PartialEq`, which stays strictly
+    /// typed for `Hash` consistency: this mirrors the Int/Float arms documented
+    /// above and is the same trade-off.
+    #[test]
+    fn datetime_orders_against_int_by_microseconds_not_by_type_tag() {
+        use std::cmp::Ordering;
+        assert_eq!(Value::DateTime(100).cmp(&Value::Int(200)), Ordering::Less);
+        assert_eq!(
+            Value::DateTime(300).cmp(&Value::Int(200)),
+            Ordering::Greater
+        );
+        assert_eq!(Value::DateTime(200).cmp(&Value::Int(200)), Ordering::Equal);
+        assert_eq!(Value::Int(100).cmp(&Value::DateTime(200)), Ordering::Less);
+        assert_eq!(
+            Value::Int(300).cmp(&Value::DateTime(200)),
+            Ordering::Greater
+        );
+        assert_eq!(Value::Int(200).cmp(&Value::DateTime(200)), Ordering::Equal);
+
+        // Negative timestamps (pre-epoch) must order correctly too, which a
+        // tag comparison would also get wrong.
+        assert_eq!(Value::DateTime(-5).cmp(&Value::Int(5)), Ordering::Less);
+
+        // Equality stays strictly typed on purpose, as for Int vs Float.
+        assert_ne!(Value::DateTime(200), Value::Int(200));
     }
 }

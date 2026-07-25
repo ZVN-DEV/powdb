@@ -7,7 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+## [0.20.0] - 2026-07-25
+
+### Security
+
+- **Remote denial of service via long operator chains (both frontends).** The
+  parser bounded recursive descent but not the shape of the tree it produced,
+  so a flat chain such as `T filter .a = 1 and .a = 1 ...` repeated a few
+  thousand times built an AST deep enough to overflow the stack during the
+  recursive planner walk. Under `panic = "abort"` that killed the whole server
+  process, dropping every connection, and it was reachable by any client that
+  could send a query (including a read-only user). Chain-building loops in both
+  the PowQL parser and the SQL frontend now count against the nesting budget.
+- **Backups and restored directories are no longer world readable.** Backup and
+  restore created directories and files with default permissions (0755 / 0644)
+  rather than the 0700 the live engine uses. A backup is a byte-for-byte copy of
+  all table data and the catalog, so a backup written on a shared host exposed
+  the entire database to other local users. Backups are now 0700 directories and
+  0600 files.
+- **TLS handshakes are now bounded (10 seconds).** A connection permit was taken
+  before the TLS handshake, and the handshake itself had no timeout, so idle
+  half-open sockets could hold every connection slot before authenticating.
+- **Corrupt pages return errors instead of aborting the process.** A corrupt slot
+  count could underflow an index computation and abort the process inside
+  `HeapFile::open`, before WAL replay, which meant a supervised server would
+  restart into the same abort indefinitely. See the breaking-change note below
+  for the new failure mode.
+
+### Fixed (correctness)
+
+- **Comparisons against a `datetime` column returned wrong rows.** A timestamp
+  literal is written as a plain integer, so `filter .created_at > 1752000000`
+  compared a `DateTime` value against an `Int`. That pairing was not handled, so
+  it fell back to comparing type tags: every `DateTime` sorted above every `Int`
+  whatever the timestamps were. The effect was a filter that matched every
+  non-null row, an equality that matched none, and a reversed comparison
+  (`1752000000 < .created_at`) that matched none. Timestamps now compare as
+  microseconds on every path.
+  - The answer also depended on whether an index existed, because the index path
+    accepted an integer literal as a `datetime` index key while the scan path did
+    not. Index keys are stored behind a type tag, so an integer probe cannot
+    match a stored timestamp: equality found nothing and a range scan matched
+    every entry. A predicate on an indexed `datetime` column now runs as a
+    compiled sequential scan, which is correct; using the index needs a real
+    timestamp literal and will come with the temporal type work.
+  - `datetime` columns also now compile into the predicate fast path and the
+    top-N sort fast path, so `filter .created_at > <ts>` and
+    `order .created_at desc limit N` no longer fall back to full row decoding.
+
+### Changed
+
+**Behavior changes that can affect existing queries. Read these before upgrading
+if you depend on exact result sets.**
+
+- **Unknown columns in `filter` and in projections are now errors.** They
+  previously evaluated to NULL, so a typo returned a plausible wrong answer
+  instead of failing: `T filter .agee > 25` returned an empty set, and
+  `count(T filter .agee = null)` matched every row, which meant
+  `T filter .agee = null delete` would silently delete an entire table. `group`,
+  `order`, and `insert` already rejected unknown columns; `filter` and
+  projections now match them. Queries that relied on the old NULL behavior, or
+  that generate column names dynamically, will now raise
+  `column '<name>' not found`.
+- **Type-mismatched comparisons are now errors.** Comparing a `str` column
+  against an integer literal previously evaluated true for every row.
+- **A negative `limit` is now an error** instead of being ignored and returning
+  every row. Separately, `limit 0` in a projection fast path returned one row and
+  now correctly returns none.
+- **`count(T { .col })` counts non-null values, not rows.** Both frontends were
+  wrong here in the same direction: SQL `COUNT(col)` and ungrouped PowQL
+  `count(T { .col })` both returned the row count. They now agree with each other
+  and with the grouped path. `count(T)` and `COUNT(*)` are unchanged.
+- **Operator chains longer than the nesting budget are now rejected.** This is
+  the DoS fix above. Machine-generated predicates with very many `and` / `or`
+  terms may need to be split.
+- **A corrupt page now prevents the table from opening at all.** Previously the
+  open scan skipped an unreadable page and the failure surfaced later, on the
+  read that touched it. Opening now verifies page checksums and fails closed, so
+  a single corrupt page makes the database refuse to open rather than serving
+  partial data. There is currently no skip-corrupt-pages or salvage mode: recover
+  by restoring from a backup. This trades a partial-data incident for a loud
+  total one, which is the safer default under `panic = "abort"`, but it is a real
+  availability change.
+- **The Docker image now runs as a non-root user (uid 10001)** and pins its base
+  image by digest. An existing root-owned bind mount or volume will fail with a
+  permission error until it is chowned to `10001:10001` (or the container is run
+  with `--user 0:0`). This affects upgrades of existing deployments.
+- **The TypeScript client rejects result frames over 2,000,000 cells.** A server
+  declaring a large row count could previously force a disproportionate
+  allocation in the client (a ~40 MB frame decoded into ~1.9 GB of heap).
+
+### Added
+
+- `/health` and `/healthz` on the metrics listener, for liveness probes.
+- Storage metrics: database size, WAL size, and WAL fsync counters and latency.
+- `docs/STABILITY.md`: what a minor release may break, data directory
+  compatibility, downgrade policy, and what 1.0 requires.
+- CLI: SQL is now reachable (`--sql`, and `.sql` / `.powql` in the REPL),
+  machine-readable output (`--format table|json|csv` and `.mode`), a `.cancel`
+  meta-command, and `crates/cli/README.md`.
+- TypeScript client: generics and parameter support on typed queries,
+  `queryObjects` / `querySqlObjects` returning object rows on the lossless native
+  path, and SQL escaping helpers.
+
+### Fixed
+
+- Query text is no longer written to debug logs with its literals intact; logs
+  now carry a literal-free query shape plus a hash.
+- Published benchmark numbers were measured against a code path users cannot
+  invoke (a raw B-tree probe and a hand-built aggregate plan, compared against
+  SQLite paying full statement-preparation cost). The harness now runs everything
+  through the normal PowQL path, and all published tables were re-measured. The
+  indexed point lookup, previously published as 3.0x faster, is 7.9x slower.
+  See `docs/benchmarks/2026-07-24-wide-bench-snapshot.md`.
+- Corrected platform support: PowDB does not build on Windows.
 
 ## [0.19.1] - 2026-07-24
 

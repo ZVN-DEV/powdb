@@ -371,6 +371,404 @@ fn check_plan_json_paths(
     }
 }
 
+/// Reject a reference to a column that exists nowhere in the plan, and a
+/// comparison between a column and a literal of an incompatible type.
+///
+/// `group`, `order` and `insert` already refused unknown columns; `filter` and
+/// projections did not, so `User filter .agee > 25` returned the empty set,
+/// `User { .agee }` returned a column of NULLs, and `User filter .agee = null
+/// delete` matched (and would have deleted) every row. Likewise `.name > 25` on
+/// a `str` column compared across types and returned every row.
+///
+/// Resolution is deliberately conservative so a VALID query is never rejected:
+/// a plan with no resolvable scan is skipped entirely, `count(*)`'s `*`
+/// sentinel is skipped, and a name a projection or aggregation REBINDS is
+/// excluded from the type check (its scan type no longer describes it).
+pub(crate) fn validate_column_references(
+    catalog: &Catalog,
+    plan: &PlanNode,
+) -> Result<(), QueryError> {
+    let mut scope: Vec<(String, TypeId)> = Vec::new();
+    collect_scan_columns(catalog, plan, &mut scope);
+    if scope.is_empty() {
+        // No scan resolved (DDL, a values-only insert, a view whose source is
+        // not in this tree): there is nothing to resolve names against.
+        return Ok(());
+    }
+    // Only aliases and synthetic aggregation outputs ADD a name; an unaliased
+    // `.col` in a projection just passes a scan column through, so it must not
+    // vouch for itself (that is exactly how `User { .agee }` used to slip past
+    // and return a column of NULLs).
+    let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_rebound_names(plan, &mut rebound);
+    let mut known: std::collections::HashSet<String> =
+        scope.iter().map(|(name, _)| name.clone()).collect();
+    // A join's scan columns are named `alias.field`, and an unqualified
+    // reference inside a join is resolved by suffix match at runtime, so the
+    // bare field name is legitimately known too.
+    for (name, _) in &scope {
+        if let Some((_, field)) = name.split_once('.') {
+            known.insert(field.to_string());
+        }
+    }
+    known.extend(rebound.iter().cloned());
+    let ctx = ColumnScope {
+        known,
+        rebound,
+        scope,
+    };
+    check_plan_columns(plan, &ctx)
+}
+
+/// Resolution context for [`validate_column_references`].
+struct ColumnScope {
+    /// Every name the plan can produce: scan columns, projection outputs, and
+    /// synthetic group/aggregate/window output names.
+    known: std::collections::HashSet<String>,
+    /// Names bound to a computed expression rather than passed through from a
+    /// scan, so their scan type must not drive the comparison type check.
+    rebound: std::collections::HashSet<String>,
+    /// Scan columns with their types.
+    scope: Vec<(String, TypeId)>,
+}
+
+/// Collect names bound to a computed expression: projection aliases and the
+/// synthetic outputs of grouping and window functions. Unlike
+/// [`collect_projected_names`] this deliberately skips an unaliased `.col`,
+/// which passes the scan column through unchanged and therefore keeps its type.
+fn collect_rebound_names(plan: &PlanNode, out: &mut std::collections::HashSet<String>) {
+    if let PlanNode::Project { fields, .. } = plan {
+        for field in fields {
+            if let Some(alias) = &field.alias {
+                out.insert(alias.clone());
+            }
+        }
+    }
+    match plan {
+        PlanNode::GroupBy {
+            keys, aggregates, ..
+        } => {
+            for key in keys {
+                out.insert(key.output_name.clone());
+            }
+            for aggregate in aggregates {
+                out.insert(aggregate.output_name.clone());
+            }
+        }
+        PlanNode::Window { windows, .. } => {
+            for window in windows {
+                out.insert(window.output_name.clone());
+            }
+        }
+        _ => {}
+    }
+    match plan {
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::NestedProject { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => collect_rebound_names(input, out),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            collect_rebound_names(left, out);
+            collect_rebound_names(right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Whether `name` is resolvable in this plan.
+fn column_is_known(name: &str, ctx: &ColumnScope) -> bool {
+    // `count(*)` carries `*` as a sentinel field name, not a column.
+    name == "*" || ctx.known.contains(name)
+}
+
+/// Comparability class of a column type. Types whose literal spelling is a
+/// string (datetime, uuid, bytes, json) are `Other` and never type-checked
+/// here: coercion for those is per-value and lives in the evaluator.
+#[derive(PartialEq, Clone, Copy)]
+enum TypeClass {
+    Numeric,
+    Text,
+    Bool,
+    Other,
+}
+
+fn column_class(type_id: TypeId) -> TypeClass {
+    match type_id {
+        TypeId::Int | TypeId::Float => TypeClass::Numeric,
+        TypeId::Str => TypeClass::Text,
+        TypeId::Bool => TypeClass::Bool,
+        _ => TypeClass::Other,
+    }
+}
+
+fn literal_class(literal: &Literal) -> TypeClass {
+    match literal {
+        Literal::Int(_) | Literal::Float(_) => TypeClass::Numeric,
+        Literal::String(_) => TypeClass::Text,
+        Literal::Bool(_) => TypeClass::Bool,
+    }
+}
+
+fn literal_type_name(literal: &Literal) -> &'static str {
+    match literal {
+        Literal::Int(_) => "int",
+        Literal::Float(_) => "float",
+        Literal::String(_) => "str",
+        Literal::Bool(_) => "bool",
+    }
+}
+
+/// If `expr` is a bare column reference that resolves to exactly one scan type
+/// and is not rebound by a projection, return its name and type.
+fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)> {
+    let name = match expr {
+        Expr::Field(name) => name.clone(),
+        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+        _ => return None,
+    };
+    if ctx.rebound.contains(&name) {
+        return None;
+    }
+    let type_id = resolve_scan_type(&name, &ctx.scope)?;
+    Some((name, type_id))
+}
+
+/// Reject `column <cmp> literal` (either orientation) when the two sides
+/// cannot compare, e.g. `.name > 25` on a `str` column, which used to return
+/// every row. Mirrors the message `insert` already produces for the same class
+/// of mistake.
+fn comparison_type_error(left: &Expr, right: &Expr, ctx: &ColumnScope) -> Option<String> {
+    let (column, literal) = match (left, right) {
+        (column, Expr::Literal(literal)) => (column, literal),
+        (Expr::Literal(literal), column) => (column, literal),
+        _ => return None,
+    };
+    let (name, type_id) = comparable_column(column, ctx)?;
+    let column_class = column_class(type_id);
+    let literal_class = literal_class(literal);
+    if column_class == TypeClass::Other || column_class == literal_class {
+        return None;
+    }
+    Some(format!(
+        "type mismatch for column '{}': expected {:?}, got {}",
+        name,
+        type_id,
+        literal_type_name(literal)
+    ))
+}
+
+fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> {
+    match expr {
+        Expr::Field(name) => {
+            if !column_is_known(name, ctx) {
+                return Err(QueryError::ColumnNotFound {
+                    table: String::new(),
+                    column: name.clone(),
+                });
+            }
+            Ok(())
+        }
+        Expr::QualifiedField { qualifier, field } => {
+            if !column_is_known(&format!("{qualifier}.{field}"), ctx) {
+                return Err(QueryError::ColumnNotFound {
+                    table: qualifier.clone(),
+                    column: field.clone(),
+                });
+            }
+            Ok(())
+        }
+        Expr::BinaryOp(left, op, right) => {
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+            ) {
+                if let Some(message) = comparison_type_error(left, right, ctx) {
+                    return Err(QueryError::Execution(message));
+                }
+            }
+            check_expr_columns(left, ctx)?;
+            check_expr_columns(right, ctx)
+        }
+        Expr::Coalesce(left, right) => {
+            check_expr_columns(left, ctx)?;
+            check_expr_columns(right, ctx)
+        }
+        Expr::UnaryOp(_, inner) | Expr::FunctionCall(_, inner, _) | Expr::Cast(inner, _) => {
+            check_expr_columns(inner, ctx)
+        }
+        Expr::JsonPath { base, .. } => check_expr_columns(base, ctx),
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                check_expr_columns(arg, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::InList { expr, list, .. } => {
+            check_expr_columns(expr, ctx)?;
+            for item in list {
+                check_expr_columns(item, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::Case { whens, else_expr } => {
+            for (when, then) in whens {
+                check_expr_columns(when, ctx)?;
+                check_expr_columns(then, ctx)?;
+            }
+            if let Some(else_expr) = else_expr {
+                check_expr_columns(else_expr, ctx)?;
+            }
+            Ok(())
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter().chain(partition_by) {
+                check_expr_columns(expr, ctx)?;
+            }
+            for key in order_by {
+                check_expr_columns(&key.expr, ctx)?;
+            }
+            Ok(())
+        }
+        // A subquery resolves against its own plan, which is validated when it
+        // executes; only the outer operand belongs to this scope.
+        Expr::InSubquery { expr, .. } => check_expr_columns(expr, ctx),
+        _ => Ok(()),
+    }
+}
+
+fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::Filter { input, predicate } => {
+            check_expr_columns(predicate, ctx)?;
+            check_plan_columns(input, ctx)
+        }
+        PlanNode::Project { input, fields } => {
+            for field in fields {
+                check_expr_columns(&field.expr, ctx)?;
+            }
+            check_plan_columns(input, ctx)
+        }
+        PlanNode::GroupBy {
+            input,
+            keys,
+            aggregates,
+            having,
+        } => {
+            for key in keys {
+                check_expr_columns(&key.expr, ctx)?;
+            }
+            for aggregate in aggregates {
+                check_expr_columns(&aggregate.argument, ctx)?;
+            }
+            if let Some(having) = having {
+                check_expr_columns(having, ctx)?;
+            }
+            check_plan_columns(input, ctx)
+        }
+        PlanNode::Sort { input, keys } => {
+            for key in keys {
+                check_expr_columns(&key.expr, ctx)?;
+            }
+            check_plan_columns(input, ctx)
+        }
+        PlanNode::Aggregate {
+            input, argument, ..
+        } => {
+            if let Some(argument) = argument {
+                check_expr_columns(argument, ctx)?;
+            }
+            check_plan_columns(input, ctx)
+        }
+        PlanNode::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            if let Some(on) = on {
+                check_expr_columns(on, ctx)?;
+            }
+            check_plan_columns(left, ctx)?;
+            check_plan_columns(right, ctx)
+        }
+        PlanNode::Union { left, right, .. } => {
+            check_plan_columns(left, ctx)?;
+            check_plan_columns(right, ctx)
+        }
+        // A nested projection resolves child fields against the child table's
+        // own scope, which this flat scope does not model; the executor
+        // resolves and reports those itself.
+        PlanNode::NestedProject { input, .. } => check_plan_columns(input, ctx),
+        PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => check_plan_columns(input, ctx),
+        _ => Ok(()),
+    }
+}
+
+/// Reject a negative `limit` / `offset`. Both are cast with `as usize` at
+/// execution, so `limit -1` wrapped to `usize::MAX` and silently returned every
+/// row instead of erroring.
+pub(crate) fn validate_slice_counts(plan: &PlanNode) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::Limit { input, count } => {
+            check_non_negative(count, "limit")?;
+            validate_slice_counts(input)
+        }
+        PlanNode::Offset { input, count } => {
+            check_non_negative(count, "offset")?;
+            validate_slice_counts(input)
+        }
+        PlanNode::OrderedExprIndexScan { limit, offset, .. } => {
+            check_non_negative(limit, "limit")?;
+            if let Some(offset) = offset {
+                check_non_negative(offset, "offset")?;
+            }
+            Ok(())
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::NestedProject { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => validate_slice_counts(input),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            validate_slice_counts(left)?;
+            validate_slice_counts(right)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_non_negative(count: &Expr, what: &str) -> Result<(), QueryError> {
+    match count {
+        Expr::Literal(Literal::Int(value)) if *value < 0 => Err(QueryError::Execution(format!(
+            "{what} must not be negative, got {value}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
     match plan {
         PlanNode::Project { input, fields } => {

@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.19.1.** Entity-links hardening and plan-quality patch. Link introspection (`schema links` + extended `describe`); `not in` never matches missing values (operator parity with `!=`, with a full per-operator missing-value table in POWQL.md); skew-aware driver selection (a hot equality literal no longer picks the wrong index or conjunction driver); parent-selectivity for nested blocks and scalar link hops (up to ~200x on selective parents); bare dotted link paths and aggregates over/inside link or nested projections are clear errors instead of silent wrong results; EXPLAIN names link paths; TypeScript client catalog ceiling raised to v7 so replicas sync with link-activated servers; entity-links driver contract in the drivers doc.
+> **Current release: v0.20.0.** Security, correctness, and honesty round, with behavior changes. Fixes a remote denial of service reachable by any client that could send a query (a long flat operator chain overflowed the stack during planning, and under `panic = "abort"` that killed the server process); world-readable backups; unbounded TLS handshakes; and corrupt-page process aborts. Silent wrong answers now fail loudly: unknown columns in `filter` and projections, type-mismatched comparisons, and a negative `limit` are errors rather than plausible-looking empty or full result sets. `datetime` comparisons returned wrong rows on every access path and now compare as microseconds. `count(col)` counts non-null values in both frontends. Published benchmark numbers were re-measured through the normal query path: the indexed point lookup previously published as 3.0x faster is 7.9x slower. Read the Changed section of `CHANGELOG.md` before upgrading; the Docker image now runs as uid 10001 and a corrupt page now refuses to open the database.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
@@ -34,8 +34,18 @@ When cutting a release, follow the checklist at the bottom.
 | `powdb-server-macos-aarch64` | macOS ARM64 |
 
 These two platforms (Linux x86_64, macOS ARM64) are the **only** prebuilt
-`powdb-cli` / `powdb-server` binaries. All other targets — Windows, Intel macOS,
-Linux ARM64 — build from source (`cargo install` / `cargo build --release`).
+`powdb-cli` / `powdb-server` binaries. Intel macOS and Linux ARM64 have no
+prebuilt binary but do build from source (`cargo install` / `cargo build
+--release`).
+
+**Windows is not supported and does not build from source.** The heap's
+memory-mapped scan path (`crates/storage/src/heap.rs`) uses `libc::mmap` /
+`libc::munmap` and `std::os::unix::io::AsRawFd` with no platform gate, so
+`cargo check -p powdb-storage --target x86_64-pc-windows-msvc` fails to
+compile. This is why `publish-node-addon.yml` also omits the
+`x86_64-pc-windows-msvc` addon target. Do not tell Windows users to build from
+source; there is nothing for them to build until the mmap path gains a Windows
+backend.
 Binary artifacts are built automatically by `.github/workflows/release.yml`
 when a `v*` tag is pushed.
 

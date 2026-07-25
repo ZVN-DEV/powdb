@@ -258,10 +258,11 @@ pub use self::prepared::PreparedQuery;
 
 use self::plan_exec::{
     aggregate_rows, aggregate_rows_with_provenance, compare_order_values,
-    cooperative_stable_sort_by, exec_group_by, exec_group_by_with_provenance,
+    cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
     lower_unindexed_scans, predicate_column_indices_json, range_matches,
-    synthesize_range_predicate, validate_json_path_types, validate_no_stray_aggregates,
+    synthesize_range_predicate, validate_column_references, validate_json_path_types,
+    validate_no_stray_aggregates, validate_slice_counts,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -1253,6 +1254,8 @@ impl Engine {
         // evaluating any row (see execute_plan for the rationale).
         validate_no_stray_aggregates(plan)?;
         validate_json_path_types(&self.catalog, plan)?;
+        validate_column_references(&self.catalog, plan)?;
+        validate_slice_counts(plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -1993,8 +1996,10 @@ impl Engine {
                 }
                 // Fast path: count() over SeqScan.
                 // Overflow safety (P0-4): v2-capable tables use the decoded
-                // generic path (raw count drops >= 64KB rows).
-                if *function == AggFunc::Count {
+                // generic path (raw count drops >= 64KB rows). A count with a
+                // target column (`count(T { .v })`) counts non-null values, so
+                // it must not take this row-counting path.
+                if *function == AggFunc::Count && counts_every_row(argument.as_ref()) {
                     if let PlanNode::SeqScan { table } = input.as_ref() {
                         if !self.catalog.table_has_overflow(table) {
                             // A dirty materialized view must be refreshed before

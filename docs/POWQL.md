@@ -511,14 +511,14 @@ count(distinct User { .age })
 
 | Function | Description | Syntax |
 |---|---|---|
-| `count` | Number of rows | `count(Table [filter ...])` |
+| `count` | Number of rows, or non-null values of a projected column | `count(Table [filter ...])`, `count(Table { .field })` |
 | `count(distinct ...)` | Number of unique values | `count(distinct Table { .field })` |
 | `sum` | Sum of numeric column | `sum(Table { .field })` |
 | `avg` | Average of numeric column | `avg(Table { .field })` |
 | `min` | Minimum value | `min(Table { .field })` |
 | `max` | Maximum value | `max(Table { .field })` |
 
-For `sum`, `avg`, `min`, and `max`, the target expression is specified via the projection. For `count`, the projection is optional. The expression may be a stored field, a computed value, or a JSON path:
+For `sum`, `avg`, `min`, and `max`, the target expression is specified via the projection. For `count`, the projection is optional and it changes the question being asked: `count(Table)` counts rows, while `count(Table { .field })` counts rows whose `.field` is not null. `count(distinct Table { .field })` counts unique non-null values. The expression may be a stored field, a computed value, or a JSON path:
 
 ```powql
 sum(Post { .data->price })
@@ -925,7 +925,11 @@ User as u {
 ```
 
 Nesting depth is bounded by the parser's shared nesting-depth guard (64
-levels); pathological depth is a clean parse error, not a crash.
+levels); pathological depth is a clean parse error, not a crash. The same budget
+also bounds flat operator chains, so a predicate built from many `and`, `or`, or
+arithmetic terms in sequence (as query builders sometimes generate) is rejected
+past the same limit. Both shapes are bounded because both produce a deep
+expression tree, which is what the guard exists to prevent.
 
 ### Restrictions
 
@@ -1291,6 +1295,15 @@ assignments accept literal values only — `insert Event { ts := now() }` fails
 with `expected literal value`. A `datetime` column is stored as an integer
 timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
 stamp them afterwards with `update { ts := now() }` if needed.
+
+Because a timestamp literal is written as that plain integer, a comparison
+against a `datetime` column compares the underlying microseconds:
+`Event filter .ts > 1752000000` means what it reads as, and agrees with the same
+comparison on an `int` column. One consequence to know about: a `datetime`
+column's index cannot be probed by an integer literal (index keys are stored
+behind a type tag), so a predicate on an indexed `datetime` column runs as a
+compiled sequential scan rather than an index lookup. The answer is the same
+either way; only the access path differs.
 
 #### extract
 

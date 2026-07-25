@@ -947,6 +947,17 @@ fn eval_cast(val: Value, target: CastType) -> Value {
     }
 }
 
+/// Ordering for a DateTime compared against a plain Int (in either position),
+/// comparing the underlying micros. Returns `None` for every other pairing so
+/// the caller falls through to the normal `Value` comparison.
+fn datetime_int_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::DateTime(a), Value::Int(b)) => Some(a.cmp(b)),
+        (Value::Int(a), Value::DateTime(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
 pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpMode) -> Value {
     // In `Filter` mode a missing (`Empty`) operand never matches an ordered or
     // equality / inequality comparison: the comparison is false, so the row is
@@ -967,6 +978,34 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
         && (left.is_empty() || right.is_empty())
     {
         return Value::Bool(false);
+    }
+    // A timestamp literal has no distinct spelling in PowQL: it is written as
+    // the raw micros integer, so `.created_at > 1700000000000000` arrives here
+    // as DateTime vs Int. `Value` deliberately keeps equality and hashing
+    // strictly typed, and its `Ord` falls back to comparing type discriminants
+    // for pairs it does not name, which would make every DateTime compare
+    // greater than every Int regardless of the timestamps involved. Compare
+    // the underlying micros instead, which is what the index path already does
+    // when it accepts an int literal as a datetime index key
+    // (`lowering::coerce_column_index_key`) and what the compiled DateTime
+    // leaf does. Without this the same predicate answers differently depending
+    // on whether an index happens to exist.
+    if let (Some(ordering), true) = (
+        datetime_int_cmp(left, right),
+        matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+        ),
+    ) {
+        use std::cmp::Ordering as O;
+        return Value::Bool(match op {
+            BinOp::Eq => ordering == O::Equal,
+            BinOp::Neq => ordering != O::Equal,
+            BinOp::Lt => ordering == O::Less,
+            BinOp::Gt => ordering == O::Greater,
+            BinOp::Lte => ordering != O::Greater,
+            _ => ordering != O::Less,
+        });
     }
     match op {
         BinOp::Eq => Value::Bool(left == right),

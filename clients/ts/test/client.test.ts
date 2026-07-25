@@ -8,7 +8,7 @@
  *   POWDB_HOST=127.0.0.1 POWDB_PORT=15433 npx tsx test/client.test.ts
  */
 
-import { Client, type QueryResult } from "../src/index.js";
+import { Client, sqlIdent, type QueryResult } from "../src/index.js";
 import { strict as assert } from "node:assert";
 
 const HOST = process.env.POWDB_HOST ?? "127.0.0.1";
@@ -847,6 +847,133 @@ async function main() {
   });
 
   await client.query(`drop ${rawDoc}`);
+
+  // ──────────────────────────────────────────────────────────
+  console.log("Typed rows: generics, parameters, and native object rows");
+  // ──────────────────────────────────────────────────────────
+
+  const typedT = tbl("TypedRows");
+  await test("setup typed-row fixture", async () => {
+    await client.query(
+      `type ${typedT} { required unique id: int, required name: str, required age: int, score: float, tags: json }`,
+    );
+    await client.query(
+      `insert ${typedT} { id := 1, name := "ada", age := 36, score := 9.5, tags := "[1,2]" }`,
+    );
+    await client.query(
+      `insert ${typedT} { id := 2, name := "bob", age := 24, score := 4.25 }`,
+    );
+    // A name containing PowQL quoting metacharacters, to prove parameters bind
+    // rather than interpolate on the typed path too.
+    await client.query(
+      `insert ${typedT} { id := 3, name := $1, age := 41 }`,
+      [`o'neil " \\ }`],
+    );
+  });
+
+  // Before this change typed rows and parameter binding were mutually
+  // exclusive: queryTyped took no params at all.
+  await test("queryTyped binds $N parameters", async () => {
+    interface Person {
+      name: string;
+      age: number;
+    }
+    const rows = await client.queryTyped<Person>(
+      `${typedT} filter .age > $1 order .age { .name, .age }`,
+      { name: "str", age: "int" },
+      [30],
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].name, "ada");
+    assert.equal(rows[0].age, 36);
+    assert.equal(typeof rows[0].age, "number");
+    assert.equal(rows[1].age, 41);
+  });
+
+  await test("queryTyped params compose with an abort signal", async () => {
+    const controller = new AbortController();
+    const rows = await client.queryTyped(
+      `${typedT} filter .id = $1 { .name }`,
+      { name: "str" },
+      [1],
+      { signal: controller.signal },
+    );
+    assert.deepStrictEqual(rows, [{ name: "ada" }]);
+  });
+
+  await test("queryTyped without params still works (back-compat)", async () => {
+    const rows = await client.queryTyped(`${typedT} filter .id = 2 { .name }`, {
+      name: "str",
+    });
+    assert.deepStrictEqual(rows, [{ name: "bob" }]);
+    // Legacy 3-arg opts form must keep working.
+    const withOpts = await client.queryTyped(
+      `${typedT} filter .id = 2 { .name }`,
+      { name: "str" },
+      {},
+    );
+    assert.deepStrictEqual(withOpts, [{ name: "bob" }]);
+  });
+
+  // Object rows on the LOSSLESS native path: no schema, server-declared types.
+  await test("queryObjects returns typed object rows off the native path", async () => {
+    interface Person {
+      name: string;
+      age: number;
+      score: number | null;
+      tags: unknown;
+    }
+    const rows = await client.queryObjects<Person>(
+      `${typedT} filter .id = $1 { .name, .age, .score, .tags }`,
+      [1],
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].name, "ada");
+    assert.equal(rows[0].age, 36);
+    assert.equal(typeof rows[0].age, "number");
+    assert.equal(rows[0].score, 9.5);
+    // JSON stays recursive data, not a string: that is the lossless path.
+    assert.deepStrictEqual(rows[0].tags, [1, 2]);
+  });
+
+  await test("queryObjects maps a missing value to null", async () => {
+    const rows = await client.queryObjects(
+      `${typedT} filter .id = 2 { .name, .tags }`,
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].name, "bob");
+    assert.equal(rows[0].tags, null);
+  });
+
+  await test("queryObjects rejects a non-rows result", async () => {
+    await assert.rejects(
+      () => client.queryObjects(`count(${typedT})`),
+      /expected rows result/,
+    );
+  });
+
+  await test("querySqlObjects returns object rows from the SQL frontend", async () => {
+    const rows = await client.querySqlObjects<{ name: string; age: number }>(
+      `SELECT name, age FROM ${typedT} WHERE age > 30 ORDER BY age`,
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].name, "ada");
+    assert.equal(rows[1].age, 41);
+  });
+
+  await test("sql tagged template escapes a hostile literal", async () => {
+    const { sql } = await import("../src/escape.js");
+    const hostile = `o'neil " \\ }`;
+    const rows = await client.querySqlObjects<{ id: number }>(
+      sql`SELECT id FROM ${sqlIdent(typedT)} WHERE name = ${hostile}`,
+    );
+    assert.deepStrictEqual(
+      rows.map((r) => Number(r.id)),
+      [3],
+    );
+  });
+
+  await client.query(`drop ${typedT}`);
 
   // ──────────────────────────────────────────────────────────
   // Cleanup

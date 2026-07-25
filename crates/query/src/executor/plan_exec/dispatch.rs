@@ -24,6 +24,8 @@ impl Engine {
         // tree before any row is produced.
         validate_no_stray_aggregates(plan)?;
         validate_json_path_types(&self.catalog, plan)?;
+        validate_column_references(&self.catalog, plan)?;
+        validate_slice_counts(plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -572,8 +574,10 @@ impl Engine {
                         self.query_memory_limit(),
                     );
                 }
-                // Fast path: count() over SeqScan — count rows without any decode
-                if *function == AggFunc::Count {
+                // Fast path: count() over SeqScan, counting rows without any decode.
+                // Only a count with no target column counts rows: `count(T { .v })`
+                // counts non-null `.v` and must reach the generic path below.
+                if *function == AggFunc::Count && counts_every_row(argument.as_ref()) {
                     // Overflow safety (P0-4): the raw `for_each_row_raw` count
                     // drops any row too large to re-inline (>= 64KB) and would
                     // undercount; v2-capable tables use the decoded generic path.

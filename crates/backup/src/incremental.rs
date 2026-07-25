@@ -46,7 +46,7 @@ pub fn incremental_backup(
             "sync identity changed between base and incremental backup",
         ));
     }
-    std::fs::create_dir_all(dest)?;
+    crate::secure::create_dir_secure(dest)?;
 
     let mut changed: Vec<ChangedFile> = Vec::new();
 
@@ -77,7 +77,7 @@ pub fn incremental_backup(
             if unchanged {
                 continue;
             }
-            std::fs::write(dest.join(&name), &bytes)?;
+            crate::secure::write_file_secure(&dest.join(&name), &bytes)?;
             changed.push(ChangedFile::Whole {
                 name,
                 len: bytes.len() as u64,
@@ -104,7 +104,7 @@ pub fn incremental_backup(
             continue;
         }
         let delta_file = format!("{name}.delta");
-        std::fs::write(dest.join(&delta_file), &delta)?;
+        crate::secure::write_file_secure(&dest.join(&delta_file), &delta)?;
         let delta_blake3_hex = blake3::hash(&delta).to_hex().to_string();
         changed.push(ChangedFile::Pages {
             name,
@@ -191,7 +191,7 @@ pub fn restore_chain_with_sync_mode(
                             "integrity check failed for {name}: blake3 mismatch (increment is corrupt)"
                         )));
                     }
-                    std::fs::write(dest.join(name), &bytes)?;
+                    crate::secure::write_file_secure(&dest.join(name), &bytes)?;
                 }
                 ChangedFile::Pages {
                     name,
@@ -274,12 +274,7 @@ fn apply_page_delta(
         ));
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let mut file = crate::secure::open_paged_file_secure(path)?;
     let target_len = total_pages as u64 * PAGE_SIZE as u64;
     if file.metadata()?.len() < target_len {
         file.set_len(target_len)?;

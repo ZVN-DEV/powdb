@@ -1,6 +1,6 @@
 [package]
 name = "powdb-cli"
-description = "Interactive REPL and CLI for PowDB — 3-10x faster than SQLite on aggregates"
+description = "Interactive REPL and CLI for PowDB, an embedded database with a pipeline query language and nested results"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,12 +12,12 @@ categories = ["database", "command-line-utilities"]
 documentation = "https://docs.rs/powdb-cli"
 
 [dependencies]
-powdb-storage = { version = "0.19.1", path = "../storage" }
-powdb-query = { version = "0.19.1", path = "../query" }
-powdb-server = { version = "0.19.1", path = "../server" }
-powdb-backup = { version = "0.19.1", path = "../backup" }
-powdb-auth = { version = "0.19.1", path = "../auth" }
-powdb-sync = { version = "0.19.1", path = "../sync" }
+powdb-storage = { version = "0.20.0", path = "../storage" }
+powdb-query = { version = "0.20.0", path = "../query" }
+powdb-server = { version = "0.20.0", path = "../server" }
+powdb-backup = { version = "0.20.0", path = "../backup" }
+powdb-auth = { version = "0.20.0", path = "../auth" }
+powdb-sync = { version = "0.20.0", path = "../sync" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tokio-rustls = "0.26"

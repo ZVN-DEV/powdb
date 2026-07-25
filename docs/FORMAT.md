@@ -65,7 +65,7 @@ it is used by production code.
 
 ## Format version support policy
 
-What the current release (v0.19.0) supports:
+What the current release (v0.19.1) supports:
 
 - **Reads:** every on-disk version listed in the table above, which is every
   version any released PowDB has ever written. No released data directory is

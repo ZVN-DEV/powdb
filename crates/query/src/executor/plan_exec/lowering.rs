@@ -247,9 +247,22 @@ fn column_type(catalog: &Catalog, table: &str, column: &str) -> Option<TypeId> {
 fn coerce_column_index_key(col_type: TypeId, key: &Expr) -> Option<Expr> {
     match (key, col_type) {
         // Same-typed literal: the index key already matches the stored key.
-        // A datetime column stores an int-literal timestamp as a raw `Int`
-        // (see `coerce_value`), so an int key is correct there too.
-        (Expr::Literal(Literal::Int(_)), TypeId::Int | TypeId::DateTime) => Some(key.clone()),
+        (Expr::Literal(Literal::Int(_)), TypeId::Int) => Some(key.clone()),
+        // An int literal against a DateTime column is rejected on purpose,
+        // even though the two compare correctly as micros. Index keys are
+        // stored byte-encoded behind a type tag (`btree::encode_composite_value`
+        // leads with `type_id`), so a probe built from `Literal::Int` lands in
+        // the Int lane and cannot match a stored DateTime key: equality found
+        // nothing and a range scan matched every entry. `Literal` has no
+        // DateTime variant, so this function cannot rewrite the key faithfully,
+        // and per the contract above anything we cannot rewrite without
+        // changing the result set is rejected so the caller keeps the
+        // always-correct `Filter(SeqScan)`. That scan is itself compiled now
+        // (see `compiled::build_int_leaf`, which accepts DateTime columns), so
+        // the fallback is a fast path rather than a full decode. Using a
+        // datetime index needs a real timestamp literal, which belongs with the
+        // temporal type work rather than here.
+        (Expr::Literal(Literal::Int(_)), TypeId::DateTime) => None,
         (Expr::Literal(Literal::Float(_)), TypeId::Float) => Some(key.clone()),
         (Expr::Literal(Literal::String(_)), TypeId::Str) => Some(key.clone()),
         (Expr::Literal(Literal::Bool(_)), TypeId::Bool) => Some(key.clone()),
@@ -466,6 +479,25 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
     })
 }
 
+/// Whether an index probe on `column` is built from an int literal while the
+/// column is declared `datetime`. Index keys are byte-encoded behind a type tag
+/// (`btree::encode_composite_value`), so an `Int`-tagged probe cannot match a
+/// stored `DateTime` key: equality finds nothing and a range scan matches every
+/// entry. The planner is pure and cannot see column types, so it emits these
+/// probes and this pass has to reject them. See `coerce_column_index_key`.
+fn datetime_probed_with_int_literal(
+    catalog: &Catalog,
+    table: &str,
+    column: &str,
+    keys: &[&Expr],
+) -> bool {
+    if column_type(catalog, table, column) != Some(TypeId::DateTime) {
+        return false;
+    }
+    keys.iter()
+        .any(|key| matches!(key, Expr::Literal(Literal::Int(_))))
+}
+
 /// This pass runs once per query, before execution.
 pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
@@ -485,13 +517,21 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
             start,
             end,
         } => {
+            let int_probed_datetime = {
+                let bounds: Vec<&Expr> = [start, end]
+                    .iter()
+                    .filter_map(|bound| bound.as_ref().map(|(expr, _)| expr))
+                    .collect();
+                datetime_probed_with_int_literal(catalog, table, column, &bounds)
+            };
             if let Some(tbl) = catalog.get_table(table) {
                 // Keep RangeScan whenever ANY index exists on the column:
                 // unique indexes store raw column values, non-unique indexes
                 // store composite (value, rid) keys that the executor walks
                 // natively via BTree::range_rids. Only lower to Filter(SeqScan)
-                // when the column is unindexed.
-                if tbl.has_index(column) {
+                // when the column is unindexed, or when the bounds cannot
+                // faithfully probe the index (int literal against datetime).
+                if tbl.has_index(column) && !int_probed_datetime {
                     return plan.clone();
                 }
             }
@@ -606,7 +646,12 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
         },
         PlanNode::IndexScan { table, column, key } => {
             if let Some(tbl) = catalog.get_table(table) {
-                if tbl.has_index(column) {
+                // An int literal cannot probe a datetime index at all (type-tagged
+                // key bytes), so fall through to the compiled scan below rather
+                // than returning zero rows.
+                if tbl.has_index(column)
+                    && !datetime_probed_with_int_literal(catalog, table, column, &[key])
+                {
                     // Skew guard: a lone equality on a HOT literal (one that
                     // matches more than half the table) runs faster as a
                     // compiled `Filter(SeqScan)` -- one sequential pass with the

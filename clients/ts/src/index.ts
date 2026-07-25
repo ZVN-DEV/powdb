@@ -45,7 +45,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.19.1";
+export const CLIENT_VERSION = "0.20.0";
 
 /**
  * The maximum catalog format version this client can read. State this as the
@@ -100,6 +100,12 @@ export type NativeValue =
   | string
   | Uint8Array
   | NativeJson;
+
+/**
+ * One row of a native (lossless) result, keyed by column name. The default row
+ * type of {@link Client.queryObjects} when no generic is supplied.
+ */
+export type NativeRow = Record<string, NativeValue>;
 
 export type NativeQueryResult =
   | { kind: "rows"; columns: string[]; rows: NativeValue[][] }
@@ -297,6 +303,31 @@ function nativeQueryResult(reply: Message): NativeQueryResult {
         "protocol_error",
       );
   }
+}
+
+/**
+ * Turn a rows-shaped native result into object rows keyed by column name.
+ * Non-rows results are a caller mistake, not a server error, so they raise the
+ * same `query_failed` code `queryTyped` uses.
+ */
+function nativeRowObjects<Row>(
+  result: NativeQueryResult,
+  method: string,
+): Row[] {
+  if (result.kind !== "rows") {
+    throw new PowDBError(
+      `${method}: expected rows result, got ${result.kind}`,
+      "query_failed",
+    );
+  }
+  const { columns, rows } = result;
+  return rows.map((values) => {
+    const row: NativeRow = {};
+    for (let i = 0; i < columns.length; i++) {
+      row[columns[i]!] = values[i] ?? null;
+    }
+    return row as Row;
+  });
 }
 
 function rawNativeQueryResult(reply: Message): RawNativeQueryResult {
@@ -1097,23 +1128,90 @@ export class Client extends EventEmitter<ClientEvents> {
    * using the caller-supplied schema. See `./typed.ts` for the coercion
    * rules and supported column types.
    *
-   * Returns a `TypedRow[]` — an array of objects keyed by column name.
+   * Returns `Row[]`, an array of objects keyed by column name (`TypedRow[]`
+   * when no generic is supplied). The generic is an unchecked assertion about
+   * the query's shape: the schema drives coercion, nothing validates the type.
+   * Positional `$N` parameters are accepted in the same position as
+   * {@link query}, so typed rows and injection-safe binding compose.
+   *
+   * This is the LEGACY stringly-typed path plus schema coercion. For lossless
+   * object rows with no schema at all, use {@link queryObjects}.
+   *
    * Throws `PowDBError(code="query_failed")` if the query is not a
    * rows-returning query.
    */
-  async queryTyped(
+  async queryTyped<Row extends TypedRow = TypedRow>(
     query: string,
     schema: TypedSchema,
-    opts?: { signal?: AbortSignal },
-  ): Promise<TypedRow[]> {
-    const result = await this.query(query, opts);
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<Row[]> {
+    // Same overload disambiguation as `query`, so typed rows and `$N`
+    // parameter binding are usable together:
+    //   queryTyped(q, schema)                  no params, no opts
+    //   queryTyped(q, schema, opts)            legacy 3-arg opts form
+    //   queryTyped(q, schema, params)          positional $N parameters
+    //   queryTyped(q, schema, params, opts)    params plus opts
+    const result = Array.isArray(paramsOrOpts)
+      ? await this.query(query, paramsOrOpts, maybeOpts)
+      : await this.query(query, paramsOrOpts);
     if (result.kind !== "rows") {
       throw new PowDBError(
         `queryTyped: expected rows result, got ${result.kind}`,
         "query_failed",
       );
     }
-    return coerceRows(result.columns, result.rows, schema);
+    return coerceRows(result.columns, result.rows, schema) as Row[];
+  }
+
+  /**
+   * Run PowQL on the LOSSLESS native wire surface and return object rows keyed
+   * by column name.
+   *
+   * This is {@link queryNative} plus the row-to-object step, so no schema is
+   * needed: the server states each cell's type, bytes stay bytes, JSON stays
+   * recursive data, and out-of-range integers stay `bigint`. Contrast with
+   * {@link queryTyped}, which coerces the legacy stringly-typed path using a
+   * caller-supplied schema.
+   *
+   *     interface User { name: string; age: number }
+   *     const users = await client.queryObjects<User>(
+   *       "User filter .age > $1 { .name, .age }",
+   *       [25],
+   *     );
+   *
+   * The generic is an unchecked assertion about the query's shape, exactly like
+   * a SQL driver's row type: nothing validates it at runtime. Duplicate column
+   * names collapse (last one wins), so alias them in the projection.
+   *
+   * Throws `PowDBError(code="query_failed")` if the query is not rows-returning.
+   */
+  async queryObjects<Row = NativeRow>(
+    query: string,
+    paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },
+    maybeOpts?: { signal?: AbortSignal },
+  ): Promise<Row[]> {
+    const result = Array.isArray(paramsOrOpts)
+      ? await this.queryNative(query, paramsOrOpts, maybeOpts)
+      : await this.queryNative(query, paramsOrOpts);
+    return nativeRowObjects<Row>(result, "queryObjects");
+  }
+
+  /**
+   * SQL counterpart of {@link queryObjects}: runs SQL on the lossless native
+   * surface and returns object rows keyed by column name.
+   *
+   * The SQL frontend cannot bind parameters on any wire frame yet, so build SQL
+   * with {@link escapeSqlLiteral} / {@link sqlIdent} (or the `sql` tagged
+   * template) rather than string concatenation. For parameter binding, use the
+   * PowQL surface, which has real `$N` placeholders.
+   */
+  async querySqlObjects<Row = NativeRow>(
+    query: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<Row[]> {
+    const result = await this.querySqlNative(query, opts);
+    return nativeRowObjects<Row>(result, "querySqlObjects");
   }
 
   /**
@@ -1722,6 +1820,7 @@ export type {
 export {
   MAX_PAYLOAD_SIZE,
   MAX_ROWS,
+  MAX_RESULT_CELLS,
   MAX_COLUMNS,
   MAX_PARAMS,
   MAX_SYNC_UNITS,
@@ -1735,6 +1834,11 @@ export {
   ident,
   powql,
   PowqlIdent,
+  escapeSqlLiteral,
+  escapeSqlIdent,
+  sqlIdent,
+  sql,
+  SqlIdent,
 } from "./escape.js";
 
 export { Pool } from "./pool.js";

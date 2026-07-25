@@ -553,7 +553,7 @@ pub(crate) fn aggregate_rows(
     rows: &[Vec<Value>],
 ) -> Result<QueryResult, QueryError> {
     let mut cancel = CancelCheck::new();
-    if func == AggFunc::Count && argument.is_none() {
+    if func == AggFunc::Count && counts_every_row(argument) {
         return Ok(QueryResult::Scalar(Value::Int(rows.len() as i64)));
     }
     let argument = argument.ok_or_else(|| {

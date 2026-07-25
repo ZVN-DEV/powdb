@@ -349,6 +349,13 @@ impl Engine {
         if self.catalog.table_has_overflow(table) {
             return Ok(None);
         }
+        if limit == 0 {
+            // The scan loop below pushes a row before testing the limit, so
+            // `limit 0` would emit one row. Degenerate case: let the generic
+            // path produce the empty result with proper column naming, as the
+            // sort-limit fast path already does.
+            return Ok(None);
+        }
         let schema = self
             .catalog
             .schema(table)
