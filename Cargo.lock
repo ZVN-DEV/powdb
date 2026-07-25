@@ -1904,6 +1904,7 @@ name = "powdb-query"
 version = "0.19.1"
 dependencies = [
  "powdb-storage",
+ "proptest",
  "rustc-hash",
  "tempfile",
  "thiserror 2.0.18",

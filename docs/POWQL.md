@@ -1296,6 +1296,15 @@ with `expected literal value`. A `datetime` column is stored as an integer
 timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
 stamp them afterwards with `update { ts := now() }` if needed.
 
+Because a timestamp literal is written as that plain integer, a comparison
+against a `datetime` column compares the underlying microseconds:
+`Event filter .ts > 1752000000` means what it reads as, and agrees with the same
+comparison on an `int` column. One consequence to know about: a `datetime`
+column's index cannot be probed by an integer literal (index keys are stored
+behind a type tag), so a predicate on an indexed `datetime` column runs as a
+compiled sequential scan rather than an index lookup. The answer is the same
+either way; only the access path differs.
+
 #### extract
 
 Extract a component from a datetime value. Supported components: `year`, `month`, `day`, `hour`, `minute`, `second`:

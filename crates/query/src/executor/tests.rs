@@ -7670,3 +7670,154 @@ fn read_only_engine_sql_mutation_is_terminal() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A table with a `datetime` column, plus an `int` column holding the same
+/// timestamps, so every datetime assertion can be checked against the Int
+/// path that is already known to be correct.
+///
+/// `created_at` is deliberately out of insertion order, and one row leaves it
+/// null so the bitmap-skip branch is exercised.
+fn datetime_fast_engine() -> Engine {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("powdb_dt_fast_{}_{}", std::process::id(), id));
+    let mut engine = Engine::new(&dir).unwrap();
+    engine
+        .execute_powql("type Ev { required name: str, created_at: datetime, mirror: int }")
+        .unwrap();
+    let rows = [
+        ("a", 300i64),
+        ("b", 100),
+        ("c", 500),
+        ("d", 200),
+        ("e", 400),
+    ];
+    for (name, ts) in rows {
+        engine
+            .execute_powql(&format!(
+                "insert Ev {{ name := \"{name}\", created_at := {ts}, mirror := {ts} }}"
+            ))
+            .unwrap();
+    }
+    engine.execute_powql("insert Ev { name := \"z\" }").unwrap();
+    engine
+}
+
+#[test]
+fn datetime_filter_compiles_and_matches_the_int_path() {
+    // `WHERE created_at > <micros>` is one of the two most common shapes an
+    // ORM emits. The compiled leaf rejected datetime columns, so this fell to
+    // the generic decode path. It must now compile AND agree with the
+    // equivalent Int-column query row for row.
+    let mut engine = datetime_fast_engine();
+    for (op, lit) in [(">", 200), ("<", 400), (">=", 300), ("<=", 300), ("=", 500)] {
+        let dt = engine
+            .execute_powql(&format!("count(Ev filter .created_at {op} {lit})"))
+            .unwrap();
+        let int = engine
+            .execute_powql(&format!("count(Ev filter .mirror {op} {lit})"))
+            .unwrap();
+        assert_eq!(
+            format!("{dt:?}"),
+            format!("{int:?}"),
+            "datetime and int disagreed for `{op} {lit}`"
+        );
+    }
+}
+
+#[test]
+fn datetime_filter_never_matches_a_null_timestamp() {
+    // Row "z" has no created_at. A comparison against a missing value must
+    // not match, matching filter NULL semantics and the Int leaf's null guard.
+    let mut engine = datetime_fast_engine();
+    let result = engine
+        .execute_powql("count(Ev filter .created_at > -9999999)")
+        .unwrap();
+    match result {
+        QueryResult::Scalar(Value::Int(n)) => {
+            assert_eq!(n, 5, "the null-timestamp row must be excluded, got {n}")
+        }
+        other => panic!("expected scalar int, got {other:?}"),
+    }
+}
+
+#[test]
+fn datetime_filter_accepts_a_reversed_literal() {
+    // `<literal> op .field` must compile too, with the operator flipped.
+    let mut engine = datetime_fast_engine();
+    let dt = engine
+        .execute_powql("count(Ev filter 400 > .created_at)")
+        .unwrap();
+    let int = engine
+        .execute_powql("count(Ev filter 400 > .mirror)")
+        .unwrap();
+    assert_eq!(
+        format!("{dt:?}"),
+        format!("{int:?}"),
+        "reversed-literal datetime disagreed with int"
+    );
+}
+
+#[test]
+fn datetime_top_n_sort_matches_the_int_path_and_keeps_type() {
+    // `ORDER BY created_at DESC LIMIT n` is the other most common ORM shape.
+    // The top-N fast path gated on Int|Float, so datetime sorts fell back.
+    // Ordering must match the Int mirror, and the projected value must still
+    // come back as a DateTime, not silently as an Int.
+    let mut engine = datetime_fast_engine();
+    for dir in ["desc", "asc"] {
+        let dt = engine
+            .execute_powql(&format!("Ev order .created_at {dir} limit 3 {{ .name }}"))
+            .unwrap();
+        let int = engine
+            .execute_powql(&format!("Ev order .mirror {dir} limit 3 {{ .name }}"))
+            .unwrap();
+        assert_eq!(
+            format!("{dt:?}"),
+            format!("{int:?}"),
+            "datetime top-N order disagreed with int ({dir})"
+        );
+    }
+
+    let typed = engine
+        .execute_powql("Ev order .created_at desc limit 1 { .created_at }")
+        .unwrap();
+    match typed {
+        QueryResult::Rows { rows, .. } => match &rows[0][0] {
+            Value::DateTime(v) => assert_eq!(*v, 500, "wrong row sorted first"),
+            other => panic!("top-N must preserve the DateTime type, got {other:?}"),
+        },
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn datetime_filter_agrees_whether_or_not_an_index_exists() {
+    // The index path already accepted an int literal as a datetime index key
+    // (`lowering::coerce_column_index_key`), while the scan path compared type
+    // discriminants and matched every non-null row. So the SAME predicate
+    // returned different answers depending on whether an index happened to
+    // exist, which is the worst shape a correctness bug can take.
+    let mut engine = datetime_fast_engine();
+    let queries = [
+        "count(Ev filter .created_at > 200)",
+        "count(Ev filter .created_at = 500)",
+        "count(Ev filter .created_at <= 300)",
+    ];
+
+    let before: Vec<String> = queries
+        .iter()
+        .map(|q| format!("{:?}", engine.execute_powql(q).unwrap()))
+        .collect();
+
+    engine
+        .execute_powql("alter Ev add index .created_at")
+        .unwrap();
+
+    for (q, unindexed) in queries.iter().zip(&before) {
+        let indexed = format!("{:?}", engine.execute_powql(q).unwrap());
+        assert_eq!(
+            *unindexed, indexed,
+            "`{q}` answered differently with and without an index"
+        );
+    }
+}

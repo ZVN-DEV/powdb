@@ -32,6 +32,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart into the same abort indefinitely. See the breaking-change note below
   for the new failure mode.
 
+### Fixed (correctness)
+
+- **Comparisons against a `datetime` column returned wrong rows.** A timestamp
+  literal is written as a plain integer, so `filter .created_at > 1752000000`
+  compared a `DateTime` value against an `Int`. That pairing was not handled, so
+  it fell back to comparing type tags: every `DateTime` sorted above every `Int`
+  whatever the timestamps were. The effect was a filter that matched every
+  non-null row, an equality that matched none, and a reversed comparison
+  (`1752000000 < .created_at`) that matched none. Timestamps now compare as
+  microseconds on every path.
+  - The answer also depended on whether an index existed, because the index path
+    accepted an integer literal as a `datetime` index key while the scan path did
+    not. Index keys are stored behind a type tag, so an integer probe cannot
+    match a stored timestamp: equality found nothing and a range scan matched
+    every entry. A predicate on an indexed `datetime` column now runs as a
+    compiled sequential scan, which is correct; using the index needs a real
+    timestamp literal and will come with the temporal type work.
+  - `datetime` columns also now compile into the predicate fast path and the
+    top-N sort fast path, so `filter .created_at > <ts>` and
+    `order .created_at desc limit N` no longer fall back to full row decoding.
+
 ### Changed
 
 **Behavior changes that can affect existing queries. Read these before upgrading
