@@ -106,9 +106,7 @@ pub(crate) fn execute_window(
         let mut partition_start = 0usize;
         // Running state for aggregate windows:
         let mut running_count: i64 = 0;
-        let mut running_int_sum: i64 = 0;
-        let mut running_float_sum: f64 = 0.0;
-        let mut running_saw_float = false;
+        let mut running_total = NumericAgg::new();
         let mut running_min: Option<Value> = None;
         let mut running_max: Option<Value> = None;
         let mut rank_counter: i64 = 0;
@@ -144,7 +142,11 @@ pub(crate) fn execute_window(
                 // complete, so its final running value IS the whole-partition
                 // aggregate. Back-fill it onto every row of that partition.
                 if whole_partition_frame && sorted_pos > 0 {
-                    let final_v = win_values[indices[sorted_pos - 1]].clone();
+                    let final_v = whole_partition_final_value(
+                        wdef.function,
+                        &running_total,
+                        &win_values[indices[sorted_pos - 1]],
+                    )?;
                     for ri in partition_row_indices.drain(..) {
                         cancel.tick()?;
                         win_values[ri] = final_v.clone();
@@ -152,9 +154,7 @@ pub(crate) fn execute_window(
                 }
                 partition_start = sorted_pos;
                 running_count = 0;
-                running_int_sum = 0;
-                running_float_sum = 0.0;
-                running_saw_float = false;
+                running_total = NumericAgg::new();
                 running_min = None;
                 running_max = None;
                 rank_counter = 0;
@@ -205,40 +205,26 @@ pub(crate) fn execute_window(
                 }
                 WindowFunc::Sum => {
                     if let Some(value) = current_arg() {
-                        match value {
-                            Value::Int(v) => running_int_sum += v,
-                            Value::Float(v) => {
-                                running_float_sum += v;
-                                running_saw_float = true;
-                            }
-                            _ => {}
-                        }
+                        running_total.push("sum", &value)?;
                     }
-                    if running_saw_float {
-                        Value::Float(running_float_sum + running_int_sum as f64)
+                    if whole_partition_frame {
+                        // Every intermediate is overwritten by the back-fill
+                        // below, so the i64 conversion is deferred to the
+                        // partition total that is actually emitted. Converting
+                        // per row would fail a partition like
+                        // [5e18, 5e18, -5e18] whose total fits.
+                        Value::Empty
                     } else {
-                        Value::Int(running_int_sum)
+                        // A running frame emits this prefix, so a prefix that
+                        // leaves i64 is a real overflow of a reported value.
+                        running_total.sum("sum")?
                     }
                 }
                 WindowFunc::Avg => {
                     if let Some(value) = current_arg() {
-                        match value {
-                            Value::Int(v) => {
-                                running_float_sum += v as f64;
-                                running_count += 1;
-                            }
-                            Value::Float(v) => {
-                                running_float_sum += v;
-                                running_count += 1;
-                            }
-                            _ => {}
-                        }
+                        running_total.push("avg", &value)?;
                     }
-                    if running_count == 0 {
-                        Value::Empty
-                    } else {
-                        Value::Float(running_float_sum / running_count as f64)
-                    }
+                    running_total.avg()
                 }
                 WindowFunc::Count => {
                     if count_all {
@@ -295,7 +281,11 @@ pub(crate) fn execute_window(
 
         // Back-fill the final partition (the loop only flushes at boundaries).
         if whole_partition_frame && n > 0 {
-            let final_v = win_values[indices[n - 1]].clone();
+            let final_v = whole_partition_final_value(
+                wdef.function,
+                &running_total,
+                &win_values[indices[n - 1]],
+            )?;
             for ri in partition_row_indices.drain(..) {
                 cancel.tick()?;
                 win_values[ri] = final_v.clone();
@@ -311,6 +301,27 @@ pub(crate) fn execute_window(
     }
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/// The value a whole-partition aggregate frame (`over ()` with no `order`)
+/// emits for every row of the partition that just ended.
+///
+/// Every function except `sum` stores its complete value on the partition's
+/// last row, so that stored value is the answer. `sum` stores a placeholder
+/// instead and finalizes here, because the running total is folded at full
+/// i128 width: a prefix may leave `i64` on a partition whose emitted total
+/// does not (integer addition is associative, the `i64` conversion is not).
+/// A partition total that genuinely leaves `i64` still errors, here.
+fn whole_partition_final_value(
+    function: WindowFunc,
+    running_total: &NumericAgg,
+    last_running_value: &Value,
+) -> Result<Value, QueryError> {
+    if matches!(function, WindowFunc::Sum) {
+        running_total.sum("sum")
+    } else {
+        Ok(last_running_value.clone())
+    }
 }
 
 /// Resolve a group-by key or aggregate argument name against the input
@@ -543,6 +554,110 @@ fn resolve_direct_group_expr(expr: &Expr, columns: &[String]) -> Result<Option<u
     }
 }
 
+/// Running total shared by the generic scalar path, the grouped path, the
+/// symmetric (join) path and the window path, so which of those happened to
+/// fire cannot change the answer. Two rules it enforces that the per-path
+/// accumulators did not:
+///   * a non-null value that is neither `Int` nor `Float` is a typed error,
+///     not a skipped row. `sum` over a str column used to answer `0` and
+///     `avg` used to answer null;
+///   * an integer total that leaves `i64` is a typed error, not a wrapped
+///     (generic paths) or clamped (fast path) number.
+///
+/// The compiled fast path in `fast_paths.rs` accumulates separately (it reads
+/// column bytes without materializing `Value`s) and only shares
+/// [`agg_overflow_error`]. It agrees on every input that contributes a value,
+/// but not on one that contributes none: it types the zero from the column
+/// (`sum` over an all-null float column answers `Float(0.0)`) while this
+/// accumulator types it from the values it saw (`Int(0)`), because an
+/// expression argument such as a JSON path has no declared column type to
+/// read. Unifying the two is a deliberate semantic decision, see
+/// `generic_sum_over_only_nulls_is_int_zero` below.
+pub(super) struct NumericAgg {
+    int_sum: i128,
+    float_sum: f64,
+    saw_float: bool,
+    count: u64,
+}
+
+impl NumericAgg {
+    pub(super) fn new() -> Self {
+        Self {
+            int_sum: 0,
+            float_sum: 0.0,
+            saw_float: false,
+            count: 0,
+        }
+    }
+
+    /// Fold one value in. `Empty` is PowQL's null and contributes nothing,
+    /// exactly as it does for `count`/`min`/`max`.
+    pub(super) fn push(&mut self, label: &str, value: &Value) -> Result<(), QueryError> {
+        match value {
+            Value::Int(v) => {
+                self.int_sum = self
+                    .int_sum
+                    .checked_add(i128::from(*v))
+                    .ok_or_else(|| agg_overflow_error(label))?;
+            }
+            Value::Float(v) => {
+                self.float_sum += *v;
+                self.saw_float = true;
+            }
+            Value::Empty => return Ok(()),
+            other => return Err(non_numeric_agg_error(label, other)),
+        }
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Final `sum`: `Int` unless a `Float` contributed. The `i64` conversion
+    /// is where an overflowing integer total surfaces.
+    pub(super) fn sum(&self, label: &str) -> Result<Value, QueryError> {
+        if self.saw_float {
+            return Ok(Value::Float(self.float_sum + self.int_sum as f64));
+        }
+        i64::try_from(self.int_sum)
+            .map(Value::Int)
+            .map_err(|_| agg_overflow_error(label))
+    }
+
+    /// Final `avg`: always a `Float`, and `Empty` when no numeric row
+    /// contributed. The i128 integer total means an input whose sum does not
+    /// fit in `i64` still averages correctly instead of erroring.
+    pub(super) fn avg(&self) -> Value {
+        if self.count == 0 {
+            Value::Empty
+        } else {
+            Value::Float((self.float_sum + self.int_sum as f64) / self.count as f64)
+        }
+    }
+}
+
+/// `sum`/`avg` reached a value it cannot add.
+fn non_numeric_agg_error(label: &str, value: &Value) -> QueryError {
+    let found = format!("{:?}", value.type_id()).to_lowercase();
+    QueryError::TypeError(format!(
+        "{label} requires a numeric argument, but a {found} value was aggregated"
+    ))
+}
+
+/// An integer `sum` total that no longer fits in `i64`. Shared with the
+/// compiled fast path so every path reports overflow identically.
+///
+/// Deliberately NOT [`QueryError::TypeError`]: every argument was a well typed
+/// `int`, and only their total left the range, so the `type mismatch: ` prefix
+/// that variant's Display adds told the caller something false. The refusal
+/// leads with `cannot` so the server's egress allowlist (`SAFE_ERROR_PREFIXES`
+/// in crates/server/src/handler.rs) still forwards it verbatim, and it
+/// classifies as the wire class `execution` (2) exactly as `TypeError` did, so
+/// the stable class byte is unchanged.
+pub(super) fn agg_overflow_error(label: &str) -> QueryError {
+    QueryError::Execution(format!(
+        "cannot compute {label}: the integer total overflows int64"
+    ))
+}
+
 /// Evaluate a scalar aggregate over already materialized rows. Stored-field
 /// aggregates retain their raw-column fast path in the caller; this generic
 /// path is also able to aggregate arbitrary expressions such as JSON paths.
@@ -577,46 +692,18 @@ pub(crate) fn aggregate_rows(
             Value::Int(seen.len() as i64)
         }
         AggFunc::Avg => {
-            let mut sum = 0.0;
-            let mut count = 0_u64;
-            for value in values {
-                match value {
-                    Value::Int(v) => {
-                        sum += v as f64;
-                        count += 1;
-                    }
-                    Value::Float(v) => {
-                        sum += v;
-                        count += 1;
-                    }
-                    _ => {}
-                }
+            let mut total = NumericAgg::new();
+            for value in &values {
+                total.push("avg", value)?;
             }
-            if count == 0 {
-                Value::Empty
-            } else {
-                Value::Float(sum / count as f64)
-            }
+            total.avg()
         }
         AggFunc::Sum => {
-            let mut int_sum = 0_i64;
-            let mut float_sum = 0.0;
-            let mut saw_float = false;
-            for value in values {
-                match value {
-                    Value::Int(v) => int_sum += v,
-                    Value::Float(v) => {
-                        float_sum += v;
-                        saw_float = true;
-                    }
-                    _ => {}
-                }
+            let mut total = NumericAgg::new();
+            for value in &values {
+                total.push("sum", value)?;
             }
-            if saw_float {
-                Value::Float(float_sum + int_sum as f64)
-            } else {
-                Value::Int(int_sum)
-            }
+            total.sum("sum")?
         }
         AggFunc::Min | AggFunc::Max => {
             let mut result: Option<Value> = None;
@@ -659,10 +746,9 @@ pub(crate) fn aggregate_rows_with_provenance(
             "symmetric aggregate source alias '{provenance_alias}' is not present in its input"
         ))
     })?;
+    let label = format!("{func:?}").to_lowercase();
     let mut seen = HashSet::new();
-    let mut int_sum = 0_i64;
-    let mut float_sum = 0.0_f64;
-    let mut saw_float = false;
+    let mut total = NumericAgg::new();
     let mut count = 0_u64;
     let mut cancel = CancelCheck::new();
     for (row, row_provenance) in input.rows.iter().zip(&input.provenance) {
@@ -680,27 +766,14 @@ pub(crate) fn aggregate_rows_with_provenance(
         mem_budget::charge(SYMMETRIC_RID_SET_ENTRY_BYTES, memory_limit)?;
         match func {
             AggFunc::Count => count += 1,
-            AggFunc::Sum | AggFunc::Avg => match value {
-                Value::Int(value) => {
-                    int_sum += value;
-                    count += 1;
-                }
-                Value::Float(value) => {
-                    float_sum += value;
-                    saw_float = true;
-                    count += 1;
-                }
-                _ => {}
-            },
+            AggFunc::Sum | AggFunc::Avg => total.push(&label, &value)?,
             AggFunc::CountDistinct | AggFunc::Min | AggFunc::Max => unreachable!(),
         }
     }
     let value = match func {
         AggFunc::Count => Value::Int(count as i64),
-        AggFunc::Sum if saw_float => Value::Float(float_sum + int_sum as f64),
-        AggFunc::Sum => Value::Int(int_sum),
-        AggFunc::Avg if count == 0 => Value::Empty,
-        AggFunc::Avg => Value::Float((float_sum + int_sum as f64) / count as f64),
+        AggFunc::Sum => total.sum(&label)?,
+        AggFunc::Avg => total.avg(),
         AggFunc::CountDistinct | AggFunc::Min | AggFunc::Max => unreachable!(),
     };
     Ok(QueryResult::Scalar(value))
@@ -764,14 +837,12 @@ pub(crate) fn compute_group_aggregate(
             }
             Ok(Value::Int(seen.len() as i64))
         }
-        AggFunc::Sum => {
-            // Mirror the scalar Sum path: accumulate int and float
-            // contributions separately and promote the final result to
-            // Float if any Float row was observed. Prevents silent
-            // drop of Float columns in GROUP BY aggregates.
-            let mut int_sum: i64 = 0;
-            let mut float_sum: f64 = 0.0;
-            let mut saw_float = false;
+        AggFunc::Sum | AggFunc::Avg => {
+            // Shares `NumericAgg` with the scalar, symmetric and window
+            // paths, so a grouped `sum`/`avg` promotes Float, rejects
+            // non-numeric values and reports overflow exactly as they do.
+            let label = if func == AggFunc::Sum { "sum" } else { "avg" };
+            let mut total = NumericAgg::new();
             for &ri in row_indices {
                 cancel.tick()?;
                 let value = value_at(ri);
@@ -780,48 +851,12 @@ pub(crate) fn compute_group_aggregate(
                 {
                     continue;
                 }
-                match value {
-                    Value::Int(v) => int_sum += v,
-                    Value::Float(v) => {
-                        float_sum += v;
-                        saw_float = true;
-                    }
-                    _ => {}
-                }
+                total.push(label, &value)?;
             }
-            if saw_float {
-                Ok(Value::Float(float_sum + int_sum as f64))
+            if func == AggFunc::Sum {
+                total.sum(label)
             } else {
-                Ok(Value::Int(int_sum))
-            }
-        }
-        AggFunc::Avg => {
-            let mut sum = 0.0f64;
-            let mut count = 0usize;
-            for &ri in row_indices {
-                cancel.tick()?;
-                let value = value_at(ri);
-                if value.is_empty()
-                    || !accept_symmetric_contribution(ri, source_index, provenance, &mut seen_rids)?
-                {
-                    continue;
-                }
-                match value {
-                    Value::Int(v) => {
-                        sum += v as f64;
-                        count += 1;
-                    }
-                    Value::Float(v) => {
-                        sum += v;
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-            if count == 0 {
-                Ok(Value::Empty)
-            } else {
-                Ok(Value::Float(sum / count as f64))
+                Ok(total.avg())
             }
         }
         AggFunc::Min | AggFunc::Max => {
@@ -868,4 +903,410 @@ fn accept_symmetric_contribution(
     }
     mem_budget::charge(SYMMETRIC_RID_SET_ENTRY_BYTES, memory_limit)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HUGE: i64 = 4_000_000_000_000_000_000;
+
+    fn str_rows() -> Vec<Vec<Value>> {
+        vec![vec![Value::Str("north".to_string())]]
+    }
+
+    fn overflow_rows() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Int(HUGE)],
+            vec![Value::Int(HUGE)],
+            vec![Value::Int(HUGE)],
+        ]
+    }
+
+    fn value_columns() -> Vec<String> {
+        vec!["v".to_string()]
+    }
+
+    fn value_field() -> Expr {
+        Expr::Field("v".to_string())
+    }
+
+    fn scalar_agg(func: AggFunc, rows: &[Vec<Value>]) -> Result<QueryResult, QueryError> {
+        aggregate_rows(func, Some(&value_field()), &value_columns(), rows)
+    }
+
+    fn grouped_agg(func: AggFunc, rows: Vec<Vec<Value>>) -> Result<QueryResult, QueryError> {
+        exec_group_by(
+            value_columns(),
+            rows,
+            &[],
+            &[GroupAgg {
+                function: func,
+                argument: value_field(),
+                mode: AggregateMode::Raw,
+                provenance_alias: None,
+                output_name: "total".to_string(),
+            }],
+            &None,
+        )
+    }
+
+    fn symmetric_agg(func: AggFunc, rows: Vec<Vec<Value>>) -> Result<QueryResult, QueryError> {
+        let provenance = (0..rows.len())
+            .map(|slot| {
+                vec![Some(RowId {
+                    page_id: 1,
+                    slot_index: slot as u16,
+                })]
+            })
+            .collect();
+        let input = ProvenanceRows {
+            columns: vec!["a.v".to_string()],
+            rows,
+            source_aliases: vec!["a".to_string()],
+            provenance,
+        };
+        aggregate_rows_with_provenance(
+            func,
+            Some(&Expr::QualifiedField {
+                qualifier: "a".to_string(),
+                field: "v".to_string(),
+            }),
+            &input,
+            "a",
+            usize::MAX,
+        )
+    }
+
+    fn window_over(
+        func: WindowFunc,
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<SortKey>,
+    ) -> Result<QueryResult, QueryError> {
+        execute_window(
+            QueryResult::Rows { columns, rows },
+            &[WindowDef {
+                function: func,
+                args: vec![value_field()],
+                mode: AggregateMode::Raw,
+                partition_by,
+                order_by,
+                output_name: "w".to_string(),
+            }],
+            usize::MAX,
+        )
+    }
+
+    fn window_agg(func: WindowFunc, rows: Vec<Vec<Value>>) -> Result<QueryResult, QueryError> {
+        window_over(func, value_columns(), rows, Vec::new(), Vec::new())
+    }
+
+    /// The appended window column, in the input's original row order.
+    fn window_column(result: Result<QueryResult, QueryError>) -> Vec<Value> {
+        match result {
+            Ok(QueryResult::Rows { rows, .. }) => rows
+                .into_iter()
+                .map(|row| row.last().cloned().expect("window column is appended"))
+                .collect(),
+            other => panic!("expected window rows, got {other:?}"),
+        }
+    }
+
+    fn assert_non_numeric(result: Result<QueryResult, QueryError>) {
+        match result {
+            Err(QueryError::TypeError(message)) => {
+                assert!(message.contains("numeric"), "unexpected message: {message}");
+            }
+            other => panic!("expected a non-numeric type error, got {other:?}"),
+        }
+    }
+
+    fn assert_overflow(result: Result<QueryResult, QueryError>) {
+        match result {
+            Err(QueryError::Execution(message)) => {
+                assert!(
+                    message.contains("overflow"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected an overflow error, got {other:?}"),
+        }
+    }
+
+    // ── B1: sum/avg over a non-numeric value is an error on every path ──
+    //
+    // The catch-all match arms used to skip str/bool/datetime/uuid/bytes/json
+    // silently, so `sum` answered 0 and `avg` answered null over a column that
+    // cannot be summed at all.
+
+    #[test]
+    fn scalar_sum_over_str_is_a_type_error() {
+        assert_non_numeric(scalar_agg(AggFunc::Sum, &str_rows()));
+    }
+
+    #[test]
+    fn scalar_avg_over_str_is_a_type_error() {
+        assert_non_numeric(scalar_agg(AggFunc::Avg, &str_rows()));
+    }
+
+    #[test]
+    fn grouped_sum_over_str_is_a_type_error() {
+        assert_non_numeric(grouped_agg(AggFunc::Sum, str_rows()));
+    }
+
+    #[test]
+    fn grouped_avg_over_str_is_a_type_error() {
+        assert_non_numeric(grouped_agg(AggFunc::Avg, str_rows()));
+    }
+
+    #[test]
+    fn symmetric_sum_over_str_is_a_type_error() {
+        assert_non_numeric(symmetric_agg(AggFunc::Sum, str_rows()));
+    }
+
+    #[test]
+    fn symmetric_avg_over_str_is_a_type_error() {
+        assert_non_numeric(symmetric_agg(AggFunc::Avg, str_rows()));
+    }
+
+    #[test]
+    fn window_sum_over_str_is_a_type_error() {
+        assert_non_numeric(window_agg(WindowFunc::Sum, str_rows()));
+    }
+
+    #[test]
+    fn window_avg_over_str_is_a_type_error() {
+        assert_non_numeric(window_agg(WindowFunc::Avg, str_rows()));
+    }
+
+    #[test]
+    fn non_numeric_error_names_the_offending_type() {
+        for (value, type_name) in [
+            (Value::Bool(true), "bool"),
+            (Value::DateTime(0), "datetime"),
+            (Value::Uuid([0; 16]), "uuid"),
+            (Value::Bytes(vec![1]), "bytes"),
+        ] {
+            let error = scalar_agg(AggFunc::Sum, &[vec![value]]).unwrap_err();
+            assert!(
+                error.to_string().contains(type_name),
+                "expected {type_name} in {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn nulls_are_still_skipped_rather_than_rejected() {
+        let rows = vec![vec![Value::Int(2)], vec![Value::Empty], vec![Value::Int(3)]];
+        assert!(matches!(
+            scalar_agg(AggFunc::Sum, &rows).unwrap(),
+            QueryResult::Scalar(Value::Int(5))
+        ));
+        assert!(matches!(
+            window_agg(WindowFunc::Sum, rows).unwrap(),
+            QueryResult::Rows { .. }
+        ));
+    }
+
+    // ── B2: an i64 sum total that overflows is an error, not a clamp ──
+
+    #[test]
+    fn scalar_sum_overflow_is_an_error() {
+        assert_overflow(scalar_agg(AggFunc::Sum, &overflow_rows()));
+    }
+
+    #[test]
+    fn grouped_sum_overflow_is_an_error() {
+        assert_overflow(grouped_agg(AggFunc::Sum, overflow_rows()));
+    }
+
+    #[test]
+    fn symmetric_sum_overflow_is_an_error() {
+        assert_overflow(symmetric_agg(AggFunc::Sum, overflow_rows()));
+    }
+
+    #[test]
+    fn window_sum_overflow_is_an_error() {
+        assert_overflow(window_agg(WindowFunc::Sum, overflow_rows()));
+    }
+
+    // ── B3: a transient running total must not fail a value that fits ──
+    //
+    // `over ()` with no `order` frames the WHOLE partition, so every running
+    // value is discarded and back-filled with the partition total. Converting
+    // each running value to i64 turned an input whose total fits into a
+    // query-killing overflow error, and made the answer depend on which path
+    // ran: the scalar `sum` of the same rows succeeds.
+
+    /// Total 5e18 (fits in i64); the running prefix reaches 1e19 (does not).
+    fn transient_overflow_rows() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Int(5_000_000_000_000_000_000)],
+            vec![Value::Int(5_000_000_000_000_000_000)],
+            vec![Value::Int(-5_000_000_000_000_000_000)],
+        ]
+    }
+
+    #[test]
+    fn window_sum_survives_a_transient_running_overflow() {
+        let expected = Value::Int(5_000_000_000_000_000_000);
+        assert_eq!(
+            window_column(window_agg(WindowFunc::Sum, transient_overflow_rows())),
+            vec![expected.clone(), expected.clone(), expected]
+        );
+    }
+
+    #[test]
+    fn window_and_scalar_sum_agree_on_a_transient_overflow() {
+        let scalar = match scalar_agg(AggFunc::Sum, &transient_overflow_rows()).unwrap() {
+            QueryResult::Scalar(value) => value,
+            other => panic!("expected a scalar, got {other:?}"),
+        };
+        for value in window_column(window_agg(WindowFunc::Sum, transient_overflow_rows())) {
+            assert_eq!(value, scalar);
+        }
+    }
+
+    #[test]
+    fn window_sum_finalizes_each_partition_independently() {
+        // Two partitions, each transiently overflowing, flushed by different
+        // code paths: the first at the partition boundary, the second at the
+        // end of the scan.
+        let mut rows = Vec::new();
+        for key in ["a", "b"] {
+            for row in transient_overflow_rows() {
+                rows.push(vec![Value::Str(key.to_string()), row[0].clone()]);
+            }
+        }
+        let result = window_over(
+            WindowFunc::Sum,
+            vec!["k".to_string(), "v".to_string()],
+            rows,
+            vec![Expr::Field("k".to_string())],
+            Vec::new(),
+        );
+        assert_eq!(
+            window_column(result),
+            vec![Value::Int(5_000_000_000_000_000_000); 6]
+        );
+    }
+
+    #[test]
+    fn window_running_sum_still_errors_when_an_emitted_prefix_overflows() {
+        // With an `order` clause the running prefix IS the emitted value, so
+        // a prefix of 1e19 is a real overflow of a reported number.
+        assert_overflow(window_over(
+            WindowFunc::Sum,
+            value_columns(),
+            transient_overflow_rows(),
+            Vec::new(),
+            vec![SortKey {
+                expr: value_field(),
+                descending: true,
+            }],
+        ));
+    }
+
+    #[test]
+    fn whole_partition_frame_still_back_fills_the_other_aggregates() {
+        // Only `sum` defers its finalization; the rest keep back-filling the
+        // partition's complete running value onto every row.
+        let rows = vec![vec![Value::Int(2)], vec![Value::Empty], vec![Value::Int(8)]];
+        for (func, expected) in [
+            (WindowFunc::Avg, Value::Float(5.0)),
+            (WindowFunc::Min, Value::Int(2)),
+            (WindowFunc::Max, Value::Int(8)),
+            (WindowFunc::Count, Value::Int(2)),
+        ] {
+            assert_eq!(
+                window_column(window_agg(func, rows.clone())),
+                vec![expected.clone(); 3],
+                "{func:?}"
+            );
+        }
+    }
+
+    // ── B4: the aggregate error messages are wire-visible ──
+    //
+    // `sum`/`avg` errors reach clients through the server's egress
+    // allowlist ("type mismatch" and "cannot" are both safe prefixes), and
+    // their `QueryError` variant is the wire error class a driver switches on.
+    // Both are pinned byte-exact here and, end to end through the engine, in
+    // crates/query/tests/error_display.rs.
+
+    #[test]
+    fn overflow_error_does_not_claim_a_type_mismatch() {
+        let error = scalar_agg(AggFunc::Sum, &overflow_rows()).unwrap_err();
+        assert!(
+            !matches!(error, QueryError::TypeError(_)),
+            "every summed value was a well typed int; only the total overflowed, \
+             so the `type mismatch: ` prefix would be false. got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "cannot compute sum: the integer total overflows int64"
+        );
+    }
+
+    #[test]
+    fn non_numeric_error_message_is_byte_exact() {
+        let error = scalar_agg(AggFunc::Sum, &str_rows()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "type mismatch: sum requires a numeric argument, but a str value was aggregated"
+        );
+    }
+
+    // ── B5: the type of a zero total, when nothing contributed ──
+
+    #[test]
+    fn generic_sum_over_only_nulls_is_int_zero() {
+        // Pinned because it is the one input on which the generic paths and
+        // the compiled fast path disagree: over an all-null FLOAT column the
+        // fast path answers `Float(0.0)` (it types the zero from the column)
+        // and every generic path answers `Int(0)` (it types the zero from the
+        // values it summed, because an expression argument has no column type
+        // to read).
+        //
+        // That is user-visible, and the plan shape alone decides it. On
+        // `type F { required id: int, v: float }` holding two rows with a null
+        // `v`, `sum(F { .v })` answers `Float(0.0)` while
+        // `sum(F filter .id in (1,2) { .v })` and `F group .id { s: sum(.v) }`
+        // answer `Int(0)`.
+        //
+        // Closing it needs BOTH sides changed in one step, because either half
+        // on its own widens the split (making the generic zero `Empty` would
+        // newly disagree with the fast path's `Int(0)` on an int column). The
+        // fast-path half lives in the `TypeId::Float => AggFunc::Sum` arm of
+        // `fast_paths.rs::agg_single_col_fast`; see the note on `NumericAgg`.
+        let nulls = vec![vec![Value::Empty], vec![Value::Empty]];
+        assert!(matches!(
+            scalar_agg(AggFunc::Sum, &nulls).unwrap(),
+            QueryResult::Scalar(Value::Int(0))
+        ));
+        assert_eq!(
+            window_column(window_agg(WindowFunc::Sum, nulls)),
+            vec![Value::Int(0); 2]
+        );
+    }
+
+    #[test]
+    fn avg_of_large_ints_stays_exact_instead_of_overflowing() {
+        // `avg` accumulates in i128 and only ever reports a Float, so a total
+        // that cannot fit in i64 is still a correct answer, not an error.
+        let expected = HUGE as f64;
+        for result in [
+            scalar_agg(AggFunc::Avg, &overflow_rows()).unwrap(),
+            symmetric_agg(AggFunc::Avg, overflow_rows()).unwrap(),
+        ] {
+            match result {
+                QueryResult::Scalar(Value::Float(avg)) => {
+                    assert!((avg - expected).abs() < 1.0, "got {avg}");
+                }
+                other => panic!("expected a float average, got {other:?}"),
+            }
+        }
+    }
 }

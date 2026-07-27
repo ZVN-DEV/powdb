@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (correctness)
+
+- **Unqualified columns in a join returned a row of NULLs.** The 0.20.0
+  "silent wrong answers become errors" round did not reach join scope.
+  Validation accepted a bare field name inside a join on the strength of a
+  runtime suffix match that evaluation did not actually implement, so
+  `User join Order on User.id = Order.user_id { .name, .amount }` returned NULL
+  for every column while the qualified form returned the right answer. The
+  runtime now performs the suffix match, and one resolver serves the
+  projection, filter, join-key, and sort paths instead of three that disagreed.
+  A bare name that two joined tables both expose is a typed ambiguity error
+  telling you to qualify it, never a silent pick.
+- **`order` on an unqualified join column claimed the column did not exist,**
+  one clause after the same query projected it successfully. The read-write and
+  read-only sort paths now use the same resolver as everything else.
+- **Window `sum` reported a false overflow** on a partition whose emitted total
+  fits in `int64`, because a transient running total was converted per row.
+  `sum(.v) over ()` over `[5e18, 5e18, -5e18]` now agrees with the scalar
+  `sum`, which is what "which path fired cannot change the answer" requires.
+- **Aggregates over non-numeric values silently answered 0.** `sum` over a
+  `str`, `datetime`, `bool`, `uuid`, `bytes`, or `json` column returned
+  `Int(0)` and `avg` returned NULL. All aggregate paths now raise a typed
+  error and agree with each other.
+- **Integer aggregate overflow silently clamped to `i64::MAX`** instead of
+  reporting overflow.
+- **Arithmetic on a non-numeric operand silently produced NULL.** `.ts + 1` on
+  a `datetime` column and `.id + "x"` both evaluated to a missing value.
+  Datetime arithmetic is deliberately an error rather than microsecond
+  arithmetic: `datetime + int` has no single meaning and `date_add` /
+  `date_diff` already spell both operations unambiguously. Widening an error
+  into support later is backward compatible; the reverse is not.
+- **`date_add`, `date_diff`, and `abs` used unchecked arithmetic**, which
+  panicked under overflow checks and wrapped to a bogus timestamp in release.
+
+### Security
+
+- **DDL inside an explicit transaction destroyed data while reporting
+  success.** `begin; drop T; rollback` reported "transaction rolled back" and
+  the table and its rows were permanently gone, across a full restart. DDL is
+  now refused inside a transaction with a typed error, at every entry point
+  including `drop view`, which previously left the view destroyed, its backing
+  table orphaned, and the name permanently unusable. DDL is not transactional
+  in PowDB; see `docs/POWQL.md`.
+- **An unbounded per-transaction dirty page set could OOM the process.** Under
+  `panic = "abort"` that is a client-reachable denial of service. Unflushed
+  pages are now charged against a budget (default 256 MiB, configurable via
+  `POWDB_DIRTY_PAGE_BUDGET`) and an oversized transaction is refused with a
+  typed error instead of growing until the host kills the server.
+- **Parse failures were admitted as writers.** A query that failed to parse
+  took a writer admission permit, so any authenticated principal, including a
+  read-only one, could hold all 1024 permits in a loop and block every real
+  client. A statement that executes nothing now acquires nothing. The same
+  applies to a parseable write from a principal who is not allowed to write:
+  permission is now checked before any permit is taken.
+
+### Changed
+
+- **Errors that were mislabeled now tell the truth.** Numeric overflow and
+  division by zero no longer render as "type mismatch". `DdlInTransaction` and
+  `TransactionTooLarge` reach drivers as a client-error class and
+  `LimitExceeded` respectively, rather than `Internal`, the class that means
+  "server bug, not your fault".
+
+### Known limitations
+
+- **An `update` can durably store NULL in a `required` column,** while `insert`
+  refuses the same value. PowDB has no statement-level atomicity: an `update`
+  writes rows as it walks them, so refusing a per-row value mid-statement
+  produces a torn write, which is a worse failure than the one it fixes. The
+  refusal was implemented, measured to tear, and deliberately reverted. The
+  real fix is statement-level atomicity. Documented with a reproduction in
+  `docs/STABILITY.md`.
+
+### Fixed (CI)
+
+- **The miri job had been passing without running.** It filtered on
+  `tx::tests`, a module that does not exist in `powdb-storage`, and a cargo
+  filter matching nothing exits 0. The filter is corrected and a guard now
+  fails the job when a filter matches no tests.
+- `docs/FORMAT.md` and `docs/STABILITY.md` had drifted a full minor behind the
+  published release, turning a compatibility promise into a guess. Both are
+  current and now covered by the version-consistency gate.
+
 ## [0.20.0] - 2026-07-25
 
 ### Security

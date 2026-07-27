@@ -7,6 +7,7 @@
 //! to its exact current output so refactors of the error types (e.g. the
 //! thiserror migration) cannot silently reword a message.
 
+use powdb_query::executor::Engine;
 use powdb_query::parser::ParseError;
 use powdb_query::result::QueryError;
 
@@ -117,6 +118,59 @@ fn query_error_display_is_byte_exact_for_every_variant() {
     for (error, expected) in cases {
         assert_eq!(error.to_string(), expected, "variant: {error:?}");
     }
+}
+
+/// The two messages the `sum` aggregate paths compose are wire-visible for the
+/// same reason the variants above are: the server's egress allowlist forwards
+/// anything starting with `cannot` or `type mismatch` verbatim, so clients see
+/// these strings.
+///
+/// This runs real queries through the engine rather than constructing the
+/// variants by hand. A hand-built `QueryError::TypeError("<literal>")` asserted
+/// against `"type mismatch: " + <the same literal>` only re-states the Display
+/// impl: it keeps passing when the producing function rewords its message, so
+/// it pins nothing about what a client actually receives. Going through
+/// `execute_powql` makes the assertion fail when `agg_overflow_error` or
+/// `non_numeric_agg_error` (crates/query/src/executor/plan_exec/aggregate.rs)
+/// drifts, which is the whole point of a byte-exact suite.
+#[test]
+fn aggregate_error_display_is_byte_exact() {
+    // A recycled pid would otherwise reopen a previous run's directory, where
+    // the `type Agg` below already exists.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("powdb_errdisplay_{}_{unique}", std::process::id()));
+    let mut engine = Engine::new(&dir).expect("engine");
+    engine
+        .execute_powql("type Agg { required id: int, required n: int, required label: str }")
+        .expect("ddl");
+    for (id, n) in [(1, i64::MAX), (2, i64::MAX)] {
+        engine
+            .execute_powql(&format!(
+                "insert Agg {{ id := {id}, n := {n}, label := \"x\" }}"
+            ))
+            .expect("insert");
+    }
+    // An i64 total that leaves the range: every value was a well typed int, so
+    // the message must report the overflow without claiming a type mismatch.
+    assert_eq!(
+        engine
+            .execute_powql("sum(Agg { .n })")
+            .expect_err("an overflowing total must be refused")
+            .to_string(),
+        "cannot compute sum: the integer total overflows int64"
+    );
+    // A str argument really is a type mismatch and keeps that prefix.
+    assert_eq!(
+        engine
+            .execute_powql("sum(Agg { .label })")
+            .expect_err("a str argument must be refused")
+            .to_string(),
+        "type mismatch: sum requires a numeric argument, but a str value was aggregated"
+    );
 }
 
 #[test]

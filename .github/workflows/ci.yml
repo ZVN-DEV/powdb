@@ -61,9 +61,9 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       # miri cannot interpret libc::mmap, so we skip modules that touch the
-      # mmap-based heap (heap, catalog, buffer, disk, wal, and integration
-      # tests). The remaining modules (btree, page, row, types, tx, view)
-      # still give strong UB coverage of the core data-structures.
+      # mmap-based heap (heap, catalog, table, disk, wal, and integration
+      # tests). The remaining modules still give strong UB coverage of the
+      # core data structures and the hand-rolled binary formats.
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -83,8 +83,31 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         run: |
-          cargo +nightly miri test -p powdb-storage -- \
-            btree::tests page::tests row::tests types::tests tx::tests view::tests
+          set -euo pipefail
+          filters=(
+            btree::tests
+            page::tests
+            row::tests
+            types::tests
+            view::tests
+            pj1::tests
+            stored_json_path::tests
+          )
+          # A libtest filter that matches nothing exits 0, so a renamed or
+          # deleted module would silently empty this job instead of failing
+          # it (a `tx::tests` filter did exactly that: there is no tx module).
+          # List with the SAME target selection as the run below (no --lib):
+          # a guard that inspects a different set of targets than the run does
+          # is not evidence about the run. Require each filter to select at
+          # least one test.
+          listing=$(cargo +nightly miri test -p powdb-storage -- --list "${filters[@]}")
+          for filter in "${filters[@]}"; do
+            if ! grep -q "^${filter}::" <<<"$listing"; then
+              echo "::error::miri filter '${filter}' matches no test in powdb-storage"
+              exit 1
+            fi
+          done
+          cargo +nightly miri test -p powdb-storage -- "${filters[@]}"
 
   asan:
     name: AddressSanitizer

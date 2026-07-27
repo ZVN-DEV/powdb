@@ -13,6 +13,7 @@ use crate::executor::compiled::*;
 use crate::executor::row_body_base;
 use crate::executor::Engine;
 
+use super::aggregate::agg_overflow_error;
 use super::*;
 
 impl Engine {
@@ -24,7 +25,8 @@ impl Engine {
 
     /// Aggregate sum/avg/min/max over a single fixed-size i64 column, with
     /// an optional compiled filter predicate. Walks raw row bytes — zero
-    /// per-row allocation. Uses i128 accumulator for sum/avg overflow safety.
+    /// per-row allocation. Accumulates sum/avg in i128; a `sum` total that
+    /// does not fit back into i64 is a typed error, not a clamped number.
     pub(crate) fn agg_single_col_fast(
         &self,
         table: &str,
@@ -125,8 +127,12 @@ impl Engine {
                         }
                     );
                     if matches!(function, AggFunc::Sum) {
-                        let clamped = sum_i128.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-                        QueryResult::Scalar(Value::Int(clamped))
+                        // Clamping to i64::MAX here used to report a plausible
+                        // number for a total that never happened. The generic
+                        // paths raise the same error via `NumericAgg::sum`.
+                        let total =
+                            i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?;
+                        QueryResult::Scalar(Value::Int(total))
                     } else if count == 0 {
                         QueryResult::Scalar(Value::Empty)
                     } else {
@@ -702,5 +708,97 @@ impl Engine {
             columns: proj_columns,
             rows,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    const HUGE: i64 = 4_000_000_000_000_000_000;
+
+    /// Three rows whose int total (1.2e19) is well past `i64::MAX`, plus a
+    /// str column the compiled aggregate path always declines.
+    fn overflow_engine() -> Engine {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("powdb_agg_overflow_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine
+            .execute_powql("type Big { required label: str, required n: int }")
+            .unwrap();
+        for _ in 0..3 {
+            engine
+                .execute_powql(&format!(r#"insert Big {{ label := "x", n := {HUGE} }}"#))
+                .unwrap();
+        }
+        engine
+    }
+
+    fn error_of(engine: &mut Engine, query: &str) -> QueryError {
+        engine
+            .execute_powql(query)
+            .expect_err("expected an error, got a result")
+    }
+
+    // `sum(Big { .n })` is the shape that reaches `agg_single_col_fast`:
+    // Aggregate(SeqScan) over a fixed-size Int column. It used to answer
+    // i64::MAX for a total of 1.2e19.
+    #[test]
+    fn compiled_fast_path_sum_overflow_is_an_error() {
+        let mut engine = overflow_engine();
+        let error = error_of(&mut engine, "sum(Big { .n })");
+        assert!(
+            matches!(&error, QueryError::Execution(message) if message.contains("overflow")),
+            "got {error:?}"
+        );
+    }
+
+    // Same data, same total, but `.n + 0` is not a bare field so the compiled
+    // path declines and the generic path runs. The two must not disagree.
+    #[test]
+    fn compiled_and_generic_sum_paths_agree_on_overflow() {
+        let mut engine = overflow_engine();
+        assert_eq!(
+            error_of(&mut engine, "sum(Big { .n })").to_string(),
+            error_of(&mut engine, "sum(Big { .n + 0 })").to_string()
+        );
+    }
+
+    // The compiled path only handles Int/Float columns, so a str column falls
+    // through to the generic path, which now rejects it instead of answering
+    // zero.
+    #[test]
+    fn sum_over_a_str_column_is_a_type_error() {
+        let mut engine = overflow_engine();
+        let error = error_of(&mut engine, "sum(Big { .label })");
+        assert!(
+            matches!(&error, QueryError::TypeError(message) if message.contains("numeric")),
+            "got {error:?}"
+        );
+    }
+
+    // A total that still fits keeps its exact value on both paths.
+    #[test]
+    fn sums_within_range_are_unchanged_on_both_paths() {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("powdb_agg_in_range_{}_{}", std::process::id(), id));
+        let mut engine = Engine::new(&dir).unwrap();
+        engine.execute_powql("type Small { n: int }").unwrap();
+        for n in [1, 2, 3] {
+            engine
+                .execute_powql(&format!("insert Small {{ n := {n} }}"))
+                .unwrap();
+        }
+        for query in ["sum(Small { .n })", "sum(Small { .n + 0 })"] {
+            match engine.execute_powql(query).unwrap() {
+                QueryResult::Scalar(Value::Int(total)) => assert_eq!(total, 6, "{query}"),
+                other => panic!("{query}: expected Int(6), got {other:?}"),
+            }
+        }
     }
 }

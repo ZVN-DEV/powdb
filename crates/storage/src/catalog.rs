@@ -1,6 +1,6 @@
 use crate::btree::{BTree, IndexStats};
 use crate::error::StorageError;
-use crate::heap::HeapFile;
+use crate::heap::{DirtyPageBudget, HeapFile};
 use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
 use crate::row::{encode_row_into, encode_row_v2_into, plan_spill, OverflowStub, MAX_VALUE_SIZE};
 use crate::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 static NEXT_STRUCTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -362,6 +363,10 @@ pub struct Catalog {
     /// overflow sweep ran at open, and [`Drop`] skips the checkpoint (which would
     /// otherwise flush pages and truncate the WAL, mutating the directory).
     read_only: bool,
+    /// Ceiling on unflushed heap pages, charged across every table here. An
+    /// explicit transaction that exceeds it is refused rather than allowed to
+    /// grow the per-table dirty buffers until the process is OOM-killed.
+    dirty_budget: Arc<DirtyPageBudget>,
 }
 
 impl Catalog {
@@ -406,6 +411,7 @@ impl Catalog {
             links: Vec::new(),
             structure_generation: next_structure_generation(),
             read_only: false,
+            dirty_budget: Arc::new(DirtyPageBudget::default()),
         };
         cat.persist()?;
         Ok(cat)
@@ -453,6 +459,7 @@ impl Catalog {
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
         let mut name_to_slot =
             FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        let dirty_budget = Arc::new(DirtyPageBudget::default());
         for CatalogEntry {
             schema,
             indexed_cols,
@@ -469,6 +476,7 @@ impl Catalog {
             // disk so subsequent opens hit the fast path.
             let mut table =
                 Table::open_with_indexes(schema, data_dir, &indexed_cols, &expression_metas)?;
+            table.heap.set_dirty_budget(Arc::clone(&dirty_budget));
             table.set_defaults(defaults);
             table.set_auto_cols(auto_cols);
             name_to_slot.insert(name.clone(), tables.len());
@@ -493,6 +501,7 @@ impl Catalog {
             links,
             structure_generation: next_structure_generation(),
             read_only: false,
+            dirty_budget,
         };
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
@@ -564,6 +573,7 @@ impl Catalog {
         let mut tables: Vec<Table> = Vec::with_capacity(entries.len());
         let mut name_to_slot =
             FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+        let dirty_budget = Arc::new(DirtyPageBudget::default());
         for CatalogEntry {
             schema,
             indexed_cols,
@@ -579,6 +589,7 @@ impl Catalog {
                 &indexed_cols,
                 &expression_metas,
             )?;
+            table.heap.set_dirty_budget(Arc::clone(&dirty_budget));
             table.set_defaults(defaults);
             table.set_auto_cols(auto_cols);
             name_to_slot.insert(name.clone(), tables.len());
@@ -602,6 +613,7 @@ impl Catalog {
             links,
             structure_generation: next_structure_generation(),
             read_only: true,
+            dirty_budget,
         })
     }
 
@@ -861,6 +873,7 @@ impl Catalog {
                     {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
                             if let Ok(mut table) = Table::create(schema, &self.data_dir) {
+                                table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
                                 table.set_defaults(defaults);
                                 table.set_auto_cols(auto_cols);
                                 let slot = self.tables.len();
@@ -1076,6 +1089,25 @@ impl Catalog {
         Ok(())
     }
 
+    /// Refuse DDL while an explicit transaction is active.
+    ///
+    /// DDL is not transactional here: `drop_table` unlinks the heap and
+    /// rewrites the catalog immediately, and `alter_table_*` rewrites every
+    /// row in place. ROLLBACK restores the catalog from disk, which by then
+    /// already reflects the DDL, so a `begin / drop / rollback` sequence used
+    /// to report success at every step and leave the table permanently gone.
+    /// Refusing the statement is the correct fix; making DDL transactional is
+    /// a separate, deliberately deferred decision.
+    fn ensure_no_active_transaction_for_ddl(&self, verb: &'static str) -> io::Result<()> {
+        if self.active_tx_id.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                StorageError::DdlInTransaction { verb },
+            ));
+        }
+        Ok(())
+    }
+
     fn flush_checkpoint_state(&mut self) -> io::Result<()> {
         for tbl in &mut self.tables {
             tbl.heap.flush_all_dirty()?;
@@ -1173,6 +1205,10 @@ impl Catalog {
         let id = self.next_tx_id;
         self.next_tx_id = self.next_tx_id.wrapping_add(1);
         self.active_tx_id = Some(id);
+        // From here until COMMIT/ROLLBACK the dirty pages are the only copy of
+        // the transaction's state, so they may not be spilled to disk to
+        // relieve the budget. See `DirtyPageBudget`.
+        self.dirty_budget.set_rollback_pinned(true);
         self.tx_start_len = Some(start_len);
         self.pending_autocommit_tx_ids.clear();
         if !self.wal.is_off() {
@@ -1185,6 +1221,7 @@ impl Catalog {
     /// Commit the active explicit transaction by appending a durable boundary
     /// marker after its row records.
     pub fn commit_transaction(&mut self) -> io::Result<()> {
+        self.dirty_budget.set_rollback_pinned(false);
         if let Some(id) = self.active_tx_id.take() {
             if !self.wal.is_off() {
                 self.wal.append(id, WalRecordType::Commit, &[])?;
@@ -1273,6 +1310,23 @@ impl Catalog {
     /// can lose any record written since the last `sync_wal` returned.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
         self.wal.set_sync_mode(mode);
+    }
+
+    /// Ceiling on unflushed heap pages held across every table, in bytes.
+    /// Defaults to [`crate::heap::DEFAULT_DIRTY_PAGE_BUDGET`]. A transaction
+    /// that would exceed it fails with `StorageError::TransactionTooLarge`
+    /// instead of pinning memory until the process is OOM-killed.
+    pub fn set_dirty_page_budget_bytes(&mut self, limit_bytes: usize) {
+        self.dirty_budget.set_limit_bytes(limit_bytes);
+    }
+
+    pub fn dirty_page_budget_bytes(&self) -> usize {
+        self.dirty_budget.limit_bytes()
+    }
+
+    /// Unflushed heap pages currently buffered across every table.
+    pub fn dirty_pages_buffered(&self) -> usize {
+        self.dirty_budget.charged_pages()
     }
 
     /// Defer Full-mode commit fsyncs (WAL group commit). While enabled, the
@@ -1389,12 +1443,17 @@ impl Catalog {
         if self.has_same_prepared_structure(&restored) {
             restored.structure_generation = self.structure_generation;
         }
+        let dirty_budget_limit = self.dirty_budget.limit_bytes();
         *self = restored;
         self.wal.set_sync_mode(sync_mode);
+        // The replacement catalog brought a fresh (unpinned, empty) budget;
+        // carry the configured ceiling across, like the sync mode above.
+        self.dirty_budget.set_limit_bytes(dirty_budget_limit);
         Ok(())
     }
 
     fn abandon_active_transaction_for_drop(&mut self) -> io::Result<()> {
+        self.dirty_budget.set_rollback_pinned(false);
         for tbl in &mut self.tables {
             tbl.heap.discard_dirty();
         }
@@ -1453,6 +1512,7 @@ impl Catalog {
         defaults: Vec<Option<Value>>,
         auto_cols: Vec<bool>,
     ) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("create table")?;
         self.invalidate_structure();
         validate_table_name(&schema.table_name)?;
         for col in &schema.columns {
@@ -1472,6 +1532,7 @@ impl Catalog {
             self.wal.flush()?;
         }
         let mut table = Table::create(schema, &self.data_dir)?;
+        table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
         table.set_defaults(defaults);
         table.set_auto_cols(auto_cols);
         let slot = self.tables.len();
@@ -2247,6 +2308,7 @@ impl Catalog {
         column: &str,
         unique: bool,
     ) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("create index")?;
         self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         self.by_name_mut(table)?
@@ -2415,6 +2477,7 @@ impl Catalog {
     }
 
     pub fn drop_expression_index(&mut self, table: &str, index_id: u64) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("drop index")?;
         self.invalidate_structure();
         validate_table_name(table)?;
         let removed = self
@@ -2459,6 +2522,7 @@ impl Catalog {
         json_path: StoredJsonPathV1,
         unique: bool,
     ) -> io::Result<u64> {
+        self.ensure_no_active_transaction_for_ddl("create index")?;
         self.invalidate_structure();
         validate_table_name(table)?;
         validate_column_name(&json_path.column)?;
@@ -2580,6 +2644,7 @@ impl Catalog {
     /// the catalog rename, the in-memory registry and the format version both
     /// revert and no partial state remains.
     pub fn create_link(&mut self, def: LinkDef) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("create link")?;
         self.invalidate_structure();
         validate_table_name(&def.owner_type)?;
         validate_table_name(&def.target_type)?;
@@ -2690,6 +2755,7 @@ impl Catalog {
     /// `NotFound` if no such link exists. Does not downgrade the format version
     /// (consistent with every other drop path — the version floor only rises).
     pub fn drop_link(&mut self, owner_type: &str, name: &str) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("drop link")?;
         self.invalidate_structure();
         let idx = self
             .links
@@ -2767,6 +2833,7 @@ impl Catalog {
     /// Drop a table: remove from the catalog and delete its data files.
     /// Returns `Err` if the table doesn't exist.
     pub fn drop_table(&mut self, name: &str) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("drop table")?;
         self.invalidate_structure();
         validate_table_name(name)?;
         let slot = *self.name_to_slot.get(name).ok_or_else(|| {
@@ -2851,6 +2918,7 @@ impl Catalog {
     /// and silently storing `Empty` in a required slot would just
     /// shift the invariant violation to the next query.
     pub fn alter_table_add_column(&mut self, table: &str, col: ColumnDef) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("alter table add column")?;
         self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         {
@@ -2943,6 +3011,7 @@ impl Catalog {
     /// through `Table::rewrite_rows_for_schema_change`. Dropping a
     /// column from an empty table skips the rewrite.
     pub fn alter_table_drop_column(&mut self, table: &str, col_name: &str) -> io::Result<()> {
+        self.ensure_no_active_transaction_for_ddl("alter table drop column")?;
         self.invalidate_structure();
         let data_dir = self.data_dir.clone();
         {
@@ -5333,5 +5402,209 @@ mod tests {
         assert!(result.is_err());
         // Should fail with InvalidInput (validation), not NotFound.
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Two-column table used by the DDL-in-transaction refusal tests.
+    fn ddl_guard_schema(name: &str) -> Schema {
+        Schema {
+            table_name: name.into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "label".into(),
+                    type_id: TypeId::Str,
+                    required: false,
+                    position: 1,
+                },
+            ],
+        }
+    }
+
+    fn seed_ddl_guard_catalog(dir: &std::path::Path) -> Catalog {
+        let mut cat = Catalog::create(dir).unwrap();
+        cat.create_table(ddl_guard_schema("Keep")).unwrap();
+        cat.create_index_unique("Keep", "id", true).unwrap();
+        cat.insert("Keep", &vec![Value::Int(1), Value::Str("one".into())])
+            .unwrap();
+        cat.sync_wal().unwrap();
+        cat
+    }
+
+    fn assert_refused_in_transaction(result: io::Result<()>, verb: &str) {
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "{verb} inside a transaction must be refused as InvalidInput"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with("cannot ") && message.contains("explicit transaction"),
+            "{verb} refusal must name the active transaction, got: {message}"
+        );
+    }
+
+    #[test]
+    fn drop_table_inside_transaction_is_refused_and_rollback_keeps_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = seed_ddl_guard_catalog(dir.path());
+        // Checkpoint first so the WAL no longer holds the records that created
+        // and populated `Keep`: rollback then has nothing to replay and the
+        // table can only survive if the DROP was refused outright.
+        cat.checkpoint().unwrap();
+
+        cat.begin_transaction().unwrap();
+        assert_refused_in_transaction(cat.drop_table("Keep"), "drop table");
+        cat.rollback_to_last_sync().unwrap();
+
+        let rows: Vec<_> = cat.scan("Keep").unwrap().collect();
+        assert_eq!(rows.len(), 1, "rolled-back DROP must not destroy data");
+        assert_eq!(rows[0].1[0], Value::Int(1));
+
+        // The heap file itself must still be there for the next open.
+        drop(cat);
+        let reopened = Catalog::open(dir.path()).unwrap();
+        assert_eq!(reopened.scan("Keep").unwrap().count(), 1);
+    }
+
+    #[test]
+    fn every_ddl_verb_inside_transaction_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = seed_ddl_guard_catalog(dir.path());
+        cat.create_table(ddl_guard_schema("Other")).unwrap();
+        cat.create_index_unique("Other", "id", true).unwrap();
+        cat.checkpoint().unwrap();
+
+        cat.begin_transaction().unwrap();
+
+        assert_refused_in_transaction(cat.create_table(ddl_guard_schema("New")), "create table");
+        assert_refused_in_transaction(cat.drop_table("Keep"), "drop table");
+        assert_refused_in_transaction(
+            cat.alter_table_add_column(
+                "Keep",
+                ColumnDef {
+                    name: "extra".into(),
+                    type_id: TypeId::Int,
+                    required: false,
+                    position: 2,
+                },
+            ),
+            "alter table add column",
+        );
+        assert_refused_in_transaction(
+            cat.alter_table_drop_column("Keep", "label"),
+            "alter table drop column",
+        );
+        assert_refused_in_transaction(cat.create_index("Keep", "label"), "create index");
+        assert_refused_in_transaction(
+            cat.create_index_unique("Keep", "label", true),
+            "create unique index",
+        );
+        assert_refused_in_transaction(
+            cat.create_link(LinkDef {
+                owner_type: "Other".into(),
+                name: "keep".into(),
+                target_type: "Keep".into(),
+                local_key: "id".into(),
+                target_key: "id".into(),
+                kind: LinkKind::ToOne,
+            }),
+            "create link",
+        );
+        assert_refused_in_transaction(cat.drop_link("Other", "keep"), "drop link");
+
+        cat.rollback_to_last_sync().unwrap();
+
+        // Every refused verb left the catalog exactly as it was.
+        let mut tables = cat.list_tables();
+        tables.sort_unstable();
+        assert_eq!(tables, vec!["Keep", "Other"]);
+        let schema = cat.schema("Keep").unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert!(!cat.has_index("Keep", "label"));
+        assert!(cat.links().next().is_none());
+        assert_eq!(cat.scan("Keep").unwrap().count(), 1);
+    }
+
+    #[test]
+    fn ddl_still_works_after_commit_and_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = seed_ddl_guard_catalog(dir.path());
+
+        cat.begin_transaction().unwrap();
+        assert!(cat.drop_table("Keep").is_err());
+        cat.rollback_to_last_sync().unwrap();
+        cat.create_table(ddl_guard_schema("AfterRollback")).unwrap();
+
+        cat.begin_transaction().unwrap();
+        cat.insert("Keep", &vec![Value::Int(2), Value::Str("two".into())])
+            .unwrap();
+        cat.commit_transaction().unwrap();
+        cat.drop_table("AfterRollback").unwrap();
+
+        let mut tables = cat.list_tables();
+        tables.sort_unstable();
+        assert_eq!(tables, vec!["Keep"]);
+        assert_eq!(cat.scan("Keep").unwrap().count(), 2);
+    }
+
+    #[test]
+    fn transaction_over_dirty_page_budget_is_refused_and_catalog_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Big")).unwrap();
+        // 8 pages across every table: small enough to trip in a few hundred
+        // rows, large enough that the first insert still fits.
+        cat.set_dirty_page_budget_bytes(8 * crate::page::PAGE_SIZE);
+        assert_eq!(cat.dirty_page_budget_bytes(), 8 * crate::page::PAGE_SIZE);
+
+        cat.begin_transaction().unwrap();
+        let mut refusal = None;
+        for i in 0..100_000i64 {
+            let row = vec![Value::Int(i), Value::Str(format!("row-{i:06}"))];
+            if let Err(e) = cat.insert("Big", &row) {
+                refusal = Some(e);
+                break;
+            }
+        }
+        let err = refusal.expect("an 8-page budget must refuse an unbounded transaction");
+        let typed = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<StorageError>());
+        assert!(
+            matches!(typed, Some(StorageError::TransactionTooLarge { .. })),
+            "expected a typed TransactionTooLarge, got: {err}"
+        );
+        assert!(cat.dirty_pages_buffered() <= 8);
+
+        // The refusal is not fatal: the connection rolls back and keeps working.
+        cat.rollback_to_last_sync().unwrap();
+        assert_eq!(cat.dirty_page_budget_bytes(), 8 * crate::page::PAGE_SIZE);
+        assert_eq!(cat.scan("Big").unwrap().count(), 0);
+        cat.insert("Big", &vec![Value::Int(1), Value::Str("after".into())])
+            .unwrap();
+        assert_eq!(cat.scan("Big").unwrap().count(), 1);
+    }
+
+    #[test]
+    fn autocommit_writes_are_not_capped_by_the_dirty_page_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Bulk")).unwrap();
+        cat.set_dirty_page_budget_bytes(8 * crate::page::PAGE_SIZE);
+
+        // Nothing pins the buffer for ROLLBACK here, so the budget is relieved
+        // by writing pages out rather than by failing the statement.
+        for i in 0..5_000i64 {
+            let row = vec![Value::Int(i), Value::Str(format!("row-{i:06}"))];
+            cat.insert("Bulk", &row).unwrap();
+        }
+        assert!(cat.dirty_pages_buffered() <= 8);
+        assert_eq!(cat.scan("Bulk").unwrap().count(), 5_000);
     }
 }
