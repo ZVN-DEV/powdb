@@ -95,6 +95,35 @@ while IFS= read -r ref; do
     || fail "site/ mentions $ref, expected v$current_release"
 done <<< "$site_versions"
 
+# The format and stability policies state what the *published* release
+# supports. Both drifted a whole minor behind (they still said v0.19.1 after
+# 0.20.0 shipped), which turns a compatibility promise into a guess, so pin the
+# version-bearing anchors in each. Historical version references elsewhere in
+# these documents are deliberately untouched.
+grep -qF "What the current release (v$current_release) supports:" docs/FORMAT.md \
+  || fail "docs/FORMAT.md does not state v$current_release as the current release"
+
+grep -qF "Across a patch (\`$current_release\` to " docs/STABILITY.md \
+  || fail "docs/STABILITY.md summary table patch column does not start at $current_release"
+grep -qF "Across a minor (\`${current_release%.*}\` to " docs/STABILITY.md \
+  || fail "docs/STABILITY.md summary table minor column does not start at ${current_release%.*}"
+
+# Install/pin examples must name the published release, never a stale one.
+stability_pins="$(grep -ohE -- '--version [0-9]+\.[0-9]+\.[0-9]+' docs/STABILITY.md | sort -u || true)"
+while IFS= read -r pin; do
+  [[ -n "$pin" ]] || continue
+  [[ "$pin" == "--version $current_release" ]] \
+    || fail "docs/STABILITY.md pins '$pin', expected --version $current_release"
+done <<< "$stability_pins"
+
+npm_pins="$(grep -ohE '"@zvndev/powdb-[a-z]+": "[0-9]+\.[0-9]+\.[0-9]+"' docs/STABILITY.md | sort -u || true)"
+while IFS= read -r pin; do
+  [[ -n "$pin" ]] || continue
+  pin_version="$(printf '%s\n' "$pin" | sed -n 's/.*: "\([^"]*\)"/\1/p')"
+  [[ "$pin_version" == "$current_release" ]] \
+    || fail "docs/STABILITY.md pins $pin, expected $current_release"
+done <<< "$npm_pins"
+
 grep -qE '^## \[Unreleased\]' CHANGELOG.md \
   || fail "CHANGELOG.md is missing the Unreleased section for v$workspace_version work"
 
@@ -121,4 +150,4 @@ if [[ "$next_minor_series" != "$minor_series" ]]; then
     || fail "SECURITY.md does not mark development series $next_minor_series as unreleased"
 fi
 
-log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, and SECURITY.md."
+log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, format/stability policies, and SECURITY.md."

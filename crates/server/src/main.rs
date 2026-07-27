@@ -40,6 +40,10 @@ struct Args {
     /// Fallback nested-loop join candidate-pair cap; env-only. `None` keeps the
     /// engine default (`MAX_NESTED_LOOP_PAIRS`).
     nested_loop_pair_limit: Option<usize>,
+    /// Ceiling in bytes on unflushed heap pages held across every table;
+    /// env-only. `None` keeps the storage default
+    /// (`DEFAULT_DIRTY_PAGE_BUDGET`).
+    dirty_page_budget: Option<usize>,
     require_tls: bool,
     /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
     metrics_addr: Option<String>,
@@ -95,6 +99,16 @@ fn parse_query_memory_limit(raw: Option<&str>) -> usize {
 /// a free function so it can be unit-tested without spawning the server,
 /// mirroring [`parse_query_memory_limit`].
 fn parse_nested_loop_pair_limit(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Parse the `POWDB_DIRTY_PAGE_BUDGET` environment value. Accepts a plain
+/// positive byte count for the ceiling on unflushed heap pages held across
+/// every table; `None` (unset, empty, unparseable, or zero) leaves the storage
+/// default (`DEFAULT_DIRTY_PAGE_BUDGET`, 256 MiB) in place. Mirrors
+/// [`parse_nested_loop_pair_limit`].
+fn parse_dirty_page_budget(raw: Option<&str>) -> Option<usize> {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
 }
@@ -188,6 +202,9 @@ fn parse_args() -> Args {
     // Fallback nested-loop join candidate-pair cap; env-only (no CLI flag).
     let nested_loop_pair_limit =
         parse_nested_loop_pair_limit(std::env::var("POWDB_MAX_NESTED_LOOP_PAIRS").ok().as_deref());
+    // Dirty-page (unflushed heap page) budget; env-only (no CLI flag).
+    let dirty_page_budget =
+        parse_dirty_page_budget(std::env::var("POWDB_DIRTY_PAGE_BUDGET").ok().as_deref());
     // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
     // `POWDB_READONLY` reuses the same truthy grammar as `POWDB_REQUIRE_TLS`.
@@ -342,6 +359,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_DB_NAME              Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_MAX_NESTED_LOOP_PAIRS  Fallback nested-loop join candidate-pair cap (default: 6,400,000)");
+                println!("    POWDB_DIRTY_PAGE_BUDGET    Ceiling in bytes on unflushed heap pages inside an explicit transaction (default: 256 MiB)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
@@ -370,6 +388,7 @@ fn parse_args() -> Args {
         tls_key,
         query_memory_limit,
         nested_loop_pair_limit,
+        dirty_page_budget,
         require_tls,
         metrics_addr,
         socket,
@@ -580,6 +599,13 @@ async fn main() {
         info!(
             nested_loop_pair_limit = limit,
             "fallback nested-loop join candidate-pair cap (POWDB_MAX_NESTED_LOOP_PAIRS)"
+        );
+    }
+    if let Some(limit) = args.dirty_page_budget {
+        engine.catalog_mut().set_dirty_page_budget_bytes(limit);
+        info!(
+            dirty_page_budget_bytes = limit,
+            "unflushed heap-page budget (POWDB_DIRTY_PAGE_BUDGET)"
         );
     }
 
@@ -1152,5 +1178,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let engine = Engine::with_memory_limit(&dir, limit).unwrap();
         assert_eq!(engine.query_memory_limit(), 2048);
+    }
+
+    #[test]
+    fn dirty_page_budget_env_parsing() {
+        // Unset / empty / garbage / zero all leave the storage default (None).
+        assert_eq!(parse_dirty_page_budget(None), None);
+        assert_eq!(parse_dirty_page_budget(Some("")), None);
+        assert_eq!(parse_dirty_page_budget(Some("not-a-number")), None);
+        assert_eq!(parse_dirty_page_budget(Some("0")), None);
+        // A positive byte count (including a small one for testing) overrides.
+        assert_eq!(parse_dirty_page_budget(Some("32768")), Some(32_768));
+        assert_eq!(
+            parse_dirty_page_budget(Some("  268435456 ")),
+            Some(268_435_456)
+        );
+    }
+
+    /// The parsed `POWDB_DIRTY_PAGE_BUDGET` value reaches the engine's catalog.
+    /// Without the wiring the catalog keeps `DEFAULT_DIRTY_PAGE_BUDGET`, which
+    /// is what made the 256 MiB ceiling unoverridable.
+    #[test]
+    fn env_dirty_page_budget_is_applied_to_engine() {
+        let budget = parse_dirty_page_budget(Some("32768")).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("powdb_srv_dirtybudget_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = Engine::with_memory_limit(&dir, DEFAULT_QUERY_MEMORY_LIMIT).unwrap();
+        assert_eq!(
+            engine.catalog().dirty_page_budget_bytes(),
+            powdb_storage::heap::DEFAULT_DIRTY_PAGE_BUDGET
+        );
+        engine.catalog_mut().set_dirty_page_budget_bytes(budget);
+        assert_eq!(engine.catalog().dirty_page_budget_bytes(), 32_768);
     }
 }

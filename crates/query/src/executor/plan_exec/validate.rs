@@ -5,6 +5,7 @@ use powdb_storage::catalog::Catalog;
 use powdb_storage::types::*;
 
 use crate::executor::compiled::*;
+use crate::executor::eval::date_unit_micros;
 
 use super::*;
 
@@ -184,10 +185,28 @@ fn collect_projected_names(plan: &PlanNode, out: &mut std::collections::HashSet<
 /// Resolve `name` in `scope` to a single column type. Returns `None` when the
 /// name is absent or resolves to more than one distinct type (ambiguous across
 /// joined tables) — both cases are skipped by the caller.
+///
+/// A bare name falls back to the field half of a join's `alias.field` columns,
+/// mirroring the runtime resolution in [`crate::executor::eval::resolve_column_index`]
+/// so validation types the same column the evaluator will read.
 fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
+    let exact = resolve_scan_type_by(scope, |n| n == name);
+    if exact.is_some() || name.contains('.') {
+        return exact;
+    }
+    resolve_scan_type_by(
+        scope,
+        |n| matches!(n.split_once('.'), Some((_, field)) if field == name),
+    )
+}
+
+fn resolve_scan_type_by(
+    scope: &[(String, TypeId)],
+    matches_name: impl Fn(&str) -> bool,
+) -> Option<TypeId> {
     let mut found: Option<TypeId> = None;
     for (n, t) in scope {
-        if n == name {
+        if matches_name(n) {
             match found {
                 None => found = Some(*t),
                 Some(prev) if prev == *t => {}
@@ -400,7 +419,8 @@ pub(crate) fn validate_column_references(
     // vouch for itself (that is exactly how `User { .agee }` used to slip past
     // and return a column of NULLs).
     let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_rebound_names(plan, &mut rebound);
+    let mut computed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_rebound_names(plan, &mut rebound, &mut computed);
     let mut known: std::collections::HashSet<String> =
         scope.iter().map(|(name, _)| name.clone()).collect();
     // A join's scan columns are named `alias.field`, and an unqualified
@@ -412,12 +432,94 @@ pub(crate) fn validate_column_references(
         }
     }
     known.extend(rebound.iter().cloned());
+    let mut ambiguous = ambiguous_bare_names(plan, catalog);
+    // Only a COMPUTED name is exempt from the ambiguity check, never a
+    // projection alias. A grouping or window node binds a real row column that
+    // the rest of the plan resolves by exact name, and the grouped resolver
+    // reports its own bare-name ambiguity with a message that names both
+    // candidates (`aggregate.rs::resolve_group_column`), so validation defers
+    // to it. A projection alias only renames a column of the RESULT; it makes
+    // nothing on the join input side resolvable, and letting it clear the set
+    // silently un-guarded every OTHER field in the same projection:
+    // `Cust join Ord on ... { name: Cust.name, .name }` resolved the bare
+    // `.name` by suffix match and answered from whichever side the plan put
+    // first, while the same `.name` alone was correctly refused.
+    for name in &computed {
+        ambiguous.remove(name);
+    }
     let ctx = ColumnScope {
         known,
         rebound,
+        ambiguous,
         scope,
     };
     check_plan_columns(plan, &ctx)
+}
+
+/// Bare field names that a join exposes under more than one alias.
+///
+/// The runtime resolves an unqualified `.field` inside a join by suffix match
+/// and takes the first hit ([`crate::executor::eval::resolve_column_index`]),
+/// which for two aliases exposing the same field name would silently answer
+/// from whichever side the plan happened to put first. There is no right
+/// answer, so the reference is a typed error instead.
+///
+/// Only aliases inside ONE join scope conflict: the branches of a `union`
+/// produce separate rows and each resolves its own names, so the walk stops at
+/// a `Union`. A name a plain (unaliased) scan also exposes is resolved by exact
+/// match at runtime and is therefore never ambiguous.
+fn ambiguous_bare_names(plan: &PlanNode, catalog: &Catalog) -> std::collections::HashSet<String> {
+    let mut scope: Vec<(String, TypeId)> = Vec::new();
+    collect_join_scope_columns(catalog, plan, &mut scope);
+    let mut owners: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for (name, _) in &scope {
+        let Some((qualifier, field)) = name.split_once('.') else {
+            continue;
+        };
+        match owners.get(field) {
+            Some(previous) if *previous != qualifier => {
+                ambiguous.insert(field.to_string());
+            }
+            Some(_) => {}
+            None => {
+                owners.insert(field, qualifier);
+            }
+        }
+    }
+    for (name, _) in &scope {
+        ambiguous.remove(name.as_str());
+    }
+    ambiguous
+}
+
+/// [`collect_scan_columns`] restricted to one join scope: it does not cross a
+/// `Union`, whose branches each resolve names against their own row.
+fn collect_join_scope_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(String, TypeId)>) {
+    match plan {
+        PlanNode::Union { .. } => {}
+        PlanNode::SeqScan { .. }
+        | PlanNode::IndexScan { .. }
+        | PlanNode::RangeScan { .. }
+        | PlanNode::AliasScan { .. } => collect_scan_columns(catalog, plan, out),
+        PlanNode::NestedLoopJoin { left, right, .. } => {
+            collect_join_scope_columns(catalog, left, out);
+            collect_join_scope_columns(catalog, right, out);
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => collect_join_scope_columns(catalog, input, out),
+        _ => {}
+    }
 }
 
 /// Resolution context for [`validate_column_references`].
@@ -428,6 +530,9 @@ struct ColumnScope {
     /// Names bound to a computed expression rather than passed through from a
     /// scan, so their scan type must not drive the comparison type check.
     rebound: std::collections::HashSet<String>,
+    /// Bare field names more than one joined alias exposes; see
+    /// [`ambiguous_bare_names`].
+    ambiguous: std::collections::HashSet<String>,
     /// Scan columns with their types.
     scope: Vec<(String, TypeId)>,
 }
@@ -436,7 +541,16 @@ struct ColumnScope {
 /// synthetic outputs of grouping and window functions. Unlike
 /// [`collect_projected_names`] this deliberately skips an unaliased `.col`,
 /// which passes the scan column through unchanged and therefore keeps its type.
-fn collect_rebound_names(plan: &PlanNode, out: &mut std::collections::HashSet<String>) {
+///
+/// `computed` receives the grouping and window outputs only. Those become real
+/// columns of the row later clauses read, while a projection alias only names a
+/// column of the RESULT; the ambiguity check treats the two differently, see
+/// [`validate_column_references`].
+fn collect_rebound_names(
+    plan: &PlanNode,
+    out: &mut std::collections::HashSet<String>,
+    computed: &mut std::collections::HashSet<String>,
+) {
     if let PlanNode::Project { fields, .. } = plan {
         for field in fields {
             if let Some(alias) = &field.alias {
@@ -450,14 +564,17 @@ fn collect_rebound_names(plan: &PlanNode, out: &mut std::collections::HashSet<St
         } => {
             for key in keys {
                 out.insert(key.output_name.clone());
+                computed.insert(key.output_name.clone());
             }
             for aggregate in aggregates {
                 out.insert(aggregate.output_name.clone());
+                computed.insert(aggregate.output_name.clone());
             }
         }
         PlanNode::Window { windows, .. } => {
             for window in windows {
                 out.insert(window.output_name.clone());
+                computed.insert(window.output_name.clone());
             }
         }
         _ => {}
@@ -475,10 +592,10 @@ fn collect_rebound_names(plan: &PlanNode, out: &mut std::collections::HashSet<St
         | PlanNode::Window { input, .. }
         | PlanNode::Update { input, .. }
         | PlanNode::Delete { input, .. }
-        | PlanNode::Explain { input } => collect_rebound_names(input, out),
+        | PlanNode::Explain { input } => collect_rebound_names(input, out, computed),
         PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
-            collect_rebound_names(left, out);
-            collect_rebound_names(right, out);
+            collect_rebound_names(left, out, computed);
+            collect_rebound_names(right, out, computed);
         }
         _ => {}
     }
@@ -566,6 +683,120 @@ fn comparison_type_error(left: &Expr, right: &Expr, ctx: &ColumnScope) -> Option
     ))
 }
 
+/// What an operand contributes to an arithmetic operator (`+ - * /`).
+enum ArithOperand {
+    Numeric,
+    /// An operand whose type is fixed before execution and is not a number,
+    /// carrying its PowQL spelling for the error message.
+    NonNumeric(&'static str),
+    /// A computed expression, a cast, a bound parameter, or a name a
+    /// projection rebinds: not typable before execution, so not checked.
+    Unknown,
+}
+
+fn arith_operand(expr: &Expr, ctx: &ColumnScope) -> ArithOperand {
+    match expr {
+        Expr::Literal(Literal::Int(_) | Literal::Float(_)) => ArithOperand::Numeric,
+        Expr::Literal(literal) => ArithOperand::NonNumeric(literal_type_name(literal)),
+        Expr::Field(_) | Expr::QualifiedField { .. } => match comparable_column(expr, ctx) {
+            Some((_, TypeId::Int | TypeId::Float)) => ArithOperand::Numeric,
+            Some((_, other)) => ArithOperand::NonNumeric(type_id_to_name(other)),
+            None => ArithOperand::Unknown,
+        },
+        _ => ArithOperand::Unknown,
+    }
+}
+
+/// The PowQL spelling of an arithmetic operator. Only the four arithmetic
+/// operators reach here, so `Div` covers the final arm.
+fn arith_op_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        _ => "/",
+    }
+}
+
+/// Reject arithmetic the evaluator cannot perform, which used to fall through
+/// to `Value::Empty` and answer a query with a missing value instead of an
+/// error (`Ev { .ts + 1 }` on a datetime column, `.id + "x"`, `.n / 0`).
+///
+/// Datetime arithmetic is deliberately an error rather than micros arithmetic.
+/// v0.20.0 made a DateTime and an Int COMPARE as micros because a timestamp
+/// literal has no distinct PowQL spelling and the comparison has one obvious
+/// meaning. Arithmetic does not: the result type of `datetime + int` (datetime
+/// or micros?) and of `datetime - datetime` (an interval PowDB has no type for)
+/// are open design questions, and `date_add` / `date_diff` already spell both
+/// unambiguously. Erroring keeps the door open, since widening an error into a
+/// supported operation later is backward compatible and the reverse is not.
+///
+/// The two rejections carry DIFFERENT variants because they are different
+/// mistakes. An operand of the wrong type really is a type mismatch, so it
+/// keeps [`QueryError::TypeError`] and its `type mismatch: ` prefix. A divisor
+/// of zero is well typed and simply has no answer, so prefixing it with
+/// `type mismatch: ` told the caller something false; it is an
+/// [`QueryError::Execution`] refusal instead. Both classify as the wire class
+/// `execution` (2), so this changes no class byte, only the sentence.
+fn arithmetic_type_error(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    ctx: &ColumnScope,
+) -> Option<QueryError> {
+    for operand in [left, right] {
+        if let ArithOperand::NonNumeric(type_name) = arith_operand(operand, ctx) {
+            return Some(QueryError::TypeError(format!(
+                "operator '{}' is not defined for {}; arithmetic requires int or float{}",
+                arith_op_symbol(op),
+                type_name,
+                if type_name == "datetime" {
+                    " (use date_add / date_diff for timestamps)"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    let divisor_is_zero = match right {
+        Expr::Literal(Literal::Int(value)) => *value == 0,
+        Expr::Literal(Literal::Float(value)) => *value == 0.0,
+        _ => false,
+    };
+    if op == BinOp::Div && divisor_is_zero {
+        // Leads with `cannot` so the server's egress allowlist
+        // (`SAFE_ERROR_PREFIXES` in crates/server/src/handler.rs) still
+        // forwards it verbatim now that it no longer starts with
+        // `type mismatch`.
+        return Some(QueryError::Execution(
+            "cannot divide by zero: the divisor is the literal 0".to_string(),
+        ));
+    }
+    None
+}
+
+/// Reject a `date_add` whose literal amount overflows its unit multiply. The
+/// multiply is checked at runtime too (`eval::eval_scalar_func`), but there it
+/// can only yield the empty set; a literal amount is known before any row is
+/// read, so it becomes a real error.
+///
+/// An amount too large for its unit is an arithmetic overflow, not a type
+/// mismatch, so it is an [`QueryError::Execution`] refusal phrased to lead with
+/// `cannot` (both for truth and to stay inside the server's egress allowlist).
+fn date_add_overflow_error(args: &[Expr]) -> Option<QueryError> {
+    let (Some(Expr::Literal(Literal::Int(amount))), Some(Expr::Literal(Literal::String(unit)))) =
+        (args.get(1), args.get(2))
+    else {
+        return None;
+    };
+    let factor = date_unit_micros(unit)?;
+    amount.checked_mul(factor).is_none().then(|| {
+        QueryError::Execution(format!(
+            "cannot compute date_add: amount {amount} overflows the representable range in units of '{unit}'"
+        ))
+    })
+}
+
 fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> {
     match expr {
         Expr::Field(name) => {
@@ -574,6 +805,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                     table: String::new(),
                     column: name.clone(),
                 });
+            }
+            if ctx.ambiguous.contains(name) {
+                return Err(QueryError::Execution(format!(
+                    "cannot resolve column '{name}': more than one joined table exposes it, qualify it as <alias>.{name}"
+                )));
             }
             Ok(())
         }
@@ -595,6 +831,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                     return Err(QueryError::Execution(message));
                 }
             }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+                if let Some(error) = arithmetic_type_error(left, *op, right, ctx) {
+                    return Err(error);
+                }
+            }
             check_expr_columns(left, ctx)?;
             check_expr_columns(right, ctx)
         }
@@ -606,7 +847,12 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
             check_expr_columns(inner, ctx)
         }
         Expr::JsonPath { base, .. } => check_expr_columns(base, ctx),
-        Expr::ScalarFunc(_, args) => {
+        Expr::ScalarFunc(func, args) => {
+            if *func == ScalarFn::DateAdd {
+                if let Some(error) = date_add_overflow_error(args) {
+                    return Err(error);
+                }
+            }
             for arg in args {
                 check_expr_columns(arg, ctx)?;
             }

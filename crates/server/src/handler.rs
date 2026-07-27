@@ -7,6 +7,7 @@ use powdb_query::executor::{is_read_only_statement, Engine, WalDurabilityTicket}
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
 use powdb_query::sql;
+use powdb_storage::error::StorageError;
 use powdb_storage::types::Value;
 use powdb_sync::{
     acknowledge_replica_apply, read_identity, read_units_through, replica_sync_status,
@@ -432,12 +433,20 @@ fn classify_query_error(e: &QueryError) -> ErrorClass {
         | QueryError::TypeError(_)
         | QueryError::IndexError(_)
         | QueryError::ViewError(_) => ErrorClass::Execution,
-        // Unique violations surface from storage as io::Error text; classify
-        // them by prefix like the Execution arm so the wire class matches
-        // docs/errors.md instead of collapsing to Internal.
+        // Storage refusals arrive here already rendered to text: the query
+        // crate stores them as `QueryError::StorageError(e.to_string())`, so
+        // the variant is gone. Recognize the ones the client can act on, using
+        // the predicates that live beside the messages they read
+        // (crates/storage/src/error.rs), so each gets the class docs/errors.md
+        // promises instead of collapsing to Internal ("server bug"), which
+        // tells a driver there is nothing to fix on its side.
         QueryError::StorageError(err) => {
-            if err.to_string().contains("unique constraint violation") {
+            if err.contains("unique constraint violation") {
                 ErrorClass::ConstraintViolation
+            } else if StorageError::is_transaction_too_large_message(err) {
+                ErrorClass::LimitExceeded
+            } else if StorageError::is_ddl_in_transaction_message(err) {
+                ErrorClass::Execution
             } else {
                 ErrorClass::Internal
             }
@@ -1899,6 +1908,63 @@ async fn acquire_autocommit_permit(
     }
 }
 
+/// Reject a frame whose text failed to parse, before the TxGate is touched.
+///
+/// A statement that executes nothing must acquire nothing. Admission is
+/// derived from the parsed AST and fails closed to [`AdmissionMode::Writer`],
+/// so routing an unparsable frame into the state machine made it queue for
+/// every gate permit (and then the engine write lock) only to have the engine
+/// return the same parse error: any principal, including a readonly role,
+/// could hold the whole gate by looping on garbage. The error is still
+/// counted so `powdb_queries_total{result="error"}` stays truthful.
+fn parse_failure_response(
+    message: &str,
+    metrics: &Arc<Metrics>,
+    start: Instant,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+) {
+    metrics.record_query(start.elapsed(), QueryOutcome::Error);
+    (
+        error_response(sanitize_error(message), ErrorClass::Parse),
+        None,
+        None,
+    )
+}
+
+/// Reject a frame the principal's role may not run, before the TxGate is
+/// touched.
+///
+/// Same rule as [`parse_failure_response`], and the same gap it closed: a
+/// PARSEABLE write from a readonly role took full writer admission (the whole
+/// gate) and queued for the engine write lock before the dispatcher reached
+/// [`check_statement_permitted`] and refused it. That variant needs no garbage
+/// at all, just `insert T { ... }` from a role without `Write`. Denying here
+/// makes the permit acquisition unreachable for a statement that will never
+/// execute; the dispatcher still re-checks, so the boundary stays enforced for
+/// every non-wire caller.
+fn permission_denied_response(
+    denied: &QueryError,
+    metrics: &Arc<Metrics>,
+    start: Instant,
+) -> (
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+) {
+    metrics.record_query(start.elapsed(), QueryOutcome::Error);
+    (
+        error_response(
+            sanitize_error(&denied.to_string()),
+            classify_query_error(denied),
+        ),
+        None,
+        None,
+    )
+}
+
 /// Run the shared four-arm transaction-routing state machine for one wire
 /// query frame, returning the response plus its un-waited WAL durability
 /// ticket. The TxGate permit is managed here and, crucially, is already
@@ -2185,12 +2251,21 @@ async fn execute_wire_query<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let query_deadline = Instant::now() + query_timeout;
+    let start = Instant::now();
+    let query_deadline = start + query_timeout;
     // Parse each frame once for transaction routing, admission, and role
     // enforcement. The engine still canonicalizes/parses as needed for plan
     // cache execution, but the server no longer repeats the same parse in
     // three separate routing helpers before reaching it.
     let stmt_result = parser::parse(&query).map_err(|e| e.to_string());
+    match &stmt_result {
+        Err(message) => return parse_failure_response(message, metrics, start),
+        Ok(stmt) => {
+            if let Err(denied) = check_statement_permitted(principal.as_ref(), stmt) {
+                return permission_denied_response(&denied, metrics, start);
+            }
+        }
+    }
     let parsed_query = Arc::new((query, stmt_result));
     let tx_control = parsed_transaction_control(&parsed_query.1);
     let autocommit_admission = parsed_query
@@ -2252,8 +2327,17 @@ async fn execute_wire_query_sql<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let query_deadline = Instant::now() + query_timeout;
+    let start = Instant::now();
+    let query_deadline = start + query_timeout;
     let stmt_result = sql::parse_sql(&query).map_err(|e| e.to_string());
+    match &stmt_result {
+        Err(message) => return parse_failure_response(message, metrics, start),
+        Ok(stmt) => {
+            if let Err(denied) = check_statement_permitted(principal.as_ref(), stmt) {
+                return permission_denied_response(&denied, metrics, start);
+            }
+        }
+    }
     let parsed_query = Arc::new((query, stmt_result));
     let tx_control = parsed_transaction_control(&parsed_query.1);
     let autocommit_admission = parsed_query
@@ -2319,9 +2403,18 @@ async fn execute_wire_query_with_params<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let query_deadline = Instant::now() + query_timeout;
+    let start = Instant::now();
+    let query_deadline = start + query_timeout;
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
     let stmt_result = parser::parse_with_params(&query, &bound).map_err(|e| e.to_string());
+    match &stmt_result {
+        Err(message) => return parse_failure_response(message, metrics, start),
+        Ok(stmt) => {
+            if let Err(denied) = check_statement_permitted(principal.as_ref(), stmt) {
+                return permission_denied_response(&denied, metrics, start);
+            }
+        }
+    }
     let parsed_query = Arc::new((query, bound, stmt_result));
     let tx_control = parsed_transaction_control(&parsed_query.2);
     let autocommit_admission = parsed_query
@@ -3893,6 +3986,394 @@ mod tests {
         );
     }
 
+    fn one_row_engine() -> (tempfile::TempDir, Arc<RwLock<Engine>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        engine
+            .execute_powql("type User { required id: int }")
+            .unwrap();
+        engine.execute_powql("insert User { id := 1 }").unwrap();
+        (dir, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn unparsable_frame_is_rejected_without_acquiring_any_permit() {
+        let (_dir, engine) = one_row_engine();
+        // A single-permit gate whose only permit is already held: any
+        // acquisition at all, reader or writer, would have to wait.
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+        assert_eq!(gate.available_permits(), 0);
+
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, ticket, termination) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query(
+                engine,
+                gate.clone(),
+                &mut tx_permit,
+                "this is not valid PowQL".into(),
+                WireResultMode::Native,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("an unparsable frame must never wait on the transaction gate");
+
+        match message {
+            Message::ErrorWithClass { class, .. } => assert_eq!(class, ErrorClass::Parse),
+            other => panic!("expected a typed parse error, got {other:?}"),
+        }
+        assert!(ticket.is_none());
+        assert!(termination.is_none());
+        assert!(tx_permit.is_none());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "a statement that executes nothing must acquire nothing"
+        );
+        drop(held_reader);
+        assert_eq!(gate.available_permits(), 1);
+        // The rejected frame is still a failed statement from the client's view.
+        assert!(metrics
+            .render()
+            .contains("powdb_queries_total{result=\"error\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn unparsable_frame_is_rejected_without_a_permit_on_every_frontend() {
+        let (_dir, engine) = one_row_engine();
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let _held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+
+        let (_sql_client, sql_server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(sql_server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, _, _) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query_sql(
+                Arc::clone(&engine),
+                gate.clone(),
+                &mut tx_permit,
+                "SELEKT * FROM".into(),
+                WireResultMode::Native,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("an unparsable SQL frame must never wait on the transaction gate");
+        assert!(matches!(
+            message,
+            Message::ErrorWithClass {
+                class: ErrorClass::Parse,
+                ..
+            }
+        ));
+
+        let (_params_client, params_server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(params_server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, _, _) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query_with_params(
+                engine,
+                gate.clone(),
+                &mut tx_permit,
+                "User filter .id = = $1".into(),
+                vec![WireParam::Int(1)],
+                WireResultMode::Native,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("an unparsable parameterized frame must never wait on the transaction gate");
+        assert!(matches!(
+            message,
+            Message::ErrorWithClass {
+                class: ErrorClass::Parse,
+                ..
+            }
+        ));
+        assert_eq!(gate.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn forbidden_write_is_denied_without_acquiring_any_permit() {
+        let (_dir, engine) = one_row_engine();
+        // A single-permit gate whose only permit is already held: writer
+        // admission takes the whole gate, so any acquisition would have to
+        // wait out the full tx_wait_timeout below.
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+        assert_eq!(gate.available_permits(), 0);
+
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, ticket, termination) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query(
+                engine,
+                gate.clone(),
+                &mut tx_permit,
+                "insert User { id := 2 }".into(),
+                WireResultMode::Native,
+                principal("readonly"),
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("a statement the principal may not run must never wait on the gate");
+
+        match message {
+            Message::ErrorWithClass { message, class } => {
+                assert!(
+                    message.contains("permission denied"),
+                    "unexpected message: {message}"
+                );
+                assert_eq!(class, ErrorClass::Execution);
+            }
+            other => panic!("expected a typed permission error, got {other:?}"),
+        }
+        assert!(ticket.is_none());
+        assert!(termination.is_none());
+        assert!(tx_permit.is_none());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "a statement the principal may not run must acquire nothing"
+        );
+        drop(held_reader);
+        assert_eq!(gate.available_permits(), 1);
+        assert!(metrics
+            .render()
+            .contains("powdb_queries_total{result=\"error\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn forbidden_write_is_denied_without_a_permit_on_every_frontend() {
+        let (_dir, engine) = one_row_engine();
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let _held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+
+        let (_sql_client, sql_server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(sql_server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, _, _) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query_sql(
+                Arc::clone(&engine),
+                gate.clone(),
+                &mut tx_permit,
+                "INSERT INTO User (id) VALUES (2)".into(),
+                WireResultMode::Native,
+                principal("readonly"),
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("a forbidden SQL write must never wait on the gate");
+        assert!(
+            matches!(
+                &message,
+                Message::ErrorWithClass { message, class: ErrorClass::Execution }
+                    if message.contains("permission denied")
+            ),
+            "unexpected SQL response: {message:?}"
+        );
+
+        let (_params_client, params_server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(params_server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, _, _) = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_wire_query_with_params(
+                engine,
+                gate.clone(),
+                &mut tx_permit,
+                "insert User { id := $1 }".into(),
+                vec![WireParam::Int(2)],
+                WireResultMode::Native,
+                principal("readonly"),
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("a forbidden parameterized write must never wait on the gate");
+        assert!(
+            matches!(
+                &message,
+                Message::ErrorWithClass { message, class: ErrorClass::Execution }
+                    if message.contains("permission denied")
+            ),
+            "unexpected parameterized response: {message:?}"
+        );
+        assert_eq!(gate.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn unparsable_flood_cannot_starve_a_concurrent_reader() {
+        let (_dir, engine) = one_row_engine();
+        let gate = new_tx_gate_with_permits(2);
+        let metrics = Arc::new(Metrics::new());
+        // One connection is mid-read and holds reader admission, so writer
+        // admission (the whole gate) stays unavailable for as long as it runs.
+        let _held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+
+        let flood_engine = Arc::clone(&engine);
+        let flood_gate = gate.clone();
+        let flood_metrics = Arc::clone(&metrics);
+        let flood = tokio::spawn(async move {
+            let (_client, server) = tokio::io::duplex(1024);
+            let mut reader = BufReader::new(server);
+            let mut wire_read_buffer = Vec::new();
+            let mut pending_messages = InFlightReadAhead::default();
+            let mut tx_permit = None;
+            for _ in 0..64 {
+                let (message, _, _) = execute_wire_query(
+                    Arc::clone(&flood_engine),
+                    flood_gate.clone(),
+                    &mut tx_permit,
+                    ")))".into(),
+                    WireResultMode::Native,
+                    None,
+                    Duration::from_secs(2),
+                    Duration::from_secs(10),
+                    &flood_metrics,
+                    &mut reader,
+                    &mut wire_read_buffer,
+                    &mut pending_messages,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        message,
+                        Message::ErrorWithClass {
+                            class: ErrorClass::Parse,
+                            ..
+                        }
+                    ),
+                    "unexpected flood response: {message:?}"
+                );
+            }
+        });
+        // Give the flood time to queue for the gate if it takes admission.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (_reader_client, reader_server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(reader_server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let (message, _, _) = tokio::time::timeout(
+            Duration::from_millis(500),
+            execute_wire_query(
+                engine,
+                gate.clone(),
+                &mut tx_permit,
+                "User filter .id = 1".into(),
+                WireResultMode::Native,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(10),
+                &metrics,
+                &mut reader,
+                &mut wire_read_buffer,
+                &mut pending_messages,
+            ),
+        )
+        .await
+        .expect("a real reader must complete while unparsable frames flood another connection");
+        assert!(matches!(message, Message::ResultRowsNative { .. }));
+        flood.await.expect("flood task");
+    }
+
     #[tokio::test]
     async fn writer_admission_excludes_readers() {
         let gate = new_tx_gate();
@@ -4160,6 +4641,56 @@ mod tests {
         assert!(
             err.to_string().starts_with("result too large"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ---- Wire classes for the typed storage refusals ----
+
+    #[test]
+    fn ddl_inside_a_transaction_reaches_clients_as_a_client_error() {
+        let (_dir, engine) = one_row_engine();
+        let (begin, _) = dispatch_query(&engine, "begin", None, true);
+        begin.expect("begin");
+
+        let (result, _) = dispatch_query(&engine, "drop User", None, true);
+        let err = result.expect_err("DDL inside an explicit transaction must be refused");
+        assert_eq!(
+            classify_query_error(&err),
+            ErrorClass::Execution,
+            "refusing DDL because the connection is mid-transaction is the client's mistake; \
+             ErrorClass::Internal tells the driver it hit a server bug it cannot act on"
+        );
+        // The class is only half of it: the guidance has to survive egress
+        // sanitization or the client is told to act on nothing.
+        assert!(
+            sanitize_error(&err.to_string()).contains("DDL is not transactional"),
+            "guidance was masked: {err}"
+        );
+    }
+
+    #[test]
+    fn transaction_over_the_dirty_page_budget_reaches_clients_as_a_limit() {
+        // The refusal the heap raises (crates/storage/src/heap.rs) after the
+        // query crate erases its type: `QueryError::StorageError` carries only
+        // the rendered message, which is all the server ever sees.
+        let raised = std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            StorageError::TransactionTooLarge {
+                pages: 65_536,
+                limit_bytes: 268_435_456,
+            },
+        );
+        let err = QueryError::StorageError(raised.to_string());
+        assert_eq!(
+            classify_query_error(&err),
+            ErrorClass::LimitExceeded,
+            "a transaction refused by the dirty-page budget is a resource limit, the same \
+             class MemoryLimitExceeded already carries"
+        );
+        assert_eq!(
+            sanitize_error(&err.to_string()),
+            err.to_string(),
+            "the budget message names the limit and the remedy; it must cross verbatim"
         );
     }
 

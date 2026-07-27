@@ -467,9 +467,15 @@ impl Engine {
                                     }
                                     _ => None,
                                 };
+                                // Same resolver the projections, filters and
+                                // join keys use, so `order .amount` inside a
+                                // join resolves the bare name against the
+                                // `alias.field` scan columns instead of
+                                // reporting a column the next clause projects
+                                // as missing.
                                 let index = stored_name
                                     .as_ref()
-                                    .and_then(|name| columns.iter().position(|c| c == name));
+                                    .and_then(|name| resolve_column_index(name, &columns));
                                 if let Some(name) = stored_name {
                                     if index.is_none() {
                                         return Err(QueryError::ColumnNotFound {

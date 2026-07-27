@@ -6,6 +6,8 @@ use crate::types::RowId;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub const HEAP_MAGIC: &[u8; 5] = b"PHEAP";
 /// The heap superblock version a fresh heap is created with. A database that
@@ -85,6 +87,107 @@ fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<(u32, u16)> {
     Ok((first_data_page, version))
 }
 
+/// Default ceiling on unflushed heap pages held in memory: 256 MiB, charged
+/// across every table in a catalog. Mirrors the per-query byte budget in
+/// `powdb-query`'s `mem_budget`.
+///
+/// A default, not a hard ceiling: operators raise or lower it with
+/// `POWDB_DIRTY_PAGE_BUDGET` (the server reads that env var and applies it via
+/// [`crate::catalog::Catalog::set_dirty_page_budget_bytes`]), the same way
+/// `POWDB_QUERY_MEMORY_LIMIT` overrides the per-query budget. A host with the
+/// RAM for a larger bulk-load transaction can raise it; a memory-capped host
+/// should lower it.
+pub const DEFAULT_DIRTY_PAGE_BUDGET: usize = 256 * 1024 * 1024;
+
+/// Shared accounting for dirty (mutated but not yet written) heap pages.
+///
+/// `dirty_buffer` is otherwise uncapped, and its only drains
+/// ([`HeapFile::flush_all_dirty`], [`HeapFile::discard_dirty`]) may not run
+/// mid-transaction: a large enough transaction pins unbounded memory, and
+/// under `panic = "abort"` an allocation failure kills the whole process
+/// rather than the statement. One budget is shared by every heap a catalog
+/// owns so the cap covers the engine, not a single table.
+///
+/// Outside an explicit transaction an over-budget heap simply writes its
+/// buffer out (which is what scans and checkpoints already do). Inside one it
+/// cannot: ROLLBACK works by *discarding* the unflushed pages, so spilling
+/// them would make the transaction unrollbackable. There the mutation is
+/// refused with [`StorageError::TransactionTooLarge`].
+pub struct DirtyPageBudget {
+    pages: AtomicUsize,
+    limit_bytes: AtomicUsize,
+    rollback_pinned: AtomicBool,
+}
+
+impl Default for DirtyPageBudget {
+    fn default() -> Self {
+        Self::new(DEFAULT_DIRTY_PAGE_BUDGET)
+    }
+}
+
+impl DirtyPageBudget {
+    pub fn new(limit_bytes: usize) -> Self {
+        DirtyPageBudget {
+            pages: AtomicUsize::new(0),
+            limit_bytes: AtomicUsize::new(limit_bytes),
+            rollback_pinned: AtomicBool::new(false),
+        }
+    }
+
+    pub fn limit_bytes(&self) -> usize {
+        self.limit_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_limit_bytes(&self, limit_bytes: usize) {
+        self.limit_bytes.store(limit_bytes, Ordering::Relaxed);
+    }
+
+    /// Pages currently buffered across every heap sharing this budget.
+    pub fn charged_pages(&self) -> usize {
+        self.pages.load(Ordering::Relaxed)
+    }
+
+    /// Set while an explicit transaction is open: the buffered pages are the
+    /// only copy of the pre-COMMIT state, so they must not be spilled to disk.
+    pub fn set_rollback_pinned(&self, pinned: bool) {
+        self.rollback_pinned.store(pinned, Ordering::Relaxed);
+    }
+
+    pub fn is_rollback_pinned(&self) -> bool {
+        self.rollback_pinned.load(Ordering::Relaxed)
+    }
+
+    /// Reserve room for one more buffered page. `false` means the budget is
+    /// full; nothing is charged in that case.
+    fn try_charge_page(&self) -> bool {
+        let limit_pages = self.limit_bytes.load(Ordering::Relaxed) / PAGE_SIZE;
+        if self.pages.fetch_add(1, Ordering::Relaxed) >= limit_pages {
+            self.pages.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Charge `pages` without a limit check. Used only when an already
+    /// populated heap joins a different budget.
+    fn force_charge(&self, pages: usize) {
+        self.pages.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    /// Saturating on purpose: a wrapped counter would refuse every future
+    /// page and turn this guard into the outage it exists to prevent.
+    fn release(&self, pages: usize) {
+        if pages == 0 {
+            return;
+        }
+        let _ = self
+            .pages
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
+                Some(charged.saturating_sub(pages))
+            });
+    }
+}
+
 /// A single dirty page pinned in memory for write-back coalescing.
 ///
 /// Mission C Phase 1: the previous write path did `read_page + write_page`
@@ -143,6 +246,9 @@ pub struct HeapFile {
     /// [`flush_all_dirty`] call (or `Drop`). Scan operations call
     /// `flush_all_dirty` first so their view is consistent with disk.
     dirty_buffer: FxHashMap<u32, Page>,
+    /// Cap on how much `dirty_buffer` may hold, shared with every other heap
+    /// in the same catalog. See [`DirtyPageBudget`].
+    dirty_budget: Arc<DirtyPageBudget>,
     free_overflow_pages: Vec<u32>,
     heap_version: u16,
 }
@@ -163,6 +269,7 @@ impl HeapFile {
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
+            dirty_budget: Arc::new(DirtyPageBudget::default()),
             free_overflow_pages: Vec::new(),
             heap_version: HEAP_FORMAT_VERSION,
         })
@@ -259,9 +366,24 @@ impl HeapFile {
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
+            dirty_budget: Arc::new(DirtyPageBudget::default()),
             free_overflow_pages: Vec::new(),
             heap_version,
         })
+    }
+
+    /// Join `budget`, the dirty-page cap shared by every heap in a catalog.
+    /// Called right after the heap is created or opened.
+    pub fn set_dirty_budget(&mut self, budget: Arc<DirtyPageBudget>) {
+        let held = self.dirty_buffer.len();
+        self.dirty_budget.release(held);
+        budget.force_charge(held);
+        self.dirty_budget = budget;
+    }
+
+    /// Pages this heap is currently holding unflushed (test/diagnostic hook).
+    pub fn dirty_page_count(&self) -> usize {
+        self.dirty_buffer.len()
     }
 
     pub fn format_version(&self) -> u16 {
@@ -312,13 +434,44 @@ impl HeapFile {
     ///
     /// Mission C Phase 9: this was previously a write-through. Now the
     /// only callers that actually touch disk are `flush_all_dirty`,
-    /// `enable_mmap`, and `Drop`.
-    fn park_hot_page(&mut self) {
+    /// `enable_mmap`, `Drop`, and the over-budget relief path below.
+    ///
+    /// Parking is where `dirty_buffer` grows, so it is also where the shared
+    /// [`DirtyPageBudget`] is charged. A full budget outside an explicit
+    /// transaction is relieved by draining the buffer to disk; inside one the
+    /// pages cannot be spilled without breaking ROLLBACK, so the mutation is
+    /// refused with a typed error instead of growing until the process dies.
+    fn park_hot_page(&mut self) -> io::Result<()> {
+        if !self.hot_page.as_ref().is_some_and(|hot| hot.dirty) {
+            self.hot_page = None;
+            return Ok(());
+        }
+        if !self.dirty_budget.try_charge_page() {
+            if self.dirty_budget.is_rollback_pinned() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    StorageError::TransactionTooLarge {
+                        pages: self.dirty_budget.charged_pages(),
+                        limit_bytes: self.dirty_budget.limit_bytes(),
+                    },
+                ));
+            }
+            // Draining the whole buffer (rather than writing just this page)
+            // keeps the relief an amortized batch eviction. The hot page is
+            // written by the flush too, so it is clean afterwards and needs
+            // no buffer slot.
+            self.flush_all_dirty()?;
+            self.hot_page = None;
+            return Ok(());
+        }
         if let Some(hot) = self.hot_page.take() {
-            if hot.dirty {
-                self.dirty_buffer.insert(hot.page_id, hot.page);
+            // `ensure_hot` uncharges whatever it pulls out of the buffer, so a
+            // replacement here would mean the page was charged twice.
+            if self.dirty_buffer.insert(hot.page_id, hot.page).is_some() {
+                self.dirty_budget.release(1);
             }
         }
+        Ok(())
     }
 
     /// Public API kept for compatibility: park the hot page AND flush
@@ -345,6 +498,7 @@ impl HeapFile {
         if !self.dirty_buffer.is_empty() {
             // Drain via a swap to avoid borrowing `self` twice.
             let drained: Vec<(u32, Page)> = self.dirty_buffer.drain().collect();
+            self.dirty_budget.release(drained.len());
             for (mut page, page_id) in drained.into_iter().map(|(id, p)| (p, id)) {
                 page.stamp_checksum();
                 self.disk.write_page(page_id, page.as_bytes())?;
@@ -367,13 +521,14 @@ impl HeapFile {
                 return Ok(());
             }
         }
-        self.park_hot_page();
+        self.park_hot_page()?;
 
         // Mission C Phase 9: reclaim the page from the dirty buffer if
         // we've touched it before. This is the hot path for scattered
         // delete/update workloads — we re-visit the same pages via the
         // index lookups and don't want to re-read them from disk.
         if let Some(page) = self.dirty_buffer.remove(&page_id) {
+            self.dirty_budget.release(1);
             self.hot_page = Some(HotPage {
                 page_id,
                 page,
@@ -423,7 +578,7 @@ impl HeapFile {
     /// Install a freshly-allocated page (no disk read) as the hot page.
     /// The previous hot page, if any, is parked into the dirty buffer.
     fn install_fresh_hot(&mut self, page_id: u32, page: Page) -> io::Result<()> {
-        self.park_hot_page();
+        self.park_hot_page()?;
         self.hot_page = Some(HotPage {
             page_id,
             page,
@@ -1928,6 +2083,7 @@ impl HeapFile {
         // Drop the hot page without parking it into the dirty buffer.
         self.hot_page = None;
         // Clear every buffered dirty page — they contain uncommitted writes.
+        self.dirty_budget.release(self.dirty_buffer.len());
         self.dirty_buffer.clear();
         // Tear down the mmap so stale mappings don't confuse the next reader.
         self.disable_mmap();
@@ -2384,6 +2540,87 @@ mod tests {
             heap.insert(&encode_row(&schema, &row)).unwrap();
         }
         assert_eq!(heap.scan().count(), 500);
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Fill `heap` until the shared budget refuses another buffered page,
+    /// returning the error. `None` means the budget never tripped.
+    fn fill_until_budget_trips(heap: &mut HeapFile, rows: usize) -> Option<io::Error> {
+        let schema = user_schema();
+        for i in 0..rows {
+            let row = vec![Value::Str(format!("user_{i:06}")), Value::Int(i as i64)];
+            if let Err(e) = heap.insert(&encode_row(&schema, &row)) {
+                return Some(e);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn pinned_budget_refuses_growth_with_a_typed_error() {
+        let (mut heap, path) = temp_heap("dirty_budget_pinned");
+        let budget = Arc::new(DirtyPageBudget::new(8 * PAGE_SIZE));
+        budget.set_rollback_pinned(true);
+        heap.set_dirty_budget(Arc::clone(&budget));
+
+        let err = fill_until_budget_trips(&mut heap, 100_000)
+            .expect("an 8-page budget must refuse an unbounded pinned transaction");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        let typed = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<StorageError>());
+        assert!(
+            matches!(typed, Some(StorageError::TransactionTooLarge { .. })),
+            "expected a typed TransactionTooLarge, got: {err}"
+        );
+        assert!(
+            err.to_string().starts_with("cannot "),
+            "message must survive server-side sanitization: {err}"
+        );
+        // The refusal is a bound, not a leak: nothing grew past the budget.
+        assert!(budget.charged_pages() <= 8);
+
+        // Releasing the pin (as ROLLBACK does) makes the heap usable again.
+        heap.discard_dirty();
+        budget.set_rollback_pinned(false);
+        assert_eq!(budget.charged_pages(), 0);
+        assert!(fill_until_budget_trips(&mut heap, 2_000).is_none());
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unpinned_budget_spills_instead_of_failing() {
+        let (mut heap, path) = temp_heap("dirty_budget_unpinned");
+        let budget = Arc::new(DirtyPageBudget::new(8 * PAGE_SIZE));
+        heap.set_dirty_budget(Arc::clone(&budget));
+
+        // No explicit transaction pins the buffer, so an over-budget heap
+        // writes its pages out rather than refusing the insert. Autocommit
+        // statements and WAL replay both depend on this.
+        assert!(fill_until_budget_trips(&mut heap, 5_000).is_none());
+        assert!(budget.charged_pages() <= 8);
+        assert_eq!(heap.scan().count(), 5_000);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn budget_accounting_returns_to_zero_after_flush() {
+        let (mut heap, path) = temp_heap("dirty_budget_accounting");
+        let budget = Arc::new(DirtyPageBudget::default());
+        heap.set_dirty_budget(Arc::clone(&budget));
+
+        assert!(fill_until_budget_trips(&mut heap, 2_000).is_none());
+        assert!(budget.charged_pages() > 0, "inserts must charge the budget");
+        assert_eq!(budget.charged_pages(), heap.dirty_page_count());
+
+        heap.flush_all_dirty().unwrap();
+        assert_eq!(budget.charged_pages(), 0);
+
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

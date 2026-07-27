@@ -1671,6 +1671,73 @@ commit
 - Transactions are per-connection. Other connections do not see uncommitted rows.
 - Nesting transactions is not supported -- calling `begin` inside an open transaction is an error.
 
+### DDL is not transactional
+
+**DDL must be run outside `begin` / `commit`.** A DDL statement issued while an
+explicit transaction is open is refused with an error like:
+
+```
+cannot run create table inside an explicit transaction: DDL is not transactional
+in PowDB, commit or roll back first
+```
+
+DDL applies immediately and irreversibly: `drop` unlinks the heap file and
+rewrites the catalog on the spot, and `alter` rewrites every row in place.
+`rollback` restores the catalog from disk, which by then already reflects the
+DDL, so a `begin` / `drop` / `rollback` sequence would report success at every
+step and leave the table permanently gone. Refusing the statement is the only
+answer that does not silently destroy data.
+
+Refused inside an explicit transaction:
+
+| Statement | Refusal verb |
+|---|---|
+| `type T { ... }` | `create table` |
+| `materialize V as ...` (creates a backing table) | `create table` |
+| `alter T add column ...` | `alter table add column` |
+| `alter T drop column ...` | `alter table drop column` |
+| `alter T add index ...` / `alter T add unique ...` | `create index` |
+| `alter T drop index (...)` | `drop index` |
+| `link T.x -> U on ...` / `alter T add link ...` | `create link` |
+| `drop T` | `drop table` |
+
+DML (`insert`, `update`, `delete`, `upsert`) and reads are unaffected -- those
+are exactly what transactions are for. Run schema changes first, then open the
+transaction:
+
+```
+type User { required name: str, age: int }   -- DDL, outside the transaction
+begin
+insert User { name := "Alice", age := 30 }
+insert User { name := "Bob", age := 25 }
+commit
+```
+
+Making DDL transactional is a separate, deliberately deferred decision. Until it
+lands, a migration that mixes schema changes and data changes is not atomic:
+each DDL statement commits on its own, and a failure partway through leaves the
+schema half-migrated. Plan migrations so each DDL step is independently safe to
+re-run.
+
+### Transaction size limit
+
+The unflushed pages an explicit transaction accumulates cannot be spilled to
+disk without breaking `rollback` (rollback works by *discarding* them), so they
+are held in memory and charged against a **dirty-page budget** -- 256 MiB by
+default, shared across every table. A transaction that would exceed it is
+refused with:
+
+```
+cannot buffer more of this transaction: N unflushed pages exceed the
+268435456 byte dirty-page budget, commit or roll back
+```
+
+This is a clean, typed refusal rather than an out-of-memory kill. `commit` (or
+`rollback`) releases the buffer, so the fix is to split a very large bulk load
+into several transactions. Operators can raise or lower the ceiling with the
+server's `POWDB_DIRTY_PAGE_BUDGET` environment variable (bytes); see the
+configuration table in the README.
+
 ### Concurrency behavior
 
 Reads run in parallel, but PowDB has no MVCC and serializes writers through a

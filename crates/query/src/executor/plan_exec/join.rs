@@ -111,7 +111,10 @@ fn resolve_side_column(expr: &Expr, columns: &[String]) -> Option<usize> {
                     && b[q.len() + 1..] == *f
             })
         }
-        Expr::Field(name) => columns.iter().position(|c| c == name),
+        // An unqualified `on .user_id = ...` inside a join resolves the same way
+        // the evaluator does, so the hash-join key extraction sees the column
+        // instead of falling back to the nested loop.
+        Expr::Field(name) => resolve_column_index(name, columns),
         _ => None,
     }
 }

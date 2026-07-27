@@ -1887,9 +1887,13 @@ impl Engine {
                                     }
                                     _ => None,
                                 };
+                                // Same resolver the read-write sort path and
+                                // every other clause use, so the readonly path
+                                // does not disagree with them about whether
+                                // `order .amount` inside a join names a column.
                                 let index = stored_name
                                     .as_ref()
-                                    .and_then(|name| columns.iter().position(|c| c == name));
+                                    .and_then(|name| resolve_column_index(name, &columns));
                                 if let Some(name) = stored_name {
                                     if index.is_none() {
                                         return Err(QueryError::ColumnNotFound {

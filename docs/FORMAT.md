@@ -25,6 +25,22 @@ start at page id 1. The superblock stores `PHEAP`, heap format version, flags,
 page size, and the first data page id. Existing heap files whose page 0 is not a
 meta superblock are opened as legacy heap v1.
 
+## Page checksums
+
+Every page flushed by the write path carries a CRC32 stamped into its header
+(the checksum flag in the high nibble alongside the page format version). Cold
+reads verify it; the hot mmap scan path deliberately does not, because
+re-hashing 4KB per page on the critical path would erase the scan wins.
+
+Since v0.20.0 the heap open scan verifies every page it reads instead of
+skipping unreadable ones, so a corrupt page makes the database refuse to open
+with a typed `PageCorrupt` error. That check runs before WAL replay: the
+previous behavior deferred the failure to the first read that touched the page,
+and a corrupt page that later panicked under `panic = "abort"` put a supervised
+server into a permanent restart loop. There is no salvage or skip-corrupt-pages
+mode; recover by restoring a backup. `HeapFile::verify_integrity()` scans a whole
+file on demand for a scrub that does not depend on which read path serves a page.
+
 ## Rows
 
 New row bytes are `PROW` + `u16 version` + the legacy compact row body. The body
@@ -65,7 +81,7 @@ it is used by production code.
 
 ## Format version support policy
 
-What the current release (v0.19.1) supports:
+What the current release (v0.20.0) supports:
 
 - **Reads:** every on-disk version listed in the table above, which is every
   version any released PowDB has ever written. No released data directory is
@@ -95,7 +111,9 @@ the following hold:
 - At least **4 minor versions** have shipped since the last release whose
   writer could produce that version (the superseding release). Example: a
   format superseded in v0.16.0 keeps its read branch through at least v0.19.x
-  and may be removed in v0.20.0 at the earliest.
+  and becomes *eligible* for removal in v0.20.0. Eligible is not scheduled: the
+  pre-v3 index rebuild reached that point in v0.20.0 and stayed. See Current
+  status below.
 - A **stepping-stone release** exists that migrates the structure to a current
   version automatically (rewrite-on-open, lazy bump on first touch, or index
   rebuild-on-open), or, failing that, a documented offline migration exists

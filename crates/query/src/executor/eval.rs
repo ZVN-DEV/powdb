@@ -186,6 +186,16 @@ pub(super) fn value_to_expr(val: Value) -> Expr {
 pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String> {
     use TypeId::*;
     match (&val, col.type_id) {
+        // A missing value passes through, even for a `required` column. That is
+        // a known gap: a per-row expression that evaluates to the empty set
+        // (division by a per-row zero, a missing JSON path) can land in a
+        // required column. Rejecting it here is worse, because coercion runs
+        // per row *inside* the expression-update write loop
+        // (`plan_exec/dispatch.rs`), which writes each row as it goes and
+        // commits when the statement returns whether or not it errored: the
+        // rejection turned one bad row into a torn, durably committed update of
+        // the rows before it. Closing this needs statement-level atomicity, not
+        // a per-row refusal on the write path.
         (Value::Empty, _) => Ok(val),
         (Value::Int(_), Int) => Ok(val),
         (Value::Float(_), Float) => Ok(val),
@@ -371,6 +381,27 @@ pub(super) fn eval_expr(expr: &Expr, row: &[Value], columns: &[String]) -> Value
     eval_expr_mode(expr, row, columns, CmpMode::Filter)
 }
 
+/// Resolve an unqualified field name against the row's column names.
+///
+/// An exact match wins. Failing that, a join names its output columns
+/// `alias.field`, and PowQL accepts the unqualified `.field` spelling inside a
+/// join (`User join Order on User.id = Order.user_id { .name, .amount }`), so
+/// the bare name also resolves against the field half of a qualified column.
+/// Without that second pass the exact match missed and every such projection
+/// evaluated to `Empty`: a row of NULLs for a query the validator accepted.
+///
+/// A bare name two aliases both expose has no single answer; that case is a
+/// typed error raised by `validate_column_references` before any row is read,
+/// so the first suffix match here is the only match.
+pub(super) fn resolve_column_index(name: &str, columns: &[String]) -> Option<usize> {
+    if let Some(index) = columns.iter().position(|c| c == name) {
+        return Some(index);
+    }
+    columns
+        .iter()
+        .position(|c| matches!(c.split_once('.'), Some((_, field)) if field == name))
+}
+
 pub(super) fn eval_expr_mode(
     expr: &Expr,
     row: &[Value],
@@ -378,9 +409,7 @@ pub(super) fn eval_expr_mode(
     mode: CmpMode,
 ) -> Value {
     match expr {
-        Expr::Field(name) => columns
-            .iter()
-            .position(|c| c == name)
+        Expr::Field(name) => resolve_column_index(name, columns)
             .map(|i| row[i].clone())
             .unwrap_or(Value::Empty),
         Expr::QualifiedField { qualifier, field } => {
@@ -711,8 +740,10 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             Value::Str(result)
         }
         // Math functions
+        // `i64::MIN.abs()` has no representable result: it panics under
+        // overflow checks and wraps back to `i64::MIN` in release.
         ScalarFn::Abs => match args.first() {
-            Some(Value::Int(n)) => Value::Int(n.abs()),
+            Some(Value::Int(n)) => n.checked_abs().map_or(Value::Empty, Value::Int),
             Some(Value::Float(f)) => Value::Float(f.abs()),
             _ => Value::Empty,
         },
@@ -802,16 +833,24 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
                 Some(Value::Str(s)) => s.as_str(),
                 _ => return Value::Empty,
             };
-            let delta_micros = match unit {
-                "microsecond" | "microseconds" | "us" => amount,
-                "millisecond" | "milliseconds" | "ms" => amount * 1_000,
-                "second" | "seconds" | "s" => amount * 1_000_000,
-                "minute" | "minutes" | "m" => amount * 60_000_000,
-                "hour" | "hours" | "h" => amount * 3_600_000_000,
-                "day" | "days" | "d" => amount * 86_400_000_000,
-                _ => return Value::Empty,
+            let Some(factor) = date_unit_micros(unit) else {
+                return Value::Empty;
             };
-            Value::DateTime(micros + delta_micros)
+            // Both steps used to be unchecked: `date_add(.ts, 9223372036854775807,
+            // "day")` panicked under overflow checks (a remote abort with
+            // `panic = "abort"`) and wrapped to a bogus timestamp in release.
+            // A literal amount that overflows the unit multiply is refused by
+            // `validate_column_references` before any row is read;
+            // an amount or base that only overflows for some rows cannot be typed
+            // statically, so it yields the empty set like every other date_add
+            // bail-out above.
+            match amount
+                .checked_mul(factor)
+                .and_then(|delta| micros.checked_add(delta))
+            {
+                Some(result) => Value::DateTime(result),
+                None => Value::Empty,
+            }
         }
         ScalarFn::DateDiff => {
             // date_diff(dt1, dt2, "unit")
@@ -829,21 +868,36 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
                 Some(Value::Str(s)) => s.as_str(),
                 _ => return Value::Empty,
             };
-            let diff = m1 - m2;
-            let result = match unit {
-                "microsecond" | "microseconds" | "us" => diff,
-                "millisecond" | "milliseconds" | "ms" => diff / 1_000,
-                "second" | "seconds" | "s" => diff / 1_000_000,
-                "minute" | "minutes" | "m" => diff / 60_000_000,
-                "hour" | "hours" | "h" => diff / 3_600_000_000,
-                "day" | "days" | "d" => diff / 86_400_000_000,
-                _ => return Value::Empty,
+            let Some(factor) = date_unit_micros(unit) else {
+                return Value::Empty;
             };
-            Value::Int(result)
+            // Two stored timestamps a full i64 range apart overflow the
+            // subtraction, which panics under overflow checks; the difference is
+            // not representable, so the result is the empty set.
+            match m1.checked_sub(m2) {
+                Some(diff) => Value::Int(diff / factor),
+                None => Value::Empty,
+            }
         }
         // `json_type` is intercepted in `eval_expr` (it needs the raw PJ1 node,
         // not a scalarized Value); it never reaches this Value-based dispatch.
         ScalarFn::JsonType | ScalarFn::JsonText => Value::Empty,
+    }
+}
+
+/// Microseconds in one `date_add` / `date_diff` unit, or `None` for a unit
+/// spelling neither function accepts. Shared with the planner-side validation
+/// that rejects a literal `date_add` amount whose unit multiply overflows
+/// (`plan_exec/validate.rs`), so both agree on the accepted spellings.
+pub(super) fn date_unit_micros(unit: &str) -> Option<i64> {
+    match unit {
+        "microsecond" | "microseconds" | "us" => Some(1),
+        "millisecond" | "milliseconds" | "ms" => Some(1_000),
+        "second" | "seconds" | "s" => Some(1_000_000),
+        "minute" | "minutes" | "m" => Some(60_000_000),
+        "hour" | "hours" | "h" => Some(3_600_000_000),
+        "day" | "days" | "d" => Some(86_400_000_000),
+        _ => None,
     }
 }
 
@@ -1022,6 +1076,14 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             (Value::Bool(a), Value::Bool(b)) => Value::Bool(*a || *b),
             _ => Value::Bool(false),
         },
+        // Arithmetic is defined on numbers only. An operand whose type is known
+        // before execution and is not a number (a datetime, str, bool, uuid,
+        // bytes or json column, or a string / bool literal) is rejected as a
+        // typed error by `validate_column_references`, so `.ts + 1` no longer
+        // reaches here and quietly answers with the empty set. What still falls
+        // through to the `_` arms is a MISSING operand, which propagates as
+        // missing per SQL NULL semantics, and an operand whose type is only
+        // known per row (a cast, a scalar function, a JSON path).
         BinOp::Add => match (left, right) {
             (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
@@ -1048,6 +1110,8 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             // overflow case, which panics even in release builds (and with
             // `panic = "abort"` that is a remotely-craftable process crash).
             // Returning `Empty` on either matches the sibling arithmetic arms.
+            // A literal zero divisor is a typed error at validation; only a
+            // divisor that is zero for some rows reaches this guard.
             (Value::Int(a), Value::Int(b)) => a.checked_div(*b).map_or(Value::Empty, Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
