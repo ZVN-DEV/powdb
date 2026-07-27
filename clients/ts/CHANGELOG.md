@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.21.0 - 2026-07-27
+
 ## 0.20.0 - 2026-07-25
 
 - **Security (medium): bounded result allocation.** A hostile or MITM'd server
