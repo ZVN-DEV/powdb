@@ -260,3 +260,68 @@ fn substring_rejects_a_negative_length() {
         Value::Str("bcdef".to_string())
     );
 }
+
+// ─── exact int/float comparison at extreme magnitudes ───────────────────────
+
+/// Row count of `query`, which must return Rows.
+fn row_count(engine: &mut Engine, query: &str) -> usize {
+    match engine.execute_powql(query) {
+        Ok(QueryResult::Rows { rows, .. }) => rows.len(),
+        Ok(other) => panic!("`{query}` returned {other:?}"),
+        Err(err) => panic!("`{query}` failed: {err}"),
+    }
+}
+
+/// Int/Float filter comparison is exact at every magnitude, on every access
+/// path. The defect this pins: widening the int side with `as f64` rounds
+/// `i64::MAX` up to 2^63, so `.v = 9223372036854775808.0` matched a row
+/// holding `i64::MAX` on the interpreted path while the (exact) index
+/// machinery matched nothing, and the answer depended on the access path.
+#[test]
+fn an_out_of_range_float_literal_matches_no_int_on_any_access_path() {
+    for add_index in [false, true] {
+        for force_generic in [false, true] {
+            let mut engine = Engine::new(&fresh_dir()).expect("engine opens over a fresh temp dir");
+            exec(&mut engine, "type T { required unique id: int, v: int }");
+            exec(
+                &mut engine,
+                "insert T { id := 1, v := 9223372036854775807 }",
+            );
+            exec(&mut engine, "insert T { id := 2, v := 0 }");
+            exec(
+                &mut engine,
+                "insert T { id := 3, v := -9223372036854775807 }",
+            );
+            if add_index {
+                exec(&mut engine, "alter T add index .v");
+            }
+            engine.set_force_generic_path(force_generic);
+            let label = format!("index={add_index} generic={force_generic}");
+            assert_eq!(
+                row_count(&mut engine, "T filter .v = 9223372036854775808.0 { .id }"),
+                0,
+                "2^63 equals no i64, but matched ({label})"
+            );
+            assert_eq!(
+                row_count(&mut engine, "T filter .v < 9223372036854775808.0 { .id }"),
+                3,
+                "every i64 is below 2^63 ({label})"
+            );
+            assert_eq!(
+                row_count(&mut engine, "T filter .v >= 9223372036854775808.0 { .id }"),
+                0,
+                "no i64 reaches 2^63 ({label})"
+            );
+            assert_eq!(
+                row_count(&mut engine, "T filter .v > -10000000000000000000.0 { .id }"),
+                3,
+                "every i64 is above -1e19 ({label})"
+            );
+            assert_eq!(
+                row_count(&mut engine, "T filter .v = -0.0 { .id }"),
+                1,
+                "0 equals -0.0 by numeric value ({label})"
+            );
+        }
+    }
+}

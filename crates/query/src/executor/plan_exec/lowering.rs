@@ -389,19 +389,25 @@ fn coerce_column_index_key(col_type: TypeId, key: &Expr, probe: ProbeKind) -> Op
         }
         (Expr::Literal(Literal::String(_)), TypeId::Str) => Some(key.clone()),
         (Expr::Literal(Literal::Bool(_)), TypeId::Bool) => Some(key.clone()),
-        // Int literal into a float column: widen to `f64`, exactly as the
-        // compiled float leaf and `Value::Ord` both do, so the float-typed
-        // index key matches. The widening is lossy past `2^53`, but it is the
-        // SAME loss the scan applies, so the two still agree.
+        // Int literal into a float column: widen to `f64` ONLY when the
+        // widening is exact. The scan rule (`eval::int_f64_cmp`) compares by
+        // exact numeric value at every magnitude, so a literal past 2^53 that
+        // rounds when widened would make the float-lane probe match keys the
+        // scan correctly refuses. Rejecting the index falls back to the scan,
+        // which is exact.
         (Expr::Literal(Literal::Int(v)), TypeId::Float) => {
             let widened = *v as f64;
+            if crate::executor::eval::int_f64_cmp(*v, widened) != std::cmp::Ordering::Equal {
+                return None;
+            }
             float_key_is_faithful(widened, probe).then_some(Expr::Literal(Literal::Float(widened)))
         }
         // Float literal into an int column. As a bound this is exact whenever
-        // the float names an integer the widening reaches; as an equality probe
-        // it never is, because the scan compares Int against Float with
-        // strictly-typed equality and matches nothing at all. Probing the Int
-        // lane with `Int(0)` for `.n = 0.0` returned a row the scan does not.
+        // `exact_int_bound` accepts the float. As an equality probe it is
+        // conservatively rejected: the scan's exact numeric rule would let an
+        // integral float probe the Int lane, but rejecting the index just
+        // falls back to that same exact scan, so this stays a perf question,
+        // not a correctness one.
         (Expr::Literal(Literal::Float(v)), TypeId::Int) => match probe {
             ProbeKind::LowerBound { .. } | ProbeKind::UpperBound { .. } => {
                 exact_int_bound(*v).map(|v| Expr::Literal(Literal::Int(v)))

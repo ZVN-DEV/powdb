@@ -1079,13 +1079,17 @@ fn eval_cast(val: Value, target: CastType) -> Value {
 ///
 /// Both pairings are the same rule for the same reason:
 ///
-///   * **Int/Float** — `Value::Ord` promotes the int to `f64` and compares with
-///     `total_cmp`, exactly as `compiled::CompiledLeaf::Float` does. Widening
-///     is lossy above `2^53`, but it is the SAME loss on both paths, and it is
-///     already what `<`, `<=`, `>` and `>=` did here, so leaving `=` strict
-///     made the six operators contradict each other: `.n < 1.0` false,
-///     `.n > 1.0` false, `.n <= 1.0` true, `.n >= 1.0` true and `.n = 1.0`
-///     false is not a total order.
+///   * **Int/Float** — compared EXACTLY, by numeric value, via
+///     [`int_f64_cmp`]: no precision loss at any magnitude. Widening the int
+///     with `as f64` is not an option here even though `Value::Ord` does it
+///     for sorting: `i64::MAX as f64` rounds up to 2^63 exactly, so a lossy
+///     rule lets `.id = 9223372036854775808.0` match a row holding
+///     `i64::MAX` while the index machinery (which is exact) says nothing
+///     matches, and the answer would depend on the access path. Exactness
+///     also keeps the six operators a total order: leaving `=` strict while
+///     `<` and `>=` were numeric made `.n < 1.0` false, `.n > 1.0` false,
+///     `.n <= 1.0` true, `.n >= 1.0` true and `.n = 1.0` false, which is not
+///     an order at all.
 ///   * **DateTime/Int** — a timestamp literal has no distinct spelling in
 ///     PowQL, so `.created_at > 1700000000000000` arrives as DateTime vs Int.
 ///     Without this the pair falls to `Value::Ord`'s type-discriminant tail and
@@ -1116,13 +1120,57 @@ fn cross_type_numeric_cmp(
     match (left, right) {
         (Value::DateTime(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Int(a), Value::DateTime(b)) => Some(a.cmp(b)),
-        (Value::Int(a), Value::Float(b)) if mode == CmpMode::Filter => {
-            Some((*a as f64).total_cmp(b))
-        }
+        (Value::Int(a), Value::Float(b)) if mode == CmpMode::Filter => Some(int_f64_cmp(*a, *b)),
         (Value::Float(a), Value::Int(b)) if mode == CmpMode::Filter => {
-            Some(a.total_cmp(&(*b as f64)))
+            Some(int_f64_cmp(*b, *a).reverse())
         }
         _ => None,
+    }
+}
+
+/// Exact comparison of an `i64` against an `f64` by numeric value, with no
+/// precision loss at any magnitude (the SQLite approach). Returns the ordering
+/// of the int relative to the float.
+///
+/// Why not `(i as f64).total_cmp(&f)`: that widening is lossy above 2^53
+/// (`i64::MAX as f64` rounds up to 2^63), so it would call `i64::MAX` equal
+/// to `9223372036854775808.0` while the index-probe machinery, which is
+/// exact, matches nothing. Every consumer of this rule (the generic
+/// evaluator, the compiled JSON scalar leaves) must agree with the index
+/// path, so the rule is exact everywhere.
+///
+/// NaN sorts above every number, matching `f64::total_cmp` and `Value::Ord`.
+/// `-0.0` equals `0`, which `total_cmp` would not say; equality by numeric
+/// value is the whole point of the rule.
+pub(crate) fn int_f64_cmp(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    // 2^63 and -2^63 are exactly representable in f64; every i64 lies in
+    // [-2^63, 2^63).
+    if f >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    if f < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    // In range, truncation toward zero is exact. Above 2^53 an f64 has no
+    // fractional part, so `t as f64` round-trips exactly there too; below
+    // 2^53 every i64 in range is exactly representable.
+    let t = f as i64;
+    match i.cmp(&t) {
+        Ordering::Equal => {
+            let frac = f - t as f64;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
     }
 }
 
@@ -1278,7 +1326,47 @@ pub(super) fn like_match(text: &str, pattern: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::int_f64_cmp;
     use super::like_match;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn int_f64_cmp_is_exact_at_every_magnitude() {
+        // The defect this pins: `i64::MAX as f64` rounds up to 2^63, so a
+        // lossy rule calls i64::MAX equal to 9223372036854775808.0.
+        assert_eq!(
+            int_f64_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
+            Ordering::Less
+        );
+        assert_eq!(
+            int_f64_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
+            Ordering::Equal,
+            "-2^63 is exactly representable and exactly i64::MIN"
+        );
+        assert_eq!(int_f64_cmp(i64::MIN, -1e19), Ordering::Greater);
+        assert_eq!(int_f64_cmp(i64::MAX, f64::INFINITY), Ordering::Less);
+        assert_eq!(int_f64_cmp(i64::MIN, f64::NEG_INFINITY), Ordering::Greater);
+        // 2^53 is the last f64-exact neighborhood; both sides of it compare
+        // exactly.
+        assert_eq!(
+            int_f64_cmp(9_007_199_254_740_992, 9_007_199_254_740_992.0),
+            Ordering::Equal
+        );
+        assert_eq!(
+            int_f64_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Ordering::Greater,
+            "2^53 + 1 must not collapse onto 2^53"
+        );
+        // Fractions order around the truncated integer.
+        assert_eq!(int_f64_cmp(3, 3.5), Ordering::Less);
+        assert_eq!(int_f64_cmp(4, 3.5), Ordering::Greater);
+        assert_eq!(int_f64_cmp(-3, -3.5), Ordering::Greater);
+        assert_eq!(int_f64_cmp(-4, -3.5), Ordering::Less);
+        // Numeric equality, not bit equality: 0 equals -0.0.
+        assert_eq!(int_f64_cmp(0, -0.0), Ordering::Equal);
+        // NaN sorts above every number, matching total_cmp and Value::Ord.
+        assert_eq!(int_f64_cmp(i64::MAX, f64::NAN), Ordering::Less);
+    }
 
     #[test]
     fn test_like_match_correctness() {

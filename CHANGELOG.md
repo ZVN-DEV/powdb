@@ -34,14 +34,14 @@ if you hold long transactions, write a driver, or read `catalog.bin` directly.**
   saturating.** `i64::MAX + 1` previously clamped to `i64::MAX`; a query that
   relied on the saturating result now reads a missing value.
 - **Int and Float now compare numerically in filters, on every access path.**
-  The six comparison operators widen the int side to a 64-bit float (lossy
-  above 2^53), so `.score = 3` matches a stored `3.0` whether the filter runs
-  compiled, interpreted, or through an index, and `=`, `<`, and `>=` agree as
-  one total order. Previously the answer could depend on the access path: an
-  indexed filter could match a row the same filter missed without the index.
-  `group by`, `distinct`, and join keys are unchanged and keep int and float
-  distinct. JSON path comparisons follow the same rule: `.data->views = 10.0`
-  now matches an integer node `10`.
+  The six comparison operators compare by exact numeric value, with no
+  precision loss at any magnitude, so `.score = 3` matches a stored `3.0`
+  whether the filter runs compiled, interpreted, or through an index, and
+  `=`, `<`, and `>=` agree as one total order. Previously the answer could
+  depend on the access path: an indexed filter could match a row the same
+  filter missed without the index. `group by`, `distinct`, and join keys are
+  unchanged and keep int and float distinct. JSON path comparisons follow the
+  same rule: `.data->views = 10.0` now matches an integer node `10`.
 - **Link cardinality is re-derived on every read** instead of read from the
   catalog byte: a link is to-one exactly when the target key currently carries
   a unique index. `alter <Target> add unique .<key>` now promotes a link with

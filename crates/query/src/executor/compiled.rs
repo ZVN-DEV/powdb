@@ -1,6 +1,7 @@
 //! Compiled predicates and fast-path layout utilities.
 
 use crate::ast::*;
+use crate::executor::eval::int_f64_cmp;
 use powdb_storage::pj1::{pj1_get, PathSeg as Pj1Seg};
 use powdb_storage::row::{decode_column, row_is_v2, RowLayout, ROW_MAGIC, ROW_PREFIX_SIZE};
 use powdb_storage::types::*;
@@ -527,7 +528,7 @@ fn json_scalar_eq(node: Option<&[u8]>, lit: &Value) -> bool {
             let a = i64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
                 Value::Int(l) => a == *l,
-                Value::Float(l) => (a as f64).total_cmp(l) == Ordering::Equal,
+                Value::Float(l) => int_f64_cmp(a, *l) == Ordering::Equal,
                 _ => false,
             }
         }
@@ -535,7 +536,7 @@ fn json_scalar_eq(node: Option<&[u8]>, lit: &Value) -> bool {
             let a = f64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
                 Value::Float(l) => a.total_cmp(l) == Ordering::Equal,
-                Value::Int(l) => a.total_cmp(&(*l as f64)) == Ordering::Equal,
+                Value::Int(l) => int_f64_cmp(*l, a) == Ordering::Equal,
                 _ => false,
             }
         }
@@ -569,7 +570,7 @@ fn json_scalar_cmp(node: Option<&[u8]>, lit: &Value) -> Ordering {
             let a = i64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
                 Value::Int(b) => a.cmp(b),
-                Value::Float(b) => (a as f64).total_cmp(b),
+                Value::Float(b) => int_f64_cmp(a, *b),
                 other => type_id_cmp(TypeId::Int, other.type_id()),
             }
         }
@@ -577,7 +578,7 @@ fn json_scalar_cmp(node: Option<&[u8]>, lit: &Value) -> Ordering {
             let a = f64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
                 Value::Float(b) => a.total_cmp(b),
-                Value::Int(b) => a.total_cmp(&(*b as f64)),
+                Value::Int(b) => int_f64_cmp(*b, a).reverse(),
                 other => type_id_cmp(TypeId::Float, other.type_id()),
             }
         }
@@ -814,9 +815,24 @@ fn build_float_leaf(
     // Accept either direction: field-op-literal or literal-op-field.
     // When the literal is on the left, flip the operator so the hot-loop
     // eval can assume the field is always the LHS.
+    //
+    // An Int literal is widened to the leaf's f64 ONLY when the leaf's
+    // `total_cmp` then agrees with the reference rule (`eval::int_f64_cmp`),
+    // which compares by exact numeric value at every magnitude. Two literals
+    // fail that: one past 2^53 that rounds when widened (9223372036854775807
+    // becomes 2^63.0) would match floats the interpreted path correctly
+    // refuses, and literal `0`, because `total_cmp` says `-0.0 < 0.0` while
+    // the numeric rule says a stored `-0.0` equals int `0`. Declining
+    // compilation routes the predicate to the generic evaluator, which is
+    // exact; a zero spelled as a FLOAT literal (`.v > 0.0`) keeps the leaf
+    // and its pinned total-order zero semantics.
+    let exact_widened = |v: i64| {
+        let w = v as f64;
+        (v != 0 && int_f64_cmp(v, w) == Ordering::Equal).then_some(w)
+    };
     let (field_name, literal_val, op) = match (left, right) {
         (Expr::Field(name), Expr::Literal(Literal::Float(v))) => (name, *v, op),
-        (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, *v as f64, op),
+        (Expr::Field(name), Expr::Literal(Literal::Int(v))) => (name, exact_widened(*v)?, op),
         (Expr::Literal(Literal::Float(v)), Expr::Field(name)) => {
             let flipped = match op {
                 BinOp::Lt => BinOp::Gt,
@@ -835,7 +851,7 @@ fn build_float_leaf(
                 BinOp::Gte => BinOp::Lte,
                 other => other,
             };
-            (name, *v as f64, flipped)
+            (name, exact_widened(*v)?, flipped)
         }
         _ => return None,
     };

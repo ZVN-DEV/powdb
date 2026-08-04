@@ -317,8 +317,10 @@ User filter .name = "Alice"
 User filter .score != 0
 ```
 
-**Typing rule for numbers.** `int` and `float` compare numerically: the int
-side is widened to a 64-bit float (lossy above 2^53), and all six operators
+**Typing rule for numbers.** `int` and `float` compare numerically and
+exactly: an int and a float are equal only when they denote the same number,
+with no precision loss at any magnitude (`.v = 9223372036854775808.0`
+matches no int, because 2^63 exceeds every int), and all six operators
 follow that single total order on every access path (compiled, interpreted,
 or through an index). This applies to comparisons only: `group by`,
 `distinct`, and join keys keep int and float distinct, so `1` and `1.0` are
