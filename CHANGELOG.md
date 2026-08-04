@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+**Behavior changes that can affect running servers. Read these before upgrading
+if you hold long transactions, write a driver, or read `catalog.bin` directly.**
+
+- **Explicit transactions now have a maximum lifetime, and it is default-on.**
+  `POWDB_TX_MAX_LIFETIME_MS` defaults to `300000` (five minutes). A `begin`
+  still open after that is rolled back, the write-admission gate is released,
+  and the connection is closed with a class-3 `timeout` error. If the budget
+  expires while a reply is being written and that write cannot finish, the
+  server closes the connection without sending the error frame (anything
+  written after a partly-sent frame would be read as its payload); a client
+  should treat an unexpected close during an open transaction exactly like a
+  timeout. Every uncommitted
+  write is gone: no partial commit, no resume. The clock starts at `begin` and
+  nothing extends it. It applies to legitimate long transactions exactly as it
+  applies to abandoned ones, migrations and bulk loads included. Rationale: an
+  explicit transaction holds the single write-admission gate, so one connection
+  could previously block every other connection indefinitely. Raise the budget
+  for long migrations (for example `3600000`), or set it to `0` to disable the
+  bound and restore the pre-0.22 behavior. Reaps are counted at
+  `powdb_tx_reaped_total`, and each one logs a warning naming the peer. The
+  embedded API is unaffected.
+- **Integer arithmetic that overflows now returns Empty instead of
+  saturating.** `i64::MAX + 1` previously clamped to `i64::MAX`; a query that
+  relied on the saturating result now reads a missing value.
+- **Int and Float now compare numerically in filters, on every access path.**
+  The six comparison operators widen the int side to a 64-bit float (lossy
+  above 2^53), so `.score = 3` matches a stored `3.0` whether the filter runs
+  compiled, interpreted, or through an index, and `=`, `<`, and `>=` agree as
+  one total order. Previously the answer could depend on the access path: an
+  indexed filter could match a row the same filter missed without the index.
+  `group by`, `distinct`, and join keys are unchanged and keep int and float
+  distinct. JSON path comparisons follow the same rule: `.data->views = 10.0`
+  now matches an integer node `10`.
+- **Link cardinality is re-derived on every read** instead of read from the
+  catalog byte: a link is to-one exactly when the target key currently carries
+  a unique index. `alter <Target> add unique .<key>` now promotes a link with
+  no re-declaration, DDL order no longer changes behavior, and `schema links`,
+  `describe`, `explain`, and traversal all report the same derived answer.
+- **The to-many refusal message now leads with the schema fix**
+  (`alter <Target> add unique .<key>`) and says explicitly when a plain index
+  on the target key is what blocks that statement.
+
+### Added
+
+- **Wire protocol version negotiation.** `Connect` and `ConnectOk` carry
+  optional trailing hello blocks (protocol version range, catalog format
+  ceiling, named features). A mismatch is now a typed `Error` during the
+  handshake instead of an unknown tag mid-session.
+- **Error class 10 (`ProtocolVersion`)**, sent in place of `ConnectOk` when the
+  two sides cannot agree, after which the server closes the connection.
+- **Handshake conformance vectors** at
+  `crates/server/tests/wire_vectors/handshake.txt`, decoded and re-encoded by
+  the Rust server and the TypeScript client on every CI run, and usable by any
+  driver.
+- **TypeScript client:** `CLIENT_CAPABILITIES`, `PROTOCOL_VERSION_NEGOTIATED`,
+  `WIRE_FEATURE`, `Client.protocolVersion`, `Client.hasFeature`,
+  `Client.serverHello`, and opt-in `requireProtocolVersion` / `requireFeatures`.
+  `SUPPORTED_CATALOG_VERSION` is now derived from `CLIENT_CAPABILITIES`.
+
+### Fixed (correctness)
+
+- **A prepared `update` filtered on an indexed column could silently lose the
+  write.** The prepared fast path probed every index as if it were a unique
+  int index, so on float, datetime, str, or bool columns, or under a
+  non-unique int index, it reported `Modified(0)` and wrote nothing while the
+  same statement as text modified the row. The fast path now applies only
+  where its assumption is provably true (a unique int index); everything else
+  takes the general path. The wire path was unaffected; embedded prepared
+  statements were not.
+- **Reading a projection or aggregate of a stale materialized view returned
+  pre-write data.** The fast paths scanned the view's backing heap without the
+  dirty check, so `V { .col }` could disagree with `V` on the same engine.
+  Every read now refreshes the dirty views the plan names before executing.
+- **A materialized view whose stored source no longer parses returns a typed
+  error** naming the view and the repair (`drop view`, then re-`materialize`)
+  instead of silently serving stale or wrong rows, and `union` views are now
+  tracked for refresh like every other view.
+- **Embedded: `Engine::execute_plan` now lowers the plan it is given.** Raw
+  `planner::plan` output executed through the public API could return wrong
+  rows for range predicates on unindexed columns; the entry point now answers
+  exactly like the same query as text.
+
+### On-disk compatibility
+
+No format change. Catalog v7 is unchanged and databases move in both
+directions between 0.19.0-0.21.x and this release. The per-link cardinality
+byte is still written at its existing offset but is no longer the source of
+truth; nothing resyncs or repairs it. Tools that read `catalog.bin` directly
+must derive cardinality from target-key uniqueness. See `docs/FORMAT.md`.
+
+### Compatibility
+
+Both directions, with no forced upgrade order. Protocol version `1` means "sent
+no hello block", which is every release through 0.21.0. A 0.21.0 client gets a
+byte-identical `ConnectOk`; a new client against a 0.21.0 server has its hello
+ignored and treats the server as protocol `1`. A newer client refuses an older
+server only when it explicitly asks, via `requireProtocolVersion` /
+`requireFeatures`.
+
+### Docs
+
+- `docs/errors.md`: the four budgets that produce a class-3 `timeout` and why a
+  driver must not fold them into one retry path; error class 10.
+- `docs/integrations/powql-for-drivers.md`: hello byte layouts, the negotiation
+  rule, named features, and how to use the conformance vectors.
+- `docs/STABILITY.md` and `docs/FORMAT.md`: the cardinality-byte caveat and the
+  negotiation guarantee; wire negotiation is struck from "What 1.0 requires".
+
 ## [0.21.0] - 2026-07-27
 
 ### Fixed (correctness)

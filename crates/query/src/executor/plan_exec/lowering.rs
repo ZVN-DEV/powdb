@@ -6,7 +6,7 @@ use crate::planner::{
     extract_single_bound, range_scan_for_target, try_extract_eq_index_key, RangeBound, RangeTarget,
 };
 use powdb_storage::btree::IndexStats;
-use powdb_storage::catalog::Catalog;
+use powdb_storage::catalog::{Catalog, LinkKind};
 use powdb_storage::types::*;
 use std::collections::HashSet;
 
@@ -231,6 +231,114 @@ fn column_type(catalog: &Catalog, table: &str, column: &str) -> Option<TypeId> {
         .map(|col| col.type_id)
 }
 
+/// How an index probe uses its literal, because the two uses do not obey the
+/// same coercion rule.
+///
+/// The reference `Filter(SeqScan)` decides `=` / `!=` with `Value`'s equality,
+/// which is strictly typed and has no Int/Float arm, and decides the four
+/// relational operators with `Value`'s ordering, which does promote Int to
+/// `f64` (`storage::types`). A float bound against an int column is therefore
+/// reproducible as an int bound while a float equality probe against the same
+/// column is not: the scan answers "no rows" and no key can reproduce that.
+///
+/// The two range sides are distinguished as well, because the only float
+/// literal that can address different keys under the two orders is zero, and
+/// whether it does depends on which side of the range it bounds and whether
+/// that bound is inclusive. See [`float_key_is_faithful`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeKind {
+    /// The key of an `IndexScan` (`.col = literal`).
+    Equality,
+    /// The lower side of a `RangeScan` (`.col > literal`, `.col >= literal`).
+    LowerBound { inclusive: bool },
+    /// The upper side of a `RangeScan` (`.col < literal`, `.col <= literal`).
+    UpperBound { inclusive: bool },
+}
+
+/// The `i64` a float literal denotes exactly, or `None` when no int bound
+/// reproduces it.
+///
+/// `Value::Ord` compares a stored `Int` against a `Float` literal by widening
+/// the STORED int with `as f64`, so an Int-lane bound reproduces that
+/// comparison only when no two stored ints straddle the bound after rounding.
+/// That fails from `2^53` upward, where the widening stops being injective:
+/// `9007199254740993 as f64` is `9007199254740992.0`, so the scan answers
+/// `.n <= 9007199254740992.0` true for it while the int bound `<= 9007199254740992`
+/// answers false. The limit is therefore exclusive, and it is the magnitude of
+/// the STORED values that matters, which is why nothing weaker than rejecting
+/// the whole boundary works.
+///
+/// A fractional value and a non-finite one are rejected rather than rounded,
+/// because rounding would move the boundary and silently change which rows
+/// match. Negative zero is rejected too: `Value::Ord` uses `total_cmp`, under
+/// which `0 as f64` is strictly *greater* than `-0.0`, so `Int(0)` is not the
+/// same bound.
+fn exact_int_bound(value: f64) -> Option<i64> {
+    /// First magnitude at which `i64 as f64` stops being injective.
+    const INJECTIVE_LIMIT: f64 = 9_007_199_254_740_992.0;
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value.abs() >= INJECTIVE_LIMIT
+        || (value == 0.0 && value.is_sign_negative())
+    {
+        return None;
+    }
+    Some(value as i64)
+}
+
+/// Whether a float literal addresses the same float keys under the compiled
+/// leaf's IEEE comparison and under the index's total order.
+///
+/// The compiled float leaf compares with `==` / `<` on `f64`, where `-0.0` and
+/// `0.0` are equal; the B-tree orders keys with `total_cmp`, where `-0.0` sorts
+/// strictly below `0.0`. Zero is the only finite literal the two orders
+/// disagree about, so it is the only one that can lose the index -- and it does
+/// not always lose it, because the disagreement is only observable when the
+/// pair `{-0.0, +0.0}` is split by the bound.
+///
+/// Writing `Z` for that pair, IEEE says every member of `Z` equals a zero
+/// literal, so the faithful answer includes all of `Z` or none of it. The total
+/// order splits `Z` in exactly the four cases below:
+///
+/// | probe            | literal | total order keeps | IEEE keeps | verdict |
+/// |------------------|---------|-------------------|------------|---------|
+/// | `> lit`          | `0.0`   | none of `Z`       | none       | keep    |
+/// | `>= lit`         | `0.0`   | `+0.0` only       | all        | reject  |
+/// | `> lit`          | `-0.0`  | `+0.0` only       | none       | reject  |
+/// | `>= lit`         | `-0.0`  | all of `Z`        | all        | keep    |
+/// | `< lit`          | `0.0`   | `-0.0` only       | none       | reject  |
+/// | `<= lit`         | `0.0`   | all of `Z`        | all        | keep    |
+/// | `< lit`          | `-0.0`  | none of `Z`       | none       | keep    |
+/// | `<= lit`         | `-0.0`  | `-0.0` only       | all        | reject  |
+///
+/// which collapses to "the bound is faithful when its inclusivity agrees with
+/// the literal's sign bit on the lower side, and disagrees with it on the
+/// upper side". An equality probe can never be faithful against a zero: it
+/// addresses one of the two keys and IEEE addresses both.
+///
+/// The narrower rule matters: rejecting every zero outright took `.balance >
+/// 0.0` off an index it had always used correctly, turning a bounded B-tree
+/// walk into a full sequential scan for the most ordinary filter there is.
+///
+/// A column that stores neither zero is unaffected either way, so the rule is
+/// decided from the literal and the operator alone rather than by walking the
+/// index to find out whether a `-0.0` is actually in it: the walk would cost
+/// more than the scan it is trying to avoid, and the answer would change under
+/// an insert.
+fn float_key_is_faithful(value: f64, probe: ProbeKind) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    if value != 0.0 {
+        return true;
+    }
+    match probe {
+        ProbeKind::Equality => false,
+        ProbeKind::LowerBound { inclusive } => inclusive == value.is_sign_negative(),
+        ProbeKind::UpperBound { inclusive } => inclusive != value.is_sign_negative(),
+    }
+}
+
 /// Rewrite a plain-column index-key literal into the value the index actually
 /// stores for `col_type`, or return `None` when no rewrite makes the indexed
 /// lookup equivalent to the reference `Filter(SeqScan)`.
@@ -244,7 +352,13 @@ fn column_type(catalog: &Catalog, table: &str, column: &str) -> Option<TypeId> {
 /// index-driven path exactly in step with the scan; anything we cannot rewrite
 /// without changing the result set is rejected so the caller falls back to the
 /// always-correct scan.
-fn coerce_column_index_key(col_type: TypeId, key: &Expr) -> Option<Expr> {
+///
+/// This is the single place that rule lives. Every index probe in the executor
+/// -- read, mutation, provenance, readonly -- reads its key out of the plan
+/// node this pass produces, so rejecting a key here withdraws the index from
+/// all of them at once. Calling it from only some of the lowering arms is what
+/// made `.price < 3` answer 0 while `.price < 3 and .id > 0` answered 2.
+fn coerce_column_index_key(col_type: TypeId, key: &Expr, probe: ProbeKind) -> Option<Expr> {
     match (key, col_type) {
         // Same-typed literal: the index key already matches the stored key.
         (Expr::Literal(Literal::Int(_)), TypeId::Int) => Some(key.clone()),
@@ -263,18 +377,54 @@ fn coerce_column_index_key(col_type: TypeId, key: &Expr) -> Option<Expr> {
         // datetime index needs a real timestamp literal, which belongs with the
         // temporal type work rather than here.
         (Expr::Literal(Literal::Int(_)), TypeId::DateTime) => None,
-        (Expr::Literal(Literal::Float(_)), TypeId::Float) => Some(key.clone()),
+        // A float literal against a DateTime column is rejected for the same
+        // reason, and the scan it falls back to is itself wrong today: `Ord`
+        // names an Int/DateTime pair but no Float/DateTime pair, so the two
+        // fall to the type-discriminant fallback and every timestamp compares
+        // greater than every float. Rejecting the index at least keeps the one
+        // wrong answer everywhere instead of two different ones.
+        (Expr::Literal(Literal::Float(_)), TypeId::DateTime) => None,
+        (Expr::Literal(Literal::Float(v)), TypeId::Float) => {
+            float_key_is_faithful(*v, probe).then(|| key.clone())
+        }
         (Expr::Literal(Literal::String(_)), TypeId::Str) => Some(key.clone()),
         (Expr::Literal(Literal::Bool(_)), TypeId::Bool) => Some(key.clone()),
         // Int literal into a float column: widen to `f64`, exactly as the
-        // compiled float leaf does, so the float-typed index key matches.
+        // compiled float leaf and `Value::Ord` both do, so the float-typed
+        // index key matches. The widening is lossy past `2^53`, but it is the
+        // SAME loss the scan applies, so the two still agree.
         (Expr::Literal(Literal::Int(v)), TypeId::Float) => {
-            Some(Expr::Literal(Literal::Float(*v as f64)))
+            let widened = *v as f64;
+            float_key_is_faithful(widened, probe).then_some(Expr::Literal(Literal::Float(widened)))
         }
+        // Float literal into an int column. As a bound this is exact whenever
+        // the float names an integer the widening reaches; as an equality probe
+        // it never is, because the scan compares Int against Float with
+        // strictly-typed equality and matches nothing at all. Probing the Int
+        // lane with `Int(0)` for `.n = 0.0` returned a row the scan does not.
+        (Expr::Literal(Literal::Float(v)), TypeId::Int) => match probe {
+            ProbeKind::LowerBound { .. } | ProbeKind::UpperBound { .. } => {
+                exact_int_bound(*v).map(|v| Expr::Literal(Literal::Int(v)))
+            }
+            ProbeKind::Equality => None,
+        },
         // Any other pairing either never matches under the reference semantics
         // or would need a lossy coercion that changes which rows match, so reject.
         _ => None,
     }
+}
+
+/// One side of a `RangeScan`: the bounding literal and whether it is inclusive,
+/// or `None` for "unbounded on this side".
+type RangeBoundExpr = Option<(Expr, bool)>;
+
+/// Which side of a `RangeScan` a bound sits on. The side and the inclusivity
+/// together decide whether a zero float literal can probe the index at all
+/// (see [`float_key_is_faithful`]), so neither can be dropped on the way in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundSide {
+    Lower,
+    Upper,
 }
 
 /// Coerce one optional range bound to `col_type`. The outer `Option` is the
@@ -282,27 +432,56 @@ fn coerce_column_index_key(col_type: TypeId, key: &Expr) -> Option<Expr> {
 /// "no bound on this side".
 fn coerce_column_index_bound(
     col_type: TypeId,
-    bound: Option<(Expr, bool)>,
-) -> Option<Option<(Expr, bool)>> {
+    bound: RangeBoundExpr,
+    side: BoundSide,
+) -> Option<RangeBoundExpr> {
     match bound {
         None => Some(None),
         Some((expr, inclusive)) => {
-            coerce_column_index_key(col_type, &expr).map(|expr| Some((expr, inclusive)))
+            let probe = match side {
+                BoundSide::Lower => ProbeKind::LowerBound { inclusive },
+                BoundSide::Upper => ProbeKind::UpperBound { inclusive },
+            };
+            coerce_column_index_key(col_type, &expr, probe).map(|expr| Some((expr, inclusive)))
         }
     }
 }
 
+/// Rewrite a plain-column `RangeScan`'s bounds for `col_type`, or `None` when
+/// either bound cannot faithfully probe the index.
+fn coerce_range_bounds(
+    catalog: &Catalog,
+    table: &str,
+    column: &str,
+    start: &RangeBoundExpr,
+    end: &RangeBoundExpr,
+) -> Option<(RangeBoundExpr, RangeBoundExpr)> {
+    let col_type = column_type(catalog, table, column)?;
+    Some((
+        coerce_column_index_bound(col_type, start.clone(), BoundSide::Lower)?,
+        coerce_column_index_bound(col_type, end.clone(), BoundSide::Upper)?,
+    ))
+}
+
 /// Coerce the literal key(s) of a freshly-extracted candidate scan to the
 /// driving column's declared type, or return `None` to drop the candidate (the
-/// caller then keeps the correct `Filter(SeqScan)`). Expression-index
-/// (json-path) candidates pass through unchanged: they look scalars up by raw
-/// `Value` (`BTree::lookup_all` / `raw_range_rids`), so they already agree with
-/// the sequential scan and need no type-tag coercion.
+/// caller then keeps the correct `Filter(SeqScan)`).
+///
+/// Expression-index (json-path) candidates pass through unchanged. They look
+/// scalars up by raw `Value` (`BTree::lookup_all` / `raw_range_rids`), so the
+/// type-tag coercion above does not apply to them, but they are not in step
+/// with the sequential scan either: the index stores the canonical PJ1 scalar,
+/// which normalizes a whole-numbered `3.0` to an integer, so
+/// `filter .doc->v = 3` finds a row through the index that the scan does not.
+/// A JSON path has no declared type to coerce toward, so that repair belongs
+/// with PJ1 canonicalization and the JSON comparison leaf rather than here; the
+/// divergence is pinned cell by cell in
+/// `tests/cross_type_index_parity.rs::KNOWN_JSON_PATH_DIVERGENCES`.
 fn coerce_candidate_keys(catalog: &Catalog, scan: PlanNode) -> Option<PlanNode> {
     match scan {
         PlanNode::IndexScan { table, column, key } => {
             let col_type = column_type(catalog, &table, &column)?;
-            let key = coerce_column_index_key(col_type, &key)?;
+            let key = coerce_column_index_key(col_type, &key, ProbeKind::Equality)?;
             Some(PlanNode::IndexScan { table, column, key })
         }
         PlanNode::RangeScan {
@@ -311,9 +490,7 @@ fn coerce_candidate_keys(catalog: &Catalog, scan: PlanNode) -> Option<PlanNode> 
             start,
             end,
         } => {
-            let col_type = column_type(catalog, &table, &column)?;
-            let start = coerce_column_index_bound(col_type, start)?;
-            let end = coerce_column_index_bound(col_type, end)?;
+            let (start, end) = coerce_range_bounds(catalog, &table, &column, &start, &end)?;
             Some(PlanNode::RangeScan {
                 table,
                 column,
@@ -479,27 +656,51 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
     })
 }
 
-/// Whether an index probe on `column` is built from an int literal while the
-/// column is declared `datetime`. Index keys are byte-encoded behind a type tag
-/// (`btree::encode_composite_value`), so an `Int`-tagged probe cannot match a
-/// stored `DateTime` key: equality finds nothing and a range scan matches every
-/// entry. The planner is pure and cannot see column types, so it emits these
-/// probes and this pass has to reject them. See `coerce_column_index_key`.
-fn datetime_probed_with_int_literal(
-    catalog: &Catalog,
-    table: &str,
-    column: &str,
-    keys: &[&Expr],
-) -> bool {
-    if column_type(catalog, table, column) != Some(TypeId::DateTime) {
-        return false;
+/// A plan that has been through [`lower_unindexed_scans`] and is therefore safe
+/// to execute.
+///
+/// The planner is pure: it cannot see the catalog, so it emits `IndexScan` and
+/// `RangeScan` speculatively and with the literal exactly as it was written.
+/// Lowering is what decides whether those probes exist, and what byte lane
+/// their literals address. A plan that skips it does not merely run slower, it
+/// answers differently: `count(H filter .price < 3)` returned 2 lowered and 0
+/// unlowered against the same rows.
+///
+/// The type exists so that "was this plan lowered?" is answered by the
+/// signature rather than by reading the call site. [`LoweredPlan::of`] is the
+/// only constructor and it always lowers, so an execution entry point that
+/// takes a `&LoweredPlan` cannot be handed raw planner output. Eight subquery
+/// materialization sites did exactly that: they planned a statement and passed
+/// the result straight to the executor, which is why nesting a fixed predicate
+/// one level deep brought the wrong answer back.
+///
+/// Subtrees are deliberately NOT wrapped. Lowering recurses over the whole
+/// tree, so every child of a `LoweredPlan` is itself lowered, and the internal
+/// dispatch recursion takes a bare `&PlanNode` for that reason. The type guards
+/// the boundary where a plan enters execution, which is the boundary that was
+/// actually crossed unchecked.
+pub(crate) struct LoweredPlan(PlanNode);
+
+impl LoweredPlan {
+    /// Lower `plan` against `catalog`. The only way to build one.
+    ///
+    /// Lowering is idempotent, so re-lowering an already-lowered plan is a
+    /// no-op rather than a second rewrite; `lowering_is_idempotent` in
+    /// `tests/cross_type_index_parity.rs` holds that. Idempotence is what lets
+    /// the boundary be enforced by construction instead of by auditing which
+    /// paths have already lowered.
+    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Self {
+        LoweredPlan(lower_unindexed_scans(catalog, plan))
     }
-    keys.iter()
-        .any(|key| matches!(key, Expr::Literal(Literal::Int(_))))
+
+    /// The lowered tree, for dispatch.
+    pub(crate) fn node(&self) -> &PlanNode {
+        &self.0
+    }
 }
 
 /// This pass runs once per query, before execution.
-pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
+fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
     match plan {
         PlanNode::ExprIndexScan { table, path, .. }
         | PlanNode::ExprRangeScan { table, path, .. }
@@ -517,22 +718,28 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
             start,
             end,
         } => {
-            let int_probed_datetime = {
-                let bounds: Vec<&Expr> = [start, end]
-                    .iter()
-                    .filter_map(|bound| bound.as_ref().map(|(expr, _)| expr))
-                    .collect();
-                datetime_probed_with_int_literal(catalog, table, column, &bounds)
-            };
             if let Some(tbl) = catalog.get_table(table) {
                 // Keep RangeScan whenever ANY index exists on the column:
                 // unique indexes store raw column values, non-unique indexes
                 // store composite (value, rid) keys that the executor walks
                 // natively via BTree::range_rids. Only lower to Filter(SeqScan)
-                // when the column is unindexed, or when the bounds cannot
-                // faithfully probe the index (int literal against datetime).
-                if tbl.has_index(column) && !int_probed_datetime {
-                    return plan.clone();
+                // when the column is unindexed, or when a bound cannot
+                // faithfully probe the index. The bounds are rewritten into the
+                // column's own type here rather than left raw: an `Int(3)`
+                // bound on a float column addresses the Int key lane and
+                // stopped before the first stored float, so `.price < 3`
+                // returned nothing and `.price < 3 delete` deleted nothing.
+                if tbl.has_index(column) {
+                    if let Some((start, end)) =
+                        coerce_range_bounds(catalog, table, column, start, end)
+                    {
+                        return PlanNode::RangeScan {
+                            table: table.clone(),
+                            column: column.clone(),
+                            start,
+                            end,
+                        };
+                    }
                 }
             }
             let pred = synthesize_range_predicate(column, start, end);
@@ -646,12 +853,18 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
         },
         PlanNode::IndexScan { table, column, key } => {
             if let Some(tbl) = catalog.get_table(table) {
-                // An int literal cannot probe a datetime index at all (type-tagged
-                // key bytes), so fall through to the compiled scan below rather
-                // than returning zero rows.
-                if tbl.has_index(column)
-                    && !datetime_probed_with_int_literal(catalog, table, column, &[key])
-                {
+                // A literal the index cannot be probed with faithfully (an int
+                // against a datetime column, a float against an int column)
+                // falls through to the compiled scan below rather than
+                // answering with a different row set than the scan would.
+                let coerced = if tbl.has_index(column) {
+                    column_type(catalog, table, column).and_then(|col_type| {
+                        coerce_column_index_key(col_type, key, ProbeKind::Equality)
+                    })
+                } else {
+                    None
+                };
+                if let Some(coerced) = coerced {
                     // Skew guard: a lone equality on a HOT literal (one that
                     // matches more than half the table) runs faster as a
                     // compiled `Filter(SeqScan)` -- one sequential pass with the
@@ -659,10 +872,20 @@ pub(crate) fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanN
                     // rows by random rid. Rare / selective literals (<= half) keep
                     // the index. Unique indexes (<=1 row) and the empty/missing
                     // sentinel (`= null`, its own side list) are never hot, so
-                    // they are left exactly as before.
-                    if !hot_lone_equality(catalog, table, column, key) {
-                        return plan.clone();
+                    // they are left exactly as before. The count is taken with
+                    // the COERCED key: probing with the raw literal counted zero
+                    // entries, which made every cross-type literal look
+                    // perfectly selective to the chooser and to `explain`.
+                    if !hot_lone_equality(catalog, table, column, &coerced) {
+                        return PlanNode::IndexScan {
+                            table: table.clone(),
+                            column: column.clone(),
+                            key: coerced,
+                        };
                     }
+                    // The fallback scan re-checks the ORIGINAL literal: it is
+                    // the reference answer, and the coerced key exists only to
+                    // address index bytes.
                     return PlanNode::Filter {
                         input: Box::new(PlanNode::SeqScan {
                             table: table.clone(),
@@ -888,26 +1111,102 @@ fn explain_join_strategy(
     }
 }
 
+/// EXPLAIN's word for a link's cardinality, derived from the catalog as it
+/// stands right now.
+///
+/// The cardinality of a link is not a property of the query text: it is
+/// `Catalog::derive_link_kind`'s answer about whether the target key carries a
+/// unique index, and `alter <Target> add unique .<key>` changes it between one
+/// statement and the next. EXPLAIN used to print "to-many link" and "scalar
+/// to-one path" as fixed strings taken from the SYNTAX, so it asserted a
+/// cardinality it had never checked and could state the opposite of what
+/// execution would then do with the same plan.
+///
+/// `None` for `owner` or an undeclared link name yields "unresolved", which is
+/// the honest answer: execution will fail to resolve it too.
+fn explain_link_cardinality(catalog: &Catalog, owner: Option<&str>, name: &str) -> &'static str {
+    match owner.and_then(|owner| catalog.link_kind(owner, name)) {
+        Some(LinkKind::ToOne) => "to-one",
+        Some(LinkKind::ToMany) => "to-many",
+        None => "unresolved",
+    }
+}
+
+/// The target type a link resolves to, for walking a multi-hop path.
+fn explain_link_target<'a>(
+    catalog: &'a Catalog,
+    owner: Option<&str>,
+    name: &str,
+) -> Option<&'a str> {
+    Some(catalog.link(owner?, name)?.target_type.as_str())
+}
+
+/// EXPLAIN's word for a whole scalar hop chain, walked hop by hop against the
+/// catalog exactly as `resolve_scalar_link_field` walks it at execution.
+///
+/// A scalar path is only legal when every hop is to-one, so one to-many hop
+/// anywhere makes the whole path to-many and execution refuses it; an
+/// undeclared hop name makes it unresolved and execution refuses it for that
+/// reason instead. Both used to print as "scalar to-one path".
+fn explain_scalar_link_cardinality(
+    catalog: &Catalog,
+    owner: Option<&str>,
+    links: &[String],
+) -> &'static str {
+    let mut current = owner;
+    let mut saw_to_many = false;
+    for name in links {
+        match current.and_then(|owner| catalog.link_kind(owner, name)) {
+            None => return "unresolved",
+            Some(LinkKind::ToMany) => saw_to_many = true,
+            Some(LinkKind::ToOne) => {}
+        }
+        current = explain_link_target(catalog, current, name);
+    }
+    if saw_to_many {
+        "to-many"
+    } else {
+        "to-one"
+    }
+}
+
 /// Format a `PlanNode` tree as a human-readable, indented text
 /// representation. Used by the `EXPLAIN` command.
 /// Append one nested projection's EXPLAIN line (and, recursively, its
 /// deeper levels) to `out`, indented under the `NestedProject` node.
-fn format_nested_projection(nested: &NestedProjection, depth: usize, out: &mut String) {
+///
+/// `owner` is the type the enclosing scope reads, which is what a link name is
+/// resolved against; it is `None` when the parent plan shape is not a plain
+/// table scan, in which case execution cannot resolve the link either.
+fn format_nested_projection(
+    catalog: &Catalog,
+    owner: Option<&str>,
+    nested: &NestedProjection,
+    depth: usize,
+    out: &mut String,
+) {
     use std::fmt::Write;
     let indent = "  ".repeat(depth);
     // A block link traversal has placeholder correlation columns until the
     // executor resolves the link from the catalog (the planner never touches
-    // the catalog), so show what IS known at plan time: the declared path.
+    // the catalog), so show what IS known at plan time: the declared path, and
+    // the cardinality the catalog gives that path right now. A block traversal
+    // of a to-one link is refused at execution, so printing "to-many link" for
+    // one was EXPLAIN contradicting the run it was explaining.
     if let Some(via) = &nested.via_link {
         let _ = writeln!(
             out,
-            "{indent}nested {}: to-many link {}.{} (child table + correlation \
+            "{indent}nested {}: {} link {}.{} (child table + correlation \
              resolved from catalog at execution)",
-            nested.name, via.outer_alias, via.link_name
+            nested.name,
+            explain_link_cardinality(catalog, owner, &via.link_name),
+            via.outer_alias,
+            via.link_name
         );
+        let child_owner = explain_link_target(catalog, owner, &via.link_name);
         for field in &nested.fields {
             if let NestedField::Nested(inner) = field {
-                format_nested_projection(inner, depth + 1, out);
+                format_nested_projection(catalog, child_owner, inner, depth + 1, out);
             }
         }
         return;
@@ -946,9 +1245,11 @@ fn format_nested_projection(nested: &NestedProjection, depth: usize, out: &mut S
         let _ = write!(out, " offset {}", bound(offset));
     }
     out.push('\n');
+    // A resolved level names its own child table, and that is what its deeper
+    // levels resolve their link names against.
     for field in &nested.fields {
         if let NestedField::Nested(inner) = field {
-            format_nested_projection(inner, depth + 1, out);
+            format_nested_projection(catalog, Some(&nested.table), inner, depth + 1, out);
         }
     }
 }
@@ -1078,21 +1379,32 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                 })
                 .collect();
             let mut out = format!("{indent}NestedProject fields=[{}]\n", names.join(", "));
+            // The type the link names hang off. Execution resolves them against
+            // the parent scan's table, so EXPLAIN has to use the same one or it
+            // is describing a different query.
+            let owner = scan_source_table(input);
             for f in fields {
                 match f {
                     NestedProjectField::Nested(nested) => {
-                        format_nested_projection(nested, depth + 1, &mut out);
+                        format_nested_projection(catalog, owner, nested, depth + 1, &mut out);
                     }
                     NestedProjectField::Link(link) => {
-                        // Links resolve at execution time (the planner never
-                        // touches the catalog), so EXPLAIN shows the declared
-                        // hop path rather than faking a resolved target.
+                        // The hop TARGETS are still resolved at execution (the
+                        // planner never touches the catalog), so the path is
+                        // printed as declared. The cardinality is not left to
+                        // the syntax though: it is derived per hop from index
+                        // uniqueness right here, because a path spelled as a
+                        // scalar is only a to-one path if the catalog says so,
+                        // and printing "scalar to-one path" for a chain
+                        // execution is about to reject as to-many made EXPLAIN
+                        // disagree with the run it described.
                         let pad = "  ".repeat(depth + 1);
                         out.push_str(&format!(
-                            "{pad}link {}: scalar to-one path {}.{}.{} \
+                            "{pad}link {}: scalar {} path {}.{}.{} \
                              (hops [{}] -> column {}; targets resolved from \
                              catalog at execution)\n",
                             link.name,
+                            explain_scalar_link_cardinality(catalog, owner, &link.links),
                             link.outer_alias,
                             link.links.join("."),
                             link.column,

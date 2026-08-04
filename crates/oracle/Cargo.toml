@@ -1,0 +1,20 @@
+[package]
+name = "powdb-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+powdb-query = { path = "../query" }
+powdb-storage = { path = "../storage" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[[bin]]
+name = "powdb-oracle"
+path = "src/bin/oracle.rs"
+test = false
+
+[lints]
+workspace = true

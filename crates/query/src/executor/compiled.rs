@@ -509,26 +509,36 @@ fn type_id_cmp(a: TypeId, b: TypeId) -> Ordering {
     (a as u8).cmp(&(b as u8))
 }
 
-/// Equality of a scalarized JSON `node` against `lit` under `Value::PartialEq`.
-/// A missing/null node (the empty set) equals no scalar literal. String nodes
-/// compare byte-for-byte (zero alloc); numbers are strict-typed (an `Int` node
-/// never equals a `Float` literal, matching `Value::PartialEq`).
+/// Equality of a scalarized JSON `node` against `lit`, matching what
+/// `eval::eval_binop_mode` computes for the same pair. A missing/null node (the
+/// empty set) equals no scalar literal. String nodes compare byte-for-byte
+/// (zero alloc); numbers compare NUMERICALLY across int and float, exactly as
+/// `json_scalar_cmp` below and the generic evaluator both do, so `->v = 3`
+/// cannot answer one thing when the predicate compiles and another when it does
+/// not. `<` and `>` were already numeric here; leaving `=` strict is what made
+/// the six operators over a JSON path disagree with each other.
 #[inline]
 fn json_scalar_eq(node: Option<&[u8]>, lit: &Value) -> bool {
     let Some(n) = node else { return false };
     match n.first() {
         Some(1) => matches!(lit, Value::Bool(false)),
         Some(2) => matches!(lit, Value::Bool(true)),
-        Some(3) if n.len() >= 9 => match lit {
-            Value::Int(l) => i64::from_le_bytes(n[1..9].try_into().unwrap()) == *l,
-            _ => false,
-        },
-        Some(4) if n.len() >= 9 => match lit {
-            Value::Float(l) => {
-                f64::from_le_bytes(n[1..9].try_into().unwrap()).total_cmp(l) == Ordering::Equal
+        Some(3) if n.len() >= 9 => {
+            let a = i64::from_le_bytes(n[1..9].try_into().unwrap());
+            match lit {
+                Value::Int(l) => a == *l,
+                Value::Float(l) => (a as f64).total_cmp(l) == Ordering::Equal,
+                _ => false,
             }
-            _ => false,
-        },
+        }
+        Some(4) if n.len() >= 9 => {
+            let a = f64::from_le_bytes(n[1..9].try_into().unwrap());
+            match lit {
+                Value::Float(l) => a.total_cmp(l) == Ordering::Equal,
+                Value::Int(l) => a.total_cmp(&(*l as f64)) == Ordering::Equal,
+                _ => false,
+            }
+        }
         Some(5) if n.len() >= 5 => match lit {
             Value::Str(l) => {
                 let len = u32::from_le_bytes(n[1..5].try_into().unwrap()) as usize;

@@ -116,9 +116,15 @@ pub struct ExpressionIndexMeta {
     pub json_path: StoredJsonPathV1,
 }
 
-/// Cardinality of a relationship link, derived at declare time from whether the
-/// target key is backed by a unique index/constraint and stored explicitly so
-/// query planning never re-derives it. Serialized as a single `u8`.
+/// Cardinality of a relationship link: whether the target key is backed by a
+/// unique index/constraint. The fact lives in the index metadata and nowhere
+/// else, and [`Catalog::derive_link_kind`] is the only thing that reads it.
+///
+/// The engine keeps no cached copy of the answer. The `u8` written into
+/// [`LinkDef::kind`] is an advisory record of what the derivation returned when
+/// the link was declared: it stays in the v7 catalog format so old and new
+/// files stay byte-compatible, it is never resynced, and nothing in the engine
+/// may branch on it. See `docs/FORMAT.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkKind {
     /// N:1 scalar hop — the target key is unique, so a hop resolves to at most
@@ -166,7 +172,15 @@ pub struct LinkDef {
     pub local_key: String,
     /// Column on the target matched against `local_key`.
     pub target_key: String,
-    /// Cardinality derived from the target key's uniqueness at declare time.
+    /// ADVISORY ONLY. Whatever [`Catalog::derive_link_kind`] returned at the
+    /// moment the link was declared, kept so the v7 on-disk layout does not
+    /// change. It is deliberately never refreshed, so it goes stale as soon as
+    /// `alter <Target> add unique .<key>` runs after the link, and it is wrong
+    /// in every database written by the declare-order-dependent versions.
+    ///
+    /// Never branch on this field. Every correctness decision (traversal gates,
+    /// `describe`, `schema links`) must call [`Catalog::link_kind`] or
+    /// [`Catalog::derive_link_kind`], which read index uniqueness live.
     pub kind: LinkKind,
 }
 
@@ -1639,7 +1653,11 @@ impl Catalog {
     }
 
     fn has_same_prepared_structure(&self, other: &Self) -> bool {
-        self.tables.len() == other.tables.len()
+        // Links are part of the structure prepared plans resolve against, even
+        // though DDL inside a transaction is refused today and so no rollback
+        // can currently change them.
+        self.links == other.links
+            && self.tables.len() == other.tables.len()
             && self.tables.iter().zip(&other.tables).all(|(left, right)| {
                 let left_schema = &left.schema;
                 let right_schema = &right.schema;
@@ -2634,10 +2652,16 @@ impl Catalog {
     /// Validation (all at declare time): both `owner_type` and `target_type`
     /// must be existing tables, `local_key` must be a column on the owner,
     /// `target_key` a column on the target, and `name` must collide with neither
-    /// a column on the owner nor an existing link on the same owner. The stored
-    /// `kind` is **derived** here from whether `target_key` is backed by a
-    /// unique index on the target (`ToOne` if unique, else `ToMany`); any `kind`
-    /// supplied by the caller is ignored.
+    /// a column on the owner nor an existing link on the same owner.
+    ///
+    /// Declaration order does not pin the cardinality, because the engine does
+    /// not store the cardinality: every reader calls [`Self::link_kind`], which
+    /// derives it from the target key's uniqueness at the moment of the read.
+    /// `link` then `unique` and `unique` then `link` therefore reach the same
+    /// schema with the same behaviour. The advisory [`LinkDef::kind`] byte is
+    /// seeded here from the same derivation purely so the v7 on-disk layout
+    /// keeps a value in that position; any `kind` supplied by the caller is
+    /// ignored, and nothing reads the byte back.
     ///
     /// Activation is lazy and crash-safe, mirroring
     /// [`Self::create_expression_index_metadata`]: on any persist failure before
@@ -2703,13 +2727,10 @@ impl Catalog {
             }
         }
 
-        // Derive cardinality from the target key's uniqueness and store it
-        // explicitly so query planning never re-derives it.
-        let kind = if self.is_index_unique(&def.target_type, &def.target_key) == Some(true) {
-            LinkKind::ToOne
-        } else {
-            LinkKind::ToMany
-        };
+        // Seed the advisory byte so the v7 layout keeps a value in that slot.
+        // It is written once and never refreshed; readers derive instead, so
+        // this value is a record of the past, not a decision about the future.
+        let kind = self.derive_link_kind(&def.target_type, &def.target_key);
         let stored = LinkDef { kind, ..def };
 
         // Lazy activation + proven rollback pattern (see
@@ -2735,6 +2756,33 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    /// Cardinality of a link between `target_type.target_key` and its owners,
+    /// computed from the catalog as it stands right now. A unique index on the
+    /// target key means a hop matches at most one row (`ToOne`); anything else
+    /// (a plain index, or no index at all) can fan out (`ToMany`).
+    ///
+    /// This is the only place the fact is computed, and there is no cached copy
+    /// of the answer anywhere: [`LinkDef::kind`] is advisory and must not be
+    /// consulted. Every cardinality decision in the engine ends up here, so a
+    /// schema change is visible to the next statement with no repair pass, no
+    /// re-declaration and no reopen.
+    pub fn derive_link_kind(&self, target_type: &str, target_key: &str) -> LinkKind {
+        if self.is_index_unique(target_type, target_key) == Some(true) {
+            LinkKind::ToOne
+        } else {
+            LinkKind::ToMany
+        }
+    }
+
+    /// Cardinality of the link registered under `(owner_type, name)`, derived
+    /// from the catalog as it stands now. `None` when no such link exists.
+    /// This is the accessor every correctness decision should use; reading
+    /// [`LinkDef::kind`] instead is the bug this API exists to prevent.
+    pub fn link_kind(&self, owner_type: &str, name: &str) -> Option<LinkKind> {
+        let link = self.link(owner_type, name)?;
+        Some(self.derive_link_kind(&link.target_type, &link.target_key))
     }
 
     /// Resolve a link by its `(owner_type, name)` registry key. The returned
@@ -2841,13 +2889,18 @@ impl Catalog {
         })?;
         // A live relationship link that names this table (as owner or target)
         // pins it in place, the same integrity discipline indexes use. The
-        // operator must drop the link first.
+        // link has to go first, and PowQL has no statement that removes one,
+        // so the message names the surface that does rather than inventing a
+        // `drop link` statement the parser would reject.
         if let Some(link) = self.link_referencing_table(name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "cannot drop table '{name}': link '{}' on '{}' references it (drop the link first)",
-                    link.name, link.owner_type
+                    "cannot drop table '{name}': link '{}' on '{}' references it. \
+                     Remove the link first with the embedded API \
+                     `Catalog::drop_link(\"{}\", \"{}\")`; PowQL has no statement \
+                     that removes a link",
+                    link.name, link.owner_type, link.owner_type, link.name
                 ),
             ));
         }
@@ -3028,13 +3081,18 @@ impl Catalog {
                 })?;
         }
         // A live link that names this column (as owner local key or target key)
-        // pins it in place; the operator must drop the link first.
+        // pins it in place. Same remedy wording as `drop_table`: name the API
+        // that can actually remove a link instead of a PowQL statement that
+        // does not exist.
         if let Some(link) = self.link_referencing_column(table, col_name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "cannot drop column '{col_name}' from '{table}': link '{}' on '{}' references it (drop the link first)",
-                    link.name, link.owner_type
+                    "cannot drop column '{col_name}' from '{table}': link '{}' on '{}' \
+                     references it. Remove the link first with the embedded API \
+                     `Catalog::drop_link(\"{}\", \"{}\")`; PowQL has no statement \
+                     that removes a link",
+                    link.name, link.owner_type, link.owner_type, link.name
                 ),
             ));
         }

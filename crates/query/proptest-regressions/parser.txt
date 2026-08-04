@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b851c69d5b473f53c4e13225e2a72f4c15aacaf8dda9c48dda31e3a9b90ec38 # shrinks to tokens = [StringLit("back\\slash")]
+cc 172769c76d1c5dd32fdf73316fe28503cd4d41b605f7b42686cbdc5cd34fdbd6 # shrinks to tokens = [Ident("order")]
+cc 48f95297f8065fcdafe2caa352ab33027eb23243496e5cce892e3625b07e82ad # shrinks to tokens = [FloatLit(0.0)]

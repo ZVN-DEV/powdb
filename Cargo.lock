@@ -1900,9 +1900,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "powdb-oracle"
+version = "0.21.0"
+dependencies = [
+ "powdb-query",
+ "powdb-storage",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "powdb-query"
 version = "0.21.0"
 dependencies = [
+ "powdb-query",
  "powdb-storage",
  "proptest",
  "rustc-hash",

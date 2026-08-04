@@ -1,0 +1,1 @@
+User group .name { .name, n: count(.id) } having count(.id) > 0

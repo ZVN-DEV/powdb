@@ -16,7 +16,37 @@ use powdb_storage::view::ViewDef;
 use super::*;
 
 impl Engine {
+    /// Execute a plan on the mutable path.
+    ///
+    /// This is the one execution entry point that takes a bare [`PlanNode`],
+    /// because embedders build plans themselves: `planner::plan` is public,
+    /// `PlanNode` is public, and the `powdb` facade re-exports this method. So
+    /// it lowers first, exactly like every path inside the executor does.
+    ///
+    /// Lowering is not an optimization. The planner is pure, so it emits index
+    /// probes speculatively and leaves every literal as written; the pass is
+    /// what decides whether those probes exist and what key bytes they address.
+    /// Executing raw planner output here made a planned `.price < 3` answer
+    /// `[]` through this entry point where the same text through
+    /// [`Engine::execute_powql`] answered the rows, and `LoweredPlan` is
+    /// crate-private, so an embedder had no way to lower for itself.
+    ///
+    /// Lowering is idempotent, so a caller that already has a lowered tree pays
+    /// one pass and gets the same plan back.
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+        let lowered = self.lower(plan);
+        self.execute_lowered(&lowered)
+    }
+
+    /// The write-path dispatch itself. Takes a bare `&PlanNode` because it is
+    /// the recursion target: every child of a lowered plan is lowered, so a
+    /// subtree needs no second pass. Mirrors [`Engine::dispatch_readonly`], and
+    /// is private for the same reason: reaching it from outside an already
+    /// lowered tree is what [`Engine::execute_plan`] above exists to prevent.
+    pub(in crate::executor) fn dispatch_mut(
+        &mut self,
+        plan: &PlanNode,
+    ) -> Result<QueryResult, QueryError> {
         // Refuse any plan whose evaluable expressions still carry an aggregate
         // FunctionCall the grouped-aggregate planner could not lower. Without
         // this, such an aggregate would reach eval_expr and silently evaluate
@@ -35,7 +65,7 @@ impl Engine {
                 }
                 let fallback = expression_index_fallback(plan)
                     .expect("expression-index branch always has a fallback");
-                self.execute_plan(&fallback)
+                self.dispatch_mut(&fallback)
             }
             PlanNode::SeqScan { table } => {
                 // Auto-refresh dirty materialized views on read.
@@ -77,7 +107,7 @@ impl Engine {
 
                 // Correlated subquery path: per-row materialisation.
                 if contains_subquery(predicate) {
-                    let result = self.execute_plan(input)?;
+                    let result = self.dispatch_mut(input)?;
                     return match result {
                         QueryResult::Rows { columns, rows } => {
                             let mut filtered = Vec::new();
@@ -121,7 +151,9 @@ impl Engine {
                 // the decoded general Filter path below — the raw fast path
                 // rehydrates to v1 and drops/mis-reads >= 64KB spilled values.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
-                    if !self.catalog.table_has_overflow(table) {
+                    if !self.catalog.table_has_overflow(table)
+                        && !self.generic_path_forced("filter-seqscan-raw")
+                    {
                         // Auto-refresh dirty materialized views.
                         if self.view_registry.is_dirty(table) {
                             self.refresh_view(table)?;
@@ -148,9 +180,13 @@ impl Engine {
                         // captured error is surfaced after the scan returns.
                         let mut cancel = CancelCheck::new();
                         let mut cancel_err: Option<QueryError> = None;
-                        if let Some(compiled) =
-                            compile_predicate(predicate, &columns, &fast, &schema)
-                        {
+                        if let Some(compiled) = self.compile_predicate_unless_forced(
+                            "filter-seqscan:predicate",
+                            predicate,
+                            &columns,
+                            &fast,
+                            &schema,
+                        ) {
                             self.catalog
                                 .try_for_each_row_raw(table, |_rid, data| {
                                     if let Err(e) = cancel.tick() {
@@ -189,7 +225,7 @@ impl Engine {
                 }
 
                 // General path: materialise then filter.
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut cancel = CancelCheck::new();
@@ -263,7 +299,10 @@ impl Engine {
                     // generic expression-evaluating path — otherwise its column
                     // is silently dropped (proj_indices only collects Fields).
                     let all_plain_fields = fields.iter().all(|f| matches!(f.expr, Expr::Field(_)));
-                    if tbl.has_index(column) && all_plain_fields {
+                    if tbl.has_index(column)
+                        && all_plain_fields
+                        && !self.generic_path_forced("project-over-index-scan")
+                    {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = CancelCheck::new();
@@ -408,7 +447,7 @@ impl Engine {
                     }
                 }
 
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let proj_columns: Vec<String> = fields
@@ -447,7 +486,7 @@ impl Engine {
             }
 
             PlanNode::Sort { input, keys } => {
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
                         // WS2: row-count cap is a cheap secondary guard; the
@@ -515,7 +554,7 @@ impl Engine {
             }
 
             PlanNode::Limit { input, count } => {
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,
                     _ => return Err("limit must be integer literal".into()),
@@ -538,7 +577,7 @@ impl Engine {
             }
 
             PlanNode::Offset { input, count } => {
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,
                     _ => return Err("offset must be integer literal".into()),
@@ -583,7 +622,14 @@ impl Engine {
                 // Fast path: count() over SeqScan, counting rows without any decode.
                 // Only a count with no target column counts rows: `count(T { .v })`
                 // counts non-null `.v` and must reach the generic path below.
-                if *function == AggFunc::Count && counts_every_row(argument.as_ref()) {
+                // The forced-generic check gates the whole block, including the
+                // count-over-filter path further down: one guard, so the inner
+                // `compile_predicate_unless_forced` never records a decline
+                // while the switch is on.
+                if *function == AggFunc::Count
+                    && counts_every_row(argument.as_ref())
+                    && !self.generic_path_forced("count-fast-block")
+                {
                     // Overflow safety (P0-4): the raw `for_each_row_raw` count
                     // drops any row too large to re-inline (>= 64KB) and would
                     // undercount; v2-capable tables use the decoded generic path.
@@ -635,9 +681,13 @@ impl Engine {
 
                                 // Try compiled predicate (zero-allocation hot path).
                                 // Handles int leaves, string-eq leaves, AND conjunctions.
-                                if let Some(compiled) =
-                                    compile_predicate(predicate, &columns, &fast, &schema)
-                                {
+                                if let Some(compiled) = self.compile_predicate_unless_forced(
+                                    "count-filter:predicate",
+                                    predicate,
+                                    &columns,
+                                    &fast,
+                                    &schema,
+                                ) {
                                     let mut count: i64 = 0;
                                     for_each_row_raw_cancellable(
                                         &self.catalog,
@@ -718,7 +768,7 @@ impl Engine {
                 // only projected columns, stop once we hit the limit.
                 // (Handled in the Project branch; this branch only fires when
                 // the aggregate is the outer node.)
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         aggregate_rows(*function, argument.as_ref(), &columns, &rows)
@@ -1121,7 +1171,11 @@ impl Engine {
                     // them is indexed, we can skip decode_row / Vec<Value> /
                     // encode_row_into entirely and patch the row's raw bytes on
                     // the hot page.
-                    let fast_patch: Option<Vec<FastPatch>> = {
+                    let fast_patch: Option<Vec<FastPatch>> = if self
+                        .generic_path_forced("update-byte-patch")
+                    {
+                        None
+                    } else {
                         let tbl = self
                             .catalog
                             .get_table(table)
@@ -1225,7 +1279,11 @@ impl Engine {
                     }
 
                     // Mission C Phase 10: var-column in-place shrink fast path.
-                    let var_fast: Option<(usize, Option<Vec<u8>>)> = {
+                    let var_fast: Option<(usize, Option<Vec<u8>>)> = if self
+                        .generic_path_forced("update-var-shrink")
+                    {
+                        None
+                    } else {
                         let tbl = self
                             .catalog
                             .get_table(table)
@@ -1420,14 +1478,15 @@ impl Engine {
                 // Overflow safety (P1): a v2-capable table cannot take the fused
                 // raw-byte delete — the compiled predicate mis-reads spilled
                 // columns. Route it through the reassembling collect-rids path.
-                let delete_overflow = self.catalog.table_has_overflow(table);
+                let skip_fused_delete = self.catalog.table_has_overflow(table)
+                    || self.generic_path_forced("delete-fused");
                 if let PlanNode::Filter {
                     input: inner,
                     predicate,
                 } = input.as_ref()
                 {
                     if let PlanNode::SeqScan { table: t } = inner.as_ref() {
-                        if t == table && !delete_overflow {
+                        if t == table && !skip_fused_delete {
                             let schema = self
                                 .catalog
                                 .schema(table)
@@ -1435,9 +1494,13 @@ impl Engine {
                             let columns: Vec<String> =
                                 schema.columns.iter().map(|c| c.name.clone()).collect();
                             let fast = FastLayout::new(schema);
-                            if let Some(compiled) =
-                                compile_predicate(predicate, &columns, &fast, schema)
-                            {
+                            if let Some(compiled) = self.compile_predicate_unless_forced(
+                                "delete-fused:predicate",
+                                predicate,
+                                &columns,
+                                &fast,
+                                schema,
+                            ) {
                                 // Mission B2: logged variant so every
                                 // matched rid hits the WAL during the
                                 // single-pass scan. Structure of the
@@ -1454,7 +1517,7 @@ impl Engine {
                         }
                     }
                 } else if let PlanNode::SeqScan { table: t } = input.as_ref() {
-                    if t == table && !delete_overflow {
+                    if t == table && !skip_fused_delete {
                         // `delete from T` with no predicate — every live
                         // row matches. One pass is still the right shape.
                         // Mission B2: logged variant — see above.
@@ -1509,7 +1572,7 @@ impl Engine {
                         self.refresh_view(&table)?;
                     }
                 }
-                let parent = self.execute_plan(input)?;
+                let parent = self.dispatch_mut(input)?;
                 self.execute_nested_project(parent, fields)
             }
 
@@ -1562,8 +1625,8 @@ impl Engine {
                 //      predicates, or `on` expressions that reference
                 //      either side with something more complex than a
                 //      QualifiedField.
-                let left_result = self.execute_plan(left)?;
-                let right_result = self.execute_plan(right)?;
+                let left_result = self.dispatch_mut(left)?;
+                let right_result = self.dispatch_mut(right)?;
                 let (left_columns, left_rows) = match left_result {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("join left side must produce rows".into()),
@@ -1591,7 +1654,7 @@ impl Engine {
             }
 
             PlanNode::Distinct { input } => {
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
@@ -1632,7 +1695,7 @@ impl Engine {
                         self.query_memory_limit(),
                     );
                 }
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         // WS2: byte-budget guard on the GROUP BY input buffer
@@ -2014,13 +2077,13 @@ impl Engine {
             }
 
             PlanNode::Window { input, windows } => {
-                let result = self.execute_plan(input)?;
+                let result = self.dispatch_mut(input)?;
                 execute_window(result, windows, self.query_memory_limit)
             }
 
             PlanNode::Union { left, right, all } => {
-                let left_result = self.execute_plan(left)?;
-                let right_result = self.execute_plan(right)?;
+                let left_result = self.dispatch_mut(left)?;
+                let right_result = self.dispatch_mut(right)?;
                 let (left_cols, left_rows) = match left_result {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on left side".into()),
@@ -2160,8 +2223,13 @@ impl Engine {
                 // Overflow safety (P0-4/P1): the raw compiled scan drops/mis-reads
                 // spilled columns; a v2-capable table uses the decoded scan below.
                 if !tbl.has_overflow_rows() {
-                    if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, schema)
-                    {
+                    if let Some(compiled) = self.compile_predicate_unless_forced(
+                        "index-scan-scan-fallback:predicate",
+                        &synth_pred,
+                        &columns,
+                        &fast,
+                        schema,
+                    ) {
                         // Mission F: skip the first 4 Vec doublings.
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                         for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
@@ -2311,7 +2379,13 @@ impl Engine {
                 let fast = FastLayout::new(schema);
                 let synth = synthesize_range_predicate(column, start, end);
                 if !tbl.has_overflow_rows() {
-                    if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
+                    if let Some(compiled) = self.compile_predicate_unless_forced(
+                        "range-scan-scan-fallback:predicate",
+                        &synth,
+                        &columns,
+                        &fast,
+                        schema,
+                    ) {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                         for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
                             if compiled(data) {
@@ -2349,6 +2423,9 @@ impl Engine {
     }
 
     // ─── Materialized view operations ──────────────────────────────────────
+    //
+    // See [`parse_stored_view_source`] below for why a stored source is parsed
+    // before anything is computed from it.
 
     /// Create a materialized view: execute the source query, store results
     /// in a new backing table, and register the view.
@@ -2377,7 +2454,7 @@ impl Engine {
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
         // Determine which base tables this view depends on by parsing the query.
-        let depends_on = self.extract_view_deps(query_text);
+        let depends_on = self.extract_view_deps(name, query_text)?;
         self.view_registry
             .register(ViewDef {
                 name: name.to_string(),
@@ -2391,12 +2468,16 @@ impl Engine {
 
     /// Refresh a materialized view: re-execute its source query and replace
     /// the backing table's contents.
-    fn refresh_view(&mut self, name: &str) -> Result<(), QueryError> {
+    pub(in crate::executor) fn refresh_view(&mut self, name: &str) -> Result<(), QueryError> {
         let def = self
             .view_registry
             .get(name)
             .ok_or_else(|| format!("materialized view '{name}' not found"))?;
         let query_text = def.query.clone();
+        // The stored source has to be readable before anything is recomputed
+        // from it. Re-executing it blind is what made a view with an
+        // unparseable source silently keep serving its old rows.
+        parse_stored_view_source(name, &query_text)?;
         // Execute the source query.
         let result = self.execute_powql(&query_text)?;
         let (_columns, rows) = match result {
@@ -2463,19 +2544,36 @@ impl Engine {
     }
 
     /// Extract base table dependencies from a view's source query by
-    /// parsing it and collecting the source table name.
-    fn extract_view_deps(&self, query_text: &str) -> Vec<String> {
-        use crate::parser::parse;
-        match parse(query_text) {
-            Ok(Statement::Query(q)) => {
-                let mut deps = vec![q.source.clone()];
-                for j in &q.joins {
-                    deps.push(j.source.clone());
+    /// parsing it and collecting the source table names.
+    ///
+    /// A parse failure is an error rather than "no dependencies". An empty
+    /// dependency list means nothing ever marks the view dirty, so it is never
+    /// refreshed and every read serves whatever the backing table happens to
+    /// hold, permanently and without any error: the exact silent-wrong-answer
+    /// shape the rest of the engine refuses.
+    fn extract_view_deps(&self, name: &str, query_text: &str) -> Result<Vec<String>, QueryError> {
+        fn collect(statement: &Statement, deps: &mut Vec<String>) {
+            match statement {
+                Statement::Query(q) => {
+                    deps.push(q.source.clone());
+                    for join in &q.joins {
+                        deps.push(join.source.clone());
+                    }
                 }
-                deps
+                // Both halves of a union are read by the view, so both have to
+                // be able to dirty it. Without this arm a `union` view was
+                // registered with no dependencies at all and never refreshed.
+                Statement::Union(u) => {
+                    collect(&u.left, deps);
+                    collect(&u.right, deps);
+                }
+                _ => {}
             }
-            _ => Vec::new(),
         }
+        let statement = parse_stored_view_source(name, query_text)?;
+        let mut deps = Vec::new();
+        collect(&statement, &mut deps);
+        Ok(deps)
     }
 
     /// Route a parsed link declaration to the persistent catalog's
@@ -2536,7 +2634,9 @@ impl Engine {
     /// and fill in the child table and correlation columns so execution
     /// proceeds exactly as for the explicit correlated spelling. A block
     /// traversal is only valid through a `ToMany` link; a `ToOne` link is a
-    /// pinned kind-mismatch error. `qualify_parent` mirrors the planner: the
+    /// kind-mismatch error. Cardinality is derived from the catalog at
+    /// execution time, so it tracks index DDL that ran after the link was
+    /// declared. `qualify_parent` mirrors the planner: the
     /// top level correlates against an `AliasScan`'s `alias.col` columns,
     /// deeper levels against the enclosing child's bare schema columns.
     fn resolve_via_link(
@@ -2555,11 +2655,25 @@ impl Engine {
                     via.link_name, outer_table, outer_table, via.link_name
                 ))
             })?;
-            if link.kind != LinkKind::ToMany {
+            // GATE B1. Cardinality is derived from index uniqueness here and
+            // nowhere else. `LinkDef::kind` is an advisory byte that is never
+            // refreshed (see `Catalog::derive_link_kind`); reading it would
+            // make `alter <Target> add unique .<key>` after the link silently
+            // keep this hop to-many forever.
+            let kind = self
+                .catalog
+                .derive_link_kind(&link.target_type, &link.target_key);
+            if kind != LinkKind::ToMany {
                 return Err(QueryError::Execution(format!(
-                    "link `{}` on type `{}` is a to-one link; traverse it as a \
-                     path (`{}.{}.<column>`), not a block",
-                    via.link_name, outer_table, nested.parent_alias, via.link_name
+                    "link `{}` on type `{}` is a to-one link (its target key \
+                     `{}.{}` is unique, so a hop matches at most one row); \
+                     traverse it as a path (`{}.{}.<column>`), not a block",
+                    via.link_name,
+                    outer_table,
+                    link.target_type,
+                    link.target_key,
+                    nested.parent_alias,
+                    via.link_name
                 )));
             }
             // owner.local_key = target.target_key: the child (target) side of
@@ -2594,8 +2708,10 @@ impl Engine {
     /// link on the type reached so far. Produces one [`ScalarLinkHop`] per
     /// segment; the first hop's FK column is qualified with the outer alias to
     /// match the parent `AliasScan`'s column names. A `ToMany` link in the
-    /// chain (a non-unique target key) is a pinned kind-mismatch error, never
-    /// a silent fan-out.
+    /// chain (a non-unique target key) is a kind-mismatch error, never a silent
+    /// fan-out. Each hop's cardinality is derived from the catalog at execution
+    /// time, so a target key made unique after the link was declared is a
+    /// to-one hop from that moment on, with no re-declaration.
     fn resolve_scalar_link_field(
         &self,
         field: &ScalarLinkField,
@@ -2615,22 +2731,67 @@ impl Engine {
                      `link {current}.{link_name} -> <Target> on <local> = <target>`"
                 ))
             })?;
-            if link.kind != LinkKind::ToOne {
+            // GATE B2, per hop: every link in the chain is checked against the
+            // catalog as it stands now, not as it stood when the link was
+            // declared. Same rule as B1: never read `LinkDef::kind`.
+            let kind = self
+                .catalog
+                .derive_link_kind(&link.target_type, &link.target_key);
+            if kind != LinkKind::ToOne {
+                // Lead with the remedy that keeps the query as written. The
+                // block form is the alternative, not the default: it turns a
+                // foreign-key lookup into a one-element array the caller has to
+                // unwrap forever. Only offer `add unique` when it would
+                // actually be accepted: a target key that already carries a
+                // plain index cannot be upgraded in place, and pointing at a
+                // statement that errors is how the old message misled.
+                //
+                // Each branch supplies a whole sentence rather than a fragment
+                // spliced into a shared frame: the plain-index case has no
+                // imperative to give, and forcing it into "To read one value
+                // per row, <fragment>" produced a sentence that did not parse.
+                let remedy = if self
+                    .catalog
+                    .is_index_unique(&link.target_type, &link.target_key)
+                    == Some(false)
+                {
+                    format!(
+                        "There is no way to read one value per row here: `{}.{}` \
+                         already carries a non-unique index and an index cannot \
+                         be upgraded in place, so this link stays to-many.",
+                        link.target_type, link.target_key
+                    )
+                } else {
+                    format!(
+                        "To read one value per row, make the target key unique \
+                         with `alter {} add unique .{}`.",
+                        link.target_type, link.target_key
+                    )
+                };
                 return Err(QueryError::Execution(format!(
-                    "link `{link_name}` on type `{current}` is a to-many link \
-                     (its target key `{target_key}` is not unique); traverse it \
-                     with a block (`{}: {}.{link_name} {{ ... }}`), not a scalar path",
-                    link_name,
-                    field.outer_alias,
-                    target_key = link.target_key
+                    "link `{link_name}` on type `{current}` is a to-many link: \
+                     its target key `{}.{}` is not unique, so a hop can match \
+                     many rows. {remedy} To read every match, traverse it with a \
+                     block (`{link_name}: {}.{link_name} {{ ... }}`)",
+                    link.target_type, link.target_key, field.outer_alias
                 )));
             }
             current = link.target_type.clone();
             chain.push(link);
         }
         // owner.local_key = target.target_key: the FK on the many side is
-        // `local_key`, the key on the one side is `target_key`.
-        let first_fk = format!("{}.{}", field.outer_alias, chain[0].local_key);
+        // `local_key`, the key on the one side is `target_key`. The parser only
+        // builds a link path with at least one hop, but this runs on any plan
+        // an executor is handed, and an empty chain must be a typed error and
+        // never a slice-index panic (panic = abort makes that a remote DoS).
+        let Some(first) = chain.first() else {
+            return Err(QueryError::Execution(format!(
+                "scalar link path for column `{}` names no link to traverse; \
+                 write it as `<alias>.<link>.<column>`",
+                field.column
+            )));
+        };
+        let first_fk = format!("{}.{}", field.outer_alias, first.local_key);
         let hops = chain
             .iter()
             .enumerate()
@@ -3300,4 +3461,38 @@ fn push_json_value(out: &mut String, value: &Value) {
         }
         other => push_json_string(out, &other.to_wire_string()),
     }
+}
+
+/// Parse a materialized view's STORED source text, or fail with a typed error
+/// naming the view.
+///
+/// A view's source text outlives the process and outlives the release that
+/// wrote it. Releases up to 0.21.0 reconstructed that text in a way that could
+/// lose string escapes and backtick-quoted identifiers, so a database written
+/// by one of them can hold a source that no longer parses at all. Both places
+/// that read one back treated a parse failure as "nothing to do":
+/// `extract_view_deps` returned no dependencies, so the view was never marked
+/// dirty and therefore never refreshed, and every read of it then served
+/// whatever rows the backing table happened to hold, forever, with no error
+/// anywhere. A read returned `[]` where the view's own query returned `[1]`.
+///
+/// Fixing the reconstruction is not retroactive: nothing rewrites a source that
+/// is already on disk. So the read side refuses instead, which turns a silent
+/// wrong answer into an error the operator can act on.
+///
+/// The relex round-trip check that guards `materialize` is deliberately NOT
+/// applied here. A refresh executes the stored text directly rather than
+/// re-rendering it, so a source that parses but is not a fixed point of the
+/// current reconstruction still computes exactly what it says; rejecting it
+/// would fail live views over a difference with no runtime consequence.
+pub(super) fn parse_stored_view_source(name: &str, source: &str) -> Result<Statement, QueryError> {
+    crate::parser::parse(source).map_err(|err| {
+        QueryError::ViewError(format!(
+            "materialized view '{name}' has a stored source query that no longer parses \
+             ({err}). It was written by an older release whose source-text reconstruction \
+             was lossy, so the view cannot be refreshed and its rows cannot be trusted. \
+             Re-create it: `drop view {name}`, then `materialize {name} as \
+             <the original query>`."
+        ))
+    })
 }

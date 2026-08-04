@@ -14,6 +14,13 @@
 # This script does NOT touch thesis-ratios.json. That file is hand-edited.
 # Raising a ratio ceiling is a separate, deliberate commit.
 #
+# POLICY: baseline/main.json may only be rebaselined from a Depot run of
+# bench.yml (see CLAUDE.md). This script records the fingerprint of the host
+# it actually runs on (runner from POWDB_BENCH_RUNNER, RUSTFLAGS as set, arch
+# measured from the compare binary). It never fabricates the Depot values, so
+# a baseline produced on a laptop will be refused by the comparator. That is
+# the gate working, not a bug in this script.
+#
 # Convention for the rebaseline commit:
 #   bench: rebaseline after <change> (<workload>: <delta>)
 #
@@ -86,19 +93,41 @@ for w in "${WORKLOADS[@]}"; do
     <<< "${workloads_json}")
 done
 
-# Build the full baseline document.
+# Build the full baseline document. The fingerprint is recorded truthfully
+# from this host: the comparator (schema 3) checks runner, rustflags, and a
+# measured arch, and will refuse a baseline whose fingerprint does not match
+# the machine the comparison later runs on.
+if [[ -z "${POWDB_BENCH_RUNNER:-}" ]]; then
+  echo "error: POWDB_BENCH_RUNNER is not set." >&2
+  echo "       The baseline records the runner it was produced on. The" >&2
+  echo "       authoritative rebaseline path is the Depot bench.yml run," >&2
+  echo "       which sets this. Set it explicitly to proceed locally," >&2
+  echo "       knowing the comparator will refuse a non-Depot baseline." >&2
+  exit 1
+fi
+
 RUSTC_VERSION=$(rustc --version | awk '{print $2}')
 GIT_SHA=$(git rev-parse --short HEAD)
 TODAY=$(date -u +%Y-%m-%d)
+ARCH=$(cargo run --quiet -p powdb-bench --bin compare -- --print-arch)
+if [[ -z "${ARCH}" ]]; then
+  echo "error: could not measure arch via 'compare --print-arch'." >&2
+  exit 1
+fi
 
 new_baseline=$(jq -n \
   --argjson workloads "${workloads_json}" \
   --arg rustc "${RUSTC_VERSION}" \
   --arg commit "${GIT_SHA}" \
   --arg today "${TODAY}" \
+  --arg runner "${POWDB_BENCH_RUNNER}" \
+  --arg rustflags "${RUSTFLAGS:-}" \
+  --arg arch "${ARCH}" \
   '{
-    schema: 1,
-    runner: "ubuntu-24.04",
+    schema: 3,
+    runner: $runner,
+    rustflags: $rustflags,
+    arch: $arch,
     rustc: $rustc,
     updated: $today,
     commit: $commit,

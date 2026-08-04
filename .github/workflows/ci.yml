@@ -436,6 +436,163 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm run test:native
           npm exec --yes --package=pnpm@10.29.3 -- pnpm run test:e2e
 
+  # Format compatibility against the binaries users actually installed, in both
+  # directions. Every other compatibility test in this repo asserts against
+  # bytes this repo wrote itself (catalog_v7_migration.rs builds its "v6"
+  # fixture with today's writer), so a wrong encoder would produce a wrong
+  # fixture and a green test. This job removes the shared author.
+  cross-version-compat:
+    name: cross-version compat (real released binaries)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: cross-version-compat
+
+      # Released binaries are immutable per tag, so the cache key is the
+      # version list itself.
+      - name: Released binary cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/compat-bins
+          key: compat-bins-${{ runner.os }}-v0.19.1-v0.20.0-v0.21.0-v0.18.2
+
+      - name: Build HEAD powdb-cli
+        run: cargo build --release -p powdb-cli
+
+      - name: Cross-version compatibility (forward + downgrade)
+        run: bash scripts/ci/cross-version-compat.sh
+
+  # Deterministic replay of the checked-in fuzz corpus. `fuzz.yml` runs a
+  # time-budgeted campaign, which explores and therefore cannot be a required
+  # check; this replays a fixed input set exactly once each, so its verdict is
+  # a function of the commit. It also refuses to "pass" a target whose seed
+  # directory is empty.
+  fuzz-corpus-replay:
+    name: fuzz corpus replay (deterministic)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          # Same pin as fuzz.yml, for the same reason (nightly-2026-07-23 ICEs
+          # in rustc_codegen_ssa on tokio). `nightly-pin-freshness` in fuzz.yml
+          # fails once this pin goes stale, so it cannot rot silently.
+          toolchain: nightly-2026-07-22
+
+      - name: Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            crates/query/fuzz/target
+          key: fuzz-replay-${{ runner.os }}-${{ hashFiles('crates/query/fuzz/Cargo.lock') }}
+          restore-keys: |
+            fuzz-replay-${{ runner.os }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Replay the checked-in corpus
+        env:
+          FUZZ_TOOLCHAIN: nightly-2026-07-22
+        run: bash scripts/ci/fuzz-corpus-replay.sh
+
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-replay-crashes
+          path: crates/query/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Run the corruption and wire-corpus suites against the SHIPPED panic
+  # configuration. `panic = "abort"` is on [profile.release] only, so every
+  # "the server did not abort" assertion elsewhere in the suite actually
+  # observed an unwinding test-profile binary.
+  release-profile-suites:
+    name: release-profile suites (panic=abort)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: release-profile-suites
+
+      - name: Corruption + wire-corpus suites, release profile
+        run: bash scripts/ci/release-profile-suites.sh
+
+  # The bench comparator is the only thing standing between a perf regression
+  # and a green release, and nothing checks the comparator. This drives it over
+  # synthetic fixtures and asserts each failing verdict is reachable. Fast (no
+  # benchmarking), unlike bench.yml itself.
+  bench-gate-selftest:
+    name: bench gate self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: bench-gate-selftest
+
+      - name: Prove every comparator verdict is reachable
+        run: bash scripts/ci/bench-gate-selftest.sh
+
+  # A job that is not in ci-success's `needs:` blocks nothing. The comment on
+  # that job asks contributors to keep the list current; this makes forgetting
+  # it a build failure instead of a silently unguarded job. Pure text parsing,
+  # no cargo, so it costs seconds.
+  ci-needs-completeness:
+    name: ci-success needs completeness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Every ci.yml job must be required by ci-success
+        run: bash scripts/ci/check-ci-success-needs.sh
+
   secret-scan:
     name: gitleaks secret scan
     runs-on: ubuntu-24.04
@@ -572,6 +729,11 @@ jobs:
       - ts-client
       - node-addon
       - embedded-sync-js
+      - cross-version-compat
+      - fuzz-corpus-replay
+      - release-profile-suites
+      - bench-gate-selftest
+      - ci-needs-completeness
       - secret-scan
       - audit
       - deny

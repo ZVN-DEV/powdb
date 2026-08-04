@@ -1,0 +1,1 @@
+insert User { id := 4, name := "d", score := 0.0 }

@@ -25,15 +25,35 @@ These numeric values are **stable wire contract**: they are never renumbered or 
 | 0 | `internal` | Unclassified or internal server error | Lock poisoning, internal task failure, WAL durability sync failure, protocol misuse, server shutdown notice | `query_failed` |
 | 1 | `parse` | The query text failed to lex or parse | Syntax errors, unterminated strings, unsupported constructs, excessive nesting | `query_failed` |
 | 2 | `execution` | Planning or execution failed | Unknown table or column, type mismatch, view/index errors, `cannot begin` while a transaction is active | `query_failed` |
-| 3 | `timeout` | A time budget elapsed | Per-query timeout, transaction-gate wait timeout, idle-connection timeout | `timeout` |
+| 3 | `timeout` | A time budget elapsed | Per-query timeout, transaction-gate wait timeout, idle-connection timeout, **explicit-transaction maximum lifetime** (see below) | `timeout` |
 | 4 | `limit_exceeded` | A memory or size limit was exceeded | Sort/join row caps, per-query memory budget, query text too large, result too large | `size_exceeded` |
 | 5 | `readonly_refused` | The server serves a read-only snapshot and the statement requires a writer | Any mutation (or a read that needs a writer, e.g. a stale materialized view) against `powdb-server --readonly` | `query_failed` |
 | 6 | `auth_failed` | Authentication or database selection failed at CONNECT time | Wrong password, unknown user, unknown database name | `auth_failed` |
 | 7 | `rate_limited` | Too many failed authentication attempts from this address | Repeated bad passwords; wait and retry later | `auth_failed` |
 | 8 | `constraint_violation` | A constraint rejected the write | Unique index violation | `query_failed` |
 | 9 | `cancelled` | Execution was cancelled cooperatively | The issuing client disconnected mid-query | `query_failed` |
+| 10 | `protocol_version` | The handshake could not agree on a wire protocol version or a required feature | Client and server protocol version ranges do not overlap; a feature the client requires is absent | `protocol_version` |
+
+Class `10` is the only class that never arrives mid-session: the server sends it during the handshake, in place of `ConnectOk`, and then closes the connection.
 
 The authoritative Rust definition is `ErrorClass` in `crates/server/src/protocol.rs`; the TypeScript mirror is `WIRE_ERROR_CLASS` in `clients/ts/src/errors.ts`.
+
+### Not every class-3 error is retryable in place
+
+Four different budgets produce class `3`, and they do not all mean the same thing to a client:
+
+| Message starts with | Budget | What the client must do |
+|---|---|---|
+| `query timeout after` | `POWDB_QUERY_TIMEOUT` | Retry, or simplify the query. The connection and any open transaction are intact. |
+| `transaction gate timeout after` | `POWDB_TX_WAIT_TIMEOUT_MS` | Another connection holds an explicit transaction. Retry after a backoff. |
+| `idle timeout` | `POWDB_IDLE_TIMEOUT` | The connection is closing. Reconnect. |
+| `transaction exceeded the maximum lifetime of` | `POWDB_TX_MAX_LIFETIME_MS` | **The server rolled this connection's explicit transaction back and is closing the connection.** Every uncommitted write in it is gone. Reconnect, then replay the whole transaction. Do not resume it. |
+
+The last one is a default-on behavior added in v0.22: an explicit transaction holds the single write-admission gate for its entire lifetime, so the server bounds that lifetime at 300000 ms by default. Raise `POWDB_TX_MAX_LIFETIME_MS` if transactions on that server legitimately run longer, or set it to `0` to disable the bound and return to letting the client choose how long it holds the gate. See "Explicit transactions have a maximum lifetime" in [POWQL.md](POWQL.md#concurrency-behavior).
+
+A driver that lumps all of class `3` into one retry path will silently retry a *statement* against a transaction that no longer exists, so branch on the message prefix (or simply treat any class-3 error as fatal to an open transaction).
+
+One fallback rule completes that: when the lifetime budget expires while the server is writing a reply that cannot finish, the server closes the connection without sending the error frame, because anything written after a partly-sent frame would be read as that frame's payload. The client sees only the close. **Treat an unexpected connection close during an open transaction exactly as you would a class-3 timeout:** the transaction is gone, so reconnect and replay it instead of assuming its writes survived.
 
 ## Client-side mapping (TypeScript)
 

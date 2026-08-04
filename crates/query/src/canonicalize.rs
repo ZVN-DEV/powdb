@@ -236,7 +236,13 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
             hash_byte(h, 0xF3)
         }
 
-        // Keywords. Each gets a unique tag in the 0x10..0x4F range.
+        // Keywords. Every token below must hash a tag that no other token
+        // uses: two tokens sharing a tag make two different statements
+        // canonicalize identically, and the plan cache will then run the
+        // first statement's plan for the second one. `every_token_hashes_to
+        // _a_distinct_tag` enforces this over the whole enum; do not pick a
+        // tag by eye. Free tags are scarce, so widen the range rather than
+        // reusing one.
         Token::Type => hash_byte(h, 0x10),
         Token::Filter => hash_byte(h, 0x11),
         Token::Order => hash_byte(h, 0x12),
@@ -259,9 +265,9 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
         Token::Asc => hash_byte(h, 0x1F),
         Token::Desc => hash_byte(h, 0x20),
         Token::And => hash_byte(h, 0x21),
-        Token::Or => hash_byte(h, 0x22),
+        Token::Or => hash_byte(h, 0x4E),
         Token::Not => hash_byte(h, 0x23),
-        Token::Exists => hash_byte(h, 0x24),
+        Token::Exists => hash_byte(h, 0x4F),
         Token::Let => hash_byte(h, 0x25),
         Token::As => hash_byte(h, 0x26),
         Token::Match => hash_byte(h, 0x27),
@@ -363,6 +369,314 @@ fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One representative of every `Token` variant.
+    ///
+    /// Keep in sync with `token_variant_name` below: that match has no
+    /// wildcard arm, so adding a variant to `Token` breaks this module's
+    /// compilation and lands the author here.
+    fn one_of_every_token() -> Vec<Token> {
+        vec![
+            Token::Ident("x".into()),
+            Token::DotIdent("x".into()),
+            Token::IntLit(1),
+            Token::FloatLit(1.0),
+            Token::StringLit("x".into()),
+            Token::BoolLit(true),
+            Token::Param("x".into()),
+            Token::Type,
+            Token::Filter,
+            Token::Order,
+            Token::Limit,
+            Token::Offset,
+            Token::Insert,
+            Token::Update,
+            Token::Delete,
+            Token::Upsert,
+            Token::Returning,
+            Token::Select,
+            Token::Required,
+            Token::Default,
+            Token::Auto,
+            Token::Multi,
+            Token::Link,
+            Token::Index,
+            Token::Unique,
+            Token::On,
+            Token::Conflict,
+            Token::Asc,
+            Token::Desc,
+            Token::And,
+            Token::Or,
+            Token::Not,
+            Token::Exists,
+            Token::Let,
+            Token::As,
+            Token::Match,
+            Token::Group,
+            Token::Join,
+            Token::Inner,
+            Token::LeftKw,
+            Token::RightKw,
+            Token::Outer,
+            Token::Cross,
+            Token::Transaction,
+            Token::Begin,
+            Token::Commit,
+            Token::Rollback,
+            Token::View,
+            Token::Materialized,
+            Token::Refresh,
+            Token::Union,
+            Token::Having,
+            Token::Distinct,
+            Token::In,
+            Token::Between,
+            Token::Like,
+            Token::Count,
+            Token::Avg,
+            Token::Sum,
+            Token::Min,
+            Token::Max,
+            Token::Raw,
+            Token::Is,
+            Token::Null,
+            Token::Upper,
+            Token::Lower,
+            Token::Length,
+            Token::Trim,
+            Token::Substring,
+            Token::Concat,
+            Token::Abs,
+            Token::Round,
+            Token::Ceil,
+            Token::Floor,
+            Token::Sqrt,
+            Token::Pow,
+            Token::Now,
+            Token::Extract,
+            Token::DateAdd,
+            Token::DateDiff,
+            Token::JsonType,
+            Token::JsonText,
+            Token::Cast,
+            Token::Case,
+            Token::When,
+            Token::Then,
+            Token::Else,
+            Token::End,
+            Token::Over,
+            Token::Partition,
+            Token::RowNumber,
+            Token::Rank,
+            Token::DenseRank,
+            Token::Alter,
+            Token::Drop,
+            Token::Add,
+            Token::Column,
+            Token::Explain,
+            Token::Schema,
+            Token::Describe,
+            Token::Eq,
+            Token::Neq,
+            Token::Lt,
+            Token::Gt,
+            Token::Lte,
+            Token::Gte,
+            Token::Assign,
+            Token::Arrow,
+            Token::Pipe,
+            Token::Coalesce,
+            Token::Plus,
+            Token::Minus,
+            Token::Star,
+            Token::Slash,
+            Token::LBrace,
+            Token::RBrace,
+            Token::LParen,
+            Token::RParen,
+            Token::Comma,
+            Token::Colon,
+            Token::Dot,
+            Token::Eof,
+        ]
+    }
+
+    /// Exhaustive by construction: no wildcard arm, so a new `Token` variant
+    /// stops this crate's tests from compiling until it is named here and
+    /// added to `one_of_every_token`.
+    fn token_variant_name(t: &Token) -> &'static str {
+        match t {
+            Token::Ident(_) => "Ident",
+            Token::DotIdent(_) => "DotIdent",
+            Token::IntLit(_) => "IntLit",
+            Token::FloatLit(_) => "FloatLit",
+            Token::StringLit(_) => "StringLit",
+            Token::BoolLit(_) => "BoolLit",
+            Token::Param(_) => "Param",
+            Token::Type => "Type",
+            Token::Filter => "Filter",
+            Token::Order => "Order",
+            Token::Limit => "Limit",
+            Token::Offset => "Offset",
+            Token::Insert => "Insert",
+            Token::Update => "Update",
+            Token::Delete => "Delete",
+            Token::Upsert => "Upsert",
+            Token::Returning => "Returning",
+            Token::Select => "Select",
+            Token::Required => "Required",
+            Token::Default => "Default",
+            Token::Auto => "Auto",
+            Token::Multi => "Multi",
+            Token::Link => "Link",
+            Token::Index => "Index",
+            Token::Unique => "Unique",
+            Token::On => "On",
+            Token::Conflict => "Conflict",
+            Token::Asc => "Asc",
+            Token::Desc => "Desc",
+            Token::And => "And",
+            Token::Or => "Or",
+            Token::Not => "Not",
+            Token::Exists => "Exists",
+            Token::Let => "Let",
+            Token::As => "As",
+            Token::Match => "Match",
+            Token::Group => "Group",
+            Token::Join => "Join",
+            Token::Inner => "Inner",
+            Token::LeftKw => "LeftKw",
+            Token::RightKw => "RightKw",
+            Token::Outer => "Outer",
+            Token::Cross => "Cross",
+            Token::Transaction => "Transaction",
+            Token::Begin => "Begin",
+            Token::Commit => "Commit",
+            Token::Rollback => "Rollback",
+            Token::View => "View",
+            Token::Materialized => "Materialized",
+            Token::Refresh => "Refresh",
+            Token::Union => "Union",
+            Token::Having => "Having",
+            Token::Distinct => "Distinct",
+            Token::In => "In",
+            Token::Between => "Between",
+            Token::Like => "Like",
+            Token::Count => "Count",
+            Token::Avg => "Avg",
+            Token::Sum => "Sum",
+            Token::Min => "Min",
+            Token::Max => "Max",
+            Token::Raw => "Raw",
+            Token::Is => "Is",
+            Token::Null => "Null",
+            Token::Upper => "Upper",
+            Token::Lower => "Lower",
+            Token::Length => "Length",
+            Token::Trim => "Trim",
+            Token::Substring => "Substring",
+            Token::Concat => "Concat",
+            Token::Abs => "Abs",
+            Token::Round => "Round",
+            Token::Ceil => "Ceil",
+            Token::Floor => "Floor",
+            Token::Sqrt => "Sqrt",
+            Token::Pow => "Pow",
+            Token::Now => "Now",
+            Token::Extract => "Extract",
+            Token::DateAdd => "DateAdd",
+            Token::DateDiff => "DateDiff",
+            Token::JsonType => "JsonType",
+            Token::JsonText => "JsonText",
+            Token::Cast => "Cast",
+            Token::Case => "Case",
+            Token::When => "When",
+            Token::Then => "Then",
+            Token::Else => "Else",
+            Token::End => "End",
+            Token::Over => "Over",
+            Token::Partition => "Partition",
+            Token::RowNumber => "RowNumber",
+            Token::Rank => "Rank",
+            Token::DenseRank => "DenseRank",
+            Token::Alter => "Alter",
+            Token::Drop => "Drop",
+            Token::Add => "Add",
+            Token::Column => "Column",
+            Token::Explain => "Explain",
+            Token::Schema => "Schema",
+            Token::Describe => "Describe",
+            Token::Eq => "Eq",
+            Token::Neq => "Neq",
+            Token::Lt => "Lt",
+            Token::Gt => "Gt",
+            Token::Lte => "Lte",
+            Token::Gte => "Gte",
+            Token::Assign => "Assign",
+            Token::Arrow => "Arrow",
+            Token::Pipe => "Pipe",
+            Token::Coalesce => "Coalesce",
+            Token::Plus => "Plus",
+            Token::Minus => "Minus",
+            Token::Star => "Star",
+            Token::Slash => "Slash",
+            Token::LBrace => "LBrace",
+            Token::RBrace => "RBrace",
+            Token::LParen => "LParen",
+            Token::RParen => "RParen",
+            Token::Comma => "Comma",
+            Token::Colon => "Colon",
+            Token::Dot => "Dot",
+            Token::Eof => "Eof",
+        }
+    }
+
+    #[test]
+    fn one_of_every_token_covers_the_whole_enum() {
+        let toks = one_of_every_token();
+        let mut names: Vec<&str> = toks.iter().map(token_variant_name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "one_of_every_token lists a variant twice; the distinctness test \
+             below would then compare a token against itself and pass vacuously"
+        );
+    }
+
+    /// Two tokens that hash to the same tag canonicalize two different
+    /// statements to the same cache key, and the plan cache runs the first
+    /// statement's plan for the second. That shipped: `Default` and `Or`
+    /// both hashed 0x22 and `Auto` and `Exists` both hashed 0x24, which let
+    /// `type W { exists a: int }` -- a syntax error on a cold engine --
+    /// execute a cached `type W { auto a: int }` and create a table.
+    ///
+    /// Asserted over the whole enum, not over the two pairs that were found,
+    /// so a partial fix or a future hand-picked tag fails the build.
+    #[test]
+    fn every_token_hashes_to_a_distinct_tag() {
+        let mut by_hash: std::collections::HashMap<u64, &'static str> =
+            std::collections::HashMap::new();
+        let mut collisions: Vec<String> = Vec::new();
+
+        for tok in one_of_every_token() {
+            let name = token_variant_name(&tok);
+            let mut literals = Vec::new();
+            let h = hash_token(FNV_OFFSET, &tok, &mut literals);
+            if let Some(prev) = by_hash.insert(h, name) {
+                collisions.push(format!("{prev} and {name} share a tag"));
+            }
+        }
+
+        assert!(
+            collisions.is_empty(),
+            "colliding canonical tags: {}",
+            collisions.join("; ")
+        );
+    }
 
     #[test]
     fn test_same_query_same_hash() {

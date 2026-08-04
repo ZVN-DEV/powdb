@@ -2,6 +2,15 @@ name: fuzz
 
 on:
   pull_request:
+    # This allowlist is hand-maintained, which means it is a list of what
+    # somebody remembered. It used to stop at the front end (lexer, parser,
+    # sql, pj1, wal, catalog, protocol) and therefore excluded the planner, the
+    # executor, the heap and the B-tree: a change to any of them could not
+    # trigger a fuzz run, and those four are where every shipped P0 in this
+    # engine has lived. The engine files below close that hole. The
+    # deterministic corpus replay in ci.yml runs on EVERY pull request
+    # regardless of paths, so this filter now only decides who gets the extra
+    # exploratory campaign, not who gets fuzzed at all.
     paths:
       - "crates/query/src/lexer.rs"
       - "crates/query/src/parser.rs"
@@ -10,6 +19,15 @@ on:
       - "crates/query/src/sql.rs"
       - "crates/query/src/token.rs"
       - "crates/query/src/canonicalize.rs"
+      # Engine interior: reached by fuzz_execute through real PowQL, and by
+      # fuzz_catalog_open / fuzz_wal_replay through real on-disk files.
+      - "crates/query/src/planner.rs"
+      - "crates/query/src/plan.rs"
+      - "crates/query/src/executor/**"
+      - "crates/storage/src/heap.rs"
+      - "crates/storage/src/btree.rs"
+      - "crates/storage/src/page.rs"
+      - "crates/storage/src/row.rs"
       - "crates/storage/src/pj1.rs"
       - "crates/server/src/protocol.rs"
       - "crates/storage/src/wal.rs"
@@ -45,6 +63,8 @@ jobs:
             fuzz_pj1,
             fuzz_wire,
             fuzz_wal_replay,
+            fuzz_execute,
+            fuzz_catalog_open,
           ]
     env:
       CARGO_TERM_COLOR: always
@@ -138,3 +158,18 @@ jobs:
           path: crates/query/fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14
+
+  # A toolchain pin is invisible once it works: the job stays green while the
+  # compiler, the sanitizer and the codegen backend it exercises stop moving.
+  # This runs on the nightly cron so a pin that has outlived its reason turns
+  # into a red run instead of quietly aging out.
+  nightly-pin-freshness:
+    name: nightly pin freshness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Fail if a pinned nightly has gone stale
+        run: bash scripts/ci/check-nightly-pin.sh

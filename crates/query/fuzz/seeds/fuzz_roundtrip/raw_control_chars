@@ -1,0 +1,2 @@
+insert U { s := "line1
+line2	tab" }

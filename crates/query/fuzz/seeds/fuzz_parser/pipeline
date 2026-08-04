@@ -1,0 +1,1 @@
+User filter .id = 1 order .a asc limit 5 offset 2 { .a, b: count(.c) }

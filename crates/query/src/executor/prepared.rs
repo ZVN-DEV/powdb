@@ -2,7 +2,6 @@
 
 use crate::ast::*;
 use crate::plan::*;
-use crate::planner;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::row::{ROW_MAGIC, ROW_PREFIX_SIZE};
@@ -144,7 +143,11 @@ fn restore_taken_strings(fast: &InsertFast, literals: &mut [Literal], values: &m
 
 impl Engine {
     pub fn prepare(&mut self, query: &str) -> Result<PreparedQuery, QueryError> {
-        let plan = planner::plan(query).map_err(|e| QueryError::Parse(e.to_string()))?;
+        // The stored template is the RAW plan, exactly like the plan cache's
+        // entries: lowering is a function of catalog state, and a prepared
+        // statement outlives the DDL that changes it. Lowering therefore
+        // happens per execution, below.
+        let (plan, _) = self.plan_text_and_lower(query)?;
         // Same walk-order restriction as the plan cache: a nested block that
         // wrote `offset` before `limit` cannot have its slots rebound in
         // source order.
@@ -313,9 +316,29 @@ impl Engine {
         let tbl = catalog.table_by_slot(table_slot);
         let schema = tbl.schema();
 
-        // Key column must have an index (the btree.lookup path is what
-        // makes the fast path worth building).
-        if !tbl.has_index(&key_col) {
+        // Key column must be a UNIQUE INT index, because the execute path
+        // probes it with `BTree::lookup_int`, which binary-searches assuming
+        // every key is a `Value::Int` and treats any other variant as `Less`.
+        //
+        // That probe is only equivalent to the lowered plan's probe under both
+        // conditions at once:
+        //
+        //   * `TypeId::Int` — a float / datetime / str / bool column stores its
+        //     keys in a different lane, so `lookup_int` addresses nothing and
+        //     the mutation silently reported `Modified(0)` while the same text
+        //     reported `Modified(1)` (or a typed error, for str and bool);
+        //   * unique — a non-unique index does not store one bare `Value::Int`
+        //     per key, so the same probe missed there too.
+        //
+        // Both are also what `plan_exec::lowering::coerce_column_index_key`
+        // decides for the text path, which is the definition this fast path has
+        // to match. Anything else falls through to the substitute-and-lower
+        // path below, which is always correct.
+        let key_col_idx = schema.column_index(&key_col)?;
+        if schema.columns[key_col_idx].type_id != TypeId::Int {
+            return None;
+        }
+        if tbl.is_index_unique(&key_col) != Some(true) {
             return None;
         }
 
@@ -382,7 +405,11 @@ impl Engine {
         // On rare mismatches (wrong literal type, index dropped after
         // prepare) the helper returns `Ok(None)` and we fall through to
         // the generic substitute-and-execute path below.
-        if let Some(fast) = &prep.update_pk_fast {
+        if let Some(fast) = prep
+            .update_pk_fast
+            .as_ref()
+            .filter(|_| !self.generic_path_forced("prepared-update-pk"))
+        {
             if let Some(result) = self.try_execute_update_pk_fast(fast, literals)? {
                 // Mark dependent views dirty for prepared update fast path.
                 if let PlanNode::Update { table, .. } = &prep.plan_template {
@@ -415,11 +442,10 @@ impl Engine {
         // HashMap lookup (`get_table_mut`) and dispatches straight into
         // `tbl.insert` — no intermediate schema lookup, no generic
         // `Catalog::insert` wrapper.
-        if let Some(fast) = prep
-            .insert_fast
-            .as_ref()
-            .filter(|fast| cached_table_matches(&self.catalog, fast.structure_generation))
-        {
+        if let Some(fast) = prep.insert_fast.as_ref().filter(|fast| {
+            !self.generic_path_forced("prepared-insert")
+                && cached_table_matches(&self.catalog, fast.structure_generation)
+        }) {
             let mut values = std::mem::take(&mut self.insert_values_scratch);
             values.resize(fast.n_cols, Value::Empty);
             // Columns omitted by the prepared INSERT must return to NULL on
@@ -494,7 +520,12 @@ impl Engine {
         let mut idx = 0usize;
         crate::plan_cache::substitute_plan(&mut plan, literals, &mut idx);
         debug_assert_eq!(idx, literals.len());
-        let result = self.execute_plan(&plan);
+        // The template is raw planner output and the substituted literals are
+        // new, so this is the first and only chance to lower. Executing the
+        // template directly is what made a prepared `.price < $1` answer
+        // differently from the same query executed as text.
+        let plan = self.lower(&plan);
+        let result = self.execute_lowered(&plan);
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).
         self.catalog
@@ -505,7 +536,7 @@ impl Engine {
 
     /// Mission C Phase 14: point-update fast path for prepared
     /// `T filter .pk = ? update { col := ? }` queries. The caller has
-    /// already verified this is an int-indexed pk with a fixed-size,
+    /// already verified this is a UNIQUE INT-indexed pk with a fixed-size,
     /// non-indexed target column; all we do here is pluck the two
     /// literals out of the caller's slice, run one `btree.lookup_int`,
     /// and patch 1–8 bytes of the row. No plan clone, no allocations.
@@ -526,8 +557,14 @@ impl Engine {
             return Ok(None);
         }
         let current_table = self.catalog.table_by_slot(fast.table_slot);
+        // Re-check the two properties `lookup_int` depends on rather than
+        // trusting the prepare-time decision. The structure generation above
+        // already catches index DDL, so this is defence in depth against a
+        // future mutation of the index set that forgets to bump it: losing the
+        // fast path costs speed, taking it on a non-unique or non-Int index
+        // loses writes.
         if current_table.has_indexed_col(fast.target_col_idx)
-            || !current_table.has_index(&fast.key_col)
+            || current_table.is_index_unique(&fast.key_col) != Some(true)
         {
             return Ok(None);
         }
@@ -732,9 +769,8 @@ impl Engine {
                 }
                 let inner = self.materialize_subqueries(inner)?;
                 // Plan and execute the subquery.
-                let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                let result = self.execute_plan(&sub_plan)?;
+                let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
+                let result = self.execute_lowered(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => {
                         let mut values = Vec::with_capacity(rows.len());
@@ -763,9 +799,8 @@ impl Engine {
                 }
                 // Uncorrelated EXISTS: run the subquery once and collapse
                 // into a Bool literal.
-                let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                let result = self.execute_plan(&sub_plan)?;
+                let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
+                let result = self.execute_lowered(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
                     _ => false,
@@ -826,9 +861,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                let result = self.execute_plan(&sub_plan)?;
+                let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
+                let result = self.execute_lowered(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => {
                         let mut values = Vec::with_capacity(rows.len());
@@ -860,9 +894,8 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                let result = self.execute_plan(&sub_plan)?;
+                let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
+                let result = self.execute_lowered(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
                     _ => false,

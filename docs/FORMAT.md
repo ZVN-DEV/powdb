@@ -63,6 +63,32 @@ version — it is a value-only file. A database written before v0.8.0 has no
 sidecar; its durable LSN reads as `0`, and the file is created on the next
 durable write, so older databases and backups open unchanged.
 
+## Entity link cardinality byte (catalog v7)
+
+The catalog v7 links section stores one `u8` per link for its cardinality
+(`0` to-one, `1` to-many). **Since v0.22.0 that byte is advisory and the engine
+never reads it back.**
+
+Cardinality is not a stored property: it is a consequence of whether the link's
+target key carries a unique index, and that can change after the link is
+declared (`alter <Target> add unique .<key>`). Every surface that reports or
+enforces cardinality (link traversal, `describe`, `schema links`, `explain`)
+derives it from the current catalog at the moment of the read. Earlier versions
+derived it once at declare time and stored the answer, so `link` before
+`unique` froze a link as to-many permanently.
+
+Consequences for on-disk data:
+
+- The byte is still written, at its existing offset, with the value the
+  derivation returned at declare time. The v7 layout is unchanged and files
+  written by v0.19.0 through v0.21.x remain byte-compatible in both directions.
+- The byte is **not** kept in step with later DDL, and nothing repairs it on
+  open. A database whose link was declared before the unique index carries a
+  byte that disagrees with the schema, and that is expected and harmless.
+- Do not use it as a source of truth in a tool that reads `catalog.bin`
+  directly. Derive cardinality the way the engine does: a link is to-one if and
+  only if its target key has a unique index in the same catalog.
+
 ## Retained sync segment (experimental)
 
 The experimental embedded-sync substrate (v0.8.0, `powdb-sync`, opt-in via

@@ -384,7 +384,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "powdb-auth"
-version = "0.16.0"
+version = "0.21.0"
 dependencies = [
  "argon2",
  "serde",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.16.0"
+version = "0.21.0"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.16.0"
+version = "0.21.0"
 dependencies = [
  "bytes",
  "powdb-auth",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.16.0"
+version = "0.21.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-sync"
-version = "0.16.0"
+version = "0.21.0"
 dependencies = [
  "crc32fast",
  "getrandom 0.3.4",

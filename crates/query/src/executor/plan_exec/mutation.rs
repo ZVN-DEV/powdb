@@ -39,6 +39,9 @@ impl Engine {
         resolved: &[(usize, Value)],
         changed_cols: &[usize],
     ) -> Option<Result<QueryResult, QueryError>> {
+        if self.generic_path_forced("fused-scan-update") {
+            return None;
+        }
         // Overflow safety (P0/P1): a table that may hold v2 rows can never take
         // the byte-patch fast paths — patching computes v1 offsets and would
         // corrupt a spilled row, and the compiled predicate over raw bytes
@@ -53,7 +56,13 @@ impl Engine {
             let schema = self.catalog.schema(table)?;
             let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
             let fast = FastLayout::new(schema);
-            compile_predicate(predicate, &columns, &fast, schema)?
+            self.compile_predicate_unless_forced(
+                "fused-scan-update:predicate",
+                predicate,
+                &columns,
+                &fast,
+                schema,
+            )?
         };
 
         // ── Path 1: fixed-width fast patch ──────────────────────────
@@ -392,6 +401,14 @@ impl Engine {
         if contains_subquery(predicate) || scan_table(inner) != Some(table) {
             return Ok(None);
         }
+        // The read side of this shape (`try_filter_index_residual_fast`) already
+        // declines under the forced-generic switch; without the same check here
+        // an `update`/`delete` whose discovery scan lowered to
+        // `Filter(<index scan>)` would take the index-and-recheck path either
+        // way, and the equivalence runner would be comparing it with itself.
+        if self.generic_path_forced("mutation-index-residual") {
+            return Ok(None);
+        }
         let Some(candidates) = self.index_scan_rids(inner)? else {
             return Ok(None);
         };
@@ -501,7 +518,13 @@ impl Engine {
                     BinOp::Eq,
                     Box::new(key.clone()),
                 );
-                if let Some(compiled) = compile_predicate(&synth, &columns, &fast, schema) {
+                if let Some(compiled) = self.compile_predicate_unless_forced(
+                    "mutation-index-scan-scan-fallback:predicate",
+                    &synth,
+                    &columns,
+                    &fast,
+                    schema,
+                ) {
                     // Mission F: skip the first 4 Vec doublings.
                     let mut rids: Vec<RowId> = Vec::with_capacity(64);
                     let mut cancel = CancelCheck::new();
@@ -582,7 +605,13 @@ impl Engine {
                     let mut cancel = CancelCheck::new();
                     let mut cancel_err: Option<QueryError> = None;
                     // Try compiled predicate first.
-                    if let Some(compiled) = compile_predicate(predicate, &columns, &fast, schema) {
+                    if let Some(compiled) = self.compile_predicate_unless_forced(
+                        "mutation-filter-seqscan:predicate",
+                        predicate,
+                        &columns,
+                        &fast,
+                        schema,
+                    ) {
                         // Mission F: skip the first 4 Vec doublings.
                         let mut rids: Vec<RowId> = Vec::with_capacity(64);
                         self.catalog
@@ -718,7 +747,7 @@ impl Engine {
     ) -> Result<Vec<RowId>, QueryError> {
         #[cfg(test)]
         GENERIC_RID_MATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
-        let result = self.execute_plan(input)?;
+        let result = self.dispatch_mut(input)?;
         let rows = match result {
             QueryResult::Rows { rows, .. } => rows,
             _ => return Err("mutation source must be rows".into()),

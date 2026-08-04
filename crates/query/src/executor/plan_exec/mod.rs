@@ -300,7 +300,7 @@ pub(crate) use dispatch::{nested_fields_have_via_link, scan_source_table};
 pub(crate) use join::check_nested_loop_pair_limit;
 pub(crate) use join::execute_materialized_join;
 pub(crate) use lowering::{
-    format_plan_tree, lower_unindexed_scans, range_matches, synthesize_range_predicate,
+    format_plan_tree, range_matches, synthesize_range_predicate, LoweredPlan,
 };
 pub(crate) use validate::{
     predicate_column_indices_json, validate_column_references, validate_json_path_types,

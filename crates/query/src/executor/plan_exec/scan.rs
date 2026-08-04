@@ -247,6 +247,9 @@ impl Engine {
         input: &PlanNode,
         predicate: &Expr,
     ) -> Result<Option<QueryResult>, QueryError> {
+        if self.generic_path_forced("filter-index-residual") {
+            return Ok(None);
+        }
         // A subquery residual cannot be evaluated row-at-a-time here; let the
         // general path materialize it.
         if contains_subquery(predicate) {
@@ -685,7 +688,12 @@ impl Engine {
                 Value::Str(format!(
                     "-> {} ({}, {} -> {})",
                     link.target_type,
-                    link_cardinality(link.kind),
+                    // GATE B3: derived live, never `link.kind` (advisory, stale
+                    // by design). See `Catalog::derive_link_kind`.
+                    link_cardinality(
+                        self.catalog
+                            .derive_link_kind(&link.target_type, &link.target_key)
+                    ),
                     link.local_key,
                     link.target_key
                 )),
@@ -705,7 +713,13 @@ impl Engine {
                 Value::Str(format!(
                     "<- {} ({}, {} -> {})",
                     link.owner_type,
-                    link_cardinality(link.kind),
+                    // GATE B4: the incoming-link loop is a separate site from
+                    // the outgoing one above and derives live for the same
+                    // reason.
+                    link_cardinality(
+                        self.catalog
+                            .derive_link_kind(&link.target_type, &link.target_key)
+                    ),
                     link.local_key,
                     link.target_key
                 )),
@@ -737,7 +751,13 @@ impl Engine {
                     Value::Str(l.target_type.clone()),
                     Value::Str(l.local_key.clone()),
                     Value::Str(l.target_key.clone()),
-                    Value::Str(link_cardinality(l.kind).to_string()),
+                    // GATE B5: `schema links` derives live too.
+                    Value::Str(
+                        link_cardinality(
+                            self.catalog.derive_link_kind(&l.target_type, &l.target_key),
+                        )
+                        .to_string(),
+                    ),
                 ]
             })
             .collect();

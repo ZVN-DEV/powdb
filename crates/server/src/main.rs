@@ -34,6 +34,10 @@ struct Args {
     /// How long an explicit `begin` waits for a concurrent explicit transaction
     /// on another connection before failing with a clear timeout error.
     tx_wait_timeout_ms: u64,
+    /// Ceiling on how long one connection may hold the transaction gate inside
+    /// an explicit transaction before the server rolls it back; env-only.
+    /// `None` disables the bound (`POWDB_TX_MAX_LIFETIME_MS=0`).
+    tx_max_lifetime: Option<std::time::Duration>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     query_memory_limit: usize,
@@ -91,6 +95,25 @@ fn parse_query_memory_limit(raw: Option<&str>) -> usize {
     raw.and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+}
+
+/// Parse the `POWDB_TX_MAX_LIFETIME_MS` environment value: the ceiling on how
+/// long one connection may hold the transaction gate inside an explicit
+/// transaction before the server rolls that transaction back. An explicit `0`
+/// disables the bound and restores the pre-0.22 behavior where the client
+/// chose the hold duration; unset, empty, or unparseable keeps the default
+/// (`handler::DEFAULT_TX_MAX_LIFETIME`). Pulled out as a free function so it
+/// can be unit-tested without spawning the server, mirroring
+/// [`parse_query_memory_limit`].
+fn parse_tx_max_lifetime(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+            Err(_) => Some(handler::DEFAULT_TX_MAX_LIFETIME),
+        },
+        None => Some(handler::DEFAULT_TX_MAX_LIFETIME),
+    }
 }
 
 /// Parse the `POWDB_MAX_NESTED_LOOP_PAIRS` environment value. Accepts a plain
@@ -181,6 +204,10 @@ fn parse_args() -> Args {
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_TX_WAIT_TIMEOUT_MS);
+    // Maximum explicit-transaction lifetime; env-only (no CLI flag), like the
+    // other budgets.
+    let tx_max_lifetime =
+        parse_tx_max_lifetime(std::env::var("POWDB_TX_MAX_LIFETIME_MS").ok().as_deref());
     let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME")
         .ok()
         .filter(|s| !s.is_empty());
@@ -356,6 +383,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
                 println!("    POWDB_TX_WAIT_TIMEOUT_MS   Max ms a BEGIN waits for a concurrent explicit transaction (default: 5000)");
+                println!("    POWDB_TX_MAX_LIFETIME_MS   Max ms one connection may hold an open explicit transaction before the server rolls it back (default: 300000; 0 disables)");
                 println!("    POWDB_DB_NAME              Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_MAX_NESTED_LOOP_PAIRS  Fallback nested-loop join candidate-pair cap (default: 6,400,000)");
@@ -384,6 +412,7 @@ fn parse_args() -> Args {
         idle_timeout_secs,
         query_timeout_secs,
         tx_wait_timeout_ms,
+        tx_max_lifetime,
         tls_cert,
         tls_key,
         query_memory_limit,
@@ -635,7 +664,18 @@ async fn main() {
     }
 
     let engine = Arc::new(RwLock::new(engine));
-    let tx_gate = handler::new_tx_gate();
+    let tx_gate = handler::new_tx_gate_with_max_tx_lifetime(args.tx_max_lifetime);
+    match args.tx_max_lifetime {
+        Some(max) => info!(
+            tx_max_lifetime_ms = max.as_millis(),
+            "maximum explicit-transaction lifetime (POWDB_TX_MAX_LIFETIME_MS)"
+        ),
+        None => warn!(
+            "maximum explicit-transaction lifetime DISABLED (POWDB_TX_MAX_LIFETIME_MS=0): one \
+             connection can hold the write-admission gate for as long as it likes, and every \
+             other connection, readers included, waits behind it"
+        ),
+    }
 
     // Load the multi-user store from the same data dir. When it has users, the
     // handshake authenticates (username, password) against it; when empty the
@@ -1193,6 +1233,53 @@ mod tests {
             parse_dirty_page_budget(Some("  268435456 ")),
             Some(268_435_456)
         );
+    }
+
+    /// The transaction-lifetime bound fails SAFE: only an explicit `0` turns
+    /// it off. A typo must not silently restore the unbounded behavior that
+    /// let one connection hold the write gate for as long as it liked.
+    #[test]
+    fn tx_max_lifetime_env_parsing_fails_safe() {
+        assert_eq!(
+            parse_tx_max_lifetime(None),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
+        );
+        assert_eq!(
+            parse_tx_max_lifetime(Some("")),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
+        );
+        assert_eq!(
+            parse_tx_max_lifetime(Some("not-a-number")),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
+        );
+        assert_eq!(
+            parse_tx_max_lifetime(Some("-1")),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
+        );
+        // Only an explicit zero opts out.
+        assert_eq!(parse_tx_max_lifetime(Some("0")), None);
+        assert_eq!(
+            parse_tx_max_lifetime(Some("  1500 ")),
+            Some(std::time::Duration::from_millis(1500))
+        );
+    }
+
+    /// The parsed value reaches the gate every connection is served through,
+    /// which is the only place the bound can be enforced from.
+    #[test]
+    fn tx_max_lifetime_reaches_the_transaction_gate() {
+        let gate = handler::new_tx_gate_with_max_tx_lifetime(parse_tx_max_lifetime(Some("1500")));
+        assert_eq!(
+            gate.max_tx_lifetime(),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        let default = handler::new_tx_gate();
+        assert_eq!(
+            default.max_tx_lifetime(),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
+        );
+        let disabled = handler::new_tx_gate_with_max_tx_lifetime(parse_tx_max_lifetime(Some("0")));
+        assert_eq!(disabled.max_tx_lifetime(), None);
     }
 
     /// The parsed `POWDB_DIRTY_PAGE_BUDGET` value reaches the engine's catalog.
