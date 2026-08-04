@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.22.0 - 2026-08-03
+
+- **Wire protocol version negotiation.** `Connect` now carries a hello block
+  (protocol version range, catalog format ceiling, named features) and the
+  client reads the server's hello from `ConnectOk`. New exports:
+  `CLIENT_CAPABILITIES`, `PROTOCOL_VERSION_NEGOTIATED`, `WIRE_FEATURE`;
+  new `Client.protocolVersion` and `Client.hasFeature(name)`. Against a
+  pre-0.22 server the hello is ignored as trailing bytes and everything
+  behaves as before; `legacyHandshake: true` reproduces the old frame
+  byte-for-byte for testing.
+- **`requireFeatures` connect option**: fail the connection with a typed
+  error if the server does not offer a named feature, instead of failing
+  later mid-session.
+- **Error class 10** is decoded and surfaced as error kind
+  `protocol_version` when the two sides cannot agree during the handshake.
+
 ## 0.21.0 - 2026-07-27
 
 ## 0.20.0 - 2026-07-25
