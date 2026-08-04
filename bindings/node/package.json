@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-embedded",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Embedded PowDB — the in-process database engine for Node (no server, no socket). The SQLite-shaped front door to PowDB.",
   "license": "MIT",
   "repository": {
