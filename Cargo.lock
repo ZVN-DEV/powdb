@@ -1963,7 +1963,7 @@ name = "powdb-sync"
 version = "0.22.0"
 dependencies = [
  "crc32fast",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "libc",
  "powdb-storage",
  "serde",
