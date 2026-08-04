@@ -32,6 +32,30 @@ use powdb_query::token::Token;
 // token stream keeps the printer total over a finite enum, while steps 3 and 4
 // still assert at the AST level, which is where the meaning lives.
 
+/// True when `text` lexes to exactly the one token `tok` (plus EOF). The same
+/// rule the engine's stored-view writer applies: ask the lexer which spelling
+/// round-trips instead of re-deriving its quoting rules here.
+fn lexes_to_single(text: &str, tok: &Token) -> bool {
+    matches!(lex(text), Ok(ref toks) if matches!(toks.as_slice(), [t, Token::Eof] if t == tok))
+}
+
+/// The spelling of an identifier-family token that reads back as itself: bare
+/// when the lexer agrees, backtick-quoted otherwise, `None` when neither
+/// round-trips. Bare is not always right: `` `:` `` lexes to `Ident(":")`,
+/// and written back bare it re-lexes to the colon operator, so the canonical
+/// text of a valid statement stopped parsing.
+fn ident_spelling(prefix: &str, name: &str, tok: &Token) -> Option<String> {
+    let bare = format!("{prefix}{name}");
+    if lexes_to_single(&bare, tok) {
+        return Some(bare);
+    }
+    let quoted = format!("{prefix}`{name}`");
+    if lexes_to_single(&quoted, tok) {
+        return Some(quoted);
+    }
+    None
+}
+
 /// Render a token stream back to PowQL source text.
 ///
 /// Every token is separated by a single space, so no two tokens can fuse into
@@ -47,15 +71,9 @@ fn render(tokens: &[Token]) -> Option<String> {
             out.push(' ');
         }
         match tok {
-            Token::Ident(s) => out.push_str(s),
-            Token::DotIdent(s) => {
-                out.push('.');
-                out.push_str(s);
-            }
-            Token::Param(s) => {
-                out.push('$');
-                out.push_str(s);
-            }
+            Token::Ident(s) => out.push_str(&ident_spelling("", s, tok)?),
+            Token::DotIdent(s) => out.push_str(&ident_spelling(".", s, tok)?),
+            Token::Param(s) => out.push_str(&ident_spelling("$", s, tok)?),
             Token::IntLit(v) => out.push_str(&v.to_string()),
             Token::FloatLit(v) => {
                 // The lexer has no exponent form: a float literal is

@@ -50,7 +50,7 @@ id = "like-is-case-sensitive"
 shape = "like_ascii_case"
 pair = "powql_vs_sqlite"
 reason = "SQLite's default LIKE folds ASCII case (a LIKE A is true); PowDB's LIKE compares characters as they are, which is what PostgreSQL LIKE does. Only ASCII case folding differs: the like_wildcard_only shape uses patterns with no ASCII letter and carries no entry, and it confirms that % and _ arity, UTF-8 character counting for _, and literal matching of multi-byte text all agree exactly."
-owner = "crates/query/src/executor/eval.rs:1308"
+owner = "crates/query/src/executor/eval.rs:1306"
 anchor = "p[pi] == '_' || p[pi] == t[ti]"
 
 [[divergence]]
@@ -58,7 +58,7 @@ id = "like-pattern-percent-consumed-as-a-literal"
 shape = "like_metachar_in_text"
 pair = "powql_vs_sqlite"
 reason = "CONFIRMED ENGINE BUG, recorded here so the gate stays actionable and so fixing it forces this entry to be deleted (a fix makes the entry match nothing and CI fails on the stale entry). like_match tests the literal/underscore branch before the % branch, so a pattern % that lands on a literal % in the text is consumed as an ordinary character and no backtrack point is recorded. Repro: `T filter .s like \"%\"` does NOT match a row whose s is \"%a\" or \"%%\", even though LIKE '%' must match every non-null string. Also `like_match(\"%\", \"%_\")` is false where SQL says true. Fix is to test p[pi] == '%' first. Confined to this shape and to the sm column: like_ascii_case and like_wildcard_only run over metacharacter-free text and carry no entry for this."
-owner = "crates/query/src/executor/eval.rs:1311"
+owner = "crates/query/src/executor/eval.rs:1309"
 anchor = "p[pi] == '%'"
 
 [[divergence]]
