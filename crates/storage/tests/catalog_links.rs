@@ -1,9 +1,11 @@
 //! Track A (catalog v7): persisted relationship links.
 //!
 //! Covers the storage-layer contract for `create_link` / `link` / `links` /
-//! `drop_link`: v7 round-trip, the version staircase (v5/v6 stay put until the
-//! first link, then activate v7), CRC coverage of the new section, and
-//! declare-time validation including ToOne/ToMany derivation and drop guards.
+//! `link_kind` / `derive_link_kind` / `drop_link`: v7 round-trip, the version
+//! staircase (v5/v6 stay put until the first link, then activate v7), CRC
+//! coverage of the new section, declare-time validation, the drop guards, and
+//! the rule that cardinality is derived from current index uniqueness while
+//! the persisted `LinkDef::kind` byte is advisory and never refreshed.
 //! The old-binary refusal and the activation-rollback failpoint tests live in
 //! the in-crate unit module (they touch private seams).
 
@@ -412,4 +414,108 @@ fn drop_link_unknown_is_not_found() {
     let (_dir, mut catalog) = setup();
     let err = catalog.drop_link("Order", "ghost").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// The stored kind byte is advisory: derived is the only source of truth
+// ---------------------------------------------------------------------------
+
+/// Storage-side half of RULE L. The engine-wide parity suite for link
+/// cardinality lives in `crates/query/tests/link_cardinality_parity.rs`, so
+/// `cargo test -p powdb-storage` on its own would not notice the catalog
+/// growing a cache again. These two pin the contract at this layer.
+///
+/// `Catalog::link_kind` derives from the target key's uniqueness at the moment
+/// of the call, so DDL that lands after the link is visible immediately, with
+/// no re-declaration and no reopen.
+#[test]
+fn link_kind_is_derived_from_current_uniqueness_not_declaration_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog
+        .create_table(Schema {
+            table_name: "Order".into(),
+            columns: vec![ColumnDef {
+                name: "user_id".into(),
+                type_id: TypeId::Int,
+                required: false,
+                position: 0,
+            }],
+        })
+        .unwrap();
+    catalog
+        .create_table(Schema {
+            table_name: "User".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
+        })
+        .unwrap();
+    // Declare the link BEFORE the unique index: the order that used to freeze
+    // a link as to-many for the life of the database.
+    catalog.create_link(user_link()).unwrap();
+    assert_eq!(catalog.link_kind("Order", "user"), Some(LinkKind::ToMany));
+    assert_eq!(catalog.derive_link_kind("User", "id"), LinkKind::ToMany);
+
+    catalog.create_index_unique("User", "id", true).unwrap();
+    assert_eq!(
+        catalog.link_kind("Order", "user"),
+        Some(LinkKind::ToOne),
+        "uniqueness added after the link must be visible to the next read"
+    );
+    assert_eq!(catalog.link_kind("Order", "ghost"), None);
+
+    // The persisted byte is NOT brought along, in memory or across a reopen.
+    // That is the contract, not an oversight: a mirror that is kept in step
+    // answers before the live derivation does and leaves it untested.
+    assert_eq!(
+        catalog.link("Order", "user").unwrap().kind,
+        LinkKind::ToMany
+    );
+    drop(catalog);
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.link("Order", "user").unwrap().kind,
+        LinkKind::ToMany,
+        "opening a catalog must not repair the advisory byte"
+    );
+    assert_eq!(reopened.link_kind("Order", "user"), Some(LinkKind::ToOne));
+}
+
+/// The drop guards pin a referenced table or column in place. PowQL has no
+/// statement that removes a link, so the refusal names the API that does
+/// rather than a `drop link` statement the parser would reject.
+#[test]
+fn drop_guards_name_a_remedy_that_exists() {
+    let (_dir, mut catalog) = setup();
+    catalog.create_link(user_link()).unwrap();
+
+    for err in [
+        catalog.drop_table("User").unwrap_err().to_string(),
+        catalog.drop_table("Order").unwrap_err().to_string(),
+        catalog
+            .alter_table_drop_column("User", "id")
+            .unwrap_err()
+            .to_string(),
+        catalog
+            .alter_table_drop_column("Order", "user_id")
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(
+            err.contains("Catalog::drop_link(\"Order\", \"user\")"),
+            "must name the API that can actually remove the link: {err}"
+        );
+        assert!(
+            err.contains("PowQL has no statement that removes a link"),
+            "must say why the obvious remedy is unavailable: {err}"
+        );
+        assert!(
+            !err.contains("drop the link first"),
+            "must not name a statement PowQL does not have: {err}"
+        );
+    }
 }

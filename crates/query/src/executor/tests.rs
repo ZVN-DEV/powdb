@@ -7049,7 +7049,7 @@ fn symmetric_rid_dedup_set_is_charged_to_query_memory_budget() {
 
 // ── Lane A: conjunction index selection with residual recheck ──────
 //
-// These unit tests inspect the output of `lower_unindexed_scans` directly:
+// These unit tests inspect the output of the lowering pass directly:
 // a top-level `and` filter over a bare `SeqScan` must be rewritten to drive
 // the scan from an indexed conjunct, re-checking the rest as a residual
 // Filter. Selection follows a zero-stats heuristic
@@ -7087,7 +7087,9 @@ fn engine_only() -> Engine {
 
 fn lower(engine: &Engine, query: &str) -> PlanNode {
     let plan = crate::planner::plan(query).unwrap();
-    super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan)
+    super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .node()
+        .clone()
 }
 
 #[test]
@@ -7121,7 +7123,9 @@ fn conjunction_without_any_index_is_left_byte_identical() {
     let engine = doc_no_index_engine();
     let plan = crate::planner::plan("Doc filter .data->score = 20 and .id = 1").unwrap();
     let before = format!("{plan:?}");
-    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan);
+    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .node()
+        .clone();
     assert_eq!(
         before,
         format!("{lowered:?}"),
@@ -7371,7 +7375,9 @@ fn same_column_between_pair_merges_and_empties_the_residual() {
         }),
         predicate: between,
     };
-    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &plan);
+    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .node()
+        .clone();
     match &lowered {
         PlanNode::RangeScan {
             column, start, end, ..
@@ -7500,11 +7506,17 @@ fn residual_fast_path_agrees_with_general_path() {
 
     let query = r#"Doc filter .data->tag = "x" and .model_id = 1"#;
     let raw_plan = crate::planner::plan(query).unwrap();
-    // General path: execute the un-lowered Filter(SeqScan) directly.
-    let general = engine.execute_plan(&raw_plan).unwrap();
+    // General path: execute the un-lowered Filter(SeqScan) directly. This has
+    // to reach the dispatch recursion target rather than `Engine::execute_plan`,
+    // which lowers what it is given: through that entry point both halves of
+    // this comparison would be the lowered plan and the test would compare the
+    // fast path with itself.
+    let general = engine.dispatch_mut(&raw_plan).unwrap();
 
     // Fast path: the lowered plan must be driven by the expression index.
-    let lowered = super::plan_exec::lower_unindexed_scans(&engine.catalog, &raw_plan);
+    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &raw_plan)
+        .node()
+        .clone();
     match &lowered {
         PlanNode::Filter { input, .. } => {
             assert!(

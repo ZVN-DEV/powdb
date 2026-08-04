@@ -1,0 +1,1 @@
+User { row_number() over (partition .a order .b) }

@@ -21,9 +21,15 @@ import { EventEmitter } from "node:events";
 import {
   encode,
   tryDecode,
+  legacyServerHello,
   MAX_SYNC_PULL_BYTES,
   MAX_SYNC_PULL_UNITS,
+  PROTOCOL_VERSION_LEGACY,
+  PROTOCOL_VERSION_NEGOTIATED,
+  WIRE_FEATURE,
+  type ClientHello,
   type Message,
+  type ServerHello,
   type NativeJson,
   type SyncRepairAction,
   type WireRetainedUnit,
@@ -36,6 +42,7 @@ import {
   isPowDBError,
   PowDBError,
   PowDBScriptError,
+  WIRE_ERROR_CLASS,
 } from "./errors.js";
 import { splitStatements } from "./script.js";
 import {
@@ -48,28 +55,56 @@ import {
 export const CLIENT_VERSION = "0.21.0";
 
 /**
- * The maximum catalog format version this client can read. State this as the
- * `catalogVersion` in sync pull requests: the server accepts any replica whose
- * maximum is at least its active catalog format and rejects an older replica.
- * When validating a server-reported catalog version, accept anything at or
- * below this and reject anything newer (the client cannot read it).
+ * Everything this client states about itself at connect time: the wire
+ * protocol range it can speak, the catalog format ceiling it can read, and
+ * the named wire features it understands.
  *
- * v7 is the entity-links format: it appends a relationship-link section
- * before the trailing CRC, staircase-defaulted so every older file still
- * loads (a pre-v7 file simply has zero links). It activates lazily on the
- * first `link` declaration. The client treats catalog payloads as opaque
- * bytes and only states this ceiling in the sync handshake.
+ * This is the single source of truth for compatibility. It is sent verbatim
+ * in the `Connect` hello block, and the server's answer is checked against it
+ * before {@link Client.connect} resolves, so a mismatch is a handshake
+ * failure, never a surprise on some later frame.
+ *
+ * `catalogVersion` v7 is the entity-links format: it appends a relationship
+ * link section before the trailing CRC, staircase-defaulted so every older
+ * file still loads, and activates lazily on the first `link` declaration. The
+ * client treats catalog payloads as opaque bytes and only states this ceiling.
  */
-export const SUPPORTED_CATALOG_VERSION = 7;
+export const CLIENT_CAPABILITIES = {
+  minProtocolVersion: PROTOCOL_VERSION_LEGACY,
+  maxProtocolVersion: PROTOCOL_VERSION_NEGOTIATED,
+  catalogVersion: 7,
+  features: [
+    WIRE_FEATURE.params,
+    WIRE_FEATURE.sql,
+    WIRE_FEATURE.nativeTyped,
+    WIRE_FEATURE.errorClass,
+    WIRE_FEATURE.sync,
+    WIRE_FEATURE.entityLinks,
+    WIRE_FEATURE.nestedProjection,
+  ] as string[],
+} as const;
+
+/**
+ * The maximum catalog format version this client can read.
+ *
+ * Derived from {@link CLIENT_CAPABILITIES} rather than declared separately:
+ * the handshake and the sync-pull request now state the same number, so there
+ * is one place to raise it. State it as the `catalogVersion` in sync pull
+ * requests: the server accepts any replica whose maximum is at least its
+ * active catalog format and rejects an older replica.
+ */
+export const SUPPORTED_CATALOG_VERSION: number =
+  CLIENT_CAPABILITIES.catalogVersion;
 
 /**
  * Throw when a server-reported catalog format is newer than this client can
  * read. Accepts `serverCatalogVersion <= SUPPORTED_CATALOG_VERSION`; rejects a
- * newer server, which requires upgrading the client.
+ * newer server, which requires upgrading the client. This is the same check
+ * the handshake applies to the server's reported catalog version.
  */
 export function assertServerCatalogVersionSupported(
   serverCatalogVersion: number,
-  clientMax: number = SUPPORTED_CATALOG_VERSION,
+  clientMax: number = CLIENT_CAPABILITIES.catalogVersion,
 ): void {
   if (!Number.isInteger(serverCatalogVersion) || serverCatalogVersion < 1) {
     throw new Error(
@@ -81,6 +116,43 @@ export function assertServerCatalogVersionSupported(
       `server catalog format v${serverCatalogVersion} is newer than this client supports (max v${clientMax}); upgrade the client`,
     );
   }
+}
+
+/**
+ * The client half of the handshake check: confirm the server just reached can
+ * actually serve this client. Returns an explanatory message when it cannot,
+ * or `null` when the pairing is fine.
+ *
+ * A server that stated no catalog version (pre-0.22.0) is not judged on one,
+ * and a `clientCatalogVersion` of `0` opts out of the catalog check.
+ */
+export function serverCapabilityMismatch(
+  server: ServerHello,
+  minProtocol: number,
+  requiredFeatures: readonly string[],
+  clientCatalogVersion: number,
+): string | null {
+  if (server.protocol < minProtocol) {
+    return (
+      `unsupported wire protocol: server negotiated v${server.protocol}, ` +
+      `this client requires at least v${minProtocol}; upgrade the server`
+    );
+  }
+  const missing = requiredFeatures.find((f) => !server.features.includes(f));
+  if (missing !== undefined) {
+    return `server does not support required wire feature '${missing}'; upgrade the server`;
+  }
+  if (
+    clientCatalogVersion > 0 &&
+    server.catalogVersion > 0 &&
+    server.catalogVersion > clientCatalogVersion
+  ) {
+    return (
+      `server catalog format v${server.catalogVersion} is newer than this ` +
+      `client supports (max v${clientCatalogVersion}); upgrade the client`
+    );
+  }
+  return null;
 }
 
 export type QueryResult =
@@ -466,6 +538,29 @@ export interface ClientOptions {
    * `false` (connect blocks until ConnectOk, exactly as before).
    */
   eager?: boolean;
+  /**
+   * Refuse to connect unless the negotiated wire protocol is at least this
+   * version. Defaults to {@link PROTOCOL_VERSION_LEGACY} (`1`), which accepts
+   * a pre-0.22.0 server that cannot negotiate at all. Raise it to
+   * {@link PROTOCOL_VERSION_NEGOTIATED} when your code depends on a
+   * negotiated feature set being present.
+   *
+   * A shortfall rejects during the handshake with a `protocol_version` error,
+   * before any query frame is written.
+   */
+  requireProtocolVersion?: number;
+  /**
+   * Refuse to connect unless the server agreed to every one of these
+   * {@link WIRE_FEATURE} names. Defaults to none. A pre-0.22.0 server names
+   * no features at all, so requiring any implies requiring protocol v2.
+   */
+  requireFeatures?: readonly string[];
+  /**
+   * Send the pre-0.22.0 `Connect` frame with no hello block, so the frame is
+   * byte-identical to what a 0.21.0 client writes. Only useful for testing
+   * the legacy path; leave unset in production. Defaults to `false`.
+   */
+  legacyHandshake?: boolean;
 }
 
 type Pending = {
@@ -557,6 +652,7 @@ export class Client extends EventEmitter<ClientEvents> {
   /** True once ConnectOk has been received. */
   private handshakeComplete = false;
   private _serverVersion = "";
+  private _serverHello: ServerHello = legacyServerHello();
 
   /**
    * Server version from the ConnectOk frame. For a client opened with
@@ -565,6 +661,29 @@ export class Client extends EventEmitter<ClientEvents> {
    */
   get serverVersion(): string {
     return this._serverVersion;
+  }
+
+  /**
+   * The negotiated handshake outcome: protocol version, the server's
+   * supported range, its catalog format, and the agreed feature set. Before
+   * the handshake settles (and against a pre-0.22.0 server that cannot
+   * negotiate) this is the legacy hello: protocol v1, no features.
+   */
+  get serverHello(): ServerHello {
+    return this._serverHello;
+  }
+
+  /** The wire protocol version in use for this connection. */
+  get protocolVersion(): number {
+    return this._serverHello.protocol;
+  }
+
+  /**
+   * Whether the server agreed to a named {@link WIRE_FEATURE}. Always `false`
+   * against a pre-0.22.0 server, which names nothing.
+   */
+  hasFeature(feature: string): boolean {
+    return this._serverHello.features.includes(feature);
   }
 
   private constructor(socket: net.Socket) {
@@ -594,6 +713,9 @@ export class Client extends EventEmitter<ClientEvents> {
       connectTimeoutMs = 5000,
       tls: tlsOpt = false,
       eager = false,
+      requireProtocolVersion = CLIENT_CAPABILITIES.minProtocolVersion,
+      requireFeatures = [],
+      legacyHandshake = false,
     } = opts;
 
     if (path === undefined && (host === undefined || port === undefined)) {
@@ -609,10 +731,20 @@ export class Client extends EventEmitter<ClientEvents> {
       tlsOpt,
     );
 
+    const hello: ClientHello | undefined = legacyHandshake
+      ? undefined
+      : {
+          minProtocol: CLIENT_CAPABILITIES.minProtocolVersion,
+          maxProtocol: CLIENT_CAPABILITIES.maxProtocolVersion,
+          catalogVersion: CLIENT_CAPABILITIES.catalogVersion,
+          features: [...CLIENT_CAPABILITIES.features],
+        };
+
     const client = new Client(socket);
     client.startHandshake(
-      { type: "Connect", dbName, password, username: user ?? null },
+      { type: "Connect", dbName, password, username: user ?? null, hello },
       path ?? `${host}:${port}`,
+      { requireProtocolVersion, requireFeatures },
     );
     if (!eager) {
       await client.ready();
@@ -637,20 +769,44 @@ export class Client extends EventEmitter<ClientEvents> {
    * pipelined query sees a reply. On failure, every queued query is
    * rejected with the handshake error and the socket is torn down.
    */
-  private startHandshake(connect: Message, versionWarnKey: string): void {
+  private startHandshake(
+    connect: Message,
+    versionWarnKey: string,
+    require: {
+      requireProtocolVersion: number;
+      requireFeatures: readonly string[];
+    },
+  ): void {
     this.handshake = this.send(connect).then(
       (reply) => {
         if (reply.type === "Error") {
-          throw new PowDBError(
-            `connect failed: ${reply.message}`,
-            "auth_failed",
-          );
+          // A server that refused on version grounds says so with the
+          // ProtocolVersion class; keep that distinct from a bad password.
+          const code =
+            reply.errorClass === WIRE_ERROR_CLASS.protocol_version
+              ? "protocol_version"
+              : "auth_failed";
+          throw new PowDBError(`connect failed: ${reply.message}`, code, {
+            wireErrorClass: reply.errorClass,
+          });
         }
         if (reply.type !== "ConnectOk") {
           throw new PowDBError(
             `expected ConnectOk, got ${reply.type}`,
             "protocol_error",
           );
+        }
+        // A server that sent no hello block is pre-0.22.0: it speaks protocol
+        // v1 and names no features. Judge it on that rather than assuming.
+        this._serverHello = reply.hello ?? legacyServerHello();
+        const mismatch = serverCapabilityMismatch(
+          this._serverHello,
+          require.requireProtocolVersion,
+          require.requireFeatures,
+          CLIENT_CAPABILITIES.catalogVersion,
+        );
+        if (mismatch !== null) {
+          throw new PowDBError(mismatch, "protocol_version");
         }
         this.handshakeComplete = true;
         this._serverVersion = reply.version;
@@ -1840,6 +1996,14 @@ export {
   sql,
   SqlIdent,
 } from "./escape.js";
+
+export {
+  legacyServerHello,
+  PROTOCOL_VERSION_LEGACY,
+  PROTOCOL_VERSION_NEGOTIATED,
+  WIRE_FEATURE,
+} from "./protocol.js";
+export type { ClientHello, ServerHello } from "./protocol.js";
 
 export { Pool } from "./pool.js";
 export type { PoolOptions } from "./pool.js";

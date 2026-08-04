@@ -4,4 +4,8 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc a6892f2d3d32511b3def0443622d23337c637104b3ac54820090bb490006add4 # shrinks to rows = [GenRow { a: Some(4), label: "a" }], left_op = Eq, left_lit = 4, right_op = Lt, right_lit = 0
+cc 0d3464252aef5e78f1f26d36ff0503d5445731f286f35bfd4442d77b8d065019 # shrinks to rows = [GenRow { a: None, label: None, f: None, b: None }]
+cc 1ea507511bea5844094138787c53860500fee1c3f6c797e8fb34054d24fde775 # shrinks to rows = [GenRow { a: None, label: None, f: None, b: None }, GenRow { a: Some(0), label: None, f: None, b: None }], descending = false
+cc 8c2e867abc768fa6b5d278d6ff4f0469c31ff85bffc10cedce7ac2be77c02e3c # shrinks to rows = [GenRow { a: Some(6), label: None, f: None, b: None }], op = Gte, literal = 6
+cc 1c78bc68aa10c3425e2a17828539507695b200c78bfa63db5b5da10fc26ca595 # shrinks to rows = [GenRow { a: Some(6), label: None, f: None, b: None }], op = Gte, literal = 6
+cc 97c41a7f7043399b48829f172f94764cb4be7907ae7878851d351d72287d0287 # shrinks to rows = [GenRow { a: Some(6), label: None, f: None, b: None }], left_op = Neq, left_lit = 0, right_op = Gte, right_lit = 6

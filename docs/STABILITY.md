@@ -49,6 +49,19 @@ link. That behavior is pinned by
 v6 database, asserts it is still v6, then declares a link and asserts the
 upgrade persists across another reopen.
 
+A second caveat, added in v0.22.0, this one about *meaning* rather than layout:
+the catalog v7 links section still carries a per-link cardinality byte, but the
+engine no longer reads it. Link cardinality is derived from whether the target
+key has a unique index, at the moment of the read, so `link` before
+`alter <Target> add unique .<key>` and the reverse order now behave identically
+instead of freezing the link as to-many forever. The byte keeps its offset and
+its declare-time value, so files move in both directions between 0.19-0.21 and
+0.22 unchanged, and nothing is rewritten on open. What changed is that a
+database whose stored byte disagrees with its schema now reports the schema.
+If you have a tool that reads `catalog.bin` directly, stop trusting that byte
+and derive cardinality from the target key's index instead. See
+[FORMAT.md](FORMAT.md#entity-link-cardinality-byte-catalog-v7).
+
 One caveat on "opens", added in v0.20.0: the heap open scan now verifies every
 page checksum and fails closed. A directory that already contained a corrupt
 page opened on 0.19 and surfaced the damage later, on the read that touched it;
@@ -142,26 +155,61 @@ See [POWQL.md](POWQL.md#ddl-is-not-transactional).
 
 ## Wire protocol
 
-The binary protocol is versioned by **message tag**, not by a negotiated
-protocol number. New message types get new `u8` tags (`crates/server/src/protocol.rs`);
-existing frames do not change shape. A peer that receives a tag it does not know
-fails with `unknown message type: 0x..` rather than misparsing the frame.
+The binary protocol is versioned two ways: by **message tag**, and since
+v0.22.0 by a **negotiated protocol version and feature set** exchanged in the
+handshake. New message types get new `u8` tags
+(`crates/server/src/protocol.rs`); existing frames do not change shape. A peer
+that receives a tag it does not know fails with `unknown message type: 0x..`
+rather than misparsing the frame.
 
-Practically:
+### Version negotiation (since v0.22.0)
 
-- An **older client** against a **newer server** works for every feature it
-  already knew about. It cannot use features that need new frames.
-- A **newer client** against an **older server** works only if it stays on the
-  frames that server understands. The TypeScript client handles the analogous
-  problem for schema features by declaring a catalog ceiling
-  (`SUPPORTED_CATALOG_VERSION`, currently 7) and refusing a server whose catalog
-  is newer than it can represent.
+`Connect` and `ConnectOk` each carry an optional hello block: a supported
+protocol version range, a catalog format ceiling, and a set of named features.
+The server answers with the negotiated version and the **agreed** feature set,
+which is the intersection of both sides. Anything absent from that set must not
+be used on the connection.
 
-`ConnectOk` carries the server's version string, so a client can decide for
-itself.
+If the two ranges do not overlap, the server answers an `Error` frame with
+error class `10` (`ProtocolVersion`) **instead of** `ConnectOk` and closes the
+connection. That is the guarantee worth having: a version mismatch surfaces
+during the handshake, never as an unknown tag mid-session.
 
-There is no protocol version negotiation today. That is a real gap relative to
-the on-disk guarantee, and closing it is a 1.0 requirement (below).
+**This is backward compatible in both directions, and there is no forced
+upgrade order.** Protocol version `1` means "sent no hello block", which is
+exactly what every release through v0.21.0 does:
+
+- A **v0.21.0 client** against a **v0.22.0 server** negotiates protocol `1` and
+  receives a `ConnectOk` that is byte-identical to the old one.
+- A **v0.22.0 client** against a **v0.21.0 server** sends its hello (which the
+  old server ignores as trailing bytes), gets a bare `ConnectOk` back, and
+  treats the server as protocol `1`.
+
+A newer client only refuses an older server when it explicitly asks for
+something that server cannot provide (`requireProtocolVersion` /
+`requireFeatures` in the TypeScript client), and that refusal also happens
+during the handshake.
+
+The catalog format ceiling folds into the same exchange: the server states the
+highest catalog format it writes, and a client whose ceiling is lower refuses
+during the handshake rather than failing later. In the TypeScript client this
+ceiling now lives in `CLIENT_CAPABILITIES`, with `SUPPORTED_CATALOG_VERSION`
+derived from it.
+
+Adding capability later does not require another handshake change: a new
+capability is a new feature name, and a new hello field is appended after the
+feature list, which both decoders skip.
+
+The full byte layout is documented for driver authors in
+[integrations/powql-for-drivers.md](integrations/powql-for-drivers.md#protocol-version-negotiation).
+
+The Rust and TypeScript implementations of this format are independent
+hand-written mirrors, so the handshake bytes are pinned in a shared vector file
+(`crates/server/tests/wire_vectors/handshake.txt`) that both sides decode,
+re-encode, and compare against on every CI run. It also pins the feature-name
+list and the error-class numbering, so neither can change in one first-party
+codec without the other failing CI. Its scope is the bytes on the wire: it does
+not check that a new feature name or error class has been documented anywhere.
 
 ## APIs
 
@@ -255,9 +303,7 @@ NULL for you.
 1.0 is the point at which the API surfaces get the same treatment the on-disk
 format already gets. It is not scheduled. These are the conditions:
 
-- **Wire protocol version negotiation**, so client and server agree on a
-  feature set at connect time instead of discovering a mismatch as an unknown
-  tag.
+- ~~**Wire protocol version negotiation**~~, shipped in v0.22.0 (above).
 - **A settled PowQL surface**, with a deprecation path for syntax rather than
   removal in a minor.
 - **Stable Rust and TypeScript APIs** under normal SemVer, so a minor release

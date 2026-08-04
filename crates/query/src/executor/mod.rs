@@ -21,7 +21,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 
 use self::compiled::*;
 use self::eval::*;
@@ -260,9 +260,9 @@ use self::plan_exec::{
     aggregate_rows, aggregate_rows_with_provenance, compare_order_values,
     cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
-    lower_unindexed_scans, predicate_column_indices_json, range_matches,
-    synthesize_range_predicate, validate_column_references, validate_json_path_types,
-    validate_no_stray_aggregates, validate_slice_counts,
+    predicate_column_indices_json, range_matches, synthesize_range_predicate,
+    validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
+    validate_slice_counts, LoweredPlan,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -380,6 +380,84 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
     }
 }
 
+/// Open the materialized-view registry over `data_dir`, marking every view
+/// whose stored source no longer parses as dirty.
+///
+/// Dirty is how a read is made to go through `Engine::refresh_view`, which is
+/// where an unreadable source is reported (see
+/// `plan_exec::dispatch::parse_stored_view_source`). Without this, such a view
+/// is CLEAN forever: its dependency list was empty for the same reason its
+/// source will not parse, so no mutation ever dirties it, no read ever
+/// refreshes it, and every read serves stale rows with no error at all. Marking
+/// it dirty converts that into the typed error, and touches only memory, so a
+/// database that is merely being inspected is not modified.
+fn open_view_registry(data_dir: &Path) -> ViewRegistry {
+    let mut registry = ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+    let unreadable: Vec<String> = registry
+        .list_views()
+        .iter()
+        .filter(|name| {
+            registry
+                .get(name)
+                .is_some_and(|def| crate::parser::parse(&def.query).is_err())
+        })
+        .map(|name| (*name).to_string())
+        .collect();
+    for name in unreadable {
+        warn!(
+            view = %name,
+            "materialized view has an unparseable stored source; reads will report an error \
+             rather than serve rows that cannot be recomputed"
+        );
+        registry.mark_dirty(&name);
+    }
+    registry
+}
+
+/// Names of the dirty materialized views this plan scans, taken from table
+/// names the plan itself carries.
+///
+/// Deliberately narrower than [`plan_reads_dirty_view`]: that one escalates
+/// conservatively for link traversals whose child table is only knowable after
+/// execution-time catalog resolution, which is the right answer for a preflight
+/// that can only say yes or no, but it cannot name a table to refresh. The
+/// write path refreshes those where it resolves them.
+fn collect_dirty_scanned_views(plan: &PlanNode, views: &ViewRegistry, out: &mut Vec<String>) {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::AliasScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => {
+            if views.is_dirty(table) && !out.iter().any(|name| name == table) {
+                out.push(table.clone());
+            }
+        }
+
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::NestedProject { input, .. } => collect_dirty_scanned_views(input, views, out),
+
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            collect_dirty_scanned_views(left, views, out);
+            collect_dirty_scanned_views(right, views, out);
+        }
+
+        // EXPLAIN formats its input without executing it, and the write
+        // statements own their own view bookkeeping.
+        _ => {}
+    }
+}
+
 /// True when any registered materialized view is currently dirty. Conservative
 /// escalation test for plans whose scanned tables are not knowable before
 /// execution-time catalog resolution (link traversals resolve their child
@@ -435,6 +513,23 @@ pub struct Engine {
     /// shared reader lock, and every mutating execute path returns the terminal
     /// [`QueryError::ReadonlyMode`] instead of ever touching disk.
     read_only: bool,
+    /// Test-only: when true, every executor fast path and the compiled
+    /// predicate entry decline to fire, so the query runs through the generic
+    /// evaluator. See [`Engine::set_force_generic_path`]. The field only
+    /// exists under the `testing` feature, and [`Engine::generic_path_forced`]
+    /// is a compile-time `false` without it, so no shipped build pays a branch.
+    #[cfg(feature = "testing")]
+    force_generic_path: bool,
+    /// Test-only: the name of every fast-path check site that has declined
+    /// because `force_generic_path` was set. A bare count would only tell a
+    /// test that *something* declined; a query usually passes several check
+    /// sites, so a count stays non-zero even when the one site under test lost
+    /// its guard. Recording names is what makes "this shape really was
+    /// diverted" provable, and a missed site is a hole in the whole runner.
+    /// Behind a `Mutex` because the read path drives the engine by `&self` and
+    /// `Engine` must stay `Sync`; it is only ever locked while the switch is on.
+    #[cfg(feature = "testing")]
+    forced_generic_sites: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl Engine {
@@ -492,8 +587,7 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        let view_registry =
-            ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+        let view_registry = open_view_registry(data_dir);
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -505,6 +599,10 @@ impl Engine {
             nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             wal_archive_hook,
             read_only: false,
+            #[cfg(feature = "testing")]
+            force_generic_path: false,
+            #[cfg(feature = "testing")]
+            forced_generic_sites: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -531,8 +629,7 @@ impl Engine {
         let dir_lock = powdb_storage::dir_lock::DirLock::acquire_reader(data_dir)?;
         let catalog = Catalog::open_read_only(data_dir)?;
         info!(data_dir = %data_dir.display(), "engine opened read-only for snapshot serving");
-        let view_registry =
-            ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+        let view_registry = open_view_registry(data_dir);
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -546,6 +643,10 @@ impl Engine {
             // must never checkpoint (the hook is what would drive that).
             wal_archive_hook: None,
             read_only: true,
+            #[cfg(feature = "testing")]
+            force_generic_path: false,
+            #[cfg(feature = "testing")]
+            forced_generic_sites: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -562,6 +663,210 @@ impl Engine {
     /// Whether this engine was opened read-only for snapshot serving.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Plan `stmt` and lower it. **The only place in the executor that calls
+    /// the planner.**
+    ///
+    /// Planner output is not executable as it stands: the planner is pure, so
+    /// it emits `IndexScan` / `RangeScan` probes speculatively and leaves every
+    /// literal exactly as written, and lowering is what decides whether those
+    /// probes exist and what key bytes they address. Running raw planner output
+    /// is therefore not a missed optimization, it is a different answer.
+    ///
+    /// Eight subquery materialization sites used to plan a statement and hand
+    /// the result straight to `execute_plan` / `execute_plan_readonly`. The
+    /// consequence was that a predicate answered correctly at the top level and
+    /// incorrectly one level of nesting down:
+    /// `count(H filter .price < 3)` gave 2 while
+    /// `count(H filter .n in (H filter .price < 3 { .n }))` gave 0 over the
+    /// same rows and the same index.
+    ///
+    /// Funnelling every plan through here is what makes that unrepeatable: a
+    /// ninth site has to call this to get a plan at all, and what it gets back
+    /// is a [`LoweredPlan`], which is the only thing the execution entry points
+    /// accept. `no_execution_entry_point_can_receive_an_unlowered_plan` in
+    /// `tests/cross_type_index_parity.rs` fails the build if a second call to
+    /// the planner appears anywhere under `src/executor/`.
+    fn plan_and_lower(&self, stmt: Statement) -> Result<LoweredPlan, QueryError> {
+        Ok(self.plan_and_lower_cacheable(stmt)?.1)
+    }
+
+    /// [`Engine::plan_and_lower`] for the callers that also need the raw plan,
+    /// which is only ever the plan cache: the cache stores the pre-lowering
+    /// tree, because lowering is a function of catalog state and the cache
+    /// outlives DDL. Lowering therefore runs on every cache hit as well.
+    fn plan_and_lower_cacheable(
+        &self,
+        stmt: Statement,
+    ) -> Result<(PlanNode, LoweredPlan), QueryError> {
+        let plan =
+            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let lowered = self.lower(&plan);
+        Ok((plan, lowered))
+    }
+
+    /// [`Engine::plan_and_lower_cacheable`] from PowQL text. The only call to
+    /// `planner::plan` under `src/executor/`, for the same reason.
+    fn plan_text_and_lower(&self, input: &str) -> Result<(PlanNode, LoweredPlan), QueryError> {
+        let plan = planner::plan(input).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let lowered = self.lower(&plan);
+        Ok((plan, lowered))
+    }
+
+    /// Lower a plan that came from somewhere other than the planner: the plan
+    /// cache, or a fallback the executor built from an already-lowered tree.
+    /// Lowering is idempotent, so calling it on a plan that has been through it
+    /// already is a no-op.
+    fn lower(&self, plan: &PlanNode) -> LoweredPlan {
+        LoweredPlan::of(&self.catalog, plan)
+    }
+
+    /// Test-only: the EXPLAIN text of `query`'s plan after `passes` rounds of
+    /// lowering.
+    ///
+    /// Routing every plan through [`Engine::plan_and_lower`] is only sound if
+    /// lowering is idempotent: a plan that reaches an entry point already
+    /// lowered (a re-lowered cache hit, a prepared template, a fallback the
+    /// executor rebuilt from a lowered tree) must come out unchanged rather
+    /// than rewritten a second time. This exposes the pass so a test can hold
+    /// that directly instead of inferring it from answers.
+    ///
+    /// Only available with the `testing` feature.
+    #[cfg(feature = "testing")]
+    pub fn lowered_plan_text(&self, query: &str, passes: usize) -> Result<String, QueryError> {
+        let (_, mut plan) = self.plan_text_and_lower(query)?;
+        for _ in 1..passes.max(1) {
+            plan = self.lower(plan.node());
+        }
+        Ok(format_plan_tree(&self.catalog, plan.node(), 0))
+    }
+
+    /// Run a lowered plan on the mutable path. `Engine::execute_plan` stays
+    /// public and takes a bare `&PlanNode` for embedders that build plans
+    /// themselves, and lowers it before calling this; every path inside the
+    /// executor goes through here so that what it runs is a plan the type
+    /// system says was lowered.
+    fn execute_lowered(&mut self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
+        self.refresh_dirty_views_read_by(plan.node())?;
+        self.dispatch_mut(plan.node())
+    }
+
+    /// Refresh every stale materialized view this plan is about to read, before
+    /// any of it runs.
+    ///
+    /// The dispatch arms each carry their own dirty check, and the fast paths
+    /// that short-circuit them do not: `V filter .id > 0 { .id }` is served by
+    /// `project_filter_limit_fast`, which takes the table name and scans the
+    /// backing heap directly, so a stale view answered with its pre-mutation
+    /// rows while the bare `V` next to it answered correctly. Checking at every
+    /// fast path is how that happened; checking once, here, at the boundary
+    /// every statement and subquery crosses, is what makes it not recur.
+    ///
+    /// The walk only runs when a view is dirty at all, and only refreshes views
+    /// the plan actually names, so refreshing one cannot re-enter itself
+    /// through its own source query.
+    fn refresh_dirty_views_read_by(&mut self, plan: &PlanNode) -> Result<(), QueryError> {
+        if !any_view_dirty(&self.view_registry) {
+            return Ok(());
+        }
+        let mut stale: Vec<String> = Vec::new();
+        collect_dirty_scanned_views(plan, &self.view_registry, &mut stale);
+        for name in stale {
+            self.refresh_view(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Test-only: force every query onto the generic evaluator.
+    ///
+    /// The planner is pure, so one query text runs through different physical
+    /// code depending on catalog state and plan shape: a compiled byte-level
+    /// predicate, a fused scan, a bounded top-N heap, an index probe, or the
+    /// generic decode-and-evaluate loop. Those paths are supposed to be
+    /// indistinguishable from outside; twice now they were not, and the
+    /// disagreement shipped because no test ran the same query both ways.
+    ///
+    /// With this set, predicate compilation declines and every fast-path match
+    /// site falls through, so a test can execute a query optimized and
+    /// unoptimized and diff the two results.
+    /// It changes which code runs, never what the answer should be: any
+    /// difference it exposes is a bug in one of the two paths.
+    ///
+    /// Each decline records the name of the site that declined; read them back
+    /// with [`Engine::forced_generic_sites`]. A comparison whose shape never
+    /// declined anywhere is comparing one code path with itself, so the names
+    /// are what keep the comparison honest.
+    ///
+    /// Only available with the `testing` feature; there is no way to reach it
+    /// from a shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_force_generic_path(&mut self, force: bool) {
+        self.force_generic_path = force;
+    }
+
+    /// Whether fast paths are currently suppressed, recording `site` when they
+    /// are. `site` names the specific fast path being declined, so a test can
+    /// assert that the shape it ran was diverted *there* rather than merely
+    /// somewhere. Compiles to a constant `false` without the `testing` feature,
+    /// so every guarded branch folds away in a shipped build.
+    #[cfg(feature = "testing")]
+    #[inline]
+    pub(in crate::executor) fn generic_path_forced(&self, site: &'static str) -> bool {
+        if self.force_generic_path {
+            if let Ok(mut sites) = self.forced_generic_sites.lock() {
+                sites.push(site);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Test-only: the fast-path check sites that have declined so far because
+    /// [`Engine::set_force_generic_path`] is on, in the order they declined. A
+    /// shape that is supposed to reach a named fast path but never appears here
+    /// has a missing check site, not a passing test.
+    #[cfg(feature = "testing")]
+    pub fn forced_generic_sites(&self) -> Vec<&'static str> {
+        match self.forced_generic_sites.lock() {
+            Ok(sites) => sites.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Test-only: forget the recorded declines so one query's declines can be
+    /// observed in isolation.
+    #[cfg(feature = "testing")]
+    pub fn reset_forced_generic_sites(&self) {
+        match self.forced_generic_sites.lock() {
+            Ok(mut sites) => sites.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[inline]
+    pub(in crate::executor) fn generic_path_forced(&self, _site: &'static str) -> bool {
+        false
+    }
+
+    /// Compile `predicate` into a byte-level closure, unless fast paths are
+    /// suppressed. This is the single entry point every executor site uses, so
+    /// [`Engine::set_force_generic_path`] cannot be bypassed by a caller that
+    /// forgets the check.
+    #[inline]
+    pub(in crate::executor) fn compile_predicate_unless_forced(
+        &self,
+        site: &'static str,
+        predicate: &Expr,
+        columns: &[String],
+        layout: &FastLayout,
+        schema: &Schema,
+    ) -> Option<CompiledPredicate> {
+        if self.generic_path_forced(site) {
+            return None;
+        }
+        compile_predicate(predicate, columns, layout, schema)
     }
 
     /// Open or create an engine with an explicit per-query memory limit
@@ -695,8 +1000,7 @@ impl Engine {
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.clear();
         }
-        self.view_registry = ViewRegistry::open(self.catalog.data_dir())
-            .unwrap_or_else(|_| ViewRegistry::new(self.catalog.data_dir()));
+        self.view_registry = open_view_registry(self.catalog.data_dir());
         Ok(QueryResult::Executed {
             message: "transaction rolled back".to_string(),
         })
@@ -834,8 +1138,8 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
-                    let plan = lower_unindexed_scans(&self.catalog, &plan);
-                    let result = self.execute_plan(&plan);
+                    let plan = self.lower(&plan);
+                    let result = self.execute_lowered(&plan);
                     // Mission B (post-review): statement-boundary WAL
                     // group commit. Catalog::wal_log now only appends;
                     // the fsync happens here exactly once per statement.
@@ -849,56 +1153,45 @@ impl Engine {
                     return result;
                 }
                 // Miss — plan, insert, execute.
-                return match planner::plan(input) {
-                    Ok(plan) => {
-                        self.plan_cache
-                            .lock()
-                            .map_err(|e| {
-                                QueryError::Execution(format!("plan cache lock poisoned: {e}"))
-                            })?
-                            .insert(hash, plan.clone(), literals.len());
-                        let plan = lower_unindexed_scans(&self.catalog, &plan);
-                        let result = self.execute_plan(&plan);
-                        if !self.in_transaction {
-                            self.catalog
-                                .commit_autocommit()
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                        }
-                        result
-                    }
-                    Err(e) => Err(QueryError::Parse(e.to_string())),
-                };
+                let (raw, plan) = self.plan_text_and_lower(input)?;
+                self.plan_cache
+                    .lock()
+                    .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
+                    .insert(hash, raw, literals.len());
+                let result = self.execute_lowered(&plan);
+                if !self.in_transaction {
+                    self.catalog
+                        .commit_autocommit()
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                }
+                return result;
             }
             // Lex error — fall through to the planner so the caller gets a
             // consistent error shape.
-            return match planner::plan(input) {
-                Ok(plan) => {
-                    let plan = lower_unindexed_scans(&self.catalog, &plan);
-                    let result = self.execute_plan(&plan);
-                    if !self.in_transaction {
-                        self.catalog
-                            .commit_autocommit()
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    }
-                    result
-                }
-                Err(e) => Err(QueryError::Parse(e.to_string())),
-            };
+            let (_, plan) = self.plan_text_and_lower(input)?;
+            let result = self.execute_lowered(&plan);
+            if !self.in_transaction {
+                self.catalog
+                    .commit_autocommit()
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            }
+            return result;
         }
 
         // Instrumented path — only taken under explicit tracing subscribers.
         let total_start = Instant::now();
         let plan_start = Instant::now();
-        let plan = planner::plan(input).map_err(|e| {
-            let msg = e.to_string();
-            error!(query = %input, error = %msg, "query plan failed");
-            QueryError::Parse(msg)
+        // `plan_us` now covers planning AND lowering. They are one step from
+        // the caller's point of view (lowering is not optional, an unlowered
+        // plan answers differently), and keeping them one call is what keeps
+        // the planner reachable from a single place.
+        let (_, plan) = self.plan_text_and_lower(input).inspect_err(|err| {
+            error!(query = %input, error = %err, "query plan failed");
         })?;
         let plan_us = plan_start.elapsed().as_micros();
 
         let exec_start = Instant::now();
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
-        let result = self.execute_plan(&plan);
+        let result = self.execute_lowered(&plan);
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
@@ -958,8 +1251,8 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &literals);
                 if let Some(plan) = cached {
-                    let plan = lower_unindexed_scans(&self.catalog, &plan);
-                    let result = self.execute_plan(&plan);
+                    let plan = self.lower(&plan);
+                    let result = self.execute_lowered(&plan);
                     if !self.in_transaction {
                         self.catalog
                             .commit_autocommit()
@@ -968,14 +1261,12 @@ impl Engine {
                     return result;
                 }
 
-                let plan = crate::planner::plan_statement(parsed.statement)
-                    .map_err(|e| QueryError::Parse(e.to_string()))?;
+                let (raw, plan) = self.plan_and_lower_cacheable(parsed.statement)?;
                 self.plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .insert(hash, plan.clone(), literals.len());
-                let plan = lower_unindexed_scans(&self.catalog, &plan);
-                let result = self.execute_plan(&plan);
+                    .insert(hash, raw, literals.len());
+                let result = self.execute_lowered(&plan);
                 if !self.in_transaction {
                     self.catalog
                         .commit_autocommit()
@@ -985,10 +1276,8 @@ impl Engine {
             }
         }
 
-        let plan = crate::planner::plan_statement(parsed.statement)
-            .map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
-        let result = self.execute_plan(&plan);
+        let plan = self.plan_and_lower(parsed.statement)?;
+        let result = self.execute_lowered(&plan);
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
@@ -1019,22 +1308,18 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
-                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                let plan = self.lower(&plan);
                 return self.execute_plan_readonly(&plan);
             }
-            let plan = crate::planner::plan_statement(parsed.statement)
-                .map_err(|e| QueryError::Parse(e.to_string()))?;
+            let (raw, plan) = self.plan_and_lower_cacheable(parsed.statement)?;
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, plan.clone(), literals.len());
-            let plan = lower_unindexed_scans(&self.catalog, &plan);
+                .insert(hash, raw, literals.len());
             return self.execute_plan_readonly(&plan);
         }
 
-        let plan = crate::planner::plan_statement(parsed.statement)
-            .map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let plan = self.plan_and_lower(parsed.statement)?;
         self.execute_plan_readonly(&plan)
     }
 
@@ -1057,10 +1342,8 @@ impl Engine {
         crate::cancel::check()?;
         let stmt = crate::parser::parse_with_params(input, params)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan =
-            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
-        let result = self.execute_plan(&plan);
+        let plan = self.plan_and_lower(stmt)?;
+        let result = self.execute_lowered(&plan);
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
@@ -1088,9 +1371,7 @@ impl Engine {
         if !is_read_only_statement(&stmt) {
             return Err(QueryError::ReadonlyNeedsWrite);
         }
-        let plan =
-            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let plan = self.plan_and_lower(stmt)?;
         self.execute_plan_readonly(&plan)
     }
 
@@ -1208,25 +1489,21 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &literals);
             if let Some(plan) = cached {
-                let plan = lower_unindexed_scans(&self.catalog, &plan);
+                let plan = self.lower(&plan);
                 return self.execute_plan_readonly(&plan);
             }
             // Miss: plan + insert + execute. The planner is pure, so this
             // is safe from `&self`.
-            let plan = crate::planner::plan_statement(stmt)
-                .map_err(|e| QueryError::Parse(e.to_string()))?;
+            let (raw, plan) = self.plan_and_lower_cacheable(stmt)?;
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, plan.clone(), literals.len());
-            let plan = lower_unindexed_scans(&self.catalog, &plan);
+                .insert(hash, raw, literals.len());
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error
         // shape (though `parse` above would usually have caught it).
-        let plan =
-            crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let plan = lower_unindexed_scans(&self.catalog, &plan);
+        let plan = self.plan_and_lower(stmt)?;
         self.execute_plan_readonly(&plan)
     }
 
@@ -1240,7 +1517,17 @@ impl Engine {
     /// cache mutation on inner subqueries is handled via the shared mutex
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
-    fn execute_plan_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
+    fn execute_plan_readonly(&self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
+        self.dispatch_readonly(plan.node())
+    }
+
+    /// The read-path dispatch itself. Takes a bare `&PlanNode` because it is
+    /// the recursion target: every child of a lowered plan is lowered, so a
+    /// subtree needs no second wrapper. Reaching it from outside an already
+    /// lowered tree is what [`Engine::execute_plan_readonly`] exists to
+    /// prevent, which is why this one is private and unlowered plans cannot
+    /// name it.
+    fn dispatch_readonly(&self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
         // Detect every dirty materialized-view source before executing any
         // branch of the plan. Without this preflight, a join could fully scan
         // its clean left input before discovering a dirty right input, then
@@ -1263,7 +1550,7 @@ impl Engine {
                 if let Some(result) = self.execute_expression_index_plan(plan, None)? {
                     return Ok(result);
                 }
-                let fallback = lower_unindexed_scans(&self.catalog, plan);
+                let fallback = self.lower(plan);
                 self.execute_plan_readonly(&fallback)
             }
             PlanNode::SeqScan { table } => {
@@ -1329,7 +1616,7 @@ impl Engine {
                     } else {
                         fields
                     };
-                let parent = self.execute_plan_readonly(input)?;
+                let parent = self.dispatch_readonly(input)?;
                 self.execute_nested_project(parent, fields)
             }
 
@@ -1374,8 +1661,13 @@ impl Engine {
                     Box::new(key.clone()),
                 );
                 if !tbl.has_overflow_rows() {
-                    if let Some(compiled) = compile_predicate(&synth_pred, &columns, &fast, &schema)
-                    {
+                    if let Some(compiled) = self.compile_predicate_unless_forced(
+                        "readonly:index-scan-scan-fallback:predicate",
+                        &synth_pred,
+                        &columns,
+                        &fast,
+                        &schema,
+                    ) {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                         for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
                             if compiled(data) {
@@ -1488,7 +1780,13 @@ impl Engine {
                 let fast = FastLayout::new(&schema);
                 let synth = synthesize_range_predicate(column, start, end);
                 if !tbl.has_overflow_rows() {
-                    if let Some(compiled) = compile_predicate(&synth, &columns, &fast, &schema) {
+                    if let Some(compiled) = self.compile_predicate_unless_forced(
+                        "readonly:range-scan-scan-fallback:predicate",
+                        &synth,
+                        &columns,
+                        &fast,
+                        &schema,
+                    ) {
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(64);
                         for_each_row_raw_cancellable(&self.catalog, table, |_rid, data| {
                             if compiled(data) {
@@ -1539,7 +1837,7 @@ impl Engine {
 
                 // Correlated subquery path: per-row materialisation.
                 if contains_subquery(predicate) {
-                    let result = self.execute_plan_readonly(input)?;
+                    let result = self.dispatch_readonly(input)?;
                     return match result {
                         QueryResult::Rows { columns, rows } => {
                             let mut filtered = Vec::new();
@@ -1579,7 +1877,9 @@ impl Engine {
                 // Overflow safety (P0-4/P1): v2-capable tables fall through to
                 // the decoded general path below.
                 if let PlanNode::SeqScan { table } = input.as_ref() {
-                    if !self.catalog.table_has_overflow(table) {
+                    if !self.catalog.table_has_overflow(table)
+                        && !self.generic_path_forced("readonly:filter-seqscan-raw")
+                    {
                         if self.view_registry.is_dirty(table) {
                             return Err(QueryError::ReadonlyNeedsWrite);
                         }
@@ -1599,9 +1899,13 @@ impl Engine {
                         // Filter fast path for the same pattern).
                         let mut cancel = crate::cancel::CancelCheck::new();
                         let mut cancel_err: Option<QueryError> = None;
-                        if let Some(compiled) =
-                            compile_predicate(predicate, &columns, &fast, &schema)
-                        {
+                        if let Some(compiled) = self.compile_predicate_unless_forced(
+                            "readonly:filter-seqscan:predicate",
+                            predicate,
+                            &columns,
+                            &fast,
+                            &schema,
+                        ) {
                             self.catalog
                                 .try_for_each_row_raw(table, |_rid, data| {
                                     if let Err(e) = cancel.tick() {
@@ -1640,7 +1944,7 @@ impl Engine {
                 }
 
                 // General path.
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut cancel = crate::cancel::CancelCheck::new();
@@ -1707,7 +2011,10 @@ impl Engine {
                     // expression-evaluating path (its column is otherwise
                     // dropped — proj_indices only collects Fields).
                     let all_plain_fields = fields.iter().all(|f| matches!(f.expr, Expr::Field(_)));
-                    if tbl.has_index(column) && all_plain_fields {
+                    if tbl.has_index(column)
+                        && all_plain_fields
+                        && !self.generic_path_forced("readonly:project-over-index-scan")
+                    {
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = crate::cancel::CancelCheck::new();
@@ -1833,7 +2140,7 @@ impl Engine {
                 }
 
                 // Generic path.
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let proj_columns: Vec<String> = fields
@@ -1869,7 +2176,7 @@ impl Engine {
             }
 
             PlanNode::Sort { input, keys } => {
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, mut rows } => {
                         if rows.len() > MAX_SORT_ROWS {
@@ -1933,7 +2240,7 @@ impl Engine {
             }
 
             PlanNode::Limit { input, count } => {
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,
                     _ => return Err("limit must be integer literal".into()),
@@ -1956,7 +2263,7 @@ impl Engine {
             }
 
             PlanNode::Offset { input, count } => {
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 let n = match count {
                     Expr::Literal(Literal::Int(v)) => *v as usize,
                     _ => return Err("offset must be integer literal".into()),
@@ -2003,7 +2310,10 @@ impl Engine {
                 // generic path (raw count drops >= 64KB rows). A count with a
                 // target column (`count(T { .v })`) counts non-null values, so
                 // it must not take this row-counting path.
-                if *function == AggFunc::Count && counts_every_row(argument.as_ref()) {
+                if *function == AggFunc::Count
+                    && counts_every_row(argument.as_ref())
+                    && !self.generic_path_forced("readonly:count-fast-block")
+                {
                     if let PlanNode::SeqScan { table } = input.as_ref() {
                         if !self.catalog.table_has_overflow(table) {
                             // A dirty materialized view must be refreshed before
@@ -2051,9 +2361,13 @@ impl Engine {
                                 let fast = FastLayout::new(&schema);
                                 let row_layout = RowLayout::new(&schema);
 
-                                if let Some(compiled) =
-                                    compile_predicate(predicate, &columns, &fast, &schema)
-                                {
+                                if let Some(compiled) = self.compile_predicate_unless_forced(
+                                    "readonly:count-filter:predicate",
+                                    predicate,
+                                    &columns,
+                                    &fast,
+                                    &schema,
+                                ) {
                                     let mut count: i64 = 0;
                                     for_each_row_raw_cancellable(
                                         &self.catalog,
@@ -2126,7 +2440,7 @@ impl Engine {
                 }
 
                 // Generic path.
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         aggregate_rows(*function, argument.as_ref(), &columns, &rows)
@@ -2136,7 +2450,7 @@ impl Engine {
             }
 
             PlanNode::Distinct { input } => {
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         let mut seen = std::collections::HashSet::new();
@@ -2177,7 +2491,7 @@ impl Engine {
                         self.query_memory_limit,
                     );
                 }
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 match result {
                     QueryResult::Rows { columns, rows } => {
                         // WS2: byte-budget guard on the GROUP BY input buffer
@@ -2195,8 +2509,8 @@ impl Engine {
                 on,
                 kind,
             } => {
-                let left_result = self.execute_plan_readonly(left)?;
-                let right_result = self.execute_plan_readonly(right)?;
+                let left_result = self.dispatch_readonly(left)?;
+                let right_result = self.dispatch_readonly(right)?;
                 let (left_columns, left_rows) = match left_result {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("join left side must produce rows".into()),
@@ -2222,13 +2536,13 @@ impl Engine {
             }
 
             PlanNode::Window { input, windows } => {
-                let result = self.execute_plan_readonly(input)?;
+                let result = self.dispatch_readonly(input)?;
                 execute_window(result, windows, self.query_memory_limit)
             }
 
             PlanNode::Union { left, right, all } => {
-                let left_result = self.execute_plan_readonly(left)?;
-                let right_result = self.execute_plan_readonly(right)?;
+                let left_result = self.dispatch_readonly(left)?;
+                let right_result = self.dispatch_readonly(right)?;
                 let (left_cols, left_rows) = match left_result {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on left side".into()),
@@ -2325,8 +2639,7 @@ impl Engine {
                     });
                 }
                 let inner = self.materialize_subqueries_readonly(inner)?;
-                let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => {
@@ -2354,8 +2667,7 @@ impl Engine {
                 if is_correlated_subquery(subquery, &self.catalog) {
                     return Ok(expr.clone());
                 }
-                let sub_plan = crate::planner::plan_statement(Statement::Query(*subquery.clone()))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),
@@ -2420,8 +2732,7 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
                     QueryResult::Rows { rows, .. } => {
@@ -2456,8 +2767,7 @@ impl Engine {
                         outer_columns,
                     ));
                 }
-                let sub_plan = crate::planner::plan_statement(Statement::Query(sub))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let has_rows = match result {
                     QueryResult::Rows { rows, .. } => !rows.is_empty(),

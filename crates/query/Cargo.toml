@@ -11,6 +11,14 @@ keywords = ["database", "powdb", "powql", "query-engine", "parser"]
 categories = ["database", "database-implementations", "parser-implementations"]
 documentation = "https://docs.rs/powdb-query"
 
+[features]
+# Test-only instrumentation. Enables `Engine::set_force_generic_path`, which
+# turns off every executor fast path and the compiled-predicate entry so a
+# query can be run twice — once physically optimized, once through the generic
+# evaluator — and the two answers compared. Never enable it in a shipped build:
+# it exists so tests can prove the two paths agree, not to change behavior.
+testing = []
+
 [dependencies]
 powdb-storage = { version = "0.21.0", path = "../storage" }
 thiserror.workspace = true
@@ -20,6 +28,12 @@ rustc-hash.workspace = true
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# Self dev-dependency so `cargo test -p powdb-query` builds the library with
+# `testing` on without every developer remembering `--features testing`. Cargo
+# permits a dev-dependency cycle on the same package and unifies it into the
+# single test-profile build. Path-only (no version), so it is stripped from the
+# published manifest and never affects consumers.
+powdb-query = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

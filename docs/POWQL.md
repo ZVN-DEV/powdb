@@ -317,6 +317,16 @@ User filter .name = "Alice"
 User filter .score != 0
 ```
 
+**Typing rule for numbers.** `int` and `float` compare numerically and
+exactly: an int and a float are equal only when they denote the same number,
+with no precision loss at any magnitude (`.v = 9223372036854775808.0`
+matches no int, because 2^63 exceeds every int), and all six operators
+follow that single total order on every access path (compiled, interpreted,
+or through an index). This applies to comparisons only: `group by`,
+`distinct`, and join keys keep int and float distinct, so `1` and `1.0` are
+one value to a filter and two values to a grouping. Other type pairs are not
+coerced; use `cast` where you need one.
+
 #### NULL / missing values in comparisons
 
 A missing (null) field value **never matches a comparison**. A row whose
@@ -799,13 +809,20 @@ with the matching children assembled into a JSON array inside that row.
 The examples below assume these table definitions and rows:
 
 ```
-type User { required id: int, required name: str, required email: str, age: int }
+type Company { required unique id: int, required name: str }
+type User { required unique id: int, required name: str, required email: str, age: int, company_id: int }
 type Order { required id: int, required user_id: int, required total: float, product_id: int }
 type Item { required id: int, required order_id: int, required sku: str }
 
--- Alice (id 1) has two orders, Bob (id 2) has one (with no product_id),
--- Cara (id 3) has none. Order 1 has items "a" and "b"; order 2 has item "c".
+-- Alice (id 1, company 10) has two orders, Bob (id 2) has one (with no
+-- product_id), Cara (id 3) has none. Order 1 has items "a" and "b"; order 2
+-- has item "c". Company 10 is "acme".
 ```
+
+`User.id` and `Company.id` are `unique`, which is what makes a link onto them a
+to-one link in the [entity links](#entity-links-relationship-traversal) examples
+below. `Order.id` and `Item.id` are deliberately not unique, so a link onto
+`Order.user_id` or `Item.order_id` is to-many.
 
 ### Syntax
 
@@ -1016,6 +1033,26 @@ You do not annotate the cardinality; the schema already knows it. To see the
 declared links (and their derived cardinality), use
 [`schema links`](#schema-links) or [`describe <Type>`](#describe).
 
+**Derived means re-derived.** The cardinality is read from the schema every
+time, not frozen at the moment the link was declared, so DDL order does not
+matter. Declaring the link first and adding the unique index afterwards reaches
+exactly the same place as doing it the other way round:
+
+```
+type User { required id: int, required name: str }
+type Order { required id: int, user_id: int }
+link Order.user -> User on user_id = id       -- to-many: User.id is not unique yet
+alter User add unique .id                     -- now to-one, with no re-declaration
+Order as o { o.id, o.user.name }              -- the scalar hop works
+```
+
+This is why a to-many refusal names `alter <Target> add unique .<key>` as the
+first remedy: it is a one-statement schema fix, not a reason to rewrite the
+query. Note that a target key carrying a **plain** (non-unique) index is a
+different case: PowDB does not upgrade an index in place, so `alter T add
+unique .c` is refused on an already-indexed column and the link stays to-many.
+Add uniqueness on a column that is either unindexed or already unique.
+
 ### Scalar path (to-one)
 
 A to-one link reads a column from the related row inline. Multi-hop is
@@ -1025,6 +1062,10 @@ supported.
 Order as o { o.id, o.total, o.user.name }
 Order as o { o.id, o.user.company.name }     -- multi-hop
 ```
+
+The multi-hop line assumes a second link on the type the first hop reaches
+(`link User.company -> Company on company_id = id`); every hop in the path must
+be a to-one link on the type reached so far.
 
 Result: one value per row, read through the relationship. In SQL this is a JOIN
 written solely to read one column.
@@ -1044,7 +1085,7 @@ block accepts the same per-parent `filter` / `order` / `limit` / `offset`.
 ```
 User as u {
   u.name,
-  orders: u.orders order total desc limit 3 { total, status }
+  orders: u.orders order total desc limit 3 { total, product_id }
 }
 ```
 
@@ -1058,10 +1099,18 @@ row multiplication:
 ```
 Order as o { o.user.name }
 -- if `user`'s target key is not unique:
--- Error: link `user` on type `Order` is a to-many link (its target key
---        `name` is not unique); traverse it with a block
---        (`user: o.user { ... }`), not a scalar path
+-- Error: link `user` on type `Order` is a to-many link: its target key
+--        `User.id` is not unique, so a hop can match many rows. To read one
+--        value per row, make the target key unique with
+--        `alter User add unique .id`. To read every match, traverse it with
+--        a block (`user: o.user { ... }`)
 ```
+
+The refusal leads with the schema fix because that is usually what was meant: a
+block turns a foreign-key lookup into a one-element array the caller unwraps on
+every row. The block form is offered second, for when the fan-out is real. If
+the target key already carries a plain index, the message says so instead of
+naming a statement that would be refused.
 
 The reverse (a block through a to-one link) is likewise a clean error. This is
 the guarantee SQL does not make: an inner join through a non-unique key quietly
@@ -1417,10 +1466,10 @@ Post filter .data->views > 10                -- extract, then compare
 | missing key or index | empty set |
 
 Because both JSON `null` and a missing path scalarize to the empty set, use
-[`json_type`](#json_type) when you need to tell them apart. There is no
-implicit cross-type coercion: `.data->views > 10` compares whatever the
-extraction yields under the normal PowQL value rules; use `cast` for stringly
-numbers.
+[`json_type`](#json_type) when you need to tell them apart. Numeric JSON
+values follow the numeric comparison rule: `.data->views = 10.0` matches an
+integer node `10`, and the ordering operators behave the same way. There is
+no coercion between numbers and strings; use `cast` for stringly numbers.
 
 ### Canonicalization semantics (important)
 
@@ -1508,6 +1557,9 @@ sequential scan.
   numbers < strings < arrays < objects). Numerically tied int/float values
   (`1` vs `1.0`) order deterministically with the int first; only byte-equal
   documents compare equal, so ordering, grouping, and equality always agree.
+  A scalarized numeric path is different: through `->`, equality follows the
+  numeric comparison rule while grouping keys stay strict, so `1` and `1.0`
+  are one value to a filter and two values to a `group by`.
 - The legacy string wire surface remains ambiguous for some values. Use the
   native typed client surface when exact Empty, string, Bytes, and JSON
   distinctions matter. Direct `->` intentionally maps both a missing path and
@@ -1763,6 +1815,59 @@ after 5000ms`. A client that sees this error is being told another explicit
 transaction is holding the gate; the fix is a shorter transaction on the other
 connection, not a longer timeout.
 
+#### Explicit transactions have a maximum lifetime
+
+Because one open transaction stalls every other connection, the **server** now
+puts a ceiling on how long a single transaction may hold the gate. It is a
+default-on behavior change, and it applies to legitimate long transactions
+exactly as it applies to abusive ones.
+
+- **Default: 300000 ms (5 minutes).** An explicit transaction that is still open
+  after that is **rolled back** by the server, the gate is released, and the
+  connection is sent a `Timeout`-class error and then closed:
+
+  ```
+  transaction exceeded the maximum lifetime of 300000ms and was rolled back;
+  raise POWDB_TX_MAX_LIFETIME_MS if transactions on this server legitimately run longer
+  ```
+
+  The check runs at frame boundaries, so the effective ceiling is the budget
+  plus whatever statement is in flight when it expires, not the budget exactly.
+  If the budget expires while the server is writing a reply that cannot
+  finish, the server closes the connection without sending the timeout error
+  frame: the reply is already partly on the wire, and any further frame would
+  be read as its payload. The client sees the connection close, usually
+  mid-reply, and should treat an unexpected close during an open transaction
+  exactly like a timeout. A transaction reaped while the connection is idle
+  or between frames does receive the typed error. Operators see every reap in
+  the server log and in `powdb_tx_reaped_total`.
+
+  Everything the transaction had written and not committed is gone. There is no
+  partial commit and no way to resume: the client must reconnect and start over.
+- **The clock starts at `begin`** and is not extended by anything the client
+  does afterwards. Sending more statements does not extend it, and neither does
+  `PING`; the whole point is that a client cannot choose how long it holds the
+  gate. It is also independent of `POWDB_IDLE_TIMEOUT`, which only bounds a
+  *silent* connection.
+- **The budget covers the reply, not just the statement.** A client that stops
+  reading a large result set is reaped on the same deadline rather than parking
+  the gate for the full response-write timeout.
+- **Set `POWDB_TX_MAX_LIFETIME_MS` to raise it**, for example to `3600000` for a
+  server whose migrations legitimately run for an hour.
+- **Set `POWDB_TX_MAX_LIFETIME_MS=0` to turn it off entirely** and restore the
+  pre-0.22 behavior, in which a client chooses how long it holds the gate. This
+  is a real trade: with the bound disabled, one connection that opens a
+  transaction and stops (or is killed at the wrong moment, or just loops on
+  `PING`) blocks every other connection, readers included, for as long as it
+  likes. Only turn it off when you control every client.
+- Reaped transactions are counted at `powdb_tx_reaped_total` on the metrics
+  endpoint, and each one logs a warning naming the peer and the budget. A
+  non-zero and growing counter means the budget is too low for this workload, or
+  some client is leaking transactions.
+
+The embedded (in-process) API is unaffected: there is no connection and no
+server-side reaper, so an embedded transaction lives until the caller ends it.
+
 ### Transactions and write throughput
 
 By default PowDB runs in `WalSyncMode::Full`: every autocommit statement fsyncs the write-ahead log before returning, so each write is durable on its own. That fsync is the bottleneck for single-row writes -- on real disks, autocommit inserts top out around a few hundred rows per second.
@@ -1778,6 +1883,15 @@ commit
 ```
 
 In internal benchmarks, batching inserts this way ran roughly 50x faster than the same inserts in autocommit, with identical durability guarantees. Always wrap bulk loads in a transaction.
+
+One caveat when you do this against a **server** (not the embedded API): the
+whole load has to fit inside the maximum transaction lifetime described under
+[Concurrency behavior](#concurrency-behavior), 300000 ms by default. A load that
+runs longer is rolled back in full. Either split it into several transactions,
+each comfortably inside the budget, or raise `POWDB_TX_MAX_LIFETIME_MS` on the
+server for the duration of the load. Splitting is usually the better answer: the
+gate is held for the entire transaction either way, so an hour-long transaction
+means an hour with no other writer and no reader that needs the gate.
 
 ---
 
@@ -1934,7 +2048,9 @@ schema links
 | User  | orders | Order   | id         | user_id    | to-many     |
 
 - **cardinality** is `to-one` when the target key is unique, `to-many`
-  otherwise: the same derivation the link was declared with.
+  otherwise, re-derived from the schema as it stands now. Adding or removing
+  uniqueness on the target key changes this column without re-declaring the
+  link, so it never disagrees with what a traversal does.
 - An empty catalog (or one with no links) returns zero rows, not an error.
 - `links` is matched contextually, not reserved: `describe links` still
   describes a table named `links`, and only the exact spelling `schema links`
@@ -1975,15 +2091,18 @@ describe User
 | id          | int  | false    | unique                            |
 | name        | str  | false    |                                   |
 | company_id  | int  | true     |                                   |
-| company     | link | {}       | -> Company (to-one, company_id -> id) |
-| orders      | link | {}       | -> Order (to-many, id -> user_id) |
-| Order.user  | link | {}       | <- Order (to-one, user_id -> id)  |
+| company     | link | NULL     | -> Company (to-one, company_id -> id) |
+| orders      | link | NULL     | -> Order (to-many, id -> user_id) |
+| Order.user  | link | NULL     | <- Order (to-one, user_id -> id)  |
 
 - The direction marker in **index** is `->` for the type's own (outgoing)
   links and `<-` for links targeting it; the keys shown are always the
   owner's `local_key -> target_key` as declared.
-- **nullable** is the empty value (`{}`) on link rows: nullability does not
-  apply to a link.
+- **nullable** is Empty on link rows (the CLI prints it as `NULL`):
+  nullability does not apply to a link.
+- The `to-one` / `to-many` label is re-derived from the target key's current
+  uniqueness on every call, so it cannot contradict the `unique` shown on the
+  target key's own row, or what a traversal actually does.
 
 Describing a type that does not exist is an error (`table 'Ghost' not found`).
 Introspection always reflects the **current** schema — it is never served from a
@@ -2060,6 +2179,15 @@ materialize OldUsers as User filter .age > 28
 materialize UserNames as User { .name }
 materialize ActiveUsers as User filter .status = "active" { .name, .email }
 ```
+
+The view's backing table types each column from the values across ALL result
+rows; a null never constrains the type, and a column that is null in every
+row (or a view with no rows) stores as `str`. A projection is typed per row,
+so an expression like `.tags ?? 0` can yield json in one row and int in
+another: that statement is rejected with a typed error rather than stored,
+and a `refresh` whose fresh rows no longer fit the types frozen at create
+time fails the same way, keeping the view's previous contents. Drop and
+recreate the view to change its column types.
 
 ### Query
 

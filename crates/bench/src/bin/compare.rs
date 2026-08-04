@@ -24,11 +24,48 @@
 //! initial numbers without failing — the comparator prints what it observed
 //! so the human can paste it into `main.json` for the real baseline.
 //!
+//! ## Environment fingerprint
+//!
+//! The baseline numbers are only meaningful on the machine and flags that
+//! produced them. `main.json` records three fields, and this comparator
+//! HARD-FAILS when the current environment disagrees, rather than silently
+//! comparing arm64 laptop numbers against Depot x86 numbers and reporting a
+//! 2x "improvement".
+//!
+//! Two of the three are SELF-ATTESTED; one is MEASURED:
+//!
+//! - `runner` and `rustflags` are read from the environment
+//!   (`POWDB_BENCH_RUNNER`, `RUSTFLAGS`). Anyone can export them, so on their
+//!   own they prove nothing: exporting the Depot pair on an arm64 laptop used
+//!   to produce an unlabelled clean PASS indistinguishable from a real Depot
+//!   run.
+//! - `arch` is compared against [`std::env::consts::ARCH`], which is baked
+//!   into this binary at compile time and cannot be altered by the environment
+//!   it runs in. It is the part of the fingerprint that is actual evidence.
+//!
+//! `arch` therefore fails CLOSED: a baseline that does not record it counts as
+//! a mismatch rather than as an absent expectation, because "this document is
+//! too old to say" is precisely the case where the numbers could be from
+//! anywhere. Set `POWDB_BENCH_ALLOW_ENV_MISMATCH=1` to proceed anyway; the run
+//! is then labelled NOT AUTHORITATIVE in the output.
+//!
+//! ## Control mode
+//!
+//! `--control <criterion-dir>` compares this run against a criterion run of a
+//! DIFFERENT commit measured on the SAME machine in the SAME job. That removes
+//! runner-to-runner variance, which is the whole reason the absolute
+//! thresholds had to be widened to +/-20%, so the control gate is tighter.
+//! The absolute gate against `main.json` still runs alongside it.
+//!
 //! Usage:
 //!
 //! ```bash
 //! cargo bench -p powdb-bench
 //! cargo run -p powdb-bench --bin compare
+//! # with a same-instance control run of another commit:
+//! cargo run -p powdb-bench --bin compare -- --control /path/to/control/target/criterion
+//! # print the arch this binary was compiled for (what the `arch` check uses):
+//! cargo run -p powdb-bench --bin compare -- --print-arch
 //! ```
 
 use serde_json::Value as Json;
@@ -61,6 +98,69 @@ const NOISY_ABSOLUTE_THRESHOLD: f64 = 0.10;
 /// (which would have to exceed even the slowest runner by another 20%)
 /// without flapping on every fresh Azure VM assignment.
 const VERY_NOISY_ABSOLUTE_THRESHOLD: f64 = 0.20;
+
+/// Ceiling applied in `--control` mode. Every threshold above exists to absorb
+/// variance BETWEEN machines: a fresh VM, a different CPU generation, a noisy
+/// neighbour. A control run is the other commit measured on the same instance,
+/// in the same job, minutes apart, so none of that applies and a 20% allowance
+/// would let a real 15% regression through. Control deltas are gated at
+/// `min(threshold_for(workload), 0.10)`.
+///
+/// 10% rather than something tighter because it is the highest same-machine
+/// spread this repo has actually measured (the NOISY tier's evidence, taken
+/// from repeated identical local runs). Tightening it further needs evidence
+/// from a real Depot double-run, not optimism.
+const CONTROL_ABSOLUTE_THRESHOLD: f64 = 0.10;
+
+/// Env var that downgrades the environment fingerprint check to a warning.
+/// Named loudly on purpose: a run that sets it is not evidence about the
+/// baseline.
+const ALLOW_ENV_MISMATCH: &str = "POWDB_BENCH_ALLOW_ENV_MISMATCH";
+
+/// Env var carrying the runner label to compare against `main.json`'s
+/// `runner` field. GitHub Actions does not expose the `runs-on` label to the
+/// job, so `bench.yml` sets this explicitly.
+const RUNNER_ENV: &str = "POWDB_BENCH_RUNNER";
+
+/// Baseline document schema this comparator understands.
+///
+/// Schema 3 adds the measured `arch` fingerprint field. The bump is what makes
+/// a schema-2 document (which cannot carry an `arch`) report the precise
+/// reason it is rejected instead of an opaque "arch: baseline=(not recorded)".
+/// Until this constant existed, `schema` was decoration: nothing read it.
+const EXPECTED_BASELINE_SCHEMA: u64 = 3;
+
+/// Placeholder shown for a fingerprint field the baseline never recorded.
+/// Only reachable for fail-closed fields; the self-attested ones treat an
+/// unrecorded field as "no expectation".
+const UNRECORDED: &str = "(not recorded)";
+
+/// The architecture this binary was COMPILED for.
+///
+/// The whole point of the `arch` fingerprint: unlike `POWDB_BENCH_RUNNER` and
+/// `RUSTFLAGS`, this value is fixed at compile time and no environment
+/// variable can change what it reports at run time.
+fn compiled_arch() -> &'static str {
+    std::env::consts::ARCH
+}
+
+/// Reject a baseline document whose schema this comparator does not implement.
+///
+/// Fail-closed on purpose: an unrecognised schema means the fields below might
+/// mean something else, and a bench gate that guesses is not a gate.
+fn check_baseline_schema(baseline: &Json) -> Result<(), String> {
+    match baseline.get("schema").and_then(Json::as_u64) {
+        Some(EXPECTED_BASELINE_SCHEMA) => Ok(()),
+        Some(other) => Err(format!(
+            "baseline schema is {other}, this comparator requires {EXPECTED_BASELINE_SCHEMA} \
+             (schema {EXPECTED_BASELINE_SCHEMA} added the measured `arch` fingerprint)"
+        )),
+        None => Err(format!(
+            "baseline records no `schema` field; this comparator requires schema \
+             {EXPECTED_BASELINE_SCHEMA}"
+        )),
+    }
+}
 
 const WORKLOADS: &[&str] = &[
     // ── Storage layer (ratio denominator + existing guards) ──
@@ -141,6 +241,105 @@ fn threshold_for(workload: &str) -> f64 {
     }
 }
 
+/// Control-mode threshold: the absolute tier, capped by
+/// [`CONTROL_ABSOLUTE_THRESHOLD`].
+fn control_threshold_for(workload: &str) -> f64 {
+    threshold_for(workload).min(CONTROL_ABSOLUTE_THRESHOLD)
+}
+
+/// One environment field's expected (baseline) and observed value.
+#[derive(Debug, PartialEq)]
+struct EnvMismatch {
+    field: &'static str,
+    expected: String,
+    observed: String,
+}
+
+/// Compare the baseline's recorded environment against the current one.
+///
+/// For the SELF-ATTESTED fields (`runner`, `rustflags`) a missing baseline
+/// field is not a mismatch (older baseline documents did not record
+/// `rustflags`), but a field that IS recorded must match exactly.
+///
+/// For the MEASURED field (`arch`) a missing baseline field IS a mismatch.
+/// These two rules differ because the risks differ: an unrecorded `rustflags`
+/// costs some precision, whereas an unrecorded `arch` would let the one check
+/// that cannot be spoofed be skipped by simply not writing it down. That is
+/// the same "an absent observed value is a mismatch, not a pass" rule the
+/// tests below pin, applied to the baseline side.
+///
+/// Normalising whitespace only, because `-C target-cpu=x86-64-v2` and
+/// `  -C target-cpu=x86-64-v2 ` are the same flags, whereas
+/// `-C target-cpu=native` is a different machine's benchmark.
+fn env_mismatches(
+    baseline: &Json,
+    observed_runner: Option<&str>,
+    observed_rustflags: Option<&str>,
+    observed_arch: &str,
+) -> Vec<EnvMismatch> {
+    let mut out = vec![];
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // (field, observed value, does an unrecorded baseline field fail closed?)
+    let checks: [(&'static str, Option<&str>, bool); 3] = [
+        ("runner", observed_runner, false),
+        ("rustflags", observed_rustflags, false),
+        ("arch", Some(observed_arch), true),
+    ];
+    for (field, observed, required) in checks {
+        let expected = baseline.get(field).and_then(Json::as_str);
+        let observed = observed.unwrap_or("");
+        match expected {
+            Some(expected) if norm(expected) != norm(observed) => out.push(EnvMismatch {
+                field,
+                expected: expected.to_string(),
+                observed: observed.to_string(),
+            }),
+            Some(_) => {}
+            None if required => out.push(EnvMismatch {
+                field,
+                expected: UNRECORDED.to_string(),
+                observed: observed.to_string(),
+            }),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Parsed command line.
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    /// `--control <dir>`: criterion output of another commit, same machine.
+    control: Option<PathBuf>,
+    /// `--print-arch`: print the compiled-in arch and exit. Exists so callers
+    /// that need to agree with the `arch` fingerprint (the gate self-test) can
+    /// ask THIS binary instead of asking `rustc` and hoping the two agree.
+    print_arch: bool,
+}
+
+/// Parse the argument list.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
+    let mut it = args.into_iter();
+    let mut parsed = Args::default();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--control" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| "--control requires a criterion directory".to_string())?;
+                parsed.control = Some(PathBuf::from(value));
+            }
+            other if other.starts_with("--control=") => {
+                parsed.control = Some(PathBuf::from(&other["--control=".len()..]));
+            }
+            "--print-arch" => parsed.print_arch = true,
+            other => return Err(format!("unrecognised argument: {other}")),
+        }
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug)]
 struct WorkloadResult {
     name: String,
@@ -163,6 +362,20 @@ struct RatioCheck {
 }
 
 fn main() -> ExitCode {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("usage: compare [--control <criterion-dir>] [--print-arch]");
+            return ExitCode::from(2);
+        }
+    };
+    if args.print_arch {
+        println!("{}", compiled_arch());
+        return ExitCode::SUCCESS;
+    }
+    let control_dir = args.control;
+
     let manifest_dir = env_manifest_dir();
     let workspace_root = manifest_dir
         .parent()
@@ -170,14 +383,25 @@ fn main() -> ExitCode {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let criterion_dir = workspace_root.join("target/criterion");
-    let baseline_path = manifest_dir.join("baseline/main.json");
-    let ratios_path = manifest_dir.join("baseline/thesis-ratios.json");
+    // The three inputs are overridable so the gate itself can be tested
+    // against synthetic fixtures (scripts/ci/bench-gate-selftest.sh) without a
+    // 60-second bench run, and so a two-checkout control job can point at
+    // another workspace's criterion output. CI leaves them unset.
+    let criterion_dir = env_path("POWDB_BENCH_CRITERION_DIR")
+        .unwrap_or_else(|| workspace_root.join("target/criterion"));
+    let baseline_path =
+        env_path("POWDB_BENCH_BASELINE").unwrap_or_else(|| manifest_dir.join("baseline/main.json"));
+    let ratios_path = env_path("POWDB_BENCH_RATIOS")
+        .unwrap_or_else(|| manifest_dir.join("baseline/thesis-ratios.json"));
 
     println!("PowDB bench regression gate");
     println!("  criterion dir : {}", criterion_dir.display());
     println!("  baseline      : {}", baseline_path.display());
     println!("  ratios        : {}", ratios_path.display());
+    match &control_dir {
+        Some(c) => println!("  control dir   : {}", c.display()),
+        None => println!("  control dir   : (none, absolute gate only)"),
+    }
     println!();
 
     // ── Load current run estimates ─────────────────────────────────────────
@@ -206,10 +430,71 @@ fn main() -> ExitCode {
     }
 
     // ── Load baseline (allow nulls for first-run capture) ──────────────────
-    let baseline_json = read_json(&baseline_path).unwrap_or_else(|e| {
-        eprintln!("warning: could not read baseline ({e}); treating as first-run capture");
-        Json::Null
-    });
+    // A baseline that exists must declare a schema this comparator implements.
+    // A baseline that does not exist at all stays tolerated for first-run
+    // capture on a fresh runner; that path then fails closed anyway, because
+    // an absent document records no `arch`.
+    let baseline_json = match read_json(&baseline_path) {
+        Ok(json) => {
+            if let Err(e) = check_baseline_schema(&json) {
+                eprintln!("error: {}: {e}", baseline_path.display());
+                return ExitCode::from(1);
+            }
+            json
+        }
+        Err(e) => {
+            eprintln!("warning: could not read baseline ({e}); treating as first-run capture");
+            Json::Null
+        }
+    };
+
+    // ── Environment fingerprint ────────────────────────────────────────────
+    // Numbers are only comparable to the machine and flags that produced them.
+    // Without this, running the comparator on an arm64 laptop against
+    // Depot-x86 numbers reports a uniform 2x "improvement" and exits 0, which
+    // is how a laptop rebaseline got as far as a PR once already.
+    // `runner` and `rustflags` are self-attested (anyone can export them);
+    // `arch` is read out of this binary and is the check that a spoofed
+    // environment cannot get past.
+    let observed_runner = std::env::var(RUNNER_ENV).ok();
+    let observed_rustflags = std::env::var("RUSTFLAGS").ok();
+    let mismatches = env_mismatches(
+        &baseline_json,
+        observed_runner.as_deref(),
+        observed_rustflags.as_deref(),
+        compiled_arch(),
+    );
+    let env_override = std::env::var(ALLOW_ENV_MISMATCH)
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !mismatches.is_empty() {
+        eprintln!("ENVIRONMENT MISMATCH vs {}", baseline_path.display());
+        for m in &mismatches {
+            eprintln!(
+                "  {:<10} baseline={:?}  this run={:?}",
+                m.field, m.expected, m.observed
+            );
+        }
+        if env_override {
+            eprintln!();
+            eprintln!(
+                "  {ALLOW_ENV_MISMATCH}=1 is set: continuing, but this run is NOT AUTHORITATIVE."
+            );
+            eprintln!("  Do not rebaseline main.json from it.");
+            eprintln!();
+        } else {
+            eprintln!();
+            eprintln!("  The baseline numbers were measured elsewhere; comparing against them");
+            eprintln!("  here measures the machine, not the code. Run the bench workflow on the");
+            eprintln!("  recorded runner, or set {ALLOW_ENV_MISMATCH}=1 to proceed with an");
+            eprintln!("  explicitly non-authoritative run.");
+            eprintln!();
+            eprintln!("  ({RUNNER_ENV} carries the runner label and RUSTFLAGS is read directly:");
+            eprintln!("   both are self-attested. `arch` is compiled into this binary, so it is");
+            eprintln!("   the one field the environment cannot talk its way past.)");
+            return ExitCode::from(1);
+        }
+    }
 
     let baseline_workloads = baseline_json
         .get("workloads")
@@ -338,8 +623,77 @@ fn main() -> ExitCode {
         println!();
     }
 
+    // ── Control gate (same instance, same job, other commit) ───────────────
+    let mut control_failed = false;
+    if let Some(control_dir) = &control_dir {
+        println!("Same-instance control run: {}", control_dir.display());
+        println!(
+            "{:<28} {:>14} {:>14} {:>10} {:>6} {:>8}",
+            "workload", "control", "head", "delta", "thr", "gate"
+        );
+        println!("{}", "─".repeat(86));
+
+        let mut control_missing: Vec<&'static str> = vec![];
+        for &workload in WORKLOADS {
+            let head_ns = current.get(workload).copied();
+            let control_ns = match read_estimate_median(control_dir, workload) {
+                Ok(ns) => Some(ns),
+                Err(_) => {
+                    control_missing.push(workload);
+                    None
+                }
+            };
+            let threshold = control_threshold_for(workload);
+            let (delta_str, gate_str) = match (control_ns, head_ns) {
+                (Some(c), Some(h)) if c > 0.0 => {
+                    let delta = (h - c) / c;
+                    let gate = if delta > threshold {
+                        control_failed = true;
+                        "FAIL"
+                    } else {
+                        "PASS"
+                    };
+                    (format!("{:+>9.2}%", delta * 100.0), gate)
+                }
+                _ => ("       -".to_string(), "MISSING"),
+            };
+            println!(
+                "{:<28} {:>14} {:>14} {:>10} {:>5.0}% {:>8}",
+                workload,
+                control_ns
+                    .map(|ns| format!("{:>10.0} ns", ns))
+                    .unwrap_or_else(|| "         n/a".to_string()),
+                head_ns
+                    .map(|ns| format!("{:>10.0} ns", ns))
+                    .unwrap_or_else(|| "         n/a".to_string()),
+                delta_str,
+                threshold * 100.0,
+                gate_str
+            );
+        }
+        println!();
+
+        // A control run that silently covered nothing is the miri failure
+        // mode: an empty comparison exits 0 and reads as a pass.
+        if !control_missing.is_empty() {
+            eprintln!(
+                "error: control run is missing {} workload(s): {}",
+                control_missing.len(),
+                control_missing.join(", ")
+            );
+            eprintln!("       the control commit must run the SAME bench suite as head;");
+            eprintln!("       a partial control comparison is not a gate.");
+            control_failed = true;
+        }
+    }
+
     // ── Verdict ────────────────────────────────────────────────────────────
-    if absolute_failed || ratio_failed {
+    if control_failed {
+        eprintln!("REGRESSION: head is slower than the same-instance control run.");
+        eprintln!("  This comparison has no cross-machine noise in it: both numbers came");
+        eprintln!("  from this job, on this instance, minutes apart. Treat it as real.");
+    }
+    if absolute_failed || ratio_failed || control_failed {
         eprintln!("REGRESSION: gate failed.");
         if absolute_failed {
             eprintln!(
@@ -362,10 +716,25 @@ fn main() -> ExitCode {
         println!("FIRST-RUN CAPTURE: baseline had null values for some workloads.");
         println!("  Paste the current values above into crates/bench/baseline/main.json");
         println!("  to set the real baseline, then commit.");
+    } else if control_dir.is_some() {
+        println!("OK: within absolute threshold, within ratio ceiling, and no regression");
+        println!("    against the same-instance control run.");
     } else {
         println!("OK: all workloads within threshold, all ratios within ceiling.");
     }
+    if !mismatches.is_empty() {
+        println!();
+        println!("NOT AUTHORITATIVE: the environment did not match the baseline's.");
+    }
     ExitCode::SUCCESS
+}
+
+/// Read a path from the environment, treating an empty value as unset.
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn env_manifest_dir() -> PathBuf {
@@ -440,4 +809,214 @@ fn parse_ratios(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The shell self-test (`scripts/ci/bench-gate-selftest.sh`) drives the
+    /// built binary and proves every VERDICT is reachable. It cannot reach the
+    /// branches below, because every fixture baseline it writes records both
+    /// environment fields. These cover the rest of the decision table.
+    /// The arch this test binary was compiled for, i.e. what a baseline has to
+    /// record for the measured check to pass here.
+    const HOST_ARCH: &str = std::env::consts::ARCH;
+
+    #[test]
+    fn missing_baseline_field_is_not_a_mismatch() {
+        // Schema-1 baselines predate `rustflags`. For a SELF-ATTESTED field an
+        // absent entry carries no expectation, so it must not fail a run; only
+        // a RECORDED field does. (`arch` is recorded here because it is the
+        // one field whose absence does fail; see the fail-closed test below.)
+        let baseline = json!({ "runner": "depot-ubuntu-24.04-4", "arch": HOST_ARCH });
+        let found = env_mismatches(
+            &baseline,
+            Some("depot-ubuntu-24.04-4"),
+            Some("-C target-cpu=whatever"),
+            HOST_ARCH,
+        );
+        assert!(
+            found.is_empty(),
+            "an unrecorded baseline field must not be enforced, got {found:?}"
+        );
+    }
+
+    #[test]
+    fn recorded_field_that_differs_is_a_mismatch() {
+        let baseline = json!({ "runner": "depot-ubuntu-24.04-4", "arch": HOST_ARCH });
+        let found = env_mismatches(&baseline, Some("ubuntu-24.04"), None, HOST_ARCH);
+        assert_eq!(
+            found,
+            vec![EnvMismatch {
+                field: "runner",
+                expected: "depot-ubuntu-24.04-4".to_string(),
+                observed: "ubuntu-24.04".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn absent_observed_value_is_a_mismatch_not_a_pass() {
+        // The dangerous default: a runner that simply does not set the env var
+        // must not be read as "matches".
+        let baseline = json!({ "rustflags": "-C target-cpu=x86-64-v2", "arch": HOST_ARCH });
+        let found = env_mismatches(&baseline, None, None, HOST_ARCH);
+        assert_eq!(found.len(), 1, "unset RUSTFLAGS must be a mismatch");
+        assert_eq!(found[0].observed, "");
+    }
+
+    #[test]
+    fn only_whitespace_is_normalised() {
+        let baseline = json!({ "rustflags": "-C target-cpu=x86-64-v2", "arch": HOST_ARCH });
+        // Same flags, different spacing: not a mismatch.
+        assert!(env_mismatches(
+            &baseline,
+            None,
+            Some("  -C   target-cpu=x86-64-v2 "),
+            HOST_ARCH
+        )
+        .is_empty());
+        // Different flags: a mismatch, even though it is a near-miss.
+        assert_eq!(
+            env_mismatches(&baseline, None, Some("-C target-cpu=native"), HOST_ARCH).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn matching_arch_is_not_a_mismatch() {
+        // The whole fingerprint agreeing is the ordinary Depot case: an x86_64
+        // baseline compared by an x86_64 binary exporting the recorded env.
+        let baseline = json!({
+            "runner": "depot-ubuntu-24.04-4",
+            "rustflags": "-C target-cpu=x86-64-v2",
+            "arch": HOST_ARCH,
+        });
+        let found = env_mismatches(
+            &baseline,
+            Some("depot-ubuntu-24.04-4"),
+            Some("-C target-cpu=x86-64-v2"),
+            HOST_ARCH,
+        );
+        assert!(
+            found.is_empty(),
+            "a matching fingerprint must pass: {found:?}"
+        );
+    }
+
+    #[test]
+    fn arch_mismatch_survives_a_fully_spoofed_environment() {
+        // The defect this check exists for. Both self-attested fields are set
+        // to exactly what the baseline records, which is all it used to take
+        // for an arm64 laptop to produce an unlabelled clean PASS against
+        // Depot x86 numbers. `arch` is not readable from the environment, so
+        // it still reports the mismatch.
+        let baseline = json!({
+            "runner": "depot-ubuntu-24.04-4",
+            "rustflags": "-C target-cpu=x86-64-v2",
+            "arch": "x86_64",
+        });
+        let found = env_mismatches(
+            &baseline,
+            Some("depot-ubuntu-24.04-4"),
+            Some("-C target-cpu=x86-64-v2"),
+            "aarch64",
+        );
+        assert_eq!(
+            found,
+            vec![EnvMismatch {
+                field: "arch",
+                expected: "x86_64".to_string(),
+                observed: "aarch64".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn baseline_without_arch_fails_closed() {
+        // An unrecorded `arch` must not read as "no expectation". Otherwise
+        // the one unspoofable check could be disabled by deleting one line
+        // from the JSON, which is not a security property at all.
+        let baseline = json!({
+            "runner": "depot-ubuntu-24.04-4",
+            "rustflags": "-C target-cpu=x86-64-v2",
+        });
+        let found = env_mismatches(
+            &baseline,
+            Some("depot-ubuntu-24.04-4"),
+            Some("-C target-cpu=x86-64-v2"),
+            HOST_ARCH,
+        );
+        assert_eq!(
+            found,
+            vec![EnvMismatch {
+                field: "arch",
+                expected: UNRECORDED.to_string(),
+                observed: HOST_ARCH.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn observed_arch_comes_from_the_binary_not_the_environment() {
+        // Guards the wiring, not the constant: main() must pass
+        // compiled_arch(), and compiled_arch() must be the compile-time value.
+        // If someone ever routes this through std::env::var, this fails.
+        assert_eq!(compiled_arch(), std::env::consts::ARCH);
+        assert!(!compiled_arch().is_empty());
+    }
+
+    #[test]
+    fn baseline_schema_must_be_the_expected_one() {
+        assert!(check_baseline_schema(&json!({ "schema": EXPECTED_BASELINE_SCHEMA })).is_ok());
+        // The pre-`arch` document shape: rejected with its own reason rather
+        // than surfacing as a confusing arch mismatch.
+        let old = check_baseline_schema(&json!({ "schema": 2 })).unwrap_err();
+        assert!(
+            old.contains('2') && old.contains("arch"),
+            "unhelpful: {old}"
+        );
+        // A future shape this binary does not implement is also refused.
+        assert!(check_baseline_schema(&json!({ "schema": 4 })).is_err());
+        // And the field is no longer decoration: absent is an error.
+        assert!(check_baseline_schema(&json!({ "runner": "x" })).is_err());
+    }
+
+    #[test]
+    fn control_threshold_caps_the_noisiest_tier() {
+        // agg_sum sits in the VERY_NOISY (20%) absolute tier; on one machine
+        // it must still be gated at the control ceiling.
+        assert_eq!(threshold_for("agg_sum"), VERY_NOISY_ABSOLUTE_THRESHOLD);
+        assert_eq!(control_threshold_for("agg_sum"), CONTROL_ABSOLUTE_THRESHOLD);
+        // A workload already tighter than the ceiling keeps its own threshold.
+        let tight = threshold_for("btree_lookup");
+        assert!(tight < CONTROL_ABSOLUTE_THRESHOLD);
+        assert_eq!(control_threshold_for("btree_lookup"), tight);
+    }
+
+    #[test]
+    fn control_arg_parses_both_spellings() {
+        let one = parse_args(["--control".to_string(), "/tmp/c".to_string()]).unwrap();
+        assert_eq!(one.control, Some(PathBuf::from("/tmp/c")));
+        let two = parse_args(["--control=/tmp/c".to_string()]).unwrap();
+        assert_eq!(two.control, Some(PathBuf::from("/tmp/c")));
+        assert_eq!(parse_args([]).unwrap(), Args::default());
+    }
+
+    #[test]
+    fn control_arg_rejects_bad_input_instead_of_ignoring_it() {
+        // A dropped value would silently turn a control run into an
+        // absolute-only run, i.e. the gate the control mode exists to replace.
+        assert!(parse_args(["--control".to_string()]).is_err());
+        assert!(parse_args(["--contorl=/tmp/c".to_string()]).is_err());
+    }
+
+    #[test]
+    fn print_arch_flag_parses() {
+        let parsed = parse_args(["--print-arch".to_string()]).unwrap();
+        assert!(parsed.print_arch);
+        assert_eq!(parsed.control, None);
+    }
 }

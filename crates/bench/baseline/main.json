@@ -1,6 +1,8 @@
 {
-  "schema": 1,
+  "schema": 3,
   "runner": "depot-ubuntu-24.04-4",
+  "rustflags": "-C target-cpu=x86-64-v2",
+  "arch": "x86_64",
   "rustc": "1.95.0",
   "updated": "2026-07-14",
   "commit": "9a14c4a",

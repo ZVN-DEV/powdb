@@ -28,7 +28,10 @@ test = false
 [[bin]]
 name = "compare"
 path = "src/bin/compare.rs"
-test = false
+# test stays on: the comparator's env-fingerprint decision table has unit
+# tests that must run under `cargo test --workspace`, not only via the
+# shell selftest.
+test = true
 
 # Standalone JSON-path-filter workload (design 4.4, B2). NOT part of the
 # criterion regression gate or baseline/main.json (Depot-only policy): it just

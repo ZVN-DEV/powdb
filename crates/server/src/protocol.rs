@@ -61,6 +61,270 @@ const MAX_SYNC_UNITS: usize = 4096;
 
 const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
 
+/// Wire protocol version implied by a peer that sends no handshake hello
+/// block. Every release through v0.21.0 speaks exactly this.
+pub const PROTOCOL_VERSION_LEGACY: u16 = 1;
+
+/// Wire protocol version introduced in v0.22.0: `Connect` and `ConnectOk`
+/// carry a hello block stating a supported version range and a feature set.
+pub const PROTOCOL_VERSION_NEGOTIATED: u16 = 2;
+
+/// Oldest wire protocol version this build still serves.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_LEGACY;
+
+/// Newest wire protocol version this build speaks.
+pub const MAX_SUPPORTED_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_NEGOTIATED;
+
+/// Sentinel that opens a handshake hello block, so a decoder can tell an
+/// intentional hello from stray trailing bytes and reject the latter.
+const HELLO_MAGIC: u32 = 0x5057_4831; // little-endian wire bytes 31 48 57 50
+
+/// Maximum feature names accepted in one hello block.
+const MAX_HELLO_FEATURES: usize = 64;
+
+/// Maximum byte length of one feature name.
+const MAX_FEATURE_NAME_LEN: usize = 64;
+
+/// Positional `$N` parameter binding (`0x04` / `0x14`).
+pub const FEATURE_PARAMS: &str = "params";
+/// SQL request frames (`0x05` / `0x15`).
+pub const FEATURE_SQL: &str = "sql";
+/// Native typed request and result frames (`0x13`-`0x17`).
+pub const FEATURE_NATIVE_TYPED: &str = "native-typed";
+/// Trailing [`ErrorClass`] byte on `MSG_ERROR` payloads.
+pub const FEATURE_ERROR_CLASS: &str = "error-class";
+/// Private replica sync frames (`0x20`-`0x25`).
+pub const FEATURE_SYNC: &str = "sync";
+/// PowQL entity links and relationship traversal.
+pub const FEATURE_ENTITY_LINKS: &str = "entity-links";
+/// PowQL nested projections.
+pub const FEATURE_NESTED_PROJECTION: &str = "nested-projection";
+
+/// Every named wire feature this build's server implements.
+///
+/// STABILITY: names are wire-stable. Only append; never rename or reuse a
+/// name, and never remove one while any supported protocol version still
+/// implies it. Adding capability later is a new name in this list, which is
+/// why the handshake never needs another breaking change.
+pub const SERVER_FEATURES: &[&str] = &[
+    FEATURE_PARAMS,
+    FEATURE_SQL,
+    FEATURE_NATIVE_TYPED,
+    FEATURE_ERROR_CLASS,
+    FEATURE_SYNC,
+    FEATURE_ENTITY_LINKS,
+    FEATURE_NESTED_PROJECTION,
+];
+
+/// Every named wire feature this build's first-party clients (the CLI, the
+/// in-tree Rust wire helpers) understand. Stated in the client hello so the
+/// server can answer with the agreed intersection.
+pub const CLIENT_FEATURES: &[&str] = SERVER_FEATURES;
+
+/// The catalog format ceiling a client built from this workspace can read.
+///
+/// This is the client half of the format-compatibility check that used to be
+/// a standalone constant in each client: it rides in the handshake and is
+/// compared against the server's reported catalog version by
+/// [`require_server_capabilities`].
+pub const CLIENT_CATALOG_VERSION: u16 = powdb_storage::catalog::CATALOG_VERSION;
+
+/// What a client states about itself in the `Connect` hello block.
+///
+/// A peer that sends none is [`ClientHello::legacy`]: protocol v1 only, no
+/// named features, no stated catalog ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHello {
+    /// Oldest protocol version this client can speak.
+    pub min_protocol: u16,
+    /// Newest protocol version this client can speak.
+    pub max_protocol: u16,
+    /// Highest catalog format this client can read. `0` means "not stated",
+    /// which disables the catalog check rather than failing it.
+    pub catalog_version: u16,
+    /// Named features this client understands.
+    pub features: Vec<String>,
+}
+
+impl ClientHello {
+    /// The hello implied by a peer that sent no hello block at all.
+    pub fn legacy() -> ClientHello {
+        ClientHello {
+            min_protocol: PROTOCOL_VERSION_LEGACY,
+            max_protocol: PROTOCOL_VERSION_LEGACY,
+            catalog_version: 0,
+            features: Vec::new(),
+        }
+    }
+
+    /// The hello a client built from this workspace sends.
+    pub fn current() -> ClientHello {
+        ClientHello {
+            min_protocol: MIN_SUPPORTED_PROTOCOL_VERSION,
+            max_protocol: MAX_SUPPORTED_PROTOCOL_VERSION,
+            catalog_version: CLIENT_CATALOG_VERSION,
+            features: CLIENT_FEATURES.iter().map(|f| (*f).to_owned()).collect(),
+        }
+    }
+
+    /// Whether this client stated support for `feature`.
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+/// What a server answers in the `ConnectOk` hello block: the negotiated
+/// protocol version, the range it could have agreed to, its catalog format,
+/// and the agreed feature set (the intersection of both sides).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerHello {
+    /// The version both sides will use for the rest of the session.
+    pub protocol: u16,
+    /// Oldest protocol version the server can speak.
+    pub min_protocol: u16,
+    /// Newest protocol version the server can speak.
+    pub max_protocol: u16,
+    /// Highest catalog format the server can write. `0` means "not stated".
+    pub catalog_version: u16,
+    /// Features both sides support. Anything absent must not be used.
+    pub features: Vec<String>,
+}
+
+impl ServerHello {
+    /// The hello implied by a server that sent no hello block: protocol v1,
+    /// no named features, no stated catalog version.
+    pub fn legacy() -> ServerHello {
+        ServerHello {
+            protocol: PROTOCOL_VERSION_LEGACY,
+            min_protocol: PROTOCOL_VERSION_LEGACY,
+            max_protocol: PROTOCOL_VERSION_LEGACY,
+            catalog_version: 0,
+            features: Vec::new(),
+        }
+    }
+
+    /// Whether `feature` is in the agreed set.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+/// Why a handshake could not agree on a protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolMismatch {
+    /// The peer's newest version is older than the oldest we serve.
+    PeerTooOld,
+    /// The peer's oldest version is newer than the newest we serve.
+    PeerTooNew,
+    /// The peer stated a range whose maximum is below its minimum.
+    InvalidRange,
+}
+
+/// What the peer effectively stated, given that it may have sent no hello.
+///
+/// Absence means [`ClientHello::legacy`], not "assume the best": a hello-less
+/// peer is judged as protocol v1 and no features, so raising the server floor
+/// later actually refuses the clients it is meant to refuse, and a legacy peer
+/// is never credited with capability it never claimed.
+pub fn stated_client_hello(hello: Option<&ClientHello>) -> ClientHello {
+    hello.cloned().unwrap_or_else(ClientHello::legacy)
+}
+
+/// Agree on a protocol version and feature set, or explain why the two sides
+/// cannot talk.
+///
+/// Pure: every branch is decided from its arguments, so the whole matrix is
+/// testable without a socket. The server calls this during `CONNECT`, which is
+/// the only point at which a mismatch may be reported: after this returns, no
+/// version disagreement can surface mid-session.
+pub fn negotiate_protocol(
+    client: &ClientHello,
+    server_min: u16,
+    server_max: u16,
+    server_features: &[&str],
+    server_catalog_version: u16,
+) -> Result<ServerHello, (ProtocolMismatch, String)> {
+    if client.max_protocol < client.min_protocol {
+        return Err((
+            ProtocolMismatch::InvalidRange,
+            format!(
+                "malformed wire protocol range: client minimum v{} exceeds its maximum v{}",
+                client.min_protocol, client.max_protocol
+            ),
+        ));
+    }
+    if client.max_protocol < server_min {
+        return Err((
+            ProtocolMismatch::PeerTooOld,
+            format!(
+                "unsupported wire protocol: client speaks up to v{}, this server requires at least v{server_min}; upgrade the client",
+                client.max_protocol
+            ),
+        ));
+    }
+    if client.min_protocol > server_max {
+        return Err((
+            ProtocolMismatch::PeerTooNew,
+            format!(
+                "unsupported wire protocol: client requires at least v{}, this server speaks up to v{server_max}; upgrade the server",
+                client.min_protocol
+            ),
+        ));
+    }
+    let features = server_features
+        .iter()
+        .filter(|feature| client.supports(feature))
+        .map(|feature| (*feature).to_owned())
+        .collect();
+    Ok(ServerHello {
+        protocol: client.max_protocol.min(server_max),
+        min_protocol: server_min,
+        max_protocol: server_max,
+        catalog_version: server_catalog_version,
+        features,
+    })
+}
+
+/// The client half of the handshake check: confirm the server the client just
+/// reached can actually serve it.
+///
+/// Called immediately on the `ConnectOk` reply, so a client talking to a
+/// server that is too old fails at handshake time rather than on the first
+/// frame the server does not know. `client_catalog_version` of `0` skips the
+/// catalog check; so does a server that stated no catalog version (a
+/// pre-v0.22.0 server).
+pub fn require_server_capabilities(
+    server: &ServerHello,
+    min_protocol: u16,
+    required_features: &[&str],
+    client_catalog_version: u16,
+) -> Result<(), String> {
+    if server.protocol < min_protocol {
+        return Err(format!(
+            "unsupported wire protocol: server negotiated v{}, this client requires at least v{min_protocol}; upgrade the server",
+            server.protocol
+        ));
+    }
+    if let Some(missing) = required_features
+        .iter()
+        .find(|feature| !server.has(feature))
+    {
+        return Err(format!(
+            "server does not support required wire feature '{missing}'; upgrade the server"
+        ));
+    }
+    if client_catalog_version > 0
+        && server.catalog_version > client_catalog_version
+        && server.catalog_version != 0
+    {
+        return Err(format!(
+            "server catalog format v{} is newer than this client supports (max v{client_catalog_version}); upgrade the client",
+            server.catalog_version
+        ));
+    }
+    Ok(())
+}
+
 /// Stable 1-byte error classification carried at the tail of a `MSG_ERROR`
 /// payload.
 ///
@@ -105,6 +369,9 @@ pub enum ErrorClass {
     ConstraintViolation = 8,
     /// Execution was cancelled cooperatively (client disconnect).
     Cancelled = 9,
+    /// Client and server could not agree on a wire protocol version or
+    /// feature set. Raised only during `CONNECT`, never mid-session.
+    ProtocolVersion = 10,
 }
 
 impl ErrorClass {
@@ -127,6 +394,7 @@ impl ErrorClass {
             7 => ErrorClass::RateLimited,
             8 => ErrorClass::ConstraintViolation,
             9 => ErrorClass::Cancelled,
+            10 => ErrorClass::ProtocolVersion,
             _ => return None,
         })
     }
@@ -225,8 +493,29 @@ pub enum Message {
         /// extension: old clients that omit it decode as `None`.
         username: Option<String>,
     },
+    /// A `Connect` that also states the client's protocol range and feature
+    /// set. Encodes to the same `MSG_CONNECT` tag as [`Message::Connect`],
+    /// with the hello block appended after the username field; decoding a
+    /// `MSG_CONNECT` frame yields this variant only when a hello block is
+    /// actually present, so a legacy frame still decodes to
+    /// [`Message::Connect`] byte-for-byte.
+    ConnectWithHello {
+        db_name: String,
+        password: Option<Zeroizing<String>>,
+        username: Option<String>,
+        hello: ClientHello,
+    },
     ConnectOk {
         version: String,
+    },
+    /// A `ConnectOk` that also carries the negotiated protocol version and
+    /// agreed feature set. Same `MSG_CONNECT_OK` tag as
+    /// [`Message::ConnectOk`], hello block appended after the version string,
+    /// which pre-v0.22.0 clients skip because they read the string by its
+    /// length prefix and ignore the rest of the payload.
+    ConnectOkWithHello {
+        version: String,
+        hello: ServerHello,
     },
     Query {
         query: String,
@@ -343,15 +632,44 @@ impl Message {
                     Some(p) => buf.extend_from_slice(&encode_string(p)),
                     None => buf.extend_from_slice(&0u32.to_le_bytes()),
                 }
-                // Username is appended after the password (append-only extension).
-                // Length-prefixed string; empty (len=0) means None.
+                // Username is appended after the password (append-only
+                // extension), and omitted entirely when absent, which is
+                // exactly what a client predating the field puts on the wire.
+                // Decoders accept either shape, but there is one canonical
+                // encoding so the Rust and TypeScript encoders agree
+                // byte-for-byte (crates/server/tests/wire_conformance.rs).
+                if let Some(u) = username {
+                    buf.extend_from_slice(&encode_string(u));
+                }
+                (MSG_CONNECT, buf)
+            }
+            Message::ConnectWithHello {
+                db_name,
+                password,
+                username,
+                hello,
+            } => {
+                let mut buf = encode_string(db_name);
+                match password {
+                    Some(p) => buf.extend_from_slice(&encode_string(p)),
+                    None => buf.extend_from_slice(&0u32.to_le_bytes()),
+                }
+                // The username field is always written here, even when absent:
+                // the hello block sits after it positionally, so it cannot be
+                // elided the way a legacy no-username frame elides it.
                 match username {
                     Some(u) => buf.extend_from_slice(&encode_string(u)),
                     None => buf.extend_from_slice(&0u32.to_le_bytes()),
                 }
+                encode_client_hello(&mut buf, hello);
                 (MSG_CONNECT, buf)
             }
             Message::ConnectOk { version } => (MSG_CONNECT_OK, encode_string(version)),
+            Message::ConnectOkWithHello { version, hello } => {
+                let mut buf = encode_string(version);
+                encode_server_hello(&mut buf, hello);
+                (MSG_CONNECT_OK, buf)
+            }
             Message::Query { query } => (MSG_QUERY, encode_string(query)),
             Message::QuerySql { query } => (MSG_QUERY_SQL, encode_string(query)),
             Message::QueryWithParams { query, params } => {
@@ -528,6 +846,17 @@ impl Message {
                 } else {
                     None
                 };
+                // Anything still unread is a hello block (v0.22.0+). A legacy
+                // frame ends here and yields the plain `Connect` variant.
+                if pos < payload.len() {
+                    let hello = decode_client_hello(payload, &mut pos)?;
+                    return Ok(Message::ConnectWithHello {
+                        db_name,
+                        password,
+                        username,
+                        hello,
+                    });
+                }
                 Ok(Message::Connect {
                     db_name,
                     password,
@@ -535,7 +864,12 @@ impl Message {
                 })
             }
             MSG_CONNECT_OK => {
-                let version = decode_string(payload, &mut 0)?;
+                let mut pos = 0;
+                let version = decode_string(payload, &mut pos)?;
+                if pos < payload.len() {
+                    let hello = decode_server_hello(payload, &mut pos)?;
+                    return Ok(Message::ConnectOkWithHello { version, hello });
+                }
                 Ok(Message::ConnectOk { version })
             }
             MSG_QUERY => {
@@ -839,6 +1173,105 @@ impl Message {
             .map(Some)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+}
+
+/// Append a feature-name list: `[count:u16][name:len-prefixed]*`.
+///
+/// Capped at [`MAX_HELLO_FEATURES`] so the written count always matches the
+/// number of names that follow, and so a hello stays well inside the pre-auth
+/// payload limit.
+fn encode_feature_list(out: &mut Vec<u8>, features: &[String]) {
+    let count = features.len().min(MAX_HELLO_FEATURES);
+    out.extend_from_slice(&(count as u16).to_le_bytes());
+    for feature in features.iter().take(count) {
+        out.extend_from_slice(&encode_string(feature));
+    }
+}
+
+fn decode_feature_list(data: &[u8], pos: &mut usize, label: &str) -> Result<Vec<String>, String> {
+    let count = decode_u16(data, pos, label)? as usize;
+    if count > MAX_HELLO_FEATURES {
+        return Err(format!("too many {label} entries"));
+    }
+    // Every name costs at least its 4-byte length prefix, so the remaining
+    // payload bounds how many can follow. This mirrors the amplification
+    // guards on the other count-prefixed lists in this file, but note it is
+    // NOT the load-bearing one here: the cap above already bounds the
+    // allocation to 64 entries, so removing this line changes only when the
+    // error is raised, never whether. It is deliberately not asserted on.
+    if count.saturating_mul(STRING_LEN_PREFIX) > data.len().saturating_sub(*pos) {
+        return Err(format!("{label} count exceeds payload size"));
+    }
+    let mut features = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = decode_string_strict(data, pos, label)?;
+        if name.len() > MAX_FEATURE_NAME_LEN {
+            return Err(format!("{label} name too long"));
+        }
+        features.push(name);
+    }
+    Ok(features)
+}
+
+fn encode_client_hello(out: &mut Vec<u8>, hello: &ClientHello) {
+    out.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+    out.extend_from_slice(&hello.min_protocol.to_le_bytes());
+    out.extend_from_slice(&hello.max_protocol.to_le_bytes());
+    out.extend_from_slice(&hello.catalog_version.to_le_bytes());
+    encode_feature_list(out, &hello.features);
+}
+
+/// Decode a client hello block.
+///
+/// Bytes after the feature list are deliberately left unread: that is the
+/// extension point a later release appends to, so an older peer must skip
+/// them rather than reject the frame. `pos` is advanced only past what this
+/// version understands, and the caller treats the rest as consumed.
+fn decode_client_hello(data: &[u8], pos: &mut usize) -> Result<ClientHello, String> {
+    let magic = decode_u32(data, pos, "client hello magic")?;
+    if magic != HELLO_MAGIC {
+        return Err("malformed CONNECT hello block".into());
+    }
+    let min_protocol = decode_u16(data, pos, "client hello minimum protocol")?;
+    let max_protocol = decode_u16(data, pos, "client hello maximum protocol")?;
+    let catalog_version = decode_u16(data, pos, "client hello catalog version")?;
+    let features = decode_feature_list(data, pos, "client hello feature")?;
+    Ok(ClientHello {
+        min_protocol,
+        max_protocol,
+        catalog_version,
+        features,
+    })
+}
+
+fn encode_server_hello(out: &mut Vec<u8>, hello: &ServerHello) {
+    out.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+    out.extend_from_slice(&hello.protocol.to_le_bytes());
+    out.extend_from_slice(&hello.min_protocol.to_le_bytes());
+    out.extend_from_slice(&hello.max_protocol.to_le_bytes());
+    out.extend_from_slice(&hello.catalog_version.to_le_bytes());
+    encode_feature_list(out, &hello.features);
+}
+
+/// Decode a server hello block. Trailing bytes are a future extension and are
+/// skipped, exactly as in [`decode_client_hello`].
+fn decode_server_hello(data: &[u8], pos: &mut usize) -> Result<ServerHello, String> {
+    let magic = decode_u32(data, pos, "server hello magic")?;
+    if magic != HELLO_MAGIC {
+        return Err("malformed CONNECT_OK hello block".into());
+    }
+    let protocol = decode_u16(data, pos, "server hello negotiated protocol")?;
+    let min_protocol = decode_u16(data, pos, "server hello minimum protocol")?;
+    let max_protocol = decode_u16(data, pos, "server hello maximum protocol")?;
+    let catalog_version = decode_u16(data, pos, "server hello catalog version")?;
+    let features = decode_feature_list(data, pos, "server hello feature")?;
+    Ok(ServerHello {
+        protocol,
+        min_protocol,
+        max_protocol,
+        catalog_version,
+        features,
+    })
 }
 
 fn encode_query_with_params(query: &str, params: &[WireParam]) -> Vec<u8> {
@@ -1405,6 +1838,461 @@ mod tests {
         }
     }
 
+    fn hello(min: u16, max: u16, catalog: u16, features: &[&str]) -> ClientHello {
+        ClientHello {
+            min_protocol: min,
+            max_protocol: max,
+            catalog_version: catalog,
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+        }
+    }
+
+    fn negotiate_here(client: &ClientHello) -> Result<ServerHello, (ProtocolMismatch, String)> {
+        negotiate_protocol(
+            client,
+            MIN_SUPPORTED_PROTOCOL_VERSION,
+            MAX_SUPPORTED_PROTOCOL_VERSION,
+            SERVER_FEATURES,
+            CLIENT_CATALOG_VERSION,
+        )
+    }
+
+    #[test]
+    fn connect_with_hello_round_trips_and_keeps_the_connect_tag() {
+        let sent = Message::ConnectWithHello {
+            db_name: "mydb".into(),
+            password: Some(Zeroizing::new("secret".into())),
+            username: Some("alice".into()),
+            hello: hello(1, 2, 7, &[FEATURE_SQL, FEATURE_NATIVE_TYPED]),
+        };
+        let encoded = sent.encode();
+        assert_eq!(encoded[0], MSG_CONNECT, "hello must reuse the CONNECT tag");
+        match Message::decode(&encoded).expect("hello connect round trip") {
+            Message::ConnectWithHello {
+                db_name,
+                password,
+                username,
+                hello: decoded,
+            } => {
+                assert_eq!(db_name, "mydb");
+                assert_eq!(password.as_deref().map(|p| p.as_str()), Some("secret"));
+                assert_eq!(username.as_deref(), Some("alice"));
+                assert_eq!(
+                    decoded,
+                    hello(1, 2, 7, &[FEATURE_SQL, FEATURE_NATIVE_TYPED])
+                );
+            }
+            other => panic!("expected ConnectWithHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_with_hello_and_no_username_still_finds_the_hello() {
+        // The username field cannot be elided once a hello follows it: the
+        // hello sits after it positionally.
+        let encoded = Message::ConnectWithHello {
+            db_name: "d".into(),
+            password: None,
+            username: None,
+            hello: ClientHello::current(),
+        }
+        .encode();
+        match Message::decode(&encoded).expect("hello connect round trip") {
+            Message::ConnectWithHello {
+                username, hello, ..
+            } => {
+                assert_eq!(username, None);
+                assert_eq!(hello, ClientHello::current());
+            }
+            other => panic!("expected ConnectWithHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_ok_with_hello_round_trips_and_keeps_the_connect_ok_tag() {
+        let sent = Message::ConnectOkWithHello {
+            version: "0.22.0".into(),
+            hello: ServerHello {
+                protocol: 2,
+                min_protocol: 1,
+                max_protocol: 2,
+                catalog_version: 7,
+                features: vec![FEATURE_PARAMS.into(), FEATURE_ERROR_CLASS.into()],
+            },
+        };
+        let encoded = sent.encode();
+        assert_eq!(encoded[0], MSG_CONNECT_OK);
+        match Message::decode(&encoded).expect("hello connect-ok round trip") {
+            Message::ConnectOkWithHello { version, hello } => {
+                assert_eq!(version, "0.22.0");
+                assert_eq!(hello.protocol, 2);
+                assert_eq!(hello.min_protocol, 1);
+                assert_eq!(hello.max_protocol, 2);
+                assert_eq!(hello.catalog_version, 7);
+                assert_eq!(hello.features, vec!["params", "error-class"]);
+            }
+            other => panic!("expected ConnectOkWithHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_connect_without_a_username_omits_the_field_entirely() {
+        // A client with no named user writes db + password and stops. Writing
+        // the username as an explicit empty string instead would decode the
+        // same but produce different bytes from the TypeScript client for the
+        // same logical message, which is the divergence
+        // crates/server/tests/wire_conformance.rs exists to catch.
+        let encoded = Message::Connect {
+            db_name: "mydb".into(),
+            password: Some(Zeroizing::new("pw".into())),
+            username: None,
+        }
+        .encode();
+        let mut expected_payload = encode_string("mydb");
+        expected_payload.extend_from_slice(&encode_string("pw"));
+        assert_eq!(encoded, frame(MSG_CONNECT, &expected_payload));
+
+        // The omitted field still decodes as "no username", and the explicit
+        // empty-string shape an older peer may send decodes the same way.
+        let mut explicit_empty = encode_string("mydb");
+        explicit_empty.extend_from_slice(&encode_string("pw"));
+        explicit_empty.extend_from_slice(&0u32.to_le_bytes());
+        for bytes in [encoded, frame(MSG_CONNECT, &explicit_empty)] {
+            match Message::decode(&bytes).expect("both shapes must decode") {
+                Message::Connect { username, .. } => assert_eq!(username, None),
+                other => panic!("expected Connect, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_connect_frames_stay_byte_identical_and_decode_without_a_hello() {
+        // A v0.21.0 client's CONNECT: db + password + username, nothing more.
+        // Its bytes and its decoded shape must both be unchanged.
+        let legacy = Message::Connect {
+            db_name: "mydb".into(),
+            password: Some(Zeroizing::new("pw".into())),
+            username: Some("alice".into()),
+        }
+        .encode();
+        let mut expected_payload = encode_string("mydb");
+        expected_payload.extend_from_slice(&encode_string("pw"));
+        expected_payload.extend_from_slice(&encode_string("alice"));
+        assert_eq!(legacy, frame(MSG_CONNECT, &expected_payload));
+        assert!(matches!(
+            Message::decode(&legacy).unwrap(),
+            Message::Connect { .. }
+        ));
+
+        // Likewise a v0.21.0 server's CONNECT_OK.
+        let legacy_ok = Message::ConnectOk {
+            version: "0.21.0".into(),
+        }
+        .encode();
+        assert_eq!(legacy_ok, frame(MSG_CONNECT_OK, &encode_string("0.21.0")));
+        assert!(matches!(
+            Message::decode(&legacy_ok).unwrap(),
+            Message::ConnectOk { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_decoder_reads_a_hello_bearing_connect_ok_as_a_plain_version() {
+        // The old-server/new-client direction relies on the reverse being
+        // true as well: a pre-v0.22.0 decoder reads the version string by its
+        // length prefix and ignores the appended hello block.
+        let encoded = Message::ConnectOkWithHello {
+            version: "0.22.0".into(),
+            hello: ServerHello::legacy(),
+        }
+        .encode();
+        let payload_len = u32::from_le_bytes(encoded[2..6].try_into().unwrap()) as usize;
+        let payload = &encoded[6..6 + payload_len];
+        assert_eq!(
+            decode_string(payload, &mut 0).unwrap(),
+            "0.22.0",
+            "an old decoder must still recover the version string"
+        );
+    }
+
+    #[test]
+    fn connect_rejects_trailing_bytes_that_are_not_a_hello() {
+        // Fail closed: garbage after the username is not silently ignored.
+        let mut payload = encode_string("mydb");
+        payload.extend_from_slice(&encode_string("pw"));
+        payload.extend_from_slice(&encode_string("alice"));
+        payload.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00]);
+        assert!(Message::decode(&frame(MSG_CONNECT, &payload)).is_err());
+    }
+
+    #[test]
+    fn hello_blocks_skip_trailing_bytes_so_a_later_release_can_extend_them() {
+        // This is the whole point of the design: adding a field later must not
+        // require another breaking handshake change. Append unknown bytes
+        // after the feature list; today's decoder must still succeed.
+        let mut payload = encode_string("d");
+        payload.extend_from_slice(&0u32.to_le_bytes()); // no password
+        payload.extend_from_slice(&0u32.to_le_bytes()); // no username
+        encode_client_hello(&mut payload, &hello(1, 3, 9, &["future-thing"]));
+        payload.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+        match Message::decode(&frame(MSG_CONNECT, &payload)).expect("forward-compatible hello") {
+            Message::ConnectWithHello { hello: decoded, .. } => {
+                assert_eq!(decoded.max_protocol, 3);
+                assert_eq!(decoded.catalog_version, 9);
+                assert_eq!(decoded.features, vec!["future-thing"]);
+            }
+            other => panic!("expected ConnectWithHello, got {other:?}"),
+        }
+
+        let mut ok_payload = encode_string("0.99.0");
+        encode_server_hello(
+            &mut ok_payload,
+            &ServerHello {
+                protocol: 3,
+                min_protocol: 2,
+                max_protocol: 3,
+                catalog_version: 9,
+                features: vec!["future-thing".into()],
+            },
+        );
+        ok_payload.extend_from_slice(&[0xaa; 5]);
+        match Message::decode(&frame(MSG_CONNECT_OK, &ok_payload))
+            .expect("forward-compatible hello")
+        {
+            Message::ConnectOkWithHello { hello: decoded, .. } => {
+                assert_eq!(decoded.protocol, 3);
+                assert_eq!(decoded.features, vec!["future-thing"]);
+            }
+            other => panic!("expected ConnectOkWithHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_hello_blocks_are_rejected_never_panic() {
+        let mut base = encode_string("d");
+        base.extend_from_slice(&0u32.to_le_bytes());
+        base.extend_from_slice(&0u32.to_le_bytes());
+
+        // Bad magic, and otherwise a perfectly well-formed hello: the magic
+        // check is the only thing that can reject this. (An earlier version of
+        // this case was too short, so truncation rejected it and the magic
+        // check was never exercised.)
+        let mut bad_magic = base.clone();
+        bad_magic.extend_from_slice(&(!HELLO_MAGIC).to_le_bytes());
+        bad_magic.extend_from_slice(&1u16.to_le_bytes()); // min protocol
+        bad_magic.extend_from_slice(&2u16.to_le_bytes()); // max protocol
+        bad_magic.extend_from_slice(&7u16.to_le_bytes()); // catalog version
+        bad_magic.extend_from_slice(&0u16.to_le_bytes()); // no features
+        assert!(
+            Message::decode(&frame(MSG_CONNECT, &bad_magic)).is_err(),
+            "a well-formed hello with the wrong magic must be rejected"
+        );
+        // Same bytes with the right magic must decode, which proves the case
+        // above fails on the magic and nothing else.
+        let mut good_magic = bad_magic.clone();
+        let magic_at = base.len();
+        good_magic[magic_at..magic_at + 4].copy_from_slice(&HELLO_MAGIC.to_le_bytes());
+        assert!(
+            Message::decode(&frame(MSG_CONNECT, &good_magic)).is_ok(),
+            "the control payload must differ from the rejected one only in the magic"
+        );
+
+        // One feature past the cap, with every name actually present, so the
+        // count cap is the only thing that can reject it: a short frame would
+        // be caught by truncation instead and leave the cap unexercised.
+        let over_cap = MAX_HELLO_FEATURES + 1;
+        let mut too_many = base.clone();
+        too_many.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+        too_many.extend_from_slice(&1u16.to_le_bytes());
+        too_many.extend_from_slice(&2u16.to_le_bytes());
+        too_many.extend_from_slice(&7u16.to_le_bytes());
+        too_many.extend_from_slice(&(over_cap as u16).to_le_bytes());
+        for index in 0..over_cap {
+            too_many.extend_from_slice(&encode_string(&format!("f{index}")));
+        }
+        assert!(
+            Message::decode(&frame(MSG_CONNECT, &too_many)).is_err(),
+            "a complete feature list past the cap must be rejected by the cap"
+        );
+        // Exactly at the cap, the same shape must decode: the rejection above
+        // is the cap and not some other property of the payload.
+        let mut at_cap = base.clone();
+        at_cap.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+        at_cap.extend_from_slice(&1u16.to_le_bytes());
+        at_cap.extend_from_slice(&2u16.to_le_bytes());
+        at_cap.extend_from_slice(&7u16.to_le_bytes());
+        at_cap.extend_from_slice(&(MAX_HELLO_FEATURES as u16).to_le_bytes());
+        for index in 0..MAX_HELLO_FEATURES {
+            at_cap.extend_from_slice(&encode_string(&format!("f{index}")));
+        }
+        match Message::decode(&frame(MSG_CONNECT, &at_cap)).expect("a full list must decode") {
+            Message::ConnectWithHello { hello, .. } => {
+                assert_eq!(hello.features.len(), MAX_HELLO_FEATURES);
+            }
+            other => panic!("expected ConnectWithHello, got {other:?}"),
+        }
+
+        // In-range count that the payload cannot possibly hold.
+        let mut oversized = base.clone();
+        oversized.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+        oversized.extend_from_slice(&1u16.to_le_bytes());
+        oversized.extend_from_slice(&2u16.to_le_bytes());
+        oversized.extend_from_slice(&7u16.to_le_bytes());
+        oversized.extend_from_slice(&8u16.to_le_bytes());
+        assert!(Message::decode(&frame(MSG_CONNECT, &oversized)).is_err());
+
+        // A single feature name past the length cap.
+        let mut long_name = base.clone();
+        long_name.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+        long_name.extend_from_slice(&1u16.to_le_bytes());
+        long_name.extend_from_slice(&2u16.to_le_bytes());
+        long_name.extend_from_slice(&7u16.to_le_bytes());
+        long_name.extend_from_slice(&1u16.to_le_bytes());
+        long_name.extend_from_slice(&encode_string(&"x".repeat(MAX_FEATURE_NAME_LEN + 1)));
+        assert!(Message::decode(&frame(MSG_CONNECT, &long_name)).is_err());
+
+        // Every truncation of a well-formed hello frame must reject, not panic.
+        let mut valid = base;
+        encode_client_hello(&mut valid, &ClientHello::current());
+        let valid = frame(MSG_CONNECT, &valid);
+        for end in 0..valid.len() {
+            let _ = Message::decode(&valid[..end]);
+        }
+    }
+
+    #[test]
+    fn negotiation_agrees_on_the_highest_shared_version_and_feature_set() {
+        let agreed = negotiate_here(&hello(1, 2, 7, &[FEATURE_SQL, FEATURE_PARAMS, "unknown-x"]))
+            .expect("overlapping ranges must agree");
+        assert_eq!(agreed.protocol, PROTOCOL_VERSION_NEGOTIATED);
+        assert_eq!(agreed.min_protocol, MIN_SUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(agreed.max_protocol, MAX_SUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(agreed.catalog_version, CLIENT_CATALOG_VERSION);
+        // Intersection only: a feature the server does not implement is
+        // dropped, and one the client did not claim is not granted.
+        assert_eq!(agreed.features, vec![FEATURE_PARAMS, FEATURE_SQL]);
+        assert!(!agreed.has("unknown-x"));
+        assert!(!agreed.has(FEATURE_NATIVE_TYPED));
+    }
+
+    #[test]
+    fn an_absent_hello_is_read_as_the_legacy_one_not_the_current_one() {
+        // The server negotiates against this, so crediting a hello-less peer
+        // with today's capabilities would both grant it features it never
+        // claimed and let it slip past a raised floor.
+        assert_eq!(stated_client_hello(None), ClientHello::legacy());
+        assert_ne!(stated_client_hello(None), ClientHello::current());
+        let stated = hello(1, 2, 7, &[FEATURE_SQL]);
+        assert_eq!(stated_client_hello(Some(&stated)), stated);
+    }
+
+    #[test]
+    fn a_legacy_client_still_negotiates_protocol_one() {
+        // The backward-compatibility promise: a v0.21.0 client (no hello at
+        // all) is not refused, it negotiates the legacy protocol.
+        let agreed = negotiate_here(&ClientHello::legacy()).expect("legacy client must connect");
+        assert_eq!(agreed.protocol, PROTOCOL_VERSION_LEGACY);
+        assert!(
+            agreed.features.is_empty(),
+            "a client that claimed no features gets none"
+        );
+    }
+
+    #[test]
+    fn negotiation_refuses_a_client_older_than_the_server_floor() {
+        // Simulates a future server whose floor has risen above a shipped
+        // client's ceiling: the refusal must be classified, not silent.
+        let (mismatch, message) = negotiate_protocol(
+            &hello(1, 2, 7, CLIENT_FEATURES),
+            3,
+            4,
+            SERVER_FEATURES,
+            CLIENT_CATALOG_VERSION,
+        )
+        .expect_err("client ceiling below the server floor must be refused");
+        assert_eq!(mismatch, ProtocolMismatch::PeerTooOld);
+        assert!(message.contains("upgrade the client"), "{message}");
+
+        // A hello-less peer is judged as protocol v1, not waved through: once
+        // the floor rises above v1 it must be refused like any other client.
+        let (mismatch, _) = negotiate_protocol(
+            &ClientHello::legacy(),
+            2,
+            3,
+            SERVER_FEATURES,
+            CLIENT_CATALOG_VERSION,
+        )
+        .expect_err("a legacy peer must not bypass the server floor");
+        assert_eq!(mismatch, ProtocolMismatch::PeerTooOld);
+    }
+
+    #[test]
+    fn negotiation_refuses_a_client_newer_than_the_server_ceiling() {
+        let (mismatch, message) =
+            negotiate_here(&hello(9000, 9001, 7, CLIENT_FEATURES)).expect_err("future client");
+        assert_eq!(mismatch, ProtocolMismatch::PeerTooNew);
+        assert!(message.contains("upgrade the server"), "{message}");
+    }
+
+    #[test]
+    fn negotiation_refuses_an_inverted_version_range() {
+        let (mismatch, message) = negotiate_here(&hello(2, 1, 7, &[])).expect_err("inverted range");
+        assert_eq!(mismatch, ProtocolMismatch::InvalidRange);
+        assert!(message.contains("malformed"), "{message}");
+    }
+
+    #[test]
+    fn client_side_capability_check_covers_version_features_and_catalog() {
+        let modern = ServerHello {
+            protocol: 2,
+            min_protocol: 1,
+            max_protocol: 2,
+            catalog_version: 7,
+            features: vec![FEATURE_SQL.into()],
+        };
+        assert_eq!(
+            require_server_capabilities(&modern, 2, &[FEATURE_SQL], 7),
+            Ok(())
+        );
+
+        // A server too old for what this client demands.
+        let legacy = ServerHello::legacy();
+        let err = require_server_capabilities(&legacy, 2, &[], 7)
+            .expect_err("protocol v1 server must fail a v2 requirement");
+        assert!(err.contains("upgrade the server"), "{err}");
+
+        // A missing feature is named.
+        let err = require_server_capabilities(&modern, 1, &[FEATURE_NATIVE_TYPED], 7)
+            .expect_err("missing feature must fail");
+        assert!(err.contains(FEATURE_NATIVE_TYPED), "{err}");
+
+        // A catalog format from the future.
+        let err = require_server_capabilities(&modern, 1, &[], 6)
+            .expect_err("newer server catalog must fail");
+        assert!(err.contains("upgrade the client"), "{err}");
+
+        // A server that stated no catalog version (pre-v0.22.0) is not judged
+        // on one, and a client that states none does not judge.
+        assert_eq!(require_server_capabilities(&legacy, 1, &[], 7), Ok(()));
+        assert_eq!(require_server_capabilities(&modern, 1, &[], 0), Ok(()));
+    }
+
+    #[test]
+    fn a_current_client_and_a_current_server_agree_on_every_shipped_feature() {
+        let agreed = negotiate_here(&ClientHello::current()).expect("same-version handshake");
+        assert_eq!(agreed.protocol, MAX_SUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(agreed.features, SERVER_FEATURES);
+        assert_eq!(
+            require_server_capabilities(
+                &agreed,
+                MIN_SUPPORTED_PROTOCOL_VERSION,
+                SERVER_FEATURES,
+                CLIENT_CATALOG_VERSION,
+            ),
+            Ok(())
+        );
+    }
+
     #[test]
     fn test_encode_decode_result_rows() {
         let msg = Message::ResultRows {
@@ -1689,7 +2577,7 @@ mod tests {
     fn error_class_bytes_are_stable() {
         // These values are the documented wire contract (docs/errors.md).
         // Appending new classes is fine; renumbering is a protocol break.
-        let expected: [(ErrorClass, u8); 10] = [
+        let expected: [(ErrorClass, u8); 11] = [
             (ErrorClass::Internal, 0),
             (ErrorClass::Parse, 1),
             (ErrorClass::Execution, 2),
@@ -1700,12 +2588,13 @@ mod tests {
             (ErrorClass::RateLimited, 7),
             (ErrorClass::ConstraintViolation, 8),
             (ErrorClass::Cancelled, 9),
+            (ErrorClass::ProtocolVersion, 10),
         ];
         for (class, byte) in expected {
             assert_eq!(class.as_u8(), byte, "{class:?}");
             assert_eq!(ErrorClass::from_u8(byte), Some(class));
         }
-        assert_eq!(ErrorClass::from_u8(10), None, "future bytes must be None");
+        assert_eq!(ErrorClass::from_u8(11), None, "future bytes must be None");
         assert_eq!(ErrorClass::from_u8(255), None);
     }
 

@@ -1,6 +1,8 @@
 use crate::metrics::{Metrics, QueryOutcome, SyncOperation, SyncOutcome, SyncRepairLabel};
 use crate::protocol::{
-    ErrorClass, Message, WireParam, WireRetainedUnit, WireSyncRepairAction, WireSyncStatus,
+    negotiate_protocol, stated_client_hello, ErrorClass, Message, WireParam, WireRetainedUnit,
+    WireSyncRepairAction, WireSyncStatus, CLIENT_CATALOG_VERSION, MAX_SUPPORTED_PROTOCOL_VERSION,
+    MIN_SUPPORTED_PROTOCOL_VERSION, SERVER_FEATURES,
 };
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine, WalDurabilityTicket};
@@ -32,13 +34,28 @@ pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
 /// writers, sync operations, and explicit transactions take the entire pool.
 /// Tokio's fair semaphore queue prevents a waiting writer from being starved by
 /// later readers.
+///
+/// The gate also carries the maximum time ONE connection may hold it inside an
+/// explicit transaction. That bound lives here, not in [`ConnOpts`], because it
+/// is a property of the gate being held rather than of a connection: every
+/// listener (TCP, TLS, Unix socket) already clones the same gate into every
+/// connection, so the bound reaches all of them without a per-listener wiring
+/// step that a future frontend could forget.
 #[derive(Clone)]
 pub struct TxGate {
     semaphore: Arc<Semaphore>,
     permit_count: u32,
+    max_tx_lifetime: Option<Duration>,
 }
 
 pub const DEFAULT_TX_GATE_READER_PERMITS: u32 = 1024;
+
+/// Default ceiling on how long one connection may hold the gate inside an
+/// explicit transaction before the server rolls it back. Matches the default
+/// connection idle timeout, which is what used to bound a *silent* holder; the
+/// lifetime bound is what bounds a NOISY one, because the idle deadline
+/// re-arms on every frame and a bare PING is a frame.
+pub const DEFAULT_TX_MAX_LIFETIME: Duration = Duration::from_secs(300);
 
 /// Create a transaction gate for a shared engine.
 pub fn new_tx_gate() -> TxGate {
@@ -51,16 +68,38 @@ pub fn new_tx_gate() -> TxGate {
 /// reproduce the former single-permit admission policy using the exact same
 /// handler code. Production uses [`new_tx_gate`].
 pub fn new_tx_gate_with_permits(permit_count: u32) -> TxGate {
+    new_tx_gate_with_permits_and_max_tx_lifetime(permit_count, Some(DEFAULT_TX_MAX_LIFETIME))
+}
+
+/// Create a transaction gate with an explicit maximum transaction lifetime.
+/// `None` disables the bound (the `POWDB_TX_MAX_LIFETIME_MS=0` opt-out), which
+/// restores the pre-0.22 behavior where a client controlled the hold duration.
+pub fn new_tx_gate_with_max_tx_lifetime(max_tx_lifetime: Option<Duration>) -> TxGate {
+    new_tx_gate_with_permits_and_max_tx_lifetime(DEFAULT_TX_GATE_READER_PERMITS, max_tx_lifetime)
+}
+
+fn new_tx_gate_with_permits_and_max_tx_lifetime(
+    permit_count: u32,
+    max_tx_lifetime: Option<Duration>,
+) -> TxGate {
     assert!(permit_count > 0, "transaction gate requires a permit");
     TxGate {
         semaphore: Arc::new(Semaphore::new(permit_count as usize)),
         permit_count,
+        max_tx_lifetime,
     }
 }
 
 impl TxGate {
     pub fn permit_count(&self) -> u32 {
         self.permit_count
+    }
+
+    /// How long one connection may hold this gate inside an explicit
+    /// transaction before the server rolls the transaction back and releases
+    /// it. `None` means unbounded.
+    pub fn max_tx_lifetime(&self) -> Option<Duration> {
+        self.max_tx_lifetime
     }
 
     fn available_permits(&self) -> usize {
@@ -398,6 +437,27 @@ const SAFE_ERROR_PREFIXES: &[&str] = &[
     // the mode and the fix. It leaks no internal state.
     // See QueryError::ReadonlyMode in crates/query/src/result.rs.
     "readonly mode",
+    // Entity-link diagnostics. Every one of these is derived from the client's
+    // own statement plus catalog names the client just used, exactly like the
+    // `table '...'` / `column not found` entries above, and every one names the
+    // fix. Without these prefixes a remote client saw "query execution error"
+    // for the whole link feature while an embedded caller saw the real message,
+    // so a driver could not tell a typo from a server fault.
+    // Covers the catalog's `link '<name>' not found on owner type '<T>'`,
+    // `link '<name>' already exists on owner type '<T>'`, `link local key ...`,
+    // `link target key ...`, `link name '<name>' collides with a column ...`,
+    // the planner's `link path starts at unknown alias ...`, and the executor's
+    // `link traversal requires ...`.
+    "link ",
+    "links ",
+    // The executor's own phrasing for a link that was never declared
+    // (`unknown link `x` on type `T``), which the bare `unknown table` /
+    // `unknown column` entries above never matched.
+    "unknown link",
+    // The planner's correct-by-default refusal of an aggregate over a nested or
+    // link projection: it names the statement the client sent and the rewrite
+    // that works. See crates/query/src/planner.rs.
+    "aggregates over",
 ];
 
 /// Build the client-facing error frame: sanitized message plus the stable
@@ -509,15 +569,73 @@ fn log_received_query_with_params(peer: &str, query: &str, n_params: usize, mess
 /// Write a message to the client with a timeout. Returns false if the
 /// write failed or timed out (caller should close the connection).
 async fn write_msg<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>, msg: &Message) -> bool {
+    write_msg_with_budget(writer, msg, WRITE_TIMEOUT).await
+}
+
+/// How long a reply to this connection may block, given the transaction
+/// deadline (if any) it is being written under.
+///
+/// [`WRITE_TIMEOUT`] alone is not enough while a transaction holds the gate.
+/// The reap only runs between frames, so a client that opens a transaction,
+/// asks for a reply larger than the socket buffers, and then stops reading
+/// parks the handler inside the write for the full `WRITE_TIMEOUT` with the
+/// gate still held. That is the same outage `POWDB_TX_MAX_LIFETIME_MS` exists
+/// to prevent, reached through the write side instead of the read side, and it
+/// made the advertised budget false by 30s/budget (100x at the default). The
+/// remaining lifetime therefore caps the write budget too, so the gate is
+/// released on the budget the operator configured no matter which side of the
+/// socket the client stalls.
+fn write_budget(tx_deadline: Option<Instant>) -> Duration {
+    match tx_deadline {
+        Some(deadline) => WRITE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+        None => WRITE_TIMEOUT,
+    }
+}
+
+/// [`write_msg`] bounded by an explicit budget.
+async fn write_msg_with_budget<W: AsyncWrite + Unpin>(
+    writer: &mut BufWriter<W>,
+    msg: &Message,
+    budget: Duration,
+) -> bool {
     let write_fut = async {
         if msg.write_to(writer).await.is_err() {
             return false;
         }
         writer.flush().await.is_ok()
     };
-    tokio::time::timeout(WRITE_TIMEOUT, write_fut)
+    tokio::time::timeout(budget, write_fut)
         .await
         .unwrap_or_default()
+}
+
+/// How long the connection may spend flushing what is left in its buffer on
+/// the way out. Long enough for a client that is merely slow, short enough
+/// that a client which stopped reading cannot park the teardown.
+const FINAL_FLUSH_BUDGET: Duration = Duration::from_millis(250);
+
+/// Push whatever is still buffered to the socket before the connection ends.
+///
+/// `BufWriter` has no `Drop` that flushes, so a frame that was written into it
+/// but not yet drained is discarded when the connection object goes away. Every
+/// reply path flushes on its own, but a flush that is cancelled by its budget
+/// leaves the remainder in the buffer, and that remainder is the tail of a
+/// frame the client is waiting on. Returns whether the buffer actually drained.
+async fn flush_before_close<W: AsyncWrite + Unpin>(writer: &mut BufWriter<W>) -> bool {
+    tokio::time::timeout(FINAL_FLUSH_BUDGET, writer.flush())
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+/// [`write_msg`] for replies sent while this connection may be holding the
+/// transaction gate: the write can never outlast the transaction's remaining
+/// lifetime. See [`write_budget`].
+async fn write_msg_within<W: AsyncWrite + Unpin>(
+    writer: &mut BufWriter<W>,
+    msg: &Message,
+    tx_deadline: Option<Instant>,
+) -> bool {
+    write_msg_with_budget(writer, msg, write_budget(tx_deadline)).await
 }
 
 /// Options for a single connection, bundled to keep `handle_connection`'s
@@ -933,6 +1051,7 @@ enum SyncErrorClass {
     PermissionDenied,
     InvalidReplicaId,
     ActiveTransaction,
+    GateTimeout,
     QueryExecution,
     InvalidMaxUnits,
     InvalidMaxBytes,
@@ -946,6 +1065,15 @@ enum SyncErrorClass {
     RetainedChunkNotApplyable,
     LsnAheadOfRemote,
     AckValidation,
+    /// The primary refused to advance this replica's cursor for a reason the
+    /// replica itself must act on: no cursor, an inactive cursor, or an LSN
+    /// behind the one already recorded. Sibling of
+    /// [`SyncErrorClass::IdentityOrFormatMismatch`], and classified the same
+    /// way, so the two "rebootstrap required" answers a replica has to branch
+    /// on cannot arrive with different wire classes.
+    AckRejected,
+    /// The cursor update failed for a reason on the server's side (an I/O
+    /// error). Not actionable by the replica.
     AckUpdate,
     Internal,
 }
@@ -957,6 +1085,7 @@ impl SyncErrorClass {
             Self::PermissionDenied => "permission_denied",
             Self::InvalidReplicaId => "invalid_replica_id",
             Self::ActiveTransaction => "active_transaction",
+            Self::GateTimeout => "gate_timeout",
             Self::QueryExecution => "query_execution",
             Self::InvalidMaxUnits => "invalid_max_units",
             Self::InvalidMaxBytes => "invalid_max_bytes",
@@ -970,8 +1099,60 @@ impl SyncErrorClass {
             Self::RetainedChunkNotApplyable => "retained_chunk_not_applyable",
             Self::LsnAheadOfRemote => "lsn_ahead_of_remote",
             Self::AckValidation => "ack_validation",
+            Self::AckRejected => "ack_rejected",
             Self::AckUpdate => "ack_update",
             Self::Internal => "internal",
+        }
+    }
+
+    /// The stable wire [`ErrorClass`] this sync rejection is reported as.
+    ///
+    /// Sync errors used to reach the wire as a bare `MSG_ERROR` with no class
+    /// byte at all, which is the one thing this protocol promises never to do:
+    /// a driver could tell a timeout from an auth failure on every query
+    /// frontend but not on this one. The match is exhaustive, so a new
+    /// [`SyncErrorClass`] cannot be added without choosing a class, and no arm
+    /// falls back to [`ErrorClass::Internal`] just to compile.
+    ///
+    /// Classes are the ones the query frontends already use for the same
+    /// meaning, so a client branches identically whichever frontend answered:
+    /// a role refusal is `Execution` because `check_statement_permitted`
+    /// reports its "permission denied" that way, and a gate wait is `Timeout`
+    /// because `acquire_begin_permit` reports its wait that way.
+    const fn wire_class(self) -> ErrorClass {
+        match self {
+            // Fixable by reconnecting with credentials.
+            Self::AuthRequired => ErrorClass::AuthFailed,
+            // Not fixable by re-authenticating as the same principal: parity
+            // with the query frontends' role refusals.
+            Self::PermissionDenied => ErrorClass::Execution,
+            // The client's own request field is wrong and it can say so.
+            Self::InvalidReplicaId
+            | Self::ActiveTransaction
+            | Self::CursorLsnMismatch
+            | Self::IdentityOrFormatMismatch
+            | Self::RetainedChunkNotApplyable
+            | Self::LsnAheadOfRemote
+            | Self::AckValidation
+            // A refused cursor advance is the ack-side twin of
+            // `IdentityOrFormatMismatch`: both tell the replica to rebootstrap,
+            // so both must arrive as the same class. Reporting this one as
+            // `Internal` made it indistinguishable from an unclassified server
+            // fault, which is the one answer a replica cannot act on.
+            | Self::AckRejected => ErrorClass::Execution,
+            // A caller-supplied bound outside the server's accepted range.
+            Self::InvalidMaxUnits | Self::InvalidMaxBytes => ErrorClass::LimitExceeded,
+            // The gate wait elapsed; retryable, like every other time budget.
+            Self::GateTimeout => ErrorClass::Timeout,
+            // Server-side failures the client cannot act on.
+            Self::QueryExecution
+            | Self::SyncContext
+            | Self::StatusRead
+            | Self::IdentityRead
+            | Self::RetainedRead
+            | Self::RetainedUnitEncoding
+            | Self::AckUpdate
+            | Self::Internal => ErrorClass::Internal,
         }
     }
 }
@@ -992,9 +1173,7 @@ impl SyncDecision {
 
     fn error(class: SyncErrorClass, message: impl Into<String>) -> Self {
         Self {
-            message: Message::Error {
-                message: message.into(),
-            },
+            message: error_response(message, class.wire_class()),
             error_class: Some(class),
         }
     }
@@ -1024,6 +1203,105 @@ fn check_sync_protocol_permitted(
         }
     }
     Ok(())
+}
+
+/// Range check for a sync pull's caller-supplied batch bounds. Pure: it needs
+/// no engine access, so it belongs to [`SyncPreGate`], which is the ONLY place
+/// it runs. [`dispatch_sync_pull_decision`] reaches it through the same
+/// pre-gate rather than repeating it.
+fn check_sync_pull_bounds(max_units: u32, max_bytes: u64) -> Result<(), (SyncErrorClass, String)> {
+    if max_units == 0 || max_units > MAX_SYNC_PULL_UNITS {
+        return Err((
+            SyncErrorClass::InvalidMaxUnits,
+            format!("sync pull maxUnits must be between 1 and {MAX_SYNC_PULL_UNITS}"),
+        ));
+    }
+    if max_bytes == 0 || max_bytes > MAX_SYNC_PULL_BYTES {
+        return Err((
+            SyncErrorClass::InvalidMaxBytes,
+            format!("sync pull maxBytes must be between 1 and {MAX_SYNC_PULL_BYTES}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The half of the sync ack LSN validation that compares only the two numbers
+/// the client sent. The remaining checks need the primary's LSN and therefore
+/// stay inside [`dispatch_sync_ack_decision`], under the gate.
+fn check_sync_ack_lsn_bounds(
+    applied_lsn: u64,
+    observed_remote_lsn: u64,
+) -> Result<(), (SyncErrorClass, String)> {
+    if applied_lsn > observed_remote_lsn {
+        return Err((
+            SyncErrorClass::LsnAheadOfRemote,
+            format!(
+                "sync ack appliedLsn {applied_lsn} is ahead of observed remoteLsn {observed_remote_lsn}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Everything a sync frame can be rejected for WITHOUT touching the engine,
+/// carried per sync message type.
+///
+/// This exists so [`execute_gated_sync`] can apply the rule the three query
+/// frontends already follow ("a statement that executes nothing must acquire
+/// nothing", see [`parse_failure_response`]) to the sync frontend. Before it,
+/// every one of these rejections ran *after* `acquire_many_owned(all permits)`
+/// inside the blocking decision function, so an unauthenticated peer sending a
+/// frame that would be refused in microseconds still seized the entire gate
+/// first.
+///
+/// A sync message type reaches the gate only by building one of these
+/// variants, and [`SyncPreGate::check`] matches exhaustively, so a fourth sync
+/// frame cannot be added without deciding what it may be rejected for
+/// pre-gate.
+enum SyncPreGate {
+    Status {
+        replica_id: String,
+    },
+    Pull {
+        replica_id: String,
+        max_units: u32,
+        max_bytes: u64,
+    },
+    Ack {
+        replica_id: String,
+        applied_lsn: u64,
+        observed_remote_lsn: u64,
+    },
+}
+
+impl SyncPreGate {
+    fn check(
+        &self,
+        credential_authenticated: bool,
+        principal: Option<&Principal>,
+    ) -> Result<(), (SyncErrorClass, String)> {
+        check_sync_protocol_permitted(credential_authenticated, principal)?;
+        let replica_id = match self {
+            Self::Status { replica_id }
+            | Self::Pull { replica_id, .. }
+            | Self::Ack { replica_id, .. } => replica_id,
+        };
+        validate_wire_replica_id(replica_id)
+            .map_err(|message| (SyncErrorClass::InvalidReplicaId, message))?;
+        match self {
+            Self::Status { .. } => Ok(()),
+            Self::Pull {
+                max_units,
+                max_bytes,
+                ..
+            } => check_sync_pull_bounds(*max_units, *max_bytes),
+            Self::Ack {
+                applied_lsn,
+                observed_remote_lsn,
+                ..
+            } => check_sync_ack_lsn_bounds(*applied_lsn, *observed_remote_lsn),
+        }
+    }
 }
 
 fn validate_wire_replica_id(replica_id: &str) -> Result<(), String> {
@@ -1217,6 +1495,10 @@ struct SyncExecutionContext<'a> {
     log_context: SyncLogContext,
     metrics: &'a Arc<Metrics>,
     query_timeout: Duration,
+    tx_wait_timeout: Duration,
+    credential_authenticated: bool,
+    principal: Option<Principal>,
+    pre_gate: SyncPreGate,
 }
 
 fn log_sync_decision(
@@ -1339,7 +1621,7 @@ fn log_sync_decision(
                 );
             }
         }
-        Message::Error { .. } => {
+        Message::Error { .. } | Message::ErrorWithClass { .. } => {
             warn!(
                 operation = operation,
                 replica_fingerprint = %context.replica_fingerprint,
@@ -1446,13 +1728,15 @@ fn dispatch_sync_status_decision(
     credential_authenticated: bool,
     principal: Option<&Principal>,
 ) -> SyncDecision {
-    if let Err((class, message)) =
-        check_sync_protocol_permitted(credential_authenticated, principal)
-    {
+    // Everything decidable without the engine goes through the SAME pre-gate
+    // the wire path applies before taking a permit, so the two can never
+    // disagree about what is refusable for free. See
+    // `no_sync_dispatch_function_refuses_a_frame_before_it_reads_the_engine`.
+    let pre_gate = SyncPreGate::Status {
+        replica_id: replica_id.clone(),
+    };
+    if let Err((class, message)) = pre_gate.check(credential_authenticated, principal) {
         return SyncDecision::error(class, message);
-    }
-    if let Err(message) = validate_wire_replica_id(&replica_id) {
-        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
     }
     let SyncContext {
         data_dir,
@@ -1486,25 +1770,14 @@ fn dispatch_sync_pull_decision(
     credential_authenticated: bool,
     principal: Option<&Principal>,
 ) -> SyncDecision {
-    if let Err((class, message)) =
-        check_sync_protocol_permitted(credential_authenticated, principal)
-    {
+    // See the note in `dispatch_sync_status_decision`: one pre-gate, shared.
+    let pre_gate = SyncPreGate::Pull {
+        replica_id: request.replica_id.clone(),
+        max_units: request.max_units,
+        max_bytes: request.max_bytes,
+    };
+    if let Err((class, message)) = pre_gate.check(credential_authenticated, principal) {
         return SyncDecision::error(class, message);
-    }
-    if let Err(message) = validate_wire_replica_id(&request.replica_id) {
-        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
-    }
-    if request.max_units == 0 || request.max_units > MAX_SYNC_PULL_UNITS {
-        return SyncDecision::error(
-            SyncErrorClass::InvalidMaxUnits,
-            format!("sync pull maxUnits must be between 1 and {MAX_SYNC_PULL_UNITS}"),
-        );
-    }
-    if request.max_bytes == 0 || request.max_bytes > MAX_SYNC_PULL_BYTES {
-        return SyncDecision::error(
-            SyncErrorClass::InvalidMaxBytes,
-            format!("sync pull maxBytes must be between 1 and {MAX_SYNC_PULL_BYTES}"),
-        );
     }
 
     let SyncContext {
@@ -1690,21 +1963,14 @@ fn dispatch_sync_ack_decision(
     credential_authenticated: bool,
     principal: Option<&Principal>,
 ) -> SyncDecision {
-    if let Err((class, message)) =
-        check_sync_protocol_permitted(credential_authenticated, principal)
-    {
+    // See the note in `dispatch_sync_status_decision`: one pre-gate, shared.
+    let pre_gate = SyncPreGate::Ack {
+        replica_id: replica_id.clone(),
+        applied_lsn,
+        observed_remote_lsn,
+    };
+    if let Err((class, message)) = pre_gate.check(credential_authenticated, principal) {
         return SyncDecision::error(class, message);
-    }
-    if let Err(message) = validate_wire_replica_id(&replica_id) {
-        return SyncDecision::error(SyncErrorClass::InvalidReplicaId, message);
-    }
-    if applied_lsn > observed_remote_lsn {
-        return SyncDecision::error(
-            SyncErrorClass::LsnAheadOfRemote,
-            format!(
-                "sync ack appliedLsn {applied_lsn} is ahead of observed remoteLsn {observed_remote_lsn}"
-            ),
-        );
     }
     let SyncContext {
         data_dir,
@@ -1735,7 +2001,20 @@ fn dispatch_sync_ack_decision(
             advanced: summary.advanced,
             status: wire_sync_status(summary.status),
         }),
-        Err(err) => SyncDecision::error(SyncErrorClass::AckUpdate, err.to_string()),
+        Err(err) => SyncDecision::error(classify_sync_ack_failure(&err), err.to_string()),
+    }
+}
+
+/// Split a failed cursor advance into "the replica must act" and "the server
+/// failed". `acknowledge_replica_apply` rejects a missing cursor with
+/// `NotFound` and an inactive or behind cursor with `InvalidInput`; every other
+/// kind is a real I/O failure the replica cannot do anything about.
+fn classify_sync_ack_failure(err: &std::io::Error) -> SyncErrorClass {
+    match err.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+            SyncErrorClass::AckRejected
+        }
+        _ => SyncErrorClass::AckUpdate,
     }
 }
 
@@ -1769,30 +2048,37 @@ where
         log_context,
         metrics,
         query_timeout,
+        tx_wait_timeout,
+        credential_authenticated,
+        principal,
+        pre_gate,
     } = context;
     let start = Instant::now();
-    if connection_has_transaction {
-        let decision = SyncDecision::error(
-            SyncErrorClass::ActiveTransaction,
-            "sync protocol is unavailable inside an active transaction",
-        );
+    let reject = |decision: SyncDecision| -> Message {
         let elapsed = start.elapsed();
         log_sync_decision(operation, &log_context, elapsed, &decision);
         metrics.record_sync_operation(operation, elapsed, SyncOutcome::Error);
-        return decision.message;
+        decision.message
+    };
+
+    if connection_has_transaction {
+        return reject(SyncDecision::error(
+            SyncErrorClass::ActiveTransaction,
+            "sync protocol is unavailable inside an active transaction",
+        ));
+    }
+    // Every rejection that needs no engine access happens HERE, before the gate
+    // is touched: a frame that will execute nothing must acquire nothing. The
+    // decision functions run the SAME pre-gate as their first act, so a
+    // non-wire caller gets the identical answer and the two can never drift
+    // (`no_sync_dispatch_function_refuses_a_frame_before_it_reads_the_engine`).
+    if let Err((class, message)) = pre_gate.check(credential_authenticated, principal.as_ref()) {
+        return reject(SyncDecision::error(class, message));
     }
 
-    let permit_count = tx_gate.permit_count();
-    let permit = match tx_gate.acquire_many_owned(permit_count).await {
+    let permit = match acquire_sync_permit(&tx_gate, tx_wait_timeout, metrics).await {
         Ok(permit) => permit,
-        Err(_) => {
-            let decision =
-                SyncDecision::error(SyncErrorClass::QueryExecution, "query execution error");
-            let elapsed = start.elapsed();
-            log_sync_decision(operation, &log_context, elapsed, &decision);
-            metrics.record_sync_operation(operation, elapsed, SyncOutcome::Error);
-            return decision.message;
-        }
+        Err(decision) => return reject(decision),
     };
     let decision = run_blocking_sync(input, query_timeout, f).await;
     drop(permit);
@@ -1903,6 +2189,45 @@ async fn acquire_autocommit_permit(
                     tx_wait_timeout.as_millis()
                 ),
                 ErrorClass::Timeout,
+            ))
+        }
+    }
+}
+
+/// Acquire the whole TxGate for a sync frame, bounded by `tx_wait_timeout`
+/// exactly like [`acquire_begin_permit`] and [`acquire_autocommit_permit`].
+///
+/// This was the only unbounded gate acquire in the server. A sync frame that
+/// arrived while another connection held an explicit transaction waited out
+/// that connection's ENTIRE hold: it blew straight through `tx_wait_timeout`,
+/// wrote no error frame at all, and was invisible to
+/// `powdb_tx_gate_timeouts_total` because only the two query-side acquires
+/// recorded a timeout. Bounding it here makes every gate waiter, on every
+/// frontend, give up on the same deadline with the same typed error.
+async fn acquire_sync_permit(
+    tx_gate: &TxGate,
+    tx_wait_timeout: Duration,
+    metrics: &Arc<Metrics>,
+) -> Result<OwnedSemaphorePermit, SyncDecision> {
+    match tokio::time::timeout(
+        tx_wait_timeout,
+        tx_gate.clone().acquire_many_owned(tx_gate.permit_count()),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(SyncDecision::error(
+            SyncErrorClass::QueryExecution,
+            "query execution error",
+        )),
+        Err(_) => {
+            metrics.inc_tx_gate_timeout();
+            Err(SyncDecision::error(
+                SyncErrorClass::GateTimeout,
+                format!(
+                    "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
+                    tx_wait_timeout.as_millis()
+                ),
             ))
         }
     }
@@ -2711,6 +3036,157 @@ fn is_query_cancellation_response(message: &Message) -> bool {
     )
 }
 
+/// Keep the transaction-lifetime deadline in step with the gate permit itself.
+///
+/// The deadline is DERIVED from `tx_permit` rather than armed at each install
+/// site on purpose. The permit is installed and released in seven places
+/// (begin, commit/rollback, three cancellation rollbacks, the standalone
+/// commit permit, disconnect teardown), and a bound that has to be re-armed at
+/// each of them is exactly the partial application this bound exists to
+/// prevent: miss one and that path silently becomes unbounded again. Reading
+/// the permit's own presence cannot miss a site.
+///
+/// Called once per handled frame, so `begin; commit; begin` inside one
+/// pipelined batch re-arms rather than carrying the first transaction's
+/// deadline into the second.
+fn sync_tx_deadline(
+    tx_permit: &Option<OwnedSemaphorePermit>,
+    tx_deadline: &mut Option<Instant>,
+    max_tx_lifetime: Option<Duration>,
+) {
+    match (tx_permit.is_some(), tx_deadline.is_some()) {
+        (true, false) => *tx_deadline = max_tx_lifetime.map(|max| Instant::now() + max),
+        (false, true) => *tx_deadline = None,
+        _ => {}
+    }
+}
+
+/// Roll back a transaction that has held the gate for its whole permitted
+/// lifetime, tell the client why, and release the gate.
+///
+/// Nothing else bounds this. The connection idle timeout is re-armed by every
+/// frame the client sends and a bare `PING` is a frame, so a client that pings
+/// once per idle period holds the entire writer gate forever while every other
+/// connection, readers included, times out against it. Serializing readers
+/// behind an explicit transaction is deliberate and documented; letting the
+/// client choose how long that lasts is not.
+///
+/// On a connection whose last write completed, the reply is a typed
+/// [`ErrorClass::Timeout`] naming the budget and the knob, never a silent
+/// disconnect: the client's transaction is gone and it has to know that before
+/// it sends the next statement. When the reap was triggered BY a write that
+/// could not finish, there is nowhere to put that frame; see [`ReapNotice`].
+#[allow(clippy::too_many_arguments)]
+async fn reap_expired_transaction<W>(
+    engine: &Arc<RwLock<Engine>>,
+    principal: &Option<Principal>,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    tx_deadline: &mut Option<Instant>,
+    max_tx_lifetime: Duration,
+    writer: &mut BufWriter<W>,
+    peer: &str,
+    metrics: &Arc<Metrics>,
+    notice: ReapNotice,
+) where
+    W: AsyncWrite + Unpin,
+{
+    warn!(
+        peer = %peer,
+        max_tx_lifetime_ms = max_tx_lifetime.as_millis(),
+        notified = matches!(notice, ReapNotice::Speak(_)),
+        "transaction exceeded its maximum lifetime; rolling back and releasing the transaction gate"
+    );
+    rollback_connection_transaction(engine.clone(), principal.clone(), tx_permit).await;
+    *tx_deadline = None;
+    metrics.inc_tx_reaped();
+    let ReapNotice::Speak(budget) = notice else {
+        return;
+    };
+    let err = error_response(
+        format!(
+            "transaction exceeded the maximum lifetime of {}ms and was rolled back; \
+             raise POWDB_TX_MAX_LIFETIME_MS if transactions on this server legitimately run longer",
+            max_tx_lifetime.as_millis()
+        ),
+        ErrorClass::Timeout,
+    );
+    write_msg_with_budget(writer, &err, budget).await;
+}
+
+/// Whether a reap may still tell the client what happened.
+///
+/// A frame may only be written on a frame boundary, and a reply write that
+/// failed did not necessarily fail before touching the socket:
+/// [`Message::write_to`] is one `write_all` of the encoded frame, and any
+/// frame larger than the `BufWriter`'s buffer goes straight through to the
+/// socket, so cancelling that write on the budget leaves a partial frame on
+/// the wire with its length already announced. There is no resume and no
+/// rollback for those bytes. Anything written next is read by the client as
+/// the dead frame's payload: the notification does not arrive, and the bytes
+/// that carry it corrupt the framing of a stream the client was about to see
+/// closed anyway.
+///
+/// So the reap speaks only where speaking is possible. Everything else it does
+/// (roll back, release the gate, log, count) happens either way, which is what
+/// keeps the event operator-visible when the wire cannot be.
+#[derive(Clone, Copy, Debug)]
+enum ReapNotice {
+    /// The last write on this connection completed, so the next byte written
+    /// starts a frame. The budget bounds the attempt: the gate is already
+    /// released, so a client that has stopped reading can no longer cost
+    /// anyone else anything.
+    Speak(Duration),
+    /// A reply write failed partway. The stream is no longer framable; close
+    /// it without writing anything else.
+    Silence,
+}
+
+/// A reply write failed. If this connection was inside an explicit transaction
+/// whose lifetime has run out, that is a REAP, not an ordinary write failure,
+/// and it must be treated as one: rolled back, released, logged, and counted.
+///
+/// Without this the connection simply broke out of the loop and let the
+/// disconnect teardown roll the transaction back with no log line and no
+/// counter, so the one budget that was actually being enforced left no trace
+/// anywhere an operator could see it. A write that failed for any other reason
+/// falls through to the same teardown as before.
+///
+/// This reap is always [`ReapNotice::Silence`]: it exists BECAUSE a write
+/// failed, and a write after a failed write cannot be framed. The log line and
+/// `powdb_tx_reaped_total` are what make it visible instead.
+#[allow(clippy::too_many_arguments)]
+async fn reap_after_stalled_write<W>(
+    engine: &Arc<RwLock<Engine>>,
+    principal: &Option<Principal>,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    tx_deadline: &mut Option<Instant>,
+    max_tx_lifetime: Option<Duration>,
+    writer: &mut BufWriter<W>,
+    peer: &str,
+    metrics: &Arc<Metrics>,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let (Some(deadline), Some(max)) = (*tx_deadline, max_tx_lifetime) else {
+        return;
+    };
+    if Instant::now() < deadline {
+        return;
+    }
+    reap_expired_transaction(
+        engine,
+        principal,
+        tx_permit,
+        tx_deadline,
+        max,
+        writer,
+        peer,
+        metrics,
+        ReapNotice::Silence,
+    )
+    .await;
+}
+
 /// Roll back this connection's explicit transaction while it still owns the
 /// transaction-gate permit, then release the permit. A timed-out/cancelled
 /// statement cannot leave an ambiguous transaction open and block every later
@@ -2867,9 +3343,32 @@ enum ConnectionTermination {
     ReadError,
 }
 
+/// Serve one client connection, then close it.
+///
+/// The buffered writer is owned HERE rather than inside [`serve_connection`]
+/// so that every way that function can end (a handshake it refuses, a
+/// `DISCONNECT`, a read error, a reap) passes through the same closing flush.
+/// `BufWriter` does not flush on drop, so a reply that is complete but still
+/// buffered would otherwise be discarded by the close.
 pub async fn handle_connection<S>(stream: S, opts: ConnOpts<'_>)
 where
     S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+    serve_connection(&mut reader, &mut writer, opts).await;
+    flush_before_close(&mut writer).await;
+}
+
+/// The connection itself: handshake, then frames until something ends it.
+async fn serve_connection<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    opts: ConnOpts<'_>,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let ConnOpts {
         engine,
@@ -2891,19 +3390,15 @@ where
         .unwrap_or_else(|| "unknown".into());
     let peer_ip = peer_addr.map(|a| a.ip());
 
-    let (reader, writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
-
     // Wait for Connect message (with idle timeout).
     // Accept Ping messages before authentication so load balancers can
     // health-check without completing a full CONNECT handshake.
     // Uses the smaller pre-auth payload limit (4 KB) to prevent memory abuse.
     let connect_msg = loop {
-        match tokio::time::timeout(idle_timeout, Message::read_from_preauth(&mut reader)).await {
+        match tokio::time::timeout(idle_timeout, Message::read_from_preauth(reader)).await {
             Ok(Ok(Some(Message::Ping))) => {
                 debug!(peer = %peer, "pre-auth ping");
-                if !write_msg(&mut writer, &Message::Pong).await {
+                if !write_msg(writer, &Message::Pong).await {
                     return;
                 }
                 continue;
@@ -2924,6 +3419,26 @@ where
         }
     };
 
+    // Lift the optional protocol hello off the CONNECT frame so the auth path
+    // below sees one shape. `None` means a pre-v0.22.0 client that stated
+    // nothing, which negotiates as protocol v1 with no named features.
+    let (connect_msg, client_hello) = match connect_msg {
+        Message::ConnectWithHello {
+            db_name,
+            password,
+            username,
+            hello,
+        } => (
+            Message::Connect {
+                db_name,
+                password,
+                username,
+            },
+            Some(hello),
+        ),
+        other => (other, None),
+    };
+
     // The authenticated identity for this connection. Bound at connect time
     // and enforced on every query by `dispatch_query`.
     let principal: Option<Principal>;
@@ -2942,7 +3457,7 @@ where
                         "too many auth failures, try again later",
                         ErrorClass::RateLimited,
                     );
-                    write_msg(&mut writer, &err).await;
+                    write_msg(writer, &err).await;
                     return;
                 }
             }
@@ -2963,7 +3478,7 @@ where
                         record_auth_failure(limiter, ip);
                     }
                     let err = error_response("authentication failed", ErrorClass::AuthFailed);
-                    write_msg(&mut writer, &err).await;
+                    write_msg(writer, &err).await;
                     return;
                 }
                 AuthOutcome::Authenticated {
@@ -3008,22 +3523,48 @@ where
                 Err(msg) => {
                     warn!(peer = %peer, db = %db_name, "rejected: unknown database");
                     let err = error_response(msg, ErrorClass::AuthFailed);
-                    write_msg(&mut writer, &err).await;
+                    write_msg(writer, &err).await;
                     return;
                 }
             }
 
-            let ok = Message::ConnectOk {
-                version: env!("CARGO_PKG_VERSION").into(),
+            // Version negotiation runs last, after auth and the database-name
+            // check, so an unauthenticated peer still learns nothing about
+            // this server (it already could not see the version string). It
+            // is still inside the handshake: a mismatch is answered here with
+            // a typed error and the connection closes, so no version
+            // disagreement can ever surface on a later frame.
+            let version = env!("CARGO_PKG_VERSION").to_string();
+            let stated = stated_client_hello(client_hello.as_ref());
+            let ok = match negotiate_protocol(
+                &stated,
+                MIN_SUPPORTED_PROTOCOL_VERSION,
+                MAX_SUPPORTED_PROTOCOL_VERSION,
+                SERVER_FEATURES,
+                CLIENT_CATALOG_VERSION,
+            ) {
+                // Answer a hello only to a peer that sent one: a legacy client
+                // gets a byte-identical legacy CONNECT_OK.
+                Ok(server_hello) if client_hello.is_some() => Message::ConnectOkWithHello {
+                    version,
+                    hello: server_hello,
+                },
+                Ok(_) => Message::ConnectOk { version },
+                Err((mismatch, message)) => {
+                    warn!(peer = %peer, reason = ?mismatch, "protocol negotiation failed");
+                    let err = error_response(message, ErrorClass::ProtocolVersion);
+                    write_msg(writer, &err).await;
+                    return;
+                }
             };
-            if !write_msg(&mut writer, &ok).await {
+            if !write_msg(writer, &ok).await {
                 return;
             }
         }
         _ => {
             warn!(peer = %peer, "first message was not CONNECT");
             let err = error_response("expected CONNECT", ErrorClass::Internal);
-            write_msg(&mut writer, &err).await;
+            write_msg(writer, &err).await;
             return;
         }
     }
@@ -3038,19 +3579,58 @@ where
     // the next iteration of the main loop.
     let mut carry: Option<Message> = None;
 
+    // Wall-clock deadline for the explicit transaction this connection holds
+    // the gate for, if any. Derived from `tx_permit` by `sync_tx_deadline`.
+    let max_tx_lifetime = tx_gate.max_tx_lifetime();
+    let mut tx_deadline: Option<Instant> = None;
+
     // Main query loop with idle timeout and shutdown awareness.
     'conn: loop {
+        // Reap an over-long transaction BEFORE serving the next frame. The
+        // read timeout below cannot be the only check: a client that keeps
+        // sending frames (a `PING` loop is enough) never reaches it.
+        if let (Some(deadline), Some(max)) = (tx_deadline, max_tx_lifetime) {
+            if Instant::now() >= deadline {
+                reap_expired_transaction(
+                    &engine,
+                    &principal,
+                    &mut tx_permit,
+                    &mut tx_deadline,
+                    max,
+                    writer,
+                    &peer,
+                    &metrics,
+                    // Nothing is half-written here: this runs between frames,
+                    // after the previous reply completed, so the notification
+                    // starts on a frame boundary.
+                    ReapNotice::Speak(WRITE_TIMEOUT),
+                )
+                .await;
+                break;
+            }
+        }
+
         let msg = if let Some(m) = carry.take() {
             m
         } else if let Some(m) = pending_messages.pop_front() {
             m
         } else {
+            // An open transaction shortens the wait to whichever budget
+            // expires first, so a client that holds the gate and then goes
+            // quiet is reaped on the transaction's deadline rather than the
+            // (typically far longer) idle one.
+            let read_wait = match tx_deadline {
+                Some(deadline) => {
+                    idle_timeout.min(deadline.saturating_duration_since(Instant::now()))
+                }
+                None => idle_timeout,
+            };
             tokio::select! {
                 // Read next message with idle timeout.
                 result = tokio::time::timeout(
-                    idle_timeout,
+                    read_wait,
                     read_message_cancel_safe(
-                        &mut reader,
+                        reader,
                         &mut wire_read_buffer,
                         MAX_WIRE_PAYLOAD_SIZE + 6,
                     ),
@@ -3063,9 +3643,18 @@ where
                             break;
                         }
                         Err(_) => {
+                            // The wait above may have been shortened by an
+                            // open transaction's deadline rather than being
+                            // the idle timeout. Go round: the check at the top
+                            // of `'conn` owns the reap, so a transaction is
+                            // reaped from exactly ONE place no matter which
+                            // budget woke us.
+                            if tx_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                continue;
+                            }
                             info!(peer = %peer, "idle timeout, closing connection");
                             let err = error_response("idle timeout", ErrorClass::Timeout);
-                            write_msg(&mut writer, &err).await;
+                            write_msg_within(writer, &err, tx_deadline).await;
                             break;
                         }
                     }
@@ -3075,7 +3664,7 @@ where
                     if *shutdown_rx.borrow() {
                         info!(peer = %peer, "server shutting down, closing connection");
                         let err = error_response("server shutting down", ErrorClass::Internal);
-                        write_msg(&mut writer, &err).await;
+                        write_msg_within(writer, &err, tx_deadline).await;
                         break;
                     }
                     continue;
@@ -3185,7 +3774,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3218,7 +3807,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3257,7 +3846,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3290,7 +3879,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3323,7 +3912,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3362,7 +3951,7 @@ where
                                 query_timeout,
                                 tx_wait_timeout,
                                 &metrics,
-                                &mut reader,
+                                reader,
                                 &mut wire_read_buffer,
                                 &mut pending_messages,
                             )
@@ -3371,6 +3960,11 @@ where
                     }
                     _ => unreachable!("batch loop only receives plain query frames"),
                 };
+                // This frame may have opened or closed the connection's
+                // transaction. Re-derive the lifetime deadline from the permit
+                // rather than from the statement, so no install or release
+                // site can be missed.
+                sync_tx_deadline(&tx_permit, &mut tx_deadline, max_tx_lifetime);
                 if let Some((t, m)) = ticket {
                     // Later tickets cover earlier generations — keep only the
                     // newest; the batch-end wait settles them all. Every
@@ -3407,7 +4001,7 @@ where
                     tokio::time::timeout(
                         idle_timeout,
                         read_message_cancel_safe(
-                            &mut reader,
+                            reader,
                             &mut wire_read_buffer,
                             MAX_WIRE_PAYLOAD_SIZE + 6,
                         ),
@@ -3489,7 +4083,20 @@ where
             }
 
             for r in &responses {
-                if !write_msg(&mut writer, r).await {
+                // Bounded by the transaction's remaining lifetime, not only by
+                // WRITE_TIMEOUT: this is the write side of the same budget.
+                if !write_msg_within(writer, r, tx_deadline).await {
+                    reap_after_stalled_write(
+                        &engine,
+                        &principal,
+                        &mut tx_permit,
+                        &mut tx_deadline,
+                        max_tx_lifetime,
+                        writer,
+                        &peer,
+                        &metrics,
+                    )
+                    .await;
                     break 'conn;
                 }
             }
@@ -3516,6 +4123,12 @@ where
                         log_context,
                         metrics: &metrics,
                         query_timeout,
+                        tx_wait_timeout,
+                        credential_authenticated: credential_auth_configured,
+                        principal: principal.clone(),
+                        pre_gate: SyncPreGate::Status {
+                            replica_id: replica_id.clone(),
+                        },
                     },
                     (engine, replica_id, credential_auth_configured, principal),
                     |(engine, replica_id, credential_authenticated, principal)| {
@@ -3562,6 +4175,14 @@ where
                         log_context,
                         metrics: &metrics,
                         query_timeout,
+                        tx_wait_timeout,
+                        credential_authenticated: credential_auth_configured,
+                        principal: principal.clone(),
+                        pre_gate: SyncPreGate::Pull {
+                            replica_id: request.replica_id.clone(),
+                            max_units: request.max_units,
+                            max_bytes: request.max_bytes,
+                        },
                     },
                     (engine, request, credential_auth_configured, principal),
                     |(engine, request, credential_authenticated, principal)| {
@@ -3591,6 +4212,14 @@ where
                         log_context,
                         metrics: &metrics,
                         query_timeout,
+                        tx_wait_timeout,
+                        credential_authenticated: credential_auth_configured,
+                        principal: principal.clone(),
+                        pre_gate: SyncPreGate::Ack {
+                            replica_id: replica_id.clone(),
+                            applied_lsn,
+                            observed_remote_lsn: remote_lsn,
+                        },
                     },
                     (
                         engine,
@@ -3627,7 +4256,18 @@ where
             _ => error_response("unexpected message type", ErrorClass::Internal),
         };
 
-        if !write_msg(&mut writer, &response).await {
+        if !write_msg_within(writer, &response, tx_deadline).await {
+            reap_after_stalled_write(
+                &engine,
+                &principal,
+                &mut tx_permit,
+                &mut tx_deadline,
+                max_tx_lifetime,
+                writer,
+                &peer,
+                &metrics,
+            )
+            .await;
             break;
         }
     }
@@ -3795,6 +4435,111 @@ mod tests {
             QueryError::Cancelled.to_string(),
             "query cancelled by client disconnect"
         );
+    }
+
+    // ---- Entity-link diagnostics reach remote clients ----
+
+    /// Build a schema with a link, ready for the failure cases below.
+    fn linked_engine() -> (tempfile::TempDir, Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::new(dir.path()).unwrap();
+        for ddl in [
+            "type User { required id: int, name: str }",
+            "type Order { required id: int, user_id: int, total: int }",
+            "link Order.user -> User on user_id = id",
+        ] {
+            engine.execute_powql(ddl).unwrap();
+        }
+        (dir, engine)
+    }
+
+    /// Every way a link statement or a link projection can be refused, executed
+    /// for real and then run through the sanitizer that guards the wire.
+    ///
+    /// The sanitizer is an allowlist: a message family with no prefix in it is
+    /// replaced by "query execution error" on the way out. That is what
+    /// happened to the whole entity-link feature. An embedded caller saw
+    /// `link 'author' not found on owner type 'Post'` and a remote client saw
+    /// nothing it could act on, so the same typo was diagnosable in one
+    /// deployment shape and not the other.
+    ///
+    /// The failures are enumerated by EXECUTING them rather than by quoting
+    /// strings, so rewording a message keeps it covered and only a genuinely
+    /// new failure is uncovered.
+    #[test]
+    fn every_link_diagnostic_survives_the_wire_sanitizer() {
+        let (_dir, mut engine) = linked_engine();
+        let refusals = [
+            // Catalog-side refusals of the link DDL itself.
+            "link Order.other -> User on nope = id",
+            "link Order.other -> User on user_id = nope",
+            "link Order.user_id -> User on user_id = id",
+            "link Order.user -> User on user_id = id",
+            // Planner and executor refusals of a link PROJECTION.
+            "Order as o { o.nosuchlink.name }",
+            "Order as o { wrongalias.user.name }",
+            "count(Order as o { o.user.name })",
+        ];
+        let mut masked = Vec::new();
+        for statement in refusals {
+            let err = engine
+                .execute_powql(statement)
+                .expect_err(&format!("`{statement}` must be refused"));
+            let message = err.to_string();
+            if sanitize_error(&message) != message {
+                masked.push(format!("  {statement}\n    -> {message}"));
+            }
+        }
+        assert!(
+            masked.is_empty(),
+            "these link diagnostics are masked to \"query execution error\" on their way to a \
+             remote client, so only embedded callers can see what went wrong. Add a prefix to \
+             SAFE_ERROR_PREFIXES for each:\n{}",
+            masked.join("\n")
+        );
+    }
+
+    /// The same guarantee, asserted where it is actually delivered: the frame
+    /// `execute_wire_query` hands back. Testing `sanitize_error` alone would
+    /// pass even if the wire path stopped calling it.
+    #[tokio::test]
+    async fn a_link_error_reaches_the_wire_with_its_real_message() {
+        let (_dir, engine) = linked_engine();
+        let engine = Arc::new(RwLock::new(engine));
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+
+        let (message, _, _) = execute_wire_query(
+            engine,
+            gate,
+            &mut tx_permit,
+            "Order as o { o.nosuchlink.name }".into(),
+            WireResultMode::Native,
+            None,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            &metrics,
+            &mut reader,
+            &mut wire_read_buffer,
+            &mut pending_messages,
+        )
+        .await;
+
+        match message {
+            Message::ErrorWithClass { message, .. } => {
+                assert!(
+                    message.contains("nosuchlink"),
+                    "the client was told nothing about its own typo: {message}"
+                );
+                assert_ne!(message, "query execution error");
+            }
+            other => panic!("expected a typed error frame, got {other:?}"),
+        }
     }
 
     // ---- JSON (v0.12): canonical-text wire rendering + parse-error passthrough ----
@@ -3996,6 +4741,61 @@ mod tests {
         (dir, Arc::new(RwLock::new(engine)))
     }
 
+    /// The transaction-lifetime deadline is derived from the permit, so it
+    /// cannot be armed on some install sites and forgotten on others, and a
+    /// later frame on the SAME transaction cannot re-arm it (which is exactly
+    /// how a `PING` loop defeated the idle deadline).
+    #[tokio::test]
+    async fn transaction_deadline_tracks_the_permit_and_never_re_arms_mid_transaction() {
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let max = Some(Duration::from_secs(60));
+        let mut deadline: Option<Instant> = None;
+        let mut permit: Option<OwnedSemaphorePermit> = None;
+
+        sync_tx_deadline(&permit, &mut deadline, max);
+        assert!(deadline.is_none(), "no transaction, no deadline");
+
+        permit = Some(
+            acquire_begin_permit(&gate, Duration::from_secs(1), &metrics)
+                .await
+                .expect("begin permit"),
+        );
+        sync_tx_deadline(&permit, &mut deadline, max);
+        let armed = deadline.expect("an open transaction arms the deadline");
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            sync_tx_deadline(&permit, &mut deadline, max);
+        }
+        assert_eq!(
+            deadline,
+            Some(armed),
+            "frames inside a transaction must not push its deadline out"
+        );
+
+        permit = None;
+        sync_tx_deadline(&permit, &mut deadline, max);
+        assert!(deadline.is_none(), "releasing the gate clears the deadline");
+
+        permit = Some(
+            acquire_begin_permit(&gate, Duration::from_secs(1), &metrics)
+                .await
+                .expect("second begin permit"),
+        );
+        sync_tx_deadline(&permit, &mut deadline, max);
+        assert!(
+            deadline.is_some_and(|next| next >= armed),
+            "a new transaction gets a fresh deadline, not the previous one"
+        );
+
+        // The documented opt-out.
+        let mut unbounded: Option<Instant> = None;
+        sync_tx_deadline(&permit, &mut unbounded, None);
+        assert!(unbounded.is_none());
+        drop(permit);
+    }
+
     #[tokio::test]
     async fn unparsable_frame_is_rejected_without_acquiring_any_permit() {
         let (_dir, engine) = one_row_engine();
@@ -4058,12 +4858,1107 @@ mod tests {
             .contains("powdb_queries_total{result=\"error\"} 1"));
     }
 
+    // ---- The write side of the transaction budget ----
+
+    /// A socket that accepts a fixed amount of data and then never accepts
+    /// another byte, recording everything the server offers it afterwards.
+    ///
+    /// `seal()` marks the boundary between the write that failed and whatever
+    /// the server does next: bytes offered after the seal are bytes written
+    /// AFTER a write had already failed, which is the thing that tears a frame
+    /// in half on a real socket.
+    #[derive(Clone)]
+    struct StalledSocket(Arc<Mutex<StalledSocketState>>);
+
+    struct StalledSocketState {
+        room: usize,
+        accepted: usize,
+        sealed: bool,
+        offered_after_seal: usize,
+    }
+
+    impl StalledSocket {
+        fn with_room(room: usize) -> Self {
+            Self(Arc::new(Mutex::new(StalledSocketState {
+                room,
+                accepted: 0,
+                sealed: false,
+                offered_after_seal: 0,
+            })))
+        }
+
+        fn accepted(&self) -> usize {
+            self.0.lock().unwrap().accepted
+        }
+
+        fn seal(&self) {
+            self.0.lock().unwrap().sealed = true;
+        }
+
+        fn offered_after_seal(&self) -> usize {
+            self.0.lock().unwrap().offered_after_seal
+        }
+
+        /// The client started reading again.
+        fn drain(&self, more: usize) {
+            let mut state = self.0.lock().unwrap();
+            state.room = state.room.saturating_add(more);
+        }
+    }
+
+    impl AsyncWrite for StalledSocket {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut state = self.0.lock().unwrap();
+            if state.sealed {
+                state.offered_after_seal += buf.len();
+            }
+            let room = state.room.saturating_sub(state.accepted);
+            if room == 0 {
+                // Deliberately no waker: the write budget is the only thing
+                // that ends this write, which is the stall being modelled.
+                return std::task::Poll::Pending;
+            }
+            let taken = buf.len().min(room);
+            state.accepted += taken;
+            std::task::Poll::Ready(Ok(taken))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A reply larger than any buffer, so the write goes straight to the
+    /// socket and a cancelled write leaves the frame half delivered.
+    fn unwritable_reply() -> Message {
+        error_response("x".repeat(4 << 20), ErrorClass::Internal)
+    }
+
+    /// The reap that fires because a reply write failed must write NOTHING
+    /// more on that connection.
+    ///
+    /// The frame it could not finish is already partly on the wire with its
+    /// declared length announced, and there is no resume: a client counting
+    /// that length down reads whatever comes next as the dead frame's payload.
+    /// So the notification cannot arrive, and the bytes that carry it corrupt
+    /// the client's framing on the way to a reset it would have seen anyway.
+    /// Rolling back, releasing the gate, logging, and counting still happen;
+    /// only the wire goes quiet.
     #[tokio::test]
-    async fn unparsable_frame_is_rejected_without_a_permit_on_every_frontend() {
+    async fn a_reap_after_a_stalled_write_writes_nothing_more() {
+        let (_dir, engine) = one_row_engine();
+        let metrics = Arc::new(Metrics::new());
+        let socket = StalledSocket::with_room(64 * 1024);
+        let mut writer = BufWriter::new(socket.clone());
+
+        let reply = unwritable_reply();
+        assert!(
+            !write_msg_with_budget(&mut writer, &reply, Duration::from_millis(50)).await,
+            "a socket that stops accepting must fail the write"
+        );
+        assert_eq!(
+            socket.accepted(),
+            64 * 1024,
+            "the frame must be torn on the wire, which is what makes the reap unable to speak"
+        );
+        socket.seal();
+
+        let principal: Option<Principal> = None;
+        let mut tx_permit = None;
+        let mut tx_deadline = Some(Instant::now() - Duration::from_millis(1));
+        reap_after_stalled_write(
+            &engine,
+            &principal,
+            &mut tx_permit,
+            &mut tx_deadline,
+            Some(Duration::from_millis(600)),
+            &mut writer,
+            "peer",
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(
+            socket.offered_after_seal(),
+            0,
+            "the reap wrote {} bytes after a frame it could not finish; they land inside that \
+             frame's declared payload",
+            socket.offered_after_seal()
+        );
+        assert!(
+            tx_deadline.is_none(),
+            "the transaction must still be reaped, not merely left unwritten to"
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("powdb_tx_reaped_total 1"),
+            "a silent reap is still an operator-visible reap:\n{rendered}"
+        );
+    }
+
+    /// The other half of the same rule: on a connection whose last write
+    /// COMPLETED, the next byte starts a frame, so the reap still says why.
+    /// Suppressing the notification everywhere would trade one lie for another.
+    #[tokio::test]
+    async fn a_reap_on_a_quiet_connection_still_tells_the_client_why() {
+        let (_dir, engine) = one_row_engine();
+        let metrics = Arc::new(Metrics::new());
+        let mut writer = BufWriter::new(Vec::new());
+
+        let principal: Option<Principal> = None;
+        let mut tx_permit = None;
+        let mut tx_deadline = Some(Instant::now());
+        reap_expired_transaction(
+            &engine,
+            &principal,
+            &mut tx_permit,
+            &mut tx_deadline,
+            Duration::from_millis(600),
+            &mut writer,
+            "peer",
+            &metrics,
+            ReapNotice::Speak(WRITE_TIMEOUT),
+        )
+        .await;
+
+        let frame = writer.into_inner();
+        let decoded = Message::decode(&frame).expect("the reap notification must be a whole frame");
+        match &decoded {
+            Message::Error { message } | Message::ErrorWithClass { message, .. } => assert!(
+                message.contains("maximum lifetime")
+                    && message.contains("POWDB_TX_MAX_LIFETIME_MS"),
+                "the reaped client must be told what happened and which budget to raise: {message}"
+            ),
+            other => panic!("expected a typed error frame, got {other:?}"),
+        }
+        assert_eq!(
+            crate::protocol::decode_error_class(&frame),
+            Some(ErrorClass::Timeout.as_u8()),
+            "a reap is a time budget, never an unclassified failure"
+        );
+    }
+
+    /// The budget a reply is written under, at both ends of its range.
+    #[test]
+    fn the_write_budget_is_the_smaller_of_the_write_timeout_and_the_remaining_lifetime() {
+        assert_eq!(
+            write_budget(None),
+            WRITE_TIMEOUT,
+            "with no transaction there is no lifetime to cap the write"
+        );
+        assert_eq!(
+            write_budget(Some(Instant::now() + WRITE_TIMEOUT * 2)),
+            WRITE_TIMEOUT,
+            "a distant deadline must not RAISE the write timeout"
+        );
+
+        let budget = write_budget(Some(Instant::now() + Duration::from_millis(500)));
+        assert!(
+            budget <= Duration::from_millis(500) && budget > Duration::from_millis(400),
+            "a transaction with 500ms left may write for at most 500ms, got {budget:?}"
+        );
+
+        // The edge the reap depends on: a deadline that has already passed is
+        // ZERO, never a wrapped-around eternity.
+        assert_eq!(
+            write_budget(Some(Instant::now() - Duration::from_secs(1))),
+            Duration::ZERO,
+            "an expired transaction must not be handed a budget at all"
+        );
+    }
+
+    /// `Duration::ZERO` means "no WAITING", not "no write": a reply the socket
+    /// can take immediately still goes out, and one that would block fails at
+    /// once instead of parking the handler with the gate still held.
+    #[tokio::test]
+    async fn a_zero_write_budget_delivers_what_never_blocks_and_nothing_else() {
+        let reply = error_response("small", ErrorClass::Internal);
+        let mut ready = BufWriter::new(Vec::new());
+        assert!(
+            write_msg_with_budget(&mut ready, &reply, Duration::ZERO).await,
+            "a write that never has to wait must still be delivered on a spent budget"
+        );
+        assert_eq!(ready.into_inner(), reply.encode());
+
+        let socket = StalledSocket::with_room(0);
+        let mut blocked = BufWriter::new(socket.clone());
+        assert!(
+            !write_msg_with_budget(&mut blocked, &unwritable_reply(), Duration::ZERO).await,
+            "a write that would have to wait must fail immediately on a spent budget"
+        );
+        assert_eq!(socket.accepted(), 0);
+    }
+
+    /// A frame the connection already handed to the writer must not be thrown
+    /// away because the connection is ending: `BufWriter` has no `Drop` that
+    /// flushes, so without a closing flush a complete reply left in the buffer
+    /// is silently discarded. The flush is bounded, because a client that
+    /// stopped reading must not be able to park the teardown either.
+    #[tokio::test]
+    async fn the_closing_flush_delivers_buffered_frames_without_parking_teardown() {
+        let reply = error_response("buffered", ErrorClass::Internal);
+        let socket = StalledSocket::with_room(0);
+        let mut writer = BufWriter::new(socket.clone());
+
+        // Small enough to sit entirely in the BufWriter: the socket never sees
+        // it, so nothing is torn and the frame is still whole and deliverable.
+        assert!(!write_msg_with_budget(&mut writer, &reply, Duration::from_millis(50)).await);
+        assert_eq!(
+            socket.accepted(),
+            0,
+            "the frame is buffered, not on the wire"
+        );
+
+        let started = Instant::now();
+        assert!(
+            !flush_before_close(&mut writer).await,
+            "a client that is still not reading cannot be flushed to"
+        );
+        assert!(
+            started.elapsed() < FINAL_FLUSH_BUDGET * 4,
+            "the closing flush parked teardown for {:?}",
+            started.elapsed()
+        );
+
+        socket.drain(usize::MAX / 2);
+        assert!(
+            flush_before_close(&mut writer).await,
+            "once the client reads again the buffered frame must go out"
+        );
+        assert_eq!(
+            socket.accepted(),
+            reply.encode().len(),
+            "the whole frame, exactly once"
+        );
+    }
+
+    // ---- Transaction-gate parity matrix ----
+    //
+    // The tests this replaces named three frontends by hand and stayed green
+    // for a year while a FOURTH (sync) seized the whole gate before running
+    // its own auth check, waited on it with no timeout at all, and answered
+    // with an untyped error frame.
+    //
+    // Naming frontends by hand was only half the defect. The first repair
+    // enumerated the FRONTENDS and then probed each one with a single
+    // hard-coded example, which exercises each RULE on exactly one frontend:
+    // pre-gate replica-id validation could be narrowed to `SyncStatus` alone,
+    // or dropped from `SyncPull` and `SyncAck`, with the whole suite still
+    // green. That is a spot check wearing a matrix's clothes.
+    //
+    // What follows is the CROSS PRODUCT of two enumerations:
+    //
+    //   axis 1  every rule a frame can be refused by BEFORE the gate
+    //   axis 2  every frontend that rule is reachable from
+    //
+    // and axis 2 is DERIVED rather than written down. A rule declares which
+    // SLOT of a runnable frame it corrupts, and it is probed on every frontend
+    // whose runnable frame has that slot. `SyncSlot::replica_id` is not
+    // optional, because every `SyncPreGate` variant carries a replica id and
+    // `SyncPreGate::check` destructures all three together, so a replica-id
+    // rule is probed on all three sync frontends by construction.
+    //
+    // The last test in this section closes the other direction: it enumerates
+    // every rejection site inside the sync dispatch functions straight out of
+    // this file's source, so a NEW refusal added under the gate fails the
+    // build until its author says whether it needs the engine.
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Declare the gate-frontend enum and its iteration list together, so a
+    /// variant cannot exist without being in the list the matrix walks.
+    macro_rules! gate_frontends {
+        ($($variant:ident),+ $(,)?) => {
+            #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+            enum GateFrontend { $($variant),+ }
+
+            impl GateFrontend {
+                const ALL: &'static [GateFrontend] = &[$(GateFrontend::$variant),+];
+            }
+        };
+    }
+
+    gate_frontends!(PowQl, Sql, Params, SyncStatus, SyncPull, SyncAck);
+
+    /// Declare the pre-gate rule enum and its iteration list together, for the
+    /// same reason: a rule cannot exist without the matrix walking it, and
+    /// walking it means probing every frontend it reaches.
+    macro_rules! gate_rules {
+        ($($variant:ident),+ $(,)?) => {
+            #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+            enum GateRule { $($variant),+ }
+
+            impl GateRule {
+                const ALL: &'static [GateRule] = &[$(GateRule::$variant),+];
+            }
+        };
+    }
+
+    gate_rules!(
+        UnparsableStatement,
+        RoleForbidsStatement,
+        SyncCredentialMissing,
+        SyncRoleForbidsProtocol,
+        SyncInvalidReplicaId,
+        SyncPullMaxUnitsOutOfRange,
+        SyncPullMaxBytesOutOfRange,
+        SyncAckLsnAheadOfClientRemote,
+        SyncInsideActiveTransaction,
+    );
+
+    /// Which frontend serves a wire frame, or `None` when the frame never
+    /// reaches the transaction gate.
+    ///
+    /// Exhaustive on purpose: a new `Message` variant does not compile until
+    /// someone decides whether it can reach the gate, and answering "yes"
+    /// forces a `GateFrontend` variant, which the macro forces into `ALL`,
+    /// which the matrix forces probes for.
+    fn gate_frontend(msg: &Message) -> Option<GateFrontend> {
+        match msg {
+            // Six wire message types, three frontends: the native variants
+            // differ only in result encoding and share the same wrapper.
+            Message::Query { .. } | Message::QueryNative { .. } => Some(GateFrontend::PowQl),
+            Message::QuerySql { .. } | Message::QuerySqlNative { .. } => Some(GateFrontend::Sql),
+            Message::QueryWithParams { .. } | Message::QueryWithParamsNative { .. } => {
+                Some(GateFrontend::Params)
+            }
+            Message::SyncStatus { .. } => Some(GateFrontend::SyncStatus),
+            Message::SyncPull { .. } => Some(GateFrontend::SyncPull),
+            Message::SyncAck { .. } => Some(GateFrontend::SyncAck),
+            // Handshake frames, server responses, and control frames the main
+            // loop answers without ever touching the gate.
+            Message::Connect { .. }
+            | Message::ConnectWithHello { .. }
+            | Message::ConnectOk { .. }
+            | Message::ConnectOkWithHello { .. }
+            | Message::SyncStatusResult { .. }
+            | Message::SyncPullResult { .. }
+            | Message::SyncAckResult { .. }
+            | Message::ResultRows { .. }
+            | Message::ResultScalar { .. }
+            | Message::ResultRowsNative { .. }
+            | Message::ResultScalarNative { .. }
+            | Message::ResultOk { .. }
+            | Message::ResultMessage { .. }
+            | Message::Error { .. }
+            | Message::ErrorWithClass { .. }
+            | Message::Disconnect
+            | Message::Ping
+            | Message::Pong => None,
+        }
+    }
+
+    /// A wire frame served by `frontend`, used to prove the matrix and the
+    /// dispatch surface describe the same six frontends.
+    fn representative_frame(frontend: GateFrontend) -> Message {
+        match frontend {
+            GateFrontend::PowQl => Message::Query {
+                query: "User".into(),
+            },
+            GateFrontend::Sql => Message::QuerySql {
+                query: "SELECT * FROM User".into(),
+            },
+            GateFrontend::Params => Message::QueryWithParams {
+                query: "User filter .id = $1".into(),
+                params: vec![WireParam::Int(1)],
+            },
+            GateFrontend::SyncStatus => Message::SyncStatus {
+                replica_id: "replica-a".into(),
+            },
+            GateFrontend::SyncPull => Message::SyncPull {
+                replica_id: "replica-a".into(),
+                since_lsn: 0,
+                max_units: 1,
+                max_bytes: 1024,
+                database_id: [0; 16],
+                primary_generation: 1,
+                wal_format_version: 1,
+                catalog_version: 6,
+                segment_format_version: 1,
+            },
+            GateFrontend::SyncAck => Message::SyncAck {
+                replica_id: "replica-a".into(),
+                applied_lsn: 0,
+                remote_lsn: 0,
+            },
+        }
+    }
+
+    /// The statement slot of a runnable frame. The unparsable and forbidden
+    /// variants live beside the runnable text, in the same language, so a rule
+    /// can swap in its violation without knowing which frontend it is looking
+    /// at.
+    #[derive(Clone)]
+    struct QuerySlot {
+        text: String,
+        unparsable: &'static str,
+        forbidden_write: &'static str,
+        params: Vec<WireParam>,
+        principal: Option<Principal>,
+    }
+
+    /// The identity and cursor fields only a pull frame carries.
+    #[derive(Clone, Copy)]
+    struct PullIdentity {
+        since_lsn: u64,
+        database_id: [u8; 16],
+        primary_generation: u64,
+        wal_format_version: u16,
+        catalog_version: u16,
+        segment_format_version: u16,
+    }
+
+    /// The sync slot of a runnable frame.
+    ///
+    /// `replica_id` is NOT optional. Every `SyncPreGate` variant carries one
+    /// (see the combined destructure in `SyncPreGate::check`), so every sync
+    /// frontend can be given an invalid replica id, and a rule that corrupts
+    /// the replica id is therefore probed on all three of them without anyone
+    /// listing which three.
+    #[derive(Clone)]
+    struct SyncSlot {
+        replica_id: String,
+        credential_authenticated: bool,
+        principal: Option<Principal>,
+        connection_has_transaction: bool,
+        /// Present only on the frontend whose frame carries batch bounds.
+        pull_bounds: Option<(u32, u64)>,
+        /// Present only on the frontend whose frame carries the identity and
+        /// cursor fields.
+        pull_identity: Option<PullIdentity>,
+        /// Present only on the frontend whose frame carries the two LSNs.
+        ack_lsns: Option<(u64, u64)>,
+    }
+
+    /// A frame this frontend would run, before any rule corrupts it.
+    #[derive(Clone)]
+    struct ProbeSpec {
+        frontend: GateFrontend,
+        query: Option<QuerySlot>,
+        sync: Option<SyncSlot>,
+    }
+
+    fn runnable_spec(frontend: GateFrontend) -> ProbeSpec {
+        let query = |text: &str,
+                     unparsable: &'static str,
+                     forbidden_write: &'static str,
+                     params: Vec<WireParam>| {
+            Some(QuerySlot {
+                text: text.to_string(),
+                unparsable,
+                forbidden_write,
+                params,
+                principal: None,
+            })
+        };
+        let sync = |pull_bounds, pull_identity, ack_lsns| {
+            Some(SyncSlot {
+                replica_id: "replica-a".to_string(),
+                credential_authenticated: true,
+                principal: Some(admin_principal()),
+                connection_has_transaction: false,
+                pull_bounds,
+                pull_identity,
+                ack_lsns,
+            })
+        };
+        let identity = PullIdentity {
+            since_lsn: 0,
+            database_id: [0; 16],
+            primary_generation: 1,
+            wal_format_version: 1,
+            catalog_version: 6,
+            segment_format_version: 1,
+        };
+        match frontend {
+            GateFrontend::PowQl => ProbeSpec {
+                frontend,
+                query: query(
+                    "User",
+                    "this is not valid PowQL",
+                    "insert User { id := 2 }",
+                    Vec::new(),
+                ),
+                sync: None,
+            },
+            GateFrontend::Sql => ProbeSpec {
+                frontend,
+                query: query(
+                    "SELECT * FROM User",
+                    "SELEKT * FROM",
+                    "INSERT INTO User (id) VALUES (2)",
+                    Vec::new(),
+                ),
+                sync: None,
+            },
+            GateFrontend::Params => ProbeSpec {
+                frontend,
+                query: query(
+                    "User filter .id = $1",
+                    "User filter .id = = $1",
+                    "insert User { id := $1 }",
+                    vec![WireParam::Int(1)],
+                ),
+                sync: None,
+            },
+            GateFrontend::SyncStatus => ProbeSpec {
+                frontend,
+                query: None,
+                sync: sync(None, None, None),
+            },
+            GateFrontend::SyncPull => ProbeSpec {
+                frontend,
+                query: None,
+                sync: sync(Some((1, 1024)), Some(identity), None),
+            },
+            GateFrontend::SyncAck => ProbeSpec {
+                frontend,
+                query: None,
+                sync: sync(None, None, Some((0, 0))),
+            },
+        }
+    }
+
+    impl GateRule {
+        /// Corrupt `spec` so it violates exactly this rule, and report whether
+        /// this frontend even HAS the slot the rule corrupts.
+        ///
+        /// Returning `false` is how "not reachable from this frontend" is
+        /// derived. Nothing anywhere lists which frontends a rule applies to:
+        /// the answer falls out of which slots `runnable_spec` gave them.
+        fn violate(self, spec: &mut ProbeSpec) -> bool {
+            match self {
+                Self::UnparsableStatement => match spec.query.as_mut() {
+                    Some(slot) => {
+                        slot.text = slot.unparsable.to_string();
+                        true
+                    }
+                    None => false,
+                },
+                Self::RoleForbidsStatement => match spec.query.as_mut() {
+                    Some(slot) => {
+                        slot.text = slot.forbidden_write.to_string();
+                        slot.principal = principal("readonly");
+                        true
+                    }
+                    None => false,
+                },
+                Self::SyncCredentialMissing => match spec.sync.as_mut() {
+                    Some(slot) => {
+                        slot.credential_authenticated = false;
+                        true
+                    }
+                    None => false,
+                },
+                Self::SyncRoleForbidsProtocol => match spec.sync.as_mut() {
+                    Some(slot) => {
+                        slot.principal = principal("readonly");
+                        true
+                    }
+                    None => false,
+                },
+                Self::SyncInvalidReplicaId => match spec.sync.as_mut() {
+                    Some(slot) => {
+                        slot.replica_id = String::new();
+                        true
+                    }
+                    None => false,
+                },
+                Self::SyncPullMaxUnitsOutOfRange => {
+                    match spec.sync.as_mut().and_then(|s| s.pull_bounds.as_mut()) {
+                        Some(bounds) => {
+                            bounds.0 = 0;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Self::SyncPullMaxBytesOutOfRange => {
+                    match spec.sync.as_mut().and_then(|s| s.pull_bounds.as_mut()) {
+                        Some(bounds) => {
+                            bounds.1 = MAX_SYNC_PULL_BYTES + 1;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Self::SyncAckLsnAheadOfClientRemote => {
+                    match spec.sync.as_mut().and_then(|s| s.ack_lsns.as_mut()) {
+                        Some(lsns) => {
+                            *lsns = (5, 0);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Self::SyncInsideActiveTransaction => match spec.sync.as_mut() {
+                    Some(slot) => {
+                        slot.connection_has_transaction = true;
+                        true
+                    }
+                    None => false,
+                },
+            }
+        }
+
+        /// The wire class this refusal must carry, whichever frontend answered.
+        /// No arm is a fallback: each is the class the query frontends already
+        /// use for that meaning.
+        fn expected_class(self) -> ErrorClass {
+            match self {
+                Self::UnparsableStatement => ErrorClass::Parse,
+                // Fixable only by reconnecting with credentials.
+                Self::SyncCredentialMissing => ErrorClass::AuthFailed,
+                // A caller-supplied bound outside the server's accepted range.
+                Self::SyncPullMaxUnitsOutOfRange | Self::SyncPullMaxBytesOutOfRange => {
+                    ErrorClass::LimitExceeded
+                }
+                // The caller's own request is wrong and it can say so.
+                Self::RoleForbidsStatement
+                | Self::SyncRoleForbidsProtocol
+                | Self::SyncInvalidReplicaId
+                | Self::SyncAckLsnAheadOfClientRemote
+                | Self::SyncInsideActiveTransaction => ErrorClass::Execution,
+            }
+        }
+
+        /// The class `SyncPreGate::check` itself must answer with.
+        ///
+        /// `None` for the two query-side rules, which have no `SyncPreGate` at
+        /// all, and for the active-transaction refusal, which
+        /// `execute_gated_sync` makes before it consults the pre-gate.
+        fn pre_gate_class(self) -> Option<SyncErrorClass> {
+            match self {
+                Self::UnparsableStatement
+                | Self::RoleForbidsStatement
+                | Self::SyncInsideActiveTransaction => None,
+                Self::SyncCredentialMissing => Some(SyncErrorClass::AuthRequired),
+                Self::SyncRoleForbidsProtocol => Some(SyncErrorClass::PermissionDenied),
+                Self::SyncInvalidReplicaId => Some(SyncErrorClass::InvalidReplicaId),
+                Self::SyncPullMaxUnitsOutOfRange => Some(SyncErrorClass::InvalidMaxUnits),
+                Self::SyncPullMaxBytesOutOfRange => Some(SyncErrorClass::InvalidMaxBytes),
+                Self::SyncAckLsnAheadOfClientRemote => Some(SyncErrorClass::LsnAheadOfRemote),
+            }
+        }
+    }
+
+    struct GateProbeEnv {
+        engine: Arc<RwLock<Engine>>,
+        gate: TxGate,
+        metrics: Arc<Metrics>,
+        tx_wait_timeout: Duration,
+    }
+
+    /// The pre-gate a sync frontend builds for this slot. Exhaustive on the
+    /// frontend, and every arm reads `slot.replica_id`, which is what makes the
+    /// replica-id rule reach all three.
+    fn sync_pre_gate(frontend: GateFrontend, slot: &SyncSlot) -> SyncPreGate {
+        match frontend {
+            GateFrontend::SyncStatus => SyncPreGate::Status {
+                replica_id: slot.replica_id.clone(),
+            },
+            GateFrontend::SyncPull => {
+                let (max_units, max_bytes) = slot.pull_bounds.expect("a pull frame carries bounds");
+                SyncPreGate::Pull {
+                    replica_id: slot.replica_id.clone(),
+                    max_units,
+                    max_bytes,
+                }
+            }
+            GateFrontend::SyncAck => {
+                let (applied_lsn, observed_remote_lsn) =
+                    slot.ack_lsns.expect("an ack frame carries both LSNs");
+                SyncPreGate::Ack {
+                    replica_id: slot.replica_id.clone(),
+                    applied_lsn,
+                    observed_remote_lsn,
+                }
+            }
+            GateFrontend::PowQl | GateFrontend::Sql | GateFrontend::Params => {
+                panic!("{frontend:?} is not a sync frontend")
+            }
+        }
+    }
+
+    fn sync_pull_request(slot: &SyncSlot) -> SyncPullRequest {
+        let (max_units, max_bytes) = slot.pull_bounds.expect("a pull frame carries bounds");
+        let identity = slot
+            .pull_identity
+            .expect("a pull frame carries its identity");
+        SyncPullRequest {
+            replica_id: slot.replica_id.clone(),
+            since_lsn: identity.since_lsn,
+            max_units,
+            max_bytes,
+            database_id: identity.database_id,
+            primary_generation: identity.primary_generation,
+            wal_format_version: identity.wal_format_version,
+            catalog_version: identity.catalog_version,
+            segment_format_version: identity.segment_format_version,
+        }
+    }
+
+    /// Run the frontend's own decision function against `engine`, with no gate
+    /// and no pre-gate in the way. Used to ask what the code UNDER the gate
+    /// would decide.
+    fn dispatch_sync_decision(
+        engine: &Arc<RwLock<Engine>>,
+        frontend: GateFrontend,
+        slot: &SyncSlot,
+    ) -> SyncDecision {
+        match frontend {
+            GateFrontend::SyncStatus => dispatch_sync_status_decision(
+                engine,
+                slot.replica_id.clone(),
+                slot.credential_authenticated,
+                slot.principal.as_ref(),
+            ),
+            GateFrontend::SyncPull => dispatch_sync_pull_decision(
+                engine,
+                sync_pull_request(slot),
+                slot.credential_authenticated,
+                slot.principal.as_ref(),
+            ),
+            GateFrontend::SyncAck => {
+                let (applied_lsn, observed_remote_lsn) =
+                    slot.ack_lsns.expect("an ack frame carries both LSNs");
+                dispatch_sync_ack_decision(
+                    engine,
+                    slot.replica_id.clone(),
+                    applied_lsn,
+                    observed_remote_lsn,
+                    slot.credential_authenticated,
+                    slot.principal.as_ref(),
+                )
+            }
+            GateFrontend::PowQl | GateFrontend::Sql | GateFrontend::Params => {
+                panic!("{frontend:?} is not a sync frontend")
+            }
+        }
+    }
+
+    /// Run one probe frame through the real frontend that serves it, and
+    /// return the response the client would receive.
+    async fn run_gate_probe(env: &GateProbeEnv, spec: &ProbeSpec) -> Message {
+        let (_client, server) = tokio::io::duplex(1024);
+        let mut reader = BufReader::new(server);
+        let mut wire_read_buffer = Vec::new();
+        let mut pending_messages = InFlightReadAhead::default();
+        let mut tx_permit = None;
+        let engine = Arc::clone(&env.engine);
+        let metrics = Arc::clone(&env.metrics);
+        let query_timeout = Duration::from_secs(2);
+
+        match spec.frontend {
+            GateFrontend::PowQl => {
+                let slot = spec
+                    .query
+                    .as_ref()
+                    .expect("a query frontend has a statement");
+                execute_wire_query(
+                    engine,
+                    env.gate.clone(),
+                    &mut tx_permit,
+                    slot.text.clone(),
+                    WireResultMode::Native,
+                    slot.principal.clone(),
+                    query_timeout,
+                    env.tx_wait_timeout,
+                    &metrics,
+                    &mut reader,
+                    &mut wire_read_buffer,
+                    &mut pending_messages,
+                )
+                .await
+                .0
+            }
+            GateFrontend::Sql => {
+                let slot = spec
+                    .query
+                    .as_ref()
+                    .expect("a query frontend has a statement");
+                execute_wire_query_sql(
+                    engine,
+                    env.gate.clone(),
+                    &mut tx_permit,
+                    slot.text.clone(),
+                    WireResultMode::Native,
+                    slot.principal.clone(),
+                    query_timeout,
+                    env.tx_wait_timeout,
+                    &metrics,
+                    &mut reader,
+                    &mut wire_read_buffer,
+                    &mut pending_messages,
+                )
+                .await
+                .0
+            }
+            GateFrontend::Params => {
+                let slot = spec
+                    .query
+                    .as_ref()
+                    .expect("a query frontend has a statement");
+                execute_wire_query_with_params(
+                    engine,
+                    env.gate.clone(),
+                    &mut tx_permit,
+                    slot.text.clone(),
+                    slot.params.clone(),
+                    WireResultMode::Native,
+                    slot.principal.clone(),
+                    query_timeout,
+                    env.tx_wait_timeout,
+                    &metrics,
+                    &mut reader,
+                    &mut wire_read_buffer,
+                    &mut pending_messages,
+                )
+                .await
+                .0
+            }
+            GateFrontend::SyncStatus | GateFrontend::SyncPull | GateFrontend::SyncAck => {
+                let slot = spec
+                    .sync
+                    .as_ref()
+                    .expect("a sync frontend has a sync slot")
+                    .clone();
+                let frontend = spec.frontend;
+                let operation = match frontend {
+                    GateFrontend::SyncStatus => SyncOperation::Status,
+                    GateFrontend::SyncPull => SyncOperation::Pull,
+                    _ => SyncOperation::Ack,
+                };
+                let log_context = match frontend {
+                    GateFrontend::SyncStatus => SyncLogContext::status(&slot.replica_id),
+                    GateFrontend::SyncPull => SyncLogContext::pull(&sync_pull_request(&slot)),
+                    _ => {
+                        let (applied_lsn, observed_remote_lsn) =
+                            slot.ack_lsns.expect("an ack frame carries both LSNs");
+                        SyncLogContext::ack(&slot.replica_id, applied_lsn, observed_remote_lsn)
+                    }
+                };
+                execute_gated_sync(
+                    SyncExecutionContext {
+                        tx_gate: env.gate.clone(),
+                        connection_has_transaction: slot.connection_has_transaction,
+                        operation,
+                        log_context,
+                        metrics: &metrics,
+                        query_timeout,
+                        tx_wait_timeout: env.tx_wait_timeout,
+                        credential_authenticated: slot.credential_authenticated,
+                        principal: slot.principal.clone(),
+                        pre_gate: sync_pre_gate(frontend, &slot),
+                    },
+                    (engine, frontend, slot),
+                    |(engine, frontend, slot)| dispatch_sync_decision(&engine, frontend, &slot),
+                )
+                .await
+            }
+        }
+    }
+
+    #[test]
+    fn every_gate_frontend_is_reachable_from_the_dispatch_surface() {
+        for frontend in GateFrontend::ALL.iter().copied() {
+            assert_eq!(
+                gate_frontend(&representative_frame(frontend)),
+                Some(frontend),
+                "{frontend:?} is in the parity matrix but no wire frame dispatches to it"
+            );
+        }
+        for msg in [Message::Ping, Message::Pong, Message::Disconnect] {
+            assert_eq!(
+                gate_frontend(&msg),
+                None,
+                "{msg:?} does not reach the transaction gate"
+            );
+        }
+    }
+
+    /// Every frontend that has a sync slot, derived from `runnable_spec`.
+    fn sync_frontends() -> Vec<GateFrontend> {
+        GateFrontend::ALL
+            .iter()
+            .copied()
+            .filter(|f| runnable_spec(*f).sync.is_some())
+            .collect()
+    }
+
+    /// PARITY, axis 1 x axis 2: every pre-gate rule, on every frontend it
+    /// reaches, must be refused without acquiring a permit and with the class
+    /// that rule means. The held single-permit gate is the mutation check: any
+    /// frontend that queues for a permit before deciding blows the 250ms
+    /// budget, a fortieth of the 10s `tx_wait_timeout` it would be waiting on.
+    #[tokio::test]
+    async fn every_pre_gate_rule_is_refused_without_a_permit_on_every_frontend_it_reaches() {
         let (_dir, engine) = one_row_engine();
         let gate = new_tx_gate_with_permits(1);
         let metrics = Arc::new(Metrics::new());
-        let _held_reader = acquire_autocommit_permit(
+        let held_reader = acquire_autocommit_permit(
+            &gate,
+            AdmissionMode::Reader,
+            Duration::from_secs(1),
+            &metrics,
+        )
+        .await
+        .expect("held reader admission");
+        assert_eq!(gate.available_permits(), 0);
+
+        let env = GateProbeEnv {
+            engine,
+            gate: gate.clone(),
+            metrics: Arc::clone(&metrics),
+            tx_wait_timeout: Duration::from_secs(10),
+        };
+
+        let mut coverage: BTreeMap<GateRule, Vec<GateFrontend>> = BTreeMap::new();
+        for rule in GateRule::ALL.iter().copied() {
+            for frontend in GateFrontend::ALL.iter().copied() {
+                let mut spec = runnable_spec(frontend);
+                if !rule.violate(&mut spec) {
+                    continue;
+                }
+                coverage.entry(rule).or_default().push(frontend);
+                let response =
+                    tokio::time::timeout(Duration::from_millis(250), run_gate_probe(&env, &spec))
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "{rule:?} on {frontend:?} waited on the transaction gate for a \
+                                 frame that executes nothing"
+                            )
+                        });
+                match response {
+                    Message::ErrorWithClass { class, message } => assert_eq!(
+                        class,
+                        rule.expected_class(),
+                        "{rule:?} on {frontend:?} carried the wrong class: {message}"
+                    ),
+                    other => panic!(
+                        "{rule:?} on {frontend:?} answered without a wire error class: {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    gate.available_permits(),
+                    0,
+                    "{rule:?} on {frontend:?} must acquire nothing"
+                );
+            }
+            assert!(
+                coverage.contains_key(&rule),
+                "{rule:?} is enumerated but reaches no frontend: either the rule is dead or the \
+                 slot it corrupts was renamed out from under `violate`"
+            );
+        }
+
+        // Derived, not listed: a rule that corrupts a field EVERY sync frame
+        // carries must have been probed on EVERY sync frontend. This is the
+        // assertion the one-example-per-frontend matrix could not make, and it
+        // is the one that fails when a pre-gate check is narrowed to a single
+        // sync message type.
+        let sync = sync_frontends();
+        for rule in GateRule::ALL.iter().copied() {
+            let universal = sync.iter().all(|frontend| {
+                let mut probe = runnable_spec(*frontend);
+                rule.violate(&mut probe)
+            });
+            if universal {
+                assert_eq!(
+                    coverage[&rule], sync,
+                    "{rule:?} corrupts a field every sync frame carries but was probed on a subset"
+                );
+            }
+        }
+
+        assert!(
+            metrics.render().contains("powdb_tx_gate_timeouts_total 0"),
+            "no frontend may report a gate timeout it never waited for"
+        );
+        drop(held_reader);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    /// The same cross product asserted directly against `SyncPreGate::check`,
+    /// with no gate, no timing, and no engine in the way.
+    ///
+    /// The wire-level matrix above catches a narrowed pre-gate check by timing
+    /// out on a held gate; this one catches it by name, on every sync frontend,
+    /// in microseconds.
+    #[test]
+    fn every_sync_pre_gate_rule_is_checked_on_every_sync_frontend() {
+        for frontend in sync_frontends() {
+            let runnable = runnable_spec(frontend);
+            let slot = runnable.sync.as_ref().expect("a sync frontend has a slot");
+            assert!(
+                sync_pre_gate(frontend, slot)
+                    .check(slot.credential_authenticated, slot.principal.as_ref())
+                    .is_ok(),
+                "{frontend:?}'s runnable frame must pass the pre-gate, or every probe below \
+                 proves nothing"
+            );
+        }
+
+        for rule in GateRule::ALL.iter().copied() {
+            let Some(expected) = rule.pre_gate_class() else {
+                continue;
+            };
+            let mut checked = 0usize;
+            for frontend in sync_frontends() {
+                let mut spec = runnable_spec(frontend);
+                if !rule.violate(&mut spec) {
+                    continue;
+                }
+                let slot = spec.sync.as_ref().expect("a sync frontend has a slot");
+                match sync_pre_gate(frontend, slot)
+                    .check(slot.credential_authenticated, slot.principal.as_ref())
+                {
+                    Err((class, message)) => assert_eq!(
+                        class, expected,
+                        "{rule:?} on {frontend:?} was refused as {class:?}, not {expected:?}: \
+                         {message}"
+                    ),
+                    Ok(()) => panic!(
+                        "{rule:?} is not checked pre-gate on {frontend:?}: this frame reaches \
+                         `acquire_sync_permit` and takes the whole transaction gate before the \
+                         dispatch function refuses it"
+                    ),
+                }
+                checked += 1;
+            }
+            assert!(
+                checked > 0,
+                "{rule:?} declares a pre-gate class but reaches no sync frontend"
+            );
+        }
+    }
+
+    /// PARITY: every frontend's gate acquire is bounded by `tx_wait_timeout`,
+    /// answers with a typed `Timeout`, and is counted. The sync frontend had
+    /// none of the three: it waited out the whole hold, wrote no error frame,
+    /// and never touched the counter, so a starved replica was invisible.
+    #[tokio::test]
+    async fn every_gate_frontend_bounds_its_acquire_and_counts_the_timeout() {
+        let (_dir, engine) = one_row_engine();
+        let gate = new_tx_gate_with_permits(1);
+        let metrics = Arc::new(Metrics::new());
+        let tx_wait_timeout = Duration::from_millis(150);
+        let held_reader = acquire_autocommit_permit(
             &gate,
             AdmissionMode::Reader,
             Duration::from_secs(1),
@@ -4072,71 +5967,605 @@ mod tests {
         .await
         .expect("held reader admission");
 
-        let (_sql_client, sql_server) = tokio::io::duplex(1024);
-        let mut reader = BufReader::new(sql_server);
-        let mut wire_read_buffer = Vec::new();
-        let mut pending_messages = InFlightReadAhead::default();
-        let mut tx_permit = None;
-        let (message, _, _) = tokio::time::timeout(
-            Duration::from_millis(250),
-            execute_wire_query_sql(
-                Arc::clone(&engine),
-                gate.clone(),
-                &mut tx_permit,
-                "SELEKT * FROM".into(),
-                WireResultMode::Native,
-                None,
-                Duration::from_secs(2),
-                Duration::from_secs(10),
-                &metrics,
-                &mut reader,
-                &mut wire_read_buffer,
-                &mut pending_messages,
-            ),
-        )
-        .await
-        .expect("an unparsable SQL frame must never wait on the transaction gate");
-        assert!(matches!(
-            message,
-            Message::ErrorWithClass {
-                class: ErrorClass::Parse,
-                ..
+        let env = GateProbeEnv {
+            engine,
+            gate: gate.clone(),
+            metrics: Arc::clone(&metrics),
+            tx_wait_timeout,
+        };
+        for (waited, frontend) in GateFrontend::ALL.iter().copied().enumerate() {
+            let started = Instant::now();
+            let spec = runnable_spec(frontend);
+            let response =
+                tokio::time::timeout(Duration::from_secs(5), run_gate_probe(&env, &spec))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("{frontend:?} acquires the gate with no timeout at all")
+                    });
+            assert!(
+                started.elapsed() >= tx_wait_timeout,
+                "{frontend:?} gave up before its wait elapsed"
+            );
+            match response {
+                Message::ErrorWithClass { class, message } => {
+                    assert_eq!(class, ErrorClass::Timeout, "{frontend:?}: {message}");
+                    assert!(
+                        message.contains("transaction gate timeout"),
+                        "{frontend:?} did not name the gate wait: {message}"
+                    );
+                }
+                other => panic!("{frontend:?} answered without a wire error class: {other:?}"),
             }
-        ));
+            assert!(
+                metrics
+                    .render()
+                    .contains(&format!("powdb_tx_gate_timeouts_total {}", waited + 1)),
+                "{frontend:?} timed out on the gate without counting it"
+            );
+        }
+        drop(held_reader);
+    }
 
-        let (_params_client, params_server) = tokio::io::duplex(1024);
-        let mut reader = BufReader::new(params_server);
-        let mut wire_read_buffer = Vec::new();
-        let mut pending_messages = InFlightReadAhead::default();
-        let mut tx_permit = None;
-        let (message, _, _) = tokio::time::timeout(
-            Duration::from_millis(250),
-            execute_wire_query_with_params(
-                engine,
-                gate.clone(),
-                &mut tx_permit,
-                "User filter .id = = $1".into(),
-                vec![WireParam::Int(1)],
-                WireResultMode::Native,
-                None,
-                Duration::from_secs(2),
-                Duration::from_secs(10),
-                &metrics,
-                &mut reader,
-                &mut wire_read_buffer,
-                &mut pending_messages,
-            ),
-        )
-        .await
-        .expect("an unparsable parameterized frame must never wait on the transaction gate");
-        assert!(matches!(
-            message,
-            Message::ErrorWithClass {
-                class: ErrorClass::Parse,
-                ..
+    /// Poison the engine lock so any read of it fails. Every sync dispatch
+    /// function reaches the engine through `sync_context`, so after this the
+    /// ONLY answers they can still give are the ones that need no engine at
+    /// all, plus `SyncContext` itself.
+    fn poison_engine_lock(engine: &Arc<RwLock<Engine>>) {
+        let poisoner = Arc::clone(engine);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("lock is not poisoned yet");
+            panic!("poisoning the engine lock on purpose (expected in this test)");
+        })
+        .join();
+        assert!(
+            engine.read().is_err(),
+            "the engine lock did not end up poisoned; this test proves nothing without it"
+        );
+    }
+
+    /// One-field-at-a-time sweep from this frontend's runnable frame. A refusal
+    /// keyed on any single request field shows up here.
+    fn sync_corpus(frontend: GateFrontend) -> Vec<SyncSlot> {
+        let base = runnable_spec(frontend)
+            .sync
+            .expect("a sync frontend has a slot");
+        let mut out = vec![base.clone()];
+        let mut push = |mutate: &dyn Fn(&mut SyncSlot)| {
+            let mut slot = base.clone();
+            mutate(&mut slot);
+            out.push(slot);
+        };
+
+        for authenticated in [false, true] {
+            push(&|slot: &mut SyncSlot| slot.credential_authenticated = authenticated);
+        }
+        for role in ["readonly", "admin", "no-such-role"] {
+            push(&|slot: &mut SyncSlot| slot.principal = principal(role));
+        }
+        push(&|slot: &mut SyncSlot| slot.principal = None);
+        let long_id = "x".repeat(129);
+        for replica_id in ["", "replica-a", "bad id!", long_id.as_str()] {
+            push(&|slot: &mut SyncSlot| slot.replica_id = replica_id.to_string());
+        }
+        if base.pull_bounds.is_some() {
+            for units in [
+                0u32,
+                1,
+                MAX_SYNC_PULL_UNITS,
+                MAX_SYNC_PULL_UNITS + 1,
+                u32::MAX,
+            ] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(bounds) = slot.pull_bounds.as_mut() {
+                        bounds.0 = units;
+                    }
+                });
             }
-        ));
-        assert_eq!(gate.available_permits(), 0);
+            for bytes in [
+                0u64,
+                1,
+                MAX_SYNC_PULL_BYTES,
+                MAX_SYNC_PULL_BYTES + 1,
+                u64::MAX,
+            ] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(bounds) = slot.pull_bounds.as_mut() {
+                        bounds.1 = bytes;
+                    }
+                });
+            }
+        }
+        if base.pull_identity.is_some() {
+            for since_lsn in [0u64, 1, 2, 3, 4, 5, 6, 7, 8, u64::MAX] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.since_lsn = since_lsn;
+                    }
+                });
+            }
+            for database_id in [[0u8; 16], [0xffu8; 16]] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.database_id = database_id;
+                    }
+                });
+            }
+            for generation in [0u64, 1, u64::MAX] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.primary_generation = generation;
+                    }
+                });
+            }
+            for wal in [0u16, 1, u16::MAX] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.wal_format_version = wal;
+                    }
+                });
+            }
+            for catalog in [0u16, 5, 6, 7, u16::MAX] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.catalog_version = catalog;
+                    }
+                });
+            }
+            for segment in [0u16, 1, u16::MAX] {
+                push(&|slot: &mut SyncSlot| {
+                    if let Some(identity) = slot.pull_identity.as_mut() {
+                        identity.segment_format_version = segment;
+                    }
+                });
+            }
+        }
+        if base.ack_lsns.is_some() {
+            for lsns in [
+                (0u64, 0u64),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (5, 0),
+                (u64::MAX, 0),
+                (0, u64::MAX),
+                (u64::MAX, u64::MAX),
+            ] {
+                push(&|slot: &mut SyncSlot| slot.ack_lsns = Some(lsns));
+            }
+        }
+        out
+    }
+
+    /// PARITY, the other direction: a refusal the dispatch functions can reach
+    /// WITHOUT reading the engine must also be a pre-gate refusal.
+    ///
+    /// This is the runtime half of the guard against a pure rejection sitting
+    /// under the gate. With the engine lock poisoned every engine read fails,
+    /// so any answer other than `SyncContext` is by construction one the server
+    /// could have given before taking a single permit. If the pre-gate does not
+    /// give that same answer, the frame takes the entire gate on its way to
+    /// being refused, which is exactly the outage this whole section exists to
+    /// prevent.
+    #[test]
+    fn every_engine_free_sync_refusal_is_also_a_pre_gate_refusal() {
+        let (_dir, engine) = one_row_engine();
+        poison_engine_lock(&engine);
+
+        let mut observed_pure: BTreeSet<&'static str> = BTreeSet::new();
+        let mut saw_engine_dependent = false;
+        for frontend in sync_frontends() {
+            for slot in sync_corpus(frontend) {
+                let decision = dispatch_sync_decision(&engine, frontend, &slot);
+                let class = decision.error_class.unwrap_or_else(|| {
+                    panic!(
+                        "{frontend:?} answered successfully with a poisoned engine: {:?}",
+                        decision.message
+                    )
+                });
+                if class == SyncErrorClass::SyncContext {
+                    saw_engine_dependent = true;
+                    continue;
+                }
+                observed_pure.insert(class.as_label());
+                match sync_pre_gate(frontend, &slot)
+                    .check(slot.credential_authenticated, slot.principal.as_ref())
+                {
+                    Err((pre_gate_class, _)) => assert_eq!(
+                        pre_gate_class, class,
+                        "{frontend:?} refuses replica {:?} as {class:?} without reading the \
+                         engine, but the pre-gate refuses it as {pre_gate_class:?}",
+                        slot.replica_id
+                    ),
+                    Ok(()) => panic!(
+                        "{frontend:?} refuses replica {:?} as {class:?} without ever reading the \
+                         engine, and the pre-gate lets it through: that refusal runs under the \
+                         whole transaction gate. Move the check into `SyncPreGate::check`, add a \
+                         `GateRule` for it, and the matrix will probe it on every frontend it \
+                         reaches.",
+                        slot.replica_id
+                    ),
+                }
+            }
+        }
+        assert!(
+            saw_engine_dependent,
+            "no corpus entry reached the engine, so this test proved nothing"
+        );
+        for rule in GateRule::ALL.iter().copied() {
+            if let Some(class) = rule.pre_gate_class() {
+                assert!(
+                    observed_pure.contains(class.as_label()),
+                    "{rule:?} declares the pre-gate class {class:?} but no corpus frame produced \
+                     it, so the sweep does not actually cover that rule"
+                );
+            }
+        }
+    }
+
+    /// Every rejection site inside the gated sync path, declared.
+    ///
+    /// `(function, SyncErrorClass, occurrences)`. The test below reads this
+    /// file's own source and rebuilds the same table; a mismatch means someone
+    /// added, removed, or moved a way for a sync frame to be refused.
+    ///
+    /// This exists because the wire-level and pre-gate matrices above can only
+    /// probe rules they know about. A BRAND-NEW refusal added inside a dispatch
+    /// function is invisible to both of them: it is decided under the gate, so
+    /// a frame that will be refused in microseconds still waits out another
+    /// connection's entire transaction first. Failing the build until the
+    /// author classifies the new site is the only way that stays caught.
+    ///
+    /// When this test fails: if the new refusal needs NO engine access, move it
+    /// into `SyncPreGate::check` and add a `GateRule` for it, which makes the
+    /// matrix probe it on every frontend it reaches. If it genuinely needs the
+    /// engine, it belongs under the gate, and updating this table is the whole
+    /// fix.
+    const DECLARED_SYNC_REJECTION_SITES: &[(&str, &str, usize)] = &[
+        ("acquire_sync_permit", "GateTimeout", 1),
+        ("acquire_sync_permit", "QueryExecution", 1),
+        ("classify_sync_ack_failure", "AckRejected", 1),
+        ("classify_sync_ack_failure", "AckUpdate", 1),
+        ("dispatch_sync_ack_decision", "AckValidation", 1),
+        ("dispatch_sync_ack_decision", "LsnAheadOfRemote", 1),
+        ("dispatch_sync_ack_decision", "SyncContext", 1),
+        ("dispatch_sync_pull_decision", "CursorLsnMismatch", 1),
+        ("dispatch_sync_pull_decision", "IdentityOrFormatMismatch", 2),
+        ("dispatch_sync_pull_decision", "IdentityRead", 1),
+        ("dispatch_sync_pull_decision", "InvalidMaxBytes", 1),
+        (
+            "dispatch_sync_pull_decision",
+            "RetainedChunkNotApplyable",
+            1,
+        ),
+        ("dispatch_sync_pull_decision", "RetainedRead", 1),
+        ("dispatch_sync_pull_decision", "RetainedUnitEncoding", 1),
+        ("dispatch_sync_pull_decision", "StatusRead", 1),
+        ("dispatch_sync_pull_decision", "SyncContext", 1),
+        ("dispatch_sync_status_decision", "StatusRead", 1),
+        ("dispatch_sync_status_decision", "SyncContext", 1),
+        ("execute_gated_sync", "ActiveTransaction", 1),
+        ("run_blocking_sync", "Internal", 2),
+    ];
+
+    /// Everything a sync dispatch function may do before it reads the engine,
+    /// declared: clone what it needs for the pre-gate, consult the pre-gate,
+    /// and build the pre-gate's refusal. Nothing else.
+    ///
+    /// `Err` is on the list because the scan below is syntactic and cannot
+    /// tell `Err(..)` in a pattern from a call; it decides nothing either way.
+    const PRE_ENGINE_CALLS_ALLOWED_IN_SYNC_DISPATCH: &[&str] =
+        &["Err", "SyncDecision::error", "check", "clone"];
+
+    /// The three dispatch functions run under the whole transaction gate, so a
+    /// refusal they make BEFORE they read the engine is a refusal another
+    /// connection's open transaction can delay by minutes. Structurally there
+    /// may be exactly one such refusal per function, and it must be the shared
+    /// pre-gate the wire path already applied.
+    ///
+    /// WHAT THIS CATCHES. A new refusal written into one of these three
+    /// functions ahead of the engine read, in each form it can reach source:
+    /// a second `SyncDecision::error(`; a second early `return` (any early exit
+    /// from a function returning `SyncDecision` needs one, since there is no
+    /// `?` to hide behind); or a call to a helper holding either. The last one
+    /// is why the permitted calls are declared rather than counted: moving the
+    /// refusal behind `fn refuse_x() -> SyncDecision` or
+    /// `fn refuse_x(..) -> Option<SyncDecision>` changes nothing this test can
+    /// see about `SyncDecision::error`, but it cannot avoid naming `refuse_x`
+    /// here.
+    ///
+    /// WHAT THIS CANNOT CATCH. It reads this file's text, so a refusal added
+    /// inside something it already permits is invisible to it: a new check
+    /// inside `SyncPreGate::check`, or inside `sync_context`, or in another
+    /// module entirely. The pre-gate is the sanctioned place for exactly that,
+    /// and `every_pre_gate_class_has_a_rule_the_matrix_walks` forces every
+    /// class it can answer with to have a `GateRule` beside it, which is what
+    /// makes the matrix probe it. So this test is a fence around the one region
+    /// the matrices cannot reach, not a proof that no free refusal exists
+    /// anywhere. The load-bearing half of this section is the runtime parity
+    /// matrix: `every_sync_pre_gate_rule_is_checked_on_every_sync_frontend`
+    /// and the wire-level matrix above it, which probe behavior on every
+    /// frontend instead of reading text.
+    #[test]
+    fn no_sync_dispatch_function_refuses_a_frame_before_it_reads_the_engine() {
+        let src = include_str!("handler.rs");
+        for name in [
+            "dispatch_sync_status_decision",
+            "dispatch_sync_pull_decision",
+            "dispatch_sync_ack_decision",
+        ] {
+            let body = top_level_fn_body(src, name);
+            let engine_read = body.find("sync_context(engine)").unwrap_or_else(|| {
+                panic!("{name} no longer reads the engine through sync_context")
+            });
+            let pre_gate_check = body
+                .find("pre_gate.check(credential_authenticated, principal)")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} no longer delegates to `SyncPreGate::check`, so the pre-gate and \
+                         the gated path can drift apart again"
+                    )
+                });
+            assert!(
+                pre_gate_check < engine_read,
+                "{name} consults the pre-gate only after reading the engine"
+            );
+            let before_engine = &body[..engine_read];
+
+            let early = before_engine.match_indices("SyncDecision::error(").count();
+            assert_eq!(
+                early, 1,
+                "{name} refuses a frame {early} times before it reads the engine. Only the shared \
+                 pre-gate may do that: any other refusal there needs no engine access, which \
+                 means it is being decided while this frame holds the whole transaction gate. \
+                 Move it into `SyncPreGate::check` and give it a `GateRule`, and the parity \
+                 matrix will probe it on every frontend it reaches."
+            );
+
+            let returns = word_occurrences(before_engine, "return");
+            assert_eq!(
+                returns, 1,
+                "{name} leaves itself {returns} times before it reads the engine. Exactly one \
+                 early exit may live there, the pre-gate's; a second one is a refusal decided \
+                 while this frame holds the whole transaction gate, even when the decision \
+                 itself was made inside a helper."
+            );
+
+            let mut unexpected: Vec<String> = called_names(before_engine)
+                .into_iter()
+                .filter(|called| {
+                    called != name
+                        && !PRE_ENGINE_CALLS_ALLOWED_IN_SYNC_DISPATCH.contains(&&**called)
+                })
+                .collect();
+            unexpected.sort();
+            unexpected.dedup();
+            assert!(
+                unexpected.is_empty(),
+                "{name} calls {unexpected:?} before it reads the engine. Whatever those decide is \
+                 decided while this frame holds the whole transaction gate. If they can refuse \
+                 the frame, the refusal belongs in `SyncPreGate::check` with a `GateRule` beside \
+                 it; if they genuinely cannot, add them to \
+                 PRE_ENGINE_CALLS_ALLOWED_IN_SYNC_DISPATCH and say why."
+            );
+        }
+    }
+
+    /// Occurrences of `word` in `src` that are whole tokens, so `return` does
+    /// not match `returns` and `fn` does not match `fnord`.
+    fn word_occurrences(src: &str, word: &str) -> usize {
+        let bytes = src.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        src.match_indices(word)
+            .filter(|(idx, _)| {
+                let before_ok = *idx == 0 || !is_ident(bytes[idx - 1]);
+                let after = idx + word.len();
+                let after_ok = after == bytes.len() || !is_ident(bytes[after]);
+                before_ok && after_ok
+            })
+            .count()
+    }
+
+    /// Every name that is CALLED in `src`: `foo(` as `foo`, `Type::assoc(` as
+    /// `Type::assoc`, `x.method(` as `method`, and `mac!(` as `mac!`.
+    ///
+    /// Deliberately syntactic. It is not trying to understand the code, only
+    /// to make a function that appears in a region where nothing may decide
+    /// anything impossible to add silently.
+    fn called_names(src: &str) -> Vec<String> {
+        let bytes = src.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut names = Vec::new();
+        for (idx, byte) in bytes.iter().enumerate() {
+            if *byte != b'(' {
+                continue;
+            }
+            let mut end = idx;
+            let macro_call = end > 0 && bytes[end - 1] == b'!';
+            if macro_call {
+                end -= 1;
+            }
+            let mut start = end;
+            while start > 0 && is_ident(bytes[start - 1]) {
+                start -= 1;
+            }
+            if start == end {
+                // A `(` that opens a group, a tuple, or an argument list.
+                continue;
+            }
+            // Keep any `Type::` qualification, so `SyncDecision::error` cannot
+            // be permitted by declaring a bare `error`.
+            let mut path = start;
+            while path >= 2 && bytes[path - 1] == b':' && bytes[path - 2] == b':' {
+                let mut segment = path - 2;
+                while segment > 0 && is_ident(bytes[segment - 1]) {
+                    segment -= 1;
+                }
+                if segment == path - 2 {
+                    break;
+                }
+                path = segment;
+            }
+            let mut name = src[path..end].to_string();
+            if macro_call {
+                name.push('!');
+            }
+            names.push(name);
+        }
+        names
+    }
+
+    /// The body of an `impl` block, from its header to the closing brace in
+    /// column 0.
+    fn impl_block<'a>(src: &'a str, header: &str) -> &'a str {
+        let start = src
+            .find(header)
+            .unwrap_or_else(|| panic!("`{header}` is not in handler.rs"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{header}` has no closing brace in column 0"));
+        &rest[..end]
+    }
+
+    /// Every class the pre-gate can answer with must have a `GateRule`, and
+    /// every `GateRule` class must be one the pre-gate can answer with.
+    ///
+    /// Without this, a new pre-gate check would be safe from the gate but
+    /// invisible to the matrix, so it could be applied to one sync frontend and
+    /// forgotten on the other two: the exact partial application this section
+    /// exists to make impossible.
+    #[test]
+    fn every_pre_gate_class_has_a_rule_the_matrix_walks() {
+        let src = include_str!("handler.rs");
+        let mut produced: BTreeSet<String> = BTreeSet::new();
+        let mut scan = |body: &str| {
+            for (idx, _) in body.match_indices("SyncErrorClass::") {
+                let tail = &body[idx + "SyncErrorClass::".len()..];
+                produced.insert(
+                    tail.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect(),
+                );
+            }
+        };
+        scan(impl_block(src, "\nimpl SyncPreGate {"));
+        for name in [
+            "check_sync_protocol_permitted",
+            "check_sync_pull_bounds",
+            "check_sync_ack_lsn_bounds",
+        ] {
+            scan(top_level_fn_body(src, name));
+        }
+
+        let declared: BTreeSet<String> = GateRule::ALL
+            .iter()
+            .filter_map(|rule| rule.pre_gate_class())
+            .map(|class| format!("{class:?}"))
+            .collect();
+        assert_eq!(
+            produced, declared,
+            "the pre-gate and the rule enumeration disagree about what can be refused for free. \
+             Every class on the left needs a `GateRule`, which is what makes the matrix probe it \
+             on every frontend it reaches; every class on the right must actually be reachable \
+             from the pre-gate."
+        );
+    }
+
+    /// The body of a top-level function, from its signature to the closing
+    /// brace in column 0.
+    ///
+    /// The name is matched as a whole token: `fn run_blocking_sync` must not
+    /// resolve to `fn run_blocking_sync_preflight` declared earlier in the
+    /// file. A prefix match there is not a near miss, it is a hole: the guards
+    /// below would then count rejection sites in a decoy and never look at the
+    /// function they name, and every one of them would pass while saying
+    /// nothing.
+    fn top_level_fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let bytes = src.as_bytes();
+        let mut starts: Vec<usize> = Vec::new();
+        for keyword in [
+            "\nfn ",
+            "\nasync fn ",
+            "\npub fn ",
+            "\npub async fn ",
+            "\npub(crate) fn ",
+            "\npub(crate) async fn ",
+        ] {
+            let needle = format!("{keyword}{name}");
+            for (idx, _) in src.match_indices(&needle) {
+                // The declaration ends the name here, rather than continuing
+                // it: `(` for a plain function, `<` for a generic one.
+                match bytes.get(idx + needle.len()) {
+                    Some(b'(') | Some(b'<') => starts.push(idx),
+                    _ => {}
+                }
+            }
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        assert!(
+            starts.len() <= 1,
+            "`fn {name}` is declared {} times at the top level of handler.rs; the guards below \
+             would inspect one of them and ignore the rest",
+            starts.len()
+        );
+        let start = starts.first().copied().unwrap_or_else(|| {
+            panic!("`fn {name}` is not in handler.rs; the rejection-site guard cannot see it")
+        });
+        let rest = &src[start + 1..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`fn {name}` has no closing brace in column 0"));
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_gated_sync_rejection_site_is_declared() {
+        let src = include_str!("handler.rs");
+        let mut actual: BTreeMap<(&str, String), usize> = BTreeMap::new();
+        for name in [
+            "acquire_sync_permit",
+            "classify_sync_ack_failure",
+            "dispatch_sync_ack_decision",
+            "dispatch_sync_pull_decision",
+            "dispatch_sync_status_decision",
+            "execute_gated_sync",
+            "run_blocking_sync",
+        ] {
+            let body = top_level_fn_body(src, name);
+            for (idx, _) in body.match_indices("SyncErrorClass::") {
+                let tail = &body[idx + "SyncErrorClass::".len()..];
+                let class: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                *actual.entry((name, class)).or_insert(0) += 1;
+            }
+        }
+
+        let declared: BTreeMap<(&str, String), usize> = DECLARED_SYNC_REJECTION_SITES
+            .iter()
+            .map(|(function, class, count)| ((*function, (*class).to_string()), *count))
+            .collect();
+
+        if actual != declared {
+            let rendered = actual
+                .iter()
+                .map(|((function, class), count)| {
+                    format!("        (\"{function}\", \"{class}\", {count}),")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "the gated sync path gained, lost, or moved a way to refuse a frame.\n\n\
+                 If the new refusal needs NO engine access it must move into \
+                 `SyncPreGate::check` with a `GateRule` beside it, so the parity matrix probes it \
+                 on every frontend it reaches; a pure refusal decided under the gate makes a \
+                 frame wait out another connection's whole transaction before being told no.\n\
+                 If it genuinely needs the engine, paste this over \
+                 DECLARED_SYNC_REJECTION_SITES:\n\n{rendered}\n"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4931,6 +7360,38 @@ mod tests {
         assert_eq!(SyncErrorClass::Internal.as_label(), "internal");
     }
 
+    /// A replica has exactly two "rebootstrap required" answers to branch on,
+    /// one from the pull side and one from the ack side, and they must arrive
+    /// as the SAME wire class. The ack one used to be reported as `Internal`,
+    /// which a driver is told to treat as "server bug, nothing you can fix",
+    /// so a replica whose cursor was gone or deactivated could not tell that
+    /// answer apart from an unclassified server fault.
+    #[test]
+    fn a_refused_cursor_advance_is_classified_like_its_pull_side_twin() {
+        for kind in [
+            std::io::ErrorKind::NotFound,     // cursor not found
+            std::io::ErrorKind::InvalidInput, // cursor inactive, or LSN behind
+        ] {
+            let err = std::io::Error::new(kind, "replica cursor not found; rebootstrap required");
+            let class = classify_sync_ack_failure(&err);
+            assert_eq!(class, SyncErrorClass::AckRejected, "{kind:?}");
+            assert_eq!(
+                class.wire_class(),
+                SyncErrorClass::IdentityOrFormatMismatch.wire_class(),
+                "the two rebootstrap answers must reach the replica as one class"
+            );
+            assert_ne!(class.wire_class(), ErrorClass::Internal);
+        }
+        // A real I/O failure is still the server's problem, not the replica's.
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "disk is read-only");
+        assert_eq!(classify_sync_ack_failure(&io), SyncErrorClass::AckUpdate);
+        assert_eq!(
+            SyncErrorClass::AckUpdate.wire_class(),
+            ErrorClass::Internal,
+            "an I/O failure the replica cannot act on stays unclassified"
+        );
+    }
+
     fn sync_identity() -> DatabaseIdentity {
         DatabaseIdentity {
             database_id: *b"server-sync-test",
@@ -4989,8 +7450,9 @@ mod tests {
         let engine = Arc::new(RwLock::new(Engine::new(dir.path()).unwrap()));
 
         match dispatch_sync_status(&engine, "replica-a".into(), false, None) {
-            Message::Error { message } => {
+            Message::ErrorWithClass { message, class } => {
                 assert!(message.contains("requires authentication"));
+                assert_eq!(class, ErrorClass::AuthFailed);
             }
             other => panic!("expected auth error, got {other:?}"),
         }
@@ -5000,8 +7462,10 @@ mod tests {
             role: "readonly".into(),
         };
         match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&readonly)) {
-            Message::Error { message } => {
+            Message::ErrorWithClass { message, class } => {
                 assert!(message.contains("permission denied"));
+                // Same class the query frontends give a role refusal.
+                assert_eq!(class, ErrorClass::Execution);
             }
             other => panic!("expected permission error, got {other:?}"),
         }
@@ -5161,7 +7625,7 @@ mod tests {
         // with a message naming both versions.
         let pull = pull_request_with_catalog_version(LEGACY_CATALOG_VERSION - 1);
         match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
-            Message::Error { message } => {
+            Message::ErrorWithClass { message, .. } => {
                 assert!(message.contains("v4"), "message: {message}");
                 assert!(message.contains("v5"), "message: {message}");
                 assert!(
@@ -5202,7 +7666,7 @@ mod tests {
         // now-activated v6 data and is rejected with the targeted message.
         let pull = pull_request_with_catalog_version(LEGACY_CATALOG_VERSION);
         match dispatch_sync_pull(&engine, pull, true, Some(&principal)) {
-            Message::Error { message } => {
+            Message::ErrorWithClass { message, .. } => {
                 assert!(message.contains("v5"), "message: {message}");
                 assert!(message.contains("v6"), "message: {message}");
                 assert!(
@@ -5263,7 +7727,9 @@ mod tests {
             segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
         };
         match dispatch_sync_pull(&engine, cut_pull, true, Some(&principal)) {
-            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            Message::ErrorWithClass { message, .. } => {
+                assert!(message.contains("cuts through transaction"))
+            }
             other => panic!("expected transaction-cut pull error, got {other:?}"),
         }
 
@@ -5279,7 +7745,9 @@ mod tests {
             segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
         };
         match dispatch_sync_pull(&engine, cut_bytes_pull, true, Some(&principal)) {
-            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            Message::ErrorWithClass { message, .. } => {
+                assert!(message.contains("cuts through transaction"))
+            }
             other => panic!("expected byte-capped transaction-cut pull error, got {other:?}"),
         }
 
@@ -5310,7 +7778,9 @@ mod tests {
             true,
             Some(&principal),
         ) {
-            Message::Error { message } => assert!(message.contains("cuts through transaction")),
+            Message::ErrorWithClass { message, .. } => {
+                assert!(message.contains("cuts through transaction"))
+            }
             other => panic!("expected transaction-cut ack error, got {other:?}"),
         }
         let cursor = powdb_sync::read_replica_cursors(dir.path()).unwrap();
@@ -5579,7 +8049,7 @@ mod tests {
             segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
         };
         match dispatch_sync_pull(&engine, wrong_cursor, true, Some(&principal)) {
-            Message::Error { message } => assert!(message.contains("does not match")),
+            Message::ErrorWithClass { message, .. } => assert!(message.contains("does not match")),
             other => panic!("expected cursor mismatch error, got {other:?}"),
         }
 
@@ -5595,7 +8065,9 @@ mod tests {
             segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION + 1,
         };
         match dispatch_sync_pull(&engine, wrong_format, true, Some(&principal)) {
-            Message::Error { message } => assert!(message.contains("rebootstrap required")),
+            Message::ErrorWithClass { message, .. } => {
+                assert!(message.contains("rebootstrap required"))
+            }
             other => panic!("expected format mismatch error, got {other:?}"),
         }
     }

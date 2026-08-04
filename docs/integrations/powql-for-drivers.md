@@ -71,6 +71,8 @@ Open with a `Connect` (`0x01`) frame, receive `ConnectOk` (`0x02`) or `Error`
    Omitting the field entirely (payload ends after `db_name`) also means none.
 3. `username`: length-prefixed string, appended after the password. Length `0`
    or an absent field means "no username".
+4. `hello`: the protocol negotiation block, since v0.22.0. Optional; see
+   [Protocol version negotiation](#protocol-version-negotiation).
 
 The password and username fields are append-only extensions: a client that
 sends only `db_name` + `password` is byte-identical to the pre-username frame,
@@ -78,17 +80,191 @@ and a client that sends only `db_name` is the oldest shape. Send `username`
 only for named-user (multi-user) auth; omit it for shared-password or open
 servers.
 
-`ConnectOk` payload is a single length-prefixed `version` string (the server's
-semver, e.g. `"0.14.0"`). There is no catalog-version field in the handshake;
-see [Version compatibility](#version-compatibility) for what the reference
-client actually checks.
+`ConnectOk` payload is a length-prefixed `version` string (the server's semver,
+e.g. `"0.22.0"`), optionally followed by the server's hello block.
+
+The whole payload after `db_name` is bounded by a 4 KiB pre-auth limit, so keep
+the hello small.
+
+### Protocol version negotiation
+
+**Read this before implementing anything else.** It is the contract every
+later release extends, and it is the only place a version disagreement is
+allowed to surface. A driver that skips it still works today, but it discovers
+every future addition as an unknown message tag in the middle of a session,
+which is the worst possible time.
+
+#### The hello blocks
+
+The client's hello is appended to `Connect` after the `username` field. Because
+it sits after `username` positionally, **a client that sends a hello must write
+the `username` field even when it is empty** (length `0`).
+
+```
+[magic:u32 LE = 0x50574831]   wire bytes 31 48 57 50
+[min_protocol:u16 LE]         oldest version this client speaks
+[max_protocol:u16 LE]         newest version this client speaks
+[catalog_version:u16 LE]      highest catalog format this client can read; 0 = not stated
+[feature_count:u16 LE]
+[feature_name:len-prefixed string] * feature_count
+```
+
+The server's hello is appended to `ConnectOk` after the `version` string:
+
+```
+[magic:u32 LE = 0x50574831]   wire bytes 31 48 57 50
+[protocol:u16 LE]             the NEGOTIATED version, in use for this session
+[min_protocol:u16 LE]         oldest version this server speaks
+[max_protocol:u16 LE]         newest version this server speaks
+[catalog_version:u16 LE]      highest catalog format this server writes; 0 = not stated
+[feature_count:u16 LE]
+[feature_name:len-prefixed string] * feature_count
+```
+
+The server's feature list is the **agreed set**: the intersection of what the
+client claimed and what the server implements. A feature absent from that list
+must not be used on this connection, whatever either side supports in the
+abstract.
+
+Limits a decoder must enforce: at most 64 feature names, each at most 64 bytes.
+
+#### Protocol versions
+
+| Version | Meaning |
+|---|---|
+| `1` | The implicit legacy protocol. Every release through v0.21.0. |
+| `2` | Negotiated handshake, introduced in v0.22.0. |
+
+A peer that sends **no hello block** is protocol `1` by definition. This is
+what makes the change backward compatible in both directions:
+
+- A **pre-v0.22.0 client** sends a `Connect` with no hello. A v0.22.0 server
+  negotiates protocol `1`, agrees to no named features, and answers with a
+  `ConnectOk` whose payload is byte-identical to the old one. Nothing breaks.
+- A **v0.22.0 client** against a **pre-v0.22.0 server** sends its hello; the
+  old server reads the fields it knows and ignores the trailing bytes, then
+  answers a bare `ConnectOk`. The client sees no hello in the reply and treats
+  the server as protocol `1`.
+
+There is no forced upgrade order. Upgrade either side first.
+
+#### The negotiation rule
+
+The server computes, from the client's stated range `[cmin, cmax]` and its own
+`[smin, smax]`:
+
+- `cmax < cmin` → refuse: malformed range.
+- `cmax < smin` → refuse: the client is too old (**upgrade the client**).
+- `cmin > smax` → refuse: the client is too new (**upgrade the server**).
+- otherwise → negotiated version is `min(cmax, smax)`.
+
+A refusal is an `Error` (`0x0A`) frame carrying error class `10`
+(`ProtocolVersion`, see [Section 6](#error-taxonomy)), sent **instead of**
+`ConnectOk`, after which the server closes the connection. It is a hard
+guarantee that this is the only point at which a version mismatch appears: once
+`ConnectOk` has been sent, no later frame can fail for version reasons.
+
+#### What a driver must check on the reply
+
+On receiving `ConnectOk`, before issuing any query:
+
+1. If there is no hello block, treat the server as protocol `1` with no
+   features and no stated catalog version.
+2. If the negotiated `protocol` is below the minimum your driver needs, fail
+   the handshake with a typed version error. Do not connect and hope.
+3. If any feature your driver requires is absent from the agreed set, fail the
+   handshake and name the missing feature.
+4. If the server's `catalog_version` is non-zero and higher than the highest
+   catalog format your driver can read, fail the handshake: you cannot read a
+   format from the future. A `catalog_version` of `0` on either side skips this
+   check.
+
+The reference TypeScript client does exactly this in `Client.connect`, driven
+by one exported descriptor:
+
+```ts
+import { CLIENT_CAPABILITIES, PROTOCOL_VERSION_NEGOTIATED, WIRE_FEATURE }
+  from "@zvndev/powdb-client";
+
+// Optional: refuse anything that cannot serve what you depend on.
+const client = await Client.connect({
+  host, port,
+  requireProtocolVersion: PROTOCOL_VERSION_NEGOTIATED,
+  requireFeatures: [WIRE_FEATURE.nativeTyped],
+});
+
+client.protocolVersion;                    // negotiated version
+client.hasFeature(WIRE_FEATURE.sql);       // agreed-set membership
+client.serverHello.catalogVersion;         // the server's catalog format
+```
+
+Both requirements default to "accept a legacy server", so the client stays
+backward compatible unless you opt in. `CLIENT_CAPABILITIES.catalogVersion` is
+the client's catalog ceiling; it is the single source of truth, and
+`SUPPORTED_CATALOG_VERSION` is now derived from it rather than declared
+separately.
+
+#### Named features
+
+| Name | Covers |
+|---|---|
+| `params` | Positional `$N` binding (`0x04` / `0x14`) |
+| `sql` | SQL request frames (`0x05` / `0x15`) |
+| `native-typed` | Native typed frames (`0x13`-`0x17`) |
+| `error-class` | The trailing error-class byte on `Error` payloads |
+| `sync` | Private replica sync frames (`0x20`-`0x25`) |
+| `entity-links` | PowQL entity links and relationship traversal |
+| `nested-projection` | PowQL nested projections |
+
+Names are wire-stable: they are never renamed or reused, and only appended to.
+
+#### Extending this later
+
+The design exists so that no future addition needs another breaking handshake
+change. Two extension points, both already exercised by tests:
+
+- **A new capability is a new feature name.** Add it to your list; peers that
+  do not know it simply do not intersect on it. No version bump required.
+- **A new hello field is appended after the feature list.** Both decoders stop
+  reading after the feature list and ignore whatever follows, so an older peer
+  reads a newer peer's hello without error. Only bump the protocol version when
+  the *meaning* of an existing frame changes, which the additive-only rule at
+  the end of this document is meant to prevent.
+
+Because the block is introduced by the four-byte magic, trailing bytes that are
+not a hello are rejected outright rather than misparsed.
+
+#### Conformance vectors
+
+`crates/server/tests/wire_vectors/handshake.txt` holds the exact bytes of every
+handshake frame, in hex, generated from the server's own encoder. Point your
+decoder at it: each `frame` record must decode to the fields described above and
+re-encode to the same bytes.
+
+```
+frame   <name> <hex>    one complete wire frame, header included
+framealt <name> <hex>   a byte shape the current release never emits but every
+                        decoder must still accept (what an older client writes)
+feature <name>          a wire feature name, in server order
+class   <name> <byte>   an error class and its wire byte
+```
+
+The `framealt` records matter as much as the `frame` ones. Optional trailing
+fields may be **omitted entirely or written as an empty string**, and both mean
+absent, so a decoder that only ever sees the current release's output will
+mis-handle a real older client. Decode by "is there anything left in the
+payload", never by a fixed field count.
+
+The reference TypeScript client is checked against this file on every CI run,
+which is the only thing keeping two independently written implementations of
+the same format in agreement. A driver in any language can use it the same way.
 
 ### Request and result frames
 
 | Tag | Name | Direction | Payload |
 |---|---|---|---|
-| `0x01` | Connect | → | db_name, password?, username? |
-| `0x02` | ConnectOk | ← | version string |
+| `0x01` | Connect | → | db_name, password?, username?, hello? |
+| `0x02` | ConnectOk | ← | version string, hello? |
 | `0x03` | Query | → | PowQL string |
 | `0x04` | QueryWithParams | → | PowQL string + params (see below) |
 | `0x05` | QuerySql | → | SQL string |
@@ -220,9 +396,13 @@ clean parse error. `$` placeholders are 1-based; `?` is not a placeholder and
 
 ### Error frames
 
-`Error` (`0x0A`) carries a single length-prefixed human-readable message string.
-It is the response to any failed request on any dialect. See
-[Error taxonomy](#6-error-taxonomy) for the message families you may match on.
+`Error` (`0x0A`) carries a length-prefixed human-readable message string,
+optionally followed by exactly one **error-class byte**. Read the string by its
+length prefix and treat a single trailing byte as the class; a payload with no
+trailing byte came from a server that predates the class (v0.17.0). Unknown
+class values must be treated as `0` (internal). See
+[Error taxonomy](#6-error-taxonomy) for the message families you may match on
+and [errors.md](../errors.md) for the full class list.
 
 ---
 
@@ -342,16 +522,20 @@ name does not collide with a column or an existing link on the owner. There is
 no `if not exists` form for links (redeclaring is an error), and there is no
 drop-link statement yet, so a migration layer must model links as create-only,
 like column indexes. While a link exists, dropping the table or column it
-references is refused (`... (drop the link first)`). The DDL reply is an
+references is refused: the reply names the embedded `Catalog::drop_link` API,
+because PowQL has no statement that removes a link. The DDL reply is an
 ordinary `ResultMessage`: `link '<name>' added to '<owner>'`.
 
-**Cardinality is derived, not declared.** If `target_key` is unique on the
-target type at declare time, the link is stored as **to-one**; otherwise it is
-**to-many**. A driver's relation metadata should not ask the user for
-cardinality; it falls out of the schema. The derived kind then gates which
-traversal spelling is legal, and a scalar hop's uniqueness is re-checked at
-execution time (see the error table below), so a to-one read can never
-silently fan out.
+**Cardinality is derived, not declared, and not stored.** A link is **to-one**
+whenever `target_key` currently carries a unique index on the target type, and
+**to-many** otherwise. Nothing is snapshotted at declare time: since v0.22.0
+every surface (`schema links`, `describe`, `explain`, traversal legality)
+re-derives the answer on each read, so `alter <Target> add unique .<key>` after
+the link was declared promotes it with no re-declaration, and declaration order
+cannot change behaviour. A driver's relation metadata should not ask the user
+for cardinality, and should not cache it across DDL; it falls out of the schema.
+Because the check is live, a scalar hop can never silently fan out (see the
+error table below).
 
 **Traversal spellings.** A to-one link is read as a **scalar path**, including
 multi-hop; a to-many link is read as a **block** that yields a native JSON
@@ -580,19 +764,23 @@ because they change how an application should retry and pool connections.
 
 ### Version compatibility
 
-The `ConnectOk` frame carries the server's semver string. The reference client
-warns once per host when the server's **major** version differs from the
-client's, but does not refuse to connect: a driver should follow the same
-best-effort posture rather than hard-gating on the version string.
+Three separate things, in decreasing order of how load-bearing they are:
 
-A separate ceiling governs on-disk/sync format compatibility:
-`SUPPORTED_CATALOG_VERSION` in the reference client (currently `7`; v7 is the
-entity-links catalog format, activated lazily by the first `link` declaration)
-is the highest catalog format the client can read. The reference behavior a
-driver should copy: accept a reported catalog version at or below your maximum,
-and refuse a newer one (you cannot read a format from the future). This ceiling
-is carried in the sync-bootstrap metadata, not in the ordinary query handshake,
-so most drivers only need the advisory semver check above.
+1. **The negotiated protocol version and feature set.** This is the binding
+   one, and it is checked during the handshake. See
+   [Protocol version negotiation](#protocol-version-negotiation).
+2. **The catalog format ceiling.** The server states the highest catalog format
+   it writes in its hello (`catalog_version`); a driver that cannot read that
+   format must refuse during the handshake. It is *also* carried in the
+   sync-bootstrap metadata for the replica product. In the reference client
+   this ceiling is `CLIENT_CAPABILITIES.catalogVersion` (currently `7`, the
+   entity-links format, activated lazily by the first `link` declaration), and
+   `SUPPORTED_CATALOG_VERSION` is derived from it.
+3. **The server's semver string** in `ConnectOk`. Advisory only. The reference
+   client warns once per host when the **major** version differs from its own
+   and connects anyway; a driver should follow the same best-effort posture
+   rather than hard-gating on it. Gate on the negotiated feature set instead:
+   it says what the server can actually do.
 
 ---
 
@@ -612,6 +800,13 @@ message as opaque and surface it to the caller unparsed.
 | Unique constraint | `unique constraint violation on` | not transient |
 | Permission (RBAC) | `permission denied: role` | not transient |
 | Read-only snapshot mode | `readonly mode: statement requires a writer` | not transient: route writes to the primary |
+| Protocol negotiation | error class `10`, `unsupported wire protocol` | not transient: upgrade whichever side the message names |
+
+The protocol-negotiation family is the one case where the **class byte** is the
+reliable signal rather than the substring: it arrives only in place of
+`ConnectOk`, and a driver should surface it as its own code rather than folding
+it into "authentication failed". The reference client uses the code
+`protocol_version`.
 
 Match by a stable **substring**, not the whole message: the variable parts
 (millisecond counts, pair counts, table/column/role names) are interpolated and
@@ -629,6 +824,14 @@ This document is versioned with the PowDB workspace, and behavior added in a
 given release is called out inline (for example, `explain` reflecting the
 lowered plan "as of v0.14"). When a release changes anything on this surface,
 the change is noted here per release.
+
+Driver-visible surface changes in **v0.22.0**: wire protocol version
+negotiation ([Section 1](#protocol-version-negotiation)). `Connect` and
+`ConnectOk` each gained an optional trailing hello block carrying a protocol
+version range, a catalog format ceiling, and a named feature set; a new error
+class `10` (`ProtocolVersion`) reports a handshake that cannot agree. Both
+directions stay compatible with v0.21.0 peers, which are read as protocol
+version `1`. No existing frame changed shape.
 
 Driver-visible surface changes in **v0.19.0**: entity links
 ([Section 2](#entity-links-relationship-traversal)): new link DDL and

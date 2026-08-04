@@ -28,7 +28,13 @@ export type PowDBErrorCode =
   /** An operation exceeded its configured time budget. */
   | "timeout"
   /** Type coercion on a row failed (queryTyped). */
-  | "type_coercion_failed";
+  | "type_coercion_failed"
+  /**
+   * Client and server could not agree on a wire protocol version or feature
+   * set. Raised only during the handshake, never mid-session. Not transient:
+   * one side has to be upgraded (the message says which).
+   */
+  | "protocol_version";
 
 /**
  * Stable wire error classes appended by 0.17+ servers to Error frames
@@ -56,6 +62,8 @@ export const WIRE_ERROR_CLASS = {
   constraint_violation: 8,
   /** Execution was cancelled cooperatively (client disconnect). */
   cancelled: 9,
+  /** Wire protocol version or feature-set negotiation failed at CONNECT. */
+  protocol_version: 10,
 } as const;
 
 /**
@@ -74,6 +82,8 @@ export function errorCodeForWireClass(
     case WIRE_ERROR_CLASS.auth_failed:
     case WIRE_ERROR_CLASS.rate_limited:
       return "auth_failed";
+    case WIRE_ERROR_CLASS.protocol_version:
+      return "protocol_version";
     default:
       return "query_failed";
   }

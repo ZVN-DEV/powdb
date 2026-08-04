@@ -1,33 +1,69 @@
 name: bench
 
-# Heavy criterion microbenchmark suite — DELIBERATELY NOT in the required
-# CI / release pipeline.
+# Criterion microbenchmark suite plus a SAME-INSTANCE CONTROL RUN.
 #
-# Why it's manual-only:
-#   - It's slow (~6 min on GitHub NVMe, far worse on overlay-FS runners) and
-#     resource-heavy (mmap-based heap scans), so it's a poor merge gate.
-#   - On shared runners the absolute thresholds are dominated by per-VM
-#     timing noise (±30–56%), producing false regressions.
-#   - powdb-bench depends only on powdb-storage + powdb-query, so it gates
-#     nothing the normal CI suite doesn't already cover for correctness.
+# The old shape of this job compared head against numbers measured on some
+# other machine, on some other day. Everything else followed from that: the
+# thresholds had to be widened to +/-20% to absorb runner-to-runner variance,
+# and the baseline drifted stale because rebaselining is a manual commit that
+# nobody owes anyone. A gate that has to tolerate 20% is not measuring code.
 #
-# How to use it: trigger on demand (Actions tab → "bench" → Run workflow, or
-# `gh workflow run bench.yml`). It runs on a Depot single-tenant runner
-# (depot-ubuntu-24.04-4: 4 vCPU / 16 GB, no noisy neighbours), so the numbers
-# are comparable run-to-run — unlike GitHub's shared pool, where per-VM noise
-# of ±30–56% produced false regressions. It is still NOT a required status
-# check on `main`.
+# What runs now: the job checks out head AND a control ref (default `main`),
+# builds and benchmarks BOTH on the same Depot instance in the same job, and
+# gates head against the control. Both numbers come from one machine minutes
+# apart, so the cross-machine noise is gone and the control comparison is
+# gated at 10% instead of 20%. The absolute gate against
+# `crates/bench/baseline/main.json` still runs alongside it, and the
+# comparator now HARD-FAILS if the runner label or RUSTFLAGS differ from what
+# that baseline recorded.
+#
+# STILL MANUAL, ON PURPOSE. Promoting this to a required check is the
+# repository owner's call and has not been made. The flip is ONE LINE, right
+# below: add
+#
+#   pull_request:
+#
+# under `on:` (alongside `workflow_dispatch:`). GitHub's `needs:` cannot span
+# workflows, so `ci-success` in ci.yml cannot depend on this job; once the
+# trigger exists, make it blocking by adding the check named
+# "criterion + control-run regression gate (manual)" to branch protection's
+# required checks (Settings -> Branches -> main). Until that line is added the
+# workflow is dispatch-only and gates nothing.
+#
+# Before flipping it, know the cost: this job benchmarks TWO checkouts, so it
+# roughly doubles the old runtime, and it needs a Depot instance per PR.
+#
+# Run it: Actions tab -> "bench" -> Run workflow, or `gh workflow run bench.yml`.
+#
+# Do NOT rebaseline main.json from anywhere but a Depot run of this workflow.
+# Those are x86 Depot numbers; an arm64 laptop reports a uniform ~2x
+# "improvement", and the comparator's environment fingerprint refuses that
+# comparison BY DEFAULT rather than printing it as a win. "By default" because
+# POWDB_BENCH_ALLOW_ENV_MISMATCH=1 still downgrades the refusal to a warning,
+# and such a run is labelled NOT AUTHORITATIVE in its own output.
+#
+# The fingerprint is two self-attested fields and one measured one:
+# POWDB_BENCH_RUNNER and RUSTFLAGS below are strings this workflow exports, so
+# they only prove that whoever ran the comparator exported the same strings.
+# The `arch` field is compared against the architecture compiled into the
+# comparator binary, which no environment variable can change; that is the
+# check an arm64 laptop cannot talk its way past.
 on:
   workflow_dispatch:
+    inputs:
+      control_ref:
+        description: "Git ref to benchmark as the control (same instance, same job)"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
 
 jobs:
   bench:
-    name: criterion + regression gate (manual)
+    name: criterion + control-run regression gate (manual)
     runs-on: depot-ubuntu-24.04-4
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -36,11 +72,28 @@ jobs:
       TMPDIR: /dev/shm
       # Portable x86-64-v2 baseline (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT) so a
       # cached binary can't SIGILL across the shared pool's CPU generations.
+      # This value is recorded in baseline/main.json as `rustflags` and the
+      # comparator fails if the two disagree.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      # GitHub does not expose the `runs-on` label to the job, so the
+      # comparator's environment fingerprint reads it from here. It must match
+      # baseline/main.json's `runner` field.
+      POWDB_BENCH_RUNNER: depot-ubuntu-24.04-4
+      CONTROL_REF: ${{ inputs.control_ref || 'main' }}
 
     steps:
-      - name: Checkout
+      - name: Checkout head
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: head
+          fetch-depth: 0
+
+      - name: Checkout control (${{ inputs.control_ref || 'main' }})
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: control
+          ref: ${{ inputs.control_ref || 'main' }}
+          fetch-depth: 0
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -51,27 +104,60 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: bench-${{ runner.os }}-v2-${{ hashFiles('**/Cargo.lock') }}
+            head/target
+            control/target
+          key: bench-${{ runner.os }}-v3-${{ hashFiles('head/Cargo.lock') }}
           restore-keys: |
-            bench-${{ runner.os }}-v2-
+            bench-${{ runner.os }}-v3-
 
-      - name: Print rustc version
-        run: rustc --version
+      - name: Record the environment both runs share
+        run: |
+          set -euo pipefail
+          rustc --version
+          echo "head    : $(git -C head rev-parse --short HEAD)"
+          echo "control : $(git -C control rev-parse --short HEAD) (${CONTROL_REF})"
+          echo "runner  : ${POWDB_BENCH_RUNNER}"
+          echo "rustflags: ${RUSTFLAGS}"
+          # A control ref that resolves to head measures nothing. Say so rather
+          # than reporting a flawless 0.00% delta across the board.
+          if [ "$(git -C head rev-parse HEAD)" = "$(git -C control rev-parse HEAD)" ]; then
+            echo "::error::control ref ${CONTROL_REF} resolves to the same commit as head; the control comparison would be vacuous"
+            exit 1
+          fi
 
-      - name: Build bench targets
+      # Build both before benchmarking either, so neither run pays a
+      # compile-time thermal/IO cost the other did not.
+      - name: Build bench targets (control)
+        working-directory: control
         run: cargo bench -p powdb-bench --no-run
 
-      - name: Run criterion bench suite
+      - name: Build bench targets (head)
+        working-directory: head
+        run: cargo bench -p powdb-bench --no-run
+
+      - name: Run criterion suite (control)
+        working-directory: control
         run: cargo bench -p powdb-bench --quiet
 
-      - name: Run regression gate comparator
-        run: cargo run -p powdb-bench --bin compare --quiet
+      - name: Run criterion suite (head)
+        working-directory: head
+        run: cargo bench -p powdb-bench --quiet
+
+      # Absolute gate vs main.json AND control gate vs the run above. The
+      # comparator exits non-zero if either fails, or if the runner/RUSTFLAGS
+      # do not match what main.json recorded.
+      - name: Regression gate (absolute + same-instance control)
+        working-directory: head
+        run: |
+          cargo run -p powdb-bench --bin compare --quiet -- \
+            --control "${GITHUB_WORKSPACE}/control/target/criterion"
 
       - name: Upload criterion estimates
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: criterion-estimates
-          path: target/criterion/*/new/estimates.json
+          path: |
+            head/target/criterion/*/new/estimates.json
+            control/target/criterion/*/new/estimates.json
           retention-days: 14

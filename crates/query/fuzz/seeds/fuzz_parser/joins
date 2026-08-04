@@ -1,0 +1,1 @@
+User as u join Note as n on u.id = n.user_id left outer join X as x on x.id = u.id

@@ -1,0 +1,1 @@
+Note as n filter n.id = 1 { n.body, owner: n.user.name }

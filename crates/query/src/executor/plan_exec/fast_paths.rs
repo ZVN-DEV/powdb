@@ -34,6 +34,9 @@ impl Engine {
         function: AggFunc,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        if self.generic_path_forced("agg-single-col") {
+            return Ok(None);
+        }
         // Overflow safety (P0-4): this walks raw rehydrated bytes and would
         // silently drop any row carrying a value too large to re-inline
         // (>= 64KB), undercounting the aggregate. Fall back to the decoded path.
@@ -76,7 +79,13 @@ impl Engine {
 
         // Optional compiled filter.
         let compiled_pred: Option<CompiledPredicate> = match predicate {
-            Some(pred) => match compile_predicate(pred, &columns, &fast, &schema) {
+            Some(pred) => match self.compile_predicate_unless_forced(
+                "agg-single-col:predicate",
+                pred,
+                &columns,
+                &fast,
+                &schema,
+            ) {
                 Some(c) => Some(c),
                 None => return Ok(None), // let generic path handle it
             },
@@ -349,6 +358,9 @@ impl Engine {
         limit: usize,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        if self.generic_path_forced("project-filter-limit") {
+            return Ok(None);
+        }
         // Overflow safety (P0-4): raw-byte projection over rehydrated rows
         // drops any row with a value too large to re-inline (>= 64KB) and
         // cannot return such a value; fall back to the decoded generic path.
@@ -390,7 +402,13 @@ impl Engine {
         let row_layout = RowLayout::new(&schema);
 
         let compiled_pred: Option<CompiledPredicate> = match predicate {
-            Some(pred) => match compile_predicate(pred, &all_columns, &fast, &schema) {
+            Some(pred) => match self.compile_predicate_unless_forced(
+                "project-filter-limit:predicate",
+                pred,
+                &all_columns,
+                &fast,
+                &schema,
+            ) {
                 Some(c) => Some(c),
                 None => return Ok(None),
             },
@@ -452,6 +470,9 @@ impl Engine {
         limit: usize,
         predicate: Option<&Expr>,
     ) -> Result<Option<QueryResult>, QueryError> {
+        if self.generic_path_forced("project-filter-sort-limit") {
+            return Ok(None);
+        }
         // Overflow safety (P0-4): raw-byte scan drops/wraps >= 64KB values;
         // let the decoded generic path handle v2-capable tables.
         if self.catalog.table_has_overflow(table) {
@@ -519,7 +540,13 @@ impl Engine {
         let sort_body_data_offset = 2 + fast.bitmap_size + sort_byte_offset;
 
         let compiled_pred: Option<CompiledPredicate> = match predicate {
-            Some(pred) => match compile_predicate(pred, &all_columns, &fast, &schema) {
+            Some(pred) => match self.compile_predicate_unless_forced(
+                "project-filter-sort-limit:predicate",
+                pred,
+                &all_columns,
+                &fast,
+                &schema,
+            ) {
                 Some(c) => Some(c),
                 None => return Ok(None),
             },

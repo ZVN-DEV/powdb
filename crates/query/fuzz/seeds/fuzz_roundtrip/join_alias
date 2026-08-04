@@ -1,0 +1,1 @@
+User as u join Order as o on u.id = o.user_id { u.name, o.total }

@@ -1,0 +1,47 @@
+# PowDB handshake wire vectors. GENERATED - see crates/server/tests/wire_conformance.rs.
+#
+# These bytes are the contract between crates/server/src/protocol.rs and
+# clients/ts/src/protocol.ts. Both decode every frame here, assert the fields
+# they got, and re-encode to the same bytes, so a layout that drifts in one
+# implementation fails in the other instead of shipping.
+#
+# Records:
+#   frame     <name> <hex>  one complete wire frame, header included
+#   framealt  <name> <hex>  a byte shape this build never emits but must
+#                           still decode (what an older client writes)
+#   feature   <name>        a wire feature name, in SERVER_FEATURES order
+#   class     <name> <byte> an error class and its wire byte
+#
+# Regenerate: POWDB_UPDATE_WIRE_VECTORS=1 cargo test -p powdb-server --test wire_conformance
+
+frame connect_legacy_password_only 01000e000000040000006d796462020000007077
+frame connect_legacy_password_and_username 010017000000040000006d79646202000000707705000000616c696365
+frame connect_hello_no_credentials 01001c000000040000006d7964620000000000000000314857500100020007000000
+frame connect_hello_full 010034000000040000006d79646202000000707705000000616c69636531485750010002000700020006000000706172616d730300000073716c
+frame connect_ok_legacy 02000a00000006000000302e32312e30
+frame connect_ok_hello 02002900000006000000302e32322e30314857500200010002000700020006000000706172616d730300000073716c
+frame connect_ok_hello_no_features 02001800000006000000302e32322e303148575001000100020007000000
+frame error_protocol_version 0a001e00000019000000756e737570706f7274656420776972652070726f746f636f6c0a
+
+framealt connect_legacy_db_only 010008000000040000006d796462
+framealt connect_legacy_username_explicit_empty 010012000000040000006d79646202000000707700000000
+
+feature params
+feature sql
+feature native-typed
+feature error-class
+feature sync
+feature entity-links
+feature nested-projection
+
+class internal 0
+class parse 1
+class execution 2
+class timeout 3
+class limit_exceeded 4
+class readonly_refused 5
+class auth_failed 6
+class rate_limited 7
+class constraint_violation 8
+class cancelled 9
+class protocol_version 10

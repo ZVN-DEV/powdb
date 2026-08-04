@@ -718,8 +718,19 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             }
             match (&args[0], &args[1], &args[2]) {
                 (Value::Str(s), Value::Int(start), Value::Int(len)) => {
-                    let start = (*start as usize).saturating_sub(1); // 1-indexed
-                    let len = *len as usize;
+                    // `*len as usize` turned a negative length into a number
+                    // near `usize::MAX`, so `substring(.s, 2, -1)` returned the
+                    // whole rest of the string instead of nothing. A negative
+                    // length has no substring, which is missing, not everything.
+                    let Ok(len) = usize::try_from(*len) else {
+                        return Value::Empty;
+                    };
+                    // A start before the first character selects from the
+                    // beginning of the string under the same cast; keep that,
+                    // but reach it by saturation rather than by wrapping.
+                    let start = usize::try_from(*start)
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(1); // 1-indexed
                     let sub: String = s.chars().skip(start).take(len).collect();
                     Value::Str(sub)
                 }
@@ -749,14 +760,11 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
         },
         ScalarFn::Round => {
             let decimals = match args.get(1) {
-                Some(Value::Int(d)) => *d as i32,
+                Some(Value::Int(d)) => *d,
                 _ => 0,
             };
             match args.first() {
-                Some(Value::Float(f)) => {
-                    let factor = 10_f64.powi(decimals);
-                    Value::Float((f * factor).round() / factor)
-                }
+                Some(Value::Float(f)) => Value::Float(round_to_decimals(*f, decimals)),
                 Some(Value::Int(n)) => Value::Int(*n),
                 _ => Value::Empty,
             }
@@ -779,16 +787,16 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
         ScalarFn::Pow => match (args.first(), args.get(1)) {
             (Some(Value::Float(base)), Some(Value::Float(exp))) => Value::Float(base.powf(*exp)),
             (Some(Value::Float(base)), Some(Value::Int(exp))) => {
-                Value::Float(base.powi(*exp as i32))
+                Value::Float(pow_int_exponent(*base, *exp))
             }
             (Some(Value::Int(base)), Some(Value::Int(exp))) => {
                 if *exp >= 0 && *exp <= u32::MAX as i64 {
                     match base.checked_pow(*exp as u32) {
                         Some(v) => Value::Int(v),
-                        None => Value::Float((*base as f64).powi(*exp as i32)),
+                        None => Value::Float(pow_int_exponent(*base as f64, *exp)),
                     }
                 } else {
-                    Value::Float((*base as f64).powi(*exp as i32))
+                    Value::Float(pow_int_exponent(*base as f64, *exp))
                 }
             }
             (Some(Value::Int(base)), Some(Value::Float(exp))) => {
@@ -882,6 +890,59 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
         // `json_type` is intercepted in `eval_expr` (it needs the raw PJ1 node,
         // not a scalarized Value); it never reaches this Value-based dispatch.
         ScalarFn::JsonType | ScalarFn::JsonText => Value::Empty,
+    }
+}
+
+/// `round(value, decimals)` that cannot answer with a non-finite number.
+///
+/// The decimal count used to be narrowed with `*d as i32`, which is a silent
+/// truncation rather than a range check: `round(.f, 2147483647)` raised 10 to
+/// an infinite power, `value * inf` was inf, and `inf / inf` was NaN. That NaN
+/// did not stay inside one answer, because `update` writes a projected value
+/// into the column, after which the row compared inconsistently on every access
+/// path and `max()` reported NaN while `min()` skipped it.
+///
+/// Every degenerate scaling factor has a known answer, so each is returned
+/// directly instead of being computed through a value f64 cannot hold: rounding
+/// to more decimals than an f64 carries is the identity, and rounding to a
+/// magnitude larger than the value itself is zero.
+fn round_to_decimals(value: f64, decimals: i64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let Ok(decimals) = i32::try_from(decimals) else {
+        return if decimals > 0 { value } else { 0.0 };
+    };
+    let factor = 10_f64.powi(decimals);
+    if !factor.is_finite() {
+        return value;
+    }
+    if factor == 0.0 {
+        return 0.0;
+    }
+    let scaled = value * factor;
+    if !scaled.is_finite() {
+        // The value is already integral at this magnitude, so rounding it to
+        // any number of decimals leaves it unchanged.
+        return value;
+    }
+    let rounded = scaled.round() / factor;
+    if rounded.is_finite() {
+        rounded
+    } else {
+        value
+    }
+}
+
+/// `base` raised to an integer exponent, without truncating the exponent.
+/// `*exp as i32` wrapped, so `pow(2.0, 4294967298)` answered 4.0: not an
+/// overflow, a different question silently answered. An exponent past `i32`
+/// goes through `powf`, whose answer at that magnitude is zero or infinity,
+/// which is the honest one.
+fn pow_int_exponent(base: f64, exp: i64) -> f64 {
+    match i32::try_from(exp) {
+        Ok(exp) => base.powi(exp),
+        Err(_) => base.powf(exp as f64),
     }
 }
 
@@ -1001,14 +1062,115 @@ fn eval_cast(val: Value, target: CastType) -> Value {
     }
 }
 
-/// Ordering for a DateTime compared against a plain Int (in either position),
-/// comparing the underlying micros. Returns `None` for every other pairing so
-/// the caller falls through to the normal `Value` comparison.
-fn datetime_int_cmp(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+/// Ordering for a numeric pair whose two sides are different `Value` variants,
+/// comparing what the numbers mean rather than what they are stored as.
+/// Returns `None` for every other pairing so the caller falls through to the
+/// normal `Value` comparison.
+///
+/// `Value::PartialEq` is deliberately strict per variant, because it has to
+/// agree with `Value::Hash` and that is what GROUP BY, DISTINCT and the hash
+/// joins key on. `Value::Ord` is not, and neither is the compiled predicate:
+/// the compiled float leaf promotes an int literal to `f64` and compares with
+/// `total_cmp`, and the compiled Int leaf reads a DateTime column's micros as
+/// an i64. So a comparison OPERATOR evaluated generically has to do the same or
+/// the answer depends on which physical path ran it, which is what
+/// `.f = 1` did: true through the compiled predicate and false through the
+/// generic evaluator over the same row.
+///
+/// Both pairings are the same rule for the same reason:
+///
+///   * **Int/Float** — compared EXACTLY, by numeric value, via
+///     [`int_f64_cmp`]: no precision loss at any magnitude. Widening the int
+///     with `as f64` is not an option here even though `Value::Ord` does it
+///     for sorting: `i64::MAX as f64` rounds up to 2^63 exactly, so a lossy
+///     rule lets `.id = 9223372036854775808.0` match a row holding
+///     `i64::MAX` while the index machinery (which is exact) says nothing
+///     matches, and the answer would depend on the access path. Exactness
+///     also keeps the six operators a total order: leaving `=` strict while
+///     `<` and `>=` were numeric made `.n < 1.0` false, `.n > 1.0` false,
+///     `.n <= 1.0` true, `.n >= 1.0` true and `.n = 1.0` false, which is not
+///     an order at all.
+///   * **DateTime/Int** — a timestamp literal has no distinct spelling in
+///     PowQL, so `.created_at > 1700000000000000` arrives as DateTime vs Int.
+///     Without this the pair falls to `Value::Ord`'s type-discriminant tail and
+///     every timestamp compares greater than every int.
+///
+/// A Float against a DateTime is deliberately NOT here. `Value::Ord` does not
+/// name that pair either, so both evaluators fall to the same discriminant
+/// comparison and agree with each other; making it numeric is a semantic change
+/// to what a datetime literal means, which belongs with the temporal type work
+/// rather than with keeping two evaluators in step.
+///
+/// The Int/Float rule applies in [`CmpMode::Filter`] only, because a JOIN is
+/// not evaluated by this function alone: `plan_exec::join::hash_join` buckets
+/// the build side in an `FxHashMap<Value, _>`, so a join KEY is matched by
+/// `Value`'s own `Hash` and `PartialEq` and nothing here can change that. Making
+/// the operator numeric in `Join` mode too would leave `on a.n = b.f` matching
+/// nothing as the key of a hash join and matching numerically as a residual
+/// conjunct of the same join, which is a worse answer than either rule applied
+/// consistently. Joins therefore keep strict per-variant key equality, which is
+/// what they already promised (`Empty = Empty` matches there too). Teaching them
+/// cross-type keys means giving the hash side a canonical numeric key, which is
+/// the `Value::Hash` change this deliberately does not make.
+fn cross_type_numeric_cmp(
+    left: &Value,
+    right: &Value,
+    mode: CmpMode,
+) -> Option<std::cmp::Ordering> {
     match (left, right) {
         (Value::DateTime(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Int(a), Value::DateTime(b)) => Some(a.cmp(b)),
+        (Value::Int(a), Value::Float(b)) if mode == CmpMode::Filter => Some(int_f64_cmp(*a, *b)),
+        (Value::Float(a), Value::Int(b)) if mode == CmpMode::Filter => {
+            Some(int_f64_cmp(*b, *a).reverse())
+        }
         _ => None,
+    }
+}
+
+/// Exact comparison of an `i64` against an `f64` by numeric value, with no
+/// precision loss at any magnitude (the SQLite approach). Returns the ordering
+/// of the int relative to the float.
+///
+/// Why not `(i as f64).total_cmp(&f)`: that widening is lossy above 2^53
+/// (`i64::MAX as f64` rounds up to 2^63), so it would call `i64::MAX` equal
+/// to `9223372036854775808.0` while the index-probe machinery, which is
+/// exact, matches nothing. Every consumer of this rule (the generic
+/// evaluator, the compiled JSON scalar leaves) must agree with the index
+/// path, so the rule is exact everywhere.
+///
+/// NaN sorts above every number, matching `f64::total_cmp` and `Value::Ord`.
+/// `-0.0` equals `0`, which `total_cmp` would not say; equality by numeric
+/// value is the whole point of the rule.
+pub(crate) fn int_f64_cmp(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return Ordering::Less;
+    }
+    // 2^63 and -2^63 are exactly representable in f64; every i64 lies in
+    // [-2^63, 2^63).
+    if f >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    if f < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    // In range, truncation toward zero is exact. Above 2^53 an f64 has no
+    // fractional part, so `t as f64` round-trips exactly there too; below
+    // 2^53 every i64 in range is exactly representable.
+    let t = f as i64;
+    match i.cmp(&t) {
+        Ordering::Equal => {
+            let frac = f - t as f64;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        other => other,
     }
 }
 
@@ -1033,19 +1195,13 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
     {
         return Value::Bool(false);
     }
-    // A timestamp literal has no distinct spelling in PowQL: it is written as
-    // the raw micros integer, so `.created_at > 1700000000000000` arrives here
-    // as DateTime vs Int. `Value` deliberately keeps equality and hashing
-    // strictly typed, and its `Ord` falls back to comparing type discriminants
-    // for pairs it does not name, which would make every DateTime compare
-    // greater than every Int regardless of the timestamps involved. Compare
-    // the underlying micros instead, which is what the index path already does
-    // when it accepts an int literal as a datetime index key
-    // (`lowering::coerce_column_index_key`) and what the compiled DateTime
-    // leaf does. Without this the same predicate answers differently depending
-    // on whether an index happens to exist.
+    // Numeric pairs whose two sides are different `Value` variants compare as
+    // numbers, not as variants: see `cross_type_numeric_cmp` for why the six
+    // comparison operators cannot use `Value::PartialEq` here and stay
+    // consistent with each other, with `Value::Ord`, and with the compiled
+    // predicate leaves.
     if let (Some(ordering), true) = (
-        datetime_int_cmp(left, right),
+        cross_type_numeric_cmp(left, right, mode),
         matches!(
             op,
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
@@ -1084,22 +1240,33 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
         // through to the `_` arms is a MISSING operand, which propagates as
         // missing per SQL NULL semantics, and an operand whose type is only
         // known per row (a cast, a scalar function, a JSON path).
+        // Integer overflow is missing, never a clamped number. `saturating_add`
+        // answered `.big + 1` with `i64::MAX`, which is a plausible-looking
+        // number that is not the sum, and the aggregate accumulator refuses the
+        // same overflow outright (`plan_exec::aggregate::agg_overflow_error`),
+        // so `sum(A { .v })` and `A { x: .v + 1 }` disagreed about whether the
+        // total exists. All four arithmetic operators now use the checked form
+        // that `Div` already used, and all four report the same way. `Empty`
+        // rather than an error because this evaluator has no error channel and
+        // because it is the convention every other unrepresentable result here
+        // already follows (`abs(i64::MIN)`, an overflowing `date_add`, `date_diff`
+        // across the full i64 range).
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_add(*b)),
+            (Value::Int(a), Value::Int(b)) => a.checked_add(*b).map_or(Value::Empty, Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             _ => Value::Empty,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_sub(*b)),
+            (Value::Int(a), Value::Int(b)) => a.checked_sub(*b).map_or(Value::Empty, Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Empty,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a.saturating_mul(*b)),
+            (Value::Int(a), Value::Int(b)) => a.checked_mul(*b).map_or(Value::Empty, Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
@@ -1159,7 +1326,47 @@ pub(super) fn like_match(text: &str, pattern: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::int_f64_cmp;
     use super::like_match;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn int_f64_cmp_is_exact_at_every_magnitude() {
+        // The defect this pins: `i64::MAX as f64` rounds up to 2^63, so a
+        // lossy rule calls i64::MAX equal to 9223372036854775808.0.
+        assert_eq!(
+            int_f64_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
+            Ordering::Less
+        );
+        assert_eq!(
+            int_f64_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
+            Ordering::Equal,
+            "-2^63 is exactly representable and exactly i64::MIN"
+        );
+        assert_eq!(int_f64_cmp(i64::MIN, -1e19), Ordering::Greater);
+        assert_eq!(int_f64_cmp(i64::MAX, f64::INFINITY), Ordering::Less);
+        assert_eq!(int_f64_cmp(i64::MIN, f64::NEG_INFINITY), Ordering::Greater);
+        // 2^53 is the last f64-exact neighborhood; both sides of it compare
+        // exactly.
+        assert_eq!(
+            int_f64_cmp(9_007_199_254_740_992, 9_007_199_254_740_992.0),
+            Ordering::Equal
+        );
+        assert_eq!(
+            int_f64_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Ordering::Greater,
+            "2^53 + 1 must not collapse onto 2^53"
+        );
+        // Fractions order around the truncated integer.
+        assert_eq!(int_f64_cmp(3, 3.5), Ordering::Less);
+        assert_eq!(int_f64_cmp(4, 3.5), Ordering::Greater);
+        assert_eq!(int_f64_cmp(-3, -3.5), Ordering::Greater);
+        assert_eq!(int_f64_cmp(-4, -3.5), Ordering::Less);
+        // Numeric equality, not bit equality: 0 equals -0.0.
+        assert_eq!(int_f64_cmp(0, -0.0), Ordering::Equal);
+        // NaN sorts above every number, matching total_cmp and Value::Ord.
+        assert_eq!(int_f64_cmp(i64::MAX, f64::NAN), Ordering::Less);
+    }
 
     #[test]
     fn test_like_match_correctness() {

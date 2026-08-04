@@ -194,6 +194,14 @@ async function main() {
     }
   });
 
+  await test("protocol_version class maps to protocol_version", () => {
+    assert.equal(WIRE_ERROR_CLASS.protocol_version, 10);
+    assert.equal(
+      errorCodeForWireClass(WIRE_ERROR_CLASS.protocol_version),
+      "protocol_version",
+    );
+  });
+
   await test("absent class (legacy server) falls back to query_failed", () => {
     assert.equal(errorCodeForWireClass(undefined), "query_failed");
   });

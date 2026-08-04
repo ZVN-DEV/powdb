@@ -11,6 +11,8 @@
 
 import * as net from "node:net";
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   tryDecode,
   encode,
@@ -30,12 +32,22 @@ import {
 } from "../src/protocol.js";
 import {
   Client,
+  Pool,
   PowDBError,
   isPowDBError,
   assertServerCatalogVersionSupported,
+  serverCapabilityMismatch,
+  CLIENT_CAPABILITIES,
   SUPPORTED_CATALOG_VERSION,
+  legacyServerHello,
+  PROTOCOL_VERSION_LEGACY,
+  PROTOCOL_VERSION_NEGOTIATED,
+  WIRE_FEATURE,
+  type ClientHello,
+  type ServerHello,
   type WireValue as PublicWireValue,
 } from "../src/index.js";
+import { WIRE_ERROR_CLASS } from "../src/errors.js";
 
 let passed = 0;
 let failed = 0;
@@ -81,6 +93,87 @@ function sampleSyncStatus(overrides: Partial<WireSyncStatus> = {}): WireSyncStat
     lastSyncError: null,
     ...overrides,
   };
+}
+
+/**
+ * A mock PowDB server for handshake tests.
+ *
+ * `answer` decides what to reply to the Connect frame, so one helper covers
+ * a pre-0.22.0 server (a bare ConnectOk), a negotiating server, and a server
+ * that refuses on version grounds. Every frame the client sends is recorded,
+ * which is how the tests prove a refusal happened during the handshake and
+ * not after a query had already gone out.
+ */
+function handshakeServer(answer: (connect: Message) => Message | null): {
+  server: net.Server;
+  received: Message[];
+} {
+  const received: Message[] = [];
+  const server = net.createServer((sock) => {
+    let scratch = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      const collected = collectFrames(scratch, Buffer.from(chunk));
+      scratch = collected.rest;
+      for (const msg of collected.messages) {
+        received.push(msg);
+        if (msg.type === "Connect") {
+          const reply = answer(msg);
+          if (reply === null) {
+            sock.destroy();
+            return;
+          }
+          sock.write(encode(reply));
+        } else if (msg.type === "Query") {
+          sock.write(encode({ type: "ResultScalar", value: "1" }));
+        } else if (msg.type === "Disconnect") {
+          sock.end();
+        }
+      }
+    });
+    sock.on("error", () => {});
+  });
+  return { server, received };
+}
+
+/** The ConnectOk a pre-0.22.0 server writes: a version string, nothing else. */
+function legacyConnectOk(): Message {
+  return { type: "ConnectOk", version: "0.21.0" };
+}
+
+function negotiatedConnectOk(
+  overrides: Partial<ServerHello> = {},
+): Message {
+  return {
+    type: "ConnectOk",
+    version: "0.22.0",
+    hello: {
+      protocol: PROTOCOL_VERSION_NEGOTIATED,
+      minProtocol: PROTOCOL_VERSION_LEGACY,
+      maxProtocol: PROTOCOL_VERSION_NEGOTIATED,
+      catalogVersion: SUPPORTED_CATALOG_VERSION,
+      features: [...CLIENT_CAPABILITIES.features],
+      ...overrides,
+    },
+  };
+}
+
+/** Connect against `port`, expecting the handshake to fail; return the error. */
+async function expectHandshakeFailure(
+  port: number,
+  opts: Partial<Parameters<typeof Client.connect>[0]> = {},
+): Promise<PowDBError> {
+  try {
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      ...opts,
+    });
+    await client.close();
+    throw new Error("expected the handshake to fail");
+  } catch (err) {
+    if (!isPowDBError(err)) throw err;
+    return err;
+  }
 }
 
 function collectFrames(
@@ -1319,6 +1412,569 @@ async function main() {
     assert.equal(decodedClassed.consumed, classed.length);
     assert.equal(decodedLegacy.consumed, legacy.length);
     assert.equal(decodedClassed.consumed, decodedLegacy.consumed + 1);
+  });
+
+  // ─── Wire protocol version negotiation ──────────────────────────────────
+
+  await test("Connect hello round-trips through encode/decode", () => {
+    const hello: ClientHello = {
+      minProtocol: 1,
+      maxProtocol: 2,
+      catalogVersion: 7,
+      features: [WIRE_FEATURE.sql, WIRE_FEATURE.nativeTyped],
+    };
+    const frame = encode({
+      type: "Connect",
+      dbName: "mydb",
+      password: "pw",
+      username: "alice",
+      hello,
+    });
+    assert.equal(frame[0], 0x01, "hello must reuse the Connect tag");
+    const decoded = tryDecode(frame);
+    assert.ok(decoded !== null && decoded.msg.type === "Connect");
+    assert.equal(decoded.msg.dbName, "mydb");
+    assert.equal(decoded.msg.username, "alice");
+    assert.deepEqual(decoded.msg.hello, hello);
+  });
+
+  await test("Connect hello survives a null username", () => {
+    // The username field cannot be elided once a hello follows it.
+    const frame = encode({
+      type: "Connect",
+      dbName: "d",
+      password: null,
+      username: null,
+      hello: {
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: [],
+      },
+    });
+    const decoded = tryDecode(frame);
+    assert.ok(decoded !== null && decoded.msg.type === "Connect");
+    assert.equal(decoded.msg.username, null);
+    assert.equal(decoded.msg.hello?.maxProtocol, 2);
+  });
+
+  await test("a hello-less Connect frame is byte-identical to the 0.21 shape", () => {
+    const withHello = encode({
+      type: "Connect",
+      dbName: "d",
+      password: null,
+      username: null,
+      hello: {
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: [],
+      },
+    });
+    const legacy = encode({
+      type: "Connect",
+      dbName: "d",
+      password: null,
+      username: null,
+    });
+    // 6-byte header + dbName("d") + zero-length password = 6 + 5 + 4.
+    assert.equal(legacy.length, 15);
+    assert.ok(withHello.length > legacy.length);
+    const decoded = tryDecode(legacy);
+    assert.ok(decoded !== null && decoded.msg.type === "Connect");
+    assert.equal(decoded.msg.hello, undefined);
+  });
+
+  await test("ConnectOk hello round-trips and legacy decode ignores it", () => {
+    const frame = encode(negotiatedConnectOk());
+    assert.equal(frame[0], 0x02);
+    const decoded = tryDecode(frame);
+    assert.ok(decoded !== null && decoded.msg.type === "ConnectOk");
+    assert.equal(decoded.msg.version, "0.22.0");
+    assert.equal(decoded.msg.hello?.protocol, PROTOCOL_VERSION_NEGOTIATED);
+    assert.deepEqual(
+      decoded.msg.hello?.features,
+      [...CLIENT_CAPABILITIES.features],
+    );
+
+    const bare = tryDecode(encode(legacyConnectOk()));
+    assert.ok(bare !== null && bare.msg.type === "ConnectOk");
+    assert.equal(bare.msg.hello, undefined);
+  });
+
+  await test("hello blocks skip trailing bytes so a later release can extend them", () => {
+    // The whole point of the design: adding a field later must not require
+    // another breaking handshake change.
+    const base = encode(negotiatedConnectOk());
+    const extended = Buffer.concat([base, Buffer.from([1, 2, 3, 4, 5])]);
+    extended.writeUInt32LE(extended.length - 6, 2);
+    const decoded = tryDecode(extended);
+    assert.ok(decoded !== null && decoded.msg.type === "ConnectOk");
+    assert.equal(decoded.msg.hello?.protocol, PROTOCOL_VERSION_NEGOTIATED);
+    assert.equal(decoded.consumed, extended.length);
+  });
+
+  await test("a hello with the wrong magic is rejected, not misread", () => {
+    // The block is otherwise perfectly well-formed, so the magic check is the
+    // only thing that can reject it. Building a short payload instead would
+    // fail on truncation and never exercise the magic at all.
+    const wellFormed = encode(negotiatedConnectOk());
+    const magicAt = 6 + 4 + Buffer.byteLength("0.22.0", "utf8");
+    assert.equal(wellFormed.readUInt32LE(magicAt), 0x50574831);
+    const wrongMagic = Buffer.from(wellFormed);
+    wrongMagic.writeUInt32LE(0xdeadbeef, magicAt);
+    assert.throws(() => tryDecode(wrongMagic), /malformed ConnectOk hello block/);
+    // The control: identical bytes with the right magic decode fine.
+    assert.ok(tryDecode(wellFormed) !== null);
+  });
+
+  await test("serverCapabilityMismatch covers version, features and catalog", () => {
+    const modern: ServerHello = {
+      protocol: 2,
+      minProtocol: 1,
+      maxProtocol: 2,
+      catalogVersion: 7,
+      features: [WIRE_FEATURE.sql],
+    };
+    assert.equal(serverCapabilityMismatch(modern, 2, [WIRE_FEATURE.sql], 7), null);
+    assert.match(
+      serverCapabilityMismatch(legacyServerHello(), 2, [], 7) ?? "",
+      /upgrade the server/,
+    );
+    assert.match(
+      serverCapabilityMismatch(modern, 1, [WIRE_FEATURE.nativeTyped], 7) ?? "",
+      /native-typed/,
+    );
+    assert.match(
+      serverCapabilityMismatch(modern, 1, [], 6) ?? "",
+      /upgrade the client/,
+    );
+    // A server that stated no catalog version is not judged on one.
+    assert.equal(serverCapabilityMismatch(legacyServerHello(), 1, [], 7), null);
+  });
+
+  await test("SUPPORTED_CATALOG_VERSION is derived from CLIENT_CAPABILITIES", () => {
+    assert.equal(SUPPORTED_CATALOG_VERSION, CLIENT_CAPABILITIES.catalogVersion);
+    // And the handshake applies the same ceiling the standalone helper does.
+    assert.throws(
+      () =>
+        assertServerCatalogVersionSupported(
+          CLIENT_CAPABILITIES.catalogVersion + 1,
+        ),
+      /upgrade the client/,
+    );
+    assert.match(
+      serverCapabilityMismatch(
+        {
+          protocol: 2,
+          minProtocol: 1,
+          maxProtocol: 2,
+          catalogVersion: CLIENT_CAPABILITIES.catalogVersion + 1,
+          features: [],
+        },
+        1,
+        [],
+        CLIENT_CAPABILITIES.catalogVersion,
+      ) ?? "",
+      /upgrade the client/,
+    );
+  });
+
+  await test("the client states its capabilities in the Connect frame", async () => {
+    const { server, received } = handshakeServer(() => negotiatedConnectOk());
+    const port = await listen(server);
+    try {
+      const client = await Client.connect({ host: "127.0.0.1", port });
+      const connect = received[0];
+      assert.ok(connect !== undefined && connect.type === "Connect");
+      assert.deepEqual(connect.hello, {
+        minProtocol: CLIENT_CAPABILITIES.minProtocolVersion,
+        maxProtocol: CLIENT_CAPABILITIES.maxProtocolVersion,
+        catalogVersion: CLIENT_CAPABILITIES.catalogVersion,
+        features: [...CLIENT_CAPABILITIES.features],
+      });
+      assert.equal(client.protocolVersion, PROTOCOL_VERSION_NEGOTIATED);
+      assert.equal(client.hasFeature(WIRE_FEATURE.sql), true);
+      assert.equal(client.hasFeature("not-a-feature"), false);
+      await client.close();
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("legacyHandshake sends the pre-0.22.0 frame with no hello", async () => {
+    const { server, received } = handshakeServer(() => legacyConnectOk());
+    const port = await listen(server);
+    try {
+      const client = await Client.connect({
+        host: "127.0.0.1",
+        port,
+        legacyHandshake: true,
+      });
+      const connect = received[0];
+      assert.ok(connect !== undefined && connect.type === "Connect");
+      assert.equal(connect.hello, undefined);
+      await client.close();
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("a new client still connects to a pre-0.22.0 server", async () => {
+    // Backward compatibility: no hello in the reply means protocol v1 and no
+    // named features, which the default requirements accept.
+    const { server } = handshakeServer(() => legacyConnectOk());
+    const port = await listen(server);
+    try {
+      const client = await Client.connect({ host: "127.0.0.1", port });
+      assert.equal(client.protocolVersion, PROTOCOL_VERSION_LEGACY);
+      assert.equal(client.serverVersion, "0.21.0");
+      assert.equal(client.hasFeature(WIRE_FEATURE.sql), false);
+      await client.close();
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("a new client requiring v2 fails against an old server AT the handshake", async () => {
+    const { server, received } = handshakeServer(() => legacyConnectOk());
+    const port = await listen(server);
+    try {
+      const err = await expectHandshakeFailure(port, {
+        requireProtocolVersion: PROTOCOL_VERSION_NEGOTIATED,
+      });
+      assert.equal(err.code, "protocol_version");
+      assert.match(err.message, /upgrade the server/);
+      // The refusal happened during the handshake: no query frame was ever
+      // written, so no mismatch could surface mid-session.
+      assert.deepEqual(
+        received.map((m) => m.type),
+        ["Connect"],
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("a required feature an old server cannot name fails at the handshake", async () => {
+    const { server } = handshakeServer(() => legacyConnectOk());
+    const port = await listen(server);
+    try {
+      const err = await expectHandshakeFailure(port, {
+        requireFeatures: [WIRE_FEATURE.nativeTyped],
+      });
+      assert.equal(err.code, "protocol_version");
+      assert.match(err.message, /native-typed/);
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("a server catalog newer than the client fails at the handshake", async () => {
+    const { server } = handshakeServer(() =>
+      negotiatedConnectOk({
+        catalogVersion: CLIENT_CAPABILITIES.catalogVersion + 1,
+      }),
+    );
+    const port = await listen(server);
+    try {
+      const err = await expectHandshakeFailure(port);
+      assert.equal(err.code, "protocol_version");
+      assert.match(err.message, /upgrade the client/);
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("an old client refused by a new server gets a typed version error", async () => {
+    // The mirror direction: the server decides the ranges do not overlap and
+    // answers with the ProtocolVersion class instead of ConnectOk.
+    const { server, received } = handshakeServer(() => ({
+      type: "Error",
+      message:
+        "unsupported wire protocol: client speaks up to v1, this server requires at least v3; upgrade the client",
+      errorClass: WIRE_ERROR_CLASS.protocol_version,
+    }));
+    const port = await listen(server);
+    try {
+      const err = await expectHandshakeFailure(port);
+      assert.equal(
+        err.code,
+        "protocol_version",
+        "a version refusal must not be reported as auth_failed",
+      );
+      assert.equal(err.wireErrorClass, WIRE_ERROR_CLASS.protocol_version);
+      assert.match(err.message, /upgrade the client/);
+      assert.deepEqual(
+        received.map((m) => m.type),
+        ["Connect"],
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  await test("Error frames round-trip their class byte, and omit it when absent", () => {
+    const classed = tryDecode(
+      encode({
+        type: "Error",
+        message: "boom",
+        errorClass: WIRE_ERROR_CLASS.protocol_version,
+      }),
+    );
+    assert.ok(classed !== null && classed.msg.type === "Error");
+    assert.equal(classed.msg.message, "boom");
+    assert.equal(classed.msg.errorClass, WIRE_ERROR_CLASS.protocol_version);
+
+    const bare = encode({ type: "Error", message: "boom" });
+    const decodedBare = tryDecode(bare);
+    assert.ok(decodedBare !== null && decodedBare.msg.type === "Error");
+    assert.equal(decodedBare.msg.errorClass, undefined);
+    // Byte-identical to the pre-class frame: one byte shorter, same prefix.
+    const classedFrame = encode({
+      type: "Error",
+      message: "boom",
+      errorClass: WIRE_ERROR_CLASS.protocol_version,
+    });
+    assert.equal(classedFrame.length, bare.length + 1);
+    assert.deepEqual(classedFrame.subarray(6, bare.length), bare.subarray(6));
+  });
+
+  await test("the pool does not retry a version refusal", async () => {
+    // Retrying a version mismatch can only fail the same way. One attempt.
+    const { server, received } = handshakeServer(() => legacyConnectOk());
+    const port = await listen(server);
+    const pool = new Pool({
+      host: "127.0.0.1",
+      port,
+      requireProtocolVersion: PROTOCOL_VERSION_NEGOTIATED,
+      connectRetries: 3,
+      connectBackoffMs: 1,
+    });
+    try {
+      await assert.rejects(
+        () => pool.acquire(),
+        (err: unknown) =>
+          isPowDBError(err) && err.code === "protocol_version",
+      );
+      assert.equal(
+        received.filter((m) => m.type === "Connect").length,
+        1,
+        "a version refusal must not be retried",
+      );
+    } finally {
+      await pool.close();
+      server.close();
+    }
+  });
+
+  await test("a non-version Connect refusal is still auth_failed", async () => {
+    const { server } = handshakeServer(() => ({
+      type: "Error",
+      message: "authentication failed",
+      errorClass: WIRE_ERROR_CLASS.auth_failed,
+    }));
+    const port = await listen(server);
+    try {
+      const err = await expectHandshakeFailure(port);
+      assert.equal(err.code, "auth_failed");
+    } finally {
+      server.close();
+    }
+  });
+
+  console.log("\nCross-language wire conformance");
+
+  // These read crates/server/tests/wire_vectors/handshake.txt: bytes generated
+  // by the Rust encoder, checked here against the TypeScript one. This module
+  // is a hand-written mirror of crates/server/src/protocol.rs and nothing else
+  // forces the two to agree — each side round-trips its own bytes happily, so
+  // a mirror can drift into a layout that is self-consistent, passes every
+  // test in this file, and cannot talk to a real server. Swapping two u16
+  // fields in both the encoder and the decoder below is exactly that failure.
+  //
+  // Regenerate the vectors (after an intentional wire change) with:
+  //   POWDB_UPDATE_WIRE_VECTORS=1 cargo test -p powdb-server --test wire_conformance
+
+  /** Records of one kind from the shared vector file, in file order. */
+  function vectorRecords(kind: string): Array<[string, string]> {
+    const path = fileURLToPath(
+      new URL(
+        "../../../crates/server/tests/wire_vectors/handshake.txt",
+        import.meta.url,
+      ),
+    );
+    const text = readFileSync(path, "utf8");
+    const out: Array<[string, string]> = [];
+    for (const line of text.split("\n")) {
+      if (line.startsWith("#") || line.trim() === "") continue;
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] !== kind) continue;
+      out.push([parts[1]!, parts.slice(2).join(" ")]);
+    }
+    return out;
+  }
+
+  /**
+   * What each named frame must decode to. A vector with no entry here fails
+   * loudly rather than being skipped: a frame the Rust side added and this
+   * client has not accounted for is precisely the drift being guarded against.
+   */
+  const expectedFrames: Record<string, Message> = {
+    connect_legacy_password_only: {
+      type: "Connect",
+      dbName: "mydb",
+      password: "pw",
+      username: null,
+    },
+    connect_legacy_password_and_username: {
+      type: "Connect",
+      dbName: "mydb",
+      password: "pw",
+      username: "alice",
+    },
+    connect_hello_no_credentials: {
+      type: "Connect",
+      dbName: "mydb",
+      password: null,
+      username: null,
+      hello: {
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: [],
+      },
+    },
+    connect_hello_full: {
+      type: "Connect",
+      dbName: "mydb",
+      password: "pw",
+      username: "alice",
+      hello: {
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: ["params", "sql"],
+      },
+    },
+    connect_ok_legacy: { type: "ConnectOk", version: "0.21.0" },
+    connect_ok_hello: {
+      type: "ConnectOk",
+      version: "0.22.0",
+      hello: {
+        protocol: 2,
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: ["params", "sql"],
+      },
+    },
+    connect_ok_hello_no_features: {
+      type: "ConnectOk",
+      version: "0.22.0",
+      hello: {
+        protocol: 1,
+        minProtocol: 1,
+        maxProtocol: 2,
+        catalogVersion: 7,
+        features: [],
+      },
+    },
+    error_protocol_version: {
+      type: "Error",
+      message: "unsupported wire protocol",
+      errorClass: WIRE_ERROR_CLASS.protocol_version,
+    },
+  };
+
+  await test("every Rust-generated frame decodes to the expected fields", () => {
+    const vectors = vectorRecords("frame");
+    assert.ok(vectors.length > 0, "vector file must contain frames");
+    for (const [name, hex] of vectors) {
+      const expected = expectedFrames[name];
+      assert.ok(
+        expected !== undefined,
+        `wire vector '${name}' has no expected decode in this client; the Rust ` +
+          `side added a frame this client does not account for`,
+      );
+      const decoded = tryDecode(Buffer.from(hex, "hex"));
+      assert.ok(decoded !== null, `vector '${name}' must decode`);
+      assert.deepEqual(
+        decoded.msg,
+        expected,
+        `vector '${name}' decoded to the wrong fields`,
+      );
+    }
+    assert.deepEqual(
+      vectors.map(([name]) => name).sort(),
+      Object.keys(expectedFrames).sort(),
+      "the expected-frame table and the vector file must cover the same names",
+    );
+  });
+
+  await test("this client re-encodes every frame to the exact Rust bytes", () => {
+    for (const [name, hex] of vectorRecords("frame")) {
+      const expected = expectedFrames[name]!;
+      assert.equal(
+        encode(expected).toString("hex"),
+        hex,
+        `vector '${name}': this client's encoder disagrees with the server's`,
+      );
+    }
+  });
+
+  await test("the byte shapes an older client writes still decode here", () => {
+    // The reverse-compatibility half: bytes a 0.21.0 peer puts on the wire,
+    // which neither implementation emits today.
+    const expectedAlt: Record<string, Message> = {
+      connect_legacy_db_only: {
+        type: "Connect",
+        dbName: "mydb",
+        password: null,
+        username: null,
+      },
+      connect_legacy_username_explicit_empty: {
+        type: "Connect",
+        dbName: "mydb",
+        password: "pw",
+        username: null,
+      },
+    };
+    const vectors = vectorRecords("framealt");
+    assert.ok(vectors.length > 0, "vector file must contain alternate frames");
+    for (const [name, hex] of vectors) {
+      const expected = expectedAlt[name];
+      assert.ok(expected !== undefined, `no expected decode for '${name}'`);
+      const decoded = tryDecode(Buffer.from(hex, "hex"));
+      assert.ok(decoded !== null, `vector '${name}' must decode`);
+      assert.deepEqual(decoded.msg, expected, `vector '${name}'`);
+    }
+  });
+
+  await test("the feature names match the server's, in order", () => {
+    const shipped = vectorRecords("feature").map(([name]) => name);
+    assert.deepEqual(
+      Object.values(WIRE_FEATURE),
+      shipped,
+      "WIRE_FEATURE does not match the server's SERVER_FEATURES",
+    );
+    assert.deepEqual(
+      [...CLIENT_CAPABILITIES.features],
+      shipped,
+      "CLIENT_CAPABILITIES.features does not match the server's SERVER_FEATURES",
+    );
+  });
+
+  await test("the error class numbering matches the server's", () => {
+    const shipped = vectorRecords("class");
+    assert.deepEqual(
+      Object.entries(WIRE_ERROR_CLASS).map(([name, byte]) => [
+        name,
+        String(byte),
+      ]),
+      shipped,
+      "WIRE_ERROR_CLASS does not match the server's ErrorClass numbering",
+    );
   });
 
   console.log("\n" + "═".repeat(50));

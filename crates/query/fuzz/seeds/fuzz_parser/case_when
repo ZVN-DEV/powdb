@@ -1,0 +1,1 @@
+User { case when .a = 1 then "x" else "y" end }

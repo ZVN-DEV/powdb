@@ -1,7 +1,10 @@
 use powdb_query::executor::Engine;
 use powdb_query::lexer::{split_statements, POWQL_KEYWORDS};
 use powdb_query::result::QueryResult;
-use powdb_server::protocol::Message;
+use powdb_server::protocol::{
+    require_server_capabilities, ClientHello, Message, ServerHello, CLIENT_CATALOG_VERSION,
+    MIN_SUPPORTED_PROTOCOL_VERSION,
+};
 use powdb_storage::types::Value;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -1614,6 +1617,86 @@ async fn exec_remote(
     }
 }
 
+/// Why the client half of the wire handshake did not complete.
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakeFailure {
+    /// The server answered and said no (bad credentials, unknown database,
+    /// or a protocol version it cannot serve).
+    Refused(String),
+    /// No usable reply arrived: the connection closed, the read failed, or
+    /// the frame was not a handshake reply at all. A plaintext connection to
+    /// a TLS-only listener looks like this.
+    NoReply(String),
+}
+
+impl HandshakeFailure {
+    fn message(&self) -> &str {
+        match self {
+            HandshakeFailure::Refused(m) | HandshakeFailure::NoReply(m) => m,
+        }
+    }
+}
+
+/// The CONNECT frame this CLI sends: credentials plus its protocol range,
+/// catalog ceiling, and feature set.
+fn client_connect_message(
+    db: String,
+    password: Option<String>,
+    username: Option<String>,
+) -> Message {
+    Message::ConnectWithHello {
+        db_name: db,
+        password: password.map(Into::into),
+        username,
+        hello: ClientHello::current(),
+    }
+}
+
+/// Classify a handshake reply and apply the client-side capability check.
+///
+/// Pure, so the whole matrix (negotiating server, pre-0.22.0 server, refusal,
+/// wrong frame, closed socket) is testable without a socket. A server this
+/// CLI cannot talk to is rejected here, at handshake time, rather than on the
+/// first frame it turns out not to understand.
+fn classify_handshake_reply(
+    reply: Option<Message>,
+) -> Result<(String, ServerHello), HandshakeFailure> {
+    let (version, hello) = match reply {
+        // A pre-0.22.0 server states nothing, which negotiates as protocol v1
+        // with no named features. That is still a usable server.
+        Some(Message::ConnectOk { version }) => (version, ServerHello::legacy()),
+        Some(Message::ConnectOkWithHello { version, hello }) => (version, hello),
+        Some(Message::Error { message }) => {
+            return Err(HandshakeFailure::Refused(format!(
+                "server rejected connection: {message}"
+            )));
+        }
+        Some(other) => {
+            return Err(HandshakeFailure::NoReply(format!(
+                "unexpected handshake reply: {other:?}"
+            )));
+        }
+        None => {
+            return Err(HandshakeFailure::NoReply(
+                "server closed connection during handshake".into(),
+            ));
+        }
+    };
+    require_server_capabilities(
+        &hello,
+        MIN_SUPPORTED_PROTOCOL_VERSION,
+        &[],
+        CLIENT_CATALOG_VERSION,
+    )
+    .map_err(HandshakeFailure::Refused)?;
+    Ok((version, hello))
+}
+
+/// The hint appended when the handshake produced no usable reply, which is
+/// what a plaintext connection to a TLS-only listener looks like.
+const TLS_HANDSHAKE_HINT: &str =
+    "server may require TLS; try --tls, and --tls-ca <ca.pem> for self-signed certificates";
+
 async fn exec_remote_on<S>(
     stream: S,
     db: String,
@@ -1629,30 +1712,22 @@ where
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
-    let connect = Message::Connect {
-        db_name: db,
-        password: password.map(Into::into),
-        username,
-    };
+    let connect = client_connect_message(db, password, username);
     if connect.write_to(&mut writer).await.is_err()
         || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
     {
         eprintln!("Error: failed to send CONNECT");
         return 1;
     }
-    match Message::read_from(&mut reader).await {
-        Ok(Some(Message::ConnectOk { .. })) => {}
-        Ok(Some(Message::Error { message })) => {
-            eprintln!("Error: server rejected connection: {message}");
-            return 1;
+    let reply = Message::read_from(&mut reader).await.ok().flatten();
+    if let Err(failure) = classify_handshake_reply(reply) {
+        match failure {
+            HandshakeFailure::Refused(message) => eprintln!("Error: {message}"),
+            HandshakeFailure::NoReply(message) => {
+                eprintln!("Error: handshake failed: {message} ({TLS_HANDSHAKE_HINT})");
+            }
         }
-        _ => {
-            eprintln!(
-                "Error: handshake failed (server may require TLS; try --tls, \
-                 and --tls-ca <ca.pem> for self-signed certificates)"
-            );
-            return 1;
-        }
+        return 1;
     }
 
     // The wire protocol carries one statement per `Query` message, so split
@@ -2124,11 +2199,7 @@ async fn run_remote_on<S>(
     let mut writer = BufWriter::new(writer);
 
     // Send CONNECT
-    let connect = Message::Connect {
-        db_name: db.clone(),
-        password: password.map(Into::into),
-        username,
-    };
+    let connect = client_connect_message(db.clone(), password, username);
     if let Err(e) = connect.write_to(&mut writer).await {
         eprintln!("Error: failed to send CONNECT: {e}");
         std::process::exit(1);
@@ -2139,25 +2210,23 @@ async fn run_remote_on<S>(
     }
 
     // Read CONNECT_OK or ERROR
-    match Message::read_from(&mut reader).await {
-        Ok(Some(Message::ConnectOk { version })) => {
-            eprintln!("Connected to db `{db}` (server v{version})");
-            eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
-        }
-        Ok(Some(Message::Error { message })) => {
-            eprintln!("Error: server rejected connection: {message}");
-            std::process::exit(1);
-        }
-        Ok(Some(other)) => {
-            eprintln!("Error: unexpected handshake reply: {other:?}");
-            std::process::exit(1);
-        }
-        Ok(None) => {
-            eprintln!("Error: server closed connection during handshake");
-            std::process::exit(1);
-        }
+    let reply = match Message::read_from(&mut reader).await {
+        Ok(reply) => reply,
         Err(e) => {
             eprintln!("Error: handshake read failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    match classify_handshake_reply(reply) {
+        Ok((version, hello)) => {
+            eprintln!(
+                "Connected to db `{db}` (server v{version}, wire protocol v{})",
+                hello.protocol
+            );
+            eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
+        }
+        Err(failure) => {
+            eprintln!("Error: {}", failure.message());
             std::process::exit(1);
         }
     }
@@ -2648,6 +2717,93 @@ fn format_value(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_connect_frame_states_this_build_capabilities() {
+        let frame = client_connect_message("db".into(), Some("pw".into()), None).encode();
+        match Message::decode(&frame).expect("connect frame must decode") {
+            Message::ConnectWithHello {
+                db_name,
+                password,
+                hello,
+                ..
+            } => {
+                assert_eq!(db_name, "db");
+                assert_eq!(password.as_deref().map(|p| p.as_str()), Some("pw"));
+                assert_eq!(hello, ClientHello::current());
+            }
+            other => panic!("the CLI must send a hello-bearing CONNECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_accepts_a_negotiating_server() {
+        let hello = ServerHello {
+            protocol: 2,
+            min_protocol: 1,
+            max_protocol: 2,
+            catalog_version: CLIENT_CATALOG_VERSION,
+            features: vec!["sql".into()],
+        };
+        let (version, negotiated) = classify_handshake_reply(Some(Message::ConnectOkWithHello {
+            version: "0.22.0".into(),
+            hello: hello.clone(),
+        }))
+        .expect("a same-version server must be accepted");
+        assert_eq!(version, "0.22.0");
+        assert_eq!(negotiated, hello);
+    }
+
+    #[test]
+    fn handshake_stays_backward_compatible_with_a_pre_negotiation_server() {
+        // A v0.21.0 server answers with a bare version string. The CLI must
+        // still connect, at protocol v1.
+        let (version, hello) = classify_handshake_reply(Some(Message::ConnectOk {
+            version: "0.21.0".into(),
+        }))
+        .expect("a pre-0.22.0 server must still be usable");
+        assert_eq!(version, "0.21.0");
+        assert_eq!(hello, ServerHello::legacy());
+    }
+
+    #[test]
+    fn handshake_refuses_a_server_whose_catalog_is_from_the_future() {
+        let failure = classify_handshake_reply(Some(Message::ConnectOkWithHello {
+            version: "9.9.9".into(),
+            hello: ServerHello {
+                protocol: 2,
+                min_protocol: 1,
+                max_protocol: 2,
+                catalog_version: CLIENT_CATALOG_VERSION + 1,
+                features: Vec::new(),
+            },
+        }))
+        .expect_err("a newer catalog format must be refused at handshake time");
+        assert!(matches!(failure, HandshakeFailure::Refused(_)));
+        assert!(
+            failure.message().contains("upgrade the client"),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn handshake_classifies_refusals_apart_from_silence() {
+        let refused = classify_handshake_reply(Some(Message::Error {
+            message: "authentication failed".into(),
+        }))
+        .expect_err("an Error reply is a refusal");
+        assert!(matches!(refused, HandshakeFailure::Refused(_)));
+        assert!(refused.message().contains("authentication failed"));
+
+        // A closed socket and a non-handshake frame both mean "no usable
+        // reply", which is what earns the TLS hint.
+        let closed =
+            classify_handshake_reply(None).expect_err("a closed socket is not a handshake");
+        assert!(matches!(closed, HandshakeFailure::NoReply(_)));
+        let wrong_frame = classify_handshake_reply(Some(Message::Pong))
+            .expect_err("a Pong is not a handshake reply");
+        assert!(matches!(wrong_frame, HandshakeFailure::NoReply(_)));
+    }
 
     #[test]
     fn remote_null_sentinel_renders_as_null_like_embedded() {

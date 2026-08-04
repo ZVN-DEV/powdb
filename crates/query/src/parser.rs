@@ -2379,7 +2379,7 @@ impl Parser {
         };
         let query = self.parse_query_tail(source)?;
         // Reconstruct query text from tokens for storage and re-execution.
-        let query_text = tokens_to_text(&self.tokens[query_start..self.pos]);
+        let query_text = tokens_to_text(&self.tokens[query_start..self.pos])?;
         Ok(Statement::CreateView(CreateViewExpr {
             name,
             query,
@@ -2606,28 +2606,99 @@ fn qualify_bare_fields(expr: Expr, alias: &str) -> Expr {
     }
 }
 
+/// True when `text` lexes to exactly the one token `tok` (plus EOF).
+///
+/// Lets the writers below *ask the lexer* which spelling round-trips instead
+/// of re-deriving its rules, so the two can never drift apart.
+fn relexes_to(text: &str, tok: &Token) -> bool {
+    match lex(text) {
+        Ok(toks) => matches!(toks.as_slice(), [t, Token::Eof] if t == tok),
+        Err(_) => false,
+    }
+}
+
+/// Write a string literal in source form, escaping what the lexer decodes.
+///
+/// Exact inverse of the lexer's string rule: it turns `\"`, `\\`, `\n` and
+/// `\t` into `"`, `\`, LF and TAB, copies every other character through
+/// verbatim, and swallows the backslash of any other escape (`\r` decodes to
+/// `r`). So those four are the only escapes that may be emitted, and every
+/// other character (CR included) must be written raw.
+fn push_string_literal(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
+/// Write an identifier (`prefix` is `""` for a bare name, `"."` for a field
+/// reference) in whichever spelling re-lexes to `tok` itself: bare when the
+/// lexer reads it back as this exact token, backtick-quoted otherwise.
+///
+/// Quoting is not cosmetic. `` `order` `` lexes to `Ident("order")`; written
+/// back bare it re-lexes to the *keyword* `order`, and the stored view runs a
+/// different query. Same for names with spaces, leading digits, or symbols.
+fn push_ident(out: &mut String, prefix: &str, name: &str, tok: &Token) -> Result<(), ParseError> {
+    let bare = format!("{prefix}{name}");
+    if relexes_to(&bare, tok) {
+        out.push_str(&bare);
+        return Ok(());
+    }
+    let quoted = format!("{prefix}`{name}`");
+    if relexes_to(&quoted, tok) {
+        out.push_str(&quoted);
+        return Ok(());
+    }
+    Err(ParseError::Unsupported {
+        feature: format!(
+            "cannot store view source: identifier '{name}' has no PowQL spelling that reads back unchanged"
+        ),
+    })
+}
+
 /// Reconstruct PowQL source text from a slice of tokens. Used to store the
-/// view's source query for re-execution on refresh. Not perfectly
-/// round-trippable (whitespace is normalised) but semantically identical.
-fn tokens_to_text(tokens: &[Token]) -> String {
+/// view's source query for re-execution on refresh.
+///
+/// Whitespace is normalised, but the token stream is not: re-lexing the result
+/// yields exactly the tokens passed in. That is the whole contract. A
+/// reconstruction that re-lexes to *different* tokens makes the stored view run
+/// a different query than the user wrote, with no error anywhere, so the result
+/// is verified against the lexer before it is returned and a token with no
+/// faithful spelling is a typed error rather than a quiet mismatch.
+fn tokens_to_text(tokens: &[Token]) -> Result<String, ParseError> {
     let mut out = String::with_capacity(64);
     for tok in tokens {
         if !out.is_empty() && !matches!(tok, Token::Eof) {
             out.push(' ');
         }
         match tok {
-            Token::Ident(s) => out.push_str(s),
-            Token::DotIdent(s) => {
-                out.push('.');
-                out.push_str(s);
-            }
+            Token::Ident(s) => push_ident(&mut out, "", s, tok)?,
+            Token::DotIdent(s) => push_ident(&mut out, ".", s, tok)?,
             Token::IntLit(v) => out.push_str(&v.to_string()),
-            Token::FloatLit(v) => out.push_str(&v.to_string()),
-            Token::StringLit(s) => {
-                out.push('"');
-                out.push_str(s);
-                out.push('"');
+            Token::FloatLit(v) => {
+                if !v.is_finite() {
+                    return Err(ParseError::Unsupported {
+                        feature: "cannot store view source: non-finite number literal".into(),
+                    });
+                }
+                let rendered = v.to_string();
+                out.push_str(&rendered);
+                // `Display` drops a redundant fraction (`3.0` prints as `3`,
+                // `-0.0` as `-0`), and the lexer only reads a float when a
+                // digit follows a dot, so without this the literal comes back
+                // as an INTEGER token.
+                if !rendered.contains('.') {
+                    out.push_str(".0");
+                }
             }
+            Token::StringLit(s) => push_string_literal(&mut out, s),
             Token::BoolLit(v) => out.push_str(if *v { "true" } else { "false" }),
             Token::Param(s) => {
                 out.push('$');
@@ -2750,7 +2821,24 @@ fn tokens_to_text(tokens: &[Token]) -> String {
             Token::Eof => {}
         }
     }
-    out
+    // Verify rather than trust. Every arm above is meant to be the lexer's
+    // inverse, but a wrong one is invisible: it stores a query that merely
+    // *looks* like the user's. Re-lex the result and require the same stream
+    // back, so any arm that is (or later becomes) wrong fails loudly here
+    // instead of silently redefining someone's view. EOF is dropped, since a
+    // slice of the middle of a stream never carries one.
+    let mut expected: Vec<Token> = tokens
+        .iter()
+        .filter(|t| **t != Token::Eof)
+        .cloned()
+        .collect();
+    expected.push(Token::Eof);
+    match lex(&out) {
+        Ok(round_tripped) if round_tripped == expected => Ok(out),
+        _ => Err(ParseError::Unsupported {
+            feature: "cannot store view source: query text does not read back unchanged".into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -4868,5 +4956,280 @@ mod json_path_tests {
             grouped.group_by.unwrap().keys[0].expr,
             Expr::JsonPath { .. }
         ));
+    }
+}
+
+/// `tokens_to_text` is the inverse of the lexer: whatever it writes must read
+/// back as the very tokens it was given. A view stores its defining query as
+/// that text and re-lexes it on every refresh, so any disagreement silently
+/// redefines the view.
+#[cfg(test)]
+mod token_text_roundtrip {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One value of every payload-carrying `Token` variant (with payloads
+    /// chosen to break a naive reconstruction: reserved words that exist
+    /// only as quoted identifiers, names needing quotes, escapes the lexer
+    /// decodes, numbers whose `Display` changes their type) plus every
+    /// payload-free variant except EOF.
+    ///
+    /// A variant added to `Token` and not added here still cannot slip
+    /// through unnoticed: `tokens_to_text` re-lexes what it built and
+    /// refuses to return a mismatch.
+    fn every_token() -> Vec<Token> {
+        let mut toks = vec![
+            // Identifiers: plain, reserved words, and spellings that only
+            // exist inside backticks.
+            Token::Ident("User".into()),
+            Token::Ident("order".into()),
+            Token::Ident("true".into()),
+            Token::Ident("null".into()),
+            Token::Ident("column name".into()),
+            Token::Ident("1st".into()),
+            Token::Ident("a-b".into()),
+            Token::Ident("has#hash".into()),
+            Token::Ident("has.dot".into()),
+            Token::Ident("héllo".into()),
+            Token::DotIdent("name".into()),
+            Token::DotIdent("order".into()),
+            Token::DotIdent("field name".into()),
+            Token::DotIdent("1st".into()),
+            Token::DotIdent("a-b".into()),
+            // Numbers, including the ones whose `Display` loses the
+            // fraction or overflows to a very long expansion.
+            Token::IntLit(0),
+            Token::IntLit(-1),
+            Token::IntLit(i64::MIN),
+            Token::IntLit(i64::MAX),
+            Token::FloatLit(0.0),
+            Token::FloatLit(-0.0),
+            Token::FloatLit(3.0),
+            Token::FloatLit(-2.0),
+            Token::FloatLit(1.5),
+            Token::FloatLit(1e300),
+            Token::FloatLit(1e-300),
+            Token::FloatLit(f64::MIN_POSITIVE),
+            // Strings: every escape the lexer decodes, plus characters
+            // that would otherwise leak into the grammar.
+            Token::StringLit(String::new()),
+            Token::StringLit("plain".into()),
+            Token::StringLit("back\\slash".into()),
+            Token::StringLit("he said \"hi\"".into()),
+            Token::StringLit("line\nbreak".into()),
+            Token::StringLit("tab\there".into()),
+            Token::StringLit("carriage\rreturn".into()),
+            Token::StringLit("`backtick`".into()),
+            Token::StringLit("# not a comment".into()),
+            Token::StringLit("} filter .x = 1".into()),
+            Token::StringLit("\\\"".into()),
+            Token::BoolLit(true),
+            Token::BoolLit(false),
+            Token::Param("1".into()),
+            Token::Param("name".into()),
+            Token::Param(String::new()),
+        ];
+        toks.extend([
+            Token::Type,
+            Token::Filter,
+            Token::Order,
+            Token::Limit,
+            Token::Offset,
+            Token::Insert,
+            Token::Update,
+            Token::Delete,
+            Token::Upsert,
+            Token::Returning,
+            Token::Select,
+            Token::Required,
+            Token::Default,
+            Token::Auto,
+            Token::Multi,
+            Token::Link,
+            Token::Index,
+            Token::Unique,
+            Token::On,
+            Token::Conflict,
+            Token::Asc,
+            Token::Desc,
+            Token::And,
+            Token::Or,
+            Token::Not,
+            Token::Exists,
+            Token::Let,
+            Token::As,
+            Token::Match,
+            Token::Group,
+            Token::Join,
+            Token::Inner,
+            Token::LeftKw,
+            Token::RightKw,
+            Token::Outer,
+            Token::Cross,
+            Token::Transaction,
+            Token::Begin,
+            Token::Commit,
+            Token::Rollback,
+            Token::View,
+            Token::Materialized,
+            Token::Refresh,
+            Token::Union,
+            Token::Having,
+            Token::Distinct,
+            Token::In,
+            Token::Between,
+            Token::Like,
+            Token::Count,
+            Token::Avg,
+            Token::Sum,
+            Token::Min,
+            Token::Max,
+            Token::Raw,
+            Token::Is,
+            Token::Null,
+        ]);
+        toks.extend([
+            Token::Upper,
+            Token::Lower,
+            Token::Length,
+            Token::Trim,
+            Token::Substring,
+            Token::Concat,
+            Token::Abs,
+            Token::Round,
+            Token::Ceil,
+            Token::Floor,
+            Token::Sqrt,
+            Token::Pow,
+            Token::Now,
+            Token::Extract,
+            Token::DateAdd,
+            Token::DateDiff,
+            Token::JsonType,
+            Token::JsonText,
+            Token::Cast,
+            Token::Case,
+            Token::When,
+            Token::Then,
+            Token::Else,
+            Token::End,
+            Token::Over,
+            Token::Partition,
+            Token::RowNumber,
+            Token::Rank,
+            Token::DenseRank,
+            Token::Alter,
+            Token::Drop,
+            Token::Add,
+            Token::Column,
+            Token::Explain,
+            Token::Schema,
+            Token::Describe,
+        ]);
+        toks.extend([
+            Token::Eq,
+            Token::Neq,
+            Token::Lt,
+            Token::Gt,
+            Token::Lte,
+            Token::Gte,
+            Token::Assign,
+            Token::Arrow,
+            Token::Pipe,
+            Token::Coalesce,
+            Token::Plus,
+            Token::Minus,
+            Token::Star,
+            Token::Slash,
+            Token::LBrace,
+            Token::RBrace,
+            Token::LParen,
+            Token::RParen,
+            Token::Comma,
+            Token::Colon,
+            Token::Dot,
+        ]);
+        toks
+    }
+
+    /// Reconstruct, re-lex, and compare against the input stream.
+    fn assert_round_trips(tokens: &[Token]) {
+        let text =
+            tokens_to_text(tokens).unwrap_or_else(|e| panic!("no source text for {tokens:?}: {e}"));
+        let relexed = lex(&text)
+            .unwrap_or_else(|e| panic!("`{text}` from {tokens:?} does not lex: {}", e.message));
+        let mut expected = tokens.to_vec();
+        expected.push(Token::Eof);
+        assert_eq!(relexed, expected, "`{text}` re-lexes to different tokens");
+    }
+
+    #[test]
+    fn every_token_round_trips_on_its_own() {
+        for tok in every_token() {
+            assert_round_trips(std::slice::from_ref(&tok));
+        }
+    }
+
+    #[test]
+    fn eof_contributes_no_text() {
+        assert_eq!(tokens_to_text(&[Token::Eof]).unwrap(), "");
+        assert_eq!(tokens_to_text(&[]).unwrap(), "");
+    }
+
+    /// A token with no faithful spelling is refused, not written wrong.
+    /// A backtick inside an identifier is the case that cannot be quoted
+    /// (the lexer has no escape inside backticks), and a non-finite float has
+    /// no literal form at all. The parameter name is caught by nothing but the
+    /// closing re-lex check, which is the point of having one.
+    #[test]
+    fn unspellable_tokens_are_typed_errors() {
+        for tok in [
+            Token::Ident("has`tick".into()),
+            Token::DotIdent("has`tick".into()),
+            Token::Ident(String::new()),
+            Token::FloatLit(f64::INFINITY),
+            Token::FloatLit(f64::NAN),
+            Token::Param("two words".into()),
+        ] {
+            let err = tokens_to_text(std::slice::from_ref(&tok))
+                .expect_err("{tok:?} must not be written back wrong");
+            assert!(
+                matches!(err, ParseError::Unsupported { .. }),
+                "expected a typed Unsupported error for {tok:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// A view whose source text cannot be stored faithfully is refused at
+    /// creation instead of quietly becoming a different query.
+    #[test]
+    fn unspellable_view_source_is_refused() {
+        let huge = format!("1{}.0", "0".repeat(400)); // overflows f64 to inf
+        let err = parse(&format!("materialize V as U filter .x = {huge}"))
+            .expect_err("a view source that cannot round-trip must be refused");
+        assert!(
+            matches!(err, ParseError::Unsupported { .. }),
+            "expected a typed Unsupported error, got {err:?}"
+        );
+    }
+
+    proptest! {
+        /// The property the concrete cases are instances of: for ANY token
+        /// stream, `lex(tokens_to_text(tokens)) == tokens`.
+        #[test]
+        fn any_token_stream_round_trips(
+            tokens in proptest::collection::vec(
+                proptest::sample::select(every_token()),
+                0..12usize,
+            )
+        ) {
+            let text = tokens_to_text(&tokens)
+                .map_err(|e| TestCaseError::fail(format!("no source text: {e}")))?;
+            let relexed = lex(&text)
+                .map_err(|e| TestCaseError::fail(format!("`{text}` does not lex: {}", e.message)))?;
+            let mut expected = tokens.clone();
+            expected.push(Token::Eof);
+            prop_assert_eq!(relexed, expected, "`{}` re-lexes to different tokens", text);
+        }
     }
 }

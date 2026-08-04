@@ -1,0 +1,1 @@
+link Note.user -> User on user_id = id

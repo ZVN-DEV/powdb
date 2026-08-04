@@ -171,13 +171,13 @@ fn scalarization_matrix_through_project_and_filter() {
 }
 
 #[test]
-fn no_implicit_cross_type_coercion() {
+fn numbers_compare_numerically_and_strings_do_not_coerce() {
     // `.data->age` scalarizes to whatever the node is; comparisons then follow
-    // existing Value rules with NO implicit coercion. Two distinctions matter:
-    //   - `=` is TYPED equality (Value::eq): Int(21) == literal 21, but a
-    //     Float(21.0) node does NOT equal the int literal 21, and no node
-    //     equals a string literal.
-    //   - range ops use Value::cmp, which DOES compare Int/Float numerically.
+    // the numeric comparison rule: all six operators compare Int and Float
+    // numerically, so `=` and `>` agree as one total order (0.22.0; before
+    // that, `=` was typed while ranges were numeric, and the same filter
+    // could answer differently by operator). Number/string pairs are still
+    // never coerced.
     let mut e = engine_with_posts("nocoerce");
     // Row 1 is an Int node; row 2 is a Float node.
     insert(&mut e, 1, r#"{"age":21}"#);
@@ -189,13 +189,14 @@ fn no_implicit_cross_type_coercion() {
         0,
         "number node != Str literal"
     );
-    // Typed `=`: only the Int(21) node equals the int literal 21.
+    // Numeric `=`: both the Int(21) and Float(21.0) nodes equal the int
+    // literal 21.
     assert_eq!(
         count(&mut e, "Post filter .data->age = 21"),
-        1,
-        "typed equality: Float(21.0) does NOT equal Int literal 21"
+        2,
+        "numeric equality: Float(21.0) equals Int literal 21"
     );
-    // Range `>` uses Value::cmp, so both the Int and Float nodes clear 20.
+    // Range `>` follows the same order, so both nodes clear 20.
     assert_eq!(
         count(&mut e, "Post filter .data->age > 20"),
         2,

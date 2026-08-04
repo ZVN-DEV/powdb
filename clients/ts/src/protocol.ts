@@ -39,6 +39,101 @@ export const MSG_QUERY_SQL_NATIVE = 0x15;
 export const MSG_RESULT_ROWS_NATIVE = 0x16;
 export const MSG_RESULT_SCALAR_NATIVE = 0x17;
 
+// ───── Protocol version negotiation (mirrors crates/server/src/protocol.rs) ─
+
+/**
+ * Wire protocol version implied by a peer that sends no handshake hello
+ * block. Every PowDB release through 0.21.0 speaks exactly this.
+ */
+export const PROTOCOL_VERSION_LEGACY = 1;
+
+/**
+ * Wire protocol version introduced in 0.22.0: `Connect` and `ConnectOk` carry
+ * a hello block stating a supported version range and a feature set.
+ */
+export const PROTOCOL_VERSION_NEGOTIATED = 2;
+
+/**
+ * Sentinel opening a hello block, so a decoder can tell an intentional hello
+ * from stray trailing bytes and reject the latter.
+ */
+const HELLO_MAGIC = 0x50574831; // little-endian wire bytes 31 48 57 50
+
+/** Maximum feature names accepted in one hello block. */
+const MAX_HELLO_FEATURES = 64;
+
+/** Maximum byte length of one feature name. */
+const MAX_FEATURE_NAME_LEN = 64;
+
+/**
+ * Named wire features. A capability added in a later release is a new name in
+ * this set, never a change to the handshake's shape.
+ */
+export const WIRE_FEATURE = {
+  /** Positional `$N` parameter binding (`0x04` / `0x14`). */
+  params: "params",
+  /** SQL request frames (`0x05` / `0x15`). */
+  sql: "sql",
+  /** Native typed request and result frames (`0x13`-`0x17`). */
+  nativeTyped: "native-typed",
+  /** Trailing error-class byte on `Error` payloads. */
+  errorClass: "error-class",
+  /** Private replica sync frames (`0x20`-`0x25`). */
+  sync: "sync",
+  /** PowQL entity links and relationship traversal. */
+  entityLinks: "entity-links",
+  /** PowQL nested projections. */
+  nestedProjection: "nested-projection",
+} as const;
+
+/** What a client states about itself in the `Connect` hello block. */
+export interface ClientHello {
+  /** Oldest protocol version this client can speak. */
+  minProtocol: number;
+  /** Newest protocol version this client can speak. */
+  maxProtocol: number;
+  /**
+   * Highest catalog format this client can read. `0` means "not stated",
+   * which disables the catalog check rather than failing it.
+   */
+  catalogVersion: number;
+  /** Named features this client understands. */
+  features: string[];
+}
+
+/**
+ * What a server answers in the `ConnectOk` hello block: the negotiated
+ * protocol version, the range it could have agreed to, its catalog format,
+ * and the agreed feature set (the intersection of both sides).
+ */
+export interface ServerHello {
+  /** The version both sides will use for the rest of the session. */
+  protocol: number;
+  /** Oldest protocol version the server can speak. */
+  minProtocol: number;
+  /** Newest protocol version the server can speak. */
+  maxProtocol: number;
+  /** Highest catalog format the server can write. `0` means "not stated". */
+  catalogVersion: number;
+  /** Features both sides support. Anything absent must not be used. */
+  features: string[];
+}
+
+/**
+ * The hello implied by a server that sent no hello block: a pre-0.22.0
+ * server, which speaks protocol v1 and states neither features nor a catalog
+ * version.
+ */
+export function legacyServerHello(): ServerHello {
+  return {
+    protocol: PROTOCOL_VERSION_LEGACY,
+    minProtocol: PROTOCOL_VERSION_LEGACY,
+    maxProtocol: PROTOCOL_VERSION_LEGACY,
+    catalogVersion: 0,
+    features: [],
+  };
+}
+
 // ───── Size limits (mirror crates/server/src/protocol.rs) ──────────────────
 
 /** Maximum payload size accepted from the wire (64 MB). */
@@ -168,8 +263,16 @@ export type Message =
        * servers accept it unchanged.
        */
       username: string | null;
+      /**
+       * Protocol version range and feature set (server ≥0.22.0). Appended
+       * after the username field, which is then always written even when
+       * `null` because the hello sits after it positionally. Omit the field
+       * entirely to send the byte-identical pre-0.22.0 frame; a 0.22+ server
+       * reads that as protocol v1 and still accepts it.
+       */
+      hello?: ClientHello;
     }
-  | { type: "ConnectOk"; version: string }
+  | { type: "ConnectOk"; version: string; hello?: ServerHello }
   | { type: "Query"; query: string }
   | { type: "QuerySql"; query: string }
   | { type: "QueryWithParams"; query: string; params: WireParam[] }
@@ -237,7 +340,11 @@ export function encode(msg: Message): Buffer {
       // remain after the password, so omitting it when null keeps the frame
       // byte-identical to the legacy 0.3.x shape.
       const parts = [dbBuf, pwBuf];
-      if (msg.username !== null) {
+      if (msg.hello !== undefined) {
+        // The username field cannot be elided once a hello follows it.
+        parts.push(encodeString(msg.username ?? ""));
+        parts.push(encodeClientHello(msg.hello));
+      } else if (msg.username !== null) {
         parts.push(encodeString(msg.username));
       }
       payload = Buffer.concat(parts);
@@ -245,7 +352,13 @@ export function encode(msg: Message): Buffer {
       break;
     }
     case "ConnectOk":
-      payload = encodeString(msg.version);
+      payload =
+        msg.hello === undefined
+          ? encodeString(msg.version)
+          : Buffer.concat([
+              encodeString(msg.version),
+              encodeServerHello(msg.hello),
+            ]);
       msgType = MSG_CONNECT_OK;
       break;
     case "Query":
@@ -376,7 +489,17 @@ export function encode(msg: Message): Buffer {
       msgType = MSG_RESULT_MSG;
       break;
     case "Error":
-      payload = encodeString(msg.message);
+      // The class rides as exactly one byte after the length-prefixed
+      // message, mirroring the server. Omitting it when undefined keeps the
+      // frame byte-identical to the pre-class shape, which is what a legacy
+      // decoder expects.
+      payload =
+        msg.errorClass === undefined
+          ? encodeString(msg.message)
+          : Buffer.concat([
+              encodeString(msg.message),
+              Buffer.from([msg.errorClass & 0xff]),
+            ]);
       msgType = MSG_ERROR;
       break;
     case "Disconnect":
@@ -522,10 +645,21 @@ function decodePayload(msgType: number, payload: Buffer): Message {
         const u = decodeString(payload, cursor);
         username = u.length === 0 ? null : u;
       }
+      // Anything still unread is a hello block (0.22.0+). A legacy frame ends
+      // here and decodes without one.
+      if (cursor.pos < payload.length) {
+        const hello = decodeClientHello(payload, cursor);
+        return { type: "Connect", dbName, password, username, hello };
+      }
       return { type: "Connect", dbName, password, username };
     }
-    case MSG_CONNECT_OK:
-      return { type: "ConnectOk", version: decodeString(payload, cursor) };
+    case MSG_CONNECT_OK: {
+      const version = decodeString(payload, cursor);
+      if (cursor.pos < payload.length) {
+        return { type: "ConnectOk", version, hello: decodeServerHello(payload, cursor) };
+      }
+      return { type: "ConnectOk", version };
+    }
     case MSG_QUERY:
       return { type: "Query", query: decodeString(payload, cursor) };
     case MSG_QUERY_SQL: {
@@ -1018,6 +1152,108 @@ function encodeBytes(bytes: Buffer): Buffer {
 }
 
 // ───── String helpers ──────────────────────────────────────────────────────
+
+/**
+ * Encode a feature-name list: `[count:u16][name:len-prefixed]*`.
+ *
+ * Capped at {@link MAX_HELLO_FEATURES} so the written count always matches
+ * the number of names that follow, and so a hello stays well inside the
+ * server's 4 KB pre-auth payload limit.
+ */
+function encodeFeatureList(features: string[]): Buffer {
+  const kept = features.slice(0, MAX_HELLO_FEATURES);
+  return Buffer.concat([u16LE(kept.length), ...kept.map(encodeString)]);
+}
+
+function decodeFeatureList(
+  payload: Buffer,
+  cursor: { pos: number },
+  label: string,
+): string[] {
+  const count = readU16(payload, cursor, `${label} count`);
+  if (count > MAX_HELLO_FEATURES) {
+    throw new Error(
+      `too many ${label} entries: ${count} (max ${MAX_HELLO_FEATURES})`,
+    );
+  }
+  // Every name costs at least its 4-byte length prefix, so the remaining
+  // payload bounds how many can follow: never allocate on the count alone.
+  if (count * 4 > payload.length - cursor.pos) {
+    throw new Error(`${label} count exceeds payload size`);
+  }
+  const features: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const name = decodeStringStrict(payload, cursor, label);
+    if (Buffer.byteLength(name, "utf8") > MAX_FEATURE_NAME_LEN) {
+      throw new Error(`${label} name too long`);
+    }
+    features.push(name);
+  }
+  return features;
+}
+
+function encodeClientHello(hello: ClientHello): Buffer {
+  return Buffer.concat([
+    u32LE(HELLO_MAGIC),
+    u16LE(hello.minProtocol),
+    u16LE(hello.maxProtocol),
+    u16LE(hello.catalogVersion),
+    encodeFeatureList(hello.features),
+  ]);
+}
+
+/**
+ * Decode a client hello block.
+ *
+ * Bytes after the feature list are deliberately left unread: that is the
+ * extension point a later release appends to, so an older peer must skip them
+ * rather than reject the frame.
+ */
+function decodeClientHello(
+  payload: Buffer,
+  cursor: { pos: number },
+): ClientHello {
+  const magic = readU32(payload, cursor, "client hello magic");
+  if (magic !== HELLO_MAGIC) {
+    throw new Error("malformed Connect hello block");
+  }
+  const minProtocol = readU16(payload, cursor, "client hello minimum protocol");
+  const maxProtocol = readU16(payload, cursor, "client hello maximum protocol");
+  const catalogVersion = readU16(payload, cursor, "client hello catalog version");
+  const features = decodeFeatureList(payload, cursor, "client hello feature");
+  return { minProtocol, maxProtocol, catalogVersion, features };
+}
+
+function encodeServerHello(hello: ServerHello): Buffer {
+  return Buffer.concat([
+    u32LE(HELLO_MAGIC),
+    u16LE(hello.protocol),
+    u16LE(hello.minProtocol),
+    u16LE(hello.maxProtocol),
+    u16LE(hello.catalogVersion),
+    encodeFeatureList(hello.features),
+  ]);
+}
+
+/**
+ * Decode a server hello block. Trailing bytes are a future extension and are
+ * skipped, exactly as in {@link decodeClientHello}.
+ */
+function decodeServerHello(
+  payload: Buffer,
+  cursor: { pos: number },
+): ServerHello {
+  const magic = readU32(payload, cursor, "server hello magic");
+  if (magic !== HELLO_MAGIC) {
+    throw new Error("malformed ConnectOk hello block");
+  }
+  const protocol = readU16(payload, cursor, "server hello negotiated protocol");
+  const minProtocol = readU16(payload, cursor, "server hello minimum protocol");
+  const maxProtocol = readU16(payload, cursor, "server hello maximum protocol");
+  const catalogVersion = readU16(payload, cursor, "server hello catalog version");
+  const features = decodeFeatureList(payload, cursor, "server hello feature");
+  return { protocol, minProtocol, maxProtocol, catalogVersion, features };
+}
 
 function encodeString(s: string): Buffer {
   const bytes = Buffer.from(s, "utf8");
