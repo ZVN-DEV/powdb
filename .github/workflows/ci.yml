@@ -510,8 +510,11 @@ jobs:
           restore-keys: |
             fuzz-replay-${{ runner.os }}-
 
+      # The cache above restores ~/.cargo/bin but not cargo's install-tracking
+      # metadata (~/.cargo/.crates.toml), so an unconditional install sees an
+      # untracked binary and hard-fails with "already exists in destination".
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
 
       - name: Replay the checked-in corpus
         env:

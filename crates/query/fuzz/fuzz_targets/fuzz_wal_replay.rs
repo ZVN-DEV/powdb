@@ -72,8 +72,21 @@ fn stage_case_dir(input: &[u8]) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&case);
     copy_dir(template_dir(), &case);
-    std::fs::write(case.join("wal.log"), input).expect("write fuzz WAL");
+    retry_eintr(|| std::fs::write(case.join("wal.log"), input)).expect("write fuzz WAL");
     case
+}
+
+/// Retry an fs op interrupted by a signal. libFuzzer drives its progress
+/// reporting off SIGALRM, and a `copy_file_range` that a signal lands in
+/// returns EINTR, which `std::fs::copy` surfaces rather than retries. That
+/// killed a CI run as a "crash" that had nothing to do with the input.
+fn retry_eintr<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -88,7 +101,7 @@ fn copy_dir(src: &Path, dst: &Path) {
         if from.is_dir() {
             copy_dir(&from, &to);
         } else {
-            std::fs::copy(&from, &to).expect("copy template file");
+            retry_eintr(|| std::fs::copy(&from, &to)).expect("copy template file");
         }
     }
 }

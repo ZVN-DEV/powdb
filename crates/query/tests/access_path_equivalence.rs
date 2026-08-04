@@ -1299,34 +1299,37 @@ fn a_view_materialized_over_zero_rows_types_every_column_as_str() {
     );
 }
 
-/// Pinned because it is broken, and this one takes the process with it.
+/// The refresh side of the empty-materialization bug above, formerly a
+/// process kill.
 ///
-/// Once a view has been mistyped by the empty-materialization bug above, the
-/// first refresh that has an actual row to write encodes an `int` into a column
-/// the schema calls `str` and reaches
-/// `unreachable!("variable column with non-variable value")` in the row
-/// encoder. Under the release profile PowDB is built `panic = "abort"`, so this
-/// is a process kill, and the refresh is automatic: a plain read of the view
-/// after an unrelated insert is enough to trigger it. No unusual privilege is
-/// needed, only `materialize` over a predicate that matches nothing yet.
-///
-/// Guarded on `panic = "unwind"` so a release-profile test run does not abort
-/// the harness while asserting that a release build would abort.
-#[cfg(panic = "unwind")]
+/// Once a view has been mistyped by that bug, the first refresh with an
+/// actual row to write used to encode an `int` into a column the schema
+/// calls `str` and reach `unreachable!("variable column with non-variable
+/// value")` in the row encoder: an abort under the shipped `panic = "abort"`
+/// release profile, triggered by a plain read of the view after an unrelated
+/// insert. The refresh path now validates the fresh rows against the backing
+/// schema before touching anything, so the same sequence is a typed error on
+/// every read shape, the process stays up, and the message says what to do
+/// (drop and recreate the view).
 #[test]
-#[should_panic(expected = "variable column with non-variable value")]
-fn refreshing_a_mistyped_view_aborts_the_process() {
+fn refreshing_a_mistyped_view_is_a_typed_error_not_an_abort() {
     let mut engine =
         Engine::new(&fresh_dir("viewpanic")).expect("engine opens over a fresh temp dir");
     exec(&mut engine, "type S { required unique id: int, n: int }");
     exec(&mut engine, "insert S { id := 1 }");
     exec(&mut engine, "materialize EV as S filter .n > 0");
-    // An ordinary insert into the source, then an ordinary read of the view.
-    // Any read at all will do now that every shape honours the dirty flag
-    // (`every_read_shape_refreshes_a_dirty_materialized_view`): `EV { .id }`,
-    // `count(EV)` and `refresh EV` all abort the same way.
+    // An ordinary insert into the source, then ordinary reads of the view.
+    // Every shape honours the dirty flag
+    // (`every_read_shape_refreshes_a_dirty_materialized_view`), so each one
+    // runs the refresh and each one must surface the same clean error.
     exec(&mut engine, "insert S { id := 2, n := 5 }");
-    let _ = run(&mut engine, "EV");
+    for read in ["EV", "EV { .id }", "count(EV)", "refresh EV"] {
+        let outcome = run(&mut engine, read);
+        assert!(
+            matches!(&outcome, Outcome::Error(message) if message.contains("drop and recreate")),
+            "expected a typed refresh error from {read:?}, got {outcome:?}"
+        );
+    }
 }
 
 /// Every read shape must see a refreshed materialized view, whatever physical

@@ -161,16 +161,40 @@ fn error_message(msg: &Message) -> &str {
 /// the only way to assert the class a client actually receives is to look at
 /// the frame.
 async fn read_raw_frame<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Vec<u8> {
+    read_raw_frame_or_eof(stream)
+        .await
+        .expect("server closed without answering")
+}
+
+/// Like [`read_raw_frame`], but a clean close AT a frame boundary is `None`.
+///
+/// A close halfway through a frame is still a hard failure: the write-side
+/// reap contract is that the server never leaves a partial frame behind. The
+/// boundary close, though, is a documented outcome (the closing flush is
+/// time-bounded, and after a failed write the reap stays silent), so tests
+/// that race a reap against a saturated socket have to accept it.
+async fn read_raw_frame_or_eof<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut header = [0u8; 6];
-    stream.read_exact(&mut header).await.unwrap();
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let n = stream.read(&mut header[filled..]).await.unwrap();
+        if n == 0 {
+            assert_eq!(
+                filled, 0,
+                "connection closed inside a frame header: a torn frame, not a clean close"
+            );
+            return None;
+        }
+        filled += n;
+    }
     let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
     let mut frame = header.to_vec();
     frame.resize(6 + payload_len, 0);
     if payload_len > 0 {
         stream.read_exact(&mut frame[6..]).await.unwrap();
     }
-    frame
+    Some(frame)
 }
 
 /// A `PING` loop must not extend an open transaction's hold on the gate.
@@ -279,9 +303,22 @@ async fn a_saturating_ping_flood_cannot_postpone_the_reap() {
     let started = Instant::now();
     let mut pongs = 0u64;
     loop {
-        let frame = tokio::time::timeout(flood_for, read_raw_frame(&mut rx))
+        let frame = tokio::time::timeout(flood_for, read_raw_frame_or_eof(&mut rx))
             .await
             .expect("a saturating client must still be reaped");
+        let Some(frame) = frame else {
+            // The reap can close the connection without its notice reaching
+            // us: the closing flush is time-bounded and a socket saturated
+            // by this very flood can hold it past the bound. The close is
+            // the reap (docs/errors.md tells clients to treat it as the
+            // timeout), so it proves the point as well as the notice does.
+            assert!(
+                started.elapsed() < MAX_TX_LIFETIME * 4,
+                "the flood postponed the reap by {:?}",
+                started.elapsed()
+            );
+            break;
+        };
         match Message::decode(&frame).expect("decodable frame") {
             Message::Pong => pongs += 1,
             other => {
@@ -298,6 +335,9 @@ async fn a_saturating_ping_flood_cannot_postpone_the_reap() {
             }
         }
     }
+    // TCP delivers everything sent before the FIN, so every pong the server
+    // served is read before the EOF surfaces: zero here means the flood was
+    // never actually served, with or without a reap notice.
     assert!(pongs > 0, "the flood must actually have been served");
     let _ = feeder.await;
 }

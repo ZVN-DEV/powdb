@@ -2442,7 +2442,7 @@ impl Engine {
             _ => return Err("view source query must be a SELECT".into()),
         };
         // Derive a schema for the backing table from the query result columns.
-        let schema = self.derive_view_schema(name, &columns, &rows);
+        let schema = self.derive_view_schema(name, &columns, &rows)?;
         // Create the backing table and insert the result rows.
         crate::cancel::check()?;
         self.catalog
@@ -2484,6 +2484,38 @@ impl Engine {
             QueryResult::Rows { columns, rows } => (columns, rows),
             _ => return Err("view source query must be a SELECT".into()),
         };
+        // The backing table's schema was frozen at create time, and the
+        // encoder trusts it unconditionally. A projection is typed per row,
+        // so fresh rows can legitimately come back with a different type
+        // (the base table changed, a `??` arm flipped). That has to be a
+        // typed error HERE, before the old contents are destroyed, not an
+        // abort or bit-reinterpreted garbage inside the insert loop below.
+        {
+            let schema = self.catalog.schema(name).ok_or_else(|| {
+                QueryError::ViewError(format!("materialized view '{name}' has no backing table"))
+            })?;
+            for row in &rows {
+                if row.len() != schema.columns.len() {
+                    return Err(QueryError::ViewError(format!(
+                        "refresh of materialized view '{name}' produced rows with {} \
+                         columns but the view stores {}; drop and recreate the view",
+                        row.len(),
+                        schema.columns.len()
+                    )));
+                }
+                for (val, col) in row.iter().zip(&schema.columns) {
+                    let t = val.type_id();
+                    if t != powdb_storage::types::TypeId::Empty && t != col.type_id {
+                        return Err(QueryError::ViewError(format!(
+                            "refresh of materialized view '{name}' produced a {t:?} \
+                             in column '{}' but the view stores {:?}; drop and \
+                             recreate the view to change its column types",
+                            col.name, col.type_id
+                        )));
+                    }
+                }
+            }
+        }
         // Clear old data and insert fresh results. Mission B2: logged
         // variant — view refreshes are a mutation and crash recovery
         // must see them.
@@ -2517,30 +2549,61 @@ impl Engine {
     }
 
     /// Derive a storage `Schema` for a view's backing table from query
-    /// result column names and the first row's types.
-    fn derive_view_schema(&self, name: &str, columns: &[String], rows: &[Vec<Value>]) -> Schema {
+    /// result column names and the types of ALL rows.
+    ///
+    /// A projection is typed per row (`.tags ?? 0` is json where `tags` is
+    /// set and int where it is not), while the backing table's encoder
+    /// trusts the schema unconditionally: a value whose class contradicts
+    /// its column either aborts (variable column, fixed value) or is bit-
+    /// reinterpreted on decode (int bits read as a float). So the type must
+    /// be unified over every row, with null never constraining it, and a
+    /// column that genuinely mixes types is a typed error here, before any
+    /// backing table exists.
+    fn derive_view_schema(
+        &self,
+        name: &str,
+        columns: &[String],
+        rows: &[Vec<Value>],
+    ) -> Result<Schema, QueryError> {
         use powdb_storage::types::{ColumnDef, TypeId};
+        let mut types: Vec<Option<TypeId>> = vec![None; columns.len()];
+        for row in rows {
+            for (i, val) in row.iter().enumerate().take(columns.len()) {
+                let t = val.type_id();
+                if t == TypeId::Empty {
+                    continue;
+                }
+                match types[i] {
+                    None => types[i] = Some(t),
+                    Some(prev) if prev == t => {}
+                    Some(prev) => {
+                        return Err(QueryError::ViewError(format!(
+                            "materialized view '{name}' column '{}' mixes value types \
+                             across rows ({prev:?} and {t:?}); make the projection \
+                             produce one type per column",
+                            columns[i]
+                        )));
+                    }
+                }
+            }
+        }
         let cols: Vec<ColumnDef> = columns
             .iter()
             .enumerate()
-            .map(|(i, col_name)| {
-                let type_id = rows
-                    .first()
-                    .and_then(|row| row.get(i))
-                    .map(|v| v.type_id())
-                    .unwrap_or(TypeId::Str);
-                ColumnDef {
-                    name: col_name.clone(),
-                    type_id,
-                    required: false,
-                    position: i as u16,
-                }
+            .map(|(i, col_name)| ColumnDef {
+                name: col_name.clone(),
+                // A column with no non-null value anywhere (or no rows at
+                // all) stores as str: it encodes every null and keeps the
+                // table readable.
+                type_id: types[i].unwrap_or(TypeId::Str),
+                required: false,
+                position: i as u16,
             })
             .collect();
-        Schema {
+        Ok(Schema {
             table_name: name.to_string(),
             columns: cols,
-        }
+        })
     }
 
     /// Extract base table dependencies from a view's source query by

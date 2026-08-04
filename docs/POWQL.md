@@ -2180,6 +2180,15 @@ materialize UserNames as User { .name }
 materialize ActiveUsers as User filter .status = "active" { .name, .email }
 ```
 
+The view's backing table types each column from the values across ALL result
+rows; a null never constrains the type, and a column that is null in every
+row (or a view with no rows) stores as `str`. A projection is typed per row,
+so an expression like `.tags ?? 0` can yield json in one row and int in
+another: that statement is rejected with a typed error rather than stored,
+and a `refresh` whose fresh rows no longer fit the types frozen at create
+time fails the same way, keeping the view's previous contents. Drop and
+recreate the view to change its column types.
+
 ### Query
 
 Query a materialized view exactly like a table:

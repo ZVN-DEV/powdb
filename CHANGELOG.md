@@ -70,6 +70,17 @@ if you hold long transactions, write a driver, or read `catalog.bin` directly.**
 
 ### Fixed (correctness)
 
+- **A materialized view over a projection that yields different types per row
+  could abort the server or silently corrupt values.** The backing table's
+  column types were derived from the first row only, while an expression like
+  `.tags ?? 0` is typed per row: a json-then-int column crashed the encoder
+  (an abort under the release profile, from one query), and an int/float mix
+  went further and stored one type's bits behind the other's column, so `7`
+  read back as `3.5e-323`. Column types are now unified across every row
+  (null never constrains them), a projection that genuinely mixes types in
+  one column is a typed error, and a `refresh` whose fresh rows no longer fit
+  the backing schema fails cleanly before the old contents are touched.
+  Found by the new `fuzz_execute` target on its first CI run.
 - **A prepared `update` filtered on an indexed column could silently lose the
   write.** The prepared fast path probed every index as if it were a unique
   int index, so on float, datetime, str, or bool columns, or under a
