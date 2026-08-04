@@ -166,33 +166,45 @@ async fn read_raw_frame<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Vec<
         .expect("server closed without answering")
 }
 
-/// Like [`read_raw_frame`], but a clean close AT a frame boundary is `None`.
+/// Like [`read_raw_frame`], but a connection close is `None` instead of a
+/// panic.
 ///
-/// A close halfway through a frame is still a hard failure: the write-side
-/// reap contract is that the server never leaves a partial frame behind. The
-/// boundary close, though, is a documented outcome (the closing flush is
-/// time-bounded, and after a failed write the reap stays silent), so tests
-/// that race a reap against a saturated socket have to accept it.
+/// Two closes qualify. A clean FIN at a frame boundary: the closing flush is
+/// time-bounded and after a failed write the reap stays silent, so tests that
+/// race a reap against a saturated socket have to accept it. And an RST
+/// (`ConnectionReset`), anywhere: when the server closes with unread pings
+/// still in its receive buffer, the kernel answers with a reset, and a reset
+/// discards data in flight, so bytes missing on OUR side say nothing about
+/// what the server wrote. The one outcome that stays a hard failure is a FIN
+/// inside a frame: the server really did write a partial frame, which the
+/// write-side reap contract forbids.
 async fn read_raw_frame_or_eof<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut header = [0u8; 6];
     let mut filled = 0usize;
     while filled < header.len() {
-        let n = stream.read(&mut header[filled..]).await.unwrap();
-        if n == 0 {
-            assert_eq!(
-                filled, 0,
-                "connection closed inside a frame header: a torn frame, not a clean close"
-            );
-            return None;
+        match stream.read(&mut header[filled..]).await {
+            Ok(0) => {
+                assert_eq!(
+                    filled, 0,
+                    "connection closed inside a frame header: a torn frame, not a clean close"
+                );
+                return None;
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+            Err(e) => panic!("frame header read failed: {e:?}"),
         }
-        filled += n;
     }
     let payload_len = u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
     let mut frame = header.to_vec();
     frame.resize(6 + payload_len, 0);
     if payload_len > 0 {
-        stream.read_exact(&mut frame[6..]).await.unwrap();
+        match stream.read_exact(&mut frame[6..]).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return None,
+            Err(e) => panic!("connection closed inside a frame payload: {e:?}"),
+        }
     }
     Some(frame)
 }
@@ -335,9 +347,10 @@ async fn a_saturating_ping_flood_cannot_postpone_the_reap() {
             }
         }
     }
-    // TCP delivers everything sent before the FIN, so every pong the server
-    // served is read before the EOF surfaces: zero here means the flood was
-    // never actually served, with or without a reap notice.
+    // The reader consumes pongs for the whole lifetime of the transaction
+    // (an RST can discard a tail of them, but not the ~600ms of traffic that
+    // came before it), so zero here means the flood was never actually
+    // served, with or without a reap notice.
     assert!(pongs > 0, "the flood must actually have been served");
     let _ = feeder.await;
 }
