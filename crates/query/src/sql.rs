@@ -301,9 +301,43 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
             }
             if i > chars.len() || chars.get(i.saturating_sub(1)) != Some(&quote) {
                 return Err(ParseError::Lex {
-                    message: "unterminated string".into(),
+                    message: if quote == '"' {
+                        "unterminated quoted identifier".into()
+                    } else {
+                        "unterminated string".into()
+                    },
                     position: i,
                 });
+            }
+            if quote == '"' {
+                // In SQL, double quotes delimit an *identifier*; single quotes
+                // delimit a string. Treating both as strings meant
+                // `SELECT "name" FROM t` silently returned the literal text
+                // "name" once per row instead of the column, and `FROM "t"`
+                // failed outright -- so every ORM, which quotes identifiers as
+                // a matter of course, was broken in both directions.
+                //
+                // Re-emit as a Word already wrapped in PowQL's own backtick
+                // quoting. That reuses the escape hatch PowQL already has, and
+                // it bypasses every keyword check downstream for free: a
+                // quoted `"limit"` is a column named limit, not the LIMIT
+                // keyword, and `w.eq_ignore_ascii_case("from")` cannot match
+                // "`from`".
+                if s.is_empty() {
+                    return Err(ParseError::Syntax {
+                        message: "empty quoted identifier".into(),
+                    });
+                }
+                if s.contains('`') {
+                    return Err(ParseError::Unsupported {
+                        feature: format!(
+                            "quoted identifier `{s}` contains a backtick, which PowQL uses to \
+                             quote identifiers and cannot escape"
+                        ),
+                    });
+                }
+                out.push(SqlTok::Word(format!("`{s}`")));
+                continue;
             }
             out.push(SqlTok::String(s));
             continue;
