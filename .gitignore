@@ -56,3 +56,7 @@ docs/audits/
 docs/gtm-strategy.md
 .omx/
 docs/design/*turbine*.md
+# On hold pending owner decisions (the document itself asks them). Untracked so
+# a `git add -A` cannot publish the answer before it is made; delete this line
+# to publish.
+docs/design/2026-07-27-mvcc-design.md
