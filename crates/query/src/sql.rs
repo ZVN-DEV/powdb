@@ -1498,6 +1498,25 @@ impl SqlParser {
                 break;
             }
             let rhs = self.expr_bp(r_bp, stop)?;
+            // SQL text must mean SQL. PowQL deliberately desugars `x = null`
+            // to `x is null` as a convenience, but in SQL a comparison against
+            // NULL is UNKNOWN, so `WHERE x = NULL` and `WHERE x <> NULL` both
+            // select no rows in every other engine. Emitting the PowQL
+            // spelling here would silently hand back the `IS NULL` rows —
+            // the opposite row set — so lower it to a constant-false
+            // predicate instead.
+            //
+            // The `IS NULL` / `IS NOT NULL` path above is unaffected: it sets
+            // `lhs` directly and never reaches this operator loop.
+            //
+            // Corner: PowDB filters are two-valued, so `NOT (x = NULL)`
+            // yields every row where SQL's three-valued logic would yield
+            // none. That is the already-documented 2VL divergence, not a new
+            // one.
+            if rhs == "null" && matches!(op.as_str(), "=" | "!=" | "<>") {
+                lhs = "false".to_string();
+                continue;
+            }
             lhs = format!("{lhs} {op} {rhs}");
         }
         self.depth -= 1;

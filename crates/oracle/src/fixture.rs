@@ -564,6 +564,37 @@ mod tests {
         }
     }
 
+    /// `id` must ascend with row position in every fixture.
+    ///
+    /// The rows reach PowDB in this order, so this is also the heap's scan
+    /// order, and PowDB breaks a tie in `ORDER BY` by scan order (the generic
+    /// sort is stable; the top-N heap carries a `seq` counter to reproduce it).
+    /// The `order_desc_limit` / `order_asc_limit` shapes state that rule to
+    /// SQLite as `id ASC`, which is only a true statement of PowDB's behaviour
+    /// while this holds. `ids_are_dense_and_unique` does not cover it: a
+    /// fixture could shuffle its rows and stay unique, and those shapes would
+    /// then start reporting the reference as wrong.
+    #[test]
+    fn ids_ascend_with_row_order() {
+        for fixture in all() {
+            let mut previous: Option<i64> = None;
+            for (position, row) in fixture.rows.iter().enumerate() {
+                let Lit::Int(id) = row[0] else {
+                    panic!("fixture {} id column is not an int", fixture.name)
+                };
+                if let Some(previous) = previous {
+                    assert!(
+                        id > previous,
+                        "fixture {} row {position} has id {id} after id {previous}; \
+                         the ordering shapes state PowDB's scan-order tiebreak as `id ASC`",
+                        fixture.name
+                    );
+                }
+                previous = Some(id);
+            }
+        }
+    }
+
     #[test]
     fn fixture_generation_is_deterministic() {
         let a = boundary_rows();

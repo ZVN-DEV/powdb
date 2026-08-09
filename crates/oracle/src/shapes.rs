@@ -12,7 +12,9 @@
 //! (shape, case index, fixture).
 
 use crate::fixture::predicate_literal;
-use crate::model::{ColType, Column, Kind, Lit, COLUMNS, LIKE_COLUMN, LIKE_META_COLUMN, TABLE};
+use crate::model::{
+    column, ColType, Column, Kind, Lit, COLUMNS, LIKE_COLUMN, LIKE_META_COLUMN, TABLE,
+};
 use crate::rng::Rng;
 
 /// One generated case: the same question in three dialects.
@@ -86,6 +88,54 @@ fn powql_order(col: &str, desc: bool) -> String {
 fn sql_order(col: &str, desc: bool) -> String {
     let dir = if desc { "DESC" } else { "ASC" };
     format!("{col} {dir}, id ASC")
+}
+
+/// A **single-key** order clause, with no `.id` tiebreak appended.
+///
+/// The tiebreak is what the two-key spellings above use to make the row order
+/// total, but a second sort key is also what makes the executor's bounded
+/// top-N fast path decline: it matches `Limit(Sort(..))` only when the sort has
+/// exactly one key. A shape that wants to reach that code has to ask the
+/// question the way a user asks it, with one key, and get its determinism from
+/// [`sqlite_nulls_last`] stating PowDB's tiebreak on the reference side
+/// instead.
+fn powql_order_single(col: &str, desc: bool) -> String {
+    let dir = if desc { "desc" } else { "asc" };
+    format!("order .{col} {dir}")
+}
+
+fn sql_order_single(col: &str, desc: bool) -> String {
+    let dir = if desc { "DESC" } else { "ASC" };
+    format!("{col} {dir}")
+}
+
+/// SQLite's spelling of PowDB's NULLS LAST rule for a `DISTINCT` result.
+///
+/// [`sqlite_nulls_last`] cannot be reused here: it ends with an `id ASC`
+/// tiebreak and SQLite rejects an ORDER BY term that is not derived from the
+/// result set of a `SELECT DISTINCT`. No tiebreak is needed either, because
+/// DISTINCT has already made the single output column unique, so ordering by
+/// that column alone is a total order on both sides.
+fn sqlite_distinct_nulls_last(col: &str) -> String {
+    format!("{col} IS NULL ASC, {col} ASC")
+}
+
+/// The `offset` clause in PowQL and in SQL, or nothing at all when the offset
+/// is zero.
+///
+/// `offset 0` is a no-op in every dialect *as a question*, but it is not a
+/// no-op as a plan: PowDB's planner emits an `Offset` node for it, between the
+/// `Limit` and the `Sort`, and the executor's bounded top-N fast path matches
+/// `Limit(Sort(..))` directly. A generator that always spells the offset can
+/// therefore never reach that code, however many cases it produces, and the
+/// descending top-N heap was never once exercised by this crate for exactly
+/// that reason. Zero is spelled by omission so both plan shapes are generated.
+fn offset_clauses(offset: usize) -> (String, String) {
+    if offset == 0 {
+        (String::new(), String::new())
+    } else {
+        (format!(" offset {offset}"), format!(" OFFSET {offset}"))
+    }
 }
 
 struct Builder {
@@ -169,6 +219,14 @@ const SHAPES: &[ShapeFn] = &[
     // gate for a reason that has nothing to do with the engine.
     agg_sum_avg_int_zero_default,
     filter_not_non_null,
+    // Appended for the same reason as the twins above: these draw nothing from
+    // the shared `Rng`, but appending keeps the rule simple and keeps every
+    // existing shape's draws byte-identical, so the recorded divergence
+    // profile of the run is unchanged by their arrival.
+    order_desc_limit,
+    order_asc_limit,
+    distinct_limit,
+    cmp_against_null_literal,
 ];
 
 fn select_star(b: &mut Builder, _rng: &mut Rng, _n: usize) {
@@ -499,6 +557,12 @@ fn order_desc(b: &mut Builder, _rng: &mut Rng, _n: usize) {
     }
 }
 
+/// `ORDER BY` with a `LIMIT` window, over every orderable column type.
+///
+/// A zero offset is spelled by *omitting* the clause rather than writing
+/// `offset 0`; see [`offset_clauses`] for why the difference is not cosmetic.
+/// The offset is still drawn the same way from the same `Rng`, so this change
+/// leaves every later shape's draws byte-identical.
 fn order_limit_offset(b: &mut Builder, rng: &mut Rng, n: usize) {
     let cols = orderable();
     for _ in 0..n {
@@ -506,22 +570,23 @@ fn order_limit_offset(b: &mut Builder, rng: &mut Rng, n: usize) {
         let desc = rng.chance(1, 2);
         let limit = 1 + rng.below(12);
         let offset = rng.below(5);
+        let (pq_offset, sql_offset) = offset_clauses(offset);
         b.push(Case {
             shape: "order_limit_offset",
             powql: format!(
-                "{TABLE} {} limit {limit} offset {offset} {{ .id, .{} }}",
+                "{TABLE} {} limit {limit}{pq_offset} {{ .id, .{} }}",
                 powql_order(col.name, desc),
                 col.name
             ),
             powdb_sql: format!(
-                "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit} OFFSET {offset}",
+                "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit}{sql_offset}",
                 col.name,
                 sql_order(col.name, desc)
             ),
             // Told PowDB's NULLS LAST rule, so a LIMIT window that straddles
             // the null block is comparable in both directions.
             sqlite_sql: format!(
-                "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit} OFFSET {offset}",
+                "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit}{sql_offset}",
                 col.name,
                 sqlite_nulls_last(col.name, desc)
             ),
@@ -962,6 +1027,184 @@ fn json_whole_column_eq(b: &mut Builder, rng: &mut Rng, n: usize) {
     }
 }
 
+/// The columns whose type reaches the executor's bounded top-N heap.
+///
+/// `project_filter_sort_limit_fast` declines any sort key that is not a
+/// fixed-size `Int` or `Float` column, so a shape that sampled sort keys at
+/// random would spend most of its cases in the generic path and would only
+/// reach the heap when the seed happened to draw one of these two. Naming them
+/// makes the coverage a property of the generator rather than of the seed.
+const TOPN_KEY_COLUMNS: [&str; 2] = ["i", "f"];
+
+/// LIMIT windows for the top-N shapes.
+///
+/// Both fixture bodies draw these columns from a small pool (fifteen ints,
+/// fourteen floats) spread over ~200 rows, so every one of these windows lands
+/// inside a run of equal keys rather than on a distinct one. That is the whole
+/// design: a high-cardinality key would make the shape vacuous, because the
+/// eviction rule the heap gets wrong is only reachable when the weakest key it
+/// is holding is held by more than one row.
+const TOPN_LIMITS: [usize; 6] = [1, 2, 3, 7, 12, 40];
+
+/// `ORDER BY <single key> DESC LIMIT n`, with no offset, over a
+/// low-cardinality key.
+///
+/// This is the shape that reaches the executor's bounded top-N heap, and three
+/// separate properties are needed before it can:
+///
+/// - **one sort key.** Every other ordering shape here appends an `.id`
+///   tiebreak to make the row order total, and a two-key sort is exactly what
+///   `project_filter_sort_limit_fast` refuses.
+/// - **no offset.** `offset 0` puts an `Offset` node between the `Limit` and
+///   the `Sort`, and the fast path matches `Limit(Sort(..))`. See
+///   [`offset_clauses`].
+/// - **a low-cardinality key**, so the LIMIT boundary falls inside a run of
+///   equal keys. Without ties the heap's eviction rule is never asked the
+///   question it gets wrong.
+///
+/// Determinism comes from the reference side instead of from a second sort
+/// key: [`sqlite_nulls_last`] states PowDB's two ordering rules in SQLite's own
+/// language, NULLS LAST in both directions and ties broken by scan order. Both
+/// are PowDB's own stated contract, not an assumption made here: the generic
+/// sort is a *stable* sort over the scan, and the top-N heap carries a
+/// monotonic `seq` counter for the express purpose of reproducing it. Scan
+/// order is insertion order, and the fixtures assign `id` in insertion order
+/// (`fixture::ids_ascend_with_row_order`), so `id ASC` is that contract
+/// written down. A PowDB that answers this query with a *differently chosen*
+/// set of tied rows depending on which plan ran is not exercising a liberty
+/// SQL grants it; it is contradicting itself, and this shape is where that
+/// shows up.
+fn order_desc_limit(b: &mut Builder, _rng: &mut Rng, _n: usize) {
+    top_n_shape(b, "order_desc_limit", true);
+}
+
+/// The ascending sibling of [`order_desc_limit`], pinning the branch that is
+/// correct.
+///
+/// The heap is two heaps: a max-heap for ascending and a min-heap for
+/// descending, and only one of the two orders its eviction candidate the right
+/// way when the weakest key is tied. A shape that only asked in one direction
+/// could not tell "descending is broken" from "the reference is wrong about
+/// ties", so both directions run over the identical key columns and the
+/// identical windows.
+fn order_asc_limit(b: &mut Builder, _rng: &mut Rng, _n: usize) {
+    top_n_shape(b, "order_asc_limit", false);
+}
+
+fn top_n_shape(b: &mut Builder, shape: &'static str, desc: bool) {
+    for name in TOPN_KEY_COLUMNS {
+        let col = column(name).unwrap_or_else(|| panic!("top-N key column {name} left the schema"));
+        for limit in TOPN_LIMITS {
+            b.push(Case {
+                shape,
+                powql: format!(
+                    "{TABLE} {} limit {limit} {{ .id, .{} }}",
+                    powql_order_single(col.name, desc),
+                    col.name
+                ),
+                powdb_sql: format!(
+                    "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit}",
+                    col.name,
+                    sql_order_single(col.name, desc)
+                ),
+                sqlite_sql: format!(
+                    "SELECT id, {} FROM {TABLE} ORDER BY {} LIMIT {limit}",
+                    col.name,
+                    sqlite_nulls_last(col.name, desc)
+                ),
+                sqlite_params: Vec::new(),
+                ordered: true,
+                kinds: vec![Kind::Col(ColType::Int), Kind::Col(col.ty)],
+                scalar: false,
+                sqlite_comparable: true,
+            });
+        }
+    }
+}
+
+/// `DISTINCT` combined with a `LIMIT` window.
+///
+/// `distinct_col` asks for a whole de-duplicated column and nothing else, so
+/// it says nothing about where de-duplication sits in the pipeline. In SQL
+/// that placement is not negotiable: `DISTINCT` is part of producing the
+/// result, and `ORDER BY`, `OFFSET` and `LIMIT` act on the de-duplicated rows.
+/// An engine that de-duplicates *after* the window answers
+/// `SELECT DISTINCT c ... LIMIT 5` with fewer than five rows while the table
+/// has more than five distinct values, and it does so silently.
+///
+/// The window is what makes the question decidable. `DISTINCT` alone leaves
+/// the row order free, so the comparison would have to be a multiset one and
+/// could not see a mis-ordered pipeline; with `ORDER BY` over the single
+/// de-duplicated output column the order is total on both sides, and the
+/// offsets in [`DISTINCT_WINDOWS`] make the shape sensitive to `OFFSET`
+/// applying to the wrong rows as well as to `LIMIT`.
+fn distinct_limit(b: &mut Builder, _rng: &mut Rng, _n: usize) {
+    /// (limit, offset). Zero offsets and non-zero offsets both appear, because
+    /// they are different plans; see [`offset_clauses`].
+    const DISTINCT_WINDOWS: [(usize, usize); 4] = [(1, 0), (3, 0), (5, 2), (2, 7)];
+
+    for col in orderable() {
+        for (limit, offset) in DISTINCT_WINDOWS {
+            let (pq_offset, sql_offset) = offset_clauses(offset);
+            b.push(Case {
+                shape: "distinct_limit",
+                powql: format!(
+                    "{TABLE} distinct {} limit {limit}{pq_offset} {{ .{} }}",
+                    powql_order_single(col.name, false),
+                    col.name
+                ),
+                powdb_sql: format!(
+                    "SELECT DISTINCT {0} FROM {TABLE} ORDER BY {1} LIMIT {limit}{sql_offset}",
+                    col.name,
+                    sql_order_single(col.name, false)
+                ),
+                sqlite_sql: format!(
+                    "SELECT DISTINCT {0} FROM {TABLE} ORDER BY {1} LIMIT {limit}{sql_offset}",
+                    col.name,
+                    sqlite_distinct_nulls_last(col.name)
+                ),
+                sqlite_params: Vec::new(),
+                ordered: true,
+                kinds: vec![Kind::Col(col.ty)],
+                scalar: false,
+                sqlite_comparable: true,
+            });
+        }
+    }
+}
+
+/// `col = NULL` and `col != NULL`, spelled the way a user porting SQL writes
+/// them.
+///
+/// Both PowDB frontends desugar these to `IS NULL` / `IS NOT NULL` at parse
+/// time, so `WHERE i = NULL` returns every row whose `i` is missing. Standard
+/// SQL evaluates the comparison to *unknown* and returns nothing, and so does
+/// SQLite. Neither engine errors, so the only visible sign is the row set.
+///
+/// The shape is deliberately narrow, one rule and one rule only, and the
+/// semantics it desugars *to* is policed entry-free by `filter_is_null`, which
+/// asks the same question of the same executor code through `is null` /
+/// `is not null` and carries no ledger entry. So an entry here can excuse the
+/// spelling without ever excusing a broken null test.
+fn cmp_against_null_literal(b: &mut Builder, _rng: &mut Rng, _n: usize) {
+    for col in nullable() {
+        for negated in [false, true] {
+            let op = if negated { "!=" } else { "=" };
+            b.push(Case {
+                shape: "cmp_against_null_literal",
+                powql: format!("{TABLE} filter .{} {op} null {{ .id }}", col.name),
+                powdb_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} NULL", col.name),
+                sqlite_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} NULL", col.name),
+                sqlite_params: Vec::new(),
+                ordered: false,
+                kinds: vec![Kind::Col(ColType::Int)],
+                scalar: false,
+                sqlite_comparable: true,
+            });
+        }
+    }
+}
+
 /// A SQL string literal containing a backslash, spelled the way a user porting
 /// SQL writes it.
 ///
@@ -1053,7 +1296,13 @@ mod tests {
         for case in generate(11, 8, 100_000) {
             if matches!(
                 case.shape,
-                "order_asc_naive" | "order_asc_nulls_last" | "order_desc" | "order_limit_offset"
+                "order_asc_naive"
+                    | "order_asc_nulls_last"
+                    | "order_desc"
+                    | "order_limit_offset"
+                    | "order_desc_limit"
+                    | "order_asc_limit"
+                    | "distinct_limit"
             ) {
                 assert!(
                     !case.sqlite_sql.contains(" j "),
@@ -1062,6 +1311,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A zero offset must be spelled by omission, never as `offset 0`.
+    ///
+    /// This is the regression guard for the hole this crate had for its whole
+    /// life: `order_limit_offset` emitted the clause unconditionally, PowDB's
+    /// planner turned it into an `Offset` node between the `Limit` and the
+    /// `Sort`, and the executor's bounded top-N fast path (which matches
+    /// `Limit(Sort(..))`) was therefore unreachable from the oracle. The shape
+    /// was generating cases and comparing results the entire time; it simply
+    /// could not arrive at the code where the bug was.
+    #[test]
+    fn a_zero_offset_is_never_spelled_out() {
+        for case in generate(3, 8, 100_000) {
+            for text in [&case.powql, &case.powdb_sql, &case.sqlite_sql] {
+                assert!(
+                    !text.to_lowercase().contains("offset 0"),
+                    "`offset 0` blocks the top-N fast path; omit the clause instead: {text}"
+                );
+            }
+        }
+    }
+
+    /// The top-N shapes must keep every property the fast path requires.
+    ///
+    /// Each of these is one edit away from making the shapes generate happily
+    /// and prove nothing: a tiebreak key appended for tidiness, an offset added
+    /// for coverage, or a key column swapped for one whose type the heap
+    /// declines. The plan shape itself is checked end to end against a live
+    /// engine in `tests/oracle.rs`.
+    #[test]
+    fn the_top_n_shapes_keep_a_single_key_and_no_offset() {
+        let mut seen = 0usize;
+        for case in generate(13, 8, 100_000) {
+            if !matches!(case.shape, "order_desc_limit" | "order_asc_limit") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                !case.powql.contains(", .id asc") && !case.powdb_sql.contains(", id ASC"),
+                "a second sort key makes the fast path decline: {}",
+                case.powql
+            );
+            assert!(
+                !case.powql.contains("offset") && !case.powdb_sql.contains("OFFSET"),
+                "an offset node blocks the fast path: {}",
+                case.powql
+            );
+            let key = TOPN_KEY_COLUMNS
+                .iter()
+                .find(|c| case.powql.contains(&format!("order .{c} ")));
+            assert!(
+                key.is_some(),
+                "sort key is not one the top-N heap accepts: {}",
+                case.powql
+            );
+            // The reference side is where the determinism comes from, so it
+            // must carry both of PowDB's ordering rules: nulls last, and ties
+            // broken by scan order.
+            let col = key.expect("key column");
+            assert!(
+                case.sqlite_sql.contains(&format!("{col} IS NULL ASC")),
+                "the reference must state PowDB's NULLS LAST rule: {}",
+                case.sqlite_sql
+            );
+            assert!(
+                case.sqlite_sql.contains(", id ASC LIMIT "),
+                "the reference must state PowDB's scan-order tiebreak: {}",
+                case.sqlite_sql
+            );
+        }
+        assert_eq!(
+            seen,
+            2 * TOPN_KEY_COLUMNS.len() * TOPN_LIMITS.len(),
+            "the top-N grid is not being generated in full"
+        );
+    }
+
+    /// Both directions must be generated over the identical key columns and
+    /// windows. The descending heap and the ascending heap are different code,
+    /// and only a matched pair can tell a broken direction from a broken
+    /// reference.
+    #[test]
+    fn the_top_n_shapes_are_a_matched_pair() {
+        let cases = generate(17, 8, 100_000);
+        let strip = |shape: &str, dir: &str| -> Vec<String> {
+            cases
+                .iter()
+                .filter(|c| c.shape == shape)
+                .map(|c| c.powql.replace(dir, "<dir>"))
+                .collect()
+        };
+        assert_eq!(
+            strip("order_desc_limit", " desc "),
+            strip("order_asc_limit", " asc "),
+            "the two directions must ask the identical questions"
+        );
     }
 
     #[test]
