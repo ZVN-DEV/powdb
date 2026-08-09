@@ -156,12 +156,12 @@ PowDB is durable by default. The embedded `Engine` and `powdb-server` both run i
 The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD) — not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
 
 ```
--- ~hundreds of rows/sec: one fsync per row
+# ~hundreds of rows/sec: one fsync per row
 insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
 ...
 
--- ~50x faster, still fully durable: one fsync for the whole batch
+# ~50x faster, still fully durable: one fsync for the whole batch
 begin
 insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
@@ -178,7 +178,7 @@ On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) a
 PowQL reads left to right. You name the table, apply operations, and project fields -- all in one pipeline.
 
 ```
--- Define a schema (auto-increment id, a default, a required field)
+# Define a schema (auto-increment id, a default, a required field)
 type User {
   unique auto id: int,
   required name: str,
@@ -188,47 +188,47 @@ type User {
   city: str
 }
 
--- Insert (single row)
+# Insert (single row)
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
--- Insert many rows in one statement (one fsync, one round trip, all-or-nothing).
--- Keep the whole statement on one line in the CLI REPL, which buffers input
--- across lines only while braces/parens stay open.
+# Insert many rows in one statement (one fsync, one round trip, all-or-nothing).
+# Keep the whole statement on one line in the CLI REPL, which buffers input
+# across lines only while braces/parens stay open.
 insert User { name := "Bob", email := "bob@example.com", age := 22 }, { name := "Carol", email := "carol@example.com", age := 41 }
 
--- returning: get the affected rows back in the same statement (here the auto id)
+# returning: get the affected rows back in the same statement (here the auto id)
 insert User { name := "Dave", email := "dave@example.com", age := 33 } returning
 
--- Query pipeline: source -> filter -> order -> limit -> projection
+# Query pipeline: source -> filter -> order -> limit -> projection
 User filter .age > 25 order .age desc limit 10 { .name, .age }
 
--- Aggregates
+# Aggregates
 count(User filter .age > 25)
 sum(User { .age })
 avg(User filter .city = "NYC" { .age })
 
--- Joins
+# Joins
 User as u inner join Team as t on u.team_id = t.id { u.name, team_name: t.name }
 
--- GROUP BY + HAVING
+# GROUP BY + HAVING
 User group .city having avg(.age) > 30 { .city, avg_age: avg(.age) }
 
--- JSON paths can be filtered, grouped, aggregated, ordered, and indexed
+# JSON paths can be filtered, grouped, aggregated, ordered, and indexed
 Post group .data->category { .data->category, total: sum(.data->amount) }
 alter Post add index (.data->published_at)
 
--- Subqueries
+# Subqueries
 User filter .id in (Order filter .total > 100 { .user_id })
 
--- Set operations
+# Set operations
 User filter .age > 30 union User filter .city = "NYC"
 
--- Mutations
+# Mutations
 User filter .age < 18 delete
 User filter .id = 1 update { age := 31 }
-User filter .id = 1 update { age := 32 } returning   -- post-update rows back
+User filter .id = 1 update { age := 32 } returning   # post-update rows back
 
--- DDL
+# DDL
 alter User add column score: int
 alter User drop column score
 alter User add index .email

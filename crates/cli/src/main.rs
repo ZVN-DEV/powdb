@@ -1898,6 +1898,32 @@ fn handle_shared_meta(trimmed: &str, state: &mut ReplState) -> MetaOutcome {
     }
 }
 
+/// True when the input carries no statement for the engine to run: empty,
+/// whitespace, or nothing but `#` comments.
+///
+/// A blank check on the raw text is not enough. PowQL comments start with `#`
+/// and run to end of line, so a comment-only line is non-empty text that the
+/// lexer reduces to zero tokens, and the parser then reports "expected
+/// statement, got end of input". Pasting any documented example that opens with
+/// a comment produced an error per comment line.
+///
+/// This asks the lexer rather than scanning for `#` so the CLI cannot drift
+/// from the language's own definition of a comment. A lex error is *not*
+/// treated as blank: that input is a real statement with a real problem, and
+/// the engine should be the one to report it.
+///
+/// Note that `lex` terminates every stream with `Token::Eof`, so the empty
+/// program is `[Eof]`, not `[]`.
+fn is_effectively_blank(statement: &str) -> bool {
+    if statement.trim().is_empty() {
+        return true;
+    }
+    matches!(
+        powdb_query::lexer::lex(statement),
+        Ok(tokens) if tokens.iter().all(|t| *t == powdb_query::token::Token::Eof)
+    )
+}
+
 /// True when the line is the continuation escape hatch. Recognized anywhere,
 /// including in the middle of an unterminated statement, which is the whole
 /// point: without it an unbalanced `(` swallows every later line, meta-commands
@@ -2060,7 +2086,7 @@ fn run_embedded(data_dir: &str, session: SessionOpts) {
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if statement.is_empty() {
+                if is_effectively_blank(&statement) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2335,7 +2361,7 @@ async fn run_remote_on<S>(
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if statement.is_empty() {
+                if is_effectively_blank(&statement) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2820,6 +2846,28 @@ mod tests {
     #[test]
     fn remote_db_default_matches_ts_client() {
         assert_eq!(DEFAULT_DB_NAME, "default");
+    }
+
+    #[test]
+    fn comment_only_input_is_not_sent_to_the_engine() {
+        // Every documented example opens with a comment. Sending one to the
+        // engine lexes to zero tokens and reports "expected statement, got end
+        // of input", so pasting the README produced one error per comment line.
+        assert!(is_effectively_blank(""));
+        assert!(is_effectively_blank("   \n\t "));
+        assert!(is_effectively_blank("# just a comment"));
+        assert!(is_effectively_blank("  # indented\n# and another\n"));
+
+        // Real statements must still reach the engine, including one that
+        // merely *contains* a comment, and one whose string literal contains a
+        // '#' that is not a comment at all.
+        assert!(!is_effectively_blank("User { .name }"));
+        assert!(!is_effectively_blank("# leading\nUser { .name }"));
+        assert!(!is_effectively_blank("User filter .s = \"#\" { .name }"));
+
+        // A lex error is a real problem with a real statement: let the engine
+        // report it rather than silently swallowing the line.
+        assert!(!is_effectively_blank("User filter .s = \"unterminated"));
     }
 
     #[test]
