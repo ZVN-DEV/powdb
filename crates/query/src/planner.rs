@@ -263,6 +263,14 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
             };
         }
 
+        // Same rule as the ungrouped path: `distinct` de-duplicates the
+        // projected rows before ORDER BY / OFFSET / LIMIT act on them.
+        if q.distinct {
+            node = PlanNode::Distinct {
+                input: Box::new(node),
+            };
+        }
+
         if let Some(order) = grouped_order {
             node = PlanNode::Sort {
                 input: Box::new(node),
@@ -276,27 +284,7 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
                     .collect(),
             };
         }
-        // Offset must be applied *before* Limit: skip M rows, then take N.
-        // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
-        // and Limit wraps it (outer).
-        if let Some(off) = q.offset {
-            node = PlanNode::Offset {
-                input: Box::new(node),
-                count: off,
-            };
-        }
-        if let Some(lim) = q.limit {
-            node = PlanNode::Limit {
-                input: Box::new(node),
-                count: lim,
-            };
-        }
-        if q.distinct {
-            node = PlanNode::Distinct {
-                input: Box::new(node),
-            };
-        }
-        return Ok(node);
+        return Ok(slice_layer(node, q.offset, q.limit));
     }
 
     if let Some(order) = q.order {
@@ -313,49 +301,7 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
         };
     }
 
-    // Offset must be applied *before* Limit: skip M rows, then take N.
-    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
-    // and Limit wraps it (outer).
-    if let Some(off) = q.offset {
-        node = PlanNode::Offset {
-            input: Box::new(node),
-            count: off,
-        };
-    }
-
-    if let Some(lim) = q.limit {
-        node = PlanNode::Limit {
-            input: Box::new(node),
-            count: lim,
-        };
-    }
-
-    if let Some(proj) = q.projection {
-        let mut fields: Vec<ProjectField> = proj
-            .into_iter()
-            .map(|pf| ProjectField {
-                alias: pf.alias,
-                expr: pf.expr,
-            })
-            .collect();
-        let windows = extract_windows(&mut fields);
-        if !windows.is_empty() {
-            node = PlanNode::Window {
-                input: Box::new(node),
-                windows,
-            };
-        }
-        node = PlanNode::Project {
-            input: Box::new(node),
-            fields,
-        };
-    }
-
-    if q.distinct {
-        node = PlanNode::Distinct {
-            input: Box::new(node),
-        };
-    }
+    node = projected_tail(node, q.projection, q.distinct, q.offset, q.limit);
 
     if let Some(agg) = q.aggregation {
         let provenance_alias = symmetric_provenance_alias(
@@ -374,6 +320,90 @@ fn plan_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
     }
 
     Ok(node)
+}
+
+/// Build the `[Window] -> Project` layer over `input`. Window functions are
+/// lifted out of the projection list first so they compute over the rows the
+/// projection reads.
+fn project_layer(input: PlanNode, projection: Vec<ProjectionField>) -> PlanNode {
+    let mut fields: Vec<ProjectField> = projection
+        .into_iter()
+        .map(|pf| ProjectField {
+            alias: pf.alias,
+            expr: pf.expr,
+        })
+        .collect();
+    let windows = extract_windows(&mut fields);
+    let input = if windows.is_empty() {
+        input
+    } else {
+        PlanNode::Window {
+            input: Box::new(input),
+            windows,
+        }
+    };
+    PlanNode::Project {
+        input: Box::new(input),
+        fields,
+    }
+}
+
+/// Wrap `input` in the `OFFSET`/`LIMIT` slicing layer.
+///
+/// Offset applies *before* limit — skip M rows, then take N — so the plan shape
+/// is `Limit(Offset(...))`: offset is built first (inner) and limit wraps it.
+fn slice_layer(mut input: PlanNode, offset: Option<Expr>, limit: Option<Expr>) -> PlanNode {
+    if let Some(count) = offset {
+        input = PlanNode::Offset {
+            input: Box::new(input),
+            count,
+        };
+    }
+    if let Some(count) = limit {
+        input = PlanNode::Limit {
+            input: Box::new(input),
+            count,
+        };
+    }
+    input
+}
+
+/// Assemble the projection, `distinct` and slicing tail shared by the ungrouped
+/// single-table and joined pipelines.
+///
+/// `distinct` de-duplicates the **projected** rows, and it must run *before*
+/// `offset`/`limit` slice them: `distinct limit 3` asks for three distinct rows,
+/// not for however many distinct rows survive among the first three. That
+/// forces the projection underneath the slicing nodes.
+///
+/// Without `distinct` the projection stays outermost instead. A projection is
+/// one row in, one row out, so both orders answer identically — but
+/// `Project(Limit(...))` is the shape the executor's top-N and project+limit
+/// fast paths pattern-match on, and moving the projection down unconditionally
+/// would silently retire them.
+fn projected_tail(
+    input: PlanNode,
+    projection: Option<Vec<ProjectionField>>,
+    distinct: bool,
+    offset: Option<Expr>,
+    limit: Option<Expr>,
+) -> PlanNode {
+    if distinct {
+        let mut node = match projection {
+            Some(projection) => project_layer(input, projection),
+            None => input,
+        };
+        node = PlanNode::Distinct {
+            input: Box::new(node),
+        };
+        slice_layer(node, offset, limit)
+    } else {
+        let node = slice_layer(input, offset, limit);
+        match projection {
+            Some(projection) => project_layer(node, projection),
+            None => node,
+        }
+    }
 }
 
 /// Resolve single-table qualified column references (`alias.col` or, when the
@@ -1001,6 +1031,13 @@ fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
                 fields: proj_fields,
             };
         }
+        // Same rule as the ungrouped path: `distinct` de-duplicates the
+        // projected rows before ORDER BY / OFFSET / LIMIT act on them.
+        if q.distinct {
+            node = PlanNode::Distinct {
+                input: Box::new(node),
+            };
+        }
         if let Some(order) = grouped_order {
             node = PlanNode::Sort {
                 input: Box::new(node),
@@ -1016,71 +1053,11 @@ fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
         }
         // LIMIT/OFFSET operate on grouped result rows, never on the joined
         // input. Applying either before GroupBy truncates source rows and can
-        // silently change aggregate values. Offset remains inside Limit so
-        // execution skips M grouped rows before taking N.
-        if let Some(off) = q.offset {
-            node = PlanNode::Offset {
-                input: Box::new(node),
-                count: off,
-            };
-        }
-        if let Some(lim) = q.limit {
-            node = PlanNode::Limit {
-                input: Box::new(node),
-                count: lim,
-            };
-        }
-        if q.distinct {
-            node = PlanNode::Distinct {
-                input: Box::new(node),
-            };
-        }
-        return Ok(node);
+        // silently change aggregate values.
+        return Ok(slice_layer(node, q.offset, q.limit));
     }
 
-    // Offset must be applied *before* Limit: skip M rows, then take N.
-    // Plan shape is Limit(Offset(...)), so Offset is built first (inner)
-    // and Limit wraps it (outer).
-    if let Some(off) = q.offset {
-        node = PlanNode::Offset {
-            input: Box::new(node),
-            count: off,
-        };
-    }
-
-    if let Some(lim) = q.limit {
-        node = PlanNode::Limit {
-            input: Box::new(node),
-            count: lim,
-        };
-    }
-
-    if let Some(proj) = q.projection {
-        let mut fields: Vec<ProjectField> = proj
-            .into_iter()
-            .map(|pf| ProjectField {
-                alias: pf.alias,
-                expr: pf.expr,
-            })
-            .collect();
-        let windows = extract_windows(&mut fields);
-        if !windows.is_empty() {
-            node = PlanNode::Window {
-                input: Box::new(node),
-                windows,
-            };
-        }
-        node = PlanNode::Project {
-            input: Box::new(node),
-            fields,
-        };
-    }
-
-    if q.distinct {
-        node = PlanNode::Distinct {
-            input: Box::new(node),
-        };
-    }
+    node = projected_tail(node, q.projection, q.distinct, q.offset, q.limit);
 
     if let Some(agg) = q.aggregation {
         let provenance_alias =

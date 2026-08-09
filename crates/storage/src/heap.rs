@@ -1,6 +1,6 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
-use crate::page::{iter_page_slots, Page, PageType, MAX_ROW_DATA_SIZE, PAGE_SIZE};
+use crate::page::{iter_page_slots, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE, PAGE_SIZE};
 use crate::row::{row_is_v2, validate_row_format};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
@@ -85,6 +85,41 @@ fn heap_first_data_page(buf: &[u8; PAGE_SIZE]) -> io::Result<(u32, u16)> {
             .expect("4-byte first data page"),
     );
     Ok((first_data_page, version))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Page id whose next flush write must fail. There is no portable way to
+    /// make a real `pwrite` return ENOSPC/EIO on demand, and a mid-flush write
+    /// error is precisely the case [`HeapFile::flush_all_dirty`] has to survive
+    /// without stranding the pages it has not written yet.
+    static HEAP_WRITE_FAILPOINT: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn take_heap_write_failpoint(page_id: u32) -> bool {
+    HEAP_WRITE_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == Some(page_id) {
+            failpoint.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// `DiskManager::write_page` as the flush path calls it, with the test-only
+/// failure injection point above. A free function so it can be called while a
+/// page is borrowed out of `dirty_buffer`.
+fn write_page_flushing(disk: &mut DiskManager, page_id: u32, data: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if take_heap_write_failpoint(page_id) {
+        return Err(io::Error::other(format!(
+            "injected write failure on page {page_id}"
+        )));
+    }
+    disk.write_page(page_id, data)
 }
 
 /// Default ceiling on unflushed heap pages held in memory: 256 MiB, charged
@@ -484,6 +519,14 @@ impl HeapFile {
     /// Write every buffered dirty page to disk, including the current
     /// hot page if dirty. Clears the buffer. Called by scans,
     /// `enable_mmap`, explicit flush requests, and `Drop`.
+    ///
+    /// A page leaves the buffer only once its own write has succeeded. An
+    /// earlier version drained the whole buffer up front and then wrote the
+    /// drained copies, so one ENOSPC/EIO partway through left every remaining
+    /// page in neither memory nor on disk — and a later successful checkpoint
+    /// would truncate the WAL and make that loss permanent. Keeping the
+    /// unwritten pages buffered means the mutations are still there for the
+    /// caller's retry, and still there for `Drop` and the next checkpoint.
     pub fn flush_all_dirty(&mut self) -> io::Result<()> {
         if let Some(hot) = self.hot_page.as_mut() {
             if hot.dirty {
@@ -491,17 +534,30 @@ impl HeapFile {
                 // page), not per row, so the write-path regression stays
                 // negligible.
                 hot.page.stamp_checksum();
-                self.disk.write_page(hot.page_id, hot.page.as_bytes())?;
+                write_page_flushing(&mut self.disk, hot.page_id, hot.page.as_bytes())?;
                 hot.dirty = false;
             }
         }
         if !self.dirty_buffer.is_empty() {
-            // Drain via a swap to avoid borrowing `self` twice.
-            let drained: Vec<(u32, Page)> = self.dirty_buffer.drain().collect();
-            self.dirty_budget.release(drained.len());
-            for (mut page, page_id) in drained.into_iter().map(|(id, p)| (p, id)) {
+            // Split the borrow so the write can take `&mut disk` while the
+            // page it writes is still borrowed out of the buffer. Collecting
+            // the ids (4 bytes each) is strictly cheaper than the drain this
+            // replaced, which moved every 4KB page out of the map.
+            let Self {
+                disk,
+                dirty_buffer,
+                dirty_budget,
+                ..
+            } = self;
+            let page_ids: Vec<u32> = dirty_buffer.keys().copied().collect();
+            for page_id in page_ids {
+                let Some(page) = dirty_buffer.get_mut(&page_id) else {
+                    continue;
+                };
                 page.stamp_checksum();
-                self.disk.write_page(page_id, page.as_bytes())?;
+                write_page_flushing(disk, page_id, page.as_bytes())?;
+                dirty_buffer.remove(&page_id);
+                dirty_budget.release(1);
             }
         }
         Ok(())
@@ -1411,6 +1467,24 @@ impl HeapFile {
         Ok((count, fallback))
     }
 
+    /// Where an update of `rid` to `row_len` bytes would land, without touching
+    /// the row. [`Self::update`] resolves the same question through the same
+    /// [`Page::update_fit`] call, so the two cannot disagree.
+    ///
+    /// The WAL path needs the answer *before* it appends a record: a relocating
+    /// update is not idempotent (its redo is delete + insert, and the insert
+    /// self-assigns a slot), so it has to be logged as the two physical steps
+    /// the heap is about to take rather than as one Update record. See
+    /// `Catalog::update_logged`.
+    ///
+    /// Loads the page into the hot slot, which is where [`Self::update`] wants
+    /// it anyway — the probe costs no extra I/O on the update path.
+    pub fn update_fit(&mut self, rid: RowId, row_len: usize) -> io::Result<UpdateFit> {
+        self.ensure_hot(rid.page_id)?;
+        let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
+        Ok(hot.page.update_fit(rid.slot_index, row_len))
+    }
+
     /// Update a row. Returns new RowId (may change if row moves).
     ///
     /// Mission C Phase 1: in-place updates land on the hot page directly.
@@ -2013,6 +2087,18 @@ impl HeapFile {
         Ok(())
     }
 
+    /// The inverse of [`Self::stamp_all_pages_min_lsn`]: does every page
+    /// already carry an LSN >= `barrier_lsn`? True means that barrier's stamp
+    /// already ran and reached disk, so whatever heap rewrite it guards is
+    /// already folded into these pages. Walks the same page range and reads the
+    /// same header field the stamp writes, so the two cannot drift.
+    pub fn all_pages_at_min_lsn(&self, barrier_lsn: u64) -> bool {
+        if barrier_lsn == 0 {
+            return false;
+        }
+        (0..self.disk.num_pages()).all(|page_id| self.page_lsn(page_id) >= barrier_lsn)
+    }
+
     /// Set the LSN on a specific page. Loads the page into the hot
     /// slot if needed, stamps the LSN, and marks it dirty.
     pub fn set_page_lsn(&mut self, page_id: u32, lsn: u64) -> io::Result<()> {
@@ -2605,6 +2691,64 @@ mod tests {
         assert_eq!(heap.scan().count(), 5_000);
 
         drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A4: a write error partway through a flush must not consume the pages it
+    /// never wrote. They stay buffered (and charged), so the retry that a
+    /// checkpoint or `Drop` performs still has every mutation to write.
+    #[test]
+    fn failed_flush_keeps_the_unwritten_pages_buffered() {
+        let (mut heap, path) = temp_heap("flush_write_error");
+        let budget = Arc::new(DirtyPageBudget::default());
+        heap.set_dirty_budget(Arc::clone(&budget));
+        let schema = user_schema();
+
+        // Enough rows to fill several pages, so a failure on one page leaves
+        // others behind it in the buffer.
+        for i in 0..2_000 {
+            let row = vec![Value::Str(format!("user_{i:06}")), Value::Int(i as i64)];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        let buffered_before = heap.dirty_page_count();
+        assert!(
+            buffered_before > 2,
+            "test needs several buffered pages, got {buffered_before}"
+        );
+        // Pick a page from the middle of the buffer so the flush has both
+        // written pages behind it and unwritten pages ahead of it.
+        let doomed = *heap
+            .dirty_buffer
+            .keys()
+            .nth(buffered_before / 2)
+            .expect("buffer has that many pages");
+
+        HEAP_WRITE_FAILPOINT.with(|failpoint| failpoint.set(Some(doomed)));
+        let err = heap
+            .flush_all_dirty()
+            .expect_err("the injected write failure must surface");
+        assert!(err.to_string().contains("injected write failure"));
+
+        // The failing page and everything after it are still in memory, and
+        // still charged — losing the charge would let the buffer grow past the
+        // budget by exactly the pages a failing disk keeps rejecting.
+        assert!(
+            heap.dirty_buffer.contains_key(&doomed),
+            "the page whose write failed must stay buffered"
+        );
+        assert_eq!(budget.charged_pages(), heap.dirty_page_count());
+
+        // The retry (what checkpoint and Drop do) writes everything, and every
+        // row survives a reopen.
+        heap.flush_all_dirty().unwrap();
+        assert_eq!(heap.dirty_page_count(), 0);
+        assert_eq!(budget.charged_pages(), 0);
+        heap.flush().unwrap();
+        drop(heap);
+
+        let reopened = HeapFile::open(&path).unwrap();
+        assert_eq!(reopened.scan().count(), 2_000);
+        drop(reopened);
         std::fs::remove_file(&path).ok();
     }
 

@@ -21,6 +21,24 @@ pub(crate) fn counts_every_row(argument: Option<&Expr>) -> bool {
     argument.is_none_or(|argument| matches!(argument, Expr::Field(name) if name == "*"))
 }
 
+/// The bound a `Limit` node's count names, or `None` when it is not something a
+/// fast path may act on.
+///
+/// A fast path that carries its own bound must **decline** on `None` and let the
+/// generic `PlanNode::Limit` arm run: that arm is the single place that reports
+/// `limit must be integer literal`, and negative counts are already refused up
+/// front by [`validate_slice_counts`]. Substituting `usize::MAX` for a count the
+/// fast path could not read is what made `F limit 1 + 1 { .id }` answer the whole
+/// table while the same query without the projection was rejected — and, because
+/// the top-N heap takes its capacity from the same number, it also lifted the
+/// bound that keeps a rejected query from heaping every row in the table.
+pub(super) fn literal_limit(count: &Expr) -> Option<usize> {
+    match count {
+        Expr::Literal(Literal::Int(value)) if *value >= 0 => Some(*value as usize),
+        _ => None,
+    }
+}
+
 /// Maximum number of elements sorted by the standard-library stable sort
 /// without an intervening cancellation checkpoint. Larger inputs are sorted
 /// as bounded stable runs and cooperatively merged below.
