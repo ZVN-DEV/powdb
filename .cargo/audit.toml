@@ -10,10 +10,16 @@
 # crate that pulls `postgres = "0.19"` and `mysql = "25"` purely to compare PowDB
 # against Postgres/MySQL. None of these crates ship in powdb-storage / powdb-query
 # / powdb-server / powdb-cli / powdb-auth / powdb-backup, so no published artifact
-# is affected. We do NOT broadly disable auditing — only the three postgres DoS
-# advisories below are vulnerabilities (the action's hard-fail trigger); the
-# remaining unmaintained/unsound entries are non-failing warnings and are left
-# visible on purpose.
+# is affected. We do NOT broadly disable auditing: only the four advisories
+# listed below are vulnerabilities (the action's hard-fail trigger), and every
+# one of them is reachable solely through powdb-compare. The remaining
+# unmaintained/unsound entries are non-failing warnings and are left visible on
+# purpose.
+#
+# Before adding an ID here, confirm the path really is compare-only:
+#   cargo tree -i <crate> --workspace --all-features
+# and check that no published crate reaches it. An advisory that touches a
+# shipping crate must be fixed, never ignored.
 [advisories]
 ignore = [
     # postgres-protocol < 0.6.12: unbounded SCRAM iteration count → CPU-exhaustion
@@ -29,4 +35,15 @@ ignore = [
     # → DoS. Path: tokio-postgres → postgres → powdb-compare (publish=false,
     # bench-only). No shipping crate.
     "RUSTSEC-2026-0178",
+
+    # rkyv 0.7.46: shared-pointer validation ignored pointer metadata, so an
+    # archive with two `Rc`/`Arc` pointers to one address but different slice
+    # lengths could hand out a forged length and read out of bounds. Path:
+    # rkyv → rust_decimal → mysql_common → mysql → powdb-compare
+    # (publish=false, bench-only). The 0.7 series is unmaintained upstream and
+    # the fix landed in 0.8.17, so there is no in-series upgrade to take; the
+    # dependency is transitive through `mysql`. No shipping crate reaches rkyv
+    # (verified with `cargo tree --all-features` across all eight published
+    # crates), and PowDB never feeds it an untrusted archive.
+    "RUSTSEC-2026-0235",
 ]
