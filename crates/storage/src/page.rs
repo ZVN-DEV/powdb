@@ -519,7 +519,7 @@ impl Page {
             self.write_slot_entry(slot, offset, row_data.len() as u16);
             true
         } else {
-            // Need more space — append at free_start. `update_fit` above
+            // Need more space, append at free_start. `update_fit` above
             // already proved the row fits there.
             let new_offset = self.free_start();
             let start = new_offset as usize;

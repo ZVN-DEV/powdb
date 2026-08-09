@@ -4,8 +4,8 @@
 //! database here" and calls `Catalog::create`, which writes a fresh empty
 //! catalog over the existing one and truncates the WAL. Only one `NotFound`
 //! actually means that: the one raised because `catalog.bin` is absent. Every
-//! other file the open path touches can raise the same kind — a table's `.heap`
-//! most obviously — and those all landed in the same arm.
+//! other file the open path touches can raise the same kind, a table's `.heap`
+//! most obviously, and those all landed in the same arm.
 //!
 //! The observed failure: a two-table database, one `.heap` deleted, reopened.
 //! `catalog.bin` was rewritten from 92 bytes to 14, `.tables` reported no

@@ -574,7 +574,7 @@ impl Engine {
         // so among rows tied on the boundary key the last-ranked row is the one
         // with the largest `seq`. The ascending heap gets that for free: its top
         // is the maximum `(key, seq)`. The descending heap is `Reverse`d, so its
-        // top is the minimum `(key, seq)` — the *earliest* tied row, exactly the
+        // top is the minimum `(key, seq)`, the *earliest* tied row, exactly the
         // one that must be kept. Wrapping `seq` in a second `Reverse` flips the
         // tie-break back, so the top is `(smallest key, largest seq)`. Without
         // it, `order .k desc limit N` returned a different row *set* from the

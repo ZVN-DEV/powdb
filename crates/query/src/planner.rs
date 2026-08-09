@@ -350,7 +350,7 @@ fn project_layer(input: PlanNode, projection: Vec<ProjectionField>) -> PlanNode 
 
 /// Wrap `input` in the `OFFSET`/`LIMIT` slicing layer.
 ///
-/// Offset applies *before* limit — skip M rows, then take N — so the plan shape
+/// Offset applies *before* limit (skip M rows, then take N) so the plan shape
 /// is `Limit(Offset(...))`: offset is built first (inner) and limit wraps it.
 fn slice_layer(mut input: PlanNode, offset: Option<Expr>, limit: Option<Expr>) -> PlanNode {
     if let Some(count) = offset {
@@ -377,7 +377,7 @@ fn slice_layer(mut input: PlanNode, offset: Option<Expr>, limit: Option<Expr>) -
 /// forces the projection underneath the slicing nodes.
 ///
 /// Without `distinct` the projection stays outermost instead. A projection is
-/// one row in, one row out, so both orders answer identically — but
+/// one row in, one row out, so both orders answer identically, but
 /// `Project(Limit(...))` is the shape the executor's top-N and project+limit
 /// fast paths pattern-match on, and moving the projection down unconditionally
 /// would silently retire them.

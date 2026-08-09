@@ -6,8 +6,8 @@
 //! so the row that deserves eviction among rows tied on the boundary key is the
 //! one with the *largest* sequence. The descending heap was ordered so that its
 //! top was the *smallest* sequence, i.e. exactly the row that should have been
-//! kept. `limit N` therefore returned a different row set — not merely a
-//! different order — from the first N rows of the same unlimited query.
+//! kept. `limit N` therefore returned a different row set, not merely a
+//! different order, from the first N rows of the same unlimited query.
 //!
 //! The contract these tests pin: for any N, `order K limit N` must equal the
 //! first N rows of `order K`. That is checked against the generic sort path
@@ -153,7 +153,7 @@ fn descending_top_n_evicts_the_last_tied_row_not_the_first() {
 }
 
 /// `offset 0` is a no-op, but the `Offset` node it inserts blocks the top-N
-/// fast path — so a query that answered correctly with `offset 0` answered
+/// fast path, so a query that answered correctly with `offset 0` answered
 /// differently without it. Any divergence here is a fast-path bug by
 /// construction.
 #[test]
@@ -196,7 +196,7 @@ fn filtered_descending_top_n_is_a_prefix_of_the_full_order() {
 
 /// The strongest form: run every limit with the fast paths on and again with
 /// them forced off, and require identical answers. `forced_generic_sites`
-/// proves the top-N fast path is really the code being diverted — a comparison
+/// proves the top-N fast path is really the code being diverted, a comparison
 /// that never declined anywhere would be comparing one path with itself.
 #[test]
 fn top_n_agrees_with_the_generic_path() {

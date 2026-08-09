@@ -523,7 +523,7 @@ impl HeapFile {
     /// A page leaves the buffer only once its own write has succeeded. An
     /// earlier version drained the whole buffer up front and then wrote the
     /// drained copies, so one ENOSPC/EIO partway through left every remaining
-    /// page in neither memory nor on disk — and a later successful checkpoint
+    /// page in neither memory nor on disk, and a later successful checkpoint
     /// would truncate the WAL and make that loss permanent. Keeping the
     /// unwritten pages buffered means the mutations are still there for the
     /// caller's retry, and still there for `Drop` and the next checkpoint.
@@ -1478,7 +1478,7 @@ impl HeapFile {
     /// `Catalog::update_logged`.
     ///
     /// Loads the page into the hot slot, which is where [`Self::update`] wants
-    /// it anyway — the probe costs no extra I/O on the update path.
+    /// it anyway: the probe costs no extra I/O on the update path.
     pub fn update_fit(&mut self, rid: RowId, row_len: usize) -> io::Result<UpdateFit> {
         self.ensure_hot(rid.page_id)?;
         let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
@@ -2730,7 +2730,7 @@ mod tests {
         assert!(err.to_string().contains("injected write failure"));
 
         // The failing page and everything after it are still in memory, and
-        // still charged — losing the charge would let the buffer grow past the
+        // still charged: losing the charge would let the buffer grow past the
         // budget by exactly the pages a failing disk keeps rejecting.
         assert!(
             heap.dirty_buffer.contains_key(&doomed),

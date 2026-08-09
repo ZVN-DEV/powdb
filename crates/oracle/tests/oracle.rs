@@ -131,7 +131,7 @@ fn every_shape_actually_discriminates_something() {
 /// That is not hypothetical. `order_limit_offset` spelled `offset 0` for one
 /// case in five, the planner turned it into an `Offset` node between the
 /// `Limit` and the `Sort`, and `project_filter_sort_limit_fast` matches
-/// `Limit(Sort(..))` — so the descending top-N heap, and the tie-eviction rule
+/// `Limit(Sort(..))`, so the descending top-N heap, and the tie-eviction rule
 /// inside it, were never once executed by this crate. The shape looked healthy
 /// by every other measure it had.
 ///

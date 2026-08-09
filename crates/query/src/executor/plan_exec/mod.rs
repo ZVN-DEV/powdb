@@ -29,7 +29,7 @@ pub(crate) fn counts_every_row(argument: Option<&Expr>) -> bool {
 /// `limit must be integer literal`, and negative counts are already refused up
 /// front by [`validate_slice_counts`]. Substituting `usize::MAX` for a count the
 /// fast path could not read is what made `F limit 1 + 1 { .id }` answer the whole
-/// table while the same query without the projection was rejected — and, because
+/// table while the same query without the projection was rejected, and because
 /// the top-N heap takes its capacity from the same number, it also lifted the
 /// bound that keeps a rejected query from heaping every row in the table.
 pub(super) fn literal_limit(count: &Expr) -> Option<usize> {

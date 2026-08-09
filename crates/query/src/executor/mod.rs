@@ -594,8 +594,8 @@ impl Engine {
             }
             // Exactly one NotFound means "there is no database here": the one
             // `Catalog::open` raises because the catalog file itself is absent.
-            // Every other file the open path touches raises the same kind — a
-            // table's `.heap` most obviously — and `Catalog::create` renames a
+            // Every other file the open path touches raises the same kind, a
+            // table's `.heap` most obviously, and `Catalog::create` renames a
             // fresh empty catalog over the existing one and truncates the WAL.
             // Treating any NotFound as a fresh directory therefore turned a
             // single missing heap into silent, total loss of every table,

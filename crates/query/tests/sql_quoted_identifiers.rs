@@ -4,15 +4,15 @@
 //! both, so `SELECT "name" FROM Author` returned the literal text `name` once
 //! per row instead of the column, under a header of `?`, and `FROM "Author"`
 //! failed outright with `expected table name`. Both are silent-or-broken on
-//! input that every ORM emits as a matter of course — Prisma, Django,
-//! SQLAlchemy and ActiveRecord all quote identifiers — so ported SQL was
+//! input that every ORM emits as a matter of course (Prisma, Django,
+//! SQLAlchemy and ActiveRecord all quote identifiers), so ported SQL was
 //! wrong in one direction and rejected in the other.
 //!
 //! The rules pinned here:
 //!   * `"x"` is the identifier x, everywhere an identifier is legal;
 //!   * `'x'` is still the string x;
 //!   * a quoted identifier is never a keyword, which is the entire reason
-//!     delimited identifiers exist — `"limit"` is a column named limit;
+//!     delimited identifiers exist: `"limit"` is a column named limit;
 //!   * the two are not interchangeable: comparing a column against `"literal"`
 //!     is a column-to-column comparison, not a string match.
 
@@ -75,8 +75,8 @@ fn a_quoted_column_is_the_column_not_a_string() {
     let dir = fresh_dir("col");
     let mut engine = authors(&dir);
 
-    // Before the fix this returned ["name", "name"] — the literal text, once
-    // per row — which is a silent wrong answer rather than an error.
+    // Before the fix this returned ["name", "name"], the literal text, once
+    // per row, which is a silent wrong answer rather than an error.
     assert_eq!(
         rows_sql(&mut engine, r#"SELECT "name" FROM Author"#),
         vec!["alice", "bob"]

@@ -1,7 +1,7 @@
 //! `distinct` was applied *after* `limit` / `offset`, not before.
 //!
-//! The planner built one fixed pipeline for every read —
-//! `Sort -> Offset -> Limit -> [Window] -> Project -> Distinct` — with
+//! The planner built one fixed pipeline for every read
+//! (`Sort -> Offset -> Limit -> [Window] -> Project -> Distinct`), with
 //! `Distinct` outermost. `U distinct limit 3 { .name }` therefore limited to
 //! three rows and *then* de-duplicated them, so it could return fewer rows than
 //! asked for while distinct rows the query should have reached were never

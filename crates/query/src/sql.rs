@@ -1536,8 +1536,8 @@ impl SqlParser {
             // to `x is null` as a convenience, but in SQL a comparison against
             // NULL is UNKNOWN, so `WHERE x = NULL` and `WHERE x <> NULL` both
             // select no rows in every other engine. Emitting the PowQL
-            // spelling here would silently hand back the `IS NULL` rows —
-            // the opposite row set — so lower it to a constant-false
+            // spelling here would silently hand back the `IS NULL` rows
+            // (the opposite row set), so lower it to a constant-false
             // predicate instead.
             //
             // The `IS NULL` / `IS NOT NULL` path above is unaffected: it sets

@@ -64,7 +64,7 @@ const NON_LITERAL_SHAPES: &[&str] = &[
     "F limit 1 + 1",
     // Project(Limit(Filter(SeqScan)))
     "F filter .k > 0 limit 1 + 1",
-    // Project(Limit(Sort(SeqScan))) — the top-N heap
+    // Project(Limit(Sort(SeqScan))), the top-N heap
     "F order .k limit 1 + 1",
     "F order .k desc limit 1 + 1",
     // Project(Limit(Sort(Filter(SeqScan))))

@@ -832,7 +832,7 @@ impl Catalog {
                             // Stamp the source page too, not just the landing
                             // page. A record written before v0.23 could be a
                             // relocating update, whose redo is delete+insert
-                            // into a self-assigned slot — replay cannot place
+                            // into a self-assigned slot, replay cannot place
                             // it where the crashed session did, because the
                             // record carries only the old RowId. Stamping the
                             // source page is what stops a *second* recovery
@@ -1896,7 +1896,7 @@ impl Catalog {
         let lsn = self.wal.last_appended_lsn();
         self.tables[slot].delete(rid)?;
         // Redoing a delete is idempotent, so the stamp is not what makes
-        // recovery correct here — it is what lets the per-page guard skip a
+        // recovery correct here: it is what lets the per-page guard skip a
         // record whose page already reached disk, instead of re-walking every
         // delete the WAL still holds on every single recovery.
         if lsn > 0 {
@@ -2151,7 +2151,7 @@ impl Catalog {
             self.wal_log(tx_id, WalRecordType::Insert, table, new_rid, &row_bytes)?;
             let insert_lsn = self.wal.last_appended_lsn();
             // Stamp both pages so the per-page redo guard can fire on each
-            // half independently — a crash that flushed one page but not the
+            // half independently, a crash that flushed one page but not the
             // other must redo only the missing half.
             if delete_lsn > 0 {
                 self.tables[slot]
@@ -3013,7 +3013,7 @@ impl Catalog {
         // `Catalog::open` opens every heap the on-disk catalog names *before*
         // it replays the WAL, so a crash between an early unlink and this
         // persist would leave a catalog pointing at a heap that no longer
-        // exists — an open that fails outright, with the `DdlDropTable` record
+        // exists, an open that fails outright, with the `DdlDropTable` record
         // that would have finished the drop never even read. Unlinking after
         // the catalog is durable inverts the failure into a harmless orphan
         // file, which the next `drop_table` of the same name overwrites.
@@ -5734,10 +5734,10 @@ mod tests {
     ///
     /// The window matters because `Catalog::open` opens every heap named by the
     /// on-disk catalog *before* it replays the WAL: a catalog that still names a
-    /// table whose heap file is already gone does not degrade, it refuses to
+    /// table whose heap file is already gone does not degrade; it refuses to
     /// open at all, and the `DdlDropTable` record that would have finished the
     /// job never gets read. A persist failure is the observable stand-in for a
-    /// crash in that window — with the catalog written first, the heap is still
+    /// crash in that window, with the catalog written first, the heap is still
     /// on disk and the database still opens.
     #[test]
     fn drop_table_persists_the_catalog_before_unlinking_the_heap() {
@@ -5764,7 +5764,7 @@ mod tests {
 
         std::mem::forget(cat);
         // The drop's intent was logged and flushed before any of this, so
-        // recovery finishes it — the point of the assertion is that the open
+        // recovery finishes it; the point of the assertion is that the open
         // gets far enough to replay at all.
         let reopened = Catalog::open(dir.path()).unwrap();
         assert!(reopened.schema("Gone").is_none());

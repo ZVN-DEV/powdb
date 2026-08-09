@@ -6,7 +6,7 @@
 //! there shrinks or patches in place (see `test_crash_recovery_var_col_update`,
 //! which shrinks 21 chars to 1 on purpose to stay on the in-place path). An
 //! in-place update is idempotent, so re-applying its WAL record on every
-//! recovery is harmless. A *relocating* update is not idempotent — replaying
+//! recovery is harmless. A *relocating* update is not idempotent, replaying
 //! it against a heap that already holds the pre-update row produces a second
 //! live copy of that row unless the per-page redo guard actually arms.
 
@@ -74,7 +74,7 @@ fn assert_no_duplicate_ids(ids: &[i64]) {
 
 /// The relocation itself: a 300-byte row updated to 3000 bytes cannot stay on
 /// its page, so `HeapFile::update` falls back to delete + insert and the row
-/// changes RowId. Guards the precondition of the crash test below — if the
+/// changes RowId. Guards the precondition of the crash test below: if the
 /// heap ever grows in-place page splitting, that test stops testing anything.
 #[test]
 fn growing_update_relocates_the_row() {
@@ -156,7 +156,7 @@ fn crash_after_relocating_update_does_not_duplicate_the_row() {
         );
 
         // Keep writing after the relocation so the Update record is followed
-        // by higher-LSN Insert records — the realistic crash shape, and the
+        // by higher-LSN Insert records, the realistic crash shape, and the
         // one that lets a badly-ordered redo clobber later rows.
         for i in 200..260i64 {
             cat.insert("users", &vec![Value::Int(i), Value::Str("x".repeat(300))])

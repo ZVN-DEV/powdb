@@ -341,7 +341,7 @@ impl Engine {
                     } = inner.as_ref()
                     {
                         // Fast path only for single-key sorts, and only for a
-                        // bound this path may act on — an unreadable count is
+                        // bound this path may act on, an unreadable count is
                         // the generic `Limit` arm's error to report.
                         if keys.len() == 1 {
                             if let (Expr::Field(sort_field), Some(limit)) =
