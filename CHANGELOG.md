@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-09
+
 ### Fixed
 
 **Two of these are silent data corruption. All four were reproduced before the

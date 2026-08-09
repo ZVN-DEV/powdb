@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.23.0 - 2026-08-09
+
+No client changes. Version moves in lockstep with the engine.
+
+Two server-side changes alter what existing SQL returns, so they are worth
+knowing about from the client:
+
+- `"double quotes"` in SQL now delimit an **identifier**, not a string, so
+  `SELECT "name" FROM Author` returns the column rather than the literal text
+  `name` once per row. Use single quotes for string literals.
+- `= NULL` and `<> NULL` in SQL now match nothing, as they do in every other
+  engine. They previously returned the `IS NULL` rows.
+
 ## 0.22.0 - 2026-08-03
 
 - **Wire protocol version negotiation.** `Connect` now carries a hello block
