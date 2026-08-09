@@ -69,6 +69,20 @@ fn template_dir() -> &'static Path {
     })
 }
 
+/// Retry an fs op interrupted by a signal. libFuzzer drives its progress
+/// reporting off SIGALRM, and a `copy_file_range` that a signal lands in
+/// returns EINTR, which `std::fs::copy` surfaces rather than retries. That
+/// killed CI runs as a "crash" that had nothing to do with the input.
+/// `fuzz_wal_replay` already staged its cases this way; this target did not.
+fn retry_eintr<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
 fn stage_case_dir(input: &[u8]) -> PathBuf {
     let case = std::env::temp_dir().join(format!(
         "powdb_fuzz_catalog_case_{}_{}",
@@ -95,7 +109,7 @@ fn copy_dir(src: &Path, dst: &Path) {
         if from.is_dir() {
             copy_dir(&from, &to);
         } else {
-            std::fs::copy(&from, &to).expect("copy template file");
+            retry_eintr(|| std::fs::copy(&from, &to)).expect("copy template file");
         }
     }
 }

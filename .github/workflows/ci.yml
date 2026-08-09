@@ -646,7 +646,9 @@ jobs:
           #   RUSTSEC-2026-0179  postgres-protocol SCRAM DoS  (→ powdb-compare)
           #   RUSTSEC-2026-0180  postgres-protocol hstore DoS (→ powdb-compare)
           #   RUSTSEC-2026-0178  tokio-postgres DataRow DoS   (→ powdb-compare)
-          ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178
+          #   RUSTSEC-2026-0235  rkyv 0.7 OOB read            (→ powdb-compare,
+          #                      via rust_decimal → mysql_common → mysql)
+          ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178,RUSTSEC-2026-0235
 
   # Governance gate: this is a public repo. Fail the build if internal-only
   # planning/agent artifacts get re-tracked, or if any public doc/source names

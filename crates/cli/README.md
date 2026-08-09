@@ -156,8 +156,8 @@ meta-commands.
 | `--password <PW>` | `POWDB_PASSWORD` | Password for remote auth |
 | `-u, --user <NAME>` | | Username for multi-user remote auth |
 | `--tls` | `POWDB_TLS=1` | Encrypt the remote connection |
-| `--tls-ca <PATH>` | `POWDB_TLS_CA` | Trust this root CA instead of the web roots (implies `--tls`) |
-| `--tls-server-name <N>` | `POWDB_TLS_SERVER_NAME` | Certificate name to verify against (implies `--tls`) |
+| `--tls-ca <PATH>` | `POWDB_TLS_CA` | Trust this root CA instead of the web roots (implies `--tls`, flag or env) |
+| `--tls-server-name <N>` | `POWDB_TLS_SERVER_NAME` | Certificate name to verify against (implies `--tls`, flag or env) |
 
 Prefer the env fallbacks for secrets: a `--password` on the command line is
 visible in the process list.

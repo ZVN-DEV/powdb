@@ -35,31 +35,46 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 
 ---
 
+## Comments
+
+A `#` starts a comment that runs to the end of the line. This is the only
+comment syntax PowQL has: `--`, which is a comment in SQL, is a parse error in
+PowQL because `-` is the subtraction operator.
+
+```
+# A whole-line comment
+User filter .age > 30 { .name }   # a trailing comment
+```
+
+Note that PowDB's SQL frontend is a separate language surface and does accept
+`--`, so a snippet copied between the two needs its comments translated. See
+[SQL.md](SQL.md).
+
 ## Quick Start
 
 PowQL reads left to right. You name the table, apply operations, and project fields -- all in one pipeline.
 
 ```
--- Define a schema
+# Define a schema
 type User {
   required name: str,
   required email: str,
   age: int
 }
 
--- Insert a row
+# Insert a row
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
--- Scan all users
+# Scan all users
 User
 
--- Filter, order, limit, project -- one pipeline
+# Filter, order, limit, project -- one pipeline
 User filter .age > 25 order .age desc limit 10 { .name, .age }
 
--- Count rows matching a condition
+# Count rows matching a condition
 count(User filter .age > 30)
 
--- Group and aggregate
+# Group and aggregate
 User group .status having count(.name) > 5 { .status, n: count(.name) }
 ```
 
@@ -108,14 +123,14 @@ type <TableName> {
 ### Examples
 
 ```
--- A simple user table; email must be unique across all rows
+# A simple user table; email must be unique across all rows
 type User {
   required name: str,
   required unique email: str,
   age: int
 }
 
--- A table with all supported types
+# A table with all supported types
 type Record {
   required id: int,
   required title: str,
@@ -336,11 +351,11 @@ the other side. This matches SQL NULL semantics: a comparison against a null
 is neither true nor false, so the row does not pass the filter.
 
 ```
--- rows with a null .age are excluded from ALL of these:
+# rows with a null .age are excluded from ALL of these:
 User filter .age < 30
 User filter .age >= 30
 User filter .age = 30
-User filter .age != 30      -- a null .age is NOT "not equal to 30"; it is excluded
+User filter .age != 30      # a null .age is NOT "not equal to 30"; it is excluded
 ```
 
 The same rule applies when both sides are fields: `.a = .b` (and `.a != .b`)
@@ -348,8 +363,8 @@ does not match a row where either `.a` or `.b` is missing. To test presence,
 use `is null` / `is not null` (or `exists` / `not exists`), never a comparison:
 
 ```
-User filter .age is not null           -- rows where age is present
-User filter .age is null               -- rows where age is missing
+User filter .age is not null           # rows where age is present
+User filter .age is null               # rows where age is missing
 ```
 
 This rule holds identically on every execution path (indexed scans, compiled
@@ -405,7 +420,7 @@ Standard precedence applies -- `*` and `/` bind tighter than `+` and `-`:
 User { .name, double_age: .age * 2 }
 User filter .age / 10 > 2
 User filter .price * .quantity > 100
-User filter .a + .b * .c > 0   -- parsed as .a + (.b * .c)
+User filter .a + .b * .c > 0   # parsed as .a + (.b * .c)
 ```
 
 Use parentheses to override precedence:
@@ -461,10 +476,10 @@ User filter .age not between 10 and 20
 Pattern matching with `%` (any sequence) and `_` (single character):
 
 ```
-User filter .name like "Ali%"        -- starts with "Ali"
-User filter .name like "_ob"         -- 3 chars ending in "ob"
-User filter .name like "Alice"       -- exact match
-User filter .name not like "A%"      -- does NOT start with "A"
+User filter .name like "Ali%"        # starts with "Ali"
+User filter .name like "_ob"         # 3 chars ending in "ob"
+User filter .name like "Alice"       # exact match
+User filter .name not like "A%"      # does NOT start with "A"
 ```
 
 ### Coalesce
@@ -499,13 +514,13 @@ PowQL supports five aggregate functions. They wrap a query in a function-call sy
 ### Standalone Aggregates
 
 ```
-count(User)                              -- count all rows
-count(User filter .age > 30)             -- count with filter
-sum(User { .age })                       -- sum a column
-sum(User filter .age > 30 { .age })      -- sum with filter
-avg(User { .age })                       -- average
-min(User { .age })                       -- minimum
-max(User { .age })                       -- maximum
+count(User)                              # count all rows
+count(User filter .age > 30)             # count with filter
+sum(User { .age })                       # sum a column
+sum(User filter .age > 30 { .age })      # sum with filter
+avg(User { .age })                       # average
+min(User { .age })                       # minimum
+max(User { .age })                       # maximum
 ```
 
 ### count(distinct ...)
@@ -550,10 +565,10 @@ Group rows by one or more keys and compute aggregate values per group.
 ### Basic Grouping
 
 ```
--- Count users per name
+# Count users per name
 User group .name { .name, n: count(.name) }
 
--- Group by multiple keys
+# Group by multiple keys
 User group .status, .age { .status, .age }
 ```
 
@@ -648,9 +663,9 @@ Toy example. Three accounts in one tier, joined one-to-many to their orders:
 type Account { required id: int, required tier: str, required balance: float }
 type Ord     { required id: int, required account_id: int }
 
--- tier "gold" holds all three accounts
--- balances: A = 10.0, B = 10.0, C = 40.0    (true average balance = 20.0)
--- orders:   A has 4, B has 1, C has 1        (6 joined rows in total)
+# tier "gold" holds all three accounts
+# balances: A = 10.0, B = 10.0, C = 40.0    (true average balance = 20.0)
+# orders:   A has 4, B has 1, C has 1        (6 joined rows in total)
 
 Account as a join Ord as o on a.id = o.account_id
   group a.tier { a.tier, avg_bal: avg(a.balance) }
@@ -663,7 +678,7 @@ though A has four matching orders. To aggregate the joined rows directly, add
 ```powql
 Account as a join Ord as o on a.id = o.account_id
   group a.tier { a.tier, joined_avg: avg(raw a.balance) }
--- joined_avg = (10*4 + 10 + 40) / 6 = 15.0
+# joined_avg = (10*4 + 10 + 40) / 6 = 15.0
 ```
 
 The same modifier works for top-level aggregate queries:
@@ -678,7 +693,7 @@ extreme. `count(distinct ...)` still counts distinct values rather than source
 rows:
 
 ```
--- distinct accounts per group, unaffected by order counts
+# distinct accounts per group, unaffected by order counts
 Account as a join Ord as o on a.id = o.account_id
   group a.balance { a.balance, accounts: count(distinct a.id) }
 ```
@@ -814,9 +829,9 @@ type User { required unique id: int, required name: str, required email: str, ag
 type Order { required id: int, required user_id: int, required total: float, product_id: int }
 type Item { required id: int, required order_id: int, required sku: str }
 
--- Alice (id 1, company 10) has two orders, Bob (id 2) has one (with no
--- product_id), Cara (id 3) has none. Order 1 has items "a" and "b"; order 2
--- has item "c". Company 10 is "acme".
+# Alice (id 1, company 10) has two orders, Bob (id 2) has one (with no
+# product_id), Cara (id 3) has none. Order 1 has items "a" and "b"; order 2
+# has item "c". Company 10 is "acme".
 ```
 
 `User.id` and `Company.id` are `unique`, which is what makes a link onto them a
@@ -843,9 +858,9 @@ query bound to a field name:
 
 ```
 User as u { u.name, orders: Order as o filter o.user_id = u.id { o.total, o.product_id } }
--- Alice, [{"product_id":101,"total":9.5},{"product_id":102,"total":20.25}]
--- Bob,   [{"product_id":null,"total":5.5}]
--- Cara,  []
+# Alice, [{"product_id":101,"total":9.5},{"product_id":102,"total":20.25}]
+# Bob,   [{"product_id":null,"total":5.5}]
+# Cara,  []
 ```
 
 Every parent row appears exactly once -- there is no join fan-out to undo. A
@@ -865,15 +880,15 @@ linking a child column to a parent column. Either side may be written first:
 
 ```
 orders: Order as o filter o.user_id = u.id { o.total }
-orders: Order as o filter u.id = o.user_id { o.total }    -- same query
+orders: Order as o filter u.id = o.user_id { o.total }    # same query
 ```
 
 Zero correlation predicates, or more than one, is an error:
 
 ```
 User as u { u.name, orders: Order as o filter o.total > 1.0 { o.total } }
--- Error: nested projection `orders` requires an equi-correlation predicate
--- linking `o` to the outer query (o.<col> = u.<col>) somewhere in its filter
+# Error: nested projection `orders` requires an equi-correlation predicate
+# linking `o` to the outer query (o.<col> = u.<col>) somewhere in its filter
 ```
 
 ### Child Conditions
@@ -888,9 +903,9 @@ User as u {
   u.name,
   orders: Order as o filter o.user_id = u.id and o.total > 10.0 { o.total }
 }
--- Alice, [{"total":20.25}]
--- Bob,   []      -- Bob's only order (5.5) is filtered out; he still gets []
--- Cara,  []
+# Alice, [{"total":20.25}]
+# Bob,   []      -- Bob's only order (5.5) is filtered out; he still gets []
+# Cara,  []
 ```
 
 ### Per-Parent order, limit, and offset
@@ -903,9 +918,9 @@ User as u {
   u.name,
   orders: Order as o filter o.user_id = u.id and o.total > 10 order o.total desc limit 3 { o.total, o.product_id }
 }
--- Alice, [{"product_id":102,"total":20.25}]
--- Bob,   []
--- Cara,  []
+# Alice, [{"product_id":102,"total":20.25}]
+# Bob,   []
+# Cara,  []
 ```
 
 A `limit 1` keeps the single best child for every parent rather than leaving
@@ -913,9 +928,9 @@ all but one parent childless:
 
 ```
 User as u { u.name, orders: Order as o filter o.user_id = u.id order o.total desc limit 1 { o.total } }
--- Alice, [{"total":20.25}]
--- Bob,   [{"total":5.5}]
--- Cara,  []
+# Alice, [{"total":20.25}]
+# Bob,   [{"total":5.5}]
+# Cara,  []
 ```
 
 Order keys must be child columns; rows that compare equal keep their stable
@@ -936,9 +951,9 @@ User as u {
     items: Item as i filter i.order_id = o.id { i.sku }
   }
 }
--- Alice, [{"items":[{"sku":"a"},{"sku":"b"}],"total":9.5},{"items":[{"sku":"c"}],"total":20.25}]
--- Bob,   [{"items":[],"total":5.5}]   -- an order with no items gets [], not a missing key
--- Cara,  []
+# Alice, [{"items":[{"sku":"a"},{"sku":"b"}],"total":9.5},{"items":[{"sku":"c"}],"total":20.25}]
+# Bob,   [{"items":[],"total":5.5}]   -- an order with no items gets [], not a missing key
+# Cara,  []
 ```
 
 Nesting depth is bounded by the parser's shared nesting-depth guard (64
@@ -1041,9 +1056,9 @@ exactly the same place as doing it the other way round:
 ```
 type User { required id: int, required name: str }
 type Order { required id: int, user_id: int }
-link Order.user -> User on user_id = id       -- to-many: User.id is not unique yet
-alter User add unique .id                     -- now to-one, with no re-declaration
-Order as o { o.id, o.user.name }              -- the scalar hop works
+link Order.user -> User on user_id = id       # to-many: User.id is not unique yet
+alter User add unique .id                     # now to-one, with no re-declaration
+Order as o { o.id, o.user.name }              # the scalar hop works
 ```
 
 This is why a to-many refusal names `alter <Target> add unique .<key>` as the
@@ -1060,7 +1075,7 @@ supported.
 
 ```
 Order as o { o.id, o.total, o.user.name }
-Order as o { o.id, o.user.company.name }     -- multi-hop
+Order as o { o.id, o.user.company.name }     # multi-hop
 ```
 
 The multi-hop line assumes a second link on the type the first hop reaches
@@ -1098,12 +1113,12 @@ row multiplication:
 
 ```
 Order as o { o.user.name }
--- if `user`'s target key is not unique:
--- Error: link `user` on type `Order` is a to-many link: its target key
---        `User.id` is not unique, so a hop can match many rows. To read one
---        value per row, make the target key unique with
---        `alter User add unique .id`. To read every match, traverse it with
---        a block (`user: o.user { ... }`)
+# if `user`'s target key is not unique:
+# Error: link `user` on type `Order` is a to-many link: its target key
+#        `User.id` is not unique, so a hop can match many rows. To read one
+#        value per row, make the target key unique with
+#        `alter User add unique .id`. To read every match, traverse it with
+#        a block (`user: o.user { ... }`)
 ```
 
 The refusal leads with the schema fix because that is usually what was meant: a
@@ -1251,7 +1266,7 @@ Extract a substring. Arguments: `(expr, start, length)` -- 1-indexed:
 
 ```
 User { sub: substring(.name, 1, 3) }
--- Alice -> "Ali", Bob -> "Bob", Charlie -> "Cha"
+# Alice -> "Ali", Bob -> "Bob", Charlie -> "Cha"
 ```
 
 #### concat
@@ -1260,10 +1275,10 @@ Concatenate multiple values. Non-string types are coerced to strings:
 
 ```
 User { full: concat(.name, " - ", .email) }
--- "Alice - alice@example.com"
+# "Alice - alice@example.com"
 
 User { info: concat(.name, " age=", .age) }
--- "Alice age=30"
+# "Alice age=30"
 ```
 
 #### json_type
@@ -1276,7 +1291,7 @@ the empty set:
 
 ```
 Post { kind: json_type(.data->author) }
--- "object" when author is present, empty when the key is absent
+# "object" when author is present, empty when the key is absent
 
 Post filter json_type(.data->tags) = "array"
 ```
@@ -1416,7 +1431,7 @@ CASE without ELSE returns null (Empty) when no branch matches:
 
 ```
 User { .name, label: case when .age > 100 then "old" end }
--- all labels will be null since no one is over 100
+# all labels will be null since no one is over 100
 ```
 
 ---
@@ -1447,10 +1462,10 @@ extracts first and compares second. A key that is not a bare identifier can be
 written as a string:
 
 ```
-Post { author: .data->author->name }        -- object key
-Post { first_tag: .data->tags->0 }           -- array index (0-based)
-Post { weird: .data->"has spaces!" }         -- string-form key (double-quoted)
-Post filter .data->views > 10                -- extract, then compare
+Post { author: .data->author->name }        # object key
+Post { first_tag: .data->tags->0 }           # array index (0-based)
+Post { weird: .data->"has spaces!" }         # string-form key (double-quoted)
+Post filter .data->views > 10                # extract, then compare
 ```
 
 `->` extracts and scalarizes the value it lands on:
@@ -1498,30 +1513,30 @@ type Post { required id: int, data: json }
 insert Post { id := 1, data := "{\"tags\":[\"db\"],\"author\":{\"name\":\"Ada\"},\"views\":12}" }
 insert Post { id := 2, data := "{\"author\":{\"name\":\"Grace\"},\"views\":3}" }
 
--- Extract nested fields. Note the canonical (sorted-key) output.
+# Extract nested fields. Note the canonical (sorted-key) output.
 Post { .id, author: .data->author->name, views: .data->views }
--- 1, "Ada",   12
--- 2, "Grace", 3
+# 1, "Ada",   12
+# 2, "Grace", 3
 
--- Filter on an extracted scalar.
+# Filter on an extracted scalar.
 Post filter .data->views > 10 { .id }
--- 1
+# 1
 
--- Group, aggregate, and order by extracted values.
+# Group, aggregate, and order by extracted values.
 Post group .data->author->name {
   author: .data->author->name,
   views: sum(.data->views)
 }
 Post order .data->views desc limit 10 { .id, views: .data->views }
 
--- Distinguish a missing key from a present one.
+# Distinguish a missing key from a present one.
 Post { .id, has_tags: json_type(.data->tags) }
--- 1, "array"
--- 2, (empty)   -- post 2 has no "tags" key
+# 1, "array"
+# 2, (empty)   -- post 2 has no "tags" key
 
--- Extract a sub-document (object/array come back as json text).
+# Extract a sub-document (object/array come back as json text).
 Post filter .id = 1 { sub: .data->author }
--- {"name":"Ada"}
+# {"name":"Ada"}
 ```
 
 ### JSON path indexes
@@ -1620,16 +1635,16 @@ path as a query, so a client gets the written rows in the same round trip.
 Update rows matching an optional filter. Supports both literal values and expressions:
 
 ```
--- Set a literal value
+# Set a literal value
 User filter .name = "Alice" update { age := 31 }
 
--- Update with an expression referencing the current row
+# Update with an expression referencing the current row
 User filter .name = "Alice" update { age := .age + 5 }
 
--- Update all rows
+# Update all rows
 User update { age := .age * 2 }
 
--- Arithmetic in update
+# Arithmetic in update
 User filter .age > 28 update { age := .age + 1 }
 ```
 
@@ -1677,7 +1692,7 @@ begin
 <statement1>
 <statement2>
 ...
-commit    -- apply all changes
+commit    # apply all changes
 ```
 
 ```
@@ -1685,7 +1700,7 @@ begin
 <statement1>
 <statement2>
 ...
-rollback  -- discard all changes
+rollback  # discard all changes
 ```
 
 ### Examples
@@ -1705,7 +1720,7 @@ Roll back a change before it takes effect:
 begin
 insert User { name := "Charlie", email := "charlie@example.com", age := 40 }
 rollback
--- Charlie is not inserted
+# Charlie is not inserted
 ```
 
 Mix reads and writes inside a transaction:
@@ -1758,7 +1773,7 @@ are exactly what transactions are for. Run schema changes first, then open the
 transaction:
 
 ```
-type User { required name: str, age: int }   -- DDL, outside the transaction
+type User { required name: str, age: int }   # DDL, outside the transaction
 begin
 insert User { name := "Alice", age := 30 }
 insert User { name := "Bob", age := 25 }
@@ -1878,7 +1893,7 @@ Inside a transaction, the fsync is deferred to `commit`. All statements between 
 begin
 insert User { name := "u1", email := "u1@ex.com", age := 20 }
 insert User { name := "u2", email := "u2@ex.com", age := 21 }
--- ... thousands more ...
+# ... thousands more ...
 commit
 ```
 
@@ -1931,8 +1946,8 @@ Add or drop columns on an existing table.
 
 ```
 alter User add column status: str
-alter User add required active: bool       -- only on an empty table (see note)
-alter User add status: str                 -- "column" keyword is optional
+alter User add required active: bool       # only on an empty table (see note)
+alter User add status: str                 # "column" keyword is optional
 ```
 
 > A `required` column can only be added to an **empty** table — there is no
@@ -1945,8 +1960,8 @@ alter User add status: str                 -- "column" keyword is optional
 
 ```
 alter User drop column email
-alter User drop email                      -- "column" keyword is optional
-alter User drop column if exists email     -- no-op if the column is absent
+alter User drop email                      # "column" keyword is optional
+alter User drop column if exists email     # no-op if the column is absent
 ```
 
 Dropping a column that does not exist is an error unless you add `if exists`,
@@ -1959,7 +1974,7 @@ Create a B+tree index on a column. Point lookups and range scans use indexes aut
 ```
 alter User add index .email
 alter User add index .age
-alter User add index if not exists .email  -- accepted for symmetry
+alter User add index if not exists .email  # accepted for symmetry
 ```
 
 Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is already a no-op, so `if not exists` is accepted but does not change behavior.
@@ -1981,7 +1996,7 @@ Create a unique B+tree index on a column, enforcing that no two non-null rows sh
 
 ```
 alter User add unique .email
-alter User add unique if not exists .email  -- no-op if already indexed
+alter User add unique if not exists .email  # no-op if already indexed
 alter Post add unique (.data->external_id)
 ```
 
@@ -2007,7 +2022,7 @@ Remove a table entirely:
 
 ```
 drop User
-drop if exists User                        -- no-op if the type is absent
+drop if exists User                        # no-op if the type is absent
 ```
 
 Dropping a type that does not exist is an error unless you add `if exists`.
@@ -2063,7 +2078,7 @@ indexed. `describe <Type>` and `schema <Type>` are equivalent.
 
 ```
 describe User
-schema User        -- alias for `describe User`
+schema User        # alias for `describe User`
 ```
 
 | column | type | nullable | index  |
@@ -2217,7 +2232,7 @@ Remove a materialized view:
 
 ```
 drop view OldUsers
-drop view if exists OldUsers               -- no-op if the view is absent
+drop view if exists OldUsers               # no-op if the view is absent
 ```
 
 Note: `drop view` removes the view. Plain `drop` (without `view`) drops a table. As with `drop table`, `if exists` turns a missing view into a no-op instead of an error.
@@ -2327,12 +2342,12 @@ Literals are substituted in the order they appear in the source query, left to r
 
 ```
 insert User { name := "seed", email := "seed@ex.com", age := 0 }
--- 3 literal slots: [0] = name, [1] = email, [2] = age
+# 3 literal slots: [0] = name, [1] = email, [2] = age
 ```
 
 ```
 User filter .name = "seed" update { age := 0 }
--- 2 literal slots: [0] = filter value, [1] = assignment value
+# 2 literal slots: [0] = filter value, [1] = assignment value
 ```
 
 ### Fast Paths

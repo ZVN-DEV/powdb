@@ -260,7 +260,7 @@ use self::plan_exec::{
     aggregate_rows, aggregate_rows_with_provenance, compare_order_values,
     cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
-    predicate_column_indices_json, range_matches, synthesize_range_predicate,
+    literal_limit, predicate_column_indices_json, range_matches, synthesize_range_predicate,
     validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
     validate_slice_counts, LoweredPlan,
 };
@@ -391,6 +391,17 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
 /// refreshes it, and every read serves stale rows with no error at all. Marking
 /// it dirty converts that into the typed error, and touches only memory, so a
 /// database that is merely being inspected is not modified.
+/// Whether `data_dir` already holds a catalog, i.e. whether reopening it is
+/// meant to find an existing database.
+///
+/// The file name is the on-disk identity of a PowDB directory, shared by the
+/// backup, sync and server crates; it is a format constant, not a storage
+/// implementation detail, and changing it would be a format break carrying its
+/// own migration.
+fn catalog_file_present(data_dir: &Path) -> bool {
+    data_dir.join("catalog.bin").exists()
+}
+
 fn open_view_registry(data_dir: &Path) -> ViewRegistry {
     let mut registry = ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
     let unreadable: Vec<String> = registry
@@ -581,7 +592,16 @@ impl Engine {
                 info!(data_dir = %data_dir.display(), "engine reopened existing database");
                 c
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Exactly one NotFound means "there is no database here": the one
+            // `Catalog::open` raises because the catalog file itself is absent.
+            // Every other file the open path touches raises the same kind, a
+            // table's `.heap` most obviously, and `Catalog::create` renames a
+            // fresh empty catalog over the existing one and truncates the WAL.
+            // Treating any NotFound as a fresh directory therefore turned a
+            // single missing heap into silent, total loss of every table,
+            // including the ones still intact on disk. Damage must stay loud so
+            // the missing file can be restored.
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !catalog_file_present(data_dir) => {
                 info!(data_dir = %data_dir.display(), "engine initialized fresh database");
                 Catalog::create(data_dir)?
             }
@@ -2048,12 +2068,10 @@ impl Engine {
                     } = inner.as_ref()
                     {
                         if keys.len() == 1 {
-                            if let Expr::Field(sort_field) = &keys[0].expr {
+                            if let (Expr::Field(sort_field), Some(limit)) =
+                                (&keys[0].expr, literal_limit(limit_expr))
+                            {
                                 let descending = keys[0].descending;
-                                let limit = match limit_expr {
-                                    Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                    _ => usize::MAX,
-                                };
                                 let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
                                     match sort_input.as_ref() {
                                         PlanNode::SeqScan { table } => (Some(table.as_str()), None),
@@ -2084,11 +2102,9 @@ impl Engine {
                         predicate,
                     } = inner.as_ref()
                     {
-                        if let PlanNode::SeqScan { table } = fi.as_ref() {
-                            let limit = match limit_expr {
-                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                _ => usize::MAX,
-                            };
+                        if let (PlanNode::SeqScan { table }, Some(limit)) =
+                            (fi.as_ref(), literal_limit(limit_expr))
+                        {
                             if let Some(result) = self.project_filter_limit_fast(
                                 table,
                                 fields,
@@ -2099,11 +2115,9 @@ impl Engine {
                             }
                         }
                     }
-                    if let PlanNode::SeqScan { table } = inner.as_ref() {
-                        let limit = match limit_expr {
-                            Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                            _ => usize::MAX,
-                        };
+                    if let (PlanNode::SeqScan { table }, Some(limit)) =
+                        (inner.as_ref(), literal_limit(limit_expr))
+                    {
                         if let Some(result) =
                             self.project_filter_limit_fast(table, fields, limit, None)?
                         {

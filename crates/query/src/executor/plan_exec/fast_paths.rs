@@ -16,6 +16,15 @@ use crate::executor::Engine;
 use super::aggregate::agg_overflow_error;
 use super::*;
 
+/// Bounded top-N heap for a descending sort, keyed by `(sort key, scan seq)`.
+///
+/// `Reverse` on the whole tuple makes `pop()` evict the smallest key, which is
+/// what a bounded max-N heap needs. The inner `Reverse` on the sequence number
+/// is what makes ties correct: the final order is key-descending then
+/// seq-*ascending*, so among rows tied on the boundary key the row that must be
+/// evicted is the one with the *largest* seq, not the smallest.
+type DescTopN<K> = BinaryHeap<Reverse<(K, Reverse<u64>, Vec<u8>)>>;
+
 impl Engine {
     // ─── Specialized fast paths ─────────────────────────────────────────────
     //
@@ -559,13 +568,24 @@ impl Engine {
         // a max-heap. We tie-break with a monotonic `seq` counter so the
         // result is deterministic and stable.
         //
+        // The heap's top must be the row this query would rank *last*, because
+        // that is the one eviction removes. The emitted order is key-directional
+        // then `seq` **ascending** in both directions (see the drain sort below),
+        // so among rows tied on the boundary key the last-ranked row is the one
+        // with the largest `seq`. The ascending heap gets that for free: its top
+        // is the maximum `(key, seq)`. The descending heap is `Reverse`d, so its
+        // top is the minimum `(key, seq)`, the *earliest* tied row, exactly the
+        // one that must be kept. Wrapping `seq` in a second `Reverse` flips the
+        // tie-break back, so the top is `(smallest key, largest seq)`. Without
+        // it, `order .k desc limit N` returned a different row *set* from the
+        // first N rows of `order .k desc`.
+        //
         // To keep this simple we maintain two typed heaps and pick by
         // direction.
         let drained: Vec<Vec<u8>> = match sort_col_type {
             TypeId::Int => {
                 let mut seq: u64 = 0;
-                let mut heap_desc: BinaryHeap<Reverse<(i64, u64, Vec<u8>)>> =
-                    BinaryHeap::with_capacity(prealloc);
+                let mut heap_desc: DescTopN<i64> = BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(i64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
                 let mut null_rows: Vec<Vec<u8>> = Vec::with_capacity(prealloc);
@@ -600,11 +620,11 @@ impl Engine {
                     );
                     if descending {
                         if heap_desc.len() < limit {
-                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                            heap_desc.push(Reverse((key, Reverse(id), data.to_vec())));
                         } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
                             if key > *top_key {
                                 heap_desc.pop();
-                                heap_desc.push(Reverse((key, id, data.to_vec())));
+                                heap_desc.push(Reverse((key, Reverse(id), data.to_vec())));
                             }
                         }
                     } else if heap_asc.len() < limit {
@@ -618,7 +638,10 @@ impl Engine {
                 })?;
 
                 let mut drained: Vec<(i64, u64, Vec<u8>)> = if descending {
-                    heap_desc.into_iter().map(|Reverse(t)| t).collect()
+                    heap_desc
+                        .into_iter()
+                        .map(|Reverse((key, Reverse(id), data))| (key, id, data))
+                        .collect()
                 } else {
                     heap_asc.into_iter().collect()
                 };
@@ -645,8 +668,7 @@ impl Engine {
                 // - -0.0 sorts before +0.0, matching total_cmp
                 // - Hot loop is branch-cheap (one compare + one xor)
                 let mut seq: u64 = 0;
-                let mut heap_desc: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> =
-                    BinaryHeap::with_capacity(prealloc);
+                let mut heap_desc: DescTopN<u64> = BinaryHeap::with_capacity(prealloc);
                 let mut heap_asc: BinaryHeap<(u64, u64, Vec<u8>)> =
                     BinaryHeap::with_capacity(prealloc);
                 let mut null_rows: Vec<Vec<u8>> = Vec::with_capacity(prealloc);
@@ -681,11 +703,11 @@ impl Engine {
                     let key = f64_bits_to_sortable_u64(bits);
                     if descending {
                         if heap_desc.len() < limit {
-                            heap_desc.push(Reverse((key, id, data.to_vec())));
+                            heap_desc.push(Reverse((key, Reverse(id), data.to_vec())));
                         } else if let Some(Reverse((top_key, _, _))) = heap_desc.peek() {
                             if key > *top_key {
                                 heap_desc.pop();
-                                heap_desc.push(Reverse((key, id, data.to_vec())));
+                                heap_desc.push(Reverse((key, Reverse(id), data.to_vec())));
                             }
                         }
                     } else if heap_asc.len() < limit {
@@ -699,7 +721,10 @@ impl Engine {
                 })?;
 
                 let mut drained: Vec<(u64, u64, Vec<u8>)> = if descending {
-                    heap_desc.into_iter().map(|Reverse(t)| t).collect()
+                    heap_desc
+                        .into_iter()
+                        .map(|Reverse((key, Reverse(id), data))| (key, id, data))
+                        .collect()
                 } else {
                     heap_asc.into_iter().collect()
                 };

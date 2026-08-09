@@ -340,14 +340,14 @@ impl Engine {
                         keys,
                     } = inner.as_ref()
                     {
-                        // Fast path only for single-key sorts
+                        // Fast path only for single-key sorts, and only for a
+                        // bound this path may act on, an unreadable count is
+                        // the generic `Limit` arm's error to report.
                         if keys.len() == 1 {
-                            if let Expr::Field(sort_field) = &keys[0].expr {
+                            if let (Expr::Field(sort_field), Some(limit)) =
+                                (&keys[0].expr, literal_limit(limit_expr))
+                            {
                                 let descending = keys[0].descending;
-                                let limit = match limit_expr {
-                                    Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                    _ => usize::MAX,
-                                };
                                 let (table_opt, pred_opt): (Option<&str>, Option<&Expr>) =
                                     match sort_input.as_ref() {
                                         PlanNode::SeqScan { table } => (Some(table.as_str()), None),
@@ -380,11 +380,9 @@ impl Engine {
                         predicate,
                     } = inner.as_ref()
                     {
-                        if let PlanNode::SeqScan { table } = fi.as_ref() {
-                            let limit = match limit_expr {
-                                Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                                _ => usize::MAX,
-                            };
+                        if let (PlanNode::SeqScan { table }, Some(limit)) =
+                            (fi.as_ref(), literal_limit(limit_expr))
+                        {
                             if let Some(result) = self.project_filter_limit_fast(
                                 table,
                                 fields,
@@ -396,11 +394,9 @@ impl Engine {
                         }
                     }
                     // Fast path: Project(Limit(SeqScan)) — stream, no filter.
-                    if let PlanNode::SeqScan { table } = inner.as_ref() {
-                        let limit = match limit_expr {
-                            Expr::Literal(Literal::Int(v)) if *v >= 0 => *v as usize,
-                            _ => usize::MAX,
-                        };
+                    if let (PlanNode::SeqScan { table }, Some(limit)) =
+                        (inner.as_ref(), literal_limit(limit_expr))
+                    {
                         if let Some(result) =
                             self.project_filter_limit_fast(table, fields, limit, None)?
                         {

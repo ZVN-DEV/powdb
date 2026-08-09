@@ -7,6 +7,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+**Two of these are silent data corruption. All four were reproduced before the
+fix and verified not to reproduce after.**
+
+- **WAL replay duplicated a relocating UPDATE.** `set_page_lsn` was called on
+  the live INSERT paths and throughout replay, but never on the live UPDATE
+  path, so the page LSN redo guard could never fire for an Update record and
+  every one re-applied on every recovery. That is safe only while UPDATE is
+  idempotent, and it is not: a row grown past the free space on its page
+  relocates via delete plus insert with a fresh RowId, so replay left a second
+  live copy behind. 200 rows, a checkpoint, one growing update and a crash
+  recovered **261 rows with one id present twice**. A plain checkpoint is
+  enough to reach it. Every pre-existing crash test used a shrinking update,
+  which is why this survived.
+- **A missing heap file silently reinitialized the database.** Any `NotFound`
+  during open was read as "no database here", which renamed a fresh empty
+  catalog over the real one and truncated the WAL. Deleting a single table's
+  heap file took `catalog.bin` from 92 bytes to 14 and orphaned a second,
+  fully intact table. The create fallback is now gated on `catalog.bin` itself
+  being absent, and `drop_table` persists the catalog before unlinking the
+  heap.
+- **`order ... desc limit N` returned the wrong set of tied rows.** The bounded
+  top-N heap evicted the smallest `(key, seq)`, but the required order is key
+  descending then sequence ascending, so the correct victim is the largest
+  sequence among ties. `order .k desc limit 3` could return a different row
+  *set* than the first three rows of `order .k desc`, and adding a no-op
+  `offset 0` changed the answer.
+- **`distinct` was applied after `limit`/`offset`.** The planner built the
+  Distinct node outermost, so the limit cut source rows before de-duplication:
+  `distinct limit 3` returned 2 rows where `distinct` alone returned 3.
+- **A non-literal `limit` silently became unbounded on the fast paths.** It
+  degraded to `usize::MAX` while the generic path errored, so adding a
+  projection flipped the same query between "error" and "returns the whole
+  table", bypassing `MAX_SORT_ROWS` and the per-query row budget.
+
+### Changed
+
+**Behavior changes. Read these before upgrading if you send SQL from an ORM,
+or set TLS through environment variables.**
+
+- **In SQL, double quotes now delimit an identifier, not a string.** The SQL
+  lexer treated `'` and `"` identically, so `SELECT "name" FROM Author`
+  returned the literal text `name` once per row under a header of `?`, and
+  `SELECT name FROM "Author"` failed with `expected table name`. Every ORM
+  quotes identifiers as a matter of course (Prisma, Django, SQLAlchemy,
+  ActiveRecord), so ported SQL was silently wrong in one direction and
+  rejected in the other. A quoted identifier is also never a keyword, which is
+  the entire reason delimited identifiers exist: `"limit"` is a column named
+  limit. PowQL reserves roughly 93 lowercase words, and there was previously
+  no way at all to name a column after one of them from SQL. Two cases are now
+  refused rather than mangled: an empty quoted identifier, and one containing a
+  backtick, which PowQL uses as its own quote character and cannot escape.
+  Single quotes are unchanged and still delimit a string.
+- **In SQL, `= NULL` and `<> NULL` now match nothing.** PowQL deliberately
+  desugars `x = null` to `x is null`, and the SQL frontend inherited that by
+  lowering to PowQL text, so ported SQL silently received the `IS NULL` rows:
+  the opposite row set from every other engine, on the single most commonly
+  written incorrect SQL idiom. PowDB returned 56 rows where SQLite returned 0.
+  SQL now lowers a NULL comparison to a constant-false predicate, while PowQL
+  keeps its documented convenience. This is the first and only accepted
+  divergence between PowQL and PowDB-SQL.
+- **`POWDB_TLS_CA` and `POWDB_TLS_SERVER_NAME` now imply TLS in the CLI.**
+  They previously set only their own values and never enabled TLS, so
+  `POWDB_TLS_CA=/ca.pem powdb-cli -r host:5433` connected in **cleartext**,
+  silently, while the operator had every reason to believe the session was
+  encrypted. The matching `--tls-ca` and `--tls-server-name` flags have always
+  implied `--tls`, and the CLI README documented the environment variables as
+  implying it too. A variable that says how to verify a certificate must never
+  leave the connection unencrypted.
+- **The CLI no longer sends comment-only input to the engine.** A line
+  carrying no statement lexes to zero tokens, and the REPL forwarded it
+  anyway, which reported `expected statement, got end of input`. It now asks
+  the lexer what counts as a comment rather than scanning for `#` itself, so
+  the CLI cannot drift from the language. A lex *error* is deliberately still
+  forwarded: that is a real statement with a real problem.
+
+### Added
+
+- **Differential oracle shapes covering this round.** The oracle caught none of
+  the four defects above, and that was structural rather than bad luck:
+  `order_limit_offset` unconditionally emitted `offset 0`, and an Offset node
+  between Limit and Sort blocks the executor's top-N fast path, so the shape
+  that should have covered the descending heap could never reach it. Adds
+  `order_desc_limit` over a low-cardinality key (so boundary ties are common
+  rather than incidental), an ascending sibling to pin the branch that was
+  already correct, `distinct_limit`, and `cmp_against_null_literal`, which
+  failed on its first run and found the `= NULL` divergence above.
+- Regression suites for each defect: `wal_relocating_update`,
+  `engine_open_create_fallback`, `topn_tie_eviction`,
+  `distinct_pipeline_order`, `non_literal_slice_counts`, and
+  `sql_quoted_identifiers`.
+
+### Security
+
+- **`SECURITY.md` pointed reporters at an address that cannot receive mail.**
+  It named a `@users.noreply.github.com` address; GitHub's noreply addresses
+  exist for commit attribution and reject inbound mail, so a researcher
+  following the documented process ("do not open a public issue") had no
+  working way to reach us, against a promised 48-hour acknowledgment. It now
+  points at GitHub private vulnerability reporting, with a detail-free public
+  fallback if that form is unavailable to the reporter.
+
+### Documentation
+
+- **The README's own PowQL examples did not parse.** PowQL's only comment
+  syntax is `#`, but the docs used SQL's `--` in 83 places, and `-` is the
+  subtraction operator, so every comment line was a parse error. Piping the
+  README's PowQL section into the CLI produced 20 errors before and 0 after.
+  The comment syntax itself appeared nowhere in `README.md`, `POWQL.md`,
+  `SQL.md` or `getting-started.md` and is now documented.
+- `docs/SQL.md`'s "No SQL mode in powdb-cli" callout was false: `--sql`,
+  `.sql <STMT>`, and `.sql`/`.powql` mode switching all exist and are in
+  `--help`.
+
 ## [0.22.0] - 2026-08-03
 
 ### Changed

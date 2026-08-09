@@ -2,10 +2,17 @@
 
 PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a frontend only: the SQL parser lowers supported statements to the existing PowDB AST and records canonical PowQL text for the plan cache. The default wire `Query` message remains PowQL for backward compatibility; SQL uses `Engine::execute_sql(...)` in embedded Rust or the wire/client SQL query path.
 
-> **No SQL mode in `powdb-cli`.** The CLI REPL is PowQL-only. Run SQL through the
-> embedded API (`Engine::execute_sql`, or `db.querySql(...)` in the
-> `@zvndev/powdb-embedded` Node addon) or the `QuerySql` wire path (e.g. the
+> **Running SQL from `powdb-cli`.** Start the REPL in SQL mode with `--sql`, run
+> a single statement with the `.sql <STATEMENT>` meta-command, or switch an open
+> session between dialects with `.sql` and `.powql`. The prompt changes to
+> `sql>` so the active dialect is always visible. SQL is also available through
+> the embedded API (`Engine::execute_sql`, or `db.querySql(...)` in the
+> `@zvndev/powdb-embedded` Node addon) and the `QuerySql` wire path (e.g. the
 > TypeScript client's `querySql`).
+
+> **Comments.** SQL statements use `--`; PowQL uses `#` and rejects `--`. The two
+> dialects do not share comment syntax, so translate comments when porting a
+> snippet between them.
 
 ## Supported production subset
 

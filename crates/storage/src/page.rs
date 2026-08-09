@@ -98,6 +98,20 @@ pub fn page_format_version_from_flags(flags: u8) -> crate::error::Result<u8> {
     Ok(version)
 }
 
+/// Where an update's new bytes would land relative to the row's current slot.
+/// Returned by [`Page::update_fit`] and [`crate::heap::HeapFile::update_fit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateFit {
+    /// The row is live and the new bytes fit on its current page, so the row
+    /// keeps its RowId.
+    InPlace,
+    /// The row is live but the new bytes do not fit, so the heap relocates it
+    /// with delete + insert and hands back a different RowId.
+    Relocates,
+    /// No live row at that slot (out of range, or already deleted).
+    Missing,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {
@@ -472,25 +486,41 @@ impl Page {
         }
     }
 
+    /// Where an update of `slot` to `row_len` bytes would land, decided without
+    /// mutating anything. [`Self::update`] gates on this exact answer, so a
+    /// caller that has to commit to a plan *before* the mutation (the WAL
+    /// write-ahead path, which needs a different record shape for a relocating
+    /// update than for an in-place one) cannot drift from what the mutation
+    /// then does.
+    pub fn update_fit(&self, slot: u16, row_len: usize) -> UpdateFit {
+        if slot >= self.slot_count() {
+            return UpdateFit::Missing;
+        }
+        let (_, old_length) = self.read_slot_entry(slot);
+        if old_length == DELETED_MARKER {
+            return UpdateFit::Missing;
+        }
+        if row_len <= old_length as usize || row_len <= self.free_space() {
+            UpdateFit::InPlace
+        } else {
+            UpdateFit::Relocates
+        }
+    }
+
     /// Update data in a slot in place if it fits, otherwise append at free_start.
     pub fn update(&mut self, slot: u16, row_data: &[u8]) -> bool {
-        if slot >= self.slot_count() {
+        if self.update_fit(slot, row_data.len()) != UpdateFit::InPlace {
             return false;
         }
         let (offset, old_length) = self.read_slot_entry(slot);
-        if old_length == DELETED_MARKER {
-            return false;
-        }
         if row_data.len() <= old_length as usize {
             let start = offset as usize;
             self.data[start..start + row_data.len()].copy_from_slice(row_data);
             self.write_slot_entry(slot, offset, row_data.len() as u16);
             true
         } else {
-            // Need more space — append at free_start
-            if row_data.len() > self.free_space() {
-                return false;
-            }
+            // Need more space, append at free_start. `update_fit` above
+            // already proved the row fits there.
             let new_offset = self.free_start();
             let start = new_offset as usize;
             self.data[start..start + row_data.len()].copy_from_slice(row_data);

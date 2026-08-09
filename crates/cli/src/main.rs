@@ -305,11 +305,15 @@ fn parse_args() -> CliArgs {
     let mut role: Option<String> = None;
     // TLS for remote mode: env fallbacks first (same POWDB_-prefixed
     // convention as POWDB_PASSWORD above), overridden by the flags below.
-    let mut tls_enabled = parse_tls_enabled(std::env::var("POWDB_TLS").ok().as_deref());
     let mut tls_ca: Option<String> = std::env::var("POWDB_TLS_CA").ok().filter(|s| !s.is_empty());
     let mut tls_server_name: Option<String> = std::env::var("POWDB_TLS_SERVER_NAME")
         .ok()
         .filter(|s| !s.is_empty());
+    let mut tls_enabled = tls_enabled_from_env(
+        std::env::var("POWDB_TLS").ok().as_deref(),
+        tls_ca.as_deref(),
+        tls_server_name.as_deref(),
+    );
     let mut exec: Option<String> = None;
     let mut exec_file: Option<String> = None;
     let mut dialect = Dialect::Powql;
@@ -1898,6 +1902,45 @@ fn handle_shared_meta(trimmed: &str, state: &mut ReplState) -> MetaOutcome {
     }
 }
 
+/// Whether the remote connection should use TLS, from the environment alone.
+///
+/// Configuring TLS implies asking for TLS. `--tls-ca` and `--tls-server-name`
+/// have always implied `--tls`, and `crates/cli/README.md` documents the env
+/// vars as implying it too -- but the env fallbacks used to set only their own
+/// value, so `POWDB_TLS_CA=/ca.pem powdb-cli -r host:5433` connected in
+/// *cleartext*, silently, while the operator had every reason to believe the
+/// session was encrypted. A variable that says how to verify a certificate must
+/// never leave the connection unencrypted.
+fn tls_enabled_from_env(tls: Option<&str>, ca: Option<&str>, server_name: Option<&str>) -> bool {
+    parse_tls_enabled(tls) || ca.is_some() || server_name.is_some()
+}
+
+/// True when the input carries no statement for the engine to run: empty,
+/// whitespace, or nothing but `#` comments.
+///
+/// A blank check on the raw text is not enough. PowQL comments start with `#`
+/// and run to end of line, so a comment-only line is non-empty text that the
+/// lexer reduces to zero tokens, and the parser then reports "expected
+/// statement, got end of input". Pasting any documented example that opens with
+/// a comment produced an error per comment line.
+///
+/// This asks the lexer rather than scanning for `#` so the CLI cannot drift
+/// from the language's own definition of a comment. A lex error is *not*
+/// treated as blank: that input is a real statement with a real problem, and
+/// the engine should be the one to report it.
+///
+/// Note that `lex` terminates every stream with `Token::Eof`, so the empty
+/// program is `[Eof]`, not `[]`.
+fn is_effectively_blank(statement: &str) -> bool {
+    if statement.trim().is_empty() {
+        return true;
+    }
+    matches!(
+        powdb_query::lexer::lex(statement),
+        Ok(tokens) if tokens.iter().all(|t| *t == powdb_query::token::Token::Eof)
+    )
+}
+
 /// True when the line is the continuation escape hatch. Recognized anywhere,
 /// including in the middle of an unterminated statement, which is the whole
 /// point: without it an unbalanced `(` swallows every later line, meta-commands
@@ -2060,7 +2103,7 @@ fn run_embedded(data_dir: &str, session: SessionOpts) {
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if statement.is_empty() {
+                if is_effectively_blank(&statement) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2335,7 +2378,7 @@ async fn run_remote_on<S>(
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if statement.is_empty() {
+                if is_effectively_blank(&statement) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2820,6 +2863,42 @@ mod tests {
     #[test]
     fn remote_db_default_matches_ts_client() {
         assert_eq!(DEFAULT_DB_NAME, "default");
+    }
+
+    #[test]
+    fn comment_only_input_is_not_sent_to_the_engine() {
+        // Every documented example opens with a comment. Sending one to the
+        // engine lexes to zero tokens and reports "expected statement, got end
+        // of input", so pasting the README produced one error per comment line.
+        assert!(is_effectively_blank(""));
+        assert!(is_effectively_blank("   \n\t "));
+        assert!(is_effectively_blank("# just a comment"));
+        assert!(is_effectively_blank("  # indented\n# and another\n"));
+
+        // Real statements must still reach the engine, including one that
+        // merely *contains* a comment, and one whose string literal contains a
+        // '#' that is not a comment at all.
+        assert!(!is_effectively_blank("User { .name }"));
+        assert!(!is_effectively_blank("# leading\nUser { .name }"));
+        assert!(!is_effectively_blank("User filter .s = \"#\" { .name }"));
+
+        // A lex error is a real problem with a real statement: let the engine
+        // report it rather than silently swallowing the line.
+        assert!(!is_effectively_blank("User filter .s = \"unterminated"));
+    }
+
+    #[test]
+    fn tls_config_env_vars_imply_tls() {
+        // The regression: setting only a CA left the session in cleartext,
+        // silently, while crates/cli/README.md said the variable implied --tls.
+        assert!(tls_enabled_from_env(None, Some("/ca.pem"), None));
+        assert!(tls_enabled_from_env(None, None, Some("db.internal")));
+        assert!(tls_enabled_from_env(Some("0"), Some("/ca.pem"), None));
+
+        // And the plain switch still works on its own, in both directions.
+        assert!(tls_enabled_from_env(Some("1"), None, None));
+        assert!(!tls_enabled_from_env(None, None, None));
+        assert!(!tls_enabled_from_env(Some("0"), None, None));
     }
 
     #[test]

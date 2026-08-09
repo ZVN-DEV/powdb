@@ -1,7 +1,7 @@
 use crate::btree::{BTree, IndexStats};
 use crate::error::StorageError;
 use crate::heap::{DirtyPageBudget, HeapFile};
-use crate::page::{OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
+use crate::page::{UpdateFit, OVERFLOW_CHAIN_END, OVERFLOW_PAYLOAD_CAP};
 use crate::row::{encode_row_into, encode_row_v2_into, plan_spill, OverflowStub, MAX_VALUE_SIZE};
 use crate::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
 use crate::table::Table;
@@ -829,6 +829,20 @@ impl Catalog {
                                 continue;
                             }
                             let new_rid = tbl.heap.update(rid, &row_bytes)?;
+                            // Stamp the source page too, not just the landing
+                            // page. A record written before v0.23 could be a
+                            // relocating update, whose redo is delete+insert
+                            // into a self-assigned slot, replay cannot place
+                            // it where the crashed session did, because the
+                            // record carries only the old RowId. Stamping the
+                            // source page is what stops a *second* recovery
+                            // from relocating it again to a third position.
+                            // Relocating updates written from here on are
+                            // logged as a Delete plus an Insert, both of which
+                            // redo position-stably (see `update_logged`).
+                            if new_rid != rid {
+                                tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
+                            }
                             tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_updates += 1;
                         }
@@ -1879,7 +1893,15 @@ impl Catalog {
         let tx_id = self.next_tx();
         // Delete records carry only the rid — no row payload.
         self.wal_log(tx_id, WalRecordType::Delete, table, rid, &[])?;
+        let lsn = self.wal.last_appended_lsn();
         self.tables[slot].delete(rid)?;
+        // Redoing a delete is idempotent, so the stamp is not what makes
+        // recovery correct here: it is what lets the per-page guard skip a
+        // record whose page already reached disk, instead of re-walking every
+        // delete the WAL still holds on every single recovery.
+        if lsn > 0 {
+            self.tables[slot].heap.set_page_lsn(rid.page_id, lsn)?;
+        }
         self.free_overflow_chain(slot, old_pages);
         Ok(())
     }
@@ -2076,6 +2098,21 @@ impl Catalog {
             return Ok(new_rid);
         }
         let slot = self.slot_of(table)?;
+        self.update_logged(slot, table, rid, values, None)
+    }
+
+    /// Shared WAL-logged body of [`Self::update`] and [`Self::update_hinted`].
+    /// The two entry points differ only in the changed-column hint they pass
+    /// through to the table, and the redo shape they have to log is decided
+    /// identically, so the decision lives in one place.
+    fn update_logged(
+        &mut self,
+        slot: usize,
+        table: &str,
+        rid: RowId,
+        values: &Row,
+        changed_col_indices: Option<&[usize]>,
+    ) -> io::Result<RowId> {
         self.tables[slot].preflight_update(rid, values)?;
         let tx_id = self.next_tx();
         // Capture the old row's overflow chain (empty for inline-only tables)
@@ -2083,19 +2120,67 @@ impl Catalog {
         // 3.6). A chain-replacing update always orphans the old chain.
         let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
         // Spill-aware encode: logs any overflow chains under `tx_id` (before
-        // the Update record) and returns the v1/v2 row bytes. An overflow
+        // the row record) and returns the v1/v2 row bytes. An overflow
         // transition relocates the row via heap delete+insert inside
         // `update_encoded`; the old row's chain (if any) is left for `sweep`.
         let row_bytes = {
             let Catalog { tables, wal, .. } = self;
             encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
         };
-        // Reject oversized rows BEFORE appending the Update record: a logged
-        // Update the heap then rejects would poison the next replay. (A v2
-        // stub row is always small; only a non-spilled v1 row can trip this.)
+        // Reject oversized rows BEFORE appending any record: a logged mutation
+        // the heap then rejects would poison the next replay. (A v2 stub row is
+        // always small; only a non-spilled v1 row can trip this.)
         check_encoded_row_size(&row_bytes)?;
+        let fit = self.tables[slot].heap.update_fit(rid, row_bytes.len())?;
+        if fit == UpdateFit::Relocates {
+            // A row that no longer fits its page is moved by the heap with
+            // delete + insert, and *that* is not idempotent: `HeapFile::insert`
+            // self-assigns a slot, so redoing one Update record would drop the
+            // row wherever recovery's free list happens to point. If the
+            // pre-crash copy was already durable that leaves two live copies of
+            // the row; and either way every later Insert record loses the page
+            // layout it was logged against. So log the two physical steps the
+            // heap is about to take: a Delete redoes idempotently, and an
+            // Insert redoes at its exact RowId through `insert_at`.
+            self.wal_log(tx_id, WalRecordType::Delete, table, rid, &[])?;
+            let delete_lsn = self.wal.last_appended_lsn();
+            let new_rid =
+                self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)?;
+            // Like `insert`, the record is appended after the heap call so it
+            // carries the real landing RowId.
+            self.wal_log(tx_id, WalRecordType::Insert, table, new_rid, &row_bytes)?;
+            let insert_lsn = self.wal.last_appended_lsn();
+            // Stamp both pages so the per-page redo guard can fire on each
+            // half independently, a crash that flushed one page but not the
+            // other must redo only the missing half.
+            if delete_lsn > 0 {
+                self.tables[slot]
+                    .heap
+                    .set_page_lsn(rid.page_id, delete_lsn)?;
+            }
+            if insert_lsn > 0 {
+                self.tables[slot]
+                    .heap
+                    .set_page_lsn(new_rid.page_id, insert_lsn)?;
+            }
+            self.free_overflow_chain(slot, old_pages);
+            return Ok(new_rid);
+        }
+        // `Missing` also lands here: `update_encoded` rejects a vanished row
+        // with a typed error, and reaching that error without having logged
+        // anything is what keeps a failed statement out of the next replay.
         self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
-        let new_rid = self.tables[slot].update_encoded(rid, values, &row_bytes, None)?;
+        let lsn = self.wal.last_appended_lsn();
+        let new_rid =
+            self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)?;
+        // An in-place redo is idempotent, but stamping is what lets the guard
+        // skip it once the page is durable. Unstamped, every Update record
+        // re-applied on every recovery, and a grow-in-place update re-appends
+        // its bytes at `free_start` each time until the page runs out of room
+        // and the redo starts relocating rows.
+        if lsn > 0 {
+            self.tables[slot].heap.set_page_lsn(new_rid.page_id, lsn)?;
+        }
         self.free_overflow_chain(slot, old_pages);
         Ok(new_rid)
     }
@@ -2121,20 +2206,7 @@ impl Catalog {
             return Ok(new_rid);
         }
         let slot = self.slot_of(table)?;
-        self.tables[slot].preflight_update(rid, values)?;
-        let tx_id = self.next_tx();
-        let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
-        let row_bytes = {
-            let Catalog { tables, wal, .. } = self;
-            encode_row_with_spill_logged(&mut tables[slot], wal, tx_id, values)?
-        };
-        // Same pre-WAL size gate as [`Self::update`].
-        check_encoded_row_size(&row_bytes)?;
-        self.wal_log(tx_id, WalRecordType::Update, table, rid, &row_bytes)?;
-        let new_rid =
-            self.tables[slot].update_encoded(rid, values, &row_bytes, changed_col_indices)?;
-        self.free_overflow_chain(slot, old_pages);
-        Ok(new_rid)
+        self.update_logged(slot, table, rid, values, changed_col_indices)
     }
 
     /// Mission C Phase 4: fast-path update that patches a row's raw bytes
@@ -2914,21 +2986,20 @@ impl Catalog {
         let heap_path = self
             .data_dir
             .join(format!("{}.heap", table.schema.table_name));
-        if heap_path.exists() {
-            fs::remove_file(&heap_path)?;
-        }
         // Mission 3: remove only the .idx files that actually exist
         // (i.e. the columns the table currently has indexed). The pre-
         // Mission-3 code iterated every schema column blindly — harmless
         // but noisy. Now that we persist a real list of indexed columns,
         // we can be precise.
-        for col_name in table.indexed_column_names() {
-            let idx_path = self.data_dir.join(format!("{name}_{col_name}.idx"));
-            if idx_path.exists() {
-                let _ = fs::remove_file(&idx_path);
-            }
-        }
-        let expression_index_ids = table.expression_index_ids();
+        let mut doomed_paths: Vec<PathBuf> = table
+            .indexed_column_names()
+            .into_iter()
+            .map(|col_name| self.data_dir.join(format!("{name}_{col_name}.idx")))
+            .collect();
+        doomed_paths.extend(table.expression_index_ids().into_iter().map(|index_id| {
+            self.data_dir
+                .join(expression_index_file_name(name, index_id))
+        }));
         // Swap-remove from the Vec and fix up name_to_slot.
         self.name_to_slot.remove(name);
         let last = self.tables.len() - 1;
@@ -2938,12 +3009,22 @@ impl Catalog {
             self.name_to_slot.insert(moved_name, slot);
         }
         self.tables.pop();
+        // The catalog goes first, and nothing is unlinked until it lands.
+        // `Catalog::open` opens every heap the on-disk catalog names *before*
+        // it replays the WAL, so a crash between an early unlink and this
+        // persist would leave a catalog pointing at a heap that no longer
+        // exists, an open that fails outright, with the `DdlDropTable` record
+        // that would have finished the drop never even read. Unlinking after
+        // the catalog is durable inverts the failure into a harmless orphan
+        // file, which the next `drop_table` of the same name overwrites.
         self.persist()?;
-        for index_id in expression_index_ids {
-            let idx_path = self
-                .data_dir
-                .join(expression_index_file_name(name, index_id));
-            let _ = fs::remove_file(idx_path);
+        if heap_path.exists() {
+            fs::remove_file(&heap_path)?;
+        }
+        for idx_path in doomed_paths {
+            if idx_path.exists() {
+                let _ = fs::remove_file(idx_path);
+            }
         }
         Ok(())
     }
@@ -5647,6 +5728,47 @@ mod tests {
         cat.insert("Big", &vec![Value::Int(1), Value::Str("after".into())])
             .unwrap();
         assert_eq!(cat.scan("Big").unwrap().count(), 1);
+    }
+
+    /// `drop_table` must write the catalog before it unlinks the heap.
+    ///
+    /// The window matters because `Catalog::open` opens every heap named by the
+    /// on-disk catalog *before* it replays the WAL: a catalog that still names a
+    /// table whose heap file is already gone does not degrade; it refuses to
+    /// open at all, and the `DdlDropTable` record that would have finished the
+    /// job never gets read. A persist failure is the observable stand-in for a
+    /// crash in that window, with the catalog written first, the heap is still
+    /// on disk and the database still opens.
+    #[test]
+    fn drop_table_persists_the_catalog_before_unlinking_the_heap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Gone")).unwrap();
+        cat.insert("Gone", &vec![Value::Int(1), Value::Str("row".into())])
+            .unwrap();
+        cat.checkpoint().unwrap();
+
+        let heap_path = dir.path().join("Gone.heap");
+        assert!(heap_path.exists());
+
+        fail_next_catalog_persist_at(1);
+        let error = cat.drop_table("Gone").unwrap_err();
+        assert!(
+            error.to_string().contains("before rename"),
+            "expected the injected pre-rename persist failure, got: {error}"
+        );
+        assert!(
+            heap_path.exists(),
+            "the heap must not be unlinked until the catalog no longer names it"
+        );
+
+        std::mem::forget(cat);
+        // The drop's intent was logged and flushed before any of this, so
+        // recovery finishes it; the point of the assertion is that the open
+        // gets far enough to replay at all.
+        let reopened = Catalog::open(dir.path()).unwrap();
+        assert!(reopened.schema("Gone").is_none());
+        assert!(!heap_path.exists());
     }
 
     #[test]

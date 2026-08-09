@@ -39,9 +39,14 @@ latest release to stay supported.
 
 If you discover a security vulnerability in PowDB, please report it responsibly.
 
-**Do not open a public issue.** Instead, email:
+**Do not open a public issue.** Instead, use GitHub's private vulnerability
+reporting:
 
-**78920650+zvndev@users.noreply.github.com**
+**<https://github.com/ZVN-DEV/powdb/security/advisories/new>**
+
+That link opens a report visible only to the maintainers. It works from any
+GitHub account, keeps the discussion attached to the repository, and lets us
+issue a security advisory and a patched release from the same place.
 
 Include:
 - Description of the vulnerability
@@ -50,6 +55,10 @@ Include:
 - Suggested fix (if any)
 
 You should receive an acknowledgment within 48 hours. We aim to provide a fix or mitigation within 7 days for critical issues.
+
+If the advisory form is unavailable to you for any reason, open a public issue
+containing **only** the words "security report, please open a private channel"
+and no technical detail, and we will follow up.
 
 ## Scope
 
