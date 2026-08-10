@@ -217,6 +217,91 @@ jobs:
         working-directory: clients/ts
         run: npm publish --provenance --access public
 
+  npm-publish-sync:
+    name: publish @zvndev/powdb-sync to npm (OIDC trusted publishing)
+    needs: [build, smoke-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Same token-less OIDC publish as npm-publish above, for the experimental
+    # sync orchestration package. Requires a trusted publisher configured once
+    # on npmjs.com for @zvndev/powdb-sync (org: ZVN-DEV, repo: powdb, workflow:
+    # release.yml, env: npm-publish).
+    #
+    # The package has never been published, and npm cannot configure a trusted
+    # publisher for a name that does not exist yet, so the first publish has to
+    # be a manual `npm publish` (see docs/ci/trusted-publishing.md). Until that
+    # bootstrap happens this job WARNS and skips rather than failing, so an
+    # unbootstrapped optional package cannot redden a release that is otherwise
+    # complete. It starts publishing on its own the moment the name exists.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Upgrade npm (trusted publishing requires npm >= 11.5.1)
+        run: npm install -g npm@11.5.1
+
+      - name: Verify git tag matches package.json version
+        working-directory: clients/sync
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::git tag v$tag does not match clients/sync/package.json ($pkg)"
+            exit 1
+          fi
+          echo "tag v$tag matches package.json version"
+
+      # The peer pins are exact, so a stale one would publish a package that
+      # demands versions nobody released. check-version-consistency.sh enforces
+      # this on every PR; re-check here because publishing is irreversible.
+      - name: Verify peer pins match this release
+        working-directory: clients/sync
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          for peer in @zvndev/powdb-client @zvndev/powdb-embedded; do
+            pin="$(node -p "require('./package.json').peerDependencies['$peer']")"
+            if [ "$pin" != "$tag" ]; then
+              echo "::error::peerDependency $peer pins $pin, expected $tag"
+              exit 1
+            fi
+          done
+          echo "peer pins match $tag"
+
+      - name: Has this package been bootstrapped on npm?
+        id: exists
+        run: |
+          if npm view @zvndev/powdb-sync version >/dev/null 2>&1; then
+            echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bootstrapped=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::@zvndev/powdb-sync is not on npm yet, so this release does not include it. Publish it once by hand (npm publish --access public from clients/sync), then add the trusted publisher on npmjs.com; this job takes over from the next release."
+          fi
+
+      - name: Install dependencies, build and test
+        if: steps.exists.outputs.bootstrapped == 'true'
+        working-directory: clients/sync
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.29.3 --activate
+          pnpm install --frozen-lockfile
+          pnpm build
+          pnpm test
+
+      - name: Publish to npm (token-less, with provenance)
+        if: steps.exists.outputs.bootstrapped == 'true'
+        working-directory: clients/sync
+        run: npm publish --provenance --access public
+
   release:
     name: create release
     needs: [build, smoke-release, npm-package-smoke]

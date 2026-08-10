@@ -19,8 +19,9 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
 | **crates.io** | `powdb` (embedded facade — in-process Rust API) | https://crates.io/crates/powdb |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
-| **crates.io** | `powdb-sync` (experimental — embedded-sync substrate; the companion npm package `@zvndev/powdb-sync` is **not yet published**) | https://crates.io/crates/powdb-sync |
+| **crates.io** | `powdb-sync` (experimental, the embedded-sync substrate) | https://crates.io/crates/powdb-sync |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
+| **npm** | `@zvndev/powdb-sync` (experimental sync orchestration; **awaiting its one-time bootstrap publish**, after which `release.yml` publishes it on every tag) | https://www.npmjs.com/package/@zvndev/powdb-sync |
 | **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu — no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
 | **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
@@ -98,27 +99,43 @@ one-time setup and the reusable standard.
 [ ] Update both the Next release and Current release lines in RELEASES.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
-[ ] Commit: "chore: release vX.Y.Z"
-[ ] cargo publish -p powdb-storage
-[ ] cargo publish -p powdb-auth
-[ ] cargo publish -p powdb-query
-[ ] cargo publish -p powdb-sync   # experimental (depends on storage)
-[ ] cargo publish -p powdb-backup
-[ ] cargo publish -p powdb-server
-[ ] cargo publish -p powdb       # embedded facade (depends on storage + query + sync)
-[ ] cargo publish -p powdb-cli
-[ ] git tag vX.Y.Z && git push origin vX.Y.Z
-[ ] Verify GitHub Release workflow creates binaries AND auto-publishes npm
-    (@zvndev/powdb-client) token-less via release.yml — no manual npm publish
+[ ] Commit: "chore: release vX.Y.Z", open a PR, merge it
+
+TAG BEFORE PUBLISHING. publish.yml refuses to publish unless the tag vX.Y.Z
+already exists AND points at the exact commit being published, and it must be
+dispatched on the tag. That guard is what stops an arbitrary branch shipping
+under a released version number, so the crates cannot go first.
+
+[ ] git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
+    Pushing the tag triggers release.yml, which builds the binaries, publishes
+    the multi-arch Docker image, and publishes @zvndev/powdb-client to npm
+    token-less via OIDC. No manual npm publish for the client.
+[ ] Publish the crates, dispatched ON THE TAG, in dependency order (the
+    workflow already orders them: storage, auth, query, sync, backup, server,
+    powdb, cli):
+
+      gh workflow run publish.yml --ref vX.Y.Z -f version=X.Y.Z -f dry_run=false
+
+    `dry_run` defaults to TRUE on purpose, so it must be spelled out or nothing
+    publishes. A dry run is NOT a useful rehearsal here: it fails by design for
+    every crate that depends on a workspace version not yet on crates.io.
+[ ] Publish the embedded Node addon: run publish-node-addon.yml with
+    dry_run=true to validate the full platform matrix, then re-run with
+    dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
+    Unlike publish.yml, this dry run IS meaningful: it packs every platform and
+    needs no OIDC setup. Do this BEFORE the smoke, which installs the addon.
 [ ] Smoke-test the LIVE registries: run post-publish-smoke.yml with the
     released version (`gh workflow run post-publish-smoke.yml -f version=X.Y.Z`).
     It cargo-installs powdb-cli + powdb-server from crates.io and reruns the
     durability smoke (README PowQL flow + kill -9/restart WAL replay; the gate
     v0.4.1-v0.4.3 lacked), then npm-installs @zvndev/powdb-client and
     @zvndev/powdb-embedded and exercises both
-[ ] Publish the embedded Node addon: run publish-node-addon.yml with
-    dry_run=true to validate the full platform matrix, then re-run with
-    dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
-    First-ever release of this name needs a one-time bootstrap `npm publish`
-    + trusted-publisher config — see docs/ci/trusted-publishing.md
+[ ] Verify each registry directly rather than trusting workflow exit codes:
+    crates.io versions, `gh release view vX.Y.Z`, the ghcr tag list, and
+    `npm view <pkg> version` for each npm package
 ```
+
+A brand-new package or crate name cannot use Trusted Publishing for its FIRST
+publish, because the registry only lets you configure a trusted publisher on a
+name that already exists. Bootstrap it once by hand, then configure. See
+docs/ci/trusted-publishing.md.
