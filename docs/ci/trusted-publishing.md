@@ -40,8 +40,13 @@ and workflow run that built it. Free supply-chain transparency.
 > `npm publish` while logged in locally to create it, then configure trusted
 > publishing for every release after. Existing packages: just configure.
 
-> **PowDB npm packages (2 configs):**
+> **PowDB npm packages (3 configs):**
 > - `@zvndev/powdb-client` — workflow `release.yml`, env `npm-publish`.
+> - `@zvndev/powdb-sync`: workflow `release.yml`, env `npm-publish`. The
+>   experimental sync orchestration package. Also a brand-new name, so it needs
+>   the one bootstrap `npm publish` above before the trusted publisher can be
+>   configured. Until then the `npm-publish-sync` job in `release.yml` warns and
+>   skips instead of failing the release.
 > - `@zvndev/powdb-embedded` — workflow `publish-node-addon.yml`, env
 >   `npm-publish`. This is the embedded Node addon; it ships **one** package
 >   with prebuilt binaries for all platforms bundled in (no per-platform
