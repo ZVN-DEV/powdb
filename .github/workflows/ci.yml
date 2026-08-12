@@ -42,13 +42,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Run doc tests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --locked
 
   miri:
     name: miri (powdb-storage)
@@ -318,7 +318,7 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:script
 
       - name: Build release powdb-server for server-backed TypeScript tests
-        run: cargo build --release -p powdb-server
+        run: cargo build --release -p powdb-server --locked
 
       - name: Run server-backed TypeScript tests
         working-directory: clients/ts
@@ -358,7 +358,7 @@ jobs:
 
       - name: clippy
         working-directory: bindings/node
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release --locked -- -D warnings
 
       - name: Install addon dependencies
         working-directory: bindings/node
@@ -395,7 +395,7 @@ jobs:
             bindings/node
 
       - name: Build release CLI and server
-        run: cargo build --release -p powdb-cli -p powdb-server
+        run: cargo build --release -p powdb-cli -p powdb-server --locked
 
       - name: Install addon dependencies
         working-directory: bindings/node
@@ -469,7 +469,7 @@ jobs:
           key: compat-bins-${{ runner.os }}-v0.19.1-v0.20.0-v0.21.0-v0.18.2
 
       - name: Build HEAD powdb-cli
-        run: cargo build --release -p powdb-cli
+        run: cargo build --release -p powdb-cli --locked
 
       - name: Cross-version compatibility (forward + downgrade)
         run: bash scripts/ci/cross-version-compat.sh
