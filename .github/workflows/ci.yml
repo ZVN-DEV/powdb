@@ -47,8 +47,20 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
-      - name: Run doc tests
-        run: cargo test --workspace --doc --locked
+      # The `testing` feature enables `Engine::set_force_generic_path`, which
+      # runs a query twice, once through the optimized fast paths and once
+      # through the generic evaluator, and asserts the two answers agree.
+      # Roughly 5,900 LOC of the strongest correctness tests in the repo sit
+      # behind it (access_path_equivalence, cross_type_index_parity,
+      # cross_type_matrix, cross_type_arithmetic_edges,
+      # proptest_frontend_equivalence, part of topn_tie_eviction) and CI never
+      # enabled it, so none of them had ever run here.
+      #
+      # That mattered: three of the four correctness defects fixed in v0.23.0
+      # were fast-path-disagrees-with-generic-path bugs, which is precisely
+      # what these tests detect. The repo owned the detector and did not run it.
+      - name: Run dual-path equivalence tests (`testing` feature)
+        run: cargo test -p powdb-query --features testing --locked
 
   miri:
     name: miri (powdb-storage)

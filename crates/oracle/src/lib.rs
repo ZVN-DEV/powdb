@@ -38,6 +38,7 @@ pub mod divergence;
 pub mod engines;
 pub mod fixture;
 pub mod model;
+pub mod mutations;
 pub mod normalize;
 pub mod rng;
 pub mod run;

@@ -213,3 +213,93 @@ fn the_top_n_shapes_reach_the_fast_path_plan_shape() {
          the checks above prove nothing:\n{rendered}"
     );
 }
+
+/// Mutations must leave the same table behind, whichever dialect applied them
+/// and whichever engine ran them.
+///
+/// Every other test in this file compares what an engine *says*. This one
+/// compares what it *did*, which is the half the oracle could not see when a
+/// relocating UPDATE was being duplicated by WAL replay.
+#[test]
+fn a_mutation_leaves_the_same_state_in_every_engine() {
+    let cases = powdb_oracle::mutations::generate(0x0BAD_5EED, 3, 400);
+    assert!(
+        cases.len() >= 50,
+        "mutation generator collapsed to {} cases; the gate would pass for the wrong reason",
+        cases.len()
+    );
+
+    let mut problems = Vec::new();
+    let mut adjudicated = 0usize;
+    for fx in fixture::all() {
+        for case in &cases {
+            let found = powdb_oracle::mutations::adjudicate(&fx, case).expect("adjudicate");
+            adjudicated += 1;
+            for d in found {
+                problems.push(format!(
+                    "[{}] fixture={} shape={} pair={}\n  mutation: {}\n  {}",
+                    problems.len() + 1,
+                    d.fixture,
+                    d.shape,
+                    d.pair,
+                    d.mutation,
+                    d.detail
+                ));
+            }
+        }
+    }
+
+    assert!(adjudicated > 0, "no mutation was adjudicated");
+    assert!(
+        problems.is_empty(),
+        "mutation adjudication found {} divergence(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+/// The adjudicator must be able to FAIL.
+///
+/// A state comparison that silently always agrees would make the test above
+/// pass for the wrong reason, which is the exact failure mode this crate
+/// exists to prevent, and the reason the read gate has
+/// `the_gate_actually_compares_something`. Here the two dialects are handed
+/// deliberately different mutations, so a working adjudicator must report a
+/// divergence on the resulting state.
+#[test]
+fn the_mutation_gate_can_actually_fail() {
+    use powdb_oracle::model::TABLE;
+    use powdb_oracle::mutations::{adjudicate, MutationCase};
+
+    let sabotaged = MutationCase {
+        shape: "sabotage",
+        // Unfiltered on purpose, so the divergence does not depend on which
+        // ids a particular fixture happens to contain. Each leg writes a
+        // different value to every row.
+        powql: format!("{TABLE} update {{ i := 0 }}"),
+        powdb_sql: format!("UPDATE {TABLE} SET i = 1"),
+        sqlite_sql: format!("UPDATE {TABLE} SET i = 2"),
+        sqlite_params: vec![],
+        sqlite_comparable: true,
+    };
+
+    // Must have rows. The first sqlite-representable fixture is `empty`, and
+    // picking it made an earlier version of this test pass while the
+    // adjudicator was in fact vacuous: with no rows there is no state to
+    // disagree about.
+    let fx = fixture::all()
+        .into_iter()
+        .find(|f| f.sqlite_representable && !f.rows.is_empty())
+        .expect("a non-empty sqlite-representable fixture");
+    let found = adjudicate(&fx, &sabotaged).expect("adjudicate");
+
+    let pairs: Vec<&str> = found.iter().map(|d| d.pair).collect();
+    assert!(
+        pairs.contains(&"powql-vs-powdb-sql"),
+        "adjudicator missed a PowQL-vs-SQL state difference; it is vacuous. got: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&"powdb-vs-sqlite"),
+        "adjudicator missed a PowDB-vs-SQLite state difference; it is vacuous. got: {pairs:?}"
+    );
+}
