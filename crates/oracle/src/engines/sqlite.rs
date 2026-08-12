@@ -58,6 +58,19 @@ impl Sqlite {
         Ok(Sqlite { conn })
     }
 
+    /// Run a statement that returns no rows (the reference leg of a mutation).
+    ///
+    /// Separate from [`Self::query`] because a mutation has no output columns,
+    /// so there are no `kinds` to declare and nothing to normalize. The error
+    /// is returned rather than swallowed: SQLite refusing a mutation is
+    /// information about the mutation, not a harness failure.
+    pub fn execute(&self, sql: &str, params: &[Lit]) -> Result<usize, String> {
+        let bound: Vec<SqlValue> = params.iter().map(Lit::sqlite_param).collect();
+        self.conn
+            .execute(sql, rusqlite::params_from_iter(bound.iter()))
+            .map_err(|e| e.to_string())
+    }
+
     pub fn query(&self, sql: &str, params: &[Lit], kinds: &[Kind]) -> Outcome {
         match self.try_query(sql, params, kinds) {
             Ok(rs) => Outcome::Rows(rs),
