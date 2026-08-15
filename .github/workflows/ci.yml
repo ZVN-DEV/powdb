@@ -226,9 +226,12 @@ jobs:
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
 
   examples-smoke:
-    name: examples smoke (terraform validate + compose config + dev.sh + nested-results)
+    name: examples smoke (terraform validate + compose config + dev.sh + runnable examples)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # 20, not 15: the edge-snapshot-serving example added below links the
+    # powdb-server release binary on top of the powdb-cli one nested-results
+    # already builds, and the release profile is lto=true / codegen-units=1.
+    timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -269,6 +272,14 @@ jobs:
 
       - name: nested-results example (build + run, PASS/FAIL gated)
         run: bash examples/nested-results/run.sh
+
+      # The more failure-prone of the two runnable examples, and until now the
+      # only one nothing gated: it drives backup, restore, two read-only server
+      # processes, an incremental backup, and an atomic serve-directory swap.
+      # It reuses the release binaries the step above already built, and exits
+      # nonzero if any of its 14 checks fail.
+      - name: edge-snapshot-serving example (backup/restore/swap cycle, PASS/FAIL gated)
+        run: bash examples/edge-snapshot-serving/run.sh
 
   version-consistency:
     name: version consistency
@@ -645,22 +656,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The ignore list used to carry four IDs. Three of them
+      # (RUSTSEC-2026-0179 / -0180 postgres-protocol, RUSTSEC-2026-0178
+      # tokio-postgres) were resolved by the dependency refresh in #211 and are
+      # removed: verified dead against the current Cargo.lock, and cargo-deny
+      # was already reporting all of them as `advisory-not-detected`.
+      #
+      # RUSTSEC-2026-0235 (rkyv 0.7 out-of-bounds read) stays, because it is
+      # NOT dead. Its whole path is rkyv -> rust_decimal -> mysql_common ->
+      # mysql -> powdb-compare, which is `publish = false` and pulls `mysql`
+      # only through a non-default optional feature. No shipping crate reaches
+      # it. cargo-deny resolves the feature graph and so never sees it, but
+      # cargo-audit scans Cargo.lock and classifies it as a vulnerability
+      # (hard-fail), so dropping it here would redden this job. Keep in sync
+      # with `.cargo/audit.toml`, which the local `cargo audit` reads and which
+      # documents the bar for adding anything back.
       - name: Run cargo audit
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Ignore advisories whose ENTIRE dependency path is confined to
-          # crates/compare (powdb-compare), which is `publish = false` — a
-          # benchmark-only crate that pulls `postgres`/`mysql` to compare PowDB
-          # against other engines. No shipping crate (storage/query/server/cli/
-          # auth/backup) is affected. Keep this list in sync with
-          # `.cargo/audit.toml` (which the local `cargo audit` reads).
-          #   RUSTSEC-2026-0179  postgres-protocol SCRAM DoS  (→ powdb-compare)
-          #   RUSTSEC-2026-0180  postgres-protocol hstore DoS (→ powdb-compare)
-          #   RUSTSEC-2026-0178  tokio-postgres DataRow DoS   (→ powdb-compare)
-          #   RUSTSEC-2026-0235  rkyv 0.7 OOB read            (→ powdb-compare,
-          #                      via rust_decimal → mysql_common → mysql)
-          ignore: RUSTSEC-2026-0179,RUSTSEC-2026-0180,RUSTSEC-2026-0178,RUSTSEC-2026-0235
+          ignore: RUSTSEC-2026-0235
 
   # Governance gate: this is a public repo. Fail the build if internal-only
   # planning/agent artifacts get re-tracked, or if any public doc/source names

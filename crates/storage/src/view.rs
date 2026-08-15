@@ -96,15 +96,89 @@ impl ViewRegistry {
         self.views.contains_key(name)
     }
 
-    /// Mark a view as dirty (needs refresh before next read).
-    pub fn mark_dirty(&mut self, view_name: &str) {
+    /// Mark a view as dirty (needs refresh before next read), writing the flag
+    /// through to `views.bin`.
+    ///
+    /// The flag has to reach disk or it does not exist: it lived in memory
+    /// only, so mutating a base table and then exiting the process lost it,
+    /// and the view came back CLEAN over pre-mutation rows and served them
+    /// forever. Nothing after the restart could notice — the flag is the only
+    /// record that a refresh is owed.
+    ///
+    /// Only the `false` → `true` transition writes. Every subsequent mutation
+    /// finds the flag already set and costs nothing, so the price is at most
+    /// one small write per refresh cycle rather than one per write statement.
+    ///
+    /// On a write failure the in-memory flag stays dirty — the safe value —
+    /// and the error is returned. Callers must not treat it as success: a view
+    /// whose dirty flag was not recorded is exactly the bug above.
+    pub fn mark_dirty(&mut self, view_name: &str) -> io::Result<()> {
+        let changed = match self.views.get_mut(view_name) {
+            Some(def) if !def.dirty => {
+                def.dirty = true;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.persist()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set the dirty flag in memory only, leaving `views.bin` untouched.
+    ///
+    /// For callers whose whole contract is that they do not modify the
+    /// database: engine open marks a view with an unparseable source dirty so
+    /// reads report that error instead of serving unrecomputable rows, and a
+    /// read-only open does that over a directory it must leave byte-identical
+    /// (and which may sit on read-only storage). The state is rederived on
+    /// every open, so nothing is lost by not persisting it.
+    pub fn mark_dirty_in_memory(&mut self, view_name: &str) {
         if let Some(def) = self.views.get_mut(view_name) {
             def.dirty = true;
         }
     }
 
-    /// Mark a view as clean after a successful refresh.
-    pub fn mark_clean(&mut self, view_name: &str) {
+    /// Mark a view as clean after a successful refresh, writing the flag
+    /// through to `views.bin`.
+    ///
+    /// The caller must have made the refreshed contents durable first. This
+    /// records "the stored rows are current"; if the rows it refers to are
+    /// still only buffered, a crash in between leaves a clean flag over stale
+    /// rows, which is the wrong-answer direction.
+    ///
+    /// On a write failure the in-memory flag is put back to dirty so it agrees
+    /// with what is still on disk, and the error is returned: an extra refresh
+    /// is cheap, a silently stale view is not.
+    pub fn mark_clean(&mut self, view_name: &str) -> io::Result<()> {
+        let changed = match self.views.get_mut(view_name) {
+            Some(def) if def.dirty => {
+                def.dirty = false;
+                true
+            }
+            _ => false,
+        };
+        if !changed {
+            return Ok(());
+        }
+        if let Err(e) = self.persist() {
+            if let Some(def) = self.views.get_mut(view_name) {
+                def.dirty = true;
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Clear the dirty flag in memory only, leaving `views.bin` untouched.
+    ///
+    /// For a refresh inside an explicit transaction, where there is nothing to
+    /// commit yet and so no point at which the refreshed rows are known to be
+    /// durable. Leaving the on-disk flag dirty costs one redundant refresh
+    /// after the next open and can never serve a stale row.
+    pub fn mark_clean_in_memory(&mut self, view_name: &str) {
         if let Some(def) = self.views.get_mut(view_name) {
             def.dirty = false;
         }
@@ -116,24 +190,44 @@ impl ViewRegistry {
         self.views.get(view_name).is_some_and(|d| d.dirty)
     }
 
-    /// Mark all views that depend on `table` as dirty. Called by the
-    /// executor after INSERT/UPDATE/DELETE on a base table.
+    /// Mark all views that depend on `table` as dirty, writing the flags
+    /// through to `views.bin`. Called by the executor on INSERT/UPDATE/DELETE
+    /// on a base table.
     ///
     /// Returns immediately (no-op) when no views exist or no views depend
     /// on the given table — the hot path for tables with no dependents is
     /// a single `FxHashMap::get` returning `None`.
+    ///
+    /// This runs on every write to a table that does have views, so it must
+    /// not put a file write in the write path. It does not: only a view that
+    /// is currently clean is a transition, and after the first mutation
+    /// following a refresh there are none, so the steady state is a hash
+    /// lookup and a scan of a short name list with no allocation and no I/O.
+    /// The write happens at most once per refresh cycle.
+    ///
+    /// See [`ViewRegistry::mark_dirty`] for why the flag has to be on disk
+    /// at all, and for the failure contract.
     #[inline]
-    pub fn mark_dependents_dirty(&mut self, table: &str) {
+    pub fn mark_dependents_dirty(&mut self, table: &str) -> io::Result<()> {
+        // Both fast exits before anything is cloned: no dependents at all, or
+        // every dependent already dirty.
+        let any_clean = self.deps.get(table).is_some_and(|names| {
+            names
+                .iter()
+                .any(|n| self.views.get(n.as_str()).is_some_and(|d| !d.dirty))
+        });
+        if !any_clean {
+            return Ok(());
+        }
         // Borrow the view names list first, then mutate views.
         // We need to collect to avoid double-borrow.
-        let names: Option<Vec<String>> = self.deps.get(table).cloned();
-        if let Some(names) = names {
-            for name in &names {
-                if let Some(def) = self.views.get_mut(name.as_str()) {
-                    def.dirty = true;
-                }
+        let names: Vec<String> = self.deps.get(table).cloned().unwrap_or_default();
+        for name in &names {
+            if let Some(def) = self.views.get_mut(name.as_str()) {
+                def.dirty = true;
             }
         }
+        self.persist()
     }
 
     /// List all view names.
@@ -154,12 +248,21 @@ impl ViewRegistry {
         self.views.insert(name, def);
     }
 
+    /// Durable write-temp-then-rename, matching `catalog.rs`.
+    ///
+    /// The directory fsync after the rename is load-bearing, not ceremony: the
+    /// whole point of persisting the dirty flag is that it survives a crash, and
+    /// on ext4/xfs a rename can be reordered past a power loss even though the
+    /// temp file's own contents were synced. Without it the flag could be
+    /// written, acknowledged, and then not be there on the next open, which is
+    /// exactly the stale-view bug this file exists to prevent.
     fn persist(&self) -> io::Result<()> {
         let path = self.data_dir.join(VIEW_FILE);
         let tmp = self.data_dir.join(format!("{VIEW_FILE}.tmp"));
         let defs: Vec<&ViewDef> = self.views.values().collect();
         write_view_file(&tmp, &defs)?;
         fs::rename(&tmp, &path)?;
+        crate::catalog::sync_directory(&self.data_dir)?;
         Ok(())
     }
 }
@@ -398,10 +501,85 @@ mod tests {
         })
         .unwrap();
         assert!(!reg.is_dirty("V1"));
-        reg.mark_dependents_dirty("T1");
+        reg.mark_dependents_dirty("T1").unwrap();
         assert!(reg.is_dirty("V1"));
-        reg.mark_clean("V1");
+        reg.mark_clean("V1").unwrap();
         assert!(!reg.is_dirty("V1"));
+    }
+
+    #[test]
+    fn test_dirty_flag_survives_reopen() {
+        // The dirty flag used to live in memory only: a mutation marked the
+        // view dirty, the process exited, and the reopened registry reported
+        // the view CLEAN, so every later read served pre-mutation rows with
+        // no refresh and no error. Before the fix this asserted `false` after
+        // the first reopen.
+        let dir = std::env::temp_dir().join(format!("powdb_view_dirty_rt_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut reg = ViewRegistry::new(&dir);
+            reg.register(ViewDef {
+                name: "V1".into(),
+                query: "T1".into(),
+                depends_on: vec!["T1".into()],
+                dirty: false,
+            })
+            .unwrap();
+            reg.mark_dependents_dirty("T1").unwrap();
+        }
+        {
+            let mut reg = ViewRegistry::open(&dir).unwrap();
+            assert!(reg.is_dirty("V1"), "dirty flag must survive process exit");
+            reg.mark_clean("V1").unwrap();
+        }
+        // Clean is equally durable, or every restart would refresh forever.
+        let reg = ViewRegistry::open(&dir).unwrap();
+        assert!(!reg.is_dirty("V1"), "clean flag must survive process exit");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_mark_dependents_dirty_is_idempotent_after_first_transition() {
+        // The write path calls this on every mutation, so only the
+        // false -> true transition may touch the file. Re-marking an already
+        // dirty view must not rewrite it.
+        let dir =
+            std::env::temp_dir().join(format!("powdb_view_transition_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ViewRegistry::new(&dir);
+        reg.register(ViewDef {
+            name: "V1".into(),
+            query: "T1".into(),
+            depends_on: vec!["T1".into()],
+            dirty: false,
+        })
+        .unwrap();
+        reg.mark_dependents_dirty("T1").unwrap();
+        let path = dir.join(VIEW_FILE);
+        assert!(path.exists(), "the transition itself must write the file");
+        // Removing the file makes a subsequent write unmissable and needs no
+        // mtime resolution or inode plumbing to detect: if any of the repeats
+        // below persists, the file comes back.
+        std::fs::remove_file(&path).unwrap();
+        for _ in 0..100 {
+            reg.mark_dependents_dirty("T1").unwrap();
+        }
+        assert!(
+            !path.exists(),
+            "re-marking an already dirty view must not rewrite views.bin"
+        );
+        // The same guard on the clean side: only the true -> false transition
+        // writes.
+        reg.mark_clean("V1").unwrap();
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+        for _ in 0..100 {
+            reg.mark_clean("V1").unwrap();
+        }
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -415,7 +593,7 @@ mod tests {
         })
         .unwrap();
         // Mutating either dependency dirties the view
-        reg.mark_dependents_dirty("T2");
+        reg.mark_dependents_dirty("T2").unwrap();
         assert!(reg.is_dirty("V1"));
     }
 
@@ -432,7 +610,7 @@ mod tests {
         reg.unregister("V1").unwrap();
         assert!(!reg.is_view("V1"));
         // Dependency map is cleaned up — marking T1 dirty doesn't panic
-        reg.mark_dependents_dirty("T1");
+        reg.mark_dependents_dirty("T1").unwrap();
     }
 
     #[test]

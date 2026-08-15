@@ -3,6 +3,7 @@ name = "powdb-server"
 description = "Async TCP server for PowDB with a binary wire protocol — PowQL native, SQL frontend included"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

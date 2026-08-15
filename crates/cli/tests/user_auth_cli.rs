@@ -141,6 +141,63 @@ fn cli_offline_user_admin_lifecycle() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("bob"));
 }
 
+/// `useradd` must work against a data directory that does not exist yet.
+///
+/// This is the first security step a careful operator takes, and the docs bless
+/// exactly this ordering (the user-admin subcommands work before the first
+/// server start). Every other CLI path creates its data dir on the way in;
+/// `useradd` used to be the lone exception and died with "failed to save user
+/// store: No such file or directory" on a fresh install.
+#[test]
+fn useradd_creates_a_missing_data_dir_with_owner_only_permissions() {
+    // Nested and entirely absent: no component of this path exists yet.
+    let data = tmp("freshdir").join("nested").join("powdb_data");
+    let data_s = data.to_str().unwrap().to_string();
+    assert!(!data.exists(), "precondition: data dir must not exist yet");
+
+    let out = cli(&[
+        "--data-dir",
+        &data_s,
+        "useradd",
+        "alice",
+        "--role",
+        "admin",
+        "--password",
+        "s3cret",
+    ]);
+    assert!(
+        out.status.success(),
+        "useradd into a fresh data dir failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let auth = data.join("auth.json");
+    assert!(auth.exists(), "auth.json was not written to {data_s}");
+
+    // The store holds argon2 password hashes. The directory must be created
+    // with the same owner-only mode the engine uses (0700), and the file the
+    // user store writes itself (0600) — a fresh install must not be looser
+    // than one where the engine created the directory first.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(&data).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "data dir mode was {dir_mode:o}, want 700");
+        let file_mode = std::fs::metadata(&auth).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "auth.json mode was {file_mode:o}, want 600"
+        );
+    }
+
+    // And the user is really in the store.
+    let listing = cli(&["--data-dir", &data_s, "users"]);
+    assert!(listing.status.success());
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    assert!(listing.contains("alice"), "users output: {listing:?}");
+    assert!(listing.contains("admin"), "users output: {listing:?}");
+}
+
 #[test]
 fn cli_useradd_then_authenticated_connect() {
     let data = tmp("data");

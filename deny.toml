@@ -1,17 +1,39 @@
-# cargo-deny policy. CI runs `cargo deny check bans licenses sources`
-# (ci.yml `deny` job); advisories are gated separately by the `audit` job
-# (rustsec/audit-check), so the [advisories] section here only mirrors the
-# ignore list for anyone running a full `cargo deny check` locally.
+# cargo-deny policy. CI splits this file across two jobs:
+#   * the `deny` job runs `cargo deny check bans licenses sources`
+#   * the `audit` job (rustsec/audit-check) gates advisories
+# The [advisories] section below exists so that a full local `cargo deny check`
+# reaches the same verdict CI does. That is only true if the list stays honest:
+# cargo-deny reports a stale entry as `advisory-not-detected`, and an ignore
+# list that suppresses nothing is a rubber stamp, so delete entries the moment
+# they stop matching rather than leaving them to accumulate.
 
 [advisories]
-# Keep in sync with .cargo/audit.toml and the ci.yml `audit` job: these
-# advisories are confined to the publish=false benchmark crate powdb-compare
-# (postgres/mysql comparison deps). No shipping crate is affected.
+# This list is intentionally NOT a copy of `.cargo/audit.toml`. The two tools
+# see different graphs: cargo-deny resolves features, so a dependency behind a
+# disabled optional feature is invisible to it, while cargo-audit scans
+# Cargo.lock and sees everything. `.cargo/audit.toml` therefore carries one ID
+# (RUSTSEC-2026-0235, rkyv via the powdb-compare `mysql` optional feature) that
+# must NOT be added here, because cargo-deny would report it as
+# `advisory-not-detected`.
+#
+# The list is also short because cargo-deny's default `unmaintained =
+# "workspace"` only errors on unmaintained crates we depend on DIRECTLY.
+# Transitive unmaintained/unsound advisories (proc-macro-error2, lru, rand)
+# surface as non-failing `cargo audit` warnings and are left visible on purpose.
+#
+# Nothing here may be an actual vulnerability. The single entry below is an
+# unmaintained warning; if it ever becomes a vulnerability, fix the dependency
+# instead of extending this list.
 ignore = [
-  "RUSTSEC-2026-0179",
-  "RUSTSEC-2026-0180",
-  "RUSTSEC-2026-0178",
-  "RUSTSEC-2026-0235",
+  # Unmaintained, NOT vulnerable: no CVE and no exploit path, the crate simply
+  # stopped receiving updates. rustls-pemfile is a direct dependency of
+  # powdb-server and powdb-cli, where it parses operator-supplied TLS cert/key
+  # PEM files at startup. It never sees network input. The migration target is
+  # the `PemObject` trait in rustls-pki-types >= 1.9.0, which is already in the
+  # tree via tokio-rustls, so the fix is a real code change in both crates' TLS
+  # setup rather than a version bump. Tracked as follow-up work; re-check this
+  # entry when that lands.
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 is unmaintained but not vulnerable; it only parses local operator-supplied TLS PEM files. Migration to rustls-pki-types PemObject is a code change, tracked separately." },
 ]
 
 [licenses]

@@ -45,6 +45,120 @@ pub fn parse_sql_with_canonical(input: &str) -> Result<ParsedSql, ParseError> {
     })
 }
 
+/// True when `input` carries no SQL statement for the engine to run: it is
+/// empty, whitespace, or nothing but comments.
+///
+/// The CLI needs this to decide whether a `--exec` / `--exec-file` segment is
+/// skippable, and it cannot reuse the PowQL blank check for SQL. PowQL's
+/// comment introducer is `#`; SQL's is `--`, which the PowQL lexer reads as two
+/// subtractions. So a dump ending in `-- end of dump` looked like a real
+/// statement, reached the engine, and failed with `expected SQL statement, got
+/// <eof>` *after* every real statement had already committed, which aborts a
+/// `set -e` deploy script that had in fact succeeded.
+///
+/// This asks the real SQL lexer rather than scanning for `--`, so the answer
+/// cannot drift from the dialect: `--` inside a string literal is not a
+/// comment, and `/* ... */` blocks are handled for free. `lex_sql` itself stays
+/// private because its token type is an implementation detail; this predicate
+/// is the minimum public surface that answers the CLI's question.
+///
+/// A lex error is deliberately *not* blank: that input is a real statement with
+/// a real problem, and the engine should be the one to report it. The single
+/// exception is a `#` comment. `#` is not SQL's comment character (see
+/// `docs/SQL.md`), so `lex_sql` rejects it outright, but the CLI shares one
+/// REPL across both dialects and has always skipped `#`-only lines. Flipping
+/// those to exit 1 purely because the session is in SQL mode would be a
+/// regression, so they are stripped and re-offered to the same lexer.
+pub fn sql_is_effectively_blank(input: &str) -> bool {
+    match lex_sql(input) {
+        Ok(toks) => toks.is_empty(),
+        // Only reachable once the input has already failed to lex as SQL, so
+        // this cannot reinterpret a `#` that lives inside a string literal:
+        // such an input lexes cleanly on the first attempt and never gets here.
+        Err(_) => {
+            let stripped = input
+                .lines()
+                .map(|line| line.split('#').next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            matches!(lex_sql(&stripped), Ok(toks) if toks.is_empty())
+        }
+    }
+}
+
+/// Split SQL input into statements on `;`, using SQL's own lexical rules.
+///
+/// The PowQL splitter (`lexer::split_statements`) knows `"` strings and `#`
+/// comments and nothing about `--` or `/* */`, so it splits on a `;` that is
+/// *inside* a SQL comment. That is dangerous rather than merely wrong: given
+/// `-- cleanup; DELETE FROM t`, the PowQL splitter yields `-- cleanup` and
+/// `DELETE FROM t`, and the second fragment is a live statement the user
+/// believed was commented out. A splitter that does not share the dialect's
+/// idea of a comment cannot be used to decide what runs.
+///
+/// The rules here mirror `lex_sql` exactly: `--` to end of line, `/* ... */`
+/// blocks, `'` and `"` quoting with `''` doubling inside `'`, and a backslash
+/// escaping the next character inside either quote.
+pub fn split_statements_sql(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                // An unterminated block runs to EOF; the lexer reports it.
+                i = (i + 2).min(bytes.len());
+            }
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == q {
+                        // `''` inside a single-quoted string is one quote.
+                        if q == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' => {
+                let seg = input[start..i].trim();
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let seg = input[start..].trim();
+    if !seg.is_empty() {
+        out.push(seg);
+    }
+    out
+}
+
 fn mark_sql_statement_raw(statement: &mut Statement) {
     match statement {
         Statement::Query(query) => mark_sql_query_raw(query),
@@ -842,8 +956,9 @@ impl SqlParser {
         let arg = if func == "count" && self.eat_sym('*') {
             AggArg::Star
         } else if func == "count" && self.is_kw("distinct") {
-            // count(distinct ...) has different semantics — let the generic path
-            // (which already understands `distinct`) handle it.
+            // count(distinct ...) has different semantics and is not part of the
+            // SQL subset. Restore and let the generic expression path reject it
+            // with the named unsupported-feature error (see `primary_expr`).
             self.pos = save;
             return Ok(None);
         } else {
@@ -1062,7 +1177,17 @@ impl SqlParser {
             self.expect_sym('(')?;
             let mut fields = Vec::new();
             while !self.eat_sym(')') {
-                if self.is_kw("primary") || self.is_kw("foreign") || self.is_kw("constraint") {
+                // A table-level constraint sits where a column name is expected.
+                // `UNIQUE` and `CHECK` are also *column* constraints, but those
+                // follow the type, so reaching them here can only be the table
+                // form. A column genuinely named `unique` has to be quoted, and
+                // a quoted identifier never matches `is_kw`.
+                if self.is_kw("primary")
+                    || self.is_kw("foreign")
+                    || self.is_kw("constraint")
+                    || self.is_kw("unique")
+                    || self.is_kw("check")
+                {
                     return Err(ParseError::Unsupported { feature: "SQL table constraints are not supported; declare UNIQUE columns or add indexes explicitly".into() });
                 }
                 let name = self.expect_ident("column name")?;
@@ -1501,6 +1626,18 @@ impl SqlParser {
                     feature: "SQL BETWEEN is not supported yet in the SQL frontend".into(),
                 });
             }
+            // A window call parses its function part fine and then leaves
+            // `OVER` sitting where a clause keyword should be, so the failure
+            // surfaced at the clause boundary ("expected from, got OVER")
+            // rather than at the feature. `is_kw` (not `eat_kw`) keeps the
+            // cursor on OVER; the error is terminal either way.
+            if self.is_kw("over") {
+                return Err(ParseError::Unsupported {
+                    feature: "SQL window functions (OVER) are not supported yet in the SQL \
+                              frontend; PowQL has them: row_number() over (order .col)"
+                        .into(),
+                });
+            }
             if self.eat_kw("like") {
                 let (l_bp, r_bp) = (5, 6);
                 if l_bp < min_bp {
@@ -1565,6 +1702,18 @@ impl SqlParser {
             {
                 Ok(w.to_ascii_lowercase())
             }
+            // `CASE WHEN ... THEN ... END` otherwise lowers to a bare `.CASE`
+            // field and dies at the *next* clause boundary ("expected from, got
+            // WHEN"), which reads exactly like a user typo. Name the gap here.
+            // A quoted `"case"` lexes as the backticked Word `` `case` `` and so
+            // never reaches this arm: it stays a column named case.
+            Some(SqlTok::Word(w)) if w.eq_ignore_ascii_case("case") => {
+                Err(ParseError::Unsupported {
+                    feature: "SQL CASE/WHEN is not supported yet in the SQL frontend; \
+                              PowQL has it: case when <cond> then <value> else <value> end"
+                        .into(),
+                })
+            }
             Some(SqlTok::Word(w)) => {
                 if self.eat_sym('(') {
                     let func = w.to_ascii_lowercase();
@@ -1572,9 +1721,51 @@ impl SqlParser {
                         self.expect_sym(')')?;
                         return Ok("count(*)".into());
                     }
+                    // Every refusal below is here because the construct would
+                    // otherwise lower to a syntactically valid but *wrong*
+                    // canonical PowQL call (`count(.DISTINCT, .k)`,
+                    // `cast(.id, .AS, .INT)`, `coalesce(.k, "none")`) and fail
+                    // in the PowQL re-parse with a low-level message
+                    // ("expected ')', got ','") that names neither SQL nor the
+                    // feature. Refuse in the frontend instead, in the same
+                    // shape as the BETWEEN/IN refusals below.
+                    if func == "coalesce" {
+                        return Err(ParseError::Unsupported {
+                            feature: "SQL COALESCE is not supported yet in the SQL frontend; \
+                                      PowQL spells it with the ?? operator: .a ?? .b"
+                                .into(),
+                        });
+                    }
+                    if self.is_kw("distinct") {
+                        // PowQL only has `count(distinct ...)`, so only claim
+                        // that workaround for COUNT.
+                        let hint = if func == "count" {
+                            "; PowQL spells it count(distinct T { .col })"
+                        } else {
+                            ""
+                        };
+                        return Err(ParseError::Unsupported {
+                            feature: format!(
+                                "SQL {}(DISTINCT ...) is not supported yet in the SQL \
+                                 frontend{hint}",
+                                func.to_ascii_uppercase()
+                            ),
+                        });
+                    }
                     let mut args = Vec::new();
                     while !self.eat_sym(')') {
                         args.push(self.expr_bp(0, &[])?);
+                        // `CAST(x AS TYPE)`: the argument parse stops on the
+                        // bare `AS` keyword, which no other supported function
+                        // call can be followed by inside its own parentheses.
+                        if func == "cast" && self.is_kw("as") {
+                            return Err(ParseError::Unsupported {
+                                feature: "SQL CAST(x AS TYPE) is not supported yet in the SQL \
+                                          frontend; PowDB spells a cast cast(x, 'int') with the \
+                                          target type as a string argument"
+                                    .into(),
+                            });
+                        }
                         let _ = self.eat_sym(',');
                     }
                     return Ok(format!("{}({})", func, args.join(", ")));
@@ -1693,6 +1884,56 @@ fn is_reserved_identifier(w: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ast::{AlterAction, IndexTarget};
+
+    #[test]
+    fn a_comment_only_sql_segment_is_effectively_blank() {
+        // A SQL dump ending in `-- end of dump` used to exit 1 after every
+        // real statement had committed, because the CLI asked the *PowQL*
+        // lexer, which reads `--` as two subtractions.
+        for blank in [
+            "",
+            "   ",
+            "\n\t \n",
+            "-- comment only",
+            "--comment only",
+            "-- a\n-- b\n",
+            "# comment only",
+            "  # comment only  ",
+            "# a\n# b",
+            "/* block */",
+            "/* multi\nline */\n-- and a line comment\n",
+            "-- end of dump\n",
+        ] {
+            assert!(
+                sql_is_effectively_blank(blank),
+                "{blank:?} must be effectively blank"
+            );
+        }
+
+        for real in [
+            "SELECT 1",
+            // A comment AFTER a real statement must not blank the whole input.
+            "SELECT 1 -- trailing",
+            "SELECT 1\n-- trailing",
+            "-- leading\nSELECT 1",
+            "# leading\nSELECT 1",
+            "/* leading */ SELECT 1",
+            // The obvious way this class of fix goes wrong: `--` inside a
+            // string literal is not a comment. Asking the real lexer is what
+            // makes this correct for free.
+            "SELECT '-- not a comment'",
+            "SELECT '# not a comment'",
+            "SELECT '/* not a comment */'",
+            // A lex error is a real statement with a real problem, not blank.
+            "SELECT @",
+            "SELECT 'unterminated",
+        ] {
+            assert!(
+                !sql_is_effectively_blank(real),
+                "{real:?} must not be treated as blank"
+            );
+        }
+    }
 
     #[test]
     fn sql_frontend_rejects_create_view() {
@@ -1907,5 +2148,67 @@ mod tests {
             query.aggregation.expect("aggregate").mode,
             AggregateMode::Raw
         );
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::split_statements_sql;
+
+    /// The dangerous case: a `;` inside a `--` comment is not a boundary. The
+    /// PowQL splitter cuts `-- cleanup; DELETE FROM t` in two, which turns a
+    /// commented-out statement into a live one.
+    ///
+    /// Splitting and blankness are separate jobs: the splitter must keep the
+    /// comment whole (one segment, not two), and `sql_is_effectively_blank`
+    /// then decides that segment runs nothing. Asserting the count is the
+    /// property that matters, because two segments is what deletes data.
+    #[test]
+    fn a_semicolon_inside_a_comment_is_not_a_boundary() {
+        let segs = split_statements_sql("-- cleanup; DELETE FROM t");
+        assert_eq!(segs, vec!["-- cleanup; DELETE FROM t"]);
+        assert!(super::sql_is_effectively_blank(segs[0]));
+
+        assert_eq!(
+            split_statements_sql("SELECT 1 FROM t;\n-- trailing; DELETE FROM t\n"),
+            vec!["SELECT 1 FROM t", "-- trailing; DELETE FROM t"]
+        );
+        assert_eq!(
+            split_statements_sql("/* drop it; DELETE FROM t */ SELECT 1 FROM t"),
+            vec!["/* drop it; DELETE FROM t */ SELECT 1 FROM t"]
+        );
+    }
+
+    /// A `;` inside a string literal is data, in both quote styles, including
+    /// the `''` doubling and backslash-escape forms the SQL lexer accepts.
+    #[test]
+    fn a_semicolon_inside_a_string_is_not_a_boundary() {
+        assert_eq!(
+            split_statements_sql("INSERT INTO t VALUES ('a;b')"),
+            vec!["INSERT INTO t VALUES ('a;b')"]
+        );
+        assert_eq!(
+            split_statements_sql(r#"INSERT INTO t VALUES ("a;b")"#),
+            vec![r#"INSERT INTO t VALUES ("a;b")"#]
+        );
+        assert_eq!(
+            split_statements_sql("INSERT INTO t VALUES ('it''s; here')"),
+            vec!["INSERT INTO t VALUES ('it''s; here')"]
+        );
+        assert_eq!(
+            split_statements_sql(r#"INSERT INTO t VALUES ('a\';b')"#),
+            vec![r#"INSERT INTO t VALUES ('a\';b')"#]
+        );
+    }
+
+    /// Ordinary splitting still works, and empty segments are dropped.
+    #[test]
+    fn real_boundaries_still_split() {
+        assert_eq!(
+            split_statements_sql("SELECT 1 FROM t; SELECT 2 FROM t;"),
+            vec!["SELECT 1 FROM t", "SELECT 2 FROM t"]
+        );
+        assert_eq!(split_statements_sql(";;  ;"), Vec::<&str>::new());
+        assert_eq!(split_statements_sql(""), Vec::<&str>::new());
     }
 }

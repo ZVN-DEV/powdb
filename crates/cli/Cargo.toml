@@ -3,10 +3,17 @@ name = "powdb-cli"
 description = "Interactive REPL and CLI for PowDB, an embedded database with a pipeline query language and nested results"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "../../README.md"
+# The crate's OWN reference doc, not the root project README. Both are shipped
+# in the tarball (cargo copies the package-root README.md in either case), but
+# the manifest key is what crates.io renders on the package page, and the CLI
+# reference is the right page for `cargo install powdb-cli`. Pointing this at
+# `../../README.md` also produced a cargo warning on every `cargo package`,
+# because a README.md already exists in the package root.
+readme = "README.md"
 keywords = ["database", "powdb", "powql", "cli", "embedded-database"]
 categories = ["database", "command-line-utilities"]
 documentation = "https://docs.rs/powdb-cli"

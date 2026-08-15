@@ -159,7 +159,7 @@ The server computes, from the client's stated range `[cmin, cmax]` and its own
 - otherwise → negotiated version is `min(cmax, smax)`.
 
 A refusal is an `Error` (`0x0A`) frame carrying error class `10`
-(`ProtocolVersion`, see [Section 6](#error-taxonomy)), sent **instead of**
+(`ProtocolVersion`, see [Section 6](#6-error-taxonomy)), sent **instead of**
 `ConnectOk`, after which the server closes the connection. It is a hard
 guarantee that this is the only point at which a version mismatch appears: once
 `ConnectOk` has been sent, no later frame can fail for version reasons.
@@ -468,9 +468,9 @@ For a `json` column, `->` walks into the document by object key or array index
 and binds tighter than every other operator:
 
 ```
-Post { author: .data->author->name }     -- object key
-Post { first: .data->tags->0 }            -- array index (0-based)
-Post filter .data->views > 10             -- extract, then compare
+Post { author: .data->author->name }     # object key
+Post { first: .data->tags->0 }            # array index (0-based)
+Post filter .data->views > 10             # extract, then compare
 Post order .data->score desc
 Post group .data->author->name { author: .data->author->name, views: sum(.data->views) }
 ```
@@ -484,10 +484,10 @@ identifier is written as a double-quoted string: `.data->"has spaces!"`.
 Map your schema/migration layer to these:
 
 ```
-alter User add index .email                     -- column index
-alter User add unique .email                    -- unique column index
-alter Post add index (.data->author->name)      -- expression (JSON path) index
-alter Post add unique (.data->external_id)       -- unique expression index
+alter User add index .email                     # column index
+alter User add unique .email                    # unique column index
+alter Post add index (.data->author->name)      # expression (JSON path) index
+alter Post add unique (.data->external_id)      # unique expression index
 alter Post drop index (.data->author->name)
 ```
 
@@ -606,7 +606,7 @@ Transaction control is ordinary statements, not a protocol extension:
 begin
 insert Order { user_id := 1, total := 99.95 }
 User filter .id = 1 update { order_count := .order_count + 1 }
-commit          -- or: rollback
+commit          # or: rollback
 ```
 
 Transactions are per-connection; other connections never see uncommitted rows.

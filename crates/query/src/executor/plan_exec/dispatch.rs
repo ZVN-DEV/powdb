@@ -852,7 +852,9 @@ impl Engine {
                         .insert(table, values)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 }
-                self.view_registry.mark_dependents_dirty(table);
+                self.view_registry
+                    .mark_dependents_dirty(table)
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 if *returning {
                     Ok(QueryResult::Rows {
                         columns: returning_columns,
@@ -869,7 +871,7 @@ impl Engine {
                 assignments,
                 on_conflict,
             } => {
-                let (values, key_idx) = {
+                let (mut values, key_idx) = {
                     let schema = self
                         .catalog
                         .schema(table)
@@ -895,8 +897,14 @@ impl Engine {
                             }
                         }
                     }
+                    let auto = self.catalog.auto_columns(table).unwrap_or(&[]);
                     for col in &schema.columns {
-                        if col.required && matches!(values[col.position as usize], Value::Empty) {
+                        let pos = col.position as usize;
+                        // Auto columns are exempt from the required check, same
+                        // as the Insert arm: they are filled from the sequence
+                        // on the insert branch below.
+                        let is_auto = auto.get(pos).copied().unwrap_or(false);
+                        if col.required && !is_auto && matches!(values[pos], Value::Empty) {
                             return Err(QueryError::Execution(format!(
                                 "column '{}' is required but no value was provided",
                                 col.name
@@ -973,14 +981,32 @@ impl Engine {
                     self.catalog
                         .update_hinted(table, rid, &existing_row, Some(&changed_cols))
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Modified(1))
                 } else {
-                    // No conflict: insert.
+                    // No conflict: insert. This branch creates a row, so it
+                    // owes that row the same `auto` ids a plain `insert` would
+                    // give it. Skipping this wrote Value::Empty into the column
+                    // the user declared `unique auto`, and because several
+                    // NULLs coexist happily in a unique index nothing rejected
+                    // it: repeated upserts silently accumulated rows with a
+                    // NULL primary key.
+                    //
+                    // After the conflict probe, not before: the probe has to
+                    // look up the key the caller supplied, and assigning first
+                    // would hand a freshly minted id to a lookup that then
+                    // matches nothing and inserts a duplicate. The conflict
+                    // branch above deliberately does not assign — an existing
+                    // row keeps the key it already has.
+                    self.catalog.assign_auto_columns(table, &mut values);
                     self.catalog
                         .insert(table, &values)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     Ok(QueryResult::Modified(1))
                 }
             }
@@ -1113,7 +1139,9 @@ impl Engine {
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         out_rows.push(row);
                     }
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows {
                         columns,
                         rows: out_rows,
@@ -1270,7 +1298,9 @@ impl Engine {
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             count += 1;
                         }
-                        self.view_registry.mark_dependents_dirty(table);
+                        self.view_registry
+                            .mark_dependents_dirty(table)
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(QueryResult::Modified(count));
                     }
 
@@ -1351,7 +1381,9 @@ impl Engine {
                                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
                             count += 1;
                         }
-                        self.view_registry.mark_dependents_dirty(table);
+                        self.view_registry
+                            .mark_dependents_dirty(table)
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(QueryResult::Modified(count));
                     }
 
@@ -1370,7 +1402,9 @@ impl Engine {
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         count += 1;
                     }
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Modified(count));
                 } // end if let Some(resolved_assignments)
 
@@ -1405,7 +1439,9 @@ impl Engine {
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     count += 1;
                 }
-                self.view_registry.mark_dependents_dirty(table);
+                self.view_registry
+                    .mark_dependents_dirty(table)
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 Ok(QueryResult::Modified(count))
             }
 
@@ -1444,7 +1480,9 @@ impl Engine {
                     self.catalog
                         .delete_many(table, &matching_rids)
                         .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                     return Ok(QueryResult::Rows {
                         columns,
                         rows: out_rows,
@@ -1507,7 +1545,9 @@ impl Engine {
                                     .catalog
                                     .scan_delete_matching_logged(table, |data| compiled(data))
                                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                                self.view_registry.mark_dependents_dirty(table);
+                                self.view_registry
+                                    .mark_dependents_dirty(table)
+                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                                 return Ok(QueryResult::Modified(count));
                             }
                         }
@@ -1522,7 +1562,9 @@ impl Engine {
                             .catalog
                             .scan_delete_matching_logged(table, |_| true)
                             .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                        self.view_registry.mark_dependents_dirty(table);
+                        self.view_registry
+                            .mark_dependents_dirty(table)
+                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
                         return Ok(QueryResult::Modified(count));
                     }
                 }
@@ -1533,7 +1575,9 @@ impl Engine {
                     .catalog
                     .delete_many(table, &matching_rids)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                self.view_registry.mark_dependents_dirty(table);
+                self.view_registry
+                    .mark_dependents_dirty(table)
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 Ok(QueryResult::Modified(count))
             }
 
@@ -2451,6 +2495,16 @@ impl Engine {
         }
         // Determine which base tables this view depends on by parsing the query.
         let depends_on = self.extract_view_deps(name, query_text)?;
+        // Same ordering rule as `refresh_view`: registering the view CLEAN is a
+        // durable claim that the rows just inserted are its current contents,
+        // and `register` fsyncs `views.bin` while those rows are still only in
+        // the WAL buffer. A crash in between would leave a registered, clean,
+        // EMPTY view answering queries with zero rows and no error.
+        if !self.in_transaction {
+            self.catalog
+                .commit_autocommit()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        }
         self.view_registry
             .register(ViewDef {
                 name: name.to_string(),
@@ -2524,7 +2578,25 @@ impl Engine {
                 .insert(name, row)
                 .map_err(|e| QueryError::StorageError(e.to_string()))?;
         }
-        self.view_registry.mark_clean(name);
+        // The clean flag is durable, so it must not get to disk ahead of the
+        // rows it vouches for: `mark_clean` fsyncs `views.bin`, and the writes
+        // just above are still only in the WAL buffer at this point. A crash
+        // between the two would leave a CLEAN flag over the pre-refresh rows,
+        // which is the wrong-answer direction of the same staleness bug. So
+        // commit first, then record. Inside an explicit transaction there is
+        // nothing to commit yet, so the flag is cleared in memory only and the
+        // on-disk flag stays dirty: at worst one redundant refresh after the
+        // next open, never a stale answer.
+        if self.in_transaction {
+            self.view_registry.mark_clean_in_memory(name);
+        } else {
+            self.catalog
+                .commit_autocommit()
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            self.view_registry
+                .mark_clean(name)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+        }
         Ok(())
     }
 

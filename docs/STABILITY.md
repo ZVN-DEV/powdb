@@ -243,7 +243,7 @@ you can rely on after an update.
 type T { required n: int, required z: int }
 insert T { n := 10, z := 1 }, { n := 20, z := 2 }, { n := 30, z := 0 }, { n := 40, z := 4 }
 
-T update { n := .n / .z }        -- 4 rows affected, no error
+T update { n := .n / .z }        # 4 rows affected, no error
 ```
 
 Reopened in a fresh process:

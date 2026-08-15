@@ -22,7 +22,9 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node"
+    "*.node",
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "access": "public"

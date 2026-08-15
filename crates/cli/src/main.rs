@@ -3,7 +3,7 @@ use powdb_query::lexer::{split_statements, POWQL_KEYWORDS};
 use powdb_query::result::QueryResult;
 use powdb_server::protocol::{
     require_server_capabilities, ClientHello, Message, ServerHello, CLIENT_CATALOG_VERSION,
-    MIN_SUPPORTED_PROTOCOL_VERSION,
+    FEATURE_NATIVE_TYPED, MIN_SUPPORTED_PROTOCOL_VERSION,
 };
 use powdb_storage::types::Value;
 use rustyline::completion::{Completer, Pair};
@@ -285,6 +285,62 @@ fn set_restore_sync_mode(
     *was_set = true;
 }
 
+/// Every bare-word subcommand, for typo detection on a stray positional.
+/// A word close to one of these is a mistake, not a data directory.
+const SUBCOMMANDS: &[&str] = &[
+    "backup",
+    "restore",
+    "sync-enable",
+    "sync-bootstrap",
+    "sync-status",
+    "useradd",
+    "userdel",
+    "passwd",
+    "users",
+    "sweep",
+];
+
+/// Levenshtein edit distance, for "did you mean" on a mistyped subcommand.
+/// Two rolling rows: the inputs here are single command words.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = substitution.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b_chars.len()]
+}
+
+/// The subcommand `token` was probably meant to be, if any.
+///
+/// Deliberately conservative, because a bare positional is also the documented
+/// `powdb-cli [DATA_DIR]` form: a token that looks like a path (or names a
+/// directory that exists) is taken at face value, and the distance budget is
+/// one edit for short words, two for longer ones. That still catches every
+/// plausible slip (`usrs`, `backupp`, `restor`, `useradds`, `sync-statuss`)
+/// without stealing a data dir someone genuinely named `backups`.
+fn nearest_subcommand(token: &str) -> Option<&'static str> {
+    if token.contains('/') || token.contains(std::path::MAIN_SEPARATOR) {
+        return None;
+    }
+    if token.starts_with('.') || token.starts_with('~') || Path::new(token).exists() {
+        return None;
+    }
+    let budget = if token.chars().count() <= 4 { 1 } else { 2 };
+    SUBCOMMANDS
+        .iter()
+        .map(|cmd| (edit_distance(token, cmd), *cmd))
+        .filter(|(distance, _)| *distance <= budget)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, cmd)| cmd)
+}
+
 fn restore_sync_mode_for_flag(flag: &str) -> Option<powdb_backup::RestoreSyncMode> {
     match flag {
         "--sync-strip" => Some(powdb_backup::RestoreSyncMode::StripSyncIdentity),
@@ -344,6 +400,7 @@ fn parse_args() -> CliArgs {
     };
     let mut i = 1;
     let mut saw_positional = false;
+    let mut data_dir_explicit = false;
     while i < argv.len() {
         match argv[i].as_str() {
             "--exec" | "-c" => {
@@ -450,6 +507,7 @@ fn parse_args() -> CliArgs {
                     std::process::exit(2);
                 }
                 data_dir = argv[i].clone();
+                data_dir_explicit = true;
             }
             "--version" | "-V" => {
                 println!("powdb-cli {}", env!("CARGO_PKG_VERSION"));
@@ -749,7 +807,33 @@ fn parse_args() -> CliArgs {
                     table: argv[i].clone(),
                 };
             }
-            other if !other.starts_with('-') && !saw_positional => {
+            // A bare positional is the documented `powdb-cli [DATA_DIR]` form,
+            // but it must never *silently* become a data directory. A mistyped
+            // subcommand (`powdb-cli -d /var/lib/powdb usrs`) used to ignore
+            // the explicit -d, create a fresh empty database in ./usrs, and
+            // exit 0 — the operator's real database was never touched and
+            // nothing said so.
+            other if !other.starts_with('-') => {
+                if saw_positional || data_dir_explicit {
+                    eprintln!("Error: unexpected argument: {other}");
+                    if let Some(near) = nearest_subcommand(other) {
+                        eprintln!("note: did you mean the `{near}` subcommand?");
+                    } else if data_dir_explicit {
+                        eprintln!(
+                            "note: the data directory is already set to '{data_dir}' by -d/--data-dir"
+                        );
+                    }
+                    eprintln!("try --help");
+                    std::process::exit(2);
+                }
+                if let Some(near) = nearest_subcommand(other) {
+                    eprintln!("Error: unknown subcommand: {other}");
+                    eprintln!("note: did you mean `{near}`?");
+                    eprintln!(
+                        "note: to use '{other}' as a data directory instead, pass it as -d {other}"
+                    );
+                    std::process::exit(2);
+                }
                 data_dir = other.to_string();
                 saw_positional = true;
             }
@@ -1279,6 +1363,31 @@ fn resolve_new_password(flag: Option<&str>) -> Option<String> {
     })
 }
 
+/// Persist the user store to `data_dir`, creating the directory first when it
+/// does not exist yet.
+///
+/// Every other CLI path creates its data directory on the way in (both
+/// `Catalog::open` and `Engine::new` call `create_data_dir_secure`), so the
+/// user-admin commands used to be the lone exception: `useradd` against a fresh
+/// install failed with a bare "failed to save user store: No such file or
+/// directory". That is the ordering the docs bless — user admin works before
+/// the first server start — and it is the first security step an operator
+/// takes. Creating the directory here, immediately before the write, uses the
+/// same 0700 mode the engine does, so `auth.json` (0600) never lands in a
+/// world-readable directory.
+fn save_user_store(store: &powdb_auth::UserStore, data_dir: &str) -> Result<(), i32> {
+    let dir = Path::new(data_dir);
+    if let Err(e) = powdb_storage::create_data_dir_secure(dir) {
+        eprintln!("Error: failed to create data directory {data_dir}: {e}");
+        return Err(1);
+    }
+    if let Err(e) = store.save(dir) {
+        eprintln!("Error: failed to save user store to {data_dir}: {e}");
+        return Err(1);
+    }
+    Ok(())
+}
+
 fn run_useradd(data_dir: &str, name: &str, role: Option<&str>, password: Option<&str>) -> i32 {
     let role = role.unwrap_or("readwrite");
     let Some(pw) = resolve_new_password(password) else {
@@ -1299,9 +1408,8 @@ fn run_useradd(data_dir: &str, name: &str, role: Option<&str>, password: Option<
         eprintln!("Error: {e}");
         return 1;
     }
-    if let Err(e) = store.save(dir) {
-        eprintln!("Error: failed to save user store: {e}");
-        return 1;
+    if let Err(code) = save_user_store(&store, data_dir) {
+        return code;
     }
     println!("user '{name}' created (role {role})");
     0
@@ -1320,9 +1428,8 @@ fn run_userdel(data_dir: &str, name: &str) -> i32 {
         eprintln!("Error: {e}");
         return 1;
     }
-    if let Err(e) = store.save(dir) {
-        eprintln!("Error: failed to save user store: {e}");
-        return 1;
+    if let Err(code) = save_user_store(&store, data_dir) {
+        return code;
     }
     println!("user '{name}' deleted");
     0
@@ -1347,9 +1454,8 @@ fn run_passwd(data_dir: &str, name: &str, password: Option<&str>) -> i32 {
         eprintln!("Error: {e}");
         return 1;
     }
-    if let Err(e) = store.save(dir) {
-        eprintln!("Error: failed to save user store: {e}");
-        return 1;
+    if let Err(code) = save_user_store(&store, data_dir) {
+        return code;
     }
     println!("password updated for user '{name}'");
     0
@@ -1448,8 +1554,16 @@ fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -> i32 {
     };
     // Statement-aware splitting (#150): a `;` inside a string literal or a
     // `#` comment is not a boundary, so text-heavy rows load intact.
-    let statements = split_statements(query);
+    let statements = split_statements_in(query, session.dialect);
     for stmt in &statements {
+        // A segment that is only comments and whitespace is not a statement.
+        // The engine lexes it to zero tokens and reports "expected statement,
+        // got end of input", so a dump that merely *ended* with a comment line
+        // exited 1 after committing every write — enough to abort a `set -e`
+        // deploy script that had in fact succeeded.
+        if is_effectively_blank_in(stmt, session.dialect) {
+            continue;
+        }
         if stmt.starts_with('.') {
             let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
             eprintln!(
@@ -1696,6 +1810,47 @@ fn classify_handshake_reply(
     Ok((version, hello))
 }
 
+/// Whether this session should ask the server for typed results, noting once
+/// (via `warned`, like [`note_continuation_when_piped`]) when `--format json`
+/// cannot be typed because the server predates the typed wire frames.
+///
+/// `--format json` is sold as the scriptable output, but the legacy `Query`
+/// frame stringifies every cell server-side, so an int came back as `"1"`
+/// remotely and `1` embedded: a `jq` numeric comparison written against an
+/// embedded run silently stopped matching once it was pointed at a server. The
+/// typed frames carry storage values, so the CLI renders them with the same
+/// code embedded mode uses.
+///
+/// `table` and `csv` deliberately stay on the legacy frame. Their cells are the
+/// server's own display formatting, and this fix must not shift them.
+fn negotiate_typed_json(output: OutputMode, hello: &ServerHello, warned: &mut bool) -> bool {
+    if output != OutputMode::Json {
+        return false;
+    }
+    if hello.has(FEATURE_NATIVE_TYPED) {
+        return true;
+    }
+    if !*warned {
+        *warned = true;
+        eprintln!(
+            "note: this server is too old to send typed results, so --format json renders \
+             every cell as a JSON string; upgrade the server to get int, float, and bool types"
+        );
+    }
+    false
+}
+
+/// The query frame for one statement: typed when the session negotiated typed
+/// results, else the legacy stringly-typed frame.
+fn query_message(query: String, dialect: Dialect, typed: bool) -> Message {
+    match (dialect, typed) {
+        (Dialect::Powql, false) => Message::Query { query },
+        (Dialect::Powql, true) => Message::QueryNative { query },
+        (Dialect::Sql, false) => Message::QuerySql { query },
+        (Dialect::Sql, true) => Message::QuerySqlNative { query },
+    }
+}
+
 /// The hint appended when the handshake produced no usable reply, which is
 /// what a plaintext connection to a TLS-only listener looks like.
 const TLS_HANDSHAKE_HINT: &str =
@@ -1724,22 +1879,32 @@ where
         return 1;
     }
     let reply = Message::read_from(&mut reader).await.ok().flatten();
-    if let Err(failure) = classify_handshake_reply(reply) {
-        match failure {
-            HandshakeFailure::Refused(message) => eprintln!("Error: {message}"),
-            HandshakeFailure::NoReply(message) => {
-                eprintln!("Error: handshake failed: {message} ({TLS_HANDSHAKE_HINT})");
+    let hello = match classify_handshake_reply(reply) {
+        Ok((_version, hello)) => hello,
+        Err(failure) => {
+            match failure {
+                HandshakeFailure::Refused(message) => eprintln!("Error: {message}"),
+                HandshakeFailure::NoReply(message) => {
+                    eprintln!("Error: handshake failed: {message} ({TLS_HANDSHAKE_HINT})");
+                }
             }
+            return 1;
         }
-        return 1;
-    }
+    };
+    let typed = negotiate_typed_json(session.output, &hello, &mut false);
 
     // The wire protocol carries one statement per `Query` message, so split
     // client-side (#150) and send each in turn, stopping on the first error.
     let mut code = 0;
-    let statements = split_statements(&query);
+    let statements = split_statements_in(&query, session.dialect);
     let statement_count = statements.len();
     for stmt in statements {
+        // Comment-only segments never reach the wire, same as embedded
+        // one-shot and the REPL: they are not statements, and the server
+        // would answer "expected statement, got end of input".
+        if is_effectively_blank_in(stmt, session.dialect) {
+            continue;
+        }
         if stmt.starts_with('.') {
             let cmd = stmt.split_whitespace().next().unwrap_or(stmt);
             eprintln!(
@@ -1750,14 +1915,7 @@ where
             break;
         }
 
-        let q = match session.dialect {
-            Dialect::Powql => Message::Query {
-                query: stmt.to_string(),
-            },
-            Dialect::Sql => Message::QuerySql {
-                query: stmt.to_string(),
-            },
-        };
+        let q = query_message(stmt.to_string(), session.dialect, typed);
         if q.write_to(&mut writer).await.is_err()
             || tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err()
         {
@@ -1941,6 +2099,30 @@ fn is_effectively_blank(statement: &str) -> bool {
     )
 }
 
+/// Split input into statements using the lexical rules of the dialect in use.
+/// A `;` inside a comment is not a boundary, and the two dialects disagree
+/// about what a comment is, so splitting with the wrong one can hand the engine
+/// a fragment the user believed was commented out.
+fn split_statements_in(input: &str, dialect: Dialect) -> Vec<&str> {
+    match dialect {
+        Dialect::Powql => split_statements(input),
+        Dialect::Sql => powdb_query::sql::split_statements_sql(input),
+    }
+}
+
+/// Dialect-aware blank check. The two languages disagree about what a comment
+/// is: `--` opens a comment in SQL and is subtraction in PowQL, so asking the
+/// PowQL lexer about a SQL dump that ends in `-- done` reports "not blank" and
+/// the segment reaches the engine as a syntax error, exiting 1 after every real
+/// statement has already committed. Each dialect answers with its own lexer so
+/// neither can drift from the grammar it actually parses.
+fn is_effectively_blank_in(statement: &str, dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::Powql => is_effectively_blank(statement),
+        Dialect::Sql => powdb_query::sql::sql_is_effectively_blank(statement),
+    }
+}
+
 /// True when the line is the continuation escape hatch. Recognized anywhere,
 /// including in the middle of an unterminated statement, which is the whole
 /// point: without it an unbalanced `(` swallows every later line, meta-commands
@@ -2103,7 +2285,7 @@ fn run_embedded(data_dir: &str, session: SessionOpts) {
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if is_effectively_blank(&statement) {
+                if is_effectively_blank_in(&statement, session.dialect) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2260,19 +2442,20 @@ async fn run_remote_on<S>(
             std::process::exit(1);
         }
     };
-    match classify_handshake_reply(reply) {
+    let server_hello = match classify_handshake_reply(reply) {
         Ok((version, hello)) => {
             eprintln!(
                 "Connected to db `{db}` (server v{version}, wire protocol v{})",
                 hello.protocol
             );
             eprintln!("Type PowQL queries. Use Ctrl-D to exit.\n");
+            hello
         }
         Err(failure) => {
             eprintln!("Error: {}", failure.message());
             std::process::exit(1);
         }
-    }
+    };
 
     let mut rl = match Editor::new() {
         Ok(rl) => rl,
@@ -2294,6 +2477,7 @@ async fn run_remote_on<S>(
     let mut buffer = String::new();
     let interactive = std::io::IsTerminal::is_terminal(&io::stdin());
     let mut continuation_noted = false;
+    let mut untyped_json_warned = false;
     let mut one_off_sql: Option<String>;
 
     loop {
@@ -2378,7 +2562,7 @@ async fn run_remote_on<S>(
                 continuation_noted = false;
                 let statement = buffer.trim().to_string();
                 buffer.clear();
-                if is_effectively_blank(&statement) {
+                if is_effectively_blank_in(&statement, session.dialect) {
                     continue;
                 }
                 rl.add_history_entry(&statement).ok();
@@ -2386,10 +2570,10 @@ async fn run_remote_on<S>(
             }
         };
 
-        let q = match statement_dialect {
-            Dialect::Powql => Message::Query { query: statement },
-            Dialect::Sql => Message::QuerySql { query: statement },
-        };
+        // Re-negotiated per statement because `.mode json` can switch the
+        // session's rendering mid-REPL.
+        let typed = negotiate_typed_json(state.output, &server_hello, &mut untyped_json_warned);
+        let q = query_message(statement, statement_dialect, typed);
         if q.write_to(&mut writer).await.is_err() {
             eprintln!("Error: write failed — disconnected");
             break;
@@ -2474,22 +2658,7 @@ fn print_local_result_table(result: &QueryResult) {
 /// be piped straight into `jq` (and read line by line for multi-statement runs).
 fn print_local_result_json(result: &QueryResult) {
     match result {
-        QueryResult::Rows { columns, rows } => {
-            let cols = columns
-                .iter()
-                .map(|c| json_string(c))
-                .collect::<Vec<_>>()
-                .join(",");
-            let body = rows
-                .iter()
-                .map(|row| {
-                    let cells = row.iter().map(value_to_json).collect::<Vec<_>>().join(",");
-                    format!("[{cells}]")
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            println!("{{\"columns\":[{cols}],\"rows\":[{body}]}}");
-        }
+        QueryResult::Rows { columns, rows } => println!("{}", rows_to_json(columns, rows)),
         QueryResult::Scalar(val) => println!("{{\"value\":{}}}", value_to_json(val)),
         QueryResult::Modified(n) => println!("{{\"affected\":{n}}}"),
         QueryResult::Created(name) => println!("{{\"created\":{}}}", json_string(name)),
@@ -2525,6 +2694,28 @@ fn print_local_result_csv(result: &QueryResult) {
         QueryResult::Created(name) => println!("{}", csv_field(name)),
         QueryResult::Executed { message } => println!("{}", csv_field(message)),
     }
+}
+
+/// The `{"columns":[…],"rows":[…]}` document for a typed row set.
+///
+/// Shared by embedded results and typed remote results so `--format json`
+/// renders byte-identically on both transports: the same query over the same
+/// data must not change JSON types just because it went through a server.
+fn rows_to_json(columns: &[String], rows: &[Vec<Value>]) -> String {
+    let cols = columns
+        .iter()
+        .map(|c| json_string(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = rows
+        .iter()
+        .map(|row| {
+            let cells = row.iter().map(value_to_json).collect::<Vec<_>>().join(",");
+            format!("[{cells}]")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"columns\":[{cols}],\"rows\":[{body}]}}")
 }
 
 /// Render a string as a JSON string literal (RFC 8259 escaping).
@@ -2592,12 +2783,19 @@ fn print_remote_result(msg: &Message, mode: OutputMode) {
     }
 }
 
-/// Remote results arrive on the legacy stringly-typed wire path, so machine
-/// readable output is string-valued: every cell is a JSON string except the
-/// NULL sentinel, which becomes JSON `null`. (The typed wire frames exist, but
-/// the CLI speaks the legacy `Query` frame for backward compatibility.)
+/// `--format json` asks the server for typed results (see
+/// [`negotiate_typed_json`]), so the common case renders through exactly the
+/// embedded renderer and the two transports agree byte for byte.
+///
+/// The stringly-typed arms below are the fallback for a server too old to
+/// carry typed frames: every cell is then a JSON string except the NULL
+/// sentinel, which becomes JSON `null`.
 fn print_remote_result_json(msg: &Message) {
     match msg {
+        Message::ResultRowsNative { columns, rows } => println!("{}", rows_to_json(columns, rows)),
+        Message::ResultScalarNative { value } => {
+            println!("{{\"value\":{}}}", value_to_json(value))
+        }
         Message::ResultRows { columns, rows } => {
             let cols = columns
                 .iter()
@@ -2885,6 +3083,113 @@ mod tests {
         // A lex error is a real problem with a real statement: let the engine
         // report it rather than silently swallowing the line.
         assert!(!is_effectively_blank("User filter .s = \"unterminated"));
+    }
+
+    #[test]
+    fn typo_detection_separates_subcommands_from_data_dirs() {
+        // The five slips actually observed, each one edit from a real command.
+        assert_eq!(nearest_subcommand("usrs"), Some("users"));
+        assert_eq!(nearest_subcommand("backupp"), Some("backup"));
+        assert_eq!(nearest_subcommand("sync-statuss"), Some("sync-status"));
+        assert_eq!(nearest_subcommand("useradds"), Some("useradd"));
+        assert_eq!(nearest_subcommand("restor"), Some("restore"));
+
+        // Anything path-shaped is a data directory, never a typo, even when it
+        // is spelled exactly like a subcommand.
+        assert_eq!(nearest_subcommand("./users"), None);
+        assert_eq!(nearest_subcommand("../backup"), None);
+        assert_eq!(nearest_subcommand("~/backup"), None);
+        assert_eq!(nearest_subcommand("/var/lib/backup"), None);
+
+        // Ordinary data-dir names are far enough from every subcommand.
+        assert_eq!(nearest_subcommand("mydata"), None);
+        assert_eq!(nearest_subcommand("powdb_data"), None);
+        assert_eq!(nearest_subcommand("db"), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("users", "users"), 0);
+        assert_eq!(edit_distance("usrs", "users"), 1); // insertion
+        assert_eq!(edit_distance("backupp", "backup"), 1); // deletion
+        assert_eq!(edit_distance("restire", "restore"), 1); // substitution
+        assert_eq!(edit_distance("", "sweep"), 5);
+    }
+
+    #[test]
+    fn typed_results_are_requested_only_for_json_on_a_capable_server() {
+        let mut modern = ServerHello::legacy();
+        modern.features = vec![FEATURE_NATIVE_TYPED.to_string()];
+        let old = ServerHello::legacy();
+
+        // json is the mode that promises types, so it is the one that asks.
+        assert!(negotiate_typed_json(OutputMode::Json, &modern, &mut false));
+        // table and csv render the server's display strings and must not move.
+        assert!(!negotiate_typed_json(
+            OutputMode::Table,
+            &modern,
+            &mut false
+        ));
+        assert!(!negotiate_typed_json(OutputMode::Csv, &modern, &mut false));
+        // A server without the feature falls back rather than sending a frame
+        // it cannot answer.
+        assert!(!negotiate_typed_json(OutputMode::Json, &old, &mut false));
+
+        // The fallback note is emitted once per session, not once per query.
+        let mut warned = false;
+        negotiate_typed_json(OutputMode::Json, &old, &mut warned);
+        assert!(warned, "first untyped json query must set the warned flag");
+        negotiate_typed_json(OutputMode::Json, &old, &mut warned);
+        assert!(warned);
+    }
+
+    #[test]
+    fn query_frames_follow_dialect_and_typing() {
+        assert!(matches!(
+            query_message("q".into(), Dialect::Powql, false),
+            Message::Query { .. }
+        ));
+        assert!(matches!(
+            query_message("q".into(), Dialect::Powql, true),
+            Message::QueryNative { .. }
+        ));
+        assert!(matches!(
+            query_message("q".into(), Dialect::Sql, false),
+            Message::QuerySql { .. }
+        ));
+        assert!(matches!(
+            query_message("q".into(), Dialect::Sql, true),
+            Message::QuerySqlNative { .. }
+        ));
+    }
+
+    #[test]
+    fn typed_rows_render_the_same_json_on_both_transports() {
+        // Same columns, same values: the embedded renderer and the remote
+        // typed renderer share `rows_to_json`, so this is a structural check
+        // that neither transport can drift into stringly-typed output.
+        let columns = vec!["i".to_string(), "f".to_string(), "b".to_string()];
+        let rows = vec![vec![Value::Int(1), Value::Float(1.5), Value::Bool(true)]];
+        assert_eq!(
+            rows_to_json(&columns, &rows),
+            r#"{"columns":["i","f","b"],"rows":[[1,1.5,true]]}"#
+        );
+
+        // i64 values past 2^53 keep every digit: the CLI writes the decimal
+        // form directly and never routes an int through an f64.
+        let big = vec![vec![Value::Int(9007199254740993)]];
+        assert_eq!(
+            rows_to_json(&["big".to_string()], &big),
+            r#"{"columns":["big"],"rows":[[9007199254740993]]}"#
+        );
+
+        // NULL is JSON null, not the string "NULL".
+        let nulls = vec![vec![Value::Empty]];
+        assert_eq!(
+            rows_to_json(&["n".to_string()], &nulls),
+            r#"{"columns":["n"],"rows":[[null]]}"#
+        );
     }
 
     #[test]

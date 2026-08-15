@@ -21,6 +21,17 @@ powdb-cli --help
 Embedded mode takes an exclusive lock on the data directory, so it refuses to
 open a directory a live `powdb-server` owns.
 
+A bare argument is the data directory, but only when it is unambiguous: an
+explicit `-d`/`--data-dir` always wins, and a word close to a real subcommand
+is treated as a typo rather than silently becoming a new empty database.
+
+```
+$ powdb-cli -d /var/lib/powdb usrs
+Error: unexpected argument: usrs
+note: did you mean the `users` subcommand?
+try --help
+```
+
 ## One-shot execution: `--exec` and `--exec-file`
 
 `--exec <QUERY>` (short `-c`) runs one or more statements and exits.
@@ -56,8 +67,10 @@ note: statements are separated by `;`, not by newlines ...
 ```
 
 Splitting is statement-aware: a `;` inside a string literal or a `#` comment is
-not a separator. Execution stops at the first failing statement and exits 1.
-Meta-commands (`.tables` and friends) are REPL-only and are rejected here.
+not a separator. Segments that are only comments and whitespace are skipped, so
+a dump that opens or ends with a comment line still exits 0. Execution stops at
+the first failing statement and exits 1. Meta-commands (`.tables` and friends)
+are REPL-only and are rejected here.
 
 ## SQL
 
@@ -102,11 +115,22 @@ bob,24
 ```
 
 JSON output is one document per statement on a single line, so multi-statement
-runs stream as JSON Lines and pipe straight into `jq`. In embedded mode cells
-keep their JSON type (int, float, bool, null, and json documents inline);
-uuid, datetime, and bytes render as strings exactly as the table view shows
-them. Remote results travel on the legacy stringly-typed wire frame, so every
-remote cell is a JSON string except the NULL sentinel, which is JSON `null`.
+runs stream as JSON Lines and pipe straight into `jq`. Cells keep their JSON
+type (int, float, bool, null, and json documents inline); uuid, datetime, and
+bytes render as strings exactly as the table view shows them.
+
+`--format json` is transport-independent: the same query over the same data
+produces byte-identical JSON embedded and remote, so a script written against
+an embedded database keeps working when you point it at a server. Remote mode
+gets this by asking the server for typed results, which every server from
+v0.22.0 on advertises during the handshake. Against an older one the CLI notes
+on stderr that it is falling back; every remote cell is then a JSON string
+except the NULL sentinel, which stays JSON `null`.
+
+Integers are written as JSON numbers with every digit preserved, including
+values beyond 2^53. Consumers that parse JSON numbers as IEEE doubles (`jq`
+without `--sort-keys`-style big-number handling, `JSON.parse`) lose precision
+on those; `--format csv` sidesteps it.
 
 CSV follows RFC 4180: a field containing a comma, quote, CR, or LF is quoted
 and embedded quotes are doubled.
@@ -179,6 +203,10 @@ These operate directly on `--data-dir` with no server running. See
 | `sweep <TABLE\|all>` | Reclaim orphaned overflow pages |
 
 `useradd` and `passwd` also read the new password from `POWDB_NEW_PASSWORD`.
+
+The user-admin subcommands work before the first server start: `useradd`
+creates the data directory (owner-only, `0700`) if it does not exist yet, so
+provisioning a user can be the very first thing you do on a fresh install.
 
 ## Exit codes
 

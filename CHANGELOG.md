@@ -7,6 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Read-only snapshot serving now refuses a stale materialized view instead of
+  serving it.** This follows from persisting the view dirty flag (below): a
+  read-only open cannot refresh, so a snapshot taken while a view was dirty now
+  fails every query that touches that view, with a message naming the fix
+  (`refresh materialized views before snapshotting a read-only directory`).
+  Previously the flag did not survive the snapshot, so the same directory
+  answered with stale rows and looked healthy. Operators upgrading may see new
+  errors on snapshots that appeared to work before; the remedy is documented in
+  `docs/read-only-serving.md`. Refresh before snapshotting.
+
+### Fixed
+
+**Two of these are silent wrong answers: one survives a restart and never
+repairs itself, the other writes NULL into a column the schema declares as a
+unique key. The rest are first-hour papercuts found by auditing the project the
+way a new user meets it: install, follow the README, run the CLI.**
+
+- **A materialized view served pre-mutation rows forever after a restart.**
+  Mutate a base table that has a view over it, then let the process exit before
+  anything reads that view, and the view came back marked CLEAN over its
+  pre-mutation contents and served them from then on. It was wrong in both
+  directions: a row deleted from the base table kept being returned, and a row
+  inserted into it was never returned. The dirty marker lived in memory only,
+  and it is the only record that a refresh is owed, so nothing after the
+  restart could detect the staleness or repair it; `refresh` had to be issued
+  by hand, by someone who already suspected the answer was wrong. A graceful
+  shutdown reached this just as reliably as a crash, which is why normal
+  operation could produce it. `mark_dirty` now writes the flag through to
+  `views.bin` on the `false` to `true` transition, so the cost is at most one
+  small write per refresh cycle rather than one per write statement, and a
+  failure to record it is returned to the caller instead of being swallowed as
+  success.
+- **`upsert` wrote NULL into `unique auto` columns.** The insert branch of
+  `upsert` skipped auto-assignment, so a table declared
+  `{ unique auto id: int, unique k: str }` came back as
+  `[[1,"a"],[null,"b"],[null,"c"]]` after one `insert` and two `upsert`s: only
+  the plain `insert` got an id. Auto columns are now assigned on the insert
+  branch of `upsert` exactly as on `insert` (the same sequence, so the example
+  above now yields `[[1,"a"],[2,"b"],[3,"c"]]`), while an `upsert` that matches
+  an existing row updates it and leaves that row's id alone.
+- **`--format json` returned different types embedded than it did remote.** The
+  legacy `Query` frame stringifies every cell server-side, so an integer came
+  back as `"1"` over the wire and `1` in embedded mode: a script written against
+  an embedded run silently stopped matching the moment it was pointed at a
+  server. The CLI now requests the typed wire frames, which carry storage
+  values, and renders them the same way in both modes.
+- **`--exec` and `--exec-file` exited 1 on input that merely ended with a
+  comment.** A segment holding only comments and whitespace was still handed to
+  the parser, which answered "expected statement, got end of input" *after*
+  every write in the file had already committed. A dump that happened to end
+  with a comment line aborted a `set -e` script that had in fact succeeded.
+  Comment-only segments now never reach the engine in either mode. (0.23.0
+  announced this for the interactive REPL only, which is why the non-interactive
+  paths kept the bug.)
+- **A mistyped subcommand created a stray database.** An unrecognized argument
+  was taken as a data directory, so a typo provisioned a new directory and
+  reported success while the operator's real database went untouched. Unknown
+  subcommands and unexpected arguments now exit 2 with a "did you mean" hint.
+- **`useradd`, `passwd`, and `userdel` failed on a data directory that did not
+  exist yet.** They wrote the user store without first creating the directory
+  and surfaced a raw errno, which contradicted the documented workflow of
+  provisioning the first admin *before* the server's first start. All three now
+  create the directory with the same `0700` mode the engine uses, so `auth.json`
+  (itself `0600`) never lands in a world-readable directory.
+- **The SQL frontend mis-parsed constructs it does not support instead of
+  refusing them.** `CASE`/`WHEN` lowered to a bare `.CASE` column reference,
+  `COALESCE`, `CAST`, and `COUNT(DISTINCT ...)` lowered to nonsense PowQL calls,
+  and a window function's `OVER` surfaced as "expected from, got OVER" at the
+  clause boundary. Each now returns a terminal unsupported-feature error naming
+  the construct and pointing at the PowQL spelling that does work.
+
+### Changed
+
+- The differential oracle adjudicates **mutations**, not just reads, by
+  comparing resulting table state against SQLite. It ships with a self-test
+  proving the adjudicator can fail, after the first version turned out to be
+  vacuous.
+- The dual-path equivalence tests (roughly 5,900 lines that had never run in
+  CI) are now enabled in CI, and the compiling `cargo` invocations that gate
+  merges pass `--locked`, which exposed the node addon lockfile as two minors
+  stale. (The nightly miri and ASan jobs do not, because `-Zbuild-std` resolves
+  its own std dependencies.)
+- GitHub Release binaries and the ghcr image are now attested.
+- Dependency refresh verified against the upstream registries rather than by
+  merging bot branches: 14 Cargo checksums confirmed against the crates.io API,
+  `powdb-sync` moved to getrandom 0.4, and the TypeScript client moved to
+  TypeScript 7 (which removes `moduleResolution: "node10"`; the published
+  artifact shape is unchanged and was verified rather than assumed).
+
+### Documentation
+
+- **Every relative link in `README.md` is now absolute.** All 8 published crates
+  pointed `readme` at the workspace `README.md`, so crates.io resolved each
+  relative target against the crate's own subdirectory rather than the repo
+  root. That is 16 link occurrences across 12 distinct targets, including the
+  LICENSE link, 404ing on all 8 crate pages: roughly 128 dead links on our
+  primary Rust discovery surface. (`powdb-cli` now renders its own CLI
+  reference instead, so the absolute-link fix covers the remaining 7 pages.) Each replacement target was checked for a 200, and every
+  `#anchor` was checked against a real heading in the file it points at.
+- **Removed a documented `tls` feature that does not exist.** The README told
+  readers to disable a default `tls` feature for a fully-Rust build.
+  `powdb-server` declares no Cargo features at all, so `--no-default-features`
+  was a silent no-op and a C toolchain plus `cmake` was mandatory the whole
+  time. The requirement is now stated plainly in the README and in
+  `docs/powdb-vs-sqlite.md`.
+- **Re-measured the PowDB vs SQLite table.** The published numbers were four
+  releases old. `point_lookup_indexed` was understated by roughly 2x, and
+  `delete_by_filter` and `insert_batch_1k` have crossed from "roughly tied" to
+  marginally slower. Several aggregate workloads measured *better* than
+  published. The headline no longer claims 3-7x on scan workloads, which the
+  table never supported.
+- Corrected the fuzzing count in `docs/powdb-vs-sqlite.md` from 4 targets to the
+  9 that actually exist and run.
+- Doc examples that used `--` as a comment now use `#`. In PowQL `--` is
+  subtraction, so those lines errored, and inside a `begin`/`commit` block the
+  error left the transaction open.
+- Refreshed stale `0.19.1` version pins and CLI banners to 0.23.0.
+- `docs/POWQL.md` no longer documents the `upsert` auto-column bug as if it were
+  the design. It said "Auto-assignment applies on `insert` (not on `upsert`)";
+  it now describes the fixed behavior.
+- `docs/getting-started.md` states plainly that `useradd`, `passwd`, and
+  `userdel` work on a fresh install and create the data directory themselves,
+  which is what the surrounding "before first start" workflow always assumed.
+- Corrected the `cargo bench` runtime estimate in the README, which said ~60s
+  for a suite that measures for about four minutes.
+- Added Keep a Changelog compare links for every released version, and a
+  `[0.2.1]` entry for a release that had been live on crates.io with no
+  changelog record.
+
 ## [0.23.0] - 2026-08-09
 
 ### Fixed
@@ -1953,6 +2084,41 @@ Phase 1 (perf + security hardening) + Phase 2 (deployment + DX), shipped togethe
   transitive deps).
 - Updated required status check names in branch protection.
 
+## [0.2.1] - 2026-05-10
+
+Patch release carrying the security and QA fixes found after 0.2.0 was
+published. crates.io versions are immutable, so these could not be folded into
+0.2.0 and shipped as 0.2.1 instead.
+
+### Security
+
+- **The shared-password comparison leaked the password's length.** The
+  constant-time comparison returned early when the two inputs differed in
+  length, which is a length oracle regardless of how the remaining bytes are
+  compared. Both inputs are now hashed to SHA-256 before comparison, so the
+  compared buffers are always the same size.
+- **Added a 1 MB query-length cap (`MAX_QUERY_LENGTH`).** The handler dispatched
+  arbitrarily large query strings to the parser, so a single oversized query
+  could consume unbounded memory during parsing. The length is now checked
+  before dispatch.
+- Pinned all GitHub Actions to commit SHAs and added a top-level deny-all
+  `permissions: {}` to the ci, bench, fuzz, and release workflows.
+- Removed a hardcoded production IP address from the TypeScript client's JSDoc
+  and demo script, and added `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, and
+  `credentials.json` to `.gitignore`.
+- Bumped rustls-webpki 0.103.12 to 0.103.13 (RUSTSEC-2026-0104).
+
+### Added
+
+- `--version` / `-V` flag on the `powdb-server` binary.
+
+### Fixed
+
+- Documentation and test-harness fixes found by real user-flow QA, including
+  self-contained TypeScript live tests.
+- Refreshed the benchmark baseline from CI runner medians, without changing the
+  thesis ratio ceilings.
+
 ## [TS client 0.3.3] - 2026-05-10
 
 ### Fixed
@@ -2192,3 +2358,54 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
 | agg_sum | 9.2x faster |
 | update_by_filter | 3.2x faster |
 | delete_by_filter | 1.3x faster |
+
+<!-- Release comparison links. Generated from `git tag -l`; the four
+     `TS client x.y.z` headings are npm releases with no git tag, so they
+     have no compare link. -->
+
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/ZVN-DEV/powdb/compare/v0.22.0...v0.23.0
+[0.22.0]: https://github.com/ZVN-DEV/powdb/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/ZVN-DEV/powdb/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/ZVN-DEV/powdb/compare/v0.19.1...v0.20.0
+[0.19.1]: https://github.com/ZVN-DEV/powdb/compare/v0.19.0...v0.19.1
+[0.19.0]: https://github.com/ZVN-DEV/powdb/compare/v0.18.2...v0.19.0
+[0.18.2]: https://github.com/ZVN-DEV/powdb/compare/v0.18.1...v0.18.2
+[0.18.1]: https://github.com/ZVN-DEV/powdb/compare/v0.18.0...v0.18.1
+[0.18.0]: https://github.com/ZVN-DEV/powdb/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/ZVN-DEV/powdb/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/ZVN-DEV/powdb/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/ZVN-DEV/powdb/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/ZVN-DEV/powdb/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/ZVN-DEV/powdb/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/ZVN-DEV/powdb/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/ZVN-DEV/powdb/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/ZVN-DEV/powdb/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/ZVN-DEV/powdb/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/ZVN-DEV/powdb/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/ZVN-DEV/powdb/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/ZVN-DEV/powdb/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/ZVN-DEV/powdb/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/ZVN-DEV/powdb/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/ZVN-DEV/powdb/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/ZVN-DEV/powdb/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/ZVN-DEV/powdb/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/ZVN-DEV/powdb/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/ZVN-DEV/powdb/compare/v0.4.9...v0.5.0
+[0.4.9]: https://github.com/ZVN-DEV/powdb/compare/v0.4.8...v0.4.9
+[0.4.8]: https://github.com/ZVN-DEV/powdb/compare/v0.4.7...v0.4.8
+[0.4.7]: https://github.com/ZVN-DEV/powdb/compare/v0.4.6...v0.4.7
+[0.4.6]: https://github.com/ZVN-DEV/powdb/compare/v0.4.5...v0.4.6
+[0.4.5]: https://github.com/ZVN-DEV/powdb/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/ZVN-DEV/powdb/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/ZVN-DEV/powdb/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/ZVN-DEV/powdb/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/ZVN-DEV/powdb/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/ZVN-DEV/powdb/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/ZVN-DEV/powdb/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/ZVN-DEV/powdb/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/ZVN-DEV/powdb/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/ZVN-DEV/powdb/compare/v0.1.3...v0.2.0
+[0.1.2]: https://github.com/ZVN-DEV/powdb/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/ZVN-DEV/powdb/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ZVN-DEV/powdb/releases/tag/v0.1.0

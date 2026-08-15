@@ -4,9 +4,9 @@
 [![crates.io](https://img.shields.io/crates/v/powdb-cli.svg)](https://crates.io/crates/powdb-cli)
 [![docs.rs](https://img.shields.io/docsrs/powdb-query)](https://docs.rs/powdb-query)
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)](https://github.com/ZVN-DEV/powdb/blob/main/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ZVN-DEV/powdb/blob/main/LICENSE)
 
-**PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its compiled execution engine measures 3-7x SQLite on aggregate and scan workloads, and slower than SQLite on indexed point lookups.**
+**PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its compiled execution engine measures 3-7x SQLite on aggregates and 1-3.7x on filtered scans, and roughly 16x slower than SQLite on indexed point lookups.**
 
 - **Performance** -- compiled byte-level predicates, zero-copy mmap scans, and a plan cache with literal substitution. Filter and aggregate paths skip full row decoding.
 - **Platform** -- 100% pure-Rust core, no C dependencies, embeddable and server modes, installed with a single `cargo install` on Linux and macOS. **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
@@ -14,7 +14,7 @@
 
 Website: **[zvn-dev.github.io/powdb](https://zvn-dev.github.io/powdb/)**
 
-Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to use which](docs/powdb-vs-sqlite.md). What an upgrade may and may not break: [docs/STABILITY.md](docs/STABILITY.md).
+Evaluating PowDB? Start with the honest comparison: [PowDB vs SQLite -- when to use which](https://github.com/ZVN-DEV/powdb/blob/main/docs/powdb-vs-sqlite.md). What an upgrade may and may not break: [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md).
 
 ## What PowDB is for
 
@@ -35,11 +35,11 @@ PowDB is a single-writer embedded engine with truly parallel reads. Every writer
 - **You need live replication or sync across nodes.** Use Turso.
 - **Your workload is analytical column-crunching over one big dataset.** Use DuckDB.
 
-For the concurrency numbers behind the boundary above (single-request cost versus behavior at concurrency 10), decomposed with a reproducible script, see [docs/benchmarks/concurrency-decomposition.md](docs/benchmarks/concurrency-decomposition.md).
+For the concurrency numbers behind the boundary above (single-request cost versus behavior at concurrency 10), decomposed with a reproducible script, see [docs/benchmarks/concurrency-decomposition.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/concurrency-decomposition.md).
 
 ## How it works
 
-**Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. On scan + filter + aggregate workloads, this is where the 3-7x SQLite wins come from. It does nothing for point lookups, where PowDB is slower than SQLite.
+**Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. On aggregate workloads this is where the 3-7x SQLite wins come from; on scan-shaped workloads the same machinery buys 1-3.7x. It does nothing for point lookups, where PowDB is roughly 16x slower than SQLite.
 
 **Plan cache + tight planner-executor contract.** The planner is pure (no catalog access) and produces a canonical `PlanNode` tree; the cache hashes the canonical shape with FNV-1a and substitutes literals at lookup time, so repeat queries skip lex/parse/plan entirely. Range scans without a matching index are lowered to `Filter(SeqScan)` at execution time, keeping the planner stateless and the executor's fast paths fireable.
 
@@ -88,7 +88,11 @@ cd powdb
 cargo build --release
 ```
 
-Requires Rust 1.93+. This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks. TLS support in `powdb-server` pulls `aws-lc-sys`, which requires a C toolchain (`cmake`); disable the default `tls` feature for a fully-Rust build.
+Requires Rust 1.93+. This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks.
+
+**Building `powdb-server` or `powdb-cli` requires a C toolchain and `cmake`, and there is currently no way to opt out.** Both reach TLS through `tokio-rustls`, which pulls `aws-lc-sys`. Neither crate declares any Cargo features, so `--no-default-features` is a silent no-op: there is no `tls` feature to turn off. Making TLS optional is real work we have not done yet.
+
+The whole-workspace `cargo build --release` above compiles more than the engine: it also builds `powdb-compare`, our SQLite/Postgres comparison harness, which bundles SQLite from C source via `rusqlite` and links `postgres`. Neither ships in any published crate. The engine libraries themselves (`powdb`, `powdb-storage`, `powdb-query`, `powdb-auth`, `powdb-backup`, `powdb-sync`) pull no C at all, so `cargo build --release -p powdb` needs no C toolchain.
 
 ### Platform support
 
@@ -119,35 +123,35 @@ cargo install powdb-server
 
 ## Benchmark: PowDB vs SQLite (100K rows, Apple M5 Max laptop)
 
-PowDB's compiled predicate engine excels at read-heavy aggregate and scan workloads. For durable write throughput, batch writes in a transaction, see [Write throughput & durability](#write-throughput--durability).
+PowDB's compiled predicate engine is strongest on read-heavy aggregates, and gives a smaller and more variable win on filtered scans. All 15 workloads are listed, including the four where PowDB ties or loses. For durable write throughput, batch writes in a transaction, see [Write throughput & durability](#write-throughput--durability).
 
-These are **single-request latencies**: one query at a time, measuring per-query cost, not throughput under many simultaneous clients. On a shared read-write database at concurrency, reads amplify through the write-admission gate (PowDB has no MVCC); that behavior is decomposed in [docs/benchmarks/concurrency-decomposition.md](docs/benchmarks/concurrency-decomposition.md). See also [What PowDB is for](#what-powdb-is-for).
+These are **single-request latencies**: one query at a time, measuring per-query cost, not throughput under many simultaneous clients. On a shared read-write database at concurrency, reads amplify through the write-admission gate (PowDB has no MVCC); that behavior is decomposed in [docs/benchmarks/concurrency-decomposition.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/concurrency-decomposition.md). See also [What PowDB is for](#what-powdb-is-for).
 
 | Workload | PowDB | SQLite | Result |
 |---|---|---|---|
-| Update by primary key | 66 ns | 500 ns | **7.6x faster** |
-| Aggregate MIN | 266 us | 1.77 ms | **6.7x faster** |
-| Aggregate MAX | 271 us | 1.54 ms | **5.7x faster** |
-| Aggregate SUM | 281 us | 1.57 ms | **5.6x faster** |
-| Aggregate AVG | 516 us | 1.82 ms | **3.5x faster** |
-| Scan + filter + count | 481 us | 1.47 ms | **3.1x faster** |
-| Non-indexed point lookup | 117 us | 321 us | **2.7x faster** |
-| Scan + filter + sort + limit 10 | 2.68 ms | 6.73 ms | **2.5x faster** |
-| Insert single row | 394 ns | 790 ns | **2.0x faster** |
-| Multi-column AND filter | 1.75 ms | 3.46 ms | **2.0x faster** |
-| Update by filter (10K rows) | 2.66 ms | 5.08 ms | **1.9x faster** |
-| Delete by filter (10K rows) | 1.65 ms | 1.95 ms | roughly tied |
-| Scan + filter + project top 100 | 8.0 us | 8.9 us | roughly tied |
-| Insert batch (1K rows) | 232 ns | 257 ns | roughly tied |
-| **Indexed point lookup** | **1.65 us** | **208 ns** | **7.9x SLOWER** |
+| Aggregate MIN | 221 us | 1.70 ms | **7.7x faster** |
+| Aggregate MAX | 217 us | 1.47 ms | **6.8x faster** |
+| Aggregate SUM | 234 us | 1.45 ms | **6.2x faster** |
+| Update by primary key | 60 ns | 272 ns | **4.5x faster** |
+| Aggregate AVG | 455 us | 1.70 ms | **3.7x faster** |
+| Scan + filter + count | 380 us | 1.40 ms | **3.7x faster** |
+| Non-indexed point lookup | 101 us | 319 us | **3.2x faster** |
+| Scan + filter + sort + limit 10 | 2.46 ms | 6.41 ms | **2.6x faster** |
+| Multi-column AND filter | 1.58 ms | 3.21 ms | **2.0x faster** |
+| Update by filter (10K rows) | 2.36 ms | 4.54 ms | **1.9x faster** |
+| Insert single row | 380 ns | 638 ns | roughly tied |
+| Scan + filter + project top 100 | 8.1 us | 8.9 us | roughly tied |
+| Delete by filter (10K rows) | 1.57 ms | 1.75 ms | roughly tied |
+| Insert batch (1K rows) | 242 ns | 214 ns | roughly tied |
+| **Indexed point lookup** | **3.17 us** | **202 ns** | **15.7x SLOWER** |
 
 Reproduce with `cargo run --release -p powdb-compare`.
 
-The compiled predicate engine avoids full row decoding during scans and aggregates, which is where the 3-7x gains are. Those wins come from compiled predicates and mmap scans, not from PowQL's syntax: the same query written in SQL lowers to the same plan and gets the same numbers.
+The compiled predicate engine avoids full row decoding during scans and aggregates. That is worth 3.7-7.7x on the four aggregates, but only 1.0-3.7x on the four scan-shaped workloads, so read the rows rather than a single headline multiplier. These wins come from compiled predicates and mmap scans, not from PowQL's syntax: the same query written in SQL lowers to the same plan and gets the same numbers.
 
-**PowDB loses the indexed point lookup, badly.** Once the index is probed the remaining work is trivial, so nearly the whole 1.65 us is PowDB's own front end (lex, parse, canonicalize, plan-cache lookup) while SQLite amortizes that away with a prepared statement. If your hot path is "fetch one row by id", SQLite is the better engine and scan throughput will not compensate.
+**PowDB loses the indexed point lookup, badly, and by more than we used to publish.** Once the index is probed the remaining work is trivial, so nearly the whole 3.17 us is PowDB's own front end (lex, parse, canonicalize, plan-cache lookup) while SQLite amortizes that away with a prepared statement. The previous table put this at 7.9x against an older engine. Nine independent re-measurements of the current engine, across two machines, ranged from 10x to 20x, most of them above 15x. This row got worse and we had been understating it by roughly 2x. If your hot path is "fetch one row by id", SQLite is the better engine and scan throughput will not compensate.
 
-Both engines run in memory (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from disk cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `a090568`. **These are laptop numbers, not CI numbers.** Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
+Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from durability cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `e3dfa71`, 2026-08-15. **These are laptop numbers, not CI numbers.** One caveat specific to the write rows: PowDB writes to a real temp directory while SQLite is `:memory:`, so `insert_single`, `insert_batch_1k`, and `delete_by_filter` are sensitive to whatever else is touching the disk. Measured under a heavy concurrent build on the same laptop, those rows moved by 30-100x while every other row moved by less than 2x, and two of them changed sign. The table above is from the quietest run we could get, but this machine was not fully idle, so treat the three write rows as the least reliable and re-measure them yourself before relying on them. Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
 
 ### Write throughput & durability
 
@@ -285,7 +289,7 @@ processes can serve the same directory concurrently (a read-write open refuses
 while live readers exist, and vice versa), and a read-only open never mutates the
 directory. Embedded, use `Database.openReadOnly(dir)` (Node) or
 `Database::open_read_only(dir)` (Rust). See
-[Read-only snapshot serving](docs/read-only-serving.md) for the backup to restore
+[Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) for the backup to restore
 to serve flow, the swap-directory refresh pattern, and the requirement to refresh
 materialized views before snapshotting.
 
@@ -311,20 +315,20 @@ materialized views before snapshotting.
 | `POWDB_SOCKET` | *(off)* | Path for an additional Unix-domain-socket listener served alongside the TCP listener |
 | `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated** — bind it to localhost or a private network, never the public internet |
-| `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](docs/read-only-serving.md) |
+| `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
 ### Production checklist
 
 Before exposing `powdb-server` beyond `127.0.0.1`:
 
-- [ ] Configure authentication. Either set `POWDB_PASSWORD` to a strong shared secret, or define named users with roles (`powdb-cli --data-dir <dir> useradd …`; connect with `--user`). The server logs a `WARN` on startup when neither is configured and will accept any connection. See [Multi-user authentication](docs/getting-started.md#multi-user-authentication).
+- [ ] Configure authentication. Either set `POWDB_PASSWORD` to a strong shared secret, or define named users with roles (`powdb-cli --data-dir <dir> useradd …`; connect with `--user`). The server logs a `WARN` on startup when neither is configured and will accept any connection. See [Multi-user authentication](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md#multi-user-authentication).
 - [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network — it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.19.1 --locked` or the matching ghcr tag). PowDB is pre-1.0; minor bumps may add on-disk format versions. An older directory always opens on a newer release, but not the reverse. See [docs/STABILITY.md](docs/STABILITY.md).
-- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](docs/POWQL.md#ddl-is-not-transactional).
+- [ ] Pin the version (`cargo install powdb-server --version 0.23.0 --locked` or the matching ghcr tag). Pin to a release that is still supported: [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md) ships security fixes only for the latest minor series. PowDB is pre-1.0; minor bumps may add on-disk format versions. An older directory always opens on a newer release, but not the reverse. See [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md).
+- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#ddl-is-not-transactional).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 - [ ] Size `POWDB_DIRTY_PAGE_BUDGET` the same way. It bounds the unflushed pages one explicit transaction holds in memory, so a bulk load bigger than the budget is refused (`cannot buffer more of this transaction`) rather than OOM-killing the server. Split the load into several transactions, or raise the budget if the host has the RAM. Like the query budget it is per-transaction, not aggregate.
 
@@ -340,14 +344,14 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Memory-mapped reads (zero-syscall scan path)
 - Compiled integer predicates (branch-free filter at the byte level)
 - Thread-safe concurrent reads via pread(2)/pwrite(2), with shared server admission for autocommit reads
-- Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore` — see [docs/backup-and-restore.md](docs/backup-and-restore.md))
+- Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore` — see [docs/backup-and-restore.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/backup-and-restore.md))
 
 **Query engine**
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
-- SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](docs/SQL.md))
+- SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md))
 - Joins (hash join with compound-`ON` residuals, plus bounded nested-loop fallback)
-- Nested projections (PowQL-only): one row per parent with correlated children as a native JSON array, per-parent order/limit, multi-level nesting ([docs/POWQL.md](docs/POWQL.md#nested-projections-shaped-results))
-- Entity links (PowQL-only): declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name -- scalar `o.user.name` or block `u.orders { ... }`. A scalar hop through a non-unique key is a hard error, never a silent fan-out ([docs/POWQL.md](docs/POWQL.md#entity-links-relationship-traversal))
+- Nested projections (PowQL-only): one row per parent with correlated children as a native JSON array, per-parent order/limit, multi-level nesting ([docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#nested-projections-shaped-results))
+- Entity links (PowQL-only): declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name -- scalar `o.user.name` or block `u.orders { ... }`. A scalar hop through a non-unique key is a hard error, never a silent fan-out ([docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#entity-links-relationship-traversal))
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
@@ -377,9 +381,9 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Authentication: shared password (`POWDB_PASSWORD`) or named users with roles (argon2id-hashed)
 
 **Pure Rust core**
-- No `libsqlite3-sys`, no bindgen, no embedded C SQL engine (the SQL frontend is pure-Rust and lowers to PowQL)
-- Storage, query, and CLI are 100% Rust
-- TLS (`powdb-server` only) pulls `aws-lc-sys`; disable the `tls` feature for a C-free build
+- No `libsqlite3-sys`, no bindgen, no embedded C SQL engine in any published crate (the SQL frontend is pure-Rust and lowers to PowQL). The repo-root `cargo build` also compiles the `powdb-compare` benchmark harness, which *does* bundle SQLite from C; it is `publish = false` and ships nowhere
+- Storage, query, auth, backup, sync, and the `powdb` embedded facade are 100% Rust with no C dependency
+- `powdb-server` and `powdb-cli` pull `aws-lc-sys` (a C library needing `cmake`) through `tokio-rustls`. **There is no `tls` feature to disable** and no C-free build of those two today
 - Single `cargo install` on Linux and macOS (see [Platform support](#platform-support); Windows does not compile)
 
 ## Architecture
@@ -405,7 +409,8 @@ The engine is `powdb_query::executor::Engine`. It owns a `Catalog` (which owns `
 PowDB has a benchmark regression gate that compares every workload against checked-in baselines. Run it locally before and after touching a hot path:
 
 ```bash
-cargo bench -p powdb-bench              # criterion suite (~60s)
+cargo bench -p powdb-bench              # criterion suite: 23 benchmarks, ~5 min of
+                                        # measurement, plus compile on a cold target
 cargo run --release -p powdb-bench --bin compare   # regression gate
 ```
 
@@ -425,4 +430,4 @@ cargo test --workspace
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](https://github.com/ZVN-DEV/powdb/blob/main/LICENSE) for details.

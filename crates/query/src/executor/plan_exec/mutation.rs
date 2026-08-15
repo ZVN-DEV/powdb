@@ -121,7 +121,9 @@ impl Engine {
                 .map_err(|e| e.to_string());
             match result {
                 Ok((count, _)) => {
-                    self.view_registry.mark_dependents_dirty(table);
+                    if let Err(e) = self.view_registry.mark_dependents_dirty(table) {
+                        return Some(Err(QueryError::StorageError(e.to_string())));
+                    }
                     return Some(Ok(QueryResult::Modified(count)));
                 }
                 Err(e) => return Some(Err(QueryError::Execution(e))),
@@ -180,7 +182,9 @@ impl Engine {
                         }
                         count += 1;
                     }
-                    self.view_registry.mark_dependents_dirty(table);
+                    if let Err(e) = self.view_registry.mark_dependents_dirty(table) {
+                        return Some(Err(QueryError::StorageError(e.to_string())));
+                    }
                     return Some(Ok(QueryResult::Modified(count)));
                 }
                 Err(e) => return Some(Err(QueryError::Execution(e))),

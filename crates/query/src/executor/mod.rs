@@ -420,7 +420,7 @@ fn open_view_registry(data_dir: &Path) -> ViewRegistry {
             "materialized view has an unparseable stored source; reads will report an error \
              rather than serve rows that cannot be recomputed"
         );
-        registry.mark_dirty(&name);
+        registry.mark_dirty_in_memory(&name);
     }
     registry
 }
