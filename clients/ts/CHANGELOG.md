@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.24.0 - 2026-08-15
+
+No client API changes. Version moves in lockstep with the engine. The package
+now builds under TypeScript 7.
+
+One server-side change can produce an error where a query previously succeeded:
+a **read-only** data directory (a snapshot served with `--read-only`) now
+refuses a query that touches a materialized view left dirty at snapshot time,
+rather than answering it with stale rows. A read-only open cannot refresh, so
+the old behaviour was a silent wrong answer. The error names the remedy:
+refresh materialized views before snapshotting. Read-write servers are
+unaffected, since they refresh on demand.
+
 ## 0.23.0 - 2026-08-09
 
 No client changes. Version moves in lockstep with the engine.

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-15
+
 ### Changed
 
 - **Read-only snapshot serving now refuses a stale materialized view instead of
@@ -2363,7 +2365,8 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ZVN-DEV/powdb/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/ZVN-DEV/powdb/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/ZVN-DEV/powdb/compare/v0.20.0...v0.21.0
