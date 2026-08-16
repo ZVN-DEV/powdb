@@ -17,8 +17,23 @@ pub const SYNC_METADATA_FORMAT_VERSION: u32 = 1;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CURSOR_LOCK_FILE: &str = ".replica-cursors.lock";
-const CURSOR_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a caller waits for the cursor lock before giving up.
+///
+/// Deliberately equal to [`CURSOR_LOCK_STALE_AFTER`]. The holder's critical
+/// section is two fsyncs, so its cost rises with the number of contenders and
+/// with whatever else is hitting the disk; the previous 5s could be exhausted
+/// by ordinary contention on a busy machine, and the caller then got a
+/// `WouldBlock` error for a lock that was simply in use rather than stuck. A
+/// genuinely abandoned lock is not the reason to wait less: a dead owner is
+/// detected and reclaimed by `reclaim_stale_cursor_lock` on every retry, and
+/// that only becomes possible at `CURSOR_LOCK_STALE_AFTER`. Giving up sooner
+/// than that means failing before the one mechanism that could have unblocked
+/// us has had a chance to run.
+const CURSOR_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+/// First backoff step. Grows to [`CURSOR_LOCK_RETRY_MAX`]; see
+/// [`cursor_lock_backoff`] for why it grows and why it is jittered.
 const CURSOR_LOCK_RETRY: Duration = Duration::from_millis(5);
+const CURSOR_LOCK_RETRY_MAX: Duration = Duration::from_millis(50);
 const CURSOR_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,9 +447,36 @@ impl Drop for CursorLock {
     }
 }
 
+/// How long to wait before the next attempt at the cursor lock.
+///
+/// Doubles from [`CURSOR_LOCK_RETRY`] to [`CURSOR_LOCK_RETRY_MAX`], then stays
+/// there, and every result is jittered across the lower half of its step.
+///
+/// The jitter is the point. A fixed delay makes every waiter sleep the same
+/// amount and therefore wake together, so N contenders re-collide on the same
+/// `create_new` on every round and only the scheduler decides who wins. Nothing
+/// in that arrangement guarantees a given waiter ever wins. Spreading the wakeups
+/// turns the herd into a queue.
+fn cursor_lock_backoff(attempt: u32) -> Duration {
+    let step = CURSOR_LOCK_RETRY
+        .saturating_mul(1u32 << attempt.min(5))
+        .min(CURSOR_LOCK_RETRY_MAX);
+    // Cheap decorrelation: the low bits of the clock differ between threads that
+    // reached this line at slightly different times, which is exactly the set of
+    // threads we are trying to separate. No RNG dependency for a sleep length.
+    let spread = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let half = step.as_nanos() as u64 / 2;
+    let jitter = if half == 0 { 0 } else { spread % half };
+    step - Duration::from_nanos(jitter)
+}
+
 fn acquire_cursor_lock(state_dir: &Path) -> io::Result<CursorLock> {
     let path = state_dir.join(CURSOR_LOCK_FILE);
     let start = Instant::now();
+    let mut attempt: u32 = 0;
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
@@ -470,7 +512,8 @@ fn acquire_cursor_lock(state_dir: &Path) -> io::Result<CursorLock> {
                         "timed out waiting for sync cursor metadata lock",
                     ));
                 }
-                std::thread::sleep(CURSOR_LOCK_RETRY);
+                std::thread::sleep(cursor_lock_backoff(attempt));
+                attempt = attempt.saturating_add(1);
             }
             Err(err) => return Err(err),
         }
@@ -893,6 +936,37 @@ mod tests {
         let cursors = read_replica_cursors(dir.path()).unwrap();
         assert_eq!(cursors.len(), 16);
         assert_eq!(minimum_retained_lsn(dir.path()).unwrap(), Some(101));
+    }
+
+    #[test]
+    fn cursor_lock_backoff_grows_and_stays_within_its_step() {
+        // Each step must sit in the upper half of its nominal delay: jitter
+        // only ever shortens a wait, so backoff cannot collapse to a busy loop.
+        for attempt in 0..8u32 {
+            let nominal = CURSOR_LOCK_RETRY
+                .saturating_mul(1u32 << attempt.min(5))
+                .min(CURSOR_LOCK_RETRY_MAX);
+            let waited = cursor_lock_backoff(attempt);
+            assert!(
+                waited <= nominal && waited >= nominal / 2,
+                "attempt {attempt}: {waited:?} outside the half-open step below {nominal:?}"
+            );
+        }
+        // And it must actually grow, or contention never spreads out.
+        assert!(cursor_lock_backoff(4) > cursor_lock_backoff(0));
+        // Capped, so a long wait never turns into a multi-second sleep that
+        // overshoots the timeout it is supposed to be polling within.
+        assert!(cursor_lock_backoff(31) <= CURSOR_LOCK_RETRY_MAX);
+    }
+
+    #[test]
+    fn cursor_lock_timeout_is_not_shorter_than_the_staleness_window() {
+        // Giving up before a dead owner can be declared stale means failing
+        // before reclaim -- the only thing that could unblock us -- can run.
+        assert!(
+            CURSOR_LOCK_TIMEOUT >= CURSOR_LOCK_STALE_AFTER,
+            "a caller must not give up before an abandoned lock becomes reclaimable"
+        );
     }
 
     #[test]

@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "powdb"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-auth"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "argon2",
  "serde",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-backup"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "blake3",
  "powdb-query",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-bench"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "criterion",
  "libc",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-cli"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "powdb-auth",
  "powdb-backup",
@@ -1856,7 +1856,6 @@ dependencies = [
  "powdb-storage",
  "powdb-sync",
  "rcgen",
- "rustls-pemfile",
  "rustyline",
  "tokio",
  "tokio-rustls",
@@ -1867,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-compare"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "mysql",
  "postgres",
@@ -1879,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-oracle"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1889,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1902,7 +1901,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "bytes",
  "powdb-auth",
@@ -1910,7 +1909,6 @@ dependencies = [
  "powdb-storage",
  "powdb-sync",
  "rcgen",
- "rustls-pemfile",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
@@ -1923,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1938,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-sync"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "crc32fast",
  "getrandom 0.4.3",

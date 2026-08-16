@@ -1637,15 +1637,19 @@ enum RemoteStream {
 /// bundle (Mozilla's CA program) is used.
 fn build_tls_connector(ca_path: Option<&str>) -> Result<tokio_rustls::TlsConnector, String> {
     use tokio_rustls::rustls;
+    // See the matching note in powdb-server: `rustls-pemfile` is unmaintained
+    // (RUSTSEC-2025-0134) and this API now lives in `rustls-pki-types`.
+    use rustls::pki_types::pem::PemObject;
 
     let mut roots = rustls::RootCertStore::empty();
     match ca_path {
         Some(path) => {
             let file = std::fs::File::open(path)
                 .map_err(|e| format!("failed to open TLS CA file {path}: {e}"))?;
-            let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("failed to parse TLS CA file {path}: {e}"))?;
+            let certs: Vec<_> =
+                rustls::pki_types::CertificateDer::pem_reader_iter(std::io::BufReader::new(file))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("failed to parse TLS CA file {path}: {e}"))?;
             if certs.is_empty() {
                 return Err(format!("no certificates found in TLS CA file {path}"));
             }

@@ -474,19 +474,33 @@ fn build_tls_acceptor(
 ) -> Result<tokio_rustls::TlsAcceptor, Box<dyn std::error::Error>> {
     use std::io::BufReader;
     use tokio_rustls::rustls;
+    // PEM parsing comes from `rustls-pki-types` rather than `rustls-pemfile`,
+    // which the rustls project marked unmaintained in RUSTSEC-2025-0134 after
+    // folding this exact API into pki-types. Same maintainers, same parser, and
+    // pki-types was already in the tree as a rustls dependency.
+    use rustls::pki_types::pem::PemObject;
 
     let cert_file = std::fs::File::open(cert_path)
         .map_err(|e| format!("failed to open TLS cert {cert_path}: {e}"))?;
     let key_file = std::fs::File::open(key_path)
         .map_err(|e| format!("failed to open TLS key {key_path}: {e}"))?;
 
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("failed to parse TLS certs: {e}"))?;
+    let certs: Vec<_> =
+        rustls::pki_types::CertificateDer::pem_reader_iter(BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to parse TLS certs: {e}"))?;
 
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| format!("failed to parse TLS key: {e}"))?
-        .ok_or("no private key found in TLS key file")?;
+    // `from_pem_reader` returns `NoItemsFound` where the old `private_key`
+    // returned `Ok(None)`, so the "no key in the file" case keeps its own
+    // message instead of collapsing into the generic parse error.
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_reader(BufReader::new(key_file)).map_err(
+        |e| match e {
+            rustls::pki_types::pem::Error::NoItemsFound => {
+                "no private key found in TLS key file".to_string()
+            }
+            other => format!("failed to parse TLS key: {other}"),
+        },
+    )?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()

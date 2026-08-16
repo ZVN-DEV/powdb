@@ -21,20 +21,14 @@
 # Transitive unmaintained/unsound advisories (proc-macro-error2, lru, rand)
 # surface as non-failing `cargo audit` warnings and are left visible on purpose.
 #
-# Nothing here may be an actual vulnerability. The single entry below is an
-# unmaintained warning; if it ever becomes a vulnerability, fix the dependency
-# instead of extending this list.
-ignore = [
-  # Unmaintained, NOT vulnerable: no CVE and no exploit path, the crate simply
-  # stopped receiving updates. rustls-pemfile is a direct dependency of
-  # powdb-server and powdb-cli, where it parses operator-supplied TLS cert/key
-  # PEM files at startup. It never sees network input. The migration target is
-  # the `PemObject` trait in rustls-pki-types >= 1.9.0, which is already in the
-  # tree via tokio-rustls, so the fix is a real code change in both crates' TLS
-  # setup rather than a version bump. Tracked as follow-up work; re-check this
-  # entry when that lands.
-  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 is unmaintained but not vulnerable; it only parses local operator-supplied TLS PEM files. Migration to rustls-pki-types PemObject is a code change, tracked separately." },
-]
+# Nothing here may be an actual vulnerability, and the list is currently EMPTY.
+# If you are about to add an entry, prefer fixing the dependency: the last
+# occupant (RUSTSEC-2025-0134, rustls-pemfile) sat here as "tracked as follow-up
+# work" until powdb-server and powdb-cli were migrated to the rustls-pki-types
+# `PemObject` API on 2026-08-16, at which point the entry had to be deleted --
+# cargo-deny reports an ignore that matches nothing as `advisory-not-detected`,
+# which is exactly how the previous stale list started.
+ignore = []
 
 [licenses]
 # Permissive-only allowlist covering the current dependency tree.

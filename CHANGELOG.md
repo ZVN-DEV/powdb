@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-16
+
+### Fixed
+
+**The follow-up round: the seven defects the v0.24.0 audit found and deferred.
+One of them destroyed a database.**
+
+- **`alter <T> drop <column>` could permanently brick the data directory.**
+  Dropping a column that carried a `unique` index, or dropping the last column
+  a table had, aborted the process with `index out of bounds` and left a
+  directory no later process could open. The rewrite that follows a drop
+  rebuilds every secondary index from the rewritten heap, and it used the
+  `col_idx` each index cached *before* the drop. That number is wrong in two
+  ways at once afterwards: the dropped column's own index entry names a column
+  that is gone, and every index sitting after it has shifted one slot left. The
+  crate is built `panic = "abort"`, so this was a SIGABRT rather than a
+  recoverable error, and it fired *before* the catalog was persisted while the
+  `DdlDropColumn` WAL record was already durable — so every subsequent open
+  replayed the record and aborted in the same place. A supervised server
+  restart-looped forever on data that was otherwise intact. Index positions are
+  now resolved from the post-drop schema by name, which is what the
+  expression-index arm of the same function already did, and the dropped
+  column's `.idx` file is removed instead of being orphaned under the exact
+  name a re-added column would claim.
+- **A materialized view built over another view was stale forever.** A view is a
+  legal source for another view, so `materialize V2 as V1` records `V1` as its
+  dependency, but dirty propagation only walked one level. Mutating the base
+  table marked `V1` dirty and left `V2` clean over `V1`'s pre-mutation rows, and
+  nothing ever revisits a clean view, so `V2` stayed wrong permanently, in both
+  directions, with no error. Propagation is now transitive; only a clean-to-dirty
+  transition is enqueued, so an already-dirty layer stops the walk and the
+  steady-state write cost is unchanged.
+- **Dropping a table left its views serving rows from a table that no longer
+  existed.** `drop <T>` never touched the view registry, so a materialized view
+  over the dropped table kept answering from its orphaned copy — while `refresh`
+  on that same view already failed with "table not found". The read and the
+  refresh disagreed, and the read was the one that lied. Dropping a table now
+  marks its dependent views (including views over those views) dirty, so a read
+  takes the refresh path and reports the missing source instead of serving it.
+  The `drop` message also names the views it just broke rather than leaving them
+  to be discovered by hitting the error later.
+
+### Changed
+
+- **`powdb-server` and `powdb-cli` no longer depend on `rustls-pemfile`.** The
+  rustls project marked it unmaintained (RUSTSEC-2025-0134) after folding the
+  API into `rustls-pki-types`, which was already in the tree. TLS certificate
+  and key parsing now uses `PemObject` there. Same maintainers, same parser, no
+  behaviour change; the "no private key found in TLS key file" message is
+  preserved explicitly, because the new API reports that case as an error where
+  the old one returned `Ok(None)`.
+- **The sync cursor lock waits longer and backs off.** `upsert_replica_cursor`
+  and friends gave up after 5 seconds, which a holder doing two fsyncs under
+  ordinary contention on a busy machine could exhaust — the caller then got a
+  `WouldBlock` error for a lock that was in use rather than stuck. The timeout is
+  now 30 seconds, equal to the staleness window, because giving up sooner means
+  failing before the reclaim path that detects an abandoned lock can even run.
+  Retries use jittered exponential backoff instead of a fixed 5 ms, so waiters
+  stop waking in lockstep and re-colliding on every round.
+- **The embedded Node addon's `QueryResultJs` is a discriminated union.**
+  `query`, `querySql` and `queryReadonly` were typed as a flat interface with
+  `kind: string` and every field optional, so `r.rows` stayed `string[][] |
+  undefined` even after checking `r.kind === "rows"`, and reading `r.rows` off a
+  scalar result type-checked fine. It is now the same four-variant union
+  `@zvndev/powdb-client` exports, matching the addon's own `NativeQueryResult`.
+
+  **The runtime shape is unchanged** — it is still the same flat object, now
+  exported as `QueryResultShape` — but this is a **breaking change for
+  TypeScript source**: reading `r.rows` without first narrowing on `r.kind` no
+  longer compiles, because `rows` is not a member of every variant. That is the
+  point of the change; the code it now rejects was reading a field the result
+  did not have. Add the `kind` check, and the non-null assertions the old type
+  forced (`r.rows!`) can come out:
+
+  ```ts
+  // before: r.rows is string[][] | undefined, even here
+  if (r.kind === "rows") console.log(r.rows!.length)
+  // after: r.rows is string[][]
+  if (r.kind === "rows") console.log(r.rows.length)
+  ```
+
+  JavaScript consumers are unaffected.
+
+### Documentation
+
+- **`docs/backup-and-restore.md` no longer documents a restore that cannot be
+  performed.** The coarse-PITR section showed `restore ... --apply inc-1 --apply
+  inc-2` as the recipe for recovering to a point in time. Every increment
+  `powdb-cli backup --base` produces is diffed against the same full base, so no
+  two of them can ever be chained: applying `inc-1` moves the restored database
+  to `inc-1`'s LSN while `inc-2` still records the base LSN, and the continuity
+  check correctly rejects it. The doc now shows the single-increment restore
+  that actually reaches each point in time, quotes the error the impossible form
+  produces, and explains why it is the check working rather than a bug.
+
 ## [0.24.0] - 2026-08-15
 
 ### Changed
@@ -2365,7 +2460,8 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ZVN-DEV/powdb/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/ZVN-DEV/powdb/compare/v0.21.0...v0.22.0

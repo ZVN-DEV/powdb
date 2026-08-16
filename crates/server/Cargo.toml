@@ -13,13 +13,12 @@ categories = ["database", "database-implementations", "network-programming"]
 documentation = "https://docs.rs/powdb-server"
 
 [dependencies]
-powdb-storage = { version = "0.24.0", path = "../storage" }
-powdb-query = { version = "0.24.0", path = "../query" }
-powdb-auth = { version = "0.24.0", path = "../auth" }
-powdb-sync = { version = "0.24.0", path = "../sync" }
+powdb-storage = { version = "0.25.0", path = "../storage" }
+powdb-query = { version = "0.25.0", path = "../query" }
+powdb-auth = { version = "0.25.0", path = "../auth" }
+powdb-sync = { version = "0.25.0", path = "../sync" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 sha2 = "0.11"
 zeroize = "1"
 thiserror.workspace = true

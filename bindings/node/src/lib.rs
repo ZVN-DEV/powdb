@@ -77,7 +77,7 @@ fn unregister_open(key: &Path) {
 /// - `"ok"`     → `affected`
 /// - `"message"`→ `message`
 #[napi(object)]
-pub struct QueryResultJs {
+pub struct QueryResultShape {
     pub kind: String,
     pub columns: Option<Vec<String>>,
     pub rows: Option<Vec<Vec<String>>>,
@@ -116,8 +116,8 @@ pub struct ApplyRetainedUnitsResultJs {
     pub units_applied: u32,
 }
 
-fn empty() -> QueryResultJs {
-    QueryResultJs {
+fn empty() -> QueryResultShape {
+    QueryResultShape {
         kind: String::new(),
         columns: None,
         rows: None,
@@ -127,9 +127,9 @@ fn empty() -> QueryResultJs {
     }
 }
 
-fn to_js(r: QueryResult) -> QueryResultJs {
+fn to_js(r: QueryResult) -> QueryResultShape {
     match r {
-        QueryResult::Rows { columns, rows } => QueryResultJs {
+        QueryResult::Rows { columns, rows } => QueryResultShape {
             kind: "rows".into(),
             columns: Some(columns),
             rows: Some(
@@ -139,23 +139,23 @@ fn to_js(r: QueryResult) -> QueryResultJs {
             ),
             ..empty()
         },
-        QueryResult::Scalar(v) => QueryResultJs {
+        QueryResult::Scalar(v) => QueryResultShape {
             kind: "scalar".into(),
             value: Some(v.to_wire_string()),
             ..empty()
         },
-        QueryResult::Modified(n) => QueryResultJs {
+        QueryResult::Modified(n) => QueryResultShape {
             kind: "ok".into(),
             affected: Some(BigInt::from(n)),
             ..empty()
         },
         // Match the server's wording so embedded and wire results agree.
-        QueryResult::Created(name) => QueryResultJs {
+        QueryResult::Created(name) => QueryResultShape {
             kind: "message".into(),
             message: Some(format!("type {name} created")),
             ..empty()
         },
-        QueryResult::Executed { message } => QueryResultJs {
+        QueryResult::Executed { message } => QueryResultShape {
             kind: "message".into(),
             message: Some(message),
             ..empty()
@@ -542,8 +542,8 @@ impl Database {
     }
 
     /// Run a PowQL statement.
-    #[napi]
-    pub fn query(&mut self, powql: String) -> napi::Result<QueryResultJs> {
+    #[napi(ts_return_type = "QueryResultJs")]
+    pub fn query(&mut self, powql: String) -> napi::Result<QueryResultShape> {
         self.inner_mut()?
             .query(&powql)
             .map(to_js)
@@ -551,8 +551,8 @@ impl Database {
     }
 
     /// Run a SQL statement (lowered to PowQL by the SQL frontend).
-    #[napi]
-    pub fn query_sql(&mut self, sql: String) -> napi::Result<QueryResultJs> {
+    #[napi(ts_return_type = "QueryResultJs")]
+    pub fn query_sql(&mut self, sql: String) -> napi::Result<QueryResultShape> {
         self.inner_mut()?
             .query_sql(&sql)
             .map(to_js)
@@ -560,8 +560,8 @@ impl Database {
     }
 
     /// Run a read-only PowQL statement. Errors if it would mutate.
-    #[napi]
-    pub fn query_readonly(&self, powql: String) -> napi::Result<QueryResultJs> {
+    #[napi(ts_return_type = "QueryResultJs")]
+    pub fn query_readonly(&self, powql: String) -> napi::Result<QueryResultShape> {
         self.inner_ref()?
             .query_readonly(&powql)
             .map(to_js)

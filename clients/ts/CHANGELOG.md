@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.25.0 - 2026-08-16
+
+No client API changes. Version moves in lockstep with the engine. This client's
+`QueryResult` union is unchanged; the sibling `@zvndev/powdb-embedded` addon
+adopted the same union shape this release, so the two now narrow identically.
+
+Two engine-side changes are worth knowing about from the client:
+
+- Dropping a table now invalidates every materialized view built over it
+  (including views over those views). A query against such a view returns an
+  error naming the missing source table instead of silently answering from the
+  view's orphaned copy of the rows.
+- A materialized view built over another view now sees changes to the base
+  table. It previously went stale permanently, in both directions, with no
+  error.
+
 ## 0.24.0 - 2026-08-15
 
 No client API changes. Version moves in lockstep with the engine. The package

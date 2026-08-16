@@ -205,12 +205,21 @@ impl ViewRegistry {
     /// lookup and a scan of a short name list with no allocation and no I/O.
     /// The write happens at most once per refresh cycle.
     ///
+    /// Propagation is **transitive**. A view is itself a valid source for
+    /// another view, so `V2 as V1` records `V1` in its `depends_on` and the
+    /// one-level walk this used to do never reached it: mutating the base
+    /// table marked `V1` dirty and left `V2` clean over `V1`'s pre-mutation
+    /// contents, permanently, because nothing else ever revisits a clean view.
+    /// Only a clean-to-dirty transition is enqueued, so an already-dirty layer
+    /// stops the walk and the steady-state cost is unchanged.
+    ///
     /// See [`ViewRegistry::mark_dirty`] for why the flag has to be on disk
     /// at all, and for the failure contract.
     #[inline]
     pub fn mark_dependents_dirty(&mut self, table: &str) -> io::Result<()> {
-        // Both fast exits before anything is cloned: no dependents at all, or
-        // every dependent already dirty.
+        // Fast exit before anything is cloned: no dependent of `table` is
+        // clean, so there is no transition here and none downstream either
+        // (a dirty view's own dependents were marked when it went dirty).
         let any_clean = self.deps.get(table).is_some_and(|names| {
             names
                 .iter()
@@ -219,15 +228,44 @@ impl ViewRegistry {
         if !any_clean {
             return Ok(());
         }
-        // Borrow the view names list first, then mutate views.
-        // We need to collect to avoid double-borrow.
-        let names: Vec<String> = self.deps.get(table).cloned().unwrap_or_default();
-        for name in &names {
-            if let Some(def) = self.views.get_mut(name.as_str()) {
-                def.dirty = true;
+
+        // Walk the dependency graph breadth-first, enqueuing only the views
+        // this call actually transitions. `dirty` doubles as the visited set,
+        // so a dependency cycle terminates on the second visit instead of
+        // looping.
+        let mut queue: Vec<String> = vec![table.to_string()];
+        while let Some(source) = queue.pop() {
+            let names: Vec<String> = self.deps.get(source.as_str()).cloned().unwrap_or_default();
+            for name in names {
+                match self.views.get_mut(name.as_str()) {
+                    Some(def) if !def.dirty => {
+                        def.dirty = true;
+                        queue.push(name);
+                    }
+                    _ => {}
+                }
             }
         }
         self.persist()
+    }
+
+    /// Every view that depends on `source`, directly or through another view.
+    ///
+    /// Sorted, so a caller that puts these in a message gets a stable order
+    /// rather than whatever the hash map happened to yield.
+    pub fn dependents_of(&self, source: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = vec![source.to_string()];
+        while let Some(current) = queue.pop() {
+            for name in self.deps.get(current.as_str()).into_iter().flatten() {
+                if !found.iter().any(|seen| seen == name) {
+                    found.push(name.clone());
+                    queue.push(name.clone());
+                }
+            }
+        }
+        found.sort();
+        found
     }
 
     /// List all view names.

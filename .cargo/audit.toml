@@ -29,10 +29,13 @@
 # (postgres-protocol) and RUSTSEC-2026-0178 (tokio-postgres), all resolved by
 # the dependency refresh in #211.
 #
-# Not ignored, on purpose: rustls-pemfile (RUSTSEC-2025-0134) IS reachable from
-# published crates. It is unmaintained, not vulnerable, so it is a non-failing
-# warning here and stays visible. See deny.toml for the justification and the
-# migration target.
+# Not ignored, on purpose: rustls-pemfile (RUSTSEC-2025-0134). As of 2026-08-16
+# no published crate reaches it any more — powdb-server and powdb-cli were
+# migrated to the `rustls-pki-types` PEM API, which is where the rustls project
+# moved this code when it retired the crate. The only remaining path is
+# mysql -> powdb-compare (publish=false, bench-only). It stays un-ignored rather
+# than being moved into the list below, because it is a non-failing warning and
+# leaving it visible is what will tell us when `mysql` finally drops it too.
 [advisories]
 ignore = [
     # rkyv 0.7.46: shared-pointer validation ignored pointer metadata, so an
