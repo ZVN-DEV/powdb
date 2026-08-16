@@ -3180,6 +3180,7 @@ impl Catalog {
         let removed_expression_index_ids = self
             .by_name_mut(table)?
             .remove_expression_indexes_for_root(col_name);
+        let had_plain_index = self.by_name_mut(table)?.remove_index_for_column(col_name);
         let barrier_lsn = if !self.wal.is_off() {
             let payload = encode_ddl_alter_drop_column(table, col_name);
             self.wal.append(0, WalRecordType::DdlDropColumn, &payload)?;
@@ -3232,6 +3233,14 @@ impl Catalog {
             let idx_path = self
                 .data_dir
                 .join(expression_index_file_name(table, index_id));
+            let _ = fs::remove_file(idx_path);
+        }
+        // Same cleanup for a plain column index. Left behind, the file is not
+        // just clutter: it is a tree keyed on a column the schema no longer
+        // has, sitting under the exact name a future `{table}_{col}.idx` would
+        // claim if the column were ever added back.
+        if had_plain_index {
+            let idx_path = self.data_dir.join(format!("{table}_{col_name}.idx"));
             let _ = fs::remove_file(idx_path);
         }
         Ok(())

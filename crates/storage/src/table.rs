@@ -415,6 +415,20 @@ impl Table {
             .map(|index| &mut index.btree)
     }
 
+    /// Forget the plain b-tree index on `col_name`, if there is one.
+    ///
+    /// Returns `true` when an entry was actually removed, so the caller knows
+    /// whether there is a `{table}_{col}.idx` file left to delete. Called
+    /// unconditionally on a column drop rather than relying on the rewrite
+    /// path, because the rewrite only runs when the table has rows: an empty
+    /// table would otherwise keep an index entry naming a column that no longer
+    /// exists until the next reopen rebuilt the list from the schema.
+    pub(crate) fn remove_index_for_column(&mut self, col_name: &str) -> bool {
+        let previous_len = self.indexed_cols.len();
+        self.indexed_cols.retain(|c| c.col_name != col_name);
+        self.indexed_cols.len() != previous_len
+    }
+
     pub(crate) fn remove_expression_indexes_for_root(&mut self, root: &str) -> Vec<u64> {
         let mut removed = Vec::new();
         self.expression_indexes.retain(|index| {
@@ -869,10 +883,24 @@ impl Table {
             // Preserve per-index metadata (col_idx, col_name, is_int)
             // via fresh BTree instances. The old btrees are dropped
             // when `indexed_cols` is reassigned.
+            //
+            // Resolve each index's column position from the *new* schema by
+            // name rather than trusting the `col_idx` it carried in. A drop
+            // makes both of the cached values wrong at once: the dropped
+            // column's own entry now names a column that is gone, and every
+            // index sitting after it has shifted one slot left. Reusing the old
+            // number indexed past the end of the rewritten row and aborted the
+            // process (`panic = "abort"`) before the catalog was persisted,
+            // while the DdlDropColumn WAL record was already durable — so every
+            // later open replayed it and aborted in the same place. Name
+            // resolution is what the expression-index arm below already does.
             let existing: Vec<(usize, String, bool, bool)> = self
                 .indexed_cols
                 .iter()
-                .map(|c| (c.col_idx, c.col_name.clone(), c.is_int, c.unique))
+                .filter_map(|c| {
+                    let col_idx = self.schema.column_index(&c.col_name)?;
+                    Some((col_idx, c.col_name.clone(), c.is_int, c.unique))
+                })
                 .collect();
 
             // Drain the old entries first so the borrow of

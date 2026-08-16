@@ -2079,9 +2079,31 @@ impl Engine {
                 self.catalog
                     .drop_table(name)
                     .map_err(|e| QueryError::StorageError(e.to_string()))?;
-                Ok(QueryResult::Executed {
-                    message: format!("table '{name}' dropped"),
-                })
+                // Dropping a table invalidates every view built over it just
+                // as surely as mutating one does, and more permanently: the
+                // rows a materialized view holds are now the only copy of data
+                // whose source is gone. Without this, reading such a view kept
+                // answering from that orphaned copy while `refresh` on the same
+                // view already failed with "table not found" — the read and the
+                // refresh disagreed about whether the view was still valid.
+                // Marking dependents dirty makes the read take the refresh
+                // path, so both now report the missing source instead of one
+                // silently serving it.
+                let views_affected = self
+                    .view_registry
+                    .mark_dependents_dirty(name)
+                    .map(|()| self.view_registry.dependents_of(name))
+                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                let message = if views_affected.is_empty() {
+                    format!("table '{name}' dropped")
+                } else {
+                    let (subject, verb) = describe_view_list(&views_affected);
+                    format!(
+                        "table '{name}' dropped; {subject} {verb} no source and \
+                         will fail until dropped or recreated"
+                    )
+                };
+                Ok(QueryResult::Executed { message })
             }
 
             PlanNode::ListTypes => self.introspect_list_types(),
@@ -3501,6 +3523,18 @@ impl Engine {
 /// True when any nested field (at any depth) is an unresolved link traversal
 /// (a block `via_link` or an unresolved scalar link path) and therefore needs
 /// catalog resolution before assembly.
+/// Render a view-name list for the `drop` message, with the verb that agrees
+/// with it: ("view 'V'", "has") for one, ("views 'A', 'B'", "have") for several.
+/// Callers only reach this with a non-empty list.
+fn describe_view_list(names: &[String]) -> (String, &'static str) {
+    let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
+    if quoted.len() == 1 {
+        (format!("view {}", quoted[0]), "has")
+    } else {
+        (format!("views {}", quoted.join(", ")), "have")
+    }
+}
+
 pub(crate) fn nested_fields_have_via_link(fields: &[NestedProjectField]) -> bool {
     fn nested_has(nested: &NestedProjection) -> bool {
         nested.via_link.is_some()

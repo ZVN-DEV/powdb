@@ -2,7 +2,7 @@
 
 PowDB takes a crash-consistent, blake3-verified full snapshot of a database directory and rebuilds a fresh one from it. Use it to capture a recoverable copy of your data before an upgrade, a risky migration, or on a regular schedule.
 
-The baseline is a **full snapshot**: the whole database, all tables, in one operation. On top of that, PowDB supports **incremental (differential) backups** and **coarse point-in-time restore** by chaining a full base with one or more increments (see [Incremental backup & point-in-time restore](#incremental-backup--point-in-time-restore)). Fine-grained (sub-increment) PITR and cloud sync are planned for later phases (see [Limitations](#limitations)).
+The baseline is a **full snapshot**: the whole database, all tables, in one operation. On top of that, PowDB supports **incremental (differential) backups** and **coarse point-in-time restore** by applying one increment on top of a full base (see [Incremental backup & point-in-time restore](#incremental-backup--point-in-time-restore)). Fine-grained (sub-increment) PITR and cloud sync are planned for later phases (see [Limitations](#limitations)).
 
 ---
 
@@ -52,7 +52,15 @@ A full snapshot copies every file every time. For a database that changes a litt
 
 The CLI uses a **differential-since-full** model: every incremental is diffed against the same **full base**, not against the previous increment. Each incremental compares the current page LSNs against the base's `source_lsn` and stores only pages whose `page_lsn` is newer. Whole files that can't be paged (the catalog) are copied in full when they change.
 
-Because every increment is independent of the others, you can keep a series of increments against one full base and restore *any one of them* on top of the base — no intermediate increment is required. (The underlying `restore_chain` can also apply several increments in order; the differential model just means you usually only need one.)
+Because every increment is independent of the others, you can keep a series of increments against one full base and restore *any one of them* on top of the base. No intermediate increment is required, and none may be supplied.
+
+**One increment per restore, and that is the whole model.** Every increment the CLI produces is built against the same full base, so no two of them can be chained: applying `inc-1` moves the restored database to `inc-1`'s LSN, and `inc-2` still records the *base* LSN as its starting point, so the continuity check below rejects it:
+
+```
+Error: chain restore failed: increment chain broken: expected base lsn 5, increment built on 3
+```
+
+That is the check doing its job, not a bug. `restore_chain` accepts a list because the underlying format allows a chain built against successive bases, but `powdb-cli backup --base` only ever produces differential-since-full increments, so pass exactly one `--apply` and pick the increment for the point in time you want.
 
 ### Take an incremental backup
 
@@ -74,9 +82,9 @@ incremental backup: 2 changed files (1 whole, 1 paged), 7 delta pages, base lsn 
 
 An incremental directory holds an `increment.json` manifest plus a `<name>.delta` sidecar for each paged file (each delta packs the changed pages: a 4-byte page index followed by the 4 KB page, repeated). The catalog is copied whole when it changed.
 
-### Chain restore (coarse PITR)
+### Restore an increment (coarse PITR)
 
-Restore the full base and apply the increment(s) with `--apply` (repeatable, applied in the order given):
+Restore the full base and apply one increment with `--apply`:
 
 ```bash
 # Restore the full base plus one increment
@@ -90,11 +98,12 @@ restored backup ./backups/full + 1 increment(s) -> ./restored
   applied ./backups/inc-1
 ```
 
-**Coarse PITR.** Keep periodic increments (say one per hour) against your full base. To recover to a chosen point in time, restore the full base and apply the increment(s) up to the target point. The granularity is the increment cadence — restore lands you at the state captured by the last increment you apply, not at an arbitrary instant within it.
+**Coarse PITR.** Keep periodic increments (say one per hour) against your full base. To recover to a chosen point in time, restore the full base and apply *the one increment* nearest the target point. The granularity is the increment cadence: restore lands you at the state captured by that increment, not at an arbitrary instant within it.
 
 ```bash
-# Restore to the state at inc-2's capture time
-powdb-cli restore ./backups/full ./restored --apply ./backups/inc-1 --apply ./backups/inc-2
+# Restore to the state at inc-2's capture time — inc-1 is not needed and
+# must not be passed, because inc-2 is diffed against the base, not against inc-1
+powdb-cli restore ./backups/full ./restored --apply ./backups/inc-2
 ```
 
 ### Chain verification

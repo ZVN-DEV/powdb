@@ -7,10 +7,10 @@ latest release to stay supported.
 
 | Version         | Supported          |
 | --------------- | ------------------ |
-| 0.24.x          | :white_check_mark: |
+| 0.25.x          | :white_check_mark: |
+| 0.24.x          | :x: (superseded)   |
 | 0.23.x          | :x: (superseded)   |
 | 0.22.x          | :x: (superseded)   |
-| 0.21.x          | :x: (superseded)   |
 | 0.19.x          | :x: (superseded)   |
 | 0.18.x          | :x: (superseded)   |
 | 0.17.x          | :x: (superseded)   |

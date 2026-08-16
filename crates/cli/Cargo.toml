@@ -19,16 +19,15 @@ categories = ["database", "command-line-utilities"]
 documentation = "https://docs.rs/powdb-cli"
 
 [dependencies]
-powdb-storage = { version = "0.24.0", path = "../storage" }
-powdb-query = { version = "0.24.0", path = "../query" }
-powdb-server = { version = "0.24.0", path = "../server" }
-powdb-backup = { version = "0.24.0", path = "../backup" }
-powdb-auth = { version = "0.24.0", path = "../auth" }
-powdb-sync = { version = "0.24.0", path = "../sync" }
+powdb-storage = { version = "0.25.0", path = "../storage" }
+powdb-query = { version = "0.25.0", path = "../query" }
+powdb-server = { version = "0.25.0", path = "../server" }
+powdb-backup = { version = "0.25.0", path = "../backup" }
+powdb-auth = { version = "0.25.0", path = "../auth" }
+powdb-sync = { version = "0.25.0", path = "../sync" }
 rustyline = "15"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
 # Built-in trust anchors (Mozilla CA program) for `--tls` without `--tls-ca`.
 # Chosen over rustls-native-certs so verification behaves identically on every
 # platform the CLI ships to, staying on the same rustls stack as the server.

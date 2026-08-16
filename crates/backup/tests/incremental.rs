@@ -582,3 +582,63 @@ fn restore_chain_rejects_delta_page_index_mismatch() {
         "embedded page index mismatch must be rejected, got: {err}"
     );
 }
+
+/// Two increments taken the way the CLI takes them (both `--base` the same
+/// full backup) cannot be chained, and `docs/backup-and-restore.md` now says so
+/// and quotes this error.
+///
+/// This is the differential model working as designed, not a defect: `inc2`
+/// records the *base* LSN as its starting point, so once `inc1` has moved the
+/// restored database forward the continuity check must reject `inc2`. The doc
+/// used to show exactly this two-increment command as the coarse-PITR recipe,
+/// which no user could ever have run. The test exists so that claim stays
+/// machine-checked instead of living only in prose.
+#[test]
+fn two_differential_increments_against_one_base_cannot_be_chained() {
+    let src = tmp("difsrc");
+    let mut cat = Catalog::create(&src).unwrap();
+    cat.create_table(schema_t()).unwrap();
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.sync_wal().unwrap();
+
+    let base_dir = tmp("difbase");
+    let base = powdb_backup::full_backup(&mut cat, &base_dir).unwrap();
+
+    // Both increments are diffed against the same full base, which is the only
+    // thing `powdb-cli backup --base <full>` can produce.
+    cat.insert("T", &vec![Value::Int(2)]).unwrap();
+    cat.sync_wal().unwrap();
+    let inc1_dir = tmp("difinc1");
+    powdb_backup::incremental_backup(&mut cat, &base, &inc1_dir).unwrap();
+
+    cat.insert("T", &vec![Value::Int(3)]).unwrap();
+    cat.sync_wal().unwrap();
+    let inc2_dir = tmp("difinc2");
+    powdb_backup::incremental_backup(&mut cat, &base, &inc2_dir).unwrap();
+    drop(cat);
+
+    let chained = tmp("difchained");
+    let err = powdb_backup::restore_chain(&base_dir, &[&inc1_dir, &inc2_dir], &chained)
+        .expect_err("two increments against the same base must not chain");
+    assert!(
+        err.to_string().contains("increment chain broken"),
+        "expected the continuity check to reject this, got: {err}"
+    );
+
+    // The documented single-increment recipe reaches each point in time.
+    let at_inc2 = tmp("difat2");
+    powdb_backup::restore_chain(&base_dir, &[&inc2_dir], &at_inc2).unwrap();
+    assert_eq!(
+        Catalog::open(&at_inc2).unwrap().scan("T").unwrap().count(),
+        3,
+        "inc2 alone must restore the state at its own capture time"
+    );
+
+    let at_inc1 = tmp("difat1");
+    powdb_backup::restore_chain(&base_dir, &[&inc1_dir], &at_inc1).unwrap();
+    assert_eq!(
+        Catalog::open(&at_inc1).unwrap().scan("T").unwrap().count(),
+        2,
+        "inc1 alone must restore the earlier point in time"
+    );
+}

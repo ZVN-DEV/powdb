@@ -35,6 +35,34 @@ export type WireValue =
   | { type: "json"; value: NativeJson; pj1: Uint8Array }
 
 /**
+ * The result of a string-typed query (`query`, `querySql`, `queryReadonly`).
+ *
+ * A discriminated union on `kind`, identical to `@zvndev/powdb-client`'s
+ * `QueryResult`, so the same code narrows whether it is talking to an embedded
+ * database or a server. `kind` is one of exactly four values, and each carries
+ * only its own fields:
+ *
+ * ```ts
+ * const r = db.query("User")
+ * if (r.kind === "rows") {
+ *   // r.rows is string[][] here, not string[][] | undefined
+ *   for (const row of r.rows) console.log(row.join(", "))
+ * }
+ * ```
+ *
+ * The runtime object is the flat `QueryResultShape` below (every field present,
+ * the irrelevant ones `undefined`). This union describes which of them are
+ * actually populated for a given `kind`, which the flat shape cannot express:
+ * against that shape every field was optional, so reading `r.rows` needed a
+ * non-null assertion even after checking `r.kind`.
+ */
+export type QueryResultJs =
+  | { kind: "rows"; columns: string[]; rows: string[][] }
+  | { kind: "scalar"; value: string }
+  | { kind: "ok"; affected: bigint }
+  | { kind: "message"; message: string }
+
+/**
  * The result of a native (typed) query. Same `kind` discriminants as the
  * string-typed `QueryResultJs`; only the cell transport differs (`WireValue`
  * instead of `string`).

@@ -42,10 +42,12 @@ fn build_tls_acceptor(certs: &TestCerts) -> tokio_rustls::TlsAcceptor {
     let cert_chain = vec![rustls::pki_types::CertificateDer::from(
         certs.cert_der.clone(),
     )];
-    // Parse the PEM key via rustls-pemfile so we get a PrivateKeyDer.
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(certs.key_pem.as_bytes()))
-        .unwrap()
-        .expect("no private key found in PEM");
+    // Parse the PEM key via rustls-pki-types so we get a PrivateKeyDer.
+    use rustls::pki_types::pem::PemObject;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_reader(std::io::BufReader::new(
+        certs.key_pem.as_bytes(),
+    ))
+    .expect("no private key found in PEM");
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
@@ -250,8 +252,11 @@ async fn test_tls_config_invalid_cert() {
     std::fs::write(&cert_path, b"not a real certificate").unwrap();
     std::fs::write(&key_path, b"not a real key").unwrap();
 
+    // Parse through the same crate the server now uses, so this keeps testing
+    // the real path rather than a second parser that happens to agree.
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer};
     let cert_file = std::fs::File::open(&cert_path).unwrap();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(std::io::BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_default();
     assert!(certs.is_empty(), "garbage PEM should yield no certs");
