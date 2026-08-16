@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.19.1 — embedded mode
+PowDB v0.23.0 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.
 
@@ -459,9 +459,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.19.1 — remote mode
+PowDB v0.23.0 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `default` (server v0.19.1)
+Connected to db `default` (server v0.23.0, wire protocol v2)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>
@@ -536,7 +536,12 @@ powdb-cli --remote localhost:5433 --user alice --password s3cret
 
 > The user-admin subcommands edit the data dir directly and require no running
 > server. Edit them while the server is stopped (or before first start); the
-> server loads `auth.json` at startup.
+> server loads `auth.json` at startup. `useradd` works on a fresh install: if
+> the data directory does not exist yet it is created with the same `0700` mode
+> the engine uses, so you can provision the first admin before the server has
+> ever run. No `mkdir` step is needed. `passwd` and `userdel` need a user to
+> already exist, so on a fresh install they exit 1 with `unknown user`, which is
+> the correct answer rather than a missing-directory error.
 
 #### Zero-CLI admin bootstrap
 

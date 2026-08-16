@@ -2,48 +2,54 @@
 #
 # `cargo audit` reads this file from `.cargo/audit.toml` (relative to the repo
 # root). The CI `audit` job uses the `rustsec/audit-check` GitHub Action, which
-# does NOT read this file — it takes the same advisory IDs via its `ignore:`
+# does NOT read this file: it takes the same advisory IDs via its `ignore:`
 # input (see .github/workflows/ci.yml). Keep the two lists in sync.
 #
-# Policy: we ONLY ignore advisories whose entire dependency path is confined to
-# `crates/compare` (powdb-compare), which is `publish = false` — a benchmark-only
-# crate that pulls `postgres = "0.19"` and `mysql = "25"` purely to compare PowDB
-# against Postgres/MySQL. None of these crates ship in powdb-storage / powdb-query
-# / powdb-server / powdb-cli / powdb-auth / powdb-backup, so no published artifact
-# is affected. We do NOT broadly disable auditing: only the four advisories
-# listed below are vulnerabilities (the action's hard-fail trigger), and every
-# one of them is reachable solely through powdb-compare. The remaining
-# unmaintained/unsound entries are non-failing warnings and are left visible on
-# purpose.
+# This list is NOT the same as deny.toml's, and that is deliberate. cargo-audit
+# scans Cargo.lock, which contains every crate the workspace can resolve,
+# including ones behind disabled optional features. cargo-deny resolves the
+# feature graph instead, so it never sees a dependency that no enabled feature
+# turns on. The one entry below is exactly that case: real to cargo-audit,
+# invisible to cargo-deny. Putting it in deny.toml would make cargo-deny report
+# it as `advisory-not-detected`, which is how the previous stale list started.
 #
-# Before adding an ID here, confirm the path really is compare-only:
-#   cargo tree -i <crate> --workspace --all-features
-# and check that no published crate reaches it. An advisory that touches a
-# shipping crate must be fixed, never ignored.
+# Policy for adding an entry:
+#   * NEVER ignore an advisory that touches a published crate (powdb,
+#     powdb-storage, powdb-query, powdb-server, powdb-cli, powdb-auth,
+#     powdb-backup, powdb-sync). Those must be fixed.
+#   * An advisory confined to a publish=false crate (powdb-compare,
+#     powdb-bench, powdb-oracle) may be ignored with a written reason.
+#   * Prove the path first:  cargo tree -i <crate> --workspace --all-features
+#   * Re-check on every dependency refresh and delete the entries that have
+#     gone dead. A suppression list that suppresses nothing stops being read,
+#     and the next person adds to it without checking.
+#
+# Removed 2026-08-15, verified dead against the current Cargo.lock (cargo audit
+# no longer reports any of them): RUSTSEC-2026-0179 and RUSTSEC-2026-0180
+# (postgres-protocol) and RUSTSEC-2026-0178 (tokio-postgres), all resolved by
+# the dependency refresh in #211.
+#
+# Not ignored, on purpose: rustls-pemfile (RUSTSEC-2025-0134) IS reachable from
+# published crates. It is unmaintained, not vulnerable, so it is a non-failing
+# warning here and stays visible. See deny.toml for the justification and the
+# migration target.
 [advisories]
 ignore = [
-    # postgres-protocol < 0.6.12: unbounded SCRAM iteration count → CPU-exhaustion
-    # DoS from a malicious server. Path: postgres-protocol → tokio-postgres →
-    # postgres → powdb-compare (publish=false, bench-only). No shipping crate.
-    "RUSTSEC-2026-0179",
-
-    # postgres-protocol < 0.6.12: panic decoding a malformed `hstore` value → DoS.
-    # Same powdb-compare-only path. No shipping crate.
-    "RUSTSEC-2026-0180",
-
-    # tokio-postgres < 0.7.18: panic on a `DataRow` with fewer fields than columns
-    # → DoS. Path: tokio-postgres → postgres → powdb-compare (publish=false,
-    # bench-only). No shipping crate.
-    "RUSTSEC-2026-0178",
-
     # rkyv 0.7.46: shared-pointer validation ignored pointer metadata, so an
     # archive with two `Rc`/`Arc` pointers to one address but different slice
     # lengths could hand out a forged length and read out of bounds. Path:
-    # rkyv → rust_decimal → mysql_common → mysql → powdb-compare
-    # (publish=false, bench-only). The 0.7 series is unmaintained upstream and
-    # the fix landed in 0.8.17, so there is no in-series upgrade to take; the
-    # dependency is transitive through `mysql`. No shipping crate reaches rkyv
-    # (verified with `cargo tree --all-features` across all eight published
-    # crates), and PowDB never feeds it an untrusted archive.
+    # rkyv -> rust_decimal -> mysql_common -> mysql -> powdb-compare
+    # (publish=false, bench-only, and `mysql` is itself an optional dependency
+    # behind a non-default feature). The 0.7 series is unmaintained upstream
+    # and the fix landed in 0.8.17, so there is no in-series upgrade to take;
+    # the dependency is transitive through `mysql`. No shipping crate reaches
+    # rkyv (verified with `cargo tree --all-features` across all eight
+    # published crates), and PowDB never feeds it an untrusted archive.
+    #
+    # This is the one advisory-db entry that cargo-audit still flags as a
+    # VULNERABILITY (hard-fail) rather than a warning, so dropping it turns the
+    # CI `audit` job red. cargo-deny does not see it at all, because the
+    # `mysql` feature is off by default; that is why deny.toml has no matching
+    # entry.
     "RUSTSEC-2026-0235",
 ]

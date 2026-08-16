@@ -372,9 +372,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # `version` is the image tag (v0.23.0); `semver` drops the leading v for
+      # the OCI org.opencontainers.image.version label, which the spec defines
+      # as the version of the packaged software; `created` is the RFC 3339 build
+      # timestamp the OCI spec asks for. All three feed the Dockerfile's build
+      # args so `docker inspect` can map a running container back to a commit.
       - name: Extract tag name
         id: tag
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          {
+            echo "version=${GITHUB_REF#refs/tags/}"
+            echo "semver=${GITHUB_REF#refs/tags/v}"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -399,6 +410,14 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
+          # Populates the dynamic OCI labels declared at the end of the
+          # Dockerfile. Without these the image ships the placeholder defaults
+          # (0.0.0-dev / unknown), which is the honest answer for a local build
+          # but not for a published release.
+          build-args: |
+            VERSION=${{ steps.tag.outputs.semver }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ steps.tag.outputs.created }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

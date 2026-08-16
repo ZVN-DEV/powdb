@@ -114,10 +114,10 @@ User filter .age < 20 or .age > 60</code></pre>
     <pre><code>User { .name, .email }
 User filter .age > 30 { .name, .age }
 
--- Aliases
+# Aliases
 User { full_name: .name, years: .age }
 
--- Computed expressions
+# Computed expressions
 User { .name, double_age: .age * 2 }</code></pre>
 
     <h3>Ordering</h3>
@@ -164,10 +164,10 @@ User filter not .active</code></pre>
 User filter .name in ("Alice", "Bob")
 User filter .name not in ("Alice")
 
--- BETWEEN (inclusive)
+# BETWEEN (inclusive)
 User filter .age between 25 and 35
 
--- LIKE pattern matching
+# LIKE pattern matching
 User filter .name like "Ali%"
 User filter .name not like "A%"</code></pre>
 
@@ -175,7 +175,7 @@ User filter .name not like "A%"</code></pre>
     <pre><code>User filter .age is null
 User filter .age is not null
 
--- Coalesce: return left if non-null, else right
+# Coalesce: return left if non-null, else right
 User { .name, display_age: .age ?? 0 }</code></pre>
 
     <h3>CASE WHEN</h3>
@@ -203,33 +203,33 @@ User filter upper(.name) = "ALICE"
 User { full: concat(.name, " - ", .email) }
 User { sub: substring(.name, 1, 3) }
 
--- Math functions
+# Math functions
 User { .name, rounded: round(.score, 2) }
 
--- Date/time functions (datetime is microseconds since the Unix epoch)
+# Date/time functions (datetime is microseconds since the Unix epoch)
 insert Event { name := "login", ts := 1700000000000000 }
 Event { .name, yr: extract("year", .ts) }
 
--- Cast
+# Cast
 User { .name, age_str: cast(.age, "str") }</code></pre>
 
     <!-- Aggregates -->
     <h2 id="aggregates">Aggregates</h2>
     <p>Aggregate functions wrap a query in function-call syntax:</p>
-    <pre><code>count(User)                              -- count all rows
-count(User filter .age > 30)             -- count with filter
-sum(User { .age })                       -- sum a column
-avg(User { .age })                       -- average
-min(User { .age })                       -- minimum
-max(User { .age })                       -- maximum
-count(distinct User { .name })           -- count unique values</code></pre>
+    <pre><code>count(User)                              # count all rows
+count(User filter .age > 30)             # count with filter
+sum(User { .age })                       # sum a column
+avg(User { .age })                       # average
+min(User { .age })                       # minimum
+max(User { .age })                       # maximum
+count(distinct User { .name })           # count unique values</code></pre>
 
     <!-- GROUP BY -->
     <h2 id="group-by">GROUP BY and HAVING</h2>
     <pre><code>-- Count users per name
 User group .name { .name, n: count(.name) }
 
--- Multiple aggregates per group
+# Multiple aggregates per group
 User group .status {
   .status,
   total: count(.name),
@@ -238,13 +238,13 @@ User group .status {
   oldest: max(.age)
 }
 
--- HAVING: filter groups after aggregation
+# HAVING: filter groups after aggregation
 User group .status having count(.name) > 5 { .status, n: count(.name) }
 
--- Filter before grouping
+# Filter before grouping
 User filter .age >= 30 group .name { .name, n: count(.name) }
 
--- count(*) and count(distinct) in groups
+# count(*) and count(distinct) in groups
 User group .age { .age, count(*) }
 Sale group .dept { .dept, count(distinct .item) }</code></pre>
 
@@ -255,20 +255,20 @@ Sale group .dept { .dept, count(distinct .item) }</code></pre>
     <pre><code>-- Inner join (default)
 User as u join Order as o on u.id = o.user_id
 
--- Left outer join
+# Left outer join
 User as u left join Order as o on u.id = o.user_id
 
--- Right outer join
+# Right outer join
 User as u right join Order as o on u.id = o.user_id
 
--- Cross join (no ON clause)
+# Cross join (no ON clause)
 User as u cross join Product as p
 
--- With filter and projection
+# With filter and projection
 User as u join Order as o on u.id = o.user_id
   filter o.total > 75 { u.name, o.total }
 
--- Multi-table join
+# Multi-table join
 User as u join Order as o on u.id = o.user_id
   join Product as p on o.product_id = p.id</code></pre>
 
@@ -280,11 +280,11 @@ User as u join Order as o on u.id = o.user_id
     <h3>INSERT</h3>
     <pre><code>insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
--- Omitted fields default to null
+# Omitted fields default to null
 insert User { name := "Bob", email := "bob@example.com" }
 
--- Multi-row insert: separate row blocks with commas.
--- One statement = one WAL fsync = one round trip; all-or-nothing on validation.
+# Multi-row insert: separate row blocks with commas.
+# One statement = one WAL fsync = one round trip; all-or-nothing on validation.
 insert User
   { name := "Alice", email := "alice@example.com", age := 30 },
   { name := "Bob",   email := "bob@example.com" },
@@ -294,17 +294,17 @@ insert User
     <pre><code>-- Set a literal value
 User filter .name = "Alice" update { age := 31 }
 
--- Expression referencing current row
+# Expression referencing current row
 User filter .name = "Alice" update { age := .age + 5 }
 
--- Update all rows
+# Update all rows
 User update { age := .age * 2 }</code></pre>
 
     <h3>DELETE</h3>
     <pre><code>User filter .name = "Bob" delete
 User filter .age < 18 delete
 
--- Delete all rows
+# Delete all rows
 User delete</code></pre>
 
     <h3>UPSERT</h3>
@@ -312,7 +312,7 @@ User delete</code></pre>
     <pre><code>-- Insert or update on conflict (.email must be unique)
 upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
 
--- Explicit conflict handling
+# Explicit conflict handling
 upsert User on .email { name := "Alice", email := "alice@example.com", age := 30 }
   on conflict { age := 30 }</code></pre>
 
@@ -323,12 +323,12 @@ upsert User on .email { name := "Alice", email := "alice@example.com", age := 30
 begin
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 insert User { name := "Bob", email := "bob@example.com", age := 25 }
-commit    -- apply all changes
+commit    # apply all changes
 
--- Discard uncommitted changes
+# Discard uncommitted changes
 begin
 insert User { name := "Charlie", email := "charlie@example.com", age := 40 }
-rollback  -- discard all changes</code></pre>
+rollback  # discard all changes</code></pre>
     <p>Transactions are per-connection; other connections never see uncommitted rows, and a connection that closes before <code>commit</code> rolls back implicitly. Nested <code>begin</code> is an error. Statements between <code>begin</code> and <code>commit</code> share a single WAL fsync, so bulk loads inside a transaction run roughly 50x faster than autocommit with identical durability.</p>
     <p><strong>Concurrency:</strong> PowDB has no MVCC. An explicit transaction holds the whole write-admission gate for its lifetime, so from <code>begin</code> until <code>commit</code> or <code>rollback</code> every other connection that needs the gate (readers included) waits. Keep explicit transactions short, and prefer autocommit on read-mostly paths (an autocommit writer releases admission before the fsync wait). A connection that waits past the server timeout (5 seconds by default, <code>POWDB_TX_WAIT_TIMEOUT_MS</code>) fails with a <code>transaction gate timeout</code> error rather than blocking forever.</p>
 
@@ -343,14 +343,14 @@ rollback  -- discard all changes</code></pre>
 alter User add column status: str
 alter User add required active: bool
 
--- Drop a column
+# Drop a column
 alter User drop column email
 
--- Create an index
+# Create an index
 alter User add index .email
 alter User add index .age
 
--- Add a unique constraint (scans for existing dups first; fails if any)
+# Add a unique constraint (scans for existing dups first; fails if any)
 alter User add unique .email</code></pre>
 
     <h3>Drop Table</h3>
@@ -362,15 +362,15 @@ alter User add unique .email</code></pre>
 materialize OldUsers as User filter .age > 28
 materialize UserNames as User { .name }
 
--- Query it like a table
+# Query it like a table
 OldUsers
 OldUsers filter .name = "Alice"
 count(OldUsers)
 
--- Manual refresh
+# Manual refresh
 refresh OldUsers
 
--- Drop
+# Drop
 drop view OldUsers</code></pre>
     <p>Views auto-refresh when underlying data changes. No stale reads.</p>
 
@@ -379,11 +379,11 @@ drop view OldUsers</code></pre>
     <pre><code>-- ROW_NUMBER
 User { .name, .dept, rn: row_number() over (partition .dept order .age) }
 
--- RANK / DENSE_RANK
+# RANK / DENSE_RANK
 User { .name, r: rank() over (order .score desc) }
 User { .name, dr: dense_rank() over (partition .dept order .score desc) }
 
--- Aggregate windows
+# Aggregate windows
 User { .name, .salary, dept_avg: avg(.salary) over (partition .dept) }
 User { .name, running_total: sum(.amount) over (order .date) }</code></pre>
 

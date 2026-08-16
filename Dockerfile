@@ -119,6 +119,93 @@ VOLUME ["/data"]
 
 COPY --from=builder /powdb-server /usr/local/bin/powdb-server
 
+# Container healthcheck. The runtime image ships no curl and no wget on
+# purpose: adding an HTTP client (and its TLS stack) to a production database
+# image just to answer a probe is more attack surface than the probe is worth.
+# Everything below is bash's built-in /dev/tcp redirection plus coreutils/grep,
+# all already present in debian-slim.
+#
+# No single probe is correct in every configuration, so the script picks the
+# strongest one the running config actually supports. See the block comment
+# inside it for the three modes and why each degrades the way it does.
+COPY --chmod=0755 <<'HEALTHCHECK_SH' /usr/local/bin/powdb-healthcheck
+#!/bin/bash
+# Health probe for powdb-server, in three modes:
+#
+#   1. POWDB_METRICS_ADDR set: GET /health on the metrics listener and require
+#      the documented "ok powdb <version>" body. This is the best answer
+#      available and the only mode that logs nothing on the server side. The
+#      handler never takes the engine lock, so a slow query cannot make a
+#      healthy process look dead and get it restarted mid-write.
+#   2. No metrics listener and no TLS: send a pre-auth PING frame on the wire
+#      port and require a PONG. The server accepts PING before CONNECT exactly
+#      so load balancers can probe it. Costs one "accepted connection" INFO
+#      line per interval in the server log.
+#   3. No metrics listener and TLS enabled: bash cannot speak TLS, and a
+#      plaintext connect would log a handshake failure and bump the
+#      tls_failure counter every interval. Fall back to proving the
+#      powdb-server process exists, and say so on stderr (docker inspect keeps
+#      the last probe outputs).
+#
+# Modes 2 and 3 are weaker than mode 1. Set POWDB_METRICS_ADDR to get mode 1.
+set -u
+
+note() { printf 'powdb-healthcheck: %s\n' "$*" >&2; }
+
+# A wildcard bind is reached over loopback from inside the container.
+loopback_if_wildcard() {
+  case "$1" in
+    '' | '0.0.0.0' | '::' | '[::]' | '*') printf '127.0.0.1' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+if [ -n "${POWDB_METRICS_ADDR:-}" ]; then
+  host="$(loopback_if_wildcard "${POWDB_METRICS_ADDR%:*}")"
+  port="${POWDB_METRICS_ADDR##*:}"
+  exec 3<>"/dev/tcp/${host}/${port}" || {
+    note "cannot connect to metrics listener ${host}:${port}"
+    exit 1
+  }
+  printf 'GET /health HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' "$host" >&3 || exit 1
+  if grep -q '^ok powdb ' <&3; then
+    exit 0
+  fi
+  note "metrics listener did not answer /health with 'ok powdb'"
+  exit 1
+fi
+
+if [ -z "${POWDB_TLS_CERT:-}" ] && [ -z "${POWDB_TLS_KEY:-}" ]; then
+  host="$(loopback_if_wildcard "${POWDB_BIND:-}")"
+  port="${POWDB_PORT:-5433}"
+  exec 3<>"/dev/tcp/${host}/${port}" || {
+    note "cannot connect to wire port ${host}:${port}"
+    exit 1
+  }
+  # Frame layout: [type][flags][payload length u32 LE]. 0x11 = PING, no payload.
+  printf '\x11\x00\x00\x00\x00\x00' >&3 || exit 1
+  reply=''
+  IFS= read -r -N 1 -t 5 reply <&3 || true
+  # 0x12 = PONG
+  if [ "$reply" = $'\x12' ]; then
+    exit 0
+  fi
+  note "wire port did not answer PING with PONG"
+  exit 1
+fi
+
+note "TLS is on and POWDB_METRICS_ADDR is unset, so only process liveness is checkable; set POWDB_METRICS_ADDR for a real probe"
+for proc in /proc/[0-9]*; do
+  [ -r "$proc/comm" ] || continue
+  read -r comm < "$proc/comm" || continue
+  if [ "$comm" = "powdb-server" ]; then
+    exit 0
+  fi
+done
+note "no powdb-server process found"
+exit 1
+HEALTHCHECK_SH
+
 ENV RUST_LOG=info \
     POWDB_DATA=/data \
     POWDB_PORT=5433
@@ -126,6 +213,34 @@ ENV RUST_LOG=info \
 EXPOSE 5433
 
 USER 10001:10001
+
+# Declared last so a changed revision/version/timestamp only invalidates these
+# two trailing layers, not the apt and build layers above.
+ARG VERSION=0.0.0-dev
+ARG REVISION=unknown
+ARG CREATED=1970-01-01T00:00:00Z
+
+# OCI image annotations. Without these, `docker inspect` reports Labels=null,
+# scanners and SBOM tools get nothing, and there is no way to map a running
+# container back to the commit that built it. The three dynamic values come
+# from build args wired up in .github/workflows/release.yml; a local
+# `docker build` with no args gets the honest placeholder defaults above
+# rather than a fabricated version.
+LABEL org.opencontainers.image.title="PowDB" \
+      org.opencontainers.image.description="PowDB database server: a from-scratch storage and query engine with the PowQL pipeline language and a SQL frontend" \
+      org.opencontainers.image.url="https://zvn-dev.github.io/powdb/" \
+      org.opencontainers.image.documentation="https://github.com/ZVN-DEV/powdb#readme" \
+      org.opencontainers.image.source="https://github.com/ZVN-DEV/powdb" \
+      org.opencontainers.image.vendor="ZVN DEV" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.base.name="debian:bookworm-slim" \
+      org.opencontainers.image.base.digest="sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/powdb-healthcheck"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/powdb-server"]

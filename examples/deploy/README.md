@@ -59,6 +59,7 @@ is the benchmark harness — it does not define a PowDB service):
 
 ```bash
 docker run -d --name powdb \
+  --restart unless-stopped \
   -p 5433:5433 \
   -v powdb_data:/data \
   -e POWDB_DATA=/data \
@@ -66,6 +67,23 @@ docker run -d --name powdb \
   -e POWDB_PASSWORD=change-me \
   ghcr.io/zvn-dev/powdb:v0.23.0
 ```
+
+`--restart unless-stopped` is the supervisor this deployment needs (see
+[Why auto-restart is required](#why-auto-restart-is-required-read-this-first)).
+Without it, `docker inspect` reports `RestartPolicy=no` and the first crash
+leaves the container in `Exited` until someone restarts it by hand, even though
+the data on disk is fully recoverable.
+
+The image also declares a `HEALTHCHECK`, so `docker ps` reports a health column.
+It probes `GET /health` on the metrics listener when `POWDB_METRICS_ADDR` is set.
+Without it, the probe falls back to a pre-authentication PING/PONG exchange on
+the wire port, which proves the server is answering rather than merely holding
+the socket open. That fallback costs one `accepted connection` log line per
+interval. If TLS is required, neither probe applies (the healthcheck speaks
+neither TLS nor HTTP over it), so it degrades to process liveness and says so on
+stderr. To get the richest probe and the quietest logs, add
+`-e POWDB_METRICS_ADDR=127.0.0.1:9090` to the command above (bind it to loopback
+unless you intend to expose the unauthenticated metrics endpoint).
 
 ## AWS ECS Fargate + EFS
 

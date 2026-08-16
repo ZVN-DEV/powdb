@@ -3,6 +3,7 @@ name = "powdb-sync"
 description = "Retained replication-unit substrate for PowDB embedded replicas and read replicas"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

@@ -203,6 +203,234 @@ fn exec_file_stdin() {
     assert_eq!(out_str(&got).trim(), "1");
 }
 
+/// A dump whose last line is a comment must exit 0.
+///
+/// The writes committed either way; the one-shot path then sent the trailing
+/// comment-only segment to the engine, got "expected statement, got end of
+/// input", and exited 1. Any `set -e` deploy or CI step loading a schema dump
+/// aborted (or paged someone) on a run that had in fact fully succeeded, and
+/// ending a dump with a comment is completely normal.
+#[test]
+fn exec_file_ending_in_a_comment_exits_zero() {
+    let data = tmp("trailcomment");
+    let data_s = data.to_str().unwrap();
+
+    let dump = concat!(
+        "# schema\n",
+        "type X { unique auto id: int, required a: str };\n",
+        "insert X { a := \"one\" };\n",
+        "insert X { a := \"two\" };\n",
+        "# end of dump\n",
+    );
+    let dump_path = tmp("trailcomment_dump").with_extension("powql");
+    std::fs::create_dir_all(dump_path.parent().unwrap()).unwrap();
+    std::fs::write(&dump_path, dump).unwrap();
+
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "--exec-file",
+        dump_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a dump ending in a comment must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Every real statement still ran.
+    let got = run(&["--data-dir", data_s, "-c", "count(X)"]);
+    assert_eq!(out_str(&got).trim(), "2");
+}
+
+/// The SQL dialect has its own comment syntax, so the blank check has to use
+/// the SQL lexer. `--` opens a comment in SQL and is subtraction in PowQL, so
+/// asking the PowQL lexer about a SQL dump ending in `-- done` reports "not
+/// blank" and the segment reaches the engine as a syntax error, exiting 1 after
+/// every real statement has already committed.
+#[test]
+fn sql_exec_file_ending_in_a_dash_comment_exits_zero() {
+    let data = tmp("sqltrailcomment");
+    let data_s = data.to_str().unwrap();
+
+    let dump = concat!(
+        "-- schema\n",
+        "CREATE TABLE S (id INT, k TEXT);\n",
+        "INSERT INTO S (id, k) VALUES (1, 'a');\n",
+        "-- end of dump\n",
+    );
+    let dump_path = tmp("sqltrailcomment_dump").with_extension("sql");
+    std::fs::create_dir_all(dump_path.parent().unwrap()).unwrap();
+    std::fs::write(&dump_path, dump).unwrap();
+
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "--exec-file",
+        dump_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a SQL dump ending in a -- comment must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Every real statement still ran.
+    let got = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "SELECT count(*) FROM S",
+    ]);
+    assert_eq!(out_str(&got).trim(), "1");
+
+    // A `--` inside a string literal is not a comment, so this is a real
+    // statement and must still execute rather than being skipped as blank.
+    let lit = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "SELECT '-- not a comment' AS lit FROM S",
+    ]);
+    assert_eq!(lit.status.code(), Some(0));
+    assert!(
+        out_str(&lit).contains("-- not a comment"),
+        "a -- inside a string literal must survive as data; got: {}",
+        out_str(&lit)
+    );
+
+    // A genuine SQL syntax error must still fail.
+    let bad = run(&["--data-dir", data_s, "--sql", "-c", "SELEKT bogus"]);
+    assert_eq!(
+        bad.status.code(),
+        Some(1),
+        "a real SQL syntax error must still exit non-zero"
+    );
+}
+
+/// A comment-only `--exec` is a no-op that exits 0, not an error. Same for a
+/// leading comment: the statement after it still runs.
+#[test]
+fn comment_only_exec_is_a_successful_noop() {
+    let data = tmp("commentonly");
+    let data_s = data.to_str().unwrap();
+
+    let out = run(&["--data-dir", data_s, "-c", "# just a comment"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "comment-only --exec must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_str(&out).trim().is_empty(),
+        "comment-only --exec must print nothing, got: {:?}",
+        out_str(&out)
+    );
+
+    // A comment between two statements is skipped without eating either.
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "-c",
+        "type T { required id: int };\n# a comment on its own\n; insert T { id := 1 };",
+    ]);
+    assert!(
+        out.status.success(),
+        "load with an interior comment segment failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = run(&["--data-dir", data_s, "-c", "count(T)"]);
+    assert_eq!(out_str(&got).trim(), "1");
+}
+
+/// Skipping blank segments must not weaken real error reporting: a genuine
+/// syntax error still exits non-zero, and the `;`-separator hint still fires.
+#[test]
+fn genuine_syntax_error_still_exits_nonzero() {
+    let data = tmp("stillerrors");
+    let data_s = data.to_str().unwrap();
+
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "-c",
+        "# leading comment\nthis is not powql",
+    ]);
+    assert!(
+        !out.status.success(),
+        "a real syntax error must still fail; stdout: {}",
+        out_str(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Error:"),
+        "expected an Error: line, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The missing-`;` hint is still produced for the shape it was written for.
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "-c",
+        "type T { required id: int }\ninsert T { id := 1 }",
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("separated by `;`"),
+        "missing-separator hint disappeared: {stderr}"
+    );
+}
+
+/// Remote one-shot skips comment-only segments too: the guard belongs to the
+/// CLI's statement splitter, not to one transport.
+#[test]
+fn remote_exec_ending_in_a_comment_exits_zero() {
+    let Some(server) = server_bin() else {
+        eprintln!("powdb-server binary not found; skipping remote test");
+        return;
+    };
+    let data = tmp("remotecomment");
+    std::fs::create_dir_all(&data).unwrap();
+    let port = free_port();
+    let child = Command::new(server)
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn powdb-server");
+    let _guard = ServerGuard(child);
+    wait_for_port(port);
+    let addr = format!("127.0.0.1:{port}");
+
+    let out = run(&[
+        "-r",
+        &addr,
+        "-c",
+        "# schema\ntype R { required id: int };\ninsert R { id := 1 };\n# end of dump",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "remote load ending in a comment must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = run(&["-r", &addr, "-c", "count(R)"]);
+    assert_eq!(out_str(&got).trim(), "1");
+}
+
 /// A missing `--exec-file` path exits non-zero with a clean error.
 #[test]
 fn exec_file_missing_path_errors() {
@@ -341,4 +569,93 @@ fn stop_on_first_error() {
     // Only the first insert committed; the statement after the error never ran.
     let got = run(&["--data-dir", data_s, "-c", "count(T)"]);
     assert_eq!(out_str(&got).trim(), "1");
+}
+
+/// A `;` inside a SQL comment must not end the statement. This is the dangerous
+/// direction of the dialect split: `-- cleanup; DELETE FROM t` is ONE comment,
+/// but a PowQL-only splitter cuts it in two and hands `DELETE FROM t` to the
+/// engine as a live statement the user believed was commented out. Combined
+/// with skipping blank segments, that silently destroyed data and exited 0.
+#[test]
+fn a_semicolon_inside_a_sql_comment_does_not_execute_its_tail() {
+    let data = tmp("sqlcommentsemi");
+    let data_s = data.to_str().unwrap();
+
+    for sql in [
+        "CREATE TABLE t (id INT);",
+        "INSERT INTO t (id) VALUES (1);",
+        "INSERT INTO t (id) VALUES (2);",
+    ] {
+        let out = run(&["--data-dir", data_s, "--sql", "-c", sql]);
+        assert_eq!(out.status.code(), Some(0), "setup failed for `{sql}`");
+    }
+
+    // The whole line is a comment. Nothing may run.
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "-- cleanup; DELETE FROM t",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a comment-only line must exit 0"
+    );
+
+    let got = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "SELECT count(*) FROM t",
+    ]);
+    assert_eq!(
+        out_str(&got).trim(),
+        "2",
+        "the DELETE was inside a comment and must not have run"
+    );
+
+    // Same shape in a file, which is the migration-script case.
+    let dump = concat!(
+        "-- migration 003\n",
+        "INSERT INTO t (id) VALUES (10);\n",
+        "-- cleanup temp rows; DELETE FROM t\n",
+    );
+    let dump_path = tmp("sqlcommentsemi_dump").with_extension("sql");
+    std::fs::create_dir_all(dump_path.parent().unwrap()).unwrap();
+    std::fs::write(&dump_path, dump).unwrap();
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "--exec-file",
+        dump_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+
+    let got = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "SELECT count(*) FROM t",
+    ]);
+    assert_eq!(
+        out_str(&got).trim(),
+        "3",
+        "only the real INSERT may run; the commented DELETE must not"
+    );
+
+    // A `;` inside a string literal is data, not a boundary.
+    let out = run(&[
+        "--data-dir",
+        data_s,
+        "--sql",
+        "-c",
+        "INSERT INTO t (id) VALUES (4); SELECT count(*) FROM t",
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out_str(&out).trim().lines().last().unwrap().trim(), "4");
 }

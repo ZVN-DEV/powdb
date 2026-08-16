@@ -260,12 +260,12 @@ fn write_durable_lsn(data_dir: &Path, lsn: u64) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     let _ = path;
     Ok(())
 }

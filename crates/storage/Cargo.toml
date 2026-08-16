@@ -3,6 +3,7 @@ name = "powdb-storage"
 description = "Slotted-page heap, B+tree indexes, and WAL — pure-Rust storage engine for PowDB"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

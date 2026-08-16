@@ -412,8 +412,12 @@ impl Engine {
         {
             if let Some(result) = self.try_execute_update_pk_fast(fast, literals)? {
                 // Mark dependent views dirty for prepared update fast path.
+                // Before the commit below, so the flag is on disk before the
+                // mutation it describes is durable.
                 if let PlanNode::Update { table, .. } = &prep.plan_template {
-                    self.view_registry.mark_dependents_dirty(table);
+                    self.view_registry
+                        .mark_dependents_dirty(table)
+                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
                 }
                 // Mission B (post-review): statement-boundary WAL group
                 // commit. The fast path appended an Update record but did
@@ -508,7 +512,9 @@ impl Engine {
             self.insert_values_scratch = values;
             res?;
             // Mark dependent views dirty for prepared insert fast path.
-            self.view_registry.mark_dependents_dirty(&fast.table_name);
+            self.view_registry
+                .mark_dependents_dirty(&fast.table_name)
+                .map_err(|e| QueryError::StorageError(e.to_string()))?;
             // Mission B (post-review): statement-boundary WAL group commit.
             self.catalog
                 .commit_autocommit()
@@ -719,7 +725,12 @@ impl Engine {
                 self.insert_values_scratch = values;
                 return Err(QueryError::StorageError(error.to_string()));
             }
-            self.view_registry.mark_dependents_dirty(&fast.table_name);
+            if let Err(error) = self.view_registry.mark_dependents_dirty(&fast.table_name) {
+                restore_taken_strings(fast, literals, &mut values);
+                values.clear();
+                self.insert_values_scratch = values;
+                return Err(QueryError::StorageError(error.to_string()));
+            }
             // Mission B (post-review): statement-boundary WAL group commit.
             if let Err(error) = self.catalog.commit_autocommit() {
                 restore_taken_strings(fast, literals, &mut values);
