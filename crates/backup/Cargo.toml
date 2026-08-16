@@ -13,14 +13,14 @@ categories = ["database", "database-implementations"]
 documentation = "https://docs.rs/powdb-backup"
 
 [dependencies]
-powdb-storage = { version = "0.23.0", path = "../storage" }
-powdb-sync = { version = "0.23.0", path = "../sync" }
+powdb-storage = { version = "0.24.0", path = "../storage" }
+powdb-sync = { version = "0.24.0", path = "../sync" }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
-powdb-query = { version = "0.23.0", path = "../query" }
+powdb-query = { version = "0.24.0", path = "../query" }
 
 [lints]
 workspace = true
