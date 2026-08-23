@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-23
+
 **The audit round: the findings from the 2026-08-22 gold-standard audit.**
 
 ### Fixed
@@ -2574,7 +2576,8 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ZVN-DEV/powdb/compare/v0.22.0...v0.23.0

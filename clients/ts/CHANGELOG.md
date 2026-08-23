@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.26.0 - 2026-08-23
+
+No client API changes. Version moves in lockstep with the engine.
+
+Two changes are worth knowing about from this client:
+
+- A duplicate key on a **unique expression index** now arrives as wire error
+  class `8` (`constraint_violation`) instead of `0` (`internal`), and carries
+  its own message rather than the generic `query execution error`. Code that
+  treated class `0` as "the server faulted, do not retry the caller's input"
+  will now correctly see a constraint violation. Its column-level twin was
+  already classified correctly; only the expression-index case moved.
+- The sibling `@zvndev/powdb-embedded` addon now puts a stable `code` on every
+  error it raises, using the same strings this client uses where the two
+  overlap (`query_failed`, `closed`). One `switch (err.code)` now reads
+  correctly against an embedded database or a server.
+
 ## 0.25.0 - 2026-08-16
 
 No client API changes. Version moves in lockstep with the engine. This client's

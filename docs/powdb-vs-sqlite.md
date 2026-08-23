@@ -188,7 +188,7 @@ Results land in `crates/compare/results.csv`.
 
 - **PowDB is pre-1.0.** New on-disk format versions appear across minor
   versions, though every release still reads everything earlier releases
-  wrote. Pin a version (`cargo install powdb-cli --version 0.25.0 --locked`)
+  wrote. Pin a version (`cargo install powdb-cli --version 0.26.0 --locked`)
   and expect to re-bench on upgrades until 1.0. What a minor version may and
   may not break is spelled out in [STABILITY.md](STABILITY.md); the
   version/magic mechanics are in [FORMAT.md](FORMAT.md).
