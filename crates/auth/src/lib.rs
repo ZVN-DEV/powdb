@@ -4,7 +4,7 @@
 //! [`hash`] argon2id password hashing, and the persisted [`store::UserStore`].
 //! These are live in production: `powdb-server` loads the [`store::UserStore`]
 //! at startup and enforces the [`role`] lattice on every query
-//! (`crates/server/src/handler.rs`), and `powdb-cli` manages users via the
+//! (`crates/server/src/handler/`), and `powdb-cli` manages users via the
 //! `useradd`/`passwd`/`userdel` subcommands.
 
 pub mod error;

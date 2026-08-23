@@ -99,10 +99,20 @@ one-time setup and the reusable standard.
 [ ] Update inter-crate dep versions in query/sync/backup/server/powdb/cli Cargo.toml
 [ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
 [ ] Update bindings/node/package.json version (@zvndev/powdb-embedded, lockstep)
+[ ] Update clients/sync/package.json version and its two exact peer pins
+[ ] Update bindings/node/Cargo.toml version, then regenerate its Cargo.lock
+[ ] Regenerate crates/query/fuzz/Cargo.lock
 [ ] Move CHANGELOG.md notes from Unreleased to the dated version entry
 [ ] Update both the Next release and Current release lines in RELEASES.md
+[ ] Update doc version strings: --version pins and CLI banner transcripts in
+    README.md, docs/getting-started.md, docs/powdb-vs-sqlite.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
+
+Note on the three lockfiles: bindings/node and crates/query/fuzz are detached
+workspaces, so `cargo build --workspace` never regenerates them. All three are
+gated against the workspace version, so bumping only the root Cargo.toml turns
+the release PR red. The failure names the exact file and expected value.
 [ ] Commit: "chore: release vX.Y.Z", open a PR, merge it
 
 TAG BEFORE PUBLISHING. publish.yml refuses to publish unless the tag vX.Y.Z

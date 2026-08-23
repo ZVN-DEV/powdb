@@ -42,9 +42,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `powdb_storage::error::StorageErrorKind`, with `StorageError::kind()` and
   `kind_of_io_error()`, and `powdb_query::result::QueryError::Storage { kind,
   message }` with `QueryError::from_storage_io()` and `impl From<StorageError>
-  for QueryError`. All additive; `QueryError` keeps `Clone` and `PartialEq`.
+  for QueryError`. `QueryError` keeps `Clone` and `PartialEq`. Note these are
+  new enum variants on types that are not `#[non_exhaustive]`, so an external
+  crate matching `StorageError` or `QueryError` exhaustively will need a new
+  arm.
+
+- **`@zvndev/powdb-embedded`: every error now carries a stable, machine-readable
+  `code`.** `poisoned` and `open_panicked` are distinguishable from an ordinary
+  `query_failed`, so an embedded host can recycle the handle or restore the data
+  directory instead of retrying. The full set is `query_failed`, `closed`,
+  `open_failed`, `open_panicked`, `poisoned`, `invalid_argument`, `sync_failed`,
+  `already_open`, and `internal`. `query_failed` and `closed` are the same
+  strings `@zvndev/powdb-client` uses, so one `switch` reads correctly against
+  an embedded database or a server. `PowDBErrorCode` and `PowDBError` are
+  exported from the addon's TypeScript declarations.
 
 ### Changed
+
+- **Breaking for anyone reading `err.code` from `@zvndev/powdb-embedded`.** The
+  property previously held napi's `"GenericFailure"` on every error the addon
+  raised; it now holds one of the nine codes listed above. Error messages are
+  unchanged byte for byte, so code matching on message text is unaffected.
+  Errors from argument coercion (passing a number where a string is required)
+  still report napi's own status strings and are deliberately not part of the
+  documented union.
+
+- **A duplicate key on a unique expression index now reaches the client with its
+  own message.** The prefix `unique expression index violation` was added to the
+  wire egress allowlist, which already carried its column-level twin. Without
+  it, the corrected class 8 arrived over the generic `query execution error`
+  text, telling a caller a constraint had rejected the write while naming no
+  constraint.
 
 - **Cross-crate plumbing modules are now `#[doc(hidden)]`.** In `powdb-storage`:
   `btree`, `disk`, `format`, `heap`, `page`, `row`, `wal`. In `powdb-query`:

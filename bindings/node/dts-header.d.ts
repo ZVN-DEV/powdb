@@ -81,8 +81,12 @@ export type NativeQueryResult =
 export type NativeParam = number | bigint | string | boolean | null
 
 /**
- * The stable, machine-readable code on every error this addon throws, so a
- * caller can branch without matching on message text.
+ * The stable, machine-readable code on every error raised by this addon's own
+ * logic, so a caller can branch without matching on message text.
+ *
+ * This union does NOT cover errors raised by generated argument-coercion code,
+ * which runs before any addon logic and reports napi's own status strings
+ * (`"StringExpected"` and siblings). See {@link PowDBError}.
  *
  * The vocabulary mirrors the `PowDBErrorCode` union in the networked
  * `@zvndev/powdb-client` (`clients/ts/src/errors.ts`): same lowercase
@@ -129,8 +133,9 @@ export type PowDBErrorCode =
   | "internal"
 
 /**
- * The shape of every error this addon throws: a plain `Error` carrying a
- * {@link PowDBErrorCode}. Narrow to it in a `catch` block to branch on `code`:
+ * The shape of an error raised by this addon's own logic: a plain `Error`
+ * carrying a {@link PowDBErrorCode}. Narrow to it in a `catch` block to branch
+ * on `code`:
  *
  * ```ts
  * try {
@@ -142,10 +147,18 @@ export type PowDBErrorCode =
  * }
  * ```
  *
+ * `code` is deliberately widened past {@link PowDBErrorCode}. Argument
+ * coercion happens in generated binding code that runs BEFORE any addon logic,
+ * so passing a value of the wrong type surfaces one of napi's own status
+ * strings instead (`"StringExpected"`, `"InvalidArg"`, and siblings). Those are
+ * programming errors in the calling code rather than database conditions, and
+ * they are not enumerated here. Treat an unrecognized `code` as unexpected and
+ * rethrow it; do not write an exhaustive `switch` that assumes otherwise.
+ *
  * The addon throws native `Error` instances, not instances of the networked
  * client's `PowDBError` class, so `instanceof` does not cross the two
  * packages. `code` is the portable branch.
  */
 export interface PowDBError extends Error {
-  code: PowDBErrorCode
+  code: PowDBErrorCode | (string & {})
 }

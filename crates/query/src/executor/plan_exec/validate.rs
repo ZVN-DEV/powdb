@@ -765,7 +765,7 @@ fn arithmetic_type_error(
     };
     if op == BinOp::Div && divisor_is_zero {
         // Leads with `cannot` so the server's egress allowlist
-        // (`SAFE_ERROR_PREFIXES` in crates/server/src/handler.rs) still
+        // (`SAFE_ERROR_PREFIXES` in crates/server/src/handler/classify.rs) still
         // forwards it verbatim now that it no longer starts with
         // `type mismatch`.
         return Some(QueryError::Execution(

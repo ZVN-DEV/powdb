@@ -46,6 +46,24 @@ jobs:
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
 
+      # Validate the release body HERE, in the one job everything else depends
+      # on, rather than in the `release` job. `release` is a sibling of
+      # `npm-publish`, `npm-publish-sync` and `docker`, so a changelog problem
+      # discovered there surfaces only after those irreversible publishes have
+      # already run. A tag whose version has no changelog section must fail
+      # before anything ships, not after.
+      - name: Release body is extractable from the changelog
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::tag $tag is not a vX.Y.Z release tag; the release body will fall back to generated notes"
+            exit 0
+          fi
+          bash scripts/ci/changelog-section.sh "$version" > /dev/null
+          echo "changelog section for $version is present and non-empty"
+
   build:
     name: build (${{ matrix.target }})
     needs: test
@@ -363,10 +381,21 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF#refs/tags/v}"
           notes="${RUNNER_TEMP}/release-notes.md"
-          bash scripts/ci/changelog-section.sh "$version" > "$notes"
-          echo "path=$notes" >> "$GITHUB_OUTPUT"
-          echo "Release body ($(wc -l < "$notes") lines):"
-          cat "$notes"
+          # A prerelease tag (v0.26.0-rc1) has no changelog section of its own.
+          # Fall back to generated notes rather than failing: by this point the
+          # npm and ghcr publishes have already run, so failing here would leave
+          # a release with published packages and no GitHub Release at all. The
+          # `test` job already hard-fails a vX.Y.Z tag with no section, which is
+          # the case that must never ship.
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            bash scripts/ci/changelog-section.sh "$version" > "$notes"
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+            echo "Release body ($(wc -l < "$notes") lines):"
+            cat "$notes"
+          else
+            echo "::notice::$version is not a release version; using generated notes only"
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

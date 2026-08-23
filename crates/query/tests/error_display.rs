@@ -1,7 +1,7 @@
 //! Byte-exact Display regression suite for `QueryError` and `ParseError`.
 //!
 //! The server's egress sanitization (`SAFE_ERROR_PREFIXES` in
-//! crates/server/src/handler.rs) string-matches these messages, and several
+//! crates/server/src/handler/classify.rs) string-matches these messages, and several
 //! integration tests assert on them verbatim. Any change to a Display string
 //! is therefore a wire-visible behavior change. This suite pins every variant
 //! to its exact current output so refactors of the error types (e.g. the
@@ -118,6 +118,45 @@ fn query_error_display_is_byte_exact_for_every_variant() {
     for (error, expected) in cases {
         assert_eq!(error.to_string(), expected, "variant: {error:?}");
     }
+}
+
+/// Keeps the name of the test above honest.
+///
+/// That test walks a hand-written `Vec`, so adding a `QueryError` variant does
+/// not make it fail to compile: `QueryError::Storage` was added to the enum
+/// while a test claiming to cover "every variant" stayed green and silently
+/// stopped covering everything. This match has no wildcard arm, so a new
+/// variant breaks the build here and whoever adds it is told to pin its
+/// rendered text above.
+#[test]
+fn every_query_error_variant_is_named_here() {
+    fn discriminant_name(error: &QueryError) -> &'static str {
+        match error {
+            QueryError::TableNotFound(_) => "TableNotFound",
+            QueryError::ColumnNotFound { .. } => "ColumnNotFound",
+            QueryError::TypeError(_) => "TypeError",
+            QueryError::JoinLimitExceeded => "JoinLimitExceeded",
+            QueryError::NestedLoopPairLimitExceeded { .. } => "NestedLoopPairLimitExceeded",
+            QueryError::SortLimitExceeded => "SortLimitExceeded",
+            QueryError::MemoryLimitExceeded { .. } => "MemoryLimitExceeded",
+            QueryError::Parse(_) => "Parse",
+            QueryError::IndexError(_) => "IndexError",
+            QueryError::ViewError(_) => "ViewError",
+            QueryError::StorageError(_) => "StorageError",
+            QueryError::Storage { .. } => "Storage",
+            QueryError::ReadonlyNeedsWrite => "ReadonlyNeedsWrite",
+            QueryError::ReadonlyMode => "ReadonlyMode",
+            QueryError::Timeout { .. } => "Timeout",
+            QueryError::Cancelled => "Cancelled",
+            QueryError::Execution(_) => "Execution",
+        }
+    }
+
+    assert_eq!(
+        discriminant_name(&QueryError::Cancelled),
+        "Cancelled",
+        "the guard must actually run, not merely compile"
+    );
 }
 
 /// The two messages the `sum` aggregate paths compose are wire-visible for the

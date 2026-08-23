@@ -35,6 +35,13 @@ pub(super) const SAFE_ERROR_PREFIXES: &[&str] = &[
     "permission denied",
     "row too large",
     "unique constraint violation",
+    // The expression-index twin of the line above. Both name only what the
+    // client itself declared (a column, or the indexed expression), so the
+    // expression text is exactly as safe to echo as "User.email" is. Without
+    // this entry the caller is told class 8 (a constraint rejected the write)
+    // over a generic message that names no constraint, which is worse than
+    // useless for fixing the data.
+    "unique expression index violation",
     // Resource-limit errors carry actionable guidance (e.g. "add a LIMIT
     // clause") and leak no internal state, so surface them verbatim instead
     // of masking them to the generic message. See QueryError::{SortLimit,

@@ -649,7 +649,7 @@ fn non_numeric_agg_error(label: &str, value: &Value) -> QueryError {
 /// `int`, and only their total left the range, so the `type mismatch: ` prefix
 /// that variant's Display adds told the caller something false. The refusal
 /// leads with `cannot` so the server's egress allowlist (`SAFE_ERROR_PREFIXES`
-/// in crates/server/src/handler.rs) still forwards it verbatim, and it
+/// in crates/server/src/handler/classify.rs) still forwards it verbatim, and it
 /// classifies as the wire class `execution` (2) exactly as `TypeError` did, so
 /// the stable class byte is unchanged.
 pub(super) fn agg_overflow_error(label: &str) -> QueryError {

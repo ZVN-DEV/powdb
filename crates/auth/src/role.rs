@@ -2,7 +2,7 @@
 //!
 //! A small, fixed permission lattice plus three builtin roles
 //! (`admin`, `readwrite`, `readonly`). The lattice is enforced at the server
-//! dispatch layer (`crates/server/src/handler.rs::check_statement_permitted`):
+//! dispatch layer (`crates/server/src/handler/auth.rs::check_statement_permitted`):
 //! reads need [`Permission::Read`], row mutations need [`Permission::Write`],
 //! schema changes need [`Permission::Ddl`], and [`Permission::Admin`] is
 //! reserved for user/role management (CLI-only today).
