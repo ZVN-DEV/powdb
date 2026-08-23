@@ -255,8 +255,19 @@ checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi",
+ "r-efi 5.3.0",
  "wasip2",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi 6.0.0",
 ]
 
 [[package]]
@@ -384,7 +395,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "powdb-auth"
-version = "0.21.0"
+version = "0.25.0"
 dependencies = [
  "argon2",
  "serde",
@@ -395,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.21.0"
+version = "0.25.0"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
@@ -415,14 +426,13 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.21.0"
+version = "0.25.0"
 dependencies = [
  "bytes",
  "powdb-auth",
  "powdb-query",
  "powdb-storage",
  "powdb-sync",
- "rustls-pemfile",
  "sha2",
  "thiserror",
  "tokio",
@@ -434,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.21.0"
+version = "0.25.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -446,10 +456,10 @@ dependencies = [
 
 [[package]]
 name = "powdb-sync"
-version = "0.21.0"
+version = "0.25.0"
 dependencies = [
  "crc32fast",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "libc",
  "powdb-storage",
  "serde",
@@ -485,6 +495,12 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand_core"
@@ -545,15 +561,6 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]

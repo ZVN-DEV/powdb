@@ -43,6 +43,23 @@ fail() { echo "fuzz-replay: FAIL: $*" >&2; FAILURES=$((FAILURES + 1)); }
 
 cd "${FUZZ_CRATE_DIR}" || exit 1
 
+# The checked-in fuzz lockfile must actually describe this build.
+#
+# `cargo fuzz` has no --locked flag (cargo-fuzz 0.13 rejects it outright), so
+# nothing forced the lock to be current and the fuzz build simply regenerated
+# it on every run. It sat four minors stale, pinning the powdb crates at 0.21.0
+# and still naming a dependency the workspace had dropped, while ci.yml keyed
+# its build cache on hashFiles() of that same file: a cache key derived from a
+# file the build ignored and that therefore never changed. Asserting it here is
+# what makes both the lockfile and that cache key mean something.
+if ! lock_check="$(cd fuzz && cargo "+${FUZZ_TOOLCHAIN}" metadata --locked --format-version 1 2>&1 >/dev/null)"; then
+  echo "fuzz-replay: FAIL: crates/query/fuzz/Cargo.lock is stale, or the check itself could not run." >&2
+  echo "       cargo said: ${lock_check}" >&2
+  echo "       If the lock is stale, regenerate it and commit the result:" >&2
+  echo "         (cd crates/query/fuzz && cargo metadata --offline --format-version 1 >/dev/null)" >&2
+  exit 1
+fi
+
 # Every target declared in the fuzz crate must appear in the replay list.
 # Without this, adding a `[[bin]]` and forgetting the list here would silently
 # leave the new target out of the required gate.

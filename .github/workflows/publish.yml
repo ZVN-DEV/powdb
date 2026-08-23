@@ -135,8 +135,10 @@ jobs:
 
       # Same gate CI enforces on every PR. Publishing skipped it entirely, so a
       # hand-dispatched publish could ship code that would never pass ci.yml.
+      # `--locked` is part of that parity: ci.yml requires it, so without it a
+      # publish could resolve a dependency set no CI run ever compiled.
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Enable pnpm from packageManager
         run: |
@@ -144,7 +146,7 @@ jobs:
           corepack prepare pnpm@10.29.3 --activate
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
@@ -207,9 +209,15 @@ jobs:
             echo "All crates validated for v${{ inputs.version }}. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Published to crates.io" >> "$GITHUB_STEP_SUMMARY"
+            # Listed in publish order. This block used to name 7 crates while
+            # the job published 8 (powdb-sync was missing), so the run summary
+            # under-reported what had actually gone out.
+            # scripts/check-version-consistency.sh asserts this list equals both
+            # the publish steps above and the set of publishable crate manifests.
             echo "- powdb-storage v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-query v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-auth v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-query v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-sync v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-backup v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb-server v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
             echo "- powdb (embedded facade) v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"

@@ -37,8 +37,11 @@ jobs:
           restore-keys: |
             release-test-${{ runner.os }}-
 
+      # `--locked` matches ci.yml. This workflow builds the artifacts users
+      # download, so resolving a dependency set CI never saw is worse here
+      # than anywhere else in the repo.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
@@ -87,7 +90,7 @@ jobs:
       - name: Build release binaries
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --target ${{ matrix.target }} -p powdb-cli -p powdb-server
+        run: cargo build --release --locked --target ${{ matrix.target }} -p powdb-cli -p powdb-server
 
       - name: Rename binaries
         run: |
@@ -135,7 +138,7 @@ jobs:
             release-x86_64-unknown-linux-gnu-
 
       - name: Build release binaries (powdb-cli + powdb-server)
-        run: cargo build --release -p powdb-cli -p powdb-server
+        run: cargo build --release --locked -p powdb-cli -p powdb-server
 
       # The gate whose absence caused the v0.4.1–0.4.3 data-loss yanks:
       # README PowQL flow + unique-constraint enforcement + kill -9/restart
@@ -345,9 +348,30 @@ jobs:
         with:
           subject-path: artifacts/*
 
+      # `generate_release_notes: true` on its own made the entire v0.25.0 release
+      # body one auto-generated bullet linking a PR, while the curated 95-line
+      # CHANGELOG entry (which described a defect that permanently bricked data
+      # directories) never reached the page most users read. Passing an explicit
+      # body keeps the curated notes first; GitHub still appends the generated
+      # PR list underneath because generate_release_notes stays on.
+      #
+      # The extractor fails the release if the section is missing or empty
+      # rather than publishing a blank body.
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF#refs/tags/v}"
+          notes="${RUNNER_TEMP}/release-notes.md"
+          bash scripts/ci/changelog-section.sh "$version" > "$notes"
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+          echo "Release body ($(wc -l < "$notes") lines):"
+          cat "$notes"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           files: artifacts/*
 

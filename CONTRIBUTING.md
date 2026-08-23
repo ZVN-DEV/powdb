@@ -88,7 +88,11 @@ appears in a public file.
 ### Branch protection on `main`
 
 - PRs are required (no direct pushes)
-- Required status checks must pass, all from `ci.yml`: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, examples-smoke, version consistency, TypeScript client, and gitleaks secret scan
+- There is exactly **one** required status check: `ci-success`. It is an aggregator that
+  `needs:` every other job in `ci.yml` and fails if any of them did not succeed, so the
+  whole matrix below gates merges rather than a hand-picked subset. `scripts/ci/check-ci-success-needs.sh`
+  (the `ci-needs-completeness` job) fails the build if a job is ever defined without being
+  required, or required without being defined.
 - Force-push is rejected by branch protection
 
 Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work**: routine work goes through PRs even when bypass is technically available.
@@ -107,16 +111,30 @@ Admin bypass exists for break-glass scenarios (security patches, recovering from
 
 ## CI Checks
 
-PRs must pass these gates (see `.github/workflows/`):
-- **clippy + fmt + test**: lints, formatting, and all workspace tests, run on a two-OS matrix (`ubuntu-24.04`, `macos-latest`)
-- **miri**: undefined-behavior check on the non-mmap modules
-- **asan**: AddressSanitizer run
-- **audit**: `cargo audit` against the advisory database
-- **msrv-consistency**: verifies the declared MSRV (`1.93`) builds
-- **examples-smoke**: terraform validate + compose config + dev.sh cycle on the deploy examples
-- **version consistency**: `scripts/check-version-consistency.sh` prevents Rust/TypeScript/changelog/release-doc drift
-- **TypeScript client build + tests**: installs with `pnpm --frozen-lockfile`, builds, and runs pure plus server-backed client tests
-- **gitleaks secret scan**: low-noise supply-chain/secret scan with documented placeholder allowlist
+PRs must pass every job below (see `.github/workflows/ci.yml`). All of them are reachable
+through the single `ci-success` required check, and this list is asserted against `ci.yml`
+by `scripts/ci/check-ci-success-needs.sh`, so it cannot fall behind the workflow:
+
+- **`lint-test`**: clippy, `cargo fmt --check`, the full workspace test suite, and the `testing`-feature dual-path equivalence suite, on a two-OS matrix (`ubuntu-24.04`, `macos-latest`)
+- **`miri`**: undefined-behavior check on the non-mmap `powdb-storage` modules, sharded three ways (`btree`, `row-page`, `json-types-view`). The shard map lives in `scripts/ci/miri-shards.sh`, which fails if the shards stop covering the canonical filter set or stop matching `ci.yml`
+- **`asan`**: AddressSanitizer over the workspace with `-Zbuild-std`
+- **`msrv-consistency`**: the declared MSRV agrees across `Cargo.toml`, `README.md`, and `Dockerfile`
+- **`msrv-build`**: the declared MSRV toolchain actually builds the workspace (`cargo +<msrv> check --workspace --locked`)
+- **`examples-smoke`**: terraform validate, compose config, a `scripts/dev.sh` up/down cycle, and the runnable examples
+- **`version-consistency`**: `scripts/check-version-consistency.sh` prevents Rust/TypeScript/lockfile/docs/changelog/release-doc drift
+- **`ts-client`**: TypeScript client installs with `pnpm --frozen-lockfile`, builds, and runs pure plus server-backed tests
+- **`node-addon`**: the embedded Node addon (`bindings/node`) builds and its tests pass
+- **`embedded-sync-js`**: `@zvndev/powdb-sync` builds and passes its unit, native and end-to-end tests
+- **`cross-version-compat`**: on-disk format compatibility in both directions against the REAL released binaries, not fixtures this repo wrote (`scripts/ci/cross-version-compat.sh`)
+- **`fuzz-corpus-replay`**: deterministic single-pass replay of the checked-in fuzz corpus, so a reintroduced crash fails on the first PR rather than on some future night
+- **`release-profile-suites`**: the corruption and wire-corpus suites under the shipped `panic = "abort"` profile
+- **`bench-gate-selftest`**: proves the benchmark regression gate can still fail
+- **`ci-needs-completeness`**: every job defined in `ci.yml` is required by `ci-success`, and every `needs:` entry names a job that exists
+- **`secret-scan`**: gitleaks, low-noise, with a documented placeholder allowlist
+- **`audit`**: `cargo audit` against the advisory database
+- **`deny`**: `cargo deny` for licenses, banned crates and source registries
+- **`internal-content-guard`**: keeps internal planning and dogfood content out of the public repo
+- **`ci-success`**: the aggregator described above, and the only check branch protection requires
 
 The criterion benchmark suite (`.github/workflows/bench.yml`) is **manual-only** (`workflow_dispatch`) and is *not* a required PR gate, because shared-runner noise makes it unreliable as a blocking check. Run the regression gate locally instead (below).
 

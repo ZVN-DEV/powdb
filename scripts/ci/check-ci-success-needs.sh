@@ -11,13 +11,20 @@
 # `ci-success` itself, and anything explicitly listed as intentionally
 # advisory) must appear in `ci-success.needs`.
 #
+# It also checks the same list against CONTRIBUTING.md's "CI Checks" section.
+# That section had drifted to nine of nineteen jobs, and it is what a
+# contributor reads to find out what must pass, so a stale list there is a
+# wrong answer rather than a missing one.
+#
 # Env:
-#   CI_WORKFLOW  path to the workflow (default .github/workflows/ci.yml)
+#   CI_WORKFLOW       path to the workflow (default .github/workflows/ci.yml)
+#   CONTRIBUTING_DOC  path to CONTRIBUTING.md (default CONTRIBUTING.md)
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CI_WORKFLOW="${CI_WORKFLOW:-${REPO_ROOT}/.github/workflows/ci.yml}"
+CONTRIBUTING_DOC="${CONTRIBUTING_DOC:-${REPO_ROOT}/CONTRIBUTING.md}"
 
 # Jobs deliberately excluded from the required set. Keep this empty unless
 # there is a written reason; an entry here is a job that cannot block a merge.
@@ -79,7 +86,49 @@ while IFS= read -r dep; do
   fi
 done <<<"${required}"
 
+# The contributor-facing list must name the same jobs. Bullets in the
+# "## CI Checks" section look like: - **`job-key`**: description
+if [[ ! -f "${CONTRIBUTING_DOC}" ]]; then
+  echo "::error::no CONTRIBUTING.md at ${CONTRIBUTING_DOC}" >&2
+  exit 1
+fi
+documented="$(awk '
+  /^## CI Checks/           { in_section = 1; next }
+  in_section && /^## /      { in_section = 0 }
+  in_section && /^- \*\*`[a-zA-Z0-9_-]+`\*\*/ {
+    line = $0
+    sub(/^- \*\*`/, "", line)
+    sub(/`\*\*.*$/, "", line)
+    print line
+  }
+' "${CONTRIBUTING_DOC}" | sort -u)"
+
+undocumented=()
+overdocumented=()
+if [[ -z "${documented}" ]]; then
+  echo "::error::parsed zero job names out of the CI Checks section of ${CONTRIBUTING_DOC}; this guard is not working" >&2
+  exit 1
+fi
+while IFS= read -r job; do
+  [[ -z "${job}" ]] && continue
+  grep -qx -- "${job}" <<<"${documented}" || undocumented+=("${job}")
+done <<<"${defined}"
+while IFS= read -r job; do
+  [[ -z "${job}" ]] && continue
+  grep -qx -- "${job}" <<<"${defined}" || overdocumented+=("${job}")
+done <<<"${documented}"
+
 status=0
+if (( ${#undocumented[@]} > 0 )); then
+  echo "::error::these ci.yml jobs are missing from the CI Checks list in ${CONTRIBUTING_DOC}:" >&2
+  printf '  %s\n' "${undocumented[@]}" >&2
+  status=1
+fi
+if (( ${#overdocumented[@]} > 0 )); then
+  echo "::error::${CONTRIBUTING_DOC} documents CI jobs that do not exist in ci.yml:" >&2
+  printf '  %s\n' "${overdocumented[@]}" >&2
+  status=1
+fi
 if (( ${#missing[@]} > 0 )); then
   echo "::error::these ci.yml jobs are NOT in ci-success.needs, so they gate nothing:" >&2
   printf '  %s\n' "${missing[@]}" >&2
@@ -92,6 +141,6 @@ if (( ${#stale[@]} > 0 )); then
 fi
 
 if (( status == 0 )); then
-  echo "ci-needs: all $(wc -l <<<"${defined}" | tr -d ' ') jobs are required by ci-success."
+  echo "ci-needs: all $(wc -l <<<"${defined}" | tr -d ' ') jobs are required by ci-success and documented in ${CONTRIBUTING_DOC}."
 fi
 exit "${status}"
