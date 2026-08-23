@@ -193,7 +193,7 @@ pub(super) fn for_each_row_raw_cancellable(
     if !crate::cancel::has_active_install() {
         return catalog
             .for_each_row_raw(table, f)
-            .map_err(|err| QueryError::StorageError(err.to_string()));
+            .map_err(QueryError::from_storage_io);
     }
 
     let mut cancel = CancelCheck::new();
@@ -207,7 +207,7 @@ pub(super) fn for_each_row_raw_cancellable(
             f(rid, data);
             ControlFlow::Continue(())
         })
-        .map_err(|err| QueryError::StorageError(err.to_string()))?;
+        .map_err(QueryError::from_storage_io)?;
     match cancel_err {
         Some(err) => Err(err),
         None => Ok(()),

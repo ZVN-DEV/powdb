@@ -400,6 +400,25 @@ impl ErrorClass {
     }
 }
 
+/// The payload length a wire frame header declares, or `None` when `buffer`
+/// does not yet hold a whole 6-byte header.
+///
+/// Every frame is `[type: u8][flags: u8][payload_len: u32 LE][payload]`, so
+/// the connection read loop needs this field before it knows how many more
+/// bytes to wait for. The length is returned unvalidated on purpose: the
+/// caller is the one that knows which cap applies (pre-auth payloads, the
+/// global maximum, the remaining read-ahead budget).
+///
+/// This exists as a function rather than an inline slice so the "is there a
+/// header yet" check and the read of the field cannot drift apart. The
+/// release profile builds with `panic = "abort"`, so a fixed-width read that
+/// runs one byte past a buffer a remote peer controls is not a failed
+/// request, it is a process abort that disconnects every other client.
+pub fn frame_payload_len(buffer: &[u8]) -> Option<u32> {
+    let field: [u8; 4] = buffer.get(2..6)?.try_into().ok()?;
+    Some(u32::from_le_bytes(field))
+}
+
 /// Extract the trailing error-class byte from a full `MSG_ERROR` frame, if
 /// present. Returns `None` for non-error frames, malformed frames, and
 /// legacy error frames that carry only the message string.
@@ -1323,11 +1342,11 @@ fn decode_query_with_params_exact(payload: &[u8]) -> Result<(String, Vec<WirePar
             0 => WireParam::Null,
             1 => {
                 let bytes = take_exact(payload, &mut pos, 8, "int param")?;
-                WireParam::Int(i64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+                WireParam::Int(i64::from_le_bytes(fixed_width(bytes, "int param")?))
             }
             2 => {
                 let bytes = take_exact(payload, &mut pos, 8, "float param")?;
-                WireParam::Float(f64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+                WireParam::Float(f64::from_le_bytes(fixed_width(bytes, "float param")?))
             }
             3 => WireParam::Bool(decode_bool(payload, &mut pos, "bool param")?),
             4 => WireParam::Str(decode_string_strict(payload, &mut pos, "string param")?),
@@ -1389,15 +1408,17 @@ fn decode_typed_value(data: &[u8], pos: &mut usize) -> Result<Value, String> {
         }
         TypeId::Int => {
             require_len(8)?;
-            Ok(Value::Int(i64::from_le_bytes(
-                body.try_into().expect("validated 8-byte int"),
-            )))
+            Ok(Value::Int(i64::from_le_bytes(fixed_width(
+                body,
+                "typed int value",
+            )?)))
         }
         TypeId::Float => {
             require_len(8)?;
-            Ok(Value::Float(f64::from_le_bytes(
-                body.try_into().expect("validated 8-byte float"),
-            )))
+            Ok(Value::Float(f64::from_le_bytes(fixed_width(
+                body,
+                "typed float value",
+            )?)))
         }
         TypeId::Bool => {
             require_len(1)?;
@@ -1414,15 +1435,14 @@ fn decode_typed_value(data: &[u8], pos: &mut usize) -> Result<Value, String> {
         )),
         TypeId::DateTime => {
             require_len(8)?;
-            Ok(Value::DateTime(i64::from_le_bytes(
-                body.try_into().expect("validated 8-byte datetime"),
-            )))
+            Ok(Value::DateTime(i64::from_le_bytes(fixed_width(
+                body,
+                "typed datetime value",
+            )?)))
         }
         TypeId::Uuid => {
             require_len(16)?;
-            Ok(Value::Uuid(
-                body.try_into().expect("validated 16-byte UUID"),
-            ))
+            Ok(Value::Uuid(fixed_width(body, "typed UUID value")?))
         }
         TypeId::Bytes => Ok(Value::Bytes(body.to_vec())),
         TypeId::Json => {
@@ -1472,6 +1492,24 @@ fn decode_native_rows(payload: &[u8]) -> Result<Message, String> {
     }
     require_payload_end(payload, pos, "native rows")?;
     Ok(Message::ResultRowsNative { columns, rows })
+}
+
+/// Narrow a slice that an upstream length check already sized to a
+/// fixed-width array.
+///
+/// The conversion cannot fail while that check is correct, so this reads like
+/// an assertion. It returns a protocol error instead because the release
+/// profile builds with `panic = "abort"`: a wrong invariant on bytes a remote
+/// peer sent would abort the process and disconnect every other client, where
+/// an error costs exactly one refused frame. See
+/// `tests/wire_decode_no_panic.rs`.
+fn fixed_width<const N: usize>(bytes: &[u8], label: &str) -> Result<[u8; N], String> {
+    bytes.try_into().map_err(|_| {
+        format!(
+            "invalid {label} length: expected {N} bytes, got {}",
+            bytes.len()
+        )
+    })
 }
 
 fn take_exact<'a>(

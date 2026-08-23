@@ -994,7 +994,7 @@ impl Engine {
         }
         self.catalog
             .rollback_to_last_sync_with_wal_archive(archive)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         self.finish_rollback_after_catalog_restore()
     }
 
@@ -1009,7 +1009,7 @@ impl Engine {
             }
             self.catalog
                 .rollback_to_last_sync()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
             return self.finish_rollback_after_catalog_restore();
         };
         self.rollback_transaction_with_wal_archive(move |dir, records| hook(dir, records))
@@ -1168,7 +1168,7 @@ impl Engine {
                     if !self.in_transaction {
                         self.catalog
                             .commit_autocommit()
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                     }
                     return result;
                 }
@@ -1182,7 +1182,7 @@ impl Engine {
                 if !self.in_transaction {
                     self.catalog
                         .commit_autocommit()
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 return result;
             }
@@ -1193,7 +1193,7 @@ impl Engine {
             if !self.in_transaction {
                 self.catalog
                     .commit_autocommit()
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
             }
             return result;
         }
@@ -1215,7 +1215,7 @@ impl Engine {
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         let exec_us = exec_start.elapsed().as_micros();
 
@@ -1276,7 +1276,7 @@ impl Engine {
                     if !self.in_transaction {
                         self.catalog
                             .commit_autocommit()
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                     }
                     return result;
                 }
@@ -1290,7 +1290,7 @@ impl Engine {
                 if !self.in_transaction {
                     self.catalog
                         .commit_autocommit()
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 return result;
             }
@@ -1301,7 +1301,7 @@ impl Engine {
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         result
     }
@@ -1367,7 +1367,7 @@ impl Engine {
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         result
     }
@@ -1937,7 +1937,7 @@ impl Engine {
                                     }
                                     std::ops::ControlFlow::Continue(())
                                 })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                         } else {
                             let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
@@ -1953,7 +1953,7 @@ impl Engine {
                                     }
                                     std::ops::ControlFlow::Continue(())
                                 })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                         }
                         if let Some(e) = cancel_err {
                             return Err(e);

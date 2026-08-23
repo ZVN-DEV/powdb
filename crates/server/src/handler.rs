@@ -1,15 +1,15 @@
 use crate::metrics::{Metrics, QueryOutcome, SyncOperation, SyncOutcome, SyncRepairLabel};
 use crate::protocol::{
-    negotiate_protocol, stated_client_hello, ErrorClass, Message, WireParam, WireRetainedUnit,
-    WireSyncRepairAction, WireSyncStatus, CLIENT_CATALOG_VERSION, MAX_SUPPORTED_PROTOCOL_VERSION,
-    MIN_SUPPORTED_PROTOCOL_VERSION, SERVER_FEATURES,
+    frame_payload_len, negotiate_protocol, stated_client_hello, ErrorClass, Message, WireParam,
+    WireRetainedUnit, WireSyncRepairAction, WireSyncStatus, CLIENT_CATALOG_VERSION,
+    MAX_SUPPORTED_PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION, SERVER_FEATURES,
 };
 use powdb_auth::{Permission, Role, UserStore};
 use powdb_query::executor::{is_read_only_statement, Engine, WalDurabilityTicket};
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
 use powdb_query::sql;
-use powdb_storage::error::StorageError;
+use powdb_storage::error::{StorageError, StorageErrorKind};
 use powdb_storage::types::Value;
 use powdb_sync::{
     acknowledge_replica_apply, read_identity, read_units_through, replica_sync_status,
@@ -493,24 +493,11 @@ fn classify_query_error(e: &QueryError) -> ErrorClass {
         | QueryError::TypeError(_)
         | QueryError::IndexError(_)
         | QueryError::ViewError(_) => ErrorClass::Execution,
-        // Storage refusals arrive here already rendered to text: the query
-        // crate stores them as `QueryError::StorageError(e.to_string())`, so
-        // the variant is gone. Recognize the ones the client can act on, using
-        // the predicates that live beside the messages they read
-        // (crates/storage/src/error.rs), so each gets the class docs/errors.md
-        // promises instead of collapsing to Internal ("server bug"), which
-        // tells a driver there is nothing to fix on its side.
-        QueryError::StorageError(err) => {
-            if err.contains("unique constraint violation") {
-                ErrorClass::ConstraintViolation
-            } else if StorageError::is_transaction_too_large_message(err) {
-                ErrorClass::LimitExceeded
-            } else if StorageError::is_ddl_in_transaction_message(err) {
-                ErrorClass::Execution
-            } else {
-                ErrorClass::Internal
-            }
-        }
+        // A storage refusal that kept its kind is classified from the kind.
+        QueryError::Storage { kind, .. } => class_for_storage_kind(*kind),
+        // A storage refusal whose kind was already discarded. See
+        // `class_for_legacy_storage_text`.
+        QueryError::StorageError(err) => class_for_legacy_storage_text(err),
         QueryError::Execution(msg) => {
             if msg.starts_with("unique constraint violation") {
                 ErrorClass::ConstraintViolation
@@ -520,6 +507,70 @@ fn classify_query_error(e: &QueryError) -> ErrorClass {
                 ErrorClass::Execution
             }
         }
+    }
+}
+
+/// The wire [`ErrorClass`] for a storage refusal, decided by its
+/// [`StorageErrorKind`].
+///
+/// The match is exhaustive with no wildcard arm: a new storage variant fails
+/// to compile here until someone decides what a client should do about it.
+/// That is the point of routing classification through the type. The class
+/// byte is what a driver branches on, so defaulting a new refusal to
+/// [`ErrorClass::Internal`] ("the server broke, nothing to fix on your side")
+/// is a wrong answer, not a safe one.
+fn class_for_storage_kind(kind: StorageErrorKind) -> ErrorClass {
+    match kind {
+        // A constraint rejected the write. The caller's data is the problem
+        // and the caller can fix it. docs/errors.md class 8.
+        StorageErrorKind::UniqueConstraintViolation
+        | StorageErrorKind::UniqueExpressionIndexViolation => ErrorClass::ConstraintViolation,
+        // A size budget was exceeded, with actionable guidance in the message
+        // (commit more often). docs/errors.md class 4.
+        StorageErrorKind::TransactionTooLarge => ErrorClass::LimitExceeded,
+        // The statement is not allowed here, and the message says what to do
+        // instead (commit or roll back first). docs/errors.md class 2.
+        StorageErrorKind::DdlInTransaction => ErrorClass::Execution,
+        // Genuine server-side faults: disk failures, corruption, and the
+        // physical row/value caps, which no client action resolves.
+        StorageErrorKind::Io
+        | StorageErrorKind::CorruptData
+        | StorageErrorKind::CorruptCrc
+        | StorageErrorKind::WalReplay
+        | StorageErrorKind::CatalogCorrupt
+        | StorageErrorKind::PageCorrupt
+        | StorageErrorKind::InvalidIdentifier
+        | StorageErrorKind::RowTooLarge
+        | StorageErrorKind::ValueTooLarge
+        | StorageErrorKind::OverflowCorrupt => ErrorClass::Internal,
+    }
+}
+
+/// LEGACY FALLBACK: the wire [`ErrorClass`] for a storage refusal that was
+/// rendered to text before it reached the query layer, so its kind is gone.
+///
+/// [`QueryError::Storage`] carries the kind and is what the executor produces
+/// today, but `QueryError::StorageError(String)` is still reachable: a plain
+/// [`std::io::Error`] has no storage kind to recover, and paths that stringify
+/// a failure early (the fast-path row patcher, for one) never had the typed
+/// error to begin with. Without this fallback those refusals would all collapse
+/// to [`ErrorClass::Internal`], which tells a driver the server broke when the
+/// caller merely inserted a duplicate.
+///
+/// Each predicate lives beside the `#[error(...)]` string it reads, in
+/// `crates/storage/src/error.rs`, where a test renders one instance of every
+/// variant and fails if a reworded message stops matching or starts matching a
+/// sibling. Do not add new callers of this: give the refusal a
+/// [`StorageErrorKind`] instead.
+fn class_for_legacy_storage_text(message: &str) -> ErrorClass {
+    if StorageError::is_unique_violation_message(message) {
+        ErrorClass::ConstraintViolation
+    } else if StorageError::is_transaction_too_large_message(message) {
+        ErrorClass::LimitExceeded
+    } else if StorageError::is_ddl_in_transaction_message(message) {
+        ErrorClass::Execution
+    } else {
+        ErrorClass::Internal
     }
 }
 
@@ -3257,12 +3308,8 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        if buffered.len() >= 6 {
-            let payload_len = u32::from_le_bytes(
-                buffered[2..6]
-                    .try_into()
-                    .expect("four-byte wire payload length"),
-            ) as usize;
+        if let Some(declared_payload_len) = frame_payload_len(buffered) {
+            let payload_len = declared_payload_len as usize;
             if payload_len > MAX_WIRE_PAYLOAD_SIZE {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -3301,23 +3348,18 @@ where
         // Read only the bytes needed for this frame stage. Besides preserving
         // cancellation safety, this prevents a large pipelined payload from
         // overshooting the in-flight byte budget in one buffered read.
-        let wanted = if buffered.len() < 6 {
-            6 - buffered.len()
-        } else {
-            let payload_len = u32::from_le_bytes(
-                buffered[2..6]
-                    .try_into()
-                    .expect("four-byte wire payload length"),
-            ) as usize;
-            6usize
-                .checked_add(payload_len)
+        let wanted = match frame_payload_len(buffered) {
+            // Not a whole header yet, so the next read is the rest of it.
+            None => 6 - buffered.len(),
+            Some(payload_len) => 6usize
+                .checked_add(payload_len as usize)
                 .and_then(|frame_len| frame_len.checked_sub(buffered.len()))
                 .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid buffered wire frame length",
                     )
-                })?
+                })?,
         };
         let read_limit = wanted.min(chunk.len());
         let read = reader.read(&mut chunk[..read_limit]).await?;
@@ -3733,10 +3775,10 @@ async fn serve_connection<R, W>(
             /// durability settlement and unflushed replies hostage to a slow
             /// (or malicious) client, up to the idle timeout.
             fn complete_frame_buffered(buf: &[u8]) -> bool {
-                buf.len() >= 6 && {
-                    let payload_len =
-                        u32::from_le_bytes(buf[2..6].try_into().expect("4-byte slice")) as usize;
-                    buf.len() - 6 >= payload_len
+                match frame_payload_len(buf) {
+                    // `Some` only when a whole 6-byte header is buffered.
+                    Some(payload_len) => buf.len() - 6 >= payload_len as usize,
+                    None => false,
                 }
             }
 
@@ -4393,6 +4435,41 @@ mod tests {
     #[test]
     fn null_serializes_as_null_bareword_on_wire() {
         assert_eq!(value_to_display(&Value::Empty), "null");
+    }
+
+    // ---- Wire frame header reads must never panic (panic = "abort") ----
+
+    /// A connection sits with fewer than six buffered bytes every time it
+    /// waits for the next frame, and a peer can pin it there by sending a
+    /// partial header and stopping. The read loop must treat that as "no
+    /// header yet" rather than reading the four-byte length field out of it.
+    /// The release profile aborts on panic, so one byte past the end of this
+    /// buffer is not a failed request: it disconnects every other client on
+    /// the server and forces a WAL replay on restart.
+    #[tokio::test]
+    async fn a_partial_frame_header_never_panics_the_read_loop() {
+        for prefix in 0..6usize {
+            let mut buffered = vec![0xFFu8; prefix];
+            let empty: &[u8] = &[];
+            let mut reader = BufReader::new(empty);
+            let got = read_message_cancel_safe(
+                &mut reader,
+                &mut buffered,
+                MAX_IN_FLIGHT_READ_AHEAD_BYTES,
+            )
+            .await;
+            match got {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!(
+                    "the read loop decoded a whole frame out of a {prefix}-byte \
+                     partial header"
+                ),
+                Err(error) => panic!(
+                    "a {prefix}-byte partial header followed by EOF must close the \
+                     connection cleanly, got error: {error}"
+                ),
+            }
+        }
     }
 
     // ---- Error sanitization allowlist ----
@@ -7099,27 +7176,93 @@ mod tests {
 
     #[test]
     fn transaction_over_the_dirty_page_budget_reaches_clients_as_a_limit() {
-        // The refusal the heap raises (crates/storage/src/heap.rs) after the
-        // query crate erases its type: `QueryError::StorageError` carries only
-        // the rendered message, which is all the server ever sees.
-        let raised = std::io::Error::new(
-            std::io::ErrorKind::OutOfMemory,
-            StorageError::TransactionTooLarge {
-                pages: 65_536,
-                limit_bytes: 268_435_456,
-            },
+        // The refusal the heap raises (crates/storage/src/heap.rs), in both
+        // shapes it can reach the server in.
+        let raised = || {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                StorageError::TransactionTooLarge {
+                    pages: 65_536,
+                    limit_bytes: 268_435_456,
+                },
+            )
+        };
+
+        // The path the executor takes today: the kind survives, and the class
+        // comes from it.
+        let typed = QueryError::from_storage_io(raised());
+        assert!(
+            matches!(typed, QueryError::Storage { .. }),
+            "the executor must deliver this refusal typed, or the type-driven \
+             classification below never fires in production"
         );
-        let err = QueryError::StorageError(raised.to_string());
         assert_eq!(
-            classify_query_error(&err),
+            classify_query_error(&typed),
             ErrorClass::LimitExceeded,
             "a transaction refused by the dirty-page budget is a resource limit, the same \
              class MemoryLimitExceeded already carries"
         );
+
+        // The legacy shape, for any path that still renders the refusal to
+        // text before the server sees it. It must classify identically.
+        let legacy = QueryError::StorageError(raised().to_string());
+        assert_eq!(
+            classify_query_error(&legacy),
+            ErrorClass::LimitExceeded,
+            "the legacy text fallback must agree with the typed path"
+        );
+        assert_eq!(
+            typed.to_string(),
+            legacy.to_string(),
+            "typing the refusal must not change one byte of what the client reads"
+        );
+        assert_eq!(
+            sanitize_error(&typed.to_string()),
+            typed.to_string(),
+            "the budget message names the limit and the remedy; it must cross verbatim"
+        );
+    }
+
+    #[test]
+    fn a_unique_violation_reaches_clients_as_a_constraint_violation() {
+        let raised = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                StorageError::UniqueConstraintViolation {
+                    table: "User".into(),
+                    column: "email".into(),
+                },
+            )
+        };
+
+        let typed = QueryError::from_storage_io(raised());
+        assert_eq!(
+            classify_query_error(&typed),
+            ErrorClass::ConstraintViolation,
+            "a duplicate key is the caller's data problem, not a server fault"
+        );
+
+        let legacy = QueryError::StorageError(raised().to_string());
+        assert_eq!(
+            classify_query_error(&legacy),
+            ErrorClass::ConstraintViolation,
+            "the legacy text fallback must agree with the typed path"
+        );
+        assert_eq!(typed.to_string(), legacy.to_string());
+    }
+
+    /// A storage failure with no kind to recover must not be dressed up as one
+    /// of the refusals a client can act on.
+    #[test]
+    fn a_plain_io_failure_still_reaches_clients_as_internal() {
+        let bare = std::io::Error::other("disk went away");
+        let err = QueryError::from_storage_io(bare);
+        assert!(matches!(err, QueryError::StorageError(_)));
+        assert_eq!(classify_query_error(&err), ErrorClass::Internal);
         assert_eq!(
             sanitize_error(&err.to_string()),
-            err.to_string(),
-            "the budget message names the limit and the remedy; it must cross verbatim"
+            "query execution error",
+            "an internal I/O detail must never cross the wire verbatim"
         );
     }
 

@@ -64,28 +64,122 @@ pub enum StorageError {
         "cannot buffer more of this transaction: {pages} unflushed pages exceed the {limit_bytes} byte dirty-page budget, commit or roll back"
     )]
     TransactionTooLarge { pages: usize, limit_bytes: usize },
+
+    /// A write would put a duplicate key into a unique column index. Raised by
+    /// the insert/update preflight before anything is written, so the heap and
+    /// every index are left untouched.
+    #[error("unique constraint violation on {table}.{column}")]
+    UniqueConstraintViolation { table: String, column: String },
+
+    /// The same refusal for a unique *expression* index (for example a unique
+    /// JSON path). Separate from [`Self::UniqueConstraintViolation`] because
+    /// the offending key is an expression rather than a column, and the
+    /// message names it.
+    #[error("unique expression index violation on {table} ({expression})")]
+    UniqueExpressionIndexViolation { table: String, expression: String },
+}
+
+/// The kind of a [`StorageError`], stripped of its payload.
+///
+/// [`StorageError`] can be neither `Clone` nor `PartialEq` because
+/// [`StorageError::Io`] wraps [`std::io::Error`], which is neither. Callers
+/// that must keep a refusal around and branch on it later carry this instead
+/// of the error itself: the query layer stores it in `QueryError::Storage`
+/// beside the rendered message, and the server maps it to a wire error class.
+///
+/// [`StorageError::kind`] matches exhaustively, so a new `StorageError`
+/// variant does not compile until it has been given a kind here, and the
+/// server's mapping from kind to wire class is exhaustive for the same
+/// reason. That is the whole point of the type: the class of an error a
+/// client acts on is decided by the compiler, not by a substring search over
+/// a message that anyone may reword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageErrorKind {
+    Io,
+    CorruptData,
+    CorruptCrc,
+    WalReplay,
+    CatalogCorrupt,
+    PageCorrupt,
+    InvalidIdentifier,
+    RowTooLarge,
+    ValueTooLarge,
+    OverflowCorrupt,
+    DdlInTransaction,
+    TransactionTooLarge,
+    UniqueConstraintViolation,
+    UniqueExpressionIndexViolation,
 }
 
 impl StorageError {
+    /// This error's [`StorageErrorKind`].
+    ///
+    /// The match is exhaustive on purpose: a new variant fails to compile
+    /// until it is classified, which is what stops a refusal a client must act
+    /// on from silently defaulting to "internal server error".
+    pub fn kind(&self) -> StorageErrorKind {
+        match self {
+            Self::Io(_) => StorageErrorKind::Io,
+            Self::CorruptData(_) => StorageErrorKind::CorruptData,
+            Self::CorruptCrc { .. } => StorageErrorKind::CorruptCrc,
+            Self::WalReplay(_) => StorageErrorKind::WalReplay,
+            Self::CatalogCorrupt(_) => StorageErrorKind::CatalogCorrupt,
+            Self::PageCorrupt(_) => StorageErrorKind::PageCorrupt,
+            Self::InvalidIdentifier(_) => StorageErrorKind::InvalidIdentifier,
+            Self::RowTooLarge { .. } => StorageErrorKind::RowTooLarge,
+            Self::ValueTooLarge { .. } => StorageErrorKind::ValueTooLarge,
+            Self::OverflowCorrupt(_) => StorageErrorKind::OverflowCorrupt,
+            Self::DdlInTransaction { .. } => StorageErrorKind::DdlInTransaction,
+            Self::TransactionTooLarge { .. } => StorageErrorKind::TransactionTooLarge,
+            Self::UniqueConstraintViolation { .. } => StorageErrorKind::UniqueConstraintViolation,
+            Self::UniqueExpressionIndexViolation { .. } => {
+                StorageErrorKind::UniqueExpressionIndexViolation
+            }
+        }
+    }
+
+    /// Recover the kind of a refusal that crossed an `io::Result` boundary.
+    ///
+    /// Most of the storage engine's internals still speak `io::Result`, and a
+    /// typed refusal travels through them as the `io::Error`'s inner source
+    /// (`io::Error::new(kind, StorageError::...)`). Downcasting back to the
+    /// real error is what lets the query layer keep the variant instead of
+    /// flattening it to text. Returns `None` for a plain I/O failure or for a
+    /// refusal that was raised as a bare string.
+    pub fn kind_of_io_error(error: &std::io::Error) -> Option<StorageErrorKind> {
+        error
+            .get_ref()?
+            .downcast_ref::<StorageError>()
+            .map(StorageError::kind)
+    }
+
     /// Whether `message` is the rendered form of [`Self::DdlInTransaction`].
     ///
-    /// The variant itself never reaches the server: storage raises it inside
-    /// an `io::Error`, and the query crate stores that as
-    /// `QueryError::StorageError(e.to_string())`, so by the time a wire error
-    /// class is picked the only evidence left is the text produced here.
-    /// Recovering it in this file, beside the `#[error(...)]` string it reads,
-    /// is what keeps the two in step: `rendered_messages_identify_exactly_
-    /// their_own_variant` renders a real instance of every variant and fails
-    /// if a reworded message stops matching, or starts matching a sibling.
+    /// LEGACY FALLBACK. Classification is normally recovered from the variant
+    /// (see [`Self::kind_of_io_error`]), but not every path that turns a
+    /// storage failure into a query error carries the typed error along: some
+    /// still render it with `to_string()` first, and the variant is gone by
+    /// the time a wire error class is picked. For those, the text produced
+    /// here is the only evidence left. Keeping the predicate in this file,
+    /// beside the `#[error(...)]` string it reads, is what keeps the two in
+    /// step: `rendered_messages_identify_exactly_their_own_variant` renders a
+    /// real instance of every variant and fails if a reworded message stops
+    /// matching, or starts matching a sibling.
     pub fn is_ddl_in_transaction_message(message: &str) -> bool {
         message.contains("inside an explicit transaction: DDL is not transactional")
     }
 
     /// Whether `message` is the rendered form of [`Self::TransactionTooLarge`].
-    /// See [`Self::is_ddl_in_transaction_message`] for why the classification
-    /// is recovered from text rather than from the variant.
+    /// LEGACY FALLBACK; see [`Self::is_ddl_in_transaction_message`].
     pub fn is_transaction_too_large_message(message: &str) -> bool {
         message.contains("cannot buffer more of this transaction:")
+    }
+
+    /// Whether `message` is the rendered form of one of the unique-index
+    /// refusals. LEGACY FALLBACK; see [`Self::is_ddl_in_transaction_message`].
+    pub fn is_unique_violation_message(message: &str) -> bool {
+        message.contains("unique constraint violation on")
+            || message.contains("unique expression index violation on")
     }
 }
 
@@ -131,14 +225,25 @@ mod tests {
                 pages: 65_536,
                 limit_bytes: 268_435_456,
             },
+            StorageError::UniqueConstraintViolation {
+                table: "User".into(),
+                column: "email".into(),
+            },
+            StorageError::UniqueExpressionIndexViolation {
+                table: "Doc".into(),
+                expression: ".data->code".into(),
+            },
         ]
     }
 
-    /// `(is_ddl_in_transaction, is_transaction_too_large)` for a variant.
-    fn expected_predicates(err: &StorageError) -> (bool, bool) {
+    /// `(is_ddl_in_transaction, is_transaction_too_large, is_unique_violation)`
+    /// for a variant.
+    fn expected_predicates(err: &StorageError) -> (bool, bool, bool) {
         match err {
-            StorageError::DdlInTransaction { .. } => (true, false),
-            StorageError::TransactionTooLarge { .. } => (false, true),
+            StorageError::DdlInTransaction { .. } => (true, false, false),
+            StorageError::TransactionTooLarge { .. } => (false, true, false),
+            StorageError::UniqueConstraintViolation { .. }
+            | StorageError::UniqueExpressionIndexViolation { .. } => (false, false, true),
             StorageError::Io(_)
             | StorageError::CorruptData(_)
             | StorageError::CorruptCrc { .. }
@@ -148,7 +253,7 @@ mod tests {
             | StorageError::InvalidIdentifier(_)
             | StorageError::RowTooLarge { .. }
             | StorageError::ValueTooLarge { .. }
-            | StorageError::OverflowCorrupt(_) => (false, false),
+            | StorageError::OverflowCorrupt(_) => (false, false, false),
         }
     }
 
@@ -156,7 +261,7 @@ mod tests {
     fn rendered_messages_identify_exactly_their_own_variant() {
         for err in one_of_every_variant() {
             let rendered = err.to_string();
-            let (ddl, too_large) = expected_predicates(&err);
+            let (ddl, too_large, unique) = expected_predicates(&err);
             assert_eq!(
                 StorageError::is_ddl_in_transaction_message(&rendered),
                 ddl,
@@ -167,7 +272,54 @@ mod tests {
                 too_large,
                 "wrong transaction-too-large verdict for {err:?} rendered as {rendered:?}"
             );
+            assert_eq!(
+                StorageError::is_unique_violation_message(&rendered),
+                unique,
+                "wrong unique-violation verdict for {err:?} rendered as {rendered:?}"
+            );
         }
+    }
+
+    /// Every variant must map to its own kind. A `kind()` arm that returns a
+    /// sibling's kind (the copy-paste failure this table exists to catch)
+    /// makes two variants share one kind and fails here.
+    #[test]
+    fn every_variant_has_a_distinct_kind() {
+        let mut seen: Vec<StorageErrorKind> = Vec::new();
+        for err in one_of_every_variant() {
+            let kind = err.kind();
+            assert!(
+                !seen.contains(&kind),
+                "{err:?} reuses the kind {kind:?} of an earlier variant"
+            );
+            seen.push(kind);
+        }
+    }
+
+    /// The variant must survive the `io::Error` the engine raises it through.
+    /// This is the round trip the query layer depends on to keep a refusal's
+    /// kind instead of flattening it to text.
+    #[test]
+    fn kinds_survive_the_io_error_round_trip() {
+        for err in one_of_every_variant() {
+            let expected = err.kind();
+            let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidInput, err);
+            assert_eq!(
+                StorageError::kind_of_io_error(&wrapped),
+                Some(expected),
+                "the kind was lost crossing an io::Error boundary"
+            );
+        }
+    }
+
+    /// A plain I/O failure carries no storage kind, so callers fall back to
+    /// the legacy text path rather than mis-reporting one.
+    #[test]
+    fn a_plain_io_error_has_no_storage_kind() {
+        let bare = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        assert_eq!(StorageError::kind_of_io_error(&bare), None);
+        let no_source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(StorageError::kind_of_io_error(&no_source), None);
     }
 
     #[test]

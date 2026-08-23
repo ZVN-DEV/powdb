@@ -455,7 +455,7 @@ impl Engine {
                     ControlFlow::Continue(())
                 }
             })
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         if let Some(e) = cancel_err {
             return Err(e);
         }
