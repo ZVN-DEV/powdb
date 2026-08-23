@@ -1,17 +1,46 @@
+//! PowDB storage engine: catalog, tables, heap files, B+tree indexes, and the
+//! write-ahead log.
+//!
+//! # Public API boundary
+//!
+//! `btree`, `disk`, `format`, `heap`, `page`, `row`, and `wal` are marked
+//! `#[doc(hidden)]`. They stay `pub` and code that imports them still compiles:
+//! the attribute hides a module from the generated documentation without
+//! restricting access to it. What it withdraws is the implication that these
+//! are an interface. They are `pub` because sibling crates in this workspace
+//! link against them, and they carry no compatibility promise.
+//!
+//! `row` is the clearest case. It is the raw on-disk row encoding, which the
+//! `powdb-query` executor decodes and patches in place on its fast paths, so it
+//! has to be reachable across the crate boundary. It also moves whenever the
+//! storage format moves, and that is a format-version event governed by
+//! `docs/FORMAT.md`, not a crate-API event.
+//!
+//! The supported entry points are the `powdb` facade crate and the `Engine`
+//! API in `powdb-query`. See `docs/STABILITY.md` for what a version bump
+//! promises.
+
+#[doc(hidden)]
 pub mod btree;
 pub mod catalog;
 pub mod dir_lock;
+#[doc(hidden)]
 pub mod disk;
 pub mod error;
+#[doc(hidden)]
 pub mod format;
+#[doc(hidden)]
 pub mod heap;
+#[doc(hidden)]
 pub mod page;
 pub mod pj1;
+#[doc(hidden)]
 pub mod row;
 pub mod stored_json_path;
 pub mod table;
 pub mod types;
 pub mod view;
+#[doc(hidden)]
 pub mod wal;
 
 use std::io;

@@ -931,7 +931,7 @@ fn load_historical_legacy_baseline() -> HistoricalLegacyBaseline {
 }
 
 fn assert_native_pj1_has_no_text_serialization() {
-    const HANDLER: &str = include_str!("../../../server/src/handler.rs");
+    const HANDLER: &str = include_str!("../../../server/src/handler/wire.rs");
     const PROTOCOL: &str = include_str!("../../../server/src/protocol.rs");
 
     let conversion_start = HANDLER

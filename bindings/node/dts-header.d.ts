@@ -79,3 +79,86 @@ export type NativeQueryResult =
  * (int), `string`, `boolean`, and `null` (PowQL `null`).
  */
 export type NativeParam = number | bigint | string | boolean | null
+
+/**
+ * The stable, machine-readable code on every error raised by this addon's own
+ * logic, so a caller can branch without matching on message text.
+ *
+ * This union does NOT cover errors raised by generated argument-coercion code,
+ * which runs before any addon logic and reports napi's own status strings
+ * (`"StringExpected"` and siblings). See {@link PowDBError}.
+ *
+ * The vocabulary mirrors the `PowDBErrorCode` union in the networked
+ * `@zvndev/powdb-client` (`clients/ts/src/errors.ts`): same lowercase
+ * snake_case naming, and the codes for conditions both clients have
+ * (`query_failed`, `closed`) are the identical strings, so the same `switch`
+ * reads correctly against an embedded database or a server. The remaining
+ * codes describe embedded-only conditions the networked client cannot hit.
+ *
+ * `poisoned` and `open_panicked` are the two that matter operationally: both
+ * mean the handle (or the data directory) is no longer usable, so an embedded
+ * host should recycle or restore rather than retry.
+ */
+export type PowDBErrorCode =
+  /** The statement failed to parse, plan, or execute. */
+  | "query_failed"
+  /** `close()` has already been called on this handle. */
+  | "closed"
+  /** Opening the data directory failed (I/O, permissions, no catalog). */
+  | "open_failed"
+  /**
+   * Opening the database panicked, so the data directory is likely corrupt.
+   * Terminal: restore from a backup instead of retrying.
+   */
+  | "open_panicked"
+  /**
+   * A previous call panicked and poisoned this handle. Terminal for the
+   * handle: every later call fails until the database is reopened.
+   * `db.isPoisoned()` reports the same state without throwing.
+   */
+  | "poisoned"
+  /**
+   * An argument was rejected: an unknown sync mode, a parameter of a type
+   * PowQL cannot bind, a malformed `databaseId`.
+   */
+  | "invalid_argument"
+  /** Applying a retained-unit chunk to this embedded replica failed. */
+  | "sync_failed"
+  /** The data directory is already open elsewhere in this process. */
+  | "already_open"
+  /**
+   * The JS engine refused an operation while a result was being built, or a
+   * stored value could not be decoded. Not caller-actionable.
+   */
+  | "internal"
+
+/**
+ * The shape of an error raised by this addon's own logic: a plain `Error`
+ * carrying a {@link PowDBErrorCode}. Narrow to it in a `catch` block to branch
+ * on `code`:
+ *
+ * ```ts
+ * try {
+ *   db.query("User")
+ * } catch (e) {
+ *   const err = e as PowDBError
+ *   if (err.code === "poisoned" || err.code === "open_panicked") throw err
+ *   if (err.code === "query_failed") console.warn(err.message)
+ * }
+ * ```
+ *
+ * `code` is deliberately widened past {@link PowDBErrorCode}. Argument
+ * coercion happens in generated binding code that runs BEFORE any addon logic,
+ * so passing a value of the wrong type surfaces one of napi's own status
+ * strings instead (`"StringExpected"`, `"InvalidArg"`, and siblings). Those are
+ * programming errors in the calling code rather than database conditions, and
+ * they are not enumerated here. Treat an unrecognized `code` as unexpected and
+ * rethrow it; do not write an exhaustive `switch` that assumes otherwise.
+ *
+ * The addon throws native `Error` instances, not instances of the networked
+ * client's `PowDBError` class, so `instanceof` does not cross the two
+ * packages. `code` is the portable branch.
+ */
+export interface PowDBError extends Error {
+  code: PowDBErrorCode | (string & {})
+}

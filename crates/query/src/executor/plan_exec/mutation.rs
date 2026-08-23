@@ -4,10 +4,8 @@
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::row::{patch_var_column_in_place, RowLayout};
-use powdb_storage::types::*;
 use std::ops::ControlFlow;
 
-use crate::executor::compiled::*;
 use crate::executor::eval::*;
 use crate::executor::row_body_base;
 use crate::executor::Engine;
@@ -122,7 +120,7 @@ impl Engine {
             match result {
                 Ok((count, _)) => {
                     if let Err(e) = self.view_registry.mark_dependents_dirty(table) {
-                        return Some(Err(QueryError::StorageError(e.to_string())));
+                        return Some(Err(QueryError::from_storage_io(e)));
                     }
                     return Some(Ok(QueryResult::Modified(count)));
                 }
@@ -178,12 +176,12 @@ impl Engine {
                             self.catalog
                                 .update_hinted(table, rid, &row, Some(changed_cols))
                         {
-                            return Some(Err(QueryError::StorageError(e.to_string())));
+                            return Some(Err(QueryError::from_storage_io(e)));
                         }
                         count += 1;
                     }
                     if let Err(e) = self.view_registry.mark_dependents_dirty(table) {
-                        return Some(Err(QueryError::StorageError(e.to_string())));
+                        return Some(Err(QueryError::from_storage_io(e)));
                     }
                     return Some(Ok(QueryResult::Modified(count)));
                 }
@@ -229,7 +227,7 @@ impl Engine {
                 } else {
                     self.catalog
                         .expression_index_lookup_all(table, index.index_id, &key_value)
-                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                        .map_err(QueryError::from_storage_io)?
                 };
                 Ok(Some(rids))
             }
@@ -354,7 +352,7 @@ impl Engine {
                         start_val.as_ref(),
                         end_val.as_ref(),
                     )
-                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 let schema = self
                     .catalog
                     .schema(table)
@@ -433,7 +431,7 @@ impl Engine {
             let Some(sparse) = self
                 .catalog
                 .get_projected(table, rid, &residual_indices)
-                .map_err(|error| QueryError::StorageError(error.to_string()))?
+                .map_err(QueryError::from_storage_io)?
             else {
                 continue;
             };
@@ -474,7 +472,7 @@ impl Engine {
                 for (rid, _) in self
                     .catalog
                     .scan(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                    .map_err(QueryError::from_storage_io)?
                 {
                     cancel.tick()?;
                     rids.push(rid);
@@ -544,7 +542,7 @@ impl Engine {
                             }
                             ControlFlow::Continue(())
                         })
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     if let Some(e) = cancel_err {
                         return Err(e);
                     }
@@ -564,7 +562,7 @@ impl Engine {
                 for (rid, row) in self
                     .catalog
                     .scan(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                    .map_err(QueryError::from_storage_io)?
                 {
                     cancel.tick()?;
                     if row[col_idx] == key_value {
@@ -629,7 +627,7 @@ impl Engine {
                                 }
                                 ControlFlow::Continue(())
                             })
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         if let Some(e) = cancel_err {
                             return Err(e);
                         }
@@ -651,7 +649,7 @@ impl Engine {
                             }
                             ControlFlow::Continue(())
                         })
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     if let Some(e) = cancel_err {
                         return Err(e);
                     }
@@ -727,7 +725,7 @@ impl Engine {
         for (rid, row) in self
             .catalog
             .scan(table)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?
+            .map_err(QueryError::from_storage_io)?
         {
             cancel.tick()?;
             let keep = match &pred {
@@ -761,7 +759,7 @@ impl Engine {
         for (rid, row) in self
             .catalog
             .scan(table)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?
+            .map_err(QueryError::from_storage_io)?
         {
             cancel.tick()?;
             let mut matched = false;

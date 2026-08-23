@@ -44,7 +44,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.23.0 — embedded mode
+PowDB v0.26.0 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.
 
@@ -459,9 +459,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.23.0 — remote mode
+PowDB v0.26.0 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `default` (server v0.23.0, wire protocol v2)
+Connected to db `default` (server v0.26.0, wire protocol v2)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>
@@ -505,7 +505,7 @@ single-shared-password model. The auth model is **backward compatible**:
   `(username, password)` against the user store (`auth.json` in the data dir),
   and the shared password is no longer used.
 
-Users live in the data directory's `auth.json` (argon2id hashes only — never
+Users live in the data directory's `auth.json` (argon2id hashes only, never
 plaintext, `0600` on Unix). Manage them offline with the CLI, pointing at the
 **same `--data-dir` the server uses**:
 
@@ -518,7 +518,7 @@ powdb-cli --data-dir ./powdb_data useradd bob   --role readonly --password hunte
 # The password may also come from the environment (handy in scripts/CI):
 POWDB_NEW_PASSWORD=s3cret powdb-cli --data-dir ./powdb_data useradd carol --role readwrite
 
-# List users (shows name + role only — never password hashes).
+# List users (shows name + role only, never password hashes).
 powdb-cli --data-dir ./powdb_data users
 
 # Change a password.
@@ -568,7 +568,7 @@ a partial mutation.
 Explicit transactions (`begin` ... `commit`) are **serialized across
 connections**: one process runs one explicit transaction at a time. When a
 connection issues `begin` while another connection's transaction is still open,
-it **queues** rather than failing — so a burst of concurrent writers all commit
+it **queues** rather than failing, so a burst of concurrent writers all commit
 instead of erroring out.
 
 Bare **autocommit** writes (an `insert`/`update`/`delete` with no surrounding

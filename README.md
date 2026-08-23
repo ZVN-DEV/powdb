@@ -70,10 +70,10 @@ Full language reference: [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/m
 cargo install powdb-cli
 cargo install powdb-server
 
-# TypeScript client (Node 18+) — version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
+# TypeScript client (Node 18+): version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
-# In-process Node addon — embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu; other targets build from source)
+# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu; other targets build from source)
 npm install @zvndev/powdb-embedded
 
 # Prebuilt binaries (linux x86_64, macos aarch64)
@@ -115,7 +115,7 @@ platforms), so the gap is narrow, but it is real today.
 
 ### Apple silicon / arm64
 
-As of **v0.10.0**, the published `ghcr.io/zvn-dev/powdb` image is multi-arch (`linux/amd64` + `linux/arm64`), so it runs natively on Apple silicon and ARM servers (e.g. Graviton). Alternatively, install the native binary directly — it builds in under a minute:
+As of **v0.10.0**, the published `ghcr.io/zvn-dev/powdb` image is multi-arch (`linux/amd64` + `linux/arm64`), so it runs natively on Apple silicon and ARM servers (e.g. Graviton). Alternatively, install the native binary directly, which builds in under a minute:
 
 ```bash
 cargo install powdb-server
@@ -157,7 +157,7 @@ Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which iso
 
 PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: every mutating statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
 
-The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD) — not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
+The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD). That is not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
 
 ```
 # ~hundreds of rows/sec: one fsync per row
@@ -173,9 +173,9 @@ insert User { id := 2, name := "b" }
 commit
 ```
 
-On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction) — a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
+On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
 
-`WalSyncMode::Off` (used by the benchmark harness to compare against SQLite `:memory:`) disables the WAL entirely and is **not durable** — never use it in production.
+`WalSyncMode::Off` (used by the benchmark harness to compare against SQLite `:memory:`) disables the WAL entirely and is **not durable**: never use it in production.
 
 ## PowQL
 
@@ -298,7 +298,7 @@ materialized views before snapshotting.
 | Variable | Default | Description |
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
-| `POWDB_BIND` | `127.0.0.1` | Interface to bind; set `0.0.0.0` behind an IPv4 platform proxy (Railway, Docker, ECS). On **Fly.io** use `[::]` instead — its `.internal` network and `fly proxy` route over IPv6, so `0.0.0.0` makes the proxy reset the connection |
+| `POWDB_BIND` | `127.0.0.1` | Interface to bind; set `0.0.0.0` behind an IPv4 platform proxy (Railway, Docker, ECS). On **Fly.io** use `[::]` instead, because its `.internal` network and `fly proxy` route over IPv6, so `0.0.0.0` makes the proxy reset the connection |
 | `POWDB_DATA` | `./powdb_data` | Data directory (heap files, WAL, catalog, indexes) |
 | `POWDB_PASSWORD` | *(none)* | Shared password required on connect when no named users are defined (set as env var) |
 | `POWDB_ADMIN_USER` / `POWDB_ADMIN_PASSWORD` | *(none)* | Bootstrap an `admin` user on startup when both are set and that user does not yet exist (password never logged) |
@@ -314,7 +314,7 @@ materialized views before snapshotting.
 | `POWDB_DIRTY_PAGE_BUDGET` | `268435456` | Ceiling in bytes (256 MiB) on unflushed heap pages held in memory, shared across every table. Inside an explicit transaction those pages cannot be spilled without breaking `rollback`, so a transaction that exceeds the budget is refused with a typed error instead of growing until the process is OOM-killed. Raise it for very large bulk-load transactions, lower it on memory-capped hosts |
 | `POWDB_SOCKET` | *(off)* | Path for an additional Unix-domain-socket listener served alongside the TCP listener |
 | `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
-| `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated** — bind it to localhost or a private network, never the public internet |
+| `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated**: bind it to localhost or a private network, never the public internet |
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
@@ -325,10 +325,11 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Configure authentication. Either set `POWDB_PASSWORD` to a strong shared secret, or define named users with roles (`powdb-cli --data-dir <dir> useradd …`; connect with `--user`). The server logs a `WARN` on startup when neither is configured and will accept any connection. See [Multi-user authentication](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md#multi-user-authentication).
 - [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
-- [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network — it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
+- [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network, because it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
-- [ ] Pin the version (`cargo install powdb-server --version 0.23.0 --locked` or the matching ghcr tag). Pin to a release that is still supported: [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md) ships security fixes only for the latest minor series. PowDB is pre-1.0; minor bumps may add on-disk format versions. An older directory always opens on a newer release, but not the reverse. See [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md).
-- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`) — one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#ddl-is-not-transactional).
+- [ ] **Run under a process supervisor with auto-restart.** PowDB is crash-only by design: the release profile sets `panic = "abort"`, so on an unrecoverable error the server exits immediately rather than limping along on possibly-corrupt shared state. WAL replay rolls the data directory forward to the last consistent state on the next start, but only if something restarts the process. Use systemd `Restart=always`, Docker `restart: unless-stopped`, a Kubernetes Deployment, Fly `auto_start_machines`, Railway `restartPolicyType = "ON_FAILURE"`, or an ECS service with `desired_count`. Every template in [`examples/deploy/`](https://github.com/ZVN-DEV/powdb/blob/main/examples/deploy/README.md) ships with auto-restart already wired in.
+- [ ] Pin the version (`cargo install powdb-server --version 0.26.0 --locked` or the matching ghcr tag). Pin to a release that is still supported: [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md) ships security fixes only for the latest minor series. PowDB is pre-1.0; minor bumps may add on-disk format versions. An older directory always opens on a newer release, but not the reverse. See [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md).
+- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`): one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#ddl-is-not-transactional).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 - [ ] Size `POWDB_DIRTY_PAGE_BUDGET` the same way. It bounds the unflushed pages one explicit transaction holds in memory, so a bulk load bigger than the budget is refused (`cannot buffer more of this transaction`) rather than OOM-killing the server. Split the load into several transactions, or raise the budget if the host has the RAM. Like the query budget it is per-transaction, not aggregate.
 
@@ -344,14 +345,14 @@ For a self-hostable starting point, see [`examples/deploy/fly.toml`](https://git
 - Memory-mapped reads (zero-syscall scan path)
 - Compiled integer predicates (branch-free filter at the byte level)
 - Thread-safe concurrent reads via pread(2)/pwrite(2), with shared server admission for autocommit reads
-- Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore` — see [docs/backup-and-restore.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/backup-and-restore.md))
+- Backup & restore: full + incremental + coarse point-in-time recovery (offline; `powdb-cli backup` / `restore`, see [docs/backup-and-restore.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/backup-and-restore.md))
 
 **Query engine**
 - PowQL parser + planner + executor with plan cache (FNV-1a hashing, literal substitution)
 - SQL frontend: a supported subset of SQL lowered to the PowQL AST, including `->` / `->>` JSON paths and shared plan caching ([docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md))
 - Joins (hash join with compound-`ON` residuals, plus bounded nested-loop fallback)
 - Nested projections (PowQL-only): one row per parent with correlated children as a native JSON array, per-parent order/limit, multi-level nesting ([docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#nested-projections-shaped-results))
-- Entity links (PowQL-only): declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name -- scalar `o.user.name` or block `u.orders { ... }`. A scalar hop through a non-unique key is a hard error, never a silent fan-out ([docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#entity-links-relationship-traversal))
+- Entity links (PowQL-only): declare a relationship once (`link Order.user -> User on user_id = id`) then traverse it by name: scalar `o.user.name`, or a labeled block `orders: u.orders { ... }` (the block needs a field label, which names the JSON array it returns). A scalar hop through a non-unique key is a hard error, never a silent fan-out ([docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#entity-links-relationship-traversal))
 - GROUP BY, HAVING, DISTINCT
 - UNION / UNION ALL
 - Subqueries (IN, EXISTS)
@@ -398,8 +399,11 @@ crates/
   backup/    Offline backup/restore (full, incremental, PITR)
   server/    Tokio TCP server + binary wire protocol
   cli/       Interactive REPL (embedded + remote modes)
-  bench/     Criterion benchmarks + regression gate
-  compare/   PowDB vs SQLite wide-bench harness
+  bench/     Criterion benchmarks + regression gate (publish = false)
+  compare/   PowDB vs SQLite wide-bench harness (publish = false)
+  oracle/    Differential correctness oracle: runs the same fixture and query
+             through PowQL, the SQL frontend, and SQLite, and compares full
+             result sets (publish = false)
 ```
 
 The engine is `powdb_query::executor::Engine`. It owns a `Catalog` (which owns `Table`s, each backed by a `HeapFile` + optional `BTree` indexes) and a `Wal`. The server wraps it in `Arc<RwLock<Engine>>` for concurrent access.
@@ -414,7 +418,7 @@ cargo bench -p powdb-bench              # criterion suite: 23 benchmarks, ~5 min
 cargo run --release -p powdb-bench --bin compare   # regression gate
 ```
 
-The gate also runs on-demand in CI via `workflow_dispatch` (`.github/workflows/bench.yml`) — it is **not** a required PR gate, because shared-runner noise makes it unreliable as a blocking check. The required PR gates live in `ci.yml`.
+The gate also runs on-demand in CI via `workflow_dispatch` (`.github/workflows/bench.yml`). It is **not** a required PR gate, because shared-runner noise makes it unreliable as a blocking check. The required PR gates live in `ci.yml`.
 
 Run the PowDB vs SQLite comparison bench:
 

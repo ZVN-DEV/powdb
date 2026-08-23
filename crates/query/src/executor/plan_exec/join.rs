@@ -3,7 +3,6 @@
 
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
-use powdb_storage::types::*;
 
 use crate::executor::check_join_limit;
 use crate::executor::eval::*;

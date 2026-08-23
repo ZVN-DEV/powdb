@@ -1,3 +1,4 @@
+use powdb_storage::error::{StorageError, StorageErrorKind};
 use powdb_storage::types::Value;
 
 /// The result of executing a query.
@@ -82,9 +83,31 @@ pub enum QueryError {
     /// View-related error.
     #[error("{0}")]
     ViewError(String),
-    /// WAL or I/O error.
+    /// WAL or I/O error whose originating variant was already discarded.
+    ///
+    /// Prefer [`QueryError::Storage`]: this variant keeps only the rendered
+    /// text, so anything downstream that needs to know *what* failed (the
+    /// server picks a wire error class from it) is left matching substrings.
     #[error("{0}")]
     StorageError(String),
+    /// A storage-engine refusal that reached the query layer with its kind
+    /// intact.
+    ///
+    /// `message` is the storage error rendered exactly as
+    /// [`QueryError::StorageError`] would have rendered it, so this variant is
+    /// Display-identical to the untyped one and changes nothing a client
+    /// reads. `kind` is the part that was previously thrown away, and it is
+    /// what the server classifies on.
+    ///
+    /// The kind travels beside the message rather than the
+    /// [`StorageError`] itself because that type wraps
+    /// [`std::io::Error`], which is neither `Clone` nor `PartialEq`, and
+    /// `QueryError` is both.
+    #[error("{message}")]
+    Storage {
+        kind: StorageErrorKind,
+        message: String,
+    },
     /// Readonly path needs write lock (internal sentinel). The server
     /// intercepts this variant before Display, so the sentinel string must
     /// never cross the wire.
@@ -135,6 +158,36 @@ fn nested_loop_pair_limit_message(left_rows: usize, right_rows: usize, limit: us
         None => format!(
             "nested-loop join candidate count overflows usize ({left_rows} x {right_rows}), above the {limit} pair limit; add an equi-key to ON, index/filter an input, reduce the joined row counts, or raise the cap via POWDB_MAX_NESTED_LOOP_PAIRS"
         ),
+    }
+}
+
+impl QueryError {
+    /// Wrap a storage failure that arrived as an [`std::io::Error`], keeping
+    /// its [`StorageErrorKind`] when the storage engine attached one.
+    ///
+    /// Most of the storage engine speaks `io::Result`, and a typed refusal
+    /// rides inside the `io::Error` as its source. Recovering it here is what
+    /// lets the server pick a wire error class from the error's type instead
+    /// of searching its message for a known phrase. A plain I/O failure, or a
+    /// refusal that was raised as a bare string, has no kind to recover and
+    /// falls back to [`QueryError::StorageError`] with byte-identical text.
+    pub fn from_storage_io(error: std::io::Error) -> Self {
+        match StorageError::kind_of_io_error(&error) {
+            Some(kind) => QueryError::Storage {
+                kind,
+                message: error.to_string(),
+            },
+            None => QueryError::StorageError(error.to_string()),
+        }
+    }
+}
+
+impl From<StorageError> for QueryError {
+    fn from(error: StorageError) -> Self {
+        QueryError::Storage {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
     }
 }
 

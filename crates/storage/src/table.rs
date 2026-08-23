@@ -94,10 +94,32 @@ pub struct Table {
     auto_next_ready: bool,
 }
 
+/// The refusal for a duplicate key in a unique column index.
+///
+/// Raised as a typed [`StorageError`] inside the `io::Error` so callers can
+/// downcast it back to its variant (see `StorageError::kind_of_io_error`)
+/// instead of recovering the kind by matching this message. The rendered text
+/// is unchanged: it is on the server's egress allowlist and clients assert on
+/// it.
+fn unique_column_error(table: &str, column: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        StorageError::UniqueConstraintViolation {
+            table: table.to_string(),
+            column: column.to_string(),
+        },
+    )
+}
+
+/// The same refusal for a unique expression index. See
+/// [`unique_column_error`].
 fn expression_unique_error(table: &str, expression: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("unique expression index violation on {table} ({expression})"),
+        StorageError::UniqueExpressionIndexViolation {
+            table: table.to_string(),
+            expression: expression.to_string(),
+        },
     )
 }
 
@@ -534,12 +556,9 @@ impl Table {
             }
             let val = &values[entry.col_idx];
             if !val.is_empty() && entry.btree.lookup(val).is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "unique constraint violation on {}.{}",
-                        self.schema.table_name, entry.col_name
-                    ),
+                return Err(unique_column_error(
+                    &self.schema.table_name,
+                    &entry.col_name,
                 ));
             }
         }
@@ -582,12 +601,9 @@ impl Table {
                 .lookup(new_value)
                 .is_some_and(|existing| existing != rid)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "unique constraint violation on {}.{}",
-                        self.schema.table_name, entry.col_name
-                    ),
+                return Err(unique_column_error(
+                    &self.schema.table_name,
+                    &entry.col_name,
                 ));
             }
         }

@@ -1,14 +1,11 @@
 //! Scan-family execution: expression-index scans, the Lane A index-residual
 //! fast path, provenance-preserving materialization, and introspection.
 
-use crate::ast::*;
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{IndexOrderDirection, LinkDef, LinkKind};
-use powdb_storage::types::*;
 use std::collections::HashSet;
 
-use crate::executor::compiled::*;
 use crate::executor::eval::*;
 use crate::executor::{mem_budget, Engine, MAX_SORT_ROWS};
 
@@ -85,7 +82,7 @@ impl Engine {
                 } else {
                     self.catalog
                         .expression_index_lookup_all(table, index.index_id, &key)
-                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                        .map_err(QueryError::from_storage_io)?
                 };
                 (rids, None)
             }
@@ -106,7 +103,7 @@ impl Engine {
                         start_value.as_ref(),
                         end_value.as_ref(),
                     )
-                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 (
                     rids,
                     Some((
@@ -155,7 +152,7 @@ impl Engine {
                         offset,
                         *limit as usize,
                     )
-                    .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 (rids, None)
             }
             _ => unreachable!("expression-index plan checked above"),
@@ -187,7 +184,7 @@ impl Engine {
                     let Some(mut fetched) = self
                         .catalog
                         .get_projected(table, rid, &fetch_indices)
-                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                        .map_err(QueryError::from_storage_io)?
                     else {
                         continue;
                     };
@@ -282,7 +279,7 @@ impl Engine {
                 } else {
                     self.catalog
                         .expression_index_lookup_all(table, index.index_id, &key_value)
-                        .map_err(|error| QueryError::StorageError(error.to_string()))?
+                        .map_err(QueryError::from_storage_io)?
                 };
                 (table.as_str(), rids)
             }
@@ -312,7 +309,7 @@ impl Engine {
             let Some(sparse) = self
                 .catalog
                 .get_projected(table, rid, &residual_indices)
-                .map_err(|error| QueryError::StorageError(error.to_string()))?
+                .map_err(QueryError::from_storage_io)?
             else {
                 continue;
             };
@@ -376,7 +373,7 @@ impl Engine {
         for (rid, row) in self
             .catalog
             .scan(table)
-            .map_err(|error| QueryError::StorageError(error.to_string()))?
+            .map_err(QueryError::from_storage_io)?
         {
             cancel.tick()?;
             rows.push(row);

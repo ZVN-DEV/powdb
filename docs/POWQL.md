@@ -97,9 +97,9 @@ Tables are defined using the `type` keyword. Each field has a name and a type, o
 
 Declaring a field `unique` automatically creates a unique B+tree index on that column; duplicate inserts/updates/upserts are then rejected with a `unique constraint violation` error.
 
-A field may declare a literal **`default`** after its type — the value applied when an insert (or upsert-insert) omits that column. The default is applied before the required-column check, so a `required` column with a default may be omitted. Defaults must be scalar literals (`int`, `float`, `str`, `bool`); expression defaults (e.g. a generated timestamp) are not yet supported. A default whose type does not match the column is rejected at `type`-creation time.
+A field may declare a literal **`default`** after its type: the value applied when an insert (or upsert-insert) omits that column. The default is applied before the required-column check, so a `required` column with a default may be omitted. Defaults must be scalar literals (`int`, `float`, `str`, `bool`); expression defaults (e.g. a generated timestamp) are not yet supported. A default whose type does not match the column is rejected at `type`-creation time.
 
-An integer field may declare the **`auto`** modifier (typically `unique auto id: int`) — when an insert omits it, the engine assigns the next value from a per-table sequence. The assigned id comes back through `insert ... returning`. The sequence resumes above the highest existing id after a restart (recovered from the data, so a process crash never reuses an id of a committed row). An explicit value is allowed and pushes the sequence past it. `auto` requires an `int` column and cannot be combined with `default`. Auto-assignment applies on `insert` and on the insert branch of `upsert`; an `upsert` that matches an existing row updates it and leaves that row's auto column unchanged.
+An integer field may declare the **`auto`** modifier (typically `unique auto id: int`): when an insert omits it, the engine assigns the next value from a per-table sequence. The assigned id comes back through `insert ... returning`. The sequence resumes above the highest existing id after a restart (recovered from the data, so a process crash never reuses an id of a committed row). An explicit value is allowed and pushes the sequence past it. `auto` requires an `int` column and cannot be combined with `default`. Auto-assignment applies on `insert` and on the insert branch of `upsert`; an `upsert` that matches an existing row updates it and leaves that row's auto column unchanged.
 
 ```powql
 type Account {
@@ -295,8 +295,8 @@ o.total
 ### Parameters
 
 Positional placeholders `$1`, `$2`, … bind untrusted values without string
-interpolation. They are 1-based (`?` is not a placeholder — `??` is the
-COALESCE operator):
+interpolation. They are 1-based (`?` is not a placeholder, because `??` is
+the COALESCE operator):
 
 ```
 User filter .name = $1
@@ -722,7 +722,7 @@ type Order { required id: int, required user_id: int, required total: float, pro
 type Product { required id: int, required name: str, price: float }
 ```
 
-Every column must be explicitly defined — there are no hidden/implicit columns. An id is still its own declared column, but an integer column marked `auto` (see the `auto` modifier above) is assigned from a per-table sequence when omitted, so callers don't have to generate ids themselves.
+Every column must be explicitly defined: there are no hidden/implicit columns. An id is still its own declared column, but an integer column marked `auto` (see the `auto` modifier above) is assigned from a per-table sequence when omitted, so callers don't have to generate ids themselves.
 
 ### Syntax
 
@@ -1041,8 +1041,9 @@ PowDB infers whether a link is **to-one** or **to-many** from the target key:
 
 - If `target_key` is **unique** on the target type, the link is **to-one** and
   is traversed as a **scalar path** (`o.user.name`).
-- Otherwise it is **to-many** and is traversed as a **block**
-  (`u.orders { ... }`).
+- Otherwise it is **to-many** and is traversed as a **labeled block**
+  (`orders: u.orders { ... }`). The label names the JSON array the block
+  returns and is required: `u.orders { ... }` on its own is a parse error.
 
 You do not annotate the cardinality; the schema already knows it. To see the
 declared links (and their derived cardinality), use
@@ -1355,7 +1356,7 @@ Event filter .name = "login" update { ts := now() }
 
 `now()` is a runtime function, so it can only appear where expressions are
 evaluated (filters, projections, `having`, `update` assignments). **Insert**
-assignments accept literal values only — `insert Event { ts := now() }` fails
+assignments accept literal values only: `insert Event { ts := now() }` fails
 with `expected literal value`. A `datetime` column is stored as an integer
 timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
 stamp them afterwards with `update { ts := now() }` if needed.
@@ -1608,19 +1609,19 @@ insert User
 ```
 
 A multi-row insert is **one statement = one WAL fsync** (vs one fsync per
-single-row autocommit statement), so it's the fastest durable way to bulk-load
-— and over a network connection it's **one round trip** instead of N. It's also
+single-row autocommit statement), so it's the fastest durable way to bulk-load,
+and over a network connection it's **one round trip** instead of N. It's also
 **all-or-nothing on validation**: if any row is invalid (missing a required
 field, unknown column, bad type), the whole statement fails and *no* rows are
 inserted. The result reports the number of rows inserted. (A mid-write *storage*
-failure — e.g. the disk filling between rows — is the one exception and can
+failure, e.g. the disk filling between rows, is the one exception and can
 leave earlier rows written; wrap the insert in a transaction if you need a hard
 rollback boundary.) The whole batch is also charged against
 `POWDB_QUERY_MEMORY_LIMIT`, so an over-large batch errors rather than exhausting
 memory.
 
 **`returning`.** End an insert with `returning` to get the inserted row(s) back
-(all columns) as a result set instead of a modified-count — so you don't need a
+(all columns) as a result set instead of a modified-count, so you don't need a
 follow-up `SELECT` to read the row you just wrote:
 
 ```
@@ -1672,7 +1673,7 @@ User delete
 ```
 
 End a delete with `returning` to get the **pre-delete** row(s) back (all
-columns) as a result set instead of a modified-count — useful for archiving or
+columns) as a result set instead of a modified-count, useful for archiving or
 auditing what you removed in the same round trip:
 
 ```
@@ -1925,7 +1926,7 @@ type User {
 ```
 
 Re-declaring an existing type is an error (`type 'User' already exists`). Add
-`if not exists` after the type name to make it a no-op instead — useful for
+`if not exists` after the type name to make it a no-op instead, useful for
 idempotent migrations:
 
 ```
@@ -1950,7 +1951,7 @@ alter User add required active: bool       # only on an empty table (see note)
 alter User add status: str                 # "column" keyword is optional
 ```
 
-> A `required` column can only be added to an **empty** table — there is no
+> A `required` column can only be added to an **empty** table: there is no
 > default clause to backfill existing rows, so on a non-empty table it fails with
 > `cannot add required column '…' to non-empty table '…': no default value to
 > backfill existing rows with`. Add the column nullable, populate it, then tighten
@@ -1969,7 +1970,7 @@ in which case it is a clean no-op.
 
 #### Add Index
 
-Create a B+tree index on a column. Point lookups and range scans use indexes automatically — no query hints:
+Create a B+tree index on a column. Point lookups and range scans use indexes automatically, with no query hints:
 
 ```
 alter User add index .email
@@ -2000,7 +2001,7 @@ alter User add unique if not exists .email  # no-op if already indexed
 alter Post add unique (.data->external_id)
 ```
 
-The command first scans the existing data — if any duplicate (non-null) value is already present, it fails and the index is not created. Without `if not exists` it also fails if the column already has an index, since there is no in-place index upgrade (drop and recreate the table to change an existing index's uniqueness); with `if not exists` an already-indexed column is a no-op. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
+The command first scans the existing data: if any duplicate (non-null) value is already present, it fails and the index is not created. Without `if not exists` it also fails if the column already has an index, since there is no in-place index upgrade (drop and recreate the table to change an existing index's uniqueness); with `if not exists` an already-indexed column is a no-op. Once created, the constraint is enforced on every subsequent insert/update/upsert and survives restart.
 
 #### Drop Index
 
@@ -2031,7 +2032,7 @@ Dropping a type that does not exist is an error unless you add `if exists`.
 
 ## Introspection
 
-Discover what exists in the database without any protocol extensions — the
+Discover what exists in the database without any protocol extensions. The
 commands below return ordinary result rows, so any client consumes them like a
 normal query.
 
@@ -2120,7 +2121,7 @@ describe User
   target key's own row, or what a traversal actually does.
 
 Describing a type that does not exist is an error (`table 'Ghost' not found`).
-Introspection always reflects the **current** schema — it is never served from a
+Introspection always reflects the **current** schema: it is never served from a
 stale cached plan.
 
 ---
@@ -2143,7 +2144,7 @@ rename it or quote it as `type`
 
 To use a reserved word as an identifier anyway, wrap it in **backticks**. A
 backtick-quoted identifier is always a plain name, never a keyword, and works
-everywhere an identifier is accepted — DDL field lists, `insert`/`update`/
+everywhere an identifier is accepted: DDL field lists, `insert`/`update`/
 `upsert` assignments, filters, projections, ordering, and index DDL:
 
 ```
@@ -2289,11 +2290,11 @@ upsert <Table> on .<key_column> { <assignments> } [on conflict { <conflict_assig
 
 The key column (specified after `on`) is used to detect conflicts. If a row with a matching key already exists, the row is updated with the provided assignments (or the conflict-specific assignments if `on conflict` is given). If no match exists, a new row is inserted.
 
-> **Breaking change (since 0.4.7):** the `on` column must be **unique** — declare it with the `unique` modifier (`unique email: str`) or `alter <Table> add unique .<col>`. Upserting on a non-unique column is rejected with an error. This closes a prior bug where `upsert` on a non-unique column could silently create duplicate-key rows.
+> **Breaking change (since 0.4.7):** the `on` column must be **unique**: declare it with the `unique` modifier (`unique email: str`) or `alter <Table> add unique .<col>`. Upserting on a non-unique column is rejected with an error. This closes a prior bug where `upsert` on a non-unique column could silently create duplicate-key rows.
 
 ### Examples
 
-These examples assume `email` is declared `unique` (`unique email: str`) — the
+These examples assume `email` is declared `unique` (`unique email: str`). The
 `on` column must be unique, per the note above, or the upsert is rejected.
 
 Basic upsert (insert or replace all fields on conflict):

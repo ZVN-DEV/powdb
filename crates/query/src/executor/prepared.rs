@@ -417,7 +417,7 @@ impl Engine {
                 if let PlanNode::Update { table, .. } = &prep.plan_template {
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 // Mission B (post-review): statement-boundary WAL group
                 // commit. The fast path appended an Update record but did
@@ -425,7 +425,7 @@ impl Engine {
                 // "WAL is on disk before this returns".
                 self.catalog
                     .commit_autocommit()
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 return Ok(result);
             }
         }
@@ -514,11 +514,11 @@ impl Engine {
             // Mark dependent views dirty for prepared insert fast path.
             self.view_registry
                 .mark_dependents_dirty(&fast.table_name)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
             // Mission B (post-review): statement-boundary WAL group commit.
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -536,7 +536,7 @@ impl Engine {
         // No-op when nothing was buffered (read-only plans).
         self.catalog
             .commit_autocommit()
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         result
     }
 
@@ -632,7 +632,7 @@ impl Engine {
                 row[base + field_off..base + field_off + field_bytes.len()]
                     .copy_from_slice(field_bytes);
             })
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
 
         Ok(Some(QueryResult::Modified(if ok { 1 } else { 0 })))
     }
@@ -723,20 +723,20 @@ impl Engine {
                 restore_taken_strings(fast, literals, &mut values);
                 values.clear();
                 self.insert_values_scratch = values;
-                return Err(QueryError::StorageError(error.to_string()));
+                return Err(QueryError::from_storage_io(error));
             }
             if let Err(error) = self.view_registry.mark_dependents_dirty(&fast.table_name) {
                 restore_taken_strings(fast, literals, &mut values);
                 values.clear();
                 self.insert_values_scratch = values;
-                return Err(QueryError::StorageError(error.to_string()));
+                return Err(QueryError::from_storage_io(error));
             }
             // Mission B (post-review): statement-boundary WAL group commit.
             if let Err(error) = self.catalog.commit_autocommit() {
                 restore_taken_strings(fast, literals, &mut values);
                 values.clear();
                 self.insert_values_scratch = values;
-                return Err(QueryError::StorageError(error.to_string()));
+                return Err(QueryError::from_storage_io(error));
             }
             values.clear();
             self.insert_values_scratch = values;

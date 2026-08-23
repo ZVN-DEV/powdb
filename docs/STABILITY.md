@@ -6,14 +6,14 @@ PowDB is pre-1.0. `CHANGELOG.md` says the project "adheres to Semantic
 Versioning", and under SemVer a `0.y.z` project is allowed to break anything in
 a minor bump. That is technically accurate and practically useless: it tells you
 nothing about whether your data directory survives `cargo install
-powdb-cli --version 0.25.0`. This page is the actual promise.
+powdb-cli --version 0.26.0`. This page is the actual promise.
 
 [FORMAT.md](FORMAT.md) documents the *mechanics* (magics, version numbers, the
 deprecation floor). This page documents the *commitment*.
 
 ## Summary
 
-| Surface | Across a patch (`0.25.0` to `0.25.1`) | Across a minor (`0.25` to `0.26`) |
+| Surface | Across a patch (`0.26.0` to `0.26.1`) | Across a minor (`0.26` to `0.27`) |
 |---|---|---|
 | Data directory, read forward | Compatible | **Compatible** |
 | Data directory, read backward (downgrade) | Usually | **Not supported** |
@@ -218,14 +218,63 @@ The Rust crates, the Node addon, the TypeScript client, and the CLI are all
 versions:
 
 ```bash
-cargo install powdb-cli --version 0.25.0 --locked
+cargo install powdb-cli --version 0.26.0 --locked
 ```
 
 ```json
-{ "dependencies": { "@zvndev/powdb-client": "0.25.0" } }
+{ "dependencies": { "@zvndev/powdb-client": "0.26.0" } }
 ```
 
 Breaking changes are listed in `CHANGELOG.md` under the release that made them.
+
+### Public API boundary
+
+Not everything marked `pub` in the Rust crates is an interface. `powdb-storage`
+and `powdb-query` are one engine split across crates, so an item is often `pub`
+for no better reason than that the crate next door has to reach it. The clearest
+case is `powdb_storage::row`, the raw on-disk row encoding: the executor's fast
+paths decode columns and patch values in place, so `encode_row`, `decode_row`,
+`patch_var_column_in_place`, `ROW_MAGIC`, `ROW_PREFIX_SIZE`, and `RowLayout` all
+have to be reachable from `powdb-query`. None of them is an API anyone should
+build on.
+
+Those modules are marked `#[doc(hidden)]`, so they no longer appear in the
+generated documentation:
+
+| Crate | Modules that are cross-crate plumbing |
+|---|---|
+| `powdb-storage` | `btree`, `disk`, `format`, `heap`, `page`, `row`, `wal` |
+| `powdb-query` | `canonicalize`, `plan`, `plan_cache`, `token` |
+
+**`#[doc(hidden)]` hides an item; it does not restrict access, and marking these
+broke nothing.** Code that already imports these paths still compiles. What the
+attribute changes is the claim being made: a hidden module is plumbing, it
+carries no compatibility promise of any kind, and it may change or disappear in
+a patch release without a `CHANGELOG.md` entry.
+
+That distinction matters most for the on-disk format. `row`, `page`, `heap`,
+`btree`, and `wal` move whenever the format moves, and the format already has
+its own version numbers, its own lazy-activation rules, and its own support
+policy (see "Your data directory" above and [FORMAT.md](FORMAT.md)). Documenting
+those modules as public API implied a second, stricter promise stacked on top of
+that one: that a format change is also a breaking crate-API change. It never
+was, and the documentation no longer suggests it is.
+
+The supported entry points are:
+
+- the **`powdb` facade crate** for embedded Rust, which re-exports exactly what
+  it supports and declares no `pub mod` of its own,
+- the **`Engine` API** it is built on (`powdb_query::executor::Engine`),
+- the **wire protocol**, the **TypeScript client**, and the **CLI**, each
+  covered above.
+
+Hiding a module does not withdraw a type that belongs to the supported surface.
+`WalSyncMode` and `WalDurabilityTicket` are defined in `powdb_storage::wal` and
+stay documented where you are meant to reach them, on
+`powdb_query::executor` and on the `powdb` facade.
+
+Everything in "APIs" above still applies to the surface that remains: it is
+allowed to break in a minor release, so pin exact versions.
 
 ## Known limitations
 

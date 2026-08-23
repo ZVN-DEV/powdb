@@ -4,10 +4,8 @@ use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{LinkDef, LinkKind};
 use powdb_storage::row::{decode_row, RowLayout};
-use powdb_storage::types::*;
 use std::ops::ControlFlow;
 
-use crate::executor::compiled::*;
 use crate::executor::eval::*;
 use crate::executor::row_body_base;
 use crate::executor::{Engine, MAX_SORT_ROWS};
@@ -85,7 +83,7 @@ impl Engine {
                 for (_, row) in self
                     .catalog
                     .scan(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                    .map_err(QueryError::from_storage_io)?
                 {
                     cancel.tick()?;
                     rows.push(row);
@@ -198,7 +196,7 @@ impl Engine {
                                     }
                                     ControlFlow::Continue(())
                                 })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                         } else {
                             let pred_cols = predicate_column_indices_json(predicate, &columns);
                             self.catalog
@@ -214,7 +212,7 @@ impl Engine {
                                     }
                                     ControlFlow::Continue(())
                                 })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                         }
                         if let Some(e) = cancel_err {
                             return Err(e);
@@ -850,11 +848,11 @@ impl Engine {
                 for values in &all_values {
                     self.catalog
                         .insert(table, values)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 self.view_registry
                     .mark_dependents_dirty(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 if *returning {
                     Ok(QueryResult::Rows {
                         columns: returning_columns,
@@ -980,10 +978,10 @@ impl Engine {
                     };
                     self.catalog
                         .update_hinted(table, rid, &existing_row, Some(&changed_cols))
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Modified(1))
                 } else {
                     // No conflict: insert. This branch creates a row, so it
@@ -1003,10 +1001,10 @@ impl Engine {
                     self.catalog.assign_auto_columns(table, &mut values);
                     self.catalog
                         .insert(table, &values)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Modified(1))
                 }
             }
@@ -1136,12 +1134,12 @@ impl Engine {
                         }
                         self.catalog
                             .update_hinted(table, rid, &row, Some(&changed_cols))
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         out_rows.push(row);
                     }
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     return Ok(QueryResult::Rows {
                         columns,
                         rows: out_rows,
@@ -1278,7 +1276,7 @@ impl Engine {
                                             .copy_from_slice(field_bytes);
                                     }
                                 })
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                             if ok {
                                 count += 1;
                             } else {
@@ -1295,12 +1293,12 @@ impl Engine {
                             }
                             self.catalog
                                 .update_hinted(table, rid, &row, Some(&changed_cols))
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                             count += 1;
                         }
                         self.view_registry
                             .mark_dependents_dirty(table)
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         return Ok(QueryResult::Modified(count));
                     }
 
@@ -1361,7 +1359,7 @@ impl Engine {
                             let ok = self
                                 .catalog
                                 .patch_var_col_logged(table, *rid, col_idx, new_bytes_ref)
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                             if ok {
                                 count += 1;
                             } else {
@@ -1378,12 +1376,12 @@ impl Engine {
                             }
                             self.catalog
                                 .update_hinted(table, rid, &row, Some(&changed_cols))
-                                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                .map_err(QueryError::from_storage_io)?;
                             count += 1;
                         }
                         self.view_registry
                             .mark_dependents_dirty(table)
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         return Ok(QueryResult::Modified(count));
                     }
 
@@ -1399,12 +1397,12 @@ impl Engine {
                         }
                         self.catalog
                             .update_hinted(table, rid, &row, Some(&changed_cols))
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         count += 1;
                     }
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     return Ok(QueryResult::Modified(count));
                 } // end if let Some(resolved_assignments)
 
@@ -1436,12 +1434,12 @@ impl Engine {
                     }
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     count += 1;
                 }
                 self.view_registry
                     .mark_dependents_dirty(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 Ok(QueryResult::Modified(count))
             }
 
@@ -1479,10 +1477,10 @@ impl Engine {
                     crate::cancel::check()?;
                     self.catalog
                         .delete_many(table, &matching_rids)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     self.view_registry
                         .mark_dependents_dirty(table)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     return Ok(QueryResult::Rows {
                         columns,
                         rows: out_rows,
@@ -1544,10 +1542,10 @@ impl Engine {
                                 let count = self
                                     .catalog
                                     .scan_delete_matching_logged(table, |data| compiled(data))
-                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                    .map_err(QueryError::from_storage_io)?;
                                 self.view_registry
                                     .mark_dependents_dirty(table)
-                                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                                    .map_err(QueryError::from_storage_io)?;
                                 return Ok(QueryResult::Modified(count));
                             }
                         }
@@ -1561,10 +1559,10 @@ impl Engine {
                         let count = self
                             .catalog
                             .scan_delete_matching_logged(table, |_| true)
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         self.view_registry
                             .mark_dependents_dirty(table)
-                            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         return Ok(QueryResult::Modified(count));
                     }
                 }
@@ -1574,10 +1572,10 @@ impl Engine {
                 let count = self
                     .catalog
                     .delete_many(table, &matching_rids)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 self.view_registry
                     .mark_dependents_dirty(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 Ok(QueryResult::Modified(count))
             }
 
@@ -1641,7 +1639,7 @@ impl Engine {
                 for (_, row) in self
                     .catalog
                     .scan(table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                    .map_err(QueryError::from_storage_io)?
                 {
                     cancel.tick()?;
                     rows.push(row);
@@ -1815,13 +1813,13 @@ impl Engine {
                 };
                 self.catalog
                     .create_table_full(schema, defaults, auto_cols)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 // Declaring a field `unique` auto-creates a unique B+tree
                 // index, which is where uniqueness is enforced on writes.
                 for f in fields.iter().filter(|f| f.unique) {
                     self.catalog
                         .create_index_unique(name, &f.name, true)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 Ok(QueryResult::Created(name.clone()))
             }
@@ -1859,7 +1857,7 @@ impl Engine {
                     };
                     self.catalog
                         .alter_table_add_column(table, col)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Executed {
                         message: format!("column '{name}' added to '{table}'"),
                     })
@@ -1883,7 +1881,7 @@ impl Engine {
                     }
                     self.catalog
                         .alter_table_drop_column(table, name)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Executed {
                         message: format!("column '{name}' dropped from '{table}'"),
                     })
@@ -1915,7 +1913,7 @@ impl Engine {
                                 path.clone(),
                                 false,
                             )
-                            .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         return Ok(QueryResult::Executed {
                             message: format!("expression index {index_id} on '{}' created", table),
                         });
@@ -1926,7 +1924,7 @@ impl Engine {
                     crate::cancel::check()?;
                     self.catalog
                         .create_index(table, column)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Executed {
                         message: format!("index on '{table}.{column}' created"),
                     })
@@ -1964,7 +1962,7 @@ impl Engine {
                                 path.clone(),
                                 true,
                             )
-                            .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                            .map_err(QueryError::from_storage_io)?;
                         return Ok(QueryResult::Executed {
                             message: format!(
                                 "unique expression index {index_id} on '{}' created",
@@ -2020,7 +2018,7 @@ impl Engine {
                     crate::cancel::check()?;
                     self.catalog
                         .create_index_unique(table, column, true)
-                        .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Executed {
                         message: format!("unique index on '{table}.{column}' created"),
                     })
@@ -2049,7 +2047,7 @@ impl Engine {
                     crate::cancel::check()?;
                     self.catalog
                         .drop_expression_index(table, existing.index_id)
-                        .map_err(|error| QueryError::StorageError(error.to_string()))?;
+                        .map_err(QueryError::from_storage_io)?;
                     Ok(QueryResult::Executed {
                         message: format!(
                             "expression index {} on '{}' dropped",
@@ -2078,7 +2076,7 @@ impl Engine {
                 }
                 self.catalog
                     .drop_table(name)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 // Dropping a table invalidates every view built over it just
                 // as surely as mutating one does, and more permanently: the
                 // rows a materialized view holds are now the only copy of data
@@ -2093,7 +2091,7 @@ impl Engine {
                     .view_registry
                     .mark_dependents_dirty(name)
                     .map(|()| self.view_registry.dependents_of(name))
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 let message = if views_affected.is_empty() {
                     format!("table '{name}' dropped")
                 } else {
@@ -2205,7 +2203,7 @@ impl Engine {
                 }
                 self.catalog
                     .begin_transaction()
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 self.in_transaction = true;
                 Ok(QueryResult::Executed {
                     message: "transaction started".to_string(),
@@ -2220,7 +2218,7 @@ impl Engine {
                 }
                 self.catalog
                     .commit_transaction()
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                    .map_err(QueryError::from_storage_io)?;
                 self.in_transaction = false;
                 Ok(QueryResult::Executed {
                     message: "transaction committed".to_string(),
@@ -2509,11 +2507,11 @@ impl Engine {
         crate::cancel::check()?;
         self.catalog
             .create_table(schema)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         for row in &rows {
             self.catalog
                 .insert(name, row)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         // Determine which base tables this view depends on by parsing the query.
         let depends_on = self.extract_view_deps(name, query_text)?;
@@ -2525,7 +2523,7 @@ impl Engine {
         if !self.in_transaction {
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         self.view_registry
             .register(ViewDef {
@@ -2534,7 +2532,7 @@ impl Engine {
                 depends_on,
                 dirty: false,
             })
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         Ok(())
     }
 
@@ -2594,11 +2592,11 @@ impl Engine {
         crate::cancel::check()?;
         self.catalog
             .scan_delete_matching_logged(name, |_| true)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         for row in &rows {
             self.catalog
                 .insert(name, row)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         // The clean flag is durable, so it must not get to disk ahead of the
         // rows it vouches for: `mark_clean` fsyncs `views.bin`, and the writes
@@ -2614,10 +2612,10 @@ impl Engine {
         } else {
             self.catalog
                 .commit_autocommit()
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
             self.view_registry
                 .mark_clean(name)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?;
+                .map_err(QueryError::from_storage_io)?;
         }
         Ok(())
     }
@@ -2631,10 +2629,10 @@ impl Engine {
         }
         self.view_registry
             .unregister(name)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         self.catalog
             .drop_table(name)
-            .map_err(|e| QueryError::StorageError(e.to_string()))?;
+            .map_err(QueryError::from_storage_io)?;
         Ok(())
     }
 
@@ -2753,7 +2751,7 @@ impl Engine {
                 // Placeholder: the catalog derives the real cardinality.
                 kind: LinkKind::ToMany,
             })
-            .map_err(|e| QueryError::StorageError(e.to_string()))
+            .map_err(QueryError::from_storage_io)
     }
 
     /// Resolve every unresolved link traversal among these nested fields
@@ -3052,7 +3050,7 @@ impl Engine {
                 for (_, row) in self
                     .catalog
                     .scan(&hop.table)
-                    .map_err(|e| QueryError::StorageError(e.to_string()))?
+                    .map_err(QueryError::from_storage_io)?
                 {
                     cancel.tick()?;
                     // A NULL key never matches any FK value.
@@ -3399,7 +3397,7 @@ impl Engine {
             for (_, row) in self
                 .catalog
                 .scan(&nested.table)
-                .map_err(|e| QueryError::StorageError(e.to_string()))?
+                .map_err(QueryError::from_storage_io)?
             {
                 cancel.tick()?;
                 narrow_into(&row, &mut child_rows)?;

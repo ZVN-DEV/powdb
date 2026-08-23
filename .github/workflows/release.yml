@@ -37,11 +37,32 @@ jobs:
           restore-keys: |
             release-test-${{ runner.os }}-
 
+      # `--locked` matches ci.yml. This workflow builds the artifacts users
+      # download, so resolving a dependency set CI never saw is worse here
+      # than anywhere else in the repo.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
+
+      # Validate the release body HERE, in the one job everything else depends
+      # on, rather than in the `release` job. `release` is a sibling of
+      # `npm-publish`, `npm-publish-sync` and `docker`, so a changelog problem
+      # discovered there surfaces only after those irreversible publishes have
+      # already run. A tag whose version has no changelog section must fail
+      # before anything ships, not after.
+      - name: Release body is extractable from the changelog
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::tag $tag is not a vX.Y.Z release tag; the release body will fall back to generated notes"
+            exit 0
+          fi
+          bash scripts/ci/changelog-section.sh "$version" > /dev/null
+          echo "changelog section for $version is present and non-empty"
 
   build:
     name: build (${{ matrix.target }})
@@ -87,7 +108,7 @@ jobs:
       - name: Build release binaries
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --target ${{ matrix.target }} -p powdb-cli -p powdb-server
+        run: cargo build --release --locked --target ${{ matrix.target }} -p powdb-cli -p powdb-server
 
       - name: Rename binaries
         run: |
@@ -135,7 +156,7 @@ jobs:
             release-x86_64-unknown-linux-gnu-
 
       - name: Build release binaries (powdb-cli + powdb-server)
-        run: cargo build --release -p powdb-cli -p powdb-server
+        run: cargo build --release --locked -p powdb-cli -p powdb-server
 
       # The gate whose absence caused the v0.4.1–0.4.3 data-loss yanks:
       # README PowQL flow + unique-constraint enforcement + kill -9/restart
@@ -345,9 +366,41 @@ jobs:
         with:
           subject-path: artifacts/*
 
+      # `generate_release_notes: true` on its own made the entire v0.25.0 release
+      # body one auto-generated bullet linking a PR, while the curated 95-line
+      # CHANGELOG entry (which described a defect that permanently bricked data
+      # directories) never reached the page most users read. Passing an explicit
+      # body keeps the curated notes first; GitHub still appends the generated
+      # PR list underneath because generate_release_notes stays on.
+      #
+      # The extractor fails the release if the section is missing or empty
+      # rather than publishing a blank body.
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF#refs/tags/v}"
+          notes="${RUNNER_TEMP}/release-notes.md"
+          # A prerelease tag (v0.26.0-rc1) has no changelog section of its own.
+          # Fall back to generated notes rather than failing: by this point the
+          # npm and ghcr publishes have already run, so failing here would leave
+          # a release with published packages and no GitHub Release at all. The
+          # `test` job already hard-fails a vX.Y.Z tag with no section, which is
+          # the case that must never ship.
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            bash scripts/ci/changelog-section.sh "$version" > "$notes"
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+            echo "Release body ($(wc -l < "$notes") lines):"
+            cat "$notes"
+          else
+            echo "::notice::$version is not a release version; using generated notes only"
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           files: artifacts/*
 

@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-23
+
+**The audit round: the findings from the 2026-08-22 gold-standard audit.**
+
+### Fixed
+
+- **A duplicate key on a unique expression index reported the wrong error class.**
+  It arrived as wire class `0` (`internal`), telling drivers the server had
+  faulted, when the caller had simply inserted a duplicate. The cause was
+  structural: storage errors crossed the crate boundary as plain strings, so the
+  server recovered their type by searching the rendered message for a
+  column-level phrase that an expression-index violation never contains. Wire
+  classification now runs off a typed `StorageErrorKind` through an exhaustive
+  match with no wildcard, so a new storage error variant is a compile error
+  rather than a silent `internal`. The message text is unchanged, and no other
+  class moved.
+
+- **The PowQL "did you mean" suggestion was computed from the wrong token.**
+  It read the first token of the statement instead of the token that actually
+  failed, so every query beginning with `User` suggested `` `upsert` `` no matter
+  what went wrong, including `User xyzzy`, which resembles no keyword at all.
+  Since `User` is the table name in nearly every example in the documentation,
+  a newcomer's first typo produced a confidently wrong suggestion. Suggestions
+  now come from the offending token and cover pipeline keywords (`filter`,
+  `order`, `limit`, `group`, `desc` and siblings), not just statement keywords,
+  and a token resembling nothing now suggests nothing.
+
+- **Nine `.expect()` calls on the wire decode path are now typed errors.**
+  Each was an invariant assertion guarded by an upstream length check, but under
+  the crate's deliberate `panic = "abort"` profile any one of them firing would
+  abort the process and every connected client. They now return protocol errors.
+
+### Added
+
+- `powdb_storage::error::StorageErrorKind`, with `StorageError::kind()` and
+  `kind_of_io_error()`, and `powdb_query::result::QueryError::Storage { kind,
+  message }` with `QueryError::from_storage_io()` and `impl From<StorageError>
+  for QueryError`. `QueryError` keeps `Clone` and `PartialEq`. Note these are
+  new enum variants on types that are not `#[non_exhaustive]`, so an external
+  crate matching `StorageError` or `QueryError` exhaustively will need a new
+  arm.
+
+- **`@zvndev/powdb-embedded`: every error now carries a stable, machine-readable
+  `code`.** `poisoned` and `open_panicked` are distinguishable from an ordinary
+  `query_failed`, so an embedded host can recycle the handle or restore the data
+  directory instead of retrying. The full set is `query_failed`, `closed`,
+  `open_failed`, `open_panicked`, `poisoned`, `invalid_argument`, `sync_failed`,
+  `already_open`, and `internal`. `query_failed` and `closed` are the same
+  strings `@zvndev/powdb-client` uses, so one `switch` reads correctly against
+  an embedded database or a server. `PowDBErrorCode` and `PowDBError` are
+  exported from the addon's TypeScript declarations.
+
+### Changed
+
+- **Breaking for anyone reading `err.code` from `@zvndev/powdb-embedded`.** The
+  property previously held napi's `"GenericFailure"` on every error the addon
+  raised; it now holds one of the nine codes listed above. Error messages are
+  unchanged byte for byte, so code matching on message text is unaffected.
+  Errors from argument coercion (passing a number where a string is required)
+  still report napi's own status strings and are deliberately not part of the
+  documented union.
+
+- **A duplicate key on a unique expression index now reaches the client with its
+  own message.** The prefix `unique expression index violation` was added to the
+  wire egress allowlist, which already carried its column-level twin. Without
+  it, the corrected class 8 arrived over the generic `query execution error`
+  text, telling a caller a constraint had rejected the write while naming no
+  constraint.
+
+- **Cross-crate plumbing modules are now `#[doc(hidden)]`.** In `powdb-storage`:
+  `btree`, `disk`, `format`, `heap`, `page`, `row`, `wal`. In `powdb-query`:
+  `canonicalize`, `plan`, `plan_cache`, `token`. These were public only so a
+  sibling crate could reach them, which placed the on-disk row encoding inside
+  the published semver contract. They remain accessible, so nothing breaks, but
+  they no longer appear on docs.rs and carry no compatibility promise. See the
+  new "Public API boundary" section in `docs/STABILITY.md`. The documented
+  surface drops from 117 items to 43 in `powdb-storage` and 94 to 79 in
+  `powdb-query`.
+
+- **GitHub Release bodies now carry the curated changelog.** Releases previously
+  published only auto-generated pull-request titles, so the release notes for a
+  version that fixed a data-directory-bricking defect were a single link. The
+  changelog section for the tagged version is now the release body, with the
+  generated pull-request list appended beneath it.
+
+### Documentation
+
+- `AGENTS.md` listed entity links as unimplemented and omitted nested
+  projections, both of which shipped, and described the workspace as ten crates
+  and 100K lines when it is eleven and 145K.
+- `README.md` and `docs/POWQL.md` taught an entity-link block spelling
+  (`u.orders { ... }`) that does not parse. The working form labels the field.
+- Stale `0.23.0` version strings in `README.md`, `docs/getting-started.md`, and
+  `docs/powdb-vs-sqlite.md`, including a REPL banner transcript that no longer
+  matched the binary.
+- `CLAUDE.md` claimed `powdb-bench` depends only on storage and query, which was
+  the stated justification for the benchmark workflow not gating merges. It also
+  depends on `powdb-server` and `powdb-auth`.
+- The production checklist in `README.md` never mentioned running under a
+  process supervisor with auto-restart, despite `Cargo.toml` citing that exact
+  checklist item as required.
+
+### Internal
+
+- The cross-version on-disk compatibility matrix tested v0.19.1 through v0.21.0
+  only, leaving three releases untested, two of which shipped on-disk fixes. It
+  is now derived from the published release list rather than a hardcoded literal.
+- `crates/query/fuzz/Cargo.lock` was four minors stale and failed `--locked`,
+  while a CI cache key hashed that same ignored file and therefore never
+  invalidated.
+- The `miri` job was an 18-minute single critical path; it is now sharded three
+  ways, with a guard asserting the shards cover the canonical filter set exactly.
+- `scripts/check-version-consistency.sh` now also gates documentation install
+  pins, CLI banner transcripts, every tracked `Cargo.lock`, `bindings/node/Cargo.toml`,
+  and the publish workflow's crate list, each with an anti-vacuity assertion.
+
 ## [0.25.0] - 2026-08-16
 
 ### Fixed
@@ -2460,7 +2576,8 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/ZVN-DEV/powdb/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/ZVN-DEV/powdb/compare/v0.22.0...v0.23.0

@@ -63,19 +63,24 @@ jobs:
         run: cargo test -p powdb-query --features testing --locked
 
   miri:
-    name: miri (powdb-storage)
+    name: miri (powdb-storage, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    # miri interprets rather than executes, so this job is slow by nature: runs on
-    # main sat at 16 to 20 minutes against a 20 minute cap, which meant a green run
-    # had seconds of headroom and any added storage test tipped it into a timeout
-    # that reads like a failure. 30 gives it room without hiding a real hang.
-    timeout-minutes: 30
+    # miri interprets rather than executes, so this job is slow by nature. Run
+    # as one job it sat at 16 to 20 minutes and owned the whole CI critical path
+    # while every other job finished inside 7. The filters are now sharded
+    # across this matrix, which is a wall-clock change only: every filter still
+    # runs on every commit, and `scripts/ci/miri-shards.sh` fails the job if the
+    # shards stop covering the canonical set or stop matching the names below.
+    # 20 minutes is roughly double the expected per-shard time, so a real hang
+    # still shows up as a timeout.
+    timeout-minutes: 20
+    strategy:
+      # One slow shard failing should not hide the verdict of the others.
+      fail-fast: false
+      matrix:
+        shard: [btree, row-page, json-types-view]
     env:
       CARGO_TERM_COLOR: always
-      # miri cannot interpret libc::mmap, so we skip modules that touch the
-      # mmap-based heap (heap, catalog, table, disk, wal, and integration
-      # tests). The remaining modules still give strong UB coverage of the
-      # core data structures and the hand-rolled binary formats.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,29 +94,34 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: miri
+          shared-key: miri-${{ matrix.shard }}
 
-      - name: Run miri on powdb-storage (non-mmap modules)
+      - name: Run miri on powdb-storage (shard ${{ matrix.shard }})
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
+          SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
-          filters=(
-            btree::tests
-            page::tests
-            row::tests
-            types::tests
-            view::tests
-            pj1::tests
-            stored_json_path::tests
-          )
+          # Validates the shard map (union covers the canonical filter set, and
+          # the shard names here match ci.yml) before printing this shard's
+          # filters, so a dropped filter fails instead of shrinking the run.
+          # Assigned first on purpose: `read -a x <<< "$(cmd)"` swallows a
+          # failing cmd and leaves an empty array, which is how a broken shard
+          # map would turn into a job that runs nothing and exits 0.
+          shard_filters="$(bash scripts/ci/miri-shards.sh "$SHARD")"
+          read -r -a filters <<< "$shard_filters"
+          if (( ${#filters[@]} == 0 )); then
+            echo "::error::miri shard '$SHARD' resolved to zero filters"
+            exit 1
+          fi
+          echo "shard $SHARD filters: ${filters[*]}"
           # A libtest filter that matches nothing exits 0, so a renamed or
-          # deleted module would silently empty this job instead of failing
+          # deleted module would silently empty this shard instead of failing
           # it (a `tx::tests` filter did exactly that: there is no tx module).
           # List with the SAME target selection as the run below (no --lib):
           # a guard that inspects a different set of targets than the run does
           # is not evidence about the run. Require each filter to select at
-          # least one test.
+          # least one test. This runs per shard, so sharding cannot dilute it.
           listing=$(cargo +nightly miri test -p powdb-storage -- --list "${filters[@]}")
           for filter in "${filters[@]}"; do
             if ! grep -q "^${filter}::" <<<"$listing"; then
@@ -468,6 +478,10 @@ jobs:
     name: cross-version compat (real released binaries)
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    # `gh release list` derives the tested version list. Read-only, and the
+    # script falls back to a validated pinned list if the call fails.
+    permissions:
+      contents: read
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -483,13 +497,39 @@ jobs:
         with:
           shared-key: cross-version-compat
 
+      # The tested version list is derived from the live release list, so the
+      # cache key has to come from the same call rather than a hand-copied
+      # literal. The literal was the bug: it named v0.19.1 through v0.21.0 long
+      # after v0.24.0 shipped. Resolving once and exporting the result also
+      # guarantees the run below tests exactly the versions the key was built
+      # from, instead of re-resolving and possibly disagreeing with its cache.
+      - name: Resolve compat version list
+        id: compat
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          plan="$(bash scripts/ci/cross-version-compat.sh --print-plan)"
+          echo "$plan"
+          versions="$(sed -n 's/^versions=//p' <<<"$plan")"
+          floor="$(sed -n 's/^floor=//p' <<<"$plan")"
+          if [ -z "$versions" ] || [ -z "$floor" ]; then
+            echo "::error::could not resolve the cross-version compat plan"
+            exit 1
+          fi
+          {
+            echo "POWDB_COMPAT_VERSIONS=$versions"
+            echo "POWDB_COMPAT_FLOOR=$floor"
+          } >> "$GITHUB_ENV"
+          echo "cache-key=$(echo "$versions $floor" | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+
       # Released binaries are immutable per tag, so the cache key is the
-      # version list itself.
+      # resolved version list itself.
       - name: Released binary cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/compat-bins
-          key: compat-bins-${{ runner.os }}-v0.19.1-v0.20.0-v0.21.0-v0.18.2
+          key: compat-bins-${{ runner.os }}-${{ steps.compat.outputs.cache-key }}
 
       - name: Build HEAD powdb-cli
         run: cargo build --release -p powdb-cli --locked

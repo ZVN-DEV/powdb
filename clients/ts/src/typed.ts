@@ -2,7 +2,7 @@
  * Optional row-level type coercion for `queryTyped`.
  *
  * The server's wire format serialises every value to a string (see
- * `crates/server/src/handler.rs::value_to_display`):
+ * `crates/server/src/handler/wire.rs::value_to_display`):
  *   Int      → decimal digits, e.g. "42" or "-7"
  *   Float    → Rust `{}` format, e.g. "3.14"
  *   Bool     → "true" / "false"

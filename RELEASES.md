@@ -3,7 +3,7 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
-> **Current release: v0.25.0.** The follow-up round: the seven defects the v0.24.0 audit found and deferred, one of which destroyed a database. `alter <T> drop <column>` could permanently brick the data directory. Dropping a column that carried a `unique` index, or dropping the last column a table had, aborted the process and left a directory no later process could open: the post-drop index rebuild reused the column positions each index cached before the drop, which are wrong in two ways at once (the dropped column's own entry names a column that is gone, and every index after it has shifted one slot left). Because the crate is built `panic = "abort"` this was a SIGABRT, and it fired before the catalog was persisted while the DdlDropColumn WAL record was already durable, so every subsequent open replayed it and aborted identically and a supervised server restart-looped forever on intact data. Two materialized-view defects of the same class as v0.24.0's: a view built over another view was stale forever, because dirty propagation walked only one level and nothing ever revisits a clean view; and dropping a table left its views answering from an orphaned copy of rows whose source no longer existed, while `refresh` on the very same view already failed. Both now refuse or are correct, never silently serve. `powdb-server` and `powdb-cli` dropped the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134) for the `rustls-pki-types` PEM API the rustls project moved it into. The sync cursor lock waits 30s with jittered backoff instead of 5s in lockstep, so ordinary contention no longer fails an upsert. Breaking for TypeScript source only: the embedded addon's `QueryResultJs` is now a discriminated union, so reading a field the result does not carry is a compile error rather than a silent `undefined`; the runtime shape is unchanged. And the backup guide no longer documents a point-in-time restore that no user could ever have run.
+> **Current release: v0.26.0.** The audit round: the findings from the 2026-08-22 gold-standard audit. A duplicate key on a unique expression index reported wire error class `0` (`internal`) instead of `8` (`constraint_violation`), telling drivers the server had faulted when a caller had simply inserted a duplicate. The cause was structural: storage errors crossed the crate boundary as plain strings, so the server recovered their type by searching the rendered message for a column-level phrase an expression-index violation never contains. Classification now runs off a typed `StorageErrorKind` through an exhaustive match, so a new storage error variant is a compile error rather than a silent `internal`. Nine `.expect()` calls on the wire decode path became typed errors: each was an invariant assertion, but under `panic = "abort"` any one firing would abort the process and every connected client. The PowQL "did you mean" suggestion was computed from the first token of the statement rather than the token that failed, so every query beginning with `User` suggested `upsert`; suggestions now come from the offending token, cover pipeline keywords, and draw on 169 of 87,332 dictionary words instead of 2,329. `@zvndev/powdb-embedded` errors now carry a stable `code`, so an embedded host can distinguish `poisoned` and `open_panicked` from an ordinary `query_failed` and recycle the handle instead of retrying; this is breaking for anyone reading `err.code`, which previously held napi's `GenericFailure` on every error. `crates/server/src/handler.rs` (8,217 lines, holding seven of the codebase's eight lint suppressions) became a seven-file module directory with those suppressions retired rather than relocated. Cross-crate plumbing modules in `powdb-storage` and `powdb-query` are now `#[doc(hidden)]`, which takes the on-disk row encoding out of the published API surface without restricting access.
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.
@@ -17,12 +17,12 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-query` | https://crates.io/crates/powdb-query |
 | **crates.io** | `powdb-backup` | https://crates.io/crates/powdb-backup |
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
-| **crates.io** | `powdb` (embedded facade — in-process Rust API) | https://crates.io/crates/powdb |
+| **crates.io** | `powdb` (embedded facade: in-process Rust API) | https://crates.io/crates/powdb |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
 | **crates.io** | `powdb-sync` (experimental, the embedded-sync substrate) | https://crates.io/crates/powdb-sync |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
-| **npm** | `@zvndev/powdb-sync` (experimental sync orchestration; **awaiting its one-time bootstrap publish**, after which `release.yml` publishes it on every tag) | https://www.npmjs.com/package/@zvndev/powdb-sync |
-| **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu — no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
+| **npm** | `@zvndev/powdb-sync` (experimental sync orchestration; bootstrapped at 0.24.0, and published on every `v*` tag by `release.yml` since) | https://www.npmjs.com/package/@zvndev/powdb-sync |
+| **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu; no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
 | **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
 ## GitHub Releases
@@ -57,29 +57,33 @@ Inter-crate dependencies require publishing in this order:
 1. `powdb-storage` (no inter-crate deps)
 2. `powdb-auth` (no inter-crate deps)
 3. `powdb-query` (depends on storage)
-4. `powdb-sync` (experimental — depends on storage)
+4. `powdb-sync` (experimental; depends on storage)
 5. `powdb-backup` (depends on storage + sync; query is dev-only)
 6. `powdb-server` (depends on storage + query + auth + sync)
-7. `powdb` (embedded facade — depends on storage + query + sync)
+7. `powdb` (embedded facade; depends on storage + query + sync)
 8. `powdb-cli` (depends on storage + query + server + backup + auth + sync)
 
-Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
+Non-publishable workspace crates (`publish = false`): `powdb-bench`, `powdb-compare`, `powdb-oracle`.
+Those three plus the eight above are the whole workspace: `cargo metadata --no-deps` lists
+eleven packages. The fuzz crate `powdb-query-fuzz` is **not** among them; it lives under
+`crates/query/fuzz` with its own `[workspace]` table, so `crates/*` never picks it up and it is
+built only by `cargo fuzz`.
 
 ## Publishing is token-less (Trusted Publishing / OIDC)
 
-Both registries publish from CI with **no stored token** — neither
+Both registries publish from CI with **no stored token**: neither
 `CARGO_REGISTRY_TOKEN` nor an npm token exists anymore. The workflows mint
 short-lived credentials from their GitHub OIDC identity. This is configured once
 per package/crate on the registry websites; see
 [`docs/ci/trusted-publishing.md`](docs/ci/trusted-publishing.md) for the
 one-time setup and the reusable standard.
 
-- **crates.io** — `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
+- **crates.io**: `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
   authenticated via `rust-lang/crates-io-auth-action`. Kept manual because
   publishing to crates.io is irreversible.
-- **npm (`@zvndev/powdb-client`)** — published automatically by `release.yml`
+- **npm (`@zvndev/powdb-client`)**: published automatically by `release.yml`
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
-- **npm (`@zvndev/powdb-embedded`)** — published by `publish-node-addon.yml`
+- **npm (`@zvndev/powdb-embedded`)**: published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
   runner matrix (macOS arm64, Linux x64/arm64; Intel macOS builds from source and
   Windows is deferred, both since the macos-13 runner retired in #149), then
@@ -95,10 +99,20 @@ one-time setup and the reusable standard.
 [ ] Update inter-crate dep versions in query/sync/backup/server/powdb/cli Cargo.toml
 [ ] Update clients/ts/package.json version and clients/ts/src/index.ts CLIENT_VERSION
 [ ] Update bindings/node/package.json version (@zvndev/powdb-embedded, lockstep)
+[ ] Update clients/sync/package.json version and its two exact peer pins
+[ ] Update bindings/node/Cargo.toml version, then regenerate its Cargo.lock
+[ ] Regenerate crates/query/fuzz/Cargo.lock
 [ ] Move CHANGELOG.md notes from Unreleased to the dated version entry
 [ ] Update both the Next release and Current release lines in RELEASES.md
+[ ] Update doc version strings: --version pins and CLI banner transcripts in
+    README.md, docs/getting-started.md, docs/powdb-vs-sqlite.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
+
+Note on the three lockfiles: bindings/node and crates/query/fuzz are detached
+workspaces, so `cargo build --workspace` never regenerates them. All three are
+gated against the workspace version, so bumping only the root Cargo.toml turns
+the release PR red. The failure names the exact file and expected value.
 [ ] Commit: "chore: release vX.Y.Z", open a PR, merge it
 
 TAG BEFORE PUBLISHING. publish.yml refuses to publish unless the tag vX.Y.Z

@@ -7,7 +7,11 @@
 
 [package]
 name = "powdb-node"
-version = "0.8.1"
+# Tracks the workspace version even though this crate is publish = false and
+# detached from the root workspace: it wraps that engine and ships as
+# @zvndev/powdb-embedded at the same number. It drifted 17 minors sitting at
+# 0.8.1, so scripts/check-version-consistency.sh now asserts it.
+version = "0.26.0"
 edition = "2021"
 license = "MIT"
 publish = false

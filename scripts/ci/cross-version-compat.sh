@@ -31,16 +31,39 @@
 #              signal, and above all not a partial read that silently drops the
 #              rows it did not understand.
 #
+# The version list is DERIVED, not written down. It used to be a literal
+# ("v0.19.1 v0.20.0 v0.21.0") that nothing bumped, so v0.22.0 through v0.24.0
+# shipped with no on-disk coverage at all, including the v0.25.0 release whose
+# headline fix was a data directory that could be left permanently unopenable.
+# The default now asks the release list for the newest patch of each of the last
+# POWDB_COMPAT_MINORS published minor series, and the pinned fallback used on a
+# machine without `gh` is itself checked against the workspace version, so a
+# stale pin fails the run instead of quietly shrinking the matrix.
+#
+# Why 5 minors: docs/FORMAT.md documents a 4-minor deprecation floor (a legacy
+# read branch may only be removed once 4 minors have shipped since the release
+# that superseded it), so 4 back plus the current release is exactly the window
+# in which compatibility is still promised.
+#
 # Env:
 #   POWDB_CLI                  HEAD powdb-cli (default target/release/powdb-cli)
 #   POWDB_COMPAT_VERSIONS      space-separated release tags to test forward and
-#                              downgrade-compatible against
-#                              (default "v0.19.1 v0.20.0 v0.21.0")
+#                              downgrade-compatible against. Default: derived
+#                              from `gh release list`, falling back to a pinned
+#                              list that is validated, not trusted.
+#   POWDB_COMPAT_MINORS        how many published minor series the derived list
+#                              covers (default 5, see above)
 #   POWDB_COMPAT_FLOOR         release tag predating the newest lazily-activated
 #                              on-disk feature, used for DOWNGRADE-REFUSED
 #                              (default "v0.18.2", the last catalog-v6 release)
 #   POWDB_COMPAT_CACHE         where to keep downloaded binaries
 #   POWDB_COMPAT_REPO          owner/name to download releases from
+#
+# Flags:
+#   --print-plan               print `versions=<list>` and `floor=<tag>` and
+#                              exit 0. A caller keys its binary cache on this so
+#                              the key is derived from the same list the run
+#                              uses, instead of a second hand-maintained copy.
 #
 # Exits 0 only when every leg of every version passed.
 
@@ -49,10 +72,20 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 POWDB_CLI="${POWDB_CLI:-${REPO_ROOT}/target/release/powdb-cli}"
-COMPAT_VERSIONS="${POWDB_COMPAT_VERSIONS:-v0.19.1 v0.20.0 v0.21.0}"
 COMPAT_FLOOR="${POWDB_COMPAT_FLOOR:-v0.18.2}"
+COMPAT_MINORS="${POWDB_COMPAT_MINORS:-5}"
 COMPAT_REPO="${POWDB_COMPAT_REPO:-ZVN-DEV/powdb}"
 CACHE_DIR="${POWDB_COMPAT_CACHE:-${REPO_ROOT}/target/compat-bins}"
+
+# Used only when `gh` cannot answer (no CLI, no network, no auth). Validated
+# against the workspace version below, so it cannot silently fall behind.
+COMPAT_VERSIONS_FALLBACK="v0.21.0 v0.22.0 v0.23.0 v0.24.0 v0.25.0"
+
+# Every tested version must understand the newest lazily-activated on-disk
+# feature, because the lazy-accept leg requires it. Entity links (catalog v7)
+# landed in v0.19.0, so that is the oldest tag this matrix may contain; the
+# DOWNGRADE-REFUSED leg deliberately uses an older binary via COMPAT_FLOOR.
+COMPAT_FEATURE_FLOOR="v0.19.0"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/powdb-compat-XXXXXX")"
 FAILURES=0
@@ -68,6 +101,119 @@ fail() {
   echo "compat: FAIL: $*" >&2
   FAILURES=$((FAILURES + 1))
 }
+die()  { echo "compat: FATAL: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Version list resolution
+#
+# The list this job runs against must track the releases that actually exist.
+# When it was a literal in this file, nothing bumped it and three consecutive
+# minors shipped with zero coverage. Derive it instead, then validate whatever
+# was derived: a `gh` call that returns nothing, or a fallback pin that has
+# aged out, would otherwise leave the loops below iterating over an empty or
+# truncated list and still printing ALL-PASS.
+# ---------------------------------------------------------------------------
+
+# "v0.25.0" -> 25 (major-scaled so it stays correct past 1.0)
+minor_key() {
+  local v="${1#v}" maj rest min
+  maj="${v%%.*}"
+  rest="${v#*.}"
+  min="${rest%%.*}"
+  echo $(( maj * 1000 + min ))
+}
+
+# Newest patch of each of the last COMPAT_MINORS published minor series, oldest
+# first. Drafts and prereleases are excluded by field, not by tag shape, so a
+# `v0.27.0` draft cut before its release cannot enter the matrix.
+derive_versions() {
+  command -v gh >/dev/null 2>&1 || return 1
+  local tags
+  tags="$(gh release list --repo "${COMPAT_REPO}" --limit 200 \
+            --json tagName,isDraft,isPrerelease \
+            --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' \
+          2>/dev/null)" || return 1
+  [[ -n "${tags}" ]] || return 1
+  printf '%s\n' "${tags}" \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sed 's/^v//' \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | awk -F. '
+        { key = $1 "." $2
+          if (key != prev) { if (prev != "") print last; prev = key }
+          last = $0 }
+        END { if (prev != "") print last }' \
+    | tail -n "${COMPAT_MINORS}" \
+    | sed 's/^/v/' \
+    | tr '\n' ' ' \
+    | sed 's/ $//'
+}
+
+# Refuse a list that cannot do the job, whatever produced it.
+validate_versions() {
+  local list="$1" origin="$2"
+  [[ -n "${list//[[:space:]]/}" ]] \
+    || die "${origin} produced an empty version list; this job would test nothing"
+
+  local ws ws_key floor_key newest_key tag key
+  ws="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' \
+          "${REPO_ROOT}/Cargo.toml" | head -1)"
+  [[ -n "${ws}" ]] || die "could not parse [workspace.package] version from Cargo.toml"
+  ws_key="$(minor_key "v${ws}")"
+  floor_key="$(minor_key "${COMPAT_FEATURE_FLOOR}")"
+  newest_key=0
+
+  for tag in ${list}; do
+    if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      die "${origin} produced '${tag}', which is not a vX.Y.Z release tag"
+    fi
+    key="$(minor_key "${tag}")"
+    if (( key < floor_key )); then
+      die "${origin} produced ${tag}, older than ${COMPAT_FEATURE_FLOOR}; the lazy-accept leg requires a release that understands entity links"
+    fi
+    (( key > newest_key )) && newest_key="${key}"
+  done
+
+  # The newest tested release must be the one immediately below the version
+  # under development. Anything further back means a release shipped without
+  # entering this matrix, which is the exact drift that let v0.22.0 through
+  # v0.24.0 go untested.
+  #
+  # A major bump is the one case where "immediately below" does not mean
+  # `ws_key - 1`. Developing 1.0.0 while the newest release is 0.30.0 is
+  # correct, not drift, but minor_key puts those 970 apart. Without this
+  # branch the 1.0.0 release PR is unmergeable until someone edits this
+  # script under release pressure.
+  local ws_maj ws_min newest_maj
+  ws_maj="$(( ws_key / 1000 ))"
+  ws_min="$(( ws_key % 1000 ))"
+  newest_maj="$(( newest_key / 1000 ))"
+  if (( ws_min == 0 )); then
+    if (( ws_maj == 0 || newest_maj != ws_maj - 1 )); then
+      die "${origin} newest entry v$(( newest_maj )).$(( newest_key % 1000 )).x does not close out the v$(( ws_maj - 1 )) series below the workspace version ${ws}. List: ${list}"
+    fi
+  elif (( newest_key < ws_key - 1 )); then
+    die "${origin} newest entry is a released minor below v${ws%.*}: the matrix has fallen behind the workspace version ${ws}. List: ${list}"
+  fi
+}
+
+if [[ -n "${POWDB_COMPAT_VERSIONS:-}" ]]; then
+  COMPAT_VERSIONS="${POWDB_COMPAT_VERSIONS}"
+  VERSIONS_ORIGIN="POWDB_COMPAT_VERSIONS"
+elif COMPAT_VERSIONS="$(derive_versions)" && [[ -n "${COMPAT_VERSIONS}" ]]; then
+  VERSIONS_ORIGIN="gh release list"
+else
+  COMPAT_VERSIONS="${COMPAT_VERSIONS_FALLBACK}"
+  VERSIONS_ORIGIN="pinned fallback (gh unavailable)"
+  echo "compat: WARNING: could not reach ${COMPAT_REPO} releases; using the pinned fallback list" >&2
+fi
+validate_versions "${COMPAT_VERSIONS}" "${VERSIONS_ORIGIN}"
+
+if [[ "${1:-}" == "--print-plan" ]]; then
+  echo "versions=${COMPAT_VERSIONS}"
+  echo "floor=${COMPAT_FLOOR}"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Assertion helpers. Every check is value-level: an exit code alone would pass
@@ -221,6 +367,7 @@ main() {
   log "HEAD cli    : ${POWDB_CLI}"
   log "platform    : ${SUFFIX}"
   log "versions    : ${COMPAT_VERSIONS}"
+  log "version src : ${VERSIONS_ORIGIN}"
   log "floor       : ${COMPAT_FLOOR}"
   echo
 

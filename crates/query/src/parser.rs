@@ -171,17 +171,114 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn keyword_suggestion(word: &str) -> Option<&'static str> {
-    const STATEMENT_KEYWORDS: &[&str] = &[
-        "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
-        "select", "type", "update", "upsert",
-    ];
+/// Keywords that can open a statement.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
+    "select", "type", "update", "upsert",
+];
+
+/// Keywords that can appear at a pipeline-stage boundary, plus the operators
+/// that join a filter expression. PowQL is a left-to-right pipeline language,
+/// so these are the words people actually mistype. Two-letter keywords (`in`,
+/// `is`, `on`, `or`) are deliberately left out: at that length almost any short
+/// identifier lands within the edit-distance bound.
+const PIPELINE_KEYWORDS: &[&str] = &[
+    "and",
+    "asc",
+    "between",
+    "conflict",
+    "cross",
+    "desc",
+    "distinct",
+    "exists",
+    "filter",
+    "group",
+    "having",
+    "inner",
+    "join",
+    "left",
+    "like",
+    "limit",
+    "match",
+    "not",
+    "offset",
+    "order",
+    "outer",
+    "returning",
+    "right",
+    "union",
+];
+
+/// Shortest word length that earns a distance-2 bound. Anything shorter is
+/// held to distance 1.
+///
+/// A distance of two on a six-letter word rewrites a third of it, and that is
+/// exactly where the collisions with ordinary English nouns live: `comment`
+/// reached `commit`, `owner` reached `order`, `alert` reached `alter`, `offer`
+/// reached `offset`. Table names are ordinary English nouns, so those all fired
+/// on real schemas. From eight characters up, a distance of two rewrites at
+/// most a quarter of the word, and the only keywords that long (`conflict`,
+/// `distinct`, `returning`, `rollback`) are the ones where an adjacent
+/// transposition, which costs two under plain Levenshtein, is the likeliest
+/// slip.
+const DISTANCE_2_MIN_LEN: usize = 8;
+
+/// Largest edit distance we will call a typo, scaled off whichever of the two
+/// words is shorter.
+///
+/// Scaling off the input alone let a long identifier reach a short keyword: it
+/// is the keyword's length that decides how much of it a two-edit rewrite
+/// destroys.
+fn suggestion_threshold(word: &str, keyword: &str) -> usize {
+    if word.len().min(keyword.len()) < DISTANCE_2_MIN_LEN {
+        1
+    } else {
+        2
+    }
+}
+
+/// Closest keyword to `word`, or `None` if nothing is close enough to be worth
+/// saying out loud. A wrong suggestion is worse than no suggestion, so this is
+/// deliberately stingy.
+fn closest_keyword<'a>(
+    word: &str,
+    candidates: impl Iterator<Item = &'a &'static str>,
+) -> Option<&'static str> {
     let lower = word.to_ascii_lowercase();
-    STATEMENT_KEYWORDS
-        .iter()
+    let initial = lower.as_bytes().first().copied();
+    candidates
         .copied()
-        .filter(|kw| edit_distance(&lower, kw) <= 2)
+        .filter(|kw| {
+            // Sharing the first letter is a hard requirement, not a tie-break.
+            // People do not typo the first letter anywhere near as often as the
+            // middle of a word, and without this rule `watch` came back as
+            // `match`, `banner` as `inner`, and `rating` as `having`. It also
+            // subsumes the tie-break it replaced: `dsc` reads as `desc`
+            // because `asc` is no longer a candidate at all.
+            kw.as_bytes().first().copied() == initial
+        })
+        .filter(|kw| {
+            let distance = edit_distance(&lower, kw);
+            // Distance zero means the word already IS the keyword, which is
+            // not a typo. Quoting it (`` `filter` ``) used to answer "did you
+            // mean `filter`?".
+            distance >= 1 && distance <= suggestion_threshold(&lower, kw)
+        })
+        // Ties go to the earliest candidate, which favours pipeline keywords
+        // over statement keywords. At a pipeline-stage boundary that is the
+        // likelier intent.
         .min_by_key(|kw| edit_distance(&lower, kw))
+}
+
+/// Best keyword match for an identifier that appeared where the parser
+/// expected syntax, drawn from every keyword that can legally appear there.
+fn keyword_suggestion(word: &str) -> Option<&'static str> {
+    closest_keyword(word, PIPELINE_KEYWORDS.iter().chain(STATEMENT_KEYWORDS))
+}
+
+/// Best statement-keyword match, used only for the first token of a statement.
+fn statement_keyword_suggestion(word: &str) -> Option<&'static str> {
+    closest_keyword(word, STATEMENT_KEYWORDS.iter())
 }
 
 /// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
@@ -205,10 +302,33 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
             parser.pos,
             parser.peek().display_name()
         );
-        if let Some(Token::Ident(first)) = parser.tokens.first() {
-            if let Some(suggestion) = keyword_suggestion(first) {
-                message.push_str(&format!("; did you mean `{suggestion}`?"));
+        // Suggest for the token that actually failed. Reading the suggestion
+        // off `tokens.first()` instead made every query starting with the
+        // table name `User` answer "did you mean `upsert`?", whatever the
+        // real mistake was. The first token is worth a second look only when
+        // it is itself a mistyped statement keyword (`updat User set age = 1`),
+        // and then only against the statement keywords.
+        let offending = match parser.peek() {
+            Token::Ident(word) => {
+                keyword_suggestion(word).map(|kw| format!("; did you mean `{kw}`?"))
             }
+            _ => None,
+        };
+        let suggestion = offending.or_else(|| {
+            // This one is about the first token, not the one named above, so
+            // say which word it read. Otherwise `Comment 42` reported
+            // "number 42; did you mean `commit`?" and left the reader to guess
+            // which of the two words the advice was about.
+            let Some(Token::Ident(first)) = parser.tokens.first() else {
+                return None;
+            };
+            let kw = statement_keyword_suggestion(first)?;
+            Some(format!(
+                "; `{first}` is not a statement keyword, did you mean `{kw}`?"
+            ))
+        });
+        if let Some(suggestion) = suggestion {
+            message.push_str(&suggestion);
         }
         return Err(ParseError::Syntax { message });
     }

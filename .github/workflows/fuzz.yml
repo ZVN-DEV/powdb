@@ -123,6 +123,15 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
+      # `cargo fuzz` has no --locked flag (cargo-fuzz 0.13 rejects the argument
+      # outright), so the checked-in lock only means something if a separate
+      # step asserts it. Without this the fuzz build regenerates the lock every
+      # run: it sat four minors stale at 0.21.0 while the cache above keyed on
+      # hashFiles() of it, deriving a key from a file the build ignored.
+      - name: Verify the checked-in fuzz lockfile is current
+        working-directory: crates/query/fuzz
+        run: cargo +nightly-2026-07-22 metadata --locked --format-version 1 > /dev/null
+
       # `cargo fuzz` expects `<crate>/fuzz/Cargo.toml` relative to its cwd,
       # so we run from `crates/query` (the crate under test), not from
       # `crates/query/fuzz` itself.
