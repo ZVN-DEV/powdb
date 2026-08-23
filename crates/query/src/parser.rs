@@ -209,37 +209,65 @@ const PIPELINE_KEYWORDS: &[&str] = &[
     "union",
 ];
 
-/// Largest edit distance we will call a typo.
+/// Shortest word length that earns a distance-2 bound. Anything shorter is
+/// held to distance 1.
 ///
-/// Short words need a tighter bound. At four characters a distance of two
-/// rewrites half the word, which is how `user` (the table name in nearly every
-/// README and docs example) used to come back as `upsert`.
-fn suggestion_threshold(word: &str) -> usize {
-    if word.len() <= 4 {
+/// A distance of two on a six-letter word rewrites a third of it, and that is
+/// exactly where the collisions with ordinary English nouns live: `comment`
+/// reached `commit`, `owner` reached `order`, `alert` reached `alter`, `offer`
+/// reached `offset`. Table names are ordinary English nouns, so those all fired
+/// on real schemas. From eight characters up, a distance of two rewrites at
+/// most a quarter of the word, and the only keywords that long (`conflict`,
+/// `distinct`, `returning`, `rollback`) are the ones where an adjacent
+/// transposition, which costs two under plain Levenshtein, is the likeliest
+/// slip.
+const DISTANCE_2_MIN_LEN: usize = 8;
+
+/// Largest edit distance we will call a typo, scaled off whichever of the two
+/// words is shorter.
+///
+/// Scaling off the input alone let a long identifier reach a short keyword: it
+/// is the keyword's length that decides how much of it a two-edit rewrite
+/// destroys.
+fn suggestion_threshold(word: &str, keyword: &str) -> usize {
+    if word.len().min(keyword.len()) < DISTANCE_2_MIN_LEN {
         1
     } else {
         2
     }
 }
 
+/// Closest keyword to `word`, or `None` if nothing is close enough to be worth
+/// saying out loud. A wrong suggestion is worse than no suggestion, so this is
+/// deliberately stingy.
 fn closest_keyword<'a>(
     word: &str,
     candidates: impl Iterator<Item = &'a &'static str>,
 ) -> Option<&'static str> {
     let lower = word.to_ascii_lowercase();
-    let max_distance = suggestion_threshold(&lower);
     let initial = lower.as_bytes().first().copied();
     candidates
         .copied()
-        .filter(|kw| edit_distance(&lower, kw) <= max_distance)
-        // Ties break toward the keyword starting with the same letter, so
-        // `dsc` reads as `desc` rather than `asc`.
-        .min_by_key(|kw| {
-            (
-                edit_distance(&lower, kw),
-                u8::from(kw.as_bytes().first().copied() != initial),
-            )
+        .filter(|kw| {
+            // Sharing the first letter is a hard requirement, not a tie-break.
+            // People do not typo the first letter anywhere near as often as the
+            // middle of a word, and without this rule `watch` came back as
+            // `match`, `banner` as `inner`, and `rating` as `having`. It also
+            // subsumes the tie-break it replaced: `dsc` reads as `desc`
+            // because `asc` is no longer a candidate at all.
+            kw.as_bytes().first().copied() == initial
         })
+        .filter(|kw| {
+            let distance = edit_distance(&lower, kw);
+            // Distance zero means the word already IS the keyword, which is
+            // not a typo. Quoting it (`` `filter` ``) used to answer "did you
+            // mean `filter`?".
+            distance >= 1 && distance <= suggestion_threshold(&lower, kw)
+        })
+        // Ties go to the earliest candidate, which favours pipeline keywords
+        // over statement keywords. At a pipeline-stage boundary that is the
+        // likelier intent.
+        .min_by_key(|kw| edit_distance(&lower, kw))
 }
 
 /// Best keyword match for an identifier that appeared where the parser
@@ -280,16 +308,27 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
         // real mistake was. The first token is worth a second look only when
         // it is itself a mistyped statement keyword (`updat User set age = 1`),
         // and then only against the statement keywords.
-        let suggestion = match parser.peek() {
-            Token::Ident(word) => keyword_suggestion(word),
+        let offending = match parser.peek() {
+            Token::Ident(word) => {
+                keyword_suggestion(word).map(|kw| format!("; did you mean `{kw}`?"))
+            }
             _ => None,
-        }
-        .or_else(|| match parser.tokens.first() {
-            Some(Token::Ident(first)) => statement_keyword_suggestion(first),
-            _ => None,
+        };
+        let suggestion = offending.or_else(|| {
+            // This one is about the first token, not the one named above, so
+            // say which word it read. Otherwise `Comment 42` reported
+            // "number 42; did you mean `commit`?" and left the reader to guess
+            // which of the two words the advice was about.
+            let Some(Token::Ident(first)) = parser.tokens.first() else {
+                return None;
+            };
+            let kw = statement_keyword_suggestion(first)?;
+            Some(format!(
+                "; `{first}` is not a statement keyword, did you mean `{kw}`?"
+            ))
         });
         if let Some(suggestion) = suggestion {
-            message.push_str(&format!("; did you mean `{suggestion}`?"));
+            message.push_str(&suggestion);
         }
         return Err(ParseError::Syntax { message });
     }
