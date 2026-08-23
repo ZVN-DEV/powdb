@@ -2,9 +2,7 @@
 
 use crate::result::QueryError;
 use powdb_storage::catalog::Catalog;
-use powdb_storage::types::*;
 
-use crate::executor::compiled::*;
 use crate::executor::eval::date_unit_micros;
 
 use super::*;

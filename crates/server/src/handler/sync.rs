@@ -1127,6 +1127,12 @@ where
 /// `powdb_tx_gate_timeouts_total` because only the two query-side acquires
 /// recorded a timeout. Bounding it here makes every gate waiter, on every
 /// frontend, give up on the same deadline with the same typed error.
+// `Message` is a large enum, so clippy::result_large_err fires on this
+// signature under Rust 1.98 and newer. Boxing the Err would change an error
+// path that the handler split deliberately left byte-identical, and this
+// shape predates that split (it sat at crates/server/src/handler.rs on main).
+// Left as-is for now; boxing the wire Message error type is its own change.
+#[allow(clippy::result_large_err)]
 pub(super) async fn acquire_sync_permit(
     tx_gate: &TxGate,
     tx_wait_timeout: Duration,

@@ -2,7 +2,6 @@
 
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
-use powdb_storage::types::*;
 use std::collections::HashSet;
 
 use crate::executor::eval::*;

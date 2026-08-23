@@ -1,14 +1,11 @@
 //! Scan-family execution: expression-index scans, the Lane A index-residual
 //! fast path, provenance-preserving materialization, and introspection.
 
-use crate::ast::*;
 use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{IndexOrderDirection, LinkDef, LinkKind};
-use powdb_storage::types::*;
 use std::collections::HashSet;
 
-use crate::executor::compiled::*;
 use crate::executor::eval::*;
 use crate::executor::{mem_budget, Engine, MAX_SORT_ROWS};
 

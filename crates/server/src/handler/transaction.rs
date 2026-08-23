@@ -150,6 +150,12 @@ pub(super) fn parsed_transaction_control(
 /// the wait elapses — so a transaction stalled (or held open) on another
 /// connection can never block this one indefinitely. A timeout is recorded so
 /// `powdb_tx_gate_timeouts_total` (and the error total) stay truthful.
+// `Message` is a large enum, so clippy::result_large_err fires on this
+// signature under Rust 1.98 and newer. Boxing the Err would change an error
+// path that the handler split deliberately left byte-identical, and this
+// shape predates that split (it sat at crates/server/src/handler.rs on main).
+// Left as-is for now; boxing the wire Message error type is its own change.
+#[allow(clippy::result_large_err)]
 pub(super) async fn acquire_begin_permit(
     tx_gate: &TxGate,
     tx_wait_timeout: Duration,
@@ -188,6 +194,12 @@ pub(super) async fn acquire_begin_permit(
 /// `powdb_tx_gate_timeouts_total` (and the error total) stay truthful. This
 /// only bounds the ACQUIRE; the permit is still dropped BEFORE the caller's
 /// durability wait so overlapping committers can share an fsync.
+// `Message` is a large enum, so clippy::result_large_err fires on this
+// signature under Rust 1.98 and newer. Boxing the Err would change an error
+// path that the handler split deliberately left byte-identical, and this
+// shape predates that split (it sat at crates/server/src/handler.rs on main).
+// Left as-is for now; boxing the wire Message error type is its own change.
+#[allow(clippy::result_large_err)]
 pub(super) async fn acquire_autocommit_permit(
     tx_gate: &TxGate,
     admission: AdmissionMode,

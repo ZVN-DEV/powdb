@@ -1,13 +1,11 @@
 //! Runtime plan lowering (unindexed scan fallbacks, conjunction index
 //! choice) and EXPLAIN plan-tree formatting.
 
-use crate::ast::*;
 use crate::planner::{
     extract_single_bound, range_scan_for_target, try_extract_eq_index_key, RangeBound, RangeTarget,
 };
 use powdb_storage::btree::IndexStats;
 use powdb_storage::catalog::{Catalog, LinkKind};
-use powdb_storage::types::*;
 use std::collections::HashSet;
 
 use crate::executor::eval::*;
