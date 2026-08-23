@@ -178,7 +178,21 @@ validate_versions() {
   # under development. Anything further back means a release shipped without
   # entering this matrix, which is the exact drift that let v0.22.0 through
   # v0.24.0 go untested.
-  if (( newest_key < ws_key - 1 )); then
+  #
+  # A major bump is the one case where "immediately below" does not mean
+  # `ws_key - 1`. Developing 1.0.0 while the newest release is 0.30.0 is
+  # correct, not drift, but minor_key puts those 970 apart. Without this
+  # branch the 1.0.0 release PR is unmergeable until someone edits this
+  # script under release pressure.
+  local ws_maj ws_min newest_maj
+  ws_maj="$(( ws_key / 1000 ))"
+  ws_min="$(( ws_key % 1000 ))"
+  newest_maj="$(( newest_key / 1000 ))"
+  if (( ws_min == 0 )); then
+    if (( ws_maj == 0 || newest_maj != ws_maj - 1 )); then
+      die "${origin} newest entry v$(( newest_maj )).$(( newest_key % 1000 )).x does not close out the v$(( ws_maj - 1 )) series below the workspace version ${ws}. List: ${list}"
+    fi
+  elif (( newest_key < ws_key - 1 )); then
     die "${origin} newest entry is a released minor below v${ws%.*}: the matrix has fallen behind the workspace version ${ws}. List: ${list}"
   fi
 }
