@@ -21,8 +21,76 @@ use powdb::{
     RetainedApplyResult, RetainedUnitInput, SyncApplyIdentity, Value,
 };
 
-fn to_napi_err(e: PowdbError) -> napi::Error {
-    napi::Error::from_reason(e.to_string())
+/// Stable, machine-readable error codes. napi-rs writes an error's status
+/// string to the JS `Error.code` property, so parameterizing [`napi::Error`]
+/// over `&'static str` is what puts one of these on every object the addon
+/// throws.
+///
+/// The vocabulary mirrors `clients/ts/src/errors.ts` in the networked
+/// `@zvndev/powdb-client`: the same lowercase snake_case naming, and where the
+/// two clients describe the same condition they use the identical string, so
+/// `err.code === "query_failed"` reads the same whether the caller is talking
+/// to an embedded database or to a server. The rest are embedded-only
+/// conditions the networked client has no equivalent for.
+///
+/// Keep this list in sync with the `PowDBErrorCode` union in `dts-header.d.ts`,
+/// which is what TypeScript callers see.
+mod code {
+    /// The statement failed to parse, plan, or execute. Shared with the
+    /// networked client, which uses it for a server `Error` frame.
+    pub const QUERY_FAILED: &str = "query_failed";
+    /// `close()` has already been called on this handle. Shared with the
+    /// networked client.
+    pub const CLOSED: &str = "closed";
+    /// Opening the data directory failed (I/O, permissions, no catalog).
+    pub const OPEN_FAILED: &str = "open_failed";
+    /// Opening the database panicked, so the data directory is likely corrupt.
+    /// Terminal: restore from a backup instead of retrying.
+    pub const OPEN_PANICKED: &str = "open_panicked";
+    /// A previous call panicked and poisoned this handle. Terminal for the
+    /// handle: every later call fails until the caller reopens the database.
+    pub const POISONED: &str = "poisoned";
+    /// A caller-supplied argument was rejected (an unknown sync mode, an
+    /// unbindable parameter, a malformed database id).
+    pub const INVALID_ARGUMENT: &str = "invalid_argument";
+    /// Applying a retained-unit chunk to this embedded replica failed.
+    pub const SYNC_FAILED: &str = "sync_failed";
+    /// The data directory is already open elsewhere in this process.
+    pub const ALREADY_OPEN: &str = "already_open";
+    /// The JS engine refused an operation while a result was being built, or a
+    /// stored value could not be decoded. Not caller-actionable.
+    pub const INTERNAL: &str = "internal";
+}
+
+/// The status type of every error the addon throws: one of the [`code`]
+/// constants, which napi-rs surfaces as the JS `Error.code` property.
+type Code = &'static str;
+
+/// A [`napi::Error`] carrying a [`Code`] instead of a napi [`napi::Status`].
+/// Every fallible `#[napi]` method returns `napi::Result<T, Code>`, so no error
+/// can reach JavaScript with napi's own `"GenericFailure"` placeholder code.
+type CodedError = napi::Error<Code>;
+
+/// Map an embedded-engine error onto a JS error carrying its code. The match is
+/// exhaustive on purpose: a new `powdb::Error` variant fails this build rather
+/// than silently inheriting some other variant's code.
+fn to_napi_err(e: PowdbError) -> CodedError {
+    let code = match &e {
+        PowdbError::Open(_) => code::OPEN_FAILED,
+        PowdbError::Query(_) => code::QUERY_FAILED,
+        PowdbError::Poisoned => code::POISONED,
+        PowdbError::OpenPanicked => code::OPEN_PANICKED,
+        PowdbError::InvalidArgument(_) => code::INVALID_ARGUMENT,
+        PowdbError::Sync(_) => code::SYNC_FAILED,
+    };
+    CodedError::new(code, e.to_string())
+}
+
+/// Re-tag an error raised by the JS engine itself while a result object is
+/// being built (`Object::set`, `create_array`), so nothing leaves the addon
+/// without a code.
+fn internal(e: napi::Error) -> CodedError {
+    CodedError::new(code::INTERNAL, e.reason.as_str())
 }
 
 /// The `DirLock` in the storage engine deliberately allows a *same-process*
@@ -54,13 +122,16 @@ fn canonical_key(dir: &str) -> PathBuf {
 }
 
 /// Reserve `key` in the process registry, or fail if it is already open here.
-fn register_open(key: &Path) -> napi::Result<()> {
+fn register_open(key: &Path) -> napi::Result<(), Code> {
     let mut set = open_registry().lock().unwrap_or_else(|e| e.into_inner());
     if !set.insert(key.to_path_buf()) {
-        return Err(napi::Error::from_reason(format!(
-            "data directory {} is already open in this process; close that handle first",
-            key.display()
-        )));
+        return Err(CodedError::new(
+            code::ALREADY_OPEN,
+            format!(
+                "data directory {} is already open in this process; close that handle first",
+                key.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -271,14 +342,14 @@ fn native_result_to_js<'env>(env: &'env Env, result: QueryResult) -> napi::Resul
 /// `string` (`str`), `boolean` (`bool`), and `null`/`undefined` (PowQL
 /// `null`). Any other type (object, `Buffer`, symbol, function) is rejected
 /// with a clear error rather than silently coerced.
-fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value> {
-    let value_type = param.get_type()?;
+fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value, Code> {
+    let value_type = param.get_type().map_err(internal)?;
     match value_type {
         ValueType::Null | ValueType::Undefined => Ok(Value::Empty),
-        ValueType::Boolean => Ok(Value::Bool(unsafe { param.cast::<bool>()? })),
-        ValueType::String => Ok(Value::Str(unsafe { param.cast::<String>()? })),
+        ValueType::Boolean => Ok(Value::Bool(unsafe { param.cast::<bool>() }.map_err(internal)?)),
+        ValueType::String => Ok(Value::Str(unsafe { param.cast::<String>() }.map_err(internal)?)),
         ValueType::Number => {
-            let n = unsafe { param.cast::<f64>()? };
+            let n = unsafe { param.cast::<f64>() }.map_err(internal)?;
             // Integral, finite, and inside i64 range binds as an int; anything
             // else (fractional or out of range) binds as a float, matching the
             // networked client's number-to-param rule.
@@ -296,25 +367,31 @@ fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value> {
             }
         }
         ValueType::BigInt => {
-            let big = unsafe { param.cast::<BigInt>()? };
+            let big = unsafe { param.cast::<BigInt>() }.map_err(internal)?;
             let (signed_value, lossless) = big.get_i64();
             if lossless {
                 Ok(Value::Int(signed_value))
             } else {
-                Err(napi::Error::from_reason(format!(
-                    "parameter {} is a BigInt outside the signed 64-bit range PowDB can bind",
-                    index + 1
-                )))
+                Err(CodedError::new(
+                    code::INVALID_ARGUMENT,
+                    format!(
+                        "parameter {} is a BigInt outside the signed 64-bit range PowDB can bind",
+                        index + 1
+                    ),
+                ))
             }
         }
-        other => Err(napi::Error::from_reason(format!(
-            "parameter {} has unsupported type {other}; supported parameter types are number, bigint, string, boolean, and null",
-            index + 1
-        ))),
+        other => Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            format!(
+                "parameter {} has unsupported type {other}; supported parameter types are number, bigint, string, boolean, and null",
+                index + 1
+            ),
+        )),
     }
 }
 
-fn js_params_to_values(params: &[Unknown]) -> napi::Result<Vec<Value>> {
+fn js_params_to_values(params: &[Unknown]) -> napi::Result<Vec<Value>, Code> {
     params
         .iter()
         .enumerate()
@@ -322,50 +399,55 @@ fn js_params_to_values(params: &[Unknown]) -> napi::Result<Vec<Value>> {
         .collect()
 }
 
-fn bigint_to_u64(value: &BigInt, label: &str) -> napi::Result<u64> {
+fn bigint_to_u64(value: &BigInt, label: &str) -> napi::Result<u64, Code> {
     let (signed, raw, lossless) = value.get_u64();
     if signed || !lossless {
-        return Err(napi::Error::from_reason(format!(
-            "{label} must be a non-negative u64 BigInt"
-        )));
+        return Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            format!("{label} must be a non-negative u64 BigInt"),
+        ));
     }
     Ok(raw)
 }
 
-fn u32_to_u16(value: u32, label: &str) -> napi::Result<u16> {
-    u16::try_from(value).map_err(|_| napi::Error::from_reason(format!("{label} must fit in u16")))
+fn u32_to_u16(value: u32, label: &str) -> napi::Result<u16, Code> {
+    u16::try_from(value)
+        .map_err(|_| CodedError::new(code::INVALID_ARGUMENT, format!("{label} must fit in u16")))
 }
 
-fn u32_to_u8(value: u32, label: &str) -> napi::Result<u8> {
-    u8::try_from(value).map_err(|_| napi::Error::from_reason(format!("{label} must fit in u8")))
+fn u32_to_u8(value: u32, label: &str) -> napi::Result<u8, Code> {
+    u8::try_from(value)
+        .map_err(|_| CodedError::new(code::INVALID_ARGUMENT, format!("{label} must fit in u8")))
 }
 
-fn decode_hex_16(hex: &str) -> napi::Result<[u8; 16]> {
-    if hex.len() != 32 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(napi::Error::from_reason(
+fn decode_hex_16(hex: &str) -> napi::Result<[u8; 16], Code> {
+    fn bad_hex() -> CodedError {
+        CodedError::new(
+            code::INVALID_ARGUMENT,
             "databaseId must be exactly 32 hex characters",
-        ));
+        )
+    }
+    if hex.len() != 32 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(bad_hex());
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
         let start = i * 2;
-        *byte = u8::from_str_radix(&hex[start..start + 2], 16).map_err(|_| {
-            napi::Error::from_reason("databaseId must be exactly 32 hex characters")
-        })?;
+        *byte = u8::from_str_radix(&hex[start..start + 2], 16).map_err(|_| bad_hex())?;
     }
     Ok(out)
 }
 
-fn decode_database_id(database_id: Either<String, Uint8Array>) -> napi::Result<[u8; 16]> {
+fn decode_database_id(database_id: Either<String, Uint8Array>) -> napi::Result<[u8; 16], Code> {
     match database_id {
         Either::A(hex) => decode_hex_16(&hex),
         Either::B(bytes) => {
             let bytes = bytes.as_ref();
             if bytes.len() != 16 {
-                return Err(napi::Error::from_reason(format!(
-                    "databaseId must be exactly 16 bytes, got {}",
-                    bytes.len()
-                )));
+                return Err(CodedError::new(
+                    code::INVALID_ARGUMENT,
+                    format!("databaseId must be exactly 16 bytes, got {}", bytes.len()),
+                ));
             }
             let mut out = [0u8; 16];
             out.copy_from_slice(bytes);
@@ -381,7 +463,9 @@ fn retained_data_to_vec(data: Either<Uint8Array, Buffer>) -> Vec<u8> {
     }
 }
 
-fn to_apply_request(request: ApplyRetainedUnitsRequestJs) -> napi::Result<RetainedApplyRequest> {
+fn to_apply_request(
+    request: ApplyRetainedUnitsRequestJs,
+) -> napi::Result<RetainedApplyRequest, Code> {
     let units = request
         .units
         .into_iter()
@@ -393,7 +477,7 @@ fn to_apply_request(request: ApplyRetainedUnitsRequestJs) -> napi::Result<Retain
                 data: retained_data_to_vec(unit.data),
             })
         })
-        .collect::<napi::Result<Vec<_>>>()?;
+        .collect::<napi::Result<Vec<_>, Code>>()?;
     Ok(RetainedApplyRequest {
         since_lsn: bigint_to_u64(&request.since_lsn, "sinceLsn")?,
         identity: SyncApplyIdentity {
@@ -410,9 +494,14 @@ fn to_apply_request(request: ApplyRetainedUnitsRequestJs) -> napi::Result<Retain
     })
 }
 
-fn apply_result_to_js(result: RetainedApplyResult) -> napi::Result<ApplyRetainedUnitsResultJs> {
+fn apply_result_to_js(
+    result: RetainedApplyResult,
+) -> napi::Result<ApplyRetainedUnitsResultJs, Code> {
     let units_applied = u32::try_from(result.units_applied).map_err(|_| {
-        napi::Error::from_reason("unitsApplied does not fit in a JavaScript number")
+        CodedError::new(
+            code::INTERNAL,
+            "unitsApplied does not fit in a JavaScript number",
+        )
     })?;
     Ok(ApplyRetainedUnitsResultJs {
         through_lsn: BigInt::from(result.through_lsn),
@@ -429,14 +518,16 @@ pub struct Database {
     key: PathBuf,
 }
 
-const CLOSED: &str = "database is closed";
+/// Message on every `code::CLOSED` error. Callers branch on the code, not
+/// on this text.
+const CLOSED_MESSAGE: &str = "database is closed";
 
 #[napi]
 impl Database {
     /// Open (or create) a database at `dir`. No server is started. Throws if
     /// the same directory is already open elsewhere in this process.
     #[napi(factory)]
-    pub fn open(dir: String) -> napi::Result<Database> {
+    pub fn open(dir: String) -> napi::Result<Database, Code> {
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open(&dir) {
@@ -455,9 +546,13 @@ impl Database {
     /// budget in bytes (caps sort/join/GROUP BY materialization). Throws if the
     /// same directory is already open elsewhere in this process.
     #[napi(factory)]
-    pub fn open_with_memory_limit(dir: String, limit_bytes: i64) -> napi::Result<Database> {
-        let limit = usize::try_from(limit_bytes)
-            .map_err(|_| napi::Error::from_reason("limit_bytes must be a non-negative integer"))?;
+    pub fn open_with_memory_limit(dir: String, limit_bytes: i64) -> napi::Result<Database, Code> {
+        let limit = usize::try_from(limit_bytes).map_err(|_| {
+            CodedError::new(
+                code::INVALID_ARGUMENT,
+                "limit_bytes must be a non-negative integer",
+            )
+        })?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_with_memory_limit(&dir, limit) {
@@ -480,7 +575,7 @@ impl Database {
     /// non-empty WAL is refused: recover the directory with a read-write open
     /// first. Throws if the same directory is already open in this process.
     #[napi(factory)]
-    pub fn open_read_only(dir: String) -> napi::Result<Database> {
+    pub fn open_read_only(dir: String) -> napi::Result<Database, Code> {
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_read_only(&dir) {
@@ -501,9 +596,13 @@ impl Database {
     pub fn open_read_only_with_memory_limit(
         dir: String,
         limit_bytes: i64,
-    ) -> napi::Result<Database> {
-        let limit = usize::try_from(limit_bytes)
-            .map_err(|_| napi::Error::from_reason("limit_bytes must be a non-negative integer"))?;
+    ) -> napi::Result<Database, Code> {
+        let limit = usize::try_from(limit_bytes).map_err(|_| {
+            CodedError::new(
+                code::INVALID_ARGUMENT,
+                "limit_bytes must be a non-negative integer",
+            )
+        })?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_read_only_with_memory_limit(&dir, limit) {
@@ -518,16 +617,16 @@ impl Database {
         }
     }
 
-    fn inner_mut(&mut self) -> napi::Result<&mut Inner> {
+    fn inner_mut(&mut self) -> napi::Result<&mut Inner, Code> {
         self.inner
             .as_mut()
-            .ok_or_else(|| napi::Error::from_reason(CLOSED))
+            .ok_or_else(|| CodedError::new(code::CLOSED, CLOSED_MESSAGE))
     }
 
-    fn inner_ref(&self) -> napi::Result<&Inner> {
+    fn inner_ref(&self) -> napi::Result<&Inner, Code> {
         self.inner
             .as_ref()
-            .ok_or_else(|| napi::Error::from_reason(CLOSED))
+            .ok_or_else(|| CodedError::new(code::CLOSED, CLOSED_MESSAGE))
     }
 
     /// Set the WAL durability mode: `"full"` (default — one fsync per commit,
@@ -535,7 +634,7 @@ impl Database {
     /// bounded crash-loss window), or `"off"` (no durability — tests/bench
     /// only). `"normal"` is what closes the embedded write gap vs SQLite.
     #[napi]
-    pub fn set_sync_mode(&mut self, mode: String) -> napi::Result<()> {
+    pub fn set_sync_mode(&mut self, mode: String) -> napi::Result<(), Code> {
         self.inner_mut()?
             .set_sync_mode_str(&mode)
             .map_err(to_napi_err)
@@ -543,7 +642,7 @@ impl Database {
 
     /// Run a PowQL statement.
     #[napi(ts_return_type = "QueryResultJs")]
-    pub fn query(&mut self, powql: String) -> napi::Result<QueryResultShape> {
+    pub fn query(&mut self, powql: String) -> napi::Result<QueryResultShape, Code> {
         self.inner_mut()?
             .query(&powql)
             .map(to_js)
@@ -552,7 +651,7 @@ impl Database {
 
     /// Run a SQL statement (lowered to PowQL by the SQL frontend).
     #[napi(ts_return_type = "QueryResultJs")]
-    pub fn query_sql(&mut self, sql: String) -> napi::Result<QueryResultShape> {
+    pub fn query_sql(&mut self, sql: String) -> napi::Result<QueryResultShape, Code> {
         self.inner_mut()?
             .query_sql(&sql)
             .map(to_js)
@@ -561,7 +660,7 @@ impl Database {
 
     /// Run a read-only PowQL statement. Errors if it would mutate.
     #[napi(ts_return_type = "QueryResultJs")]
-    pub fn query_readonly(&self, powql: String) -> napi::Result<QueryResultShape> {
+    pub fn query_readonly(&self, powql: String) -> napi::Result<QueryResultShape, Code> {
         self.inner_ref()?
             .query_readonly(&powql)
             .map(to_js)
@@ -579,9 +678,9 @@ impl Database {
         &mut self,
         env: &'env Env,
         powql: String,
-    ) -> napi::Result<Object<'env>> {
+    ) -> napi::Result<Object<'env>, Code> {
         let result = self.inner_mut()?.query(&powql).map_err(to_napi_err)?;
-        native_result_to_js(env, result)
+        native_result_to_js(env, result).map_err(internal)
     }
 
     /// Typed (`WireValue`) variant of [`Database::query_sql`].
@@ -590,9 +689,9 @@ impl Database {
         &mut self,
         env: &'env Env,
         sql: String,
-    ) -> napi::Result<Object<'env>> {
+    ) -> napi::Result<Object<'env>, Code> {
         let result = self.inner_mut()?.query_sql(&sql).map_err(to_napi_err)?;
-        native_result_to_js(env, result)
+        native_result_to_js(env, result).map_err(internal)
     }
 
     /// Typed (`WireValue`) variant of [`Database::query_readonly`]. Errors if
@@ -602,12 +701,12 @@ impl Database {
         &self,
         env: &'env Env,
         powql: String,
-    ) -> napi::Result<Object<'env>> {
+    ) -> napi::Result<Object<'env>, Code> {
         let result = self
             .inner_ref()?
             .query_readonly(&powql)
             .map_err(to_napi_err)?;
-        native_result_to_js(env, result)
+        native_result_to_js(env, result).map_err(internal)
     }
 
     /// Run a PowQL statement with positional `$1..$N` parameters bound from
@@ -624,13 +723,13 @@ impl Database {
         env: &'env Env,
         powql: String,
         params: Vec<Unknown>,
-    ) -> napi::Result<Object<'env>> {
+    ) -> napi::Result<Object<'env>, Code> {
         let bound = js_params_to_values(&params)?;
         let result = self
             .inner_mut()?
             .query_with_params(&powql, &bound)
             .map_err(to_napi_err)?;
-        native_result_to_js(env, result)
+        native_result_to_js(env, result).map_err(internal)
     }
 
     /// Apply one already-pulled retained-unit chunk to this embedded replica.
@@ -638,7 +737,7 @@ impl Database {
     pub fn apply_retained_units(
         &mut self,
         request: ApplyRetainedUnitsRequestJs,
-    ) -> napi::Result<ApplyRetainedUnitsResultJs> {
+    ) -> napi::Result<ApplyRetainedUnitsResultJs, Code> {
         let request = to_apply_request(request)?;
         self.inner_mut()?
             .apply_retained_units(request)
@@ -658,14 +757,14 @@ impl Database {
     /// one — can open it. Every later call throws `database is closed`. Calling
     /// `close()` on an already-closed handle throws the same error.
     #[napi]
-    pub fn close(&mut self) -> napi::Result<()> {
+    pub fn close(&mut self) -> napi::Result<(), Code> {
         match self.inner.take() {
             Some(inner) => {
                 inner.close();
                 unregister_open(&self.key);
                 Ok(())
             }
-            None => Err(napi::Error::from_reason(CLOSED)),
+            None => Err(CodedError::new(code::CLOSED, CLOSED_MESSAGE)),
         }
     }
 }
