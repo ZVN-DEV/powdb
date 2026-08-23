@@ -17,12 +17,12 @@ When cutting a release, follow the checklist at the bottom.
 | **crates.io** | `powdb-query` | https://crates.io/crates/powdb-query |
 | **crates.io** | `powdb-backup` | https://crates.io/crates/powdb-backup |
 | **crates.io** | `powdb-server` | https://crates.io/crates/powdb-server |
-| **crates.io** | `powdb` (embedded facade — in-process Rust API) | https://crates.io/crates/powdb |
+| **crates.io** | `powdb` (embedded facade: in-process Rust API) | https://crates.io/crates/powdb |
 | **crates.io** | `powdb-cli` | https://crates.io/crates/powdb-cli |
 | **crates.io** | `powdb-sync` (experimental, the embedded-sync substrate) | https://crates.io/crates/powdb-sync |
 | **npm** | `@zvndev/powdb-client` | https://www.npmjs.com/package/@zvndev/powdb-client |
-| **npm** | `@zvndev/powdb-sync` (experimental sync orchestration; **awaiting its one-time bootstrap publish**, after which `release.yml` publishes it on every tag) | https://www.npmjs.com/package/@zvndev/powdb-sync |
-| **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu — no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
+| **npm** | `@zvndev/powdb-sync` (experimental sync orchestration; bootstrapped at 0.24.0, and published on every `v*` tag by `release.yml` since) | https://www.npmjs.com/package/@zvndev/powdb-sync |
+| **npm** | `@zvndev/powdb-embedded` (in-process Node addon; prebuilt binaries for macOS arm64, Linux x64-gnu, Linux arm64-gnu; no source fallback, other targets are unsupported) | https://www.npmjs.com/package/@zvndev/powdb-embedded |
 | **ghcr.io** | `ghcr.io/zvn-dev/powdb` (Docker image, `latest` + `vX.Y.Z` tags) | https://github.com/orgs/ZVN-DEV/packages |
 
 ## GitHub Releases
@@ -57,29 +57,33 @@ Inter-crate dependencies require publishing in this order:
 1. `powdb-storage` (no inter-crate deps)
 2. `powdb-auth` (no inter-crate deps)
 3. `powdb-query` (depends on storage)
-4. `powdb-sync` (experimental — depends on storage)
+4. `powdb-sync` (experimental; depends on storage)
 5. `powdb-backup` (depends on storage + sync; query is dev-only)
 6. `powdb-server` (depends on storage + query + auth + sync)
-7. `powdb` (embedded facade — depends on storage + query + sync)
+7. `powdb` (embedded facade; depends on storage + query + sync)
 8. `powdb-cli` (depends on storage + query + server + backup + auth + sync)
 
-Non-publishable crates (`publish = false`): `powdb-compare`, `powdb-bench`, `powdb-query-fuzz`.
+Non-publishable workspace crates (`publish = false`): `powdb-bench`, `powdb-compare`, `powdb-oracle`.
+Those three plus the eight above are the whole workspace: `cargo metadata --no-deps` lists
+eleven packages. The fuzz crate `powdb-query-fuzz` is **not** among them; it lives under
+`crates/query/fuzz` with its own `[workspace]` table, so `crates/*` never picks it up and it is
+built only by `cargo fuzz`.
 
 ## Publishing is token-less (Trusted Publishing / OIDC)
 
-Both registries publish from CI with **no stored token** — neither
+Both registries publish from CI with **no stored token**: neither
 `CARGO_REGISTRY_TOKEN` nor an npm token exists anymore. The workflows mint
 short-lived credentials from their GitHub OIDC identity. This is configured once
 per package/crate on the registry websites; see
 [`docs/ci/trusted-publishing.md`](docs/ci/trusted-publishing.md) for the
 one-time setup and the reusable standard.
 
-- **crates.io** — `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
+- **crates.io**: `publish.yml` (manual `workflow_dispatch`, `dry_run=false`),
   authenticated via `rust-lang/crates-io-auth-action`. Kept manual because
   publishing to crates.io is irreversible.
-- **npm (`@zvndev/powdb-client`)** — published automatically by `release.yml`
+- **npm (`@zvndev/powdb-client`)**: published automatically by `release.yml`
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
-- **npm (`@zvndev/powdb-embedded`)** — published by `publish-node-addon.yml`
+- **npm (`@zvndev/powdb-embedded`)**: published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
   runner matrix (macOS arm64, Linux x64/arm64; Intel macOS builds from source and
   Windows is deferred, both since the macos-13 runner retired in #149), then

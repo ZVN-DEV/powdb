@@ -1,4 +1,4 @@
-# PowDB vs SQLite — When to use which
+# PowDB vs SQLite: When to use which
 
 SQLite is the default embedded database for very good reasons: 25+ years of
 battle-testing, billions of deployments, and a SQL surface every tool on the
@@ -45,7 +45,7 @@ between the two.
 ## When to choose SQLite
 
 - **SQL tool / driver compatibility matters.** PowDB accepts a supported
-  subset of SQL through a frontend (since v0.5.0 — see [SQL.md](SQL.md)), but
+  subset of SQL through a frontend (since v0.5.0, see [SQL.md](SQL.md)), but
   it speaks its own binary wire protocol, not the Postgres/MySQL wire or a
   JDBC/ODBC surface. Every ORM, DB browser, analytics tool, notebook, and BI
   dashboard talks to SQLite out of the box; none of them can point at PowDB.
@@ -188,7 +188,7 @@ Results land in `crates/compare/results.csv`.
 
 - **PowDB is pre-1.0.** New on-disk format versions appear across minor
   versions, though every release still reads everything earlier releases
-  wrote. Pin a version (`cargo install powdb-cli --version 0.23.0 --locked`)
+  wrote. Pin a version (`cargo install powdb-cli --version 0.25.0 --locked`)
   and expect to re-bench on upgrades until 1.0. What a minor version may and
   may not break is spelled out in [STABILITY.md](STABILITY.md); the
   version/magic mechanics are in [FORMAT.md](FORMAT.md).

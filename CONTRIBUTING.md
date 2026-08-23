@@ -34,7 +34,7 @@ For an edit-compile loop, `cargo install bacon && bacon` (or `cargo watch -x "ch
 cargo build --workspace           # debug build
 cargo build --release --workspace # release build
 cargo test --workspace            # run all tests
-cargo bench -p powdb-bench        # criterion benchmarks (~60s)
+cargo bench -p powdb-bench        # criterion benchmarks (23 benches, ~5 min of measurement)
 cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --features mysql for MySQL)
 ```
 
@@ -47,11 +47,14 @@ crates/auth      # user store, roles, argon2id password hashing
 crates/backup    # offline backup/restore (full, incremental, PITR)
 crates/sync      # embedded-sync substrate (retained replication-unit log; experimental)
 crates/server    # Tokio TCP server + binary wire protocol
-crates/powdb     # embedded facade — in-process Rust API over the engine
+crates/powdb     # embedded facade: in-process Rust API over the engine
 crates/cli       # rustyline REPL (embedded + remote mode)
-crates/bench     # criterion benchmarks + regression gate
-crates/compare   # wide benchmark comparisons vs other databases
-bindings/node    # @zvndev/powdb-embedded — in-process Node addon (napi-rs)
+crates/bench     # criterion benchmarks + regression gate (publish = false)
+crates/compare   # wide benchmark comparisons vs other databases (publish = false)
+crates/oracle    # differential correctness oracle: same fixture and query through
+                 # PowQL, the SQL frontend, and SQLite, full result sets compared
+                 # (publish = false)
+bindings/node    # @zvndev/powdb-embedded: in-process Node addon (napi-rs)
 clients/ts       # TypeScript client + demo
 clients/sync     # sync client helpers (experimental)
 ```
@@ -74,7 +77,7 @@ appears in a public file.
 
 ## Development Workflow
 
-**Never push directly to `main`.** Every change — docs, CI tweaks, version bumps, "trivial" fixes, all of it — goes through a pull request.
+**Never push directly to `main`.** Every change (docs, CI tweaks, version bumps, "trivial" fixes, all of it) goes through a pull request.
 
 1. Create a branch from `main` (kebab-case)
 2. Make changes, then run `scripts/quality fast` for the local fast gate
@@ -88,11 +91,11 @@ appears in a public file.
 - Required status checks must pass, all from `ci.yml`: clippy + fmt + test (x2 OS matrix), miri, asan, audit, MSRV consistency, examples-smoke, version consistency, TypeScript client, and gitleaks secret scan
 - Force-push is rejected by branch protection
 
-Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work** — routine work goes through PRs even when bypass is technically available.
+Admin bypass exists for break-glass scenarios (security patches, recovering from a broken state). **Do not use it for routine work**: routine work goes through PRs even when bypass is technically available.
 
 ### If you push to main by accident
 
-1. Revert the commit on `main` with a forward `git revert` (not force-push — force-push to `main` is blocked anyway).
+1. Revert the commit on `main` with a forward `git revert`, not a force-push (force-push to `main` is blocked anyway).
 2. Push the revert directly. The revert restores the invariant; that's why bypass exists.
 3. Re-introduce the work on a branch and open a PR.
 
@@ -105,17 +108,17 @@ Admin bypass exists for break-glass scenarios (security patches, recovering from
 ## CI Checks
 
 PRs must pass these gates (see `.github/workflows/`):
-- **clippy + fmt + test** — lints, formatting, and all workspace tests, run on a two-OS matrix (`ubuntu-24.04`, `macos-latest`)
-- **miri** — undefined-behavior check on the non-mmap modules
-- **asan** — AddressSanitizer run
-- **audit** — `cargo audit` against the advisory database
-- **msrv-consistency** — verifies the declared MSRV (`1.93`) builds
-- **examples-smoke** — terraform validate + compose config + dev.sh cycle on the deploy examples
-- **version consistency** — `scripts/check-version-consistency.sh` prevents Rust/TypeScript/changelog/release-doc drift
-- **TypeScript client build + tests** — installs with `pnpm --frozen-lockfile`, builds, and runs pure plus server-backed client tests
-- **gitleaks secret scan** — low-noise supply-chain/secret scan with documented placeholder allowlist
+- **clippy + fmt + test**: lints, formatting, and all workspace tests, run on a two-OS matrix (`ubuntu-24.04`, `macos-latest`)
+- **miri**: undefined-behavior check on the non-mmap modules
+- **asan**: AddressSanitizer run
+- **audit**: `cargo audit` against the advisory database
+- **msrv-consistency**: verifies the declared MSRV (`1.93`) builds
+- **examples-smoke**: terraform validate + compose config + dev.sh cycle on the deploy examples
+- **version consistency**: `scripts/check-version-consistency.sh` prevents Rust/TypeScript/changelog/release-doc drift
+- **TypeScript client build + tests**: installs with `pnpm --frozen-lockfile`, builds, and runs pure plus server-backed client tests
+- **gitleaks secret scan**: low-noise supply-chain/secret scan with documented placeholder allowlist
 
-The criterion benchmark suite (`.github/workflows/bench.yml`) is **manual-only** (`workflow_dispatch`) and is *not* a required PR gate — shared-runner noise makes it unreliable as a blocking check. Run the regression gate locally instead (below).
+The criterion benchmark suite (`.github/workflows/bench.yml`) is **manual-only** (`workflow_dispatch`) and is *not* a required PR gate, because shared-runner noise makes it unreliable as a blocking check. Run the regression gate locally instead (below).
 
 ## Benchmark Regression Gate
 
@@ -133,7 +136,7 @@ git commit -m "bench: rebaseline after <change> (<workload>: <delta>)"
 - Standard `rustfmt` formatting (enforced by CI)
 - All clippy warnings are errors in CI
 - Prefer `?` for error propagation over manual matching
-- No `unwrap()` in new code — use proper error handling
+- No `unwrap()` in new code: use proper error handling
 
 ## Architecture Notes
 
