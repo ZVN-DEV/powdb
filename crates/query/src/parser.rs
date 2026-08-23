@@ -171,17 +171,86 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-fn keyword_suggestion(word: &str) -> Option<&'static str> {
-    const STATEMENT_KEYWORDS: &[&str] = &[
-        "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
-        "select", "type", "update", "upsert",
-    ];
+/// Keywords that can open a statement.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "alter", "begin", "commit", "delete", "drop", "explain", "insert", "refresh", "rollback",
+    "select", "type", "update", "upsert",
+];
+
+/// Keywords that can appear at a pipeline-stage boundary, plus the operators
+/// that join a filter expression. PowQL is a left-to-right pipeline language,
+/// so these are the words people actually mistype. Two-letter keywords (`in`,
+/// `is`, `on`, `or`) are deliberately left out: at that length almost any short
+/// identifier lands within the edit-distance bound.
+const PIPELINE_KEYWORDS: &[&str] = &[
+    "and",
+    "asc",
+    "between",
+    "conflict",
+    "cross",
+    "desc",
+    "distinct",
+    "exists",
+    "filter",
+    "group",
+    "having",
+    "inner",
+    "join",
+    "left",
+    "like",
+    "limit",
+    "match",
+    "not",
+    "offset",
+    "order",
+    "outer",
+    "returning",
+    "right",
+    "union",
+];
+
+/// Largest edit distance we will call a typo.
+///
+/// Short words need a tighter bound. At four characters a distance of two
+/// rewrites half the word, which is how `user` (the table name in nearly every
+/// README and docs example) used to come back as `upsert`.
+fn suggestion_threshold(word: &str) -> usize {
+    if word.len() <= 4 {
+        1
+    } else {
+        2
+    }
+}
+
+fn closest_keyword<'a>(
+    word: &str,
+    candidates: impl Iterator<Item = &'a &'static str>,
+) -> Option<&'static str> {
     let lower = word.to_ascii_lowercase();
-    STATEMENT_KEYWORDS
-        .iter()
+    let max_distance = suggestion_threshold(&lower);
+    let initial = lower.as_bytes().first().copied();
+    candidates
         .copied()
-        .filter(|kw| edit_distance(&lower, kw) <= 2)
-        .min_by_key(|kw| edit_distance(&lower, kw))
+        .filter(|kw| edit_distance(&lower, kw) <= max_distance)
+        // Ties break toward the keyword starting with the same letter, so
+        // `dsc` reads as `desc` rather than `asc`.
+        .min_by_key(|kw| {
+            (
+                edit_distance(&lower, kw),
+                u8::from(kw.as_bytes().first().copied() != initial),
+            )
+        })
+}
+
+/// Best keyword match for an identifier that appeared where the parser
+/// expected syntax, drawn from every keyword that can legally appear there.
+fn keyword_suggestion(word: &str) -> Option<&'static str> {
+    closest_keyword(word, PIPELINE_KEYWORDS.iter().chain(STATEMENT_KEYWORDS))
+}
+
+/// Best statement-keyword match, used only for the first token of a statement.
+fn statement_keyword_suggestion(word: &str) -> Option<&'static str> {
+    closest_keyword(word, STATEMENT_KEYWORDS.iter())
 }
 
 /// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
@@ -205,10 +274,22 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
             parser.pos,
             parser.peek().display_name()
         );
-        if let Some(Token::Ident(first)) = parser.tokens.first() {
-            if let Some(suggestion) = keyword_suggestion(first) {
-                message.push_str(&format!("; did you mean `{suggestion}`?"));
-            }
+        // Suggest for the token that actually failed. Reading the suggestion
+        // off `tokens.first()` instead made every query starting with the
+        // table name `User` answer "did you mean `upsert`?", whatever the
+        // real mistake was. The first token is worth a second look only when
+        // it is itself a mistyped statement keyword (`updat User set age = 1`),
+        // and then only against the statement keywords.
+        let suggestion = match parser.peek() {
+            Token::Ident(word) => keyword_suggestion(word),
+            _ => None,
+        }
+        .or_else(|| match parser.tokens.first() {
+            Some(Token::Ident(first)) => statement_keyword_suggestion(first),
+            _ => None,
+        });
+        if let Some(suggestion) = suggestion {
+            message.push_str(&format!("; did you mean `{suggestion}`?"));
         }
         return Err(ParseError::Syntax { message });
     }
