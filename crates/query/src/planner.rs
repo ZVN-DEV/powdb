@@ -948,6 +948,7 @@ fn plan_joined_query(mut q: QueryExpr) -> Result<PlanNode, PlanError> {
                 message: format!(
                     "duplicate source alias `{right_alias}` in join; every joined source needs a unique alias"
                 ),
+                position: None,
             }
             .into());
         }

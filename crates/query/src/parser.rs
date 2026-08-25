@@ -28,18 +28,39 @@ pub enum ParseError {
     /// Lexer failed to tokenize the input.
     #[error("at position {position}: {message}")]
     Lex { message: String, position: usize },
-    /// Expected one token but found another.
-    #[error("expected {expected}, got {got}")]
-    UnexpectedToken { expected: String, got: String },
+    /// Expected one token but found another. `position` is the char offset
+    /// of the offending token (the lexer's `at position` coordinate system);
+    /// the parse boundary fills it in, so constructors pass `None`.
+    #[error("{}", positioned(*position, &format!("expected {expected}, got {got}")))]
+    UnexpectedToken {
+        expected: String,
+        got: String,
+        position: Option<usize>,
+    },
     /// Recursive nesting exceeded the safety limit.
     #[error("query nesting depth exceeds maximum of {max}")]
     NestingDepthExceeded { max: usize },
     /// Syntactically valid construct that the engine doesn't support yet.
     #[error("{feature}")]
     Unsupported { feature: String },
-    /// Catch-all for other syntax errors.
-    #[error("{message}")]
-    Syntax { message: String },
+    /// Catch-all for other syntax errors. `position` as in
+    /// [`ParseError::UnexpectedToken`].
+    #[error("{}", positioned(*position, message))]
+    Syntax {
+        message: String,
+        position: Option<usize>,
+    },
+}
+
+/// Render `body` with the lexer-style `at position N: ` prefix when the
+/// failing offset is known. One helper so the two positioned variants can
+/// never drift apart, and so the prefix stays byte-identical to `LexError`'s
+/// (it is an allowlisted wire prefix).
+fn positioned(position: Option<usize>, body: &str) -> String {
+    match position {
+        Some(p) => format!("at position {p}: {body}"),
+        None => body.to_string(),
+    }
 }
 
 impl ParseError {
@@ -101,11 +122,11 @@ struct Parser {
 /// assert!(matches!(stmt, Statement::CreateType(_)));
 /// ```
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
-    let tokens = lex(input).map_err(|e| ParseError::Lex {
+    let (tokens, spans) = crate::lexer::lex_with_spans(input).map_err(|e| ParseError::Lex {
         message: e.message,
         position: e.position,
     })?;
-    parse_tokens(tokens)
+    parse_tokens_with_spans(tokens, Some(spans))
 }
 
 /// Parse PowQL with `$N` placeholders bound to positional `params`.
@@ -123,7 +144,8 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
 /// a non-numeric `$name` (the named-parameter form belongs to the in-process
 /// prepared API, not the positional wire-binding path).
 pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement, ParseError> {
-    let mut tokens = lex(input).map_err(|e| ParseError::Lex {
+    // Placeholder substitution is 1:1 in place, so the spans stay aligned.
+    let (mut tokens, spans) = crate::lexer::lex_with_spans(input).map_err(|e| ParseError::Lex {
         message: e.message,
         position: e.position,
     })?;
@@ -133,10 +155,12 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                 message: format!(
                     "positional parameters must be numeric (`$1`, `$2`, …); got `${name}`"
                 ),
+                position: None,
             })?;
             if n == 0 {
                 return Err(ParseError::Syntax {
                     message: "parameter placeholders are 1-based; `$0` is invalid".into(),
+                    position: None,
                 });
             }
             let p = params.get(n - 1).ok_or_else(|| ParseError::Syntax {
@@ -144,6 +168,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                     "query references ${n} but only {} parameter(s) were supplied",
                     params.len()
                 ),
+                position: None,
             })?;
             *tok = match p {
                 ParamValue::Null => Token::Null,
@@ -154,7 +179,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
             };
         }
     }
-    parse_tokens(tokens)
+    parse_tokens_with_spans(tokens, Some(spans))
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -284,13 +309,26 @@ fn statement_keyword_suggestion(word: &str) -> Option<&'static str> {
 /// Shared tail of [`parse`] / [`parse_with_params`]: run the recursive
 /// descent over an already-lexed (and possibly param-substituted) token
 /// stream and reject any trailing tokens.
-fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
+/// Run the recursive descent with the char offsets `lex_with_spans`
+/// recorded. On any
+/// [`ParseError::UnexpectedToken`] / [`ParseError::Syntax`] that a
+/// production raised without a position, the offset of the token the parser
+/// stopped on is attached here — one boundary, so no production has to
+/// thread spans and none can forget to. `None` (a synthesized token stream
+/// with no source text) leaves errors position-free, exactly as before.
+fn parse_tokens_with_spans(
+    tokens: Vec<Token>,
+    spans: Option<Vec<usize>>,
+) -> Result<Statement, ParseError> {
     let mut parser = Parser {
         tokens,
         pos: 0,
         depth: 0,
     };
-    let stmt = parser.parse_statement()?;
+    let stmt = match parser.parse_statement() {
+        Ok(stmt) => stmt,
+        Err(e) => return Err(attach_failing_position(e, &parser, spans.as_deref())),
+    };
     // Reject trailing tokens. Without this, unrecognized tails like
     // `User create_index .email` silently succeed as `User` — which
     // misled the TS client into thinking those non-existent DDL forms
@@ -330,9 +368,50 @@ fn parse_tokens(tokens: Vec<Token>) -> Result<Statement, ParseError> {
         if let Some(suggestion) = suggestion {
             message.push_str(&suggestion);
         }
-        return Err(ParseError::Syntax { message });
+        return Err(attach_failing_position(
+            ParseError::Syntax {
+                message,
+                position: None,
+            },
+            &parser,
+            spans.as_deref(),
+        ));
     }
     Ok(stmt)
+}
+
+/// Attach the char offset of the token the parser stopped on to an error
+/// that carries none. Productions never advance past their failure, so
+/// `parser.pos` IS the failure site; a deliberate position set inside a
+/// production wins.
+fn attach_failing_position(
+    error: ParseError,
+    parser: &Parser,
+    spans: Option<&[usize]>,
+) -> ParseError {
+    let Some(spans) = spans else { return error };
+    let offset = spans
+        .get(parser.pos.min(spans.len().saturating_sub(1)))
+        .copied();
+    match error {
+        ParseError::UnexpectedToken {
+            expected,
+            got,
+            position: None,
+        } => ParseError::UnexpectedToken {
+            expected,
+            got,
+            position: offset,
+        },
+        ParseError::Syntax {
+            message,
+            position: None,
+        } => ParseError::Syntax {
+            message,
+            position: offset,
+        },
+        other => other,
+    }
 }
 
 /// Rewrite `Field(alias)` references inside `expr` to the underlying
@@ -402,6 +481,7 @@ impl Parser {
             Err(ParseError::UnexpectedToken {
                 expected: expected.display_name(),
                 got: t.display_name(),
+                position: None,
             })
         }
     }
@@ -411,6 +491,7 @@ impl Parser {
         ParseError::UnexpectedToken {
             expected: expected.into(),
             got: got.display_name(),
+            position: None,
         }
     }
 
@@ -438,11 +519,13 @@ impl Parser {
                     "syntax error: '{kw}' is a reserved word and cannot be used as a {context}; \
                      rename it or quote it as `{kw}`"
                 ),
+                position: None,
             }
         } else {
             ParseError::UnexpectedToken {
                 expected: context.into(),
                 got: got.display_name(),
+                position: None,
             }
         }
     }
@@ -522,11 +605,13 @@ impl Parser {
                 message: "'update' cannot start a statement — in PowQL, use pipeline syntax: \
                     TableName filter ... update { ... }"
                     .into(),
+                position: None,
             }),
             Token::Delete => Err(ParseError::Syntax {
                 message: "'delete' cannot start a statement — in PowQL, use pipeline syntax: \
                     TableName filter ... delete"
                     .into(),
+                position: None,
             }),
             _ => Err(self.unexpected("statement", self.peek())),
         }?;
@@ -543,6 +628,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -599,6 +685,7 @@ impl Parser {
                     let having_expr = self.parse_expr()?;
                     let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
                         message: "having without group by".into(),
+                        position: None,
                     })?;
                     let rewritten = match projection.as_ref() {
                         Some(fields) => substitute_projection_aliases(having_expr, fields),
@@ -731,6 +818,7 @@ impl Parser {
                     let having_expr = self.parse_expr()?;
                     let group = group_by.as_mut().ok_or_else(|| ParseError::Syntax {
                         message: "having without group by".into(),
+                        position: None,
                     })?;
                     let rewritten = match projection.as_ref() {
                         Some(fields) => substitute_projection_aliases(having_expr, fields),
@@ -827,6 +915,7 @@ impl Parser {
                     return Err(ParseError::UnexpectedToken {
                         expected: "type name after join".into(),
                         got: t.display_name(),
+                        position: None,
                     });
                 }
             };
@@ -839,6 +928,7 @@ impl Parser {
             } else {
                 return Err(ParseError::Syntax {
                     message: format!("expected `on <expr>` after join {source}"),
+                    position: None,
                 });
             };
 
@@ -860,6 +950,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -892,6 +983,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -902,6 +994,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: ".key_column".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -1010,6 +1103,7 @@ impl Parser {
                         message: "a nested projection needs a field name: \
                                   `<name>: <Table> as <alias> filter ... { ... }`"
                             .into(),
+                        position: None,
                     });
                 }
                 self.reject_bare_dotted_path()?;
@@ -1047,6 +1141,7 @@ impl Parser {
                      (`Order as o {{ o.{first}.{second} }}`); for separate fields, \
                      separate them with commas (`.{first}, .{second}`)"
                 ),
+                position: None,
             });
         }
         Ok(())
@@ -1137,6 +1232,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "link name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -1206,6 +1302,7 @@ impl Parser {
         if fields.is_empty() {
             return Err(ParseError::Syntax {
                 message: "link traversal requires at least one field".into(),
+                position: None,
             });
         }
         Ok(NestedQuery {
@@ -1296,6 +1393,7 @@ impl Parser {
                         message: "a nested projection needs a field name: \
                                   `<name>: <Table> as <alias> filter ... { ... }`"
                             .into(),
+                        position: None,
                     });
                 }
                 Expr::NestedQuery(Box::new(self.parse_nested_query()?))
@@ -1312,6 +1410,7 @@ impl Parser {
         if fields.is_empty() {
             return Err(ParseError::Syntax {
                 message: "nested projection requires at least one field".into(),
+                position: None,
             });
         }
         Ok(NestedQuery {
@@ -1392,11 +1491,13 @@ impl Parser {
                 "bytes" | "Bytes" | "BYTES" | "bytea" => Ok(CastType::Bytes),
                 other => Err(ParseError::Syntax {
                     message: format!("invalid cast type: \"{other}\""),
+                    position: None,
                 }),
             },
             t => Err(ParseError::UnexpectedToken {
                 expected: "string literal for cast type".into(),
                 got: t.display_name(),
+                position: None,
             }),
         }
     }
@@ -1437,6 +1538,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "aggregate function".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -1458,6 +1560,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "type name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -1790,6 +1893,7 @@ impl Parser {
         if keys.is_empty() {
             return Err(ParseError::Syntax {
                 message: "expected at least one group key after group".into(),
+                position: None,
             });
         }
         let having = if *self.peek() == Token::Having {
@@ -1884,6 +1988,7 @@ impl Parser {
                     message: "'->' JSON path access requires a field base \
                               (e.g. .data->key or posts.data->author)"
                         .into(),
+                    position: None,
                 })
             }
         }
@@ -1904,6 +2009,7 @@ impl Parser {
                         message: format!(
                             "invalid JSON path array index {v}: expected a non-negative integer that fits in 32 bits"
                         ),
+                        position: None,
                     })?;
                     PathSeg::Index(idx)
                 }
@@ -1913,6 +2019,7 @@ impl Parser {
                             "expected a JSON path segment (object key or array index) after '->', found {}",
                             other.display_name()
                         ),
+                        position: None,
                     })
                 }
             };
@@ -2049,6 +2156,7 @@ impl Parser {
                     _ => {
                         return Err(ParseError::Syntax {
                             message: "unexpected window function token".into(),
+                            position: None,
                         })
                     }
                 };
@@ -2076,6 +2184,7 @@ impl Parser {
                     _ => {
                         return Err(ParseError::Syntax {
                             message: "unexpected aggregate token".into(),
+                            position: None,
                         })
                     }
                 };
@@ -2200,6 +2309,7 @@ impl Parser {
             }
             t => Err(ParseError::Syntax {
                 message: format!("unexpected token in expression: {}", t.display_name()),
+                position: None,
             }),
         }
     }
@@ -2220,6 +2330,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "`.<name>` after the owner type (link <Owner>.<name> -> ...)".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2262,6 +2373,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "table name after alter".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2327,6 +2439,7 @@ impl Parser {
                         return Err(ParseError::UnexpectedToken {
                             expected: "type name".into(),
                             got: t.display_name(),
+                            position: None,
                         })
                     }
                 };
@@ -2364,6 +2477,7 @@ impl Parser {
             t => Err(ParseError::UnexpectedToken {
                 expected: "add or drop after alter <table>".into(),
                 got: t.display_name(),
+                position: None,
             }),
         }
     }
@@ -2380,6 +2494,7 @@ impl Parser {
                         message: format!(
                             "JSON path index targets must be parenthesized after {action}; use `(.data->key)`"
                         ),
+                        position: None,
                     });
                 }
                 let Token::DotIdent(column) = self.advance() else {
@@ -2395,6 +2510,7 @@ impl Parser {
                         message: format!(
                             "invalid expression index target after {action}: expected an unqualified JSON path like `(.data->key)`"
                         ),
+                        position: None,
                     },
                 })?;
                 if *self.peek() != Token::RParen {
@@ -2402,6 +2518,7 @@ impl Parser {
                         message: format!(
                             "invalid expression index target after {action}: only a direct JSON path is supported"
                         ),
+                        position: None,
                     });
                 }
                 self.advance();
@@ -2412,6 +2529,7 @@ impl Parser {
                             message: format!(
                                 "qualified JSON paths are not valid index targets after {action}; use an unqualified table-local path like `(.data->key)`"
                             ),
+                            position: None,
                         }
                     }),
                     None => match expr {
@@ -2419,16 +2537,19 @@ impl Parser {
                             message: format!(
                                 "invalid expression index target after {action}: parentheses are reserved for a direct JSON path like `(.data->key)`; use `.column` for a stored column"
                             ),
+                            position: None,
                         }),
                         Expr::QualifiedField { .. } => Err(ParseError::Syntax {
                             message: format!(
                                 "qualified references are not valid index targets after {action}; use a table-local `.column` or `(.data->key)`"
                             ),
+                            position: None,
                         }),
                         _ => Err(ParseError::Syntax {
                             message: format!(
                                 "invalid expression index target after {action}: only a direct JSON path is supported"
                             ),
+                            position: None,
                         }),
                     },
                 }
@@ -2436,6 +2557,7 @@ impl Parser {
             token => Err(ParseError::UnexpectedToken {
                 expected: format!(".<column> or parenthesized JSON path after {action}"),
                 got: token.display_name(),
+                position: None,
             }),
         }
     }
@@ -2452,6 +2574,7 @@ impl Parser {
                     return Err(ParseError::UnexpectedToken {
                         expected: "view name after drop view".into(),
                         got: t.display_name(),
+                        position: None,
                     })
                 }
             };
@@ -2464,6 +2587,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "table name after drop".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2482,6 +2606,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "view name after materialize".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2494,6 +2619,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "source table name".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2516,6 +2642,7 @@ impl Parser {
         if !matches!(left, Statement::Query(_) | Statement::Union(_)) {
             return Err(ParseError::Syntax {
                 message: "UNION requires a query on the left side".into(),
+                position: None,
             });
         }
         self.advance(); // consume `union`
@@ -2552,6 +2679,7 @@ impl Parser {
                     "expected query after UNION, got {}",
                     self.peek().display_name()
                 ),
+                position: None,
             }),
         }
     }
@@ -2565,6 +2693,7 @@ impl Parser {
                 return Err(ParseError::UnexpectedToken {
                     expected: "view name after refresh".into(),
                     got: t.display_name(),
+                    position: None,
                 })
             }
         };
@@ -2605,6 +2734,7 @@ impl Parser {
                     return Err(ParseError::UnexpectedToken {
                         expected: "type name".into(),
                         got: t.display_name(),
+                        position: None,
                     })
                 }
             };
@@ -2670,6 +2800,7 @@ impl Parser {
             t => Err(ParseError::UnexpectedToken {
                 expected: "literal default value".into(),
                 got: t.display_name(),
+                position: None,
             }),
         }
     }

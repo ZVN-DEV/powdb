@@ -19,23 +19,34 @@ pub fn parse_sql(input: &str) -> Result<Statement, ParseError> {
 }
 
 pub fn parse_sql_with_canonical(input: &str) -> Result<ParsedSql, ParseError> {
-    let toks = lex_sql(input)?;
+    let (toks, spans) = lex_sql_with_spans(input)?;
     let mut p = SqlParser {
         toks,
         pos: 0,
         depth: 0,
         qual_ctx: QualCtx::None,
     };
-    let canonical_powql = p.statement()?;
+    // One boundary attaches the failing token's char offset to any
+    // position-free UnexpectedToken/Syntax a production raised, mirroring
+    // the PowQL parser's `attach_failing_position`.
+    let canonical_powql = match p.statement() {
+        Ok(q) => q,
+        Err(e) => return Err(attach_sql_failing_position(e, &p, &spans)),
+    };
     if !p.at_end() {
-        return Err(ParseError::Syntax {
-            message: format!(
-                "unexpected trailing SQL token: {}",
-                p.peek()
-                    .map(|t| t.display())
-                    .unwrap_or_else(|| "<eof>".into())
-            ),
-        });
+        return Err(attach_sql_failing_position(
+            ParseError::Syntax {
+                message: format!(
+                    "unexpected trailing SQL token: {}",
+                    p.peek()
+                        .map(|t| t.display())
+                        .unwrap_or_else(|| "<eof>".into())
+                ),
+                position: None,
+            },
+            &p,
+            &spans,
+        ));
     }
     let mut statement = parser::parse(&canonical_powql)?;
     mark_sql_statement_raw(&mut statement);
@@ -356,7 +367,15 @@ impl SqlTok {
 }
 
 fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
+    lex_sql_with_spans(input).map(|(toks, _)| toks)
+}
+
+/// [`lex_sql`], additionally returning each token's char offset in `input`
+/// (the same `at position` coordinate the PowQL lexer uses), so SQL parse
+/// errors can say where they happened.
+fn lex_sql_with_spans(input: &str) -> Result<(Vec<SqlTok>, Vec<usize>), ParseError> {
     let mut out = Vec::new();
+    let mut spans: Vec<usize> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
@@ -386,6 +405,9 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
             i += 2;
             continue;
         }
+        // Every recognizer below starts at the current char, so this is the
+        // span recorded for whatever token this iteration emits.
+        let tok_start = i;
         if c == '\'' || c == '"' {
             let quote = c;
             i += 1;
@@ -440,6 +462,7 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 if s.is_empty() {
                     return Err(ParseError::Syntax {
                         message: "empty quoted identifier".into(),
+                        position: None,
                     });
                 }
                 if s.contains('`') {
@@ -451,9 +474,11 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                     });
                 }
                 out.push(SqlTok::Word(format!("`{s}`")));
+                spans.push(tok_start);
                 continue;
             }
             out.push(SqlTok::String(s));
+            spans.push(tok_start);
             continue;
         }
         if c == '$' {
@@ -463,15 +488,18 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 i += 1;
             }
             out.push(SqlTok::Param(chars[start..i].iter().collect()));
+            spans.push(tok_start);
             continue;
         }
         // Longest token first: `->>` must not be split into `->` plus `>`.
         if c == '-' && chars.get(i + 1) == Some(&'>') {
             if chars.get(i + 2) == Some(&'>') {
                 out.push(SqlTok::Op("->>".into()));
+                spans.push(tok_start);
                 i += 3;
             } else {
                 out.push(SqlTok::Op("->".into()));
+                spans.push(tok_start);
                 i += 2;
             }
             continue;
@@ -493,6 +521,7 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 }
             }
             out.push(SqlTok::Number(chars[start..i].iter().collect()));
+            spans.push(tok_start);
             continue;
         }
         if c.is_alphabetic() || c == '_' {
@@ -502,10 +531,12 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 i += 1;
             }
             out.push(SqlTok::Word(chars[start..i].iter().collect()));
+            spans.push(tok_start);
             continue;
         }
         if matches!(c, '(' | ')' | ',' | '*' | '.') {
             out.push(SqlTok::Symbol(c));
+            spans.push(tok_start);
             i += 1;
             continue;
         }
@@ -522,10 +553,12 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
                 op = "!=".into();
             }
             out.push(SqlTok::Op(op));
+            spans.push(tok_start);
             continue;
         }
         if matches!(c, '+' | '-' | '/') {
             out.push(SqlTok::Op(c.to_string()));
+            spans.push(tok_start);
             i += 1;
             continue;
         }
@@ -534,7 +567,7 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
             position: i,
         });
     }
-    Ok(out)
+    Ok((out, spans))
 }
 
 /// Bound on the nesting the SQL frontend may produce. The from-scratch SQL
@@ -551,6 +584,40 @@ fn lex_sql(input: &str) -> Result<Vec<SqlTok>, ParseError> {
 /// produced tree bounded (and stops the O(n^2) string rebuild) instead of
 /// leaving the whole load on PowQL's own chain guard.
 const MAX_SQL_NESTING_DEPTH: usize = 64;
+
+/// Attach the char offset of the token the SQL parser stopped on to an
+/// error that carries none; a deliberate position set in a production wins.
+/// A parser standing past the last token (an EOF failure) points at the end
+/// of the last token's offset — close enough to be actionable, and the only
+/// coordinate the span table still has.
+fn attach_sql_failing_position(
+    error: ParseError,
+    parser: &SqlParser,
+    spans: &[usize],
+) -> ParseError {
+    let offset = spans
+        .get(parser.pos.min(spans.len().saturating_sub(1)))
+        .copied();
+    match error {
+        ParseError::UnexpectedToken {
+            expected,
+            got,
+            position: None,
+        } => ParseError::UnexpectedToken {
+            expected,
+            got,
+            position: offset,
+        },
+        ParseError::Syntax {
+            message,
+            position: None,
+        } => ParseError::Syntax {
+            message,
+            position: offset,
+        },
+        other => other,
+    }
+}
 
 struct SqlParser {
     toks: Vec<SqlTok>,
@@ -632,6 +699,7 @@ fn build_ungrouped_aggregate(agg: &AggCall, inner: &str) -> Result<String, Parse
         // try_aggregate only constructs the five names above.
         other => Err(ParseError::Syntax {
             message: format!("unknown aggregate function `{other}`"),
+            position: None,
         }),
     }
 }
@@ -671,6 +739,7 @@ impl SqlParser {
                     .peek()
                     .map(|t| t.display())
                     .unwrap_or_else(|| "<eof>".into()),
+                position: None,
             })
         }
     }
@@ -692,6 +761,7 @@ impl SqlParser {
                     .peek()
                     .map(|t| t.display())
                     .unwrap_or_else(|| "<eof>".into()),
+                position: None,
             })
         }
     }
@@ -700,14 +770,17 @@ impl SqlParser {
             Some(SqlTok::Word(w)) if !is_reserved_identifier(&w) => Ok(w),
             Some(SqlTok::Word(w)) => Err(ParseError::Syntax {
                 message: format!("expected {what}, got reserved word `{w}`"),
+                position: None,
             }),
             Some(t) => Err(ParseError::UnexpectedToken {
                 expected: what.into(),
                 got: t.display(),
+                position: None,
             }),
             None => Err(ParseError::UnexpectedToken {
                 expected: what.into(),
                 got: "<eof>".into(),
+                position: None,
             }),
         }
     }
@@ -741,6 +814,7 @@ impl SqlParser {
                     .peek()
                     .map(|t| t.display())
                     .unwrap_or_else(|| "<eof>".into()),
+                position: None,
             })
         }
     }
@@ -860,6 +934,7 @@ impl SqlParser {
         } else if having.is_some() {
             return Err(ParseError::Syntax {
                 message: "HAVING requires GROUP BY".into(),
+                position: None,
             });
         }
         if let Some(o) = order {
@@ -1061,6 +1136,7 @@ impl SqlParser {
                         cols.len(),
                         vals.len()
                     ),
+                    position: None,
                 });
             }
             let assigns = cols
@@ -1148,6 +1224,7 @@ impl SqlParser {
                     "DEFAULT requires a literal value, got {}",
                     other.map(|t| t.display()).unwrap_or_else(|| "<eof>".into())
                 ),
+                position: None,
             }),
         }
     }
@@ -1165,6 +1242,7 @@ impl SqlParser {
                 message: "RETURNING currently supports only `RETURNING *` \
                           (column projection is not yet supported)"
                     .into(),
+                position: None,
             });
         }
         Ok(true)
@@ -1281,6 +1359,7 @@ impl SqlParser {
                             return Err(ParseError::UnexpectedToken {
                                 expected: "JSON path segment after ->".into(),
                                 got: "<eof>".into(),
+                                position: None,
                             });
                         }
                     }
@@ -1342,6 +1421,7 @@ impl SqlParser {
                     .peek()
                     .map(|t| t.display())
                     .unwrap_or_else(|| "<eof>".into()),
+                position: None,
             })
         }
     }
@@ -1372,6 +1452,7 @@ impl SqlParser {
                     .peek()
                     .map(|t| t.display())
                     .unwrap_or_else(|| "<eof>".into()),
+                position: None,
             })
         }
     }
@@ -1384,6 +1465,7 @@ impl SqlParser {
                 if self.at_end() {
                     return Err(ParseError::Syntax {
                         message: "unterminated SQL type length".into(),
+                        position: None,
                     });
                 }
                 self.bump();
@@ -1430,12 +1512,14 @@ impl SqlParser {
                     return Err(ParseError::UnexpectedToken {
                         expected: "=".into(),
                         got: t.display(),
+                        position: None,
                     })
                 }
                 None => {
                     return Err(ParseError::UnexpectedToken {
                         expected: "=".into(),
                         got: "<eof>".into(),
+                        position: None,
                     })
                 }
             }
@@ -1511,10 +1595,12 @@ impl SqlParser {
                 }
                 return Err(ParseError::Syntax {
                     message: "expected subquery after EXISTS".into(),
+                    position: None,
                 });
             }
             return Err(ParseError::Syntax {
                 message: "expected EXISTS (...)".into(),
+                position: None,
             });
         } else if self.eat_sym('(') {
             if self.is_kw("select") {
@@ -1562,12 +1648,14 @@ impl SqlParser {
                                 "SQL JSON arrows require a string key or non-negative integer index, got {}",
                                 token.display()
                             ),
+                            position: None,
                         });
                     }
                     None => {
                         return Err(ParseError::UnexpectedToken {
                             expected: "JSON object key or array index".into(),
                             got: "<eof>".into(),
+                            position: None,
                         });
                     }
                 };
@@ -1613,6 +1701,7 @@ impl SqlParser {
                         .peek()
                         .map(|t| t.display())
                         .unwrap_or_else(|| "<eof>".into()),
+                    position: None,
                 });
             }
             if self.eat_kw("in") {
@@ -1663,6 +1752,7 @@ impl SqlParser {
             };
             let (l_bp, r_bp) = infix_bp(&op).ok_or_else(|| ParseError::Syntax {
                 message: format!("unsupported SQL operator `{op}`"),
+                position: None,
             })?;
             if l_bp < min_bp {
                 self.pos -= 1;
@@ -1783,6 +1873,7 @@ impl SqlParser {
                                         "no such column: {w}.{f} (the only table in this \
                                          statement is `{visible_name}`)"
                                     ),
+                                    position: None,
                                 })
                             }
                         }
@@ -1790,6 +1881,7 @@ impl SqlParser {
                             message: format!(
                                 "qualified column reference `{w}.{f}` is not allowed here"
                             ),
+                            position: None,
                         }),
                     }
                 } else {
@@ -1802,10 +1894,12 @@ impl SqlParser {
             Some(SqlTok::Symbol('*')) => Ok("*".into()),
             Some(t) => Err(ParseError::Syntax {
                 message: format!("unexpected SQL token in expression: {}", t.display()),
+                position: None,
             }),
             None => Err(ParseError::UnexpectedToken {
                 expected: "expression".into(),
                 got: "<eof>".into(),
+                position: None,
             }),
         }
     }

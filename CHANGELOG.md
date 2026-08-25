@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Parse errors now say where.** PowQL and SQL parser failures
+  (`expected X, got Y` and syntax refusals) lead with the same
+  `at position N:` prefix the lexer's diagnostics always had, where `N` is
+  the char offset of the token the parser stopped on. Error text that
+  previously had no location is otherwise unchanged, and errors raised from
+  synthesized token streams (no source text) stay position-free.
+
 - **A json column now compares against a string literal as a document.** The
   literal is parsed and canonicalized exactly as on insert, so
   `filter .j = "{ \"b\": 2, \"a\": 1 }"` matches `{"a":1,"b":2}`
