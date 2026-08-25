@@ -131,6 +131,49 @@ jobs:
           done
           cargo +nightly miri test -p powdb-storage -- "${filters[@]}"
 
+  miri-query:
+    name: miri (powdb-query, compiled)
+    runs-on: ubuntu-24.04
+    # The compiled predicate module evaluates filters over raw row and PJ1
+    # document bytes with hand-computed offsets, exactly where undefined or
+    # out-of-bounds behavior would hide. Its unit tests are pure in-memory,
+    # so miri can interpret them; the rest of the executor reads through
+    # libc::mmap, which miri cannot. Scoped to --lib on both the list and
+    # the run, so the guard inspects the same target set it runs.
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust nightly with miri
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: miri-query-compiled
+
+      - name: Run miri on powdb-query (compiled predicates)
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        run: |
+          set -euo pipefail
+          filter="executor::compiled::tests"
+          # A libtest filter that matches nothing exits 0, so a renamed or
+          # deleted module would silently empty this job instead of failing
+          # it. Require the filter to select at least one test first.
+          listing=$(cargo +nightly miri test -p powdb-query --lib -- --list "$filter")
+          if ! grep -q "^${filter}::" <<<"$listing"; then
+            echo "::error::miri filter '${filter}' matches no test in powdb-query"
+            exit 1
+          fi
+          cargo +nightly miri test -p powdb-query --lib -- "$filter"
+
   asan:
     name: AddressSanitizer
     runs-on: ubuntu-24.04
@@ -793,6 +836,7 @@ jobs:
     needs:
       - lint-test
       - miri
+      - miri-query
       - asan
       - msrv-consistency
       - msrv-build
