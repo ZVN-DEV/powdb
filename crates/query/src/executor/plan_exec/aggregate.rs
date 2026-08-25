@@ -610,9 +610,15 @@ impl NumericAgg {
         Ok(())
     }
 
-    /// Final `sum`: `Int` unless a `Float` contributed. The `i64` conversion
-    /// is where an overflowing integer total surfaces.
+    /// Final `sum`: `Int` unless a `Float` contributed, and `Empty` when no
+    /// numeric row contributed at all — "no rows" and "a total of zero" are
+    /// different facts, and SQL's SUM (and PowQL's own `avg`) already say
+    /// NULL for the first. The `i64` conversion is where an overflowing
+    /// integer total surfaces.
     pub(super) fn sum(&self, label: &str) -> Result<Value, QueryError> {
+        if self.count == 0 {
+            return Ok(Value::Empty);
+        }
         if self.saw_float {
             return Ok(Value::Float(self.float_sum + self.int_sum as f64));
         }
@@ -1258,36 +1264,25 @@ mod tests {
         );
     }
 
-    // ── B5: the type of a zero total, when nothing contributed ──
+    // ── B5 (closed in v0.27): a sum nothing contributed to is Empty ──
 
     #[test]
-    fn generic_sum_over_only_nulls_is_int_zero() {
-        // Pinned because it is the one input on which the generic paths and
-        // the compiled fast path disagree: over an all-null FLOAT column the
-        // fast path answers `Float(0.0)` (it types the zero from the column)
-        // and every generic path answers `Int(0)` (it types the zero from the
-        // values it summed, because an expression argument has no column type
-        // to read).
-        //
-        // That is user-visible, and the plan shape alone decides it. On
-        // `type F { required id: int, v: float }` holding two rows with a null
-        // `v`, `sum(F { .v })` answers `Float(0.0)` while
-        // `sum(F filter .id in (1,2) { .v })` and `F group .id { s: sum(.v) }`
-        // answer `Int(0)`.
-        //
-        // Closing it needs BOTH sides changed in one step, because either half
-        // on its own widens the split (making the generic zero `Empty` would
-        // newly disagree with the fast path's `Int(0)` on an int column). The
-        // fast-path half lives in the `TypeId::Float => AggFunc::Sum` arm of
-        // `fast_paths.rs::agg_single_col_fast`; see the note on `NumericAgg`.
+    fn generic_sum_over_only_nulls_is_empty() {
+        // This input used to be the one on which the paths disagreed: the
+        // compiled float loop answered `Float(0.0)`, every generic path
+        // `Int(0)`, and SQL says NULL. All paths now answer `Empty` (see
+        // `NumericAgg::sum` and the two Sum arms in
+        // `fast_paths.rs::agg_single_col_fast`); the behavioral battery is
+        // tests/sum_empty_null.rs. The window form agrees: a partition whose
+        // every argument is null sums to Empty on each of its rows.
         let nulls = vec![vec![Value::Empty], vec![Value::Empty]];
         assert!(matches!(
             scalar_agg(AggFunc::Sum, &nulls).unwrap(),
-            QueryResult::Scalar(Value::Int(0))
+            QueryResult::Scalar(Value::Empty)
         ));
         assert_eq!(
             window_column(window_agg(WindowFunc::Sum, nulls)),
-            vec![Value::Int(0); 2]
+            vec![Value::Empty; 2]
         );
     }
 

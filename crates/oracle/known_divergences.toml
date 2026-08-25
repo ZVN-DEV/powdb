@@ -59,13 +59,6 @@ owner = "crates/query/src/executor/eval.rs:1313"
 anchor = "p[pi] == '_' || p[pi] == t[ti]"
 
 [[divergence]]
-id = "sum-of-no-numeric-rows-is-zero-not-null"
-shape = "agg_sum_avg_int"
-pair = "powql_vs_sqlite"
-reason = "PowDB's sum over an empty or all-null input returns Int(0); SQL returns NULL. This is a real semantic difference and it is recorded here rather than fixed because changing it is a wire-visible behaviour change that this lane does not own. It is worth noting that avg in the very same type returns Empty for the same input, so sum and avg disagree with each other inside PowDB, and that sum over a float column with no rows returns Int(0) rather than Float(0.0). Reported as a finding; see the sprint report."
-owner = "crates/query/src/executor/plan_exec/aggregate.rs:616"
-
-[[divergence]]
 id = "json-column-never-equals-a-string-literal"
 shape = "json_whole_column_eq"
 pair = "powql_vs_sqlite"

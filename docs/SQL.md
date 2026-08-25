@@ -214,7 +214,9 @@ distinction matters.
 `COUNT(*)` counts rows. `COUNT(col)` counts rows where `col` is not NULL, per
 the SQL standard, and lowers to PowQL's `count(T { .col })`, so both frontends
 return the same number for the same question. Every other aggregate
-(`SUM`/`AVG`/`MIN`/`MAX`) also skips NULL values.
+(`SUM`/`AVG`/`MIN`/`MAX`) also skips NULL values, and each of them returns
+NULL when no non-null value contributes at all (no rows, or all NULL), per
+the SQL standard. `COUNT` is the aggregate that answers `0` for no rows.
 
 ```sql
 -- 3 rows, one of which has a NULL nickname:

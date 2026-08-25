@@ -545,6 +545,8 @@ count(distinct User { .age })
 | `min` | Minimum value | `min(Table { .field })` |
 | `max` | Maximum value | `max(Table { .field })` |
 
+`sum`, `avg`, `min`, and `max` ignore null (`empty`) inputs, and when no non-null value contributes at all (no rows, or every value null) they return `empty`, not zero. This matches SQL's `SUM`/`AVG`/`MIN`/`MAX` over an empty set: "no rows" and "a total of zero" are different answers. `count` is the aggregate that answers `0` for no rows.
+
 For `sum`, `avg`, `min`, and `max`, the target expression is specified via the projection. For `count`, the projection is optional and it changes the question being asked: `count(Table)` counts rows, while `count(Table { .field })` counts rows whose `.field` is not null. `count(distinct Table { .field })` counts unique non-null values. The expression may be a stored field, a computed value, or a JSON path:
 
 ```powql

@@ -684,7 +684,12 @@ proptest! {
 
         let observed = agreed_across_frontends(
             &mut arrangements, "sum(T { .mirror })", "SELECT SUM(mirror) FROM T", false)?;
-        prop_assert_eq!(observed, Answer::Scalar(Value::Int(present.iter().sum())));
+        let expected_sum = if present.is_empty() {
+            Value::Empty
+        } else {
+            Value::Int(present.iter().sum())
+        };
+        prop_assert_eq!(observed, Answer::Scalar(expected_sum));
 
         let observed = agreed_across_frontends(
             &mut arrangements, "min(T { .mirror })", "SELECT MIN(mirror) FROM T", false)?;
@@ -842,11 +847,15 @@ proptest! {
 
         let mut arrangements = Arrangements::build(&rows);
 
-        let mut groups: BTreeMap<Option<i64>, (i64, i64)> = BTreeMap::new();
+        // Sum is `None` until a non-null value contributes, so the model can
+        // say Empty (SQL NULL) for an all-null group, as the engine does.
+        let mut groups: BTreeMap<Option<i64>, (i64, Option<i64>)> = BTreeMap::new();
         for row in &rows {
-            let entry = groups.entry(row.a).or_insert((0, 0));
+            let entry = groups.entry(row.a).or_insert((0, None));
             entry.0 += 1;
-            entry.1 += row.a.unwrap_or(0);
+            if let Some(v) = row.a {
+                *entry.1.get_or_insert(0) += v;
+            }
         }
 
         let observed = agreed(
@@ -860,12 +869,11 @@ proptest! {
                 vec![
                     key.map(Value::Int).unwrap_or(Value::Empty),
                     Value::Int(*count),
-                    // PowDB's `sum` over zero non-null values is 0, not null
-                    // (unlike `min`/`max`/`avg`, which are null). Modelled as
-                    // observed, and pinned by
-                    // `sum_of_no_values_is_zero_while_the_other_aggregates_are_null`
-                    // below so the choice cannot drift silently.
-                    Value::Int(*sum),
+                    // A group whose every `.mirror` is null sums zero
+                    // non-null values, which is Empty (SQL NULL) as of
+                    // v0.27 — the same rule as min/max/avg. Pinned by
+                    // `every_empty_set_aggregate_is_null` below.
+                    sum.map(Value::Int).unwrap_or(Value::Empty),
                 ]
             })
             .collect();
@@ -1077,17 +1085,15 @@ proptest! {
     }
 }
 
-/// PowDB's empty-set aggregates are pinned here because they are not what SQL
-/// specifies and the property models above have to encode them.
+/// PowDB's empty-set aggregates are pinned here so a change to them shows up
+/// as a failure rather than as a surprise in someone's report.
 ///
-/// `sum` over zero non-null values returns `0`; `min`, `max` and `avg` return
-/// null. SQL says all four are null. Both frontends and both physical paths
-/// agree with each other, so this reads as a deliberate PowDB choice rather
-/// than a path bug, but it is a real divergence from the SQL standard and a
-/// change to it should show up as a failure here rather than as a surprise in
-/// someone's report.
+/// As of v0.27 all four — `sum`, `min`, `max`, `avg` — return null over zero
+/// non-null values, exactly as SQL specifies. (`sum` answered `0` before,
+/// which also disagreed with PowDB's own `avg`.) Both frontends and both
+/// physical paths must keep agreeing.
 #[test]
-fn sum_of_no_values_is_zero_while_the_other_aggregates_are_null() {
+fn every_empty_set_aggregate_is_null() {
     let rows = vec![GenRow {
         a: None,
         label: None,
@@ -1100,7 +1106,7 @@ fn sum_of_no_values_is_zero_while_the_other_aggregates_are_null() {
         (
             "sum(T { .mirror })",
             "SELECT SUM(mirror) FROM T",
-            Value::Int(0),
+            Value::Empty,
         ),
         (
             "min(T { .mirror })",
@@ -1142,7 +1148,7 @@ fn sum_of_no_values_is_zero_while_the_other_aggregates_are_null() {
         grouped,
         Answer::Rows {
             columns: vec!["mirror".into(), "s".into(), "m".into()],
-            rows: vec![vec![Value::Empty, Value::Int(0), Value::Empty]],
+            rows: vec![vec![Value::Empty, Value::Empty, Value::Empty]],
         },
         "grouped aggregates over an all-null group disagree with the ungrouped ones"
     );
