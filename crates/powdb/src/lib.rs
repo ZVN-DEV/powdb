@@ -66,6 +66,8 @@
 //! so an injection-shaped string is inert data that can never change the
 //! query's shape.
 
+#![warn(missing_docs)]
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,7 +228,9 @@ pub struct RetainedApplyRequest {
 /// Summary returned after retained-unit chunk apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedApplyResult {
+    /// The LSN the replica is now applied through (the chunk's last unit).
     pub through_lsn: u64,
+    /// How many retained units this call replayed; zero for a no-op resume.
     pub units_applied: usize,
 }
 

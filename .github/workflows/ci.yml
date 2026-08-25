@@ -856,6 +856,33 @@ jobs:
       - name: Check every shipped artifact
         run: bash scripts/ci/testing-feature-guard.sh
 
+  missing-docs-ratchet:
+    name: missing_docs ratchet (public API docs only tighten)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: missing-docs-ratchet
+
+      # Proves the counter can see undocumented items before the baseline
+      # comparison certifies anything — a blind counter would report zero
+      # everywhere and look like success.
+      - name: Prove the counter can see gaps
+        run: bash scripts/ci/missing-docs-ratchet.sh --selftest
+
+      - name: Every crate matches its documented-gap baseline
+        run: bash scripts/ci/missing-docs-ratchet.sh
+
   ci-success:
     name: ci-success
     runs-on: ubuntu-24.04
@@ -883,6 +910,7 @@ jobs:
       - deny
       - internal-content-guard
       - testing-feature-guard
+      - missing-docs-ratchet
     steps:
       - name: Verify every required job succeeded
         env:

@@ -7,6 +7,9 @@
 //! (`crates/server/src/handler/`), and `powdb-cli` manages users via the
 //! `useradd`/`passwd`/`userdel` subcommands.
 
+#![warn(missing_docs)]
+
+/// The crate's typed error, [`error::AuthError`].
 pub mod error;
 pub mod hash;
 pub mod role;
