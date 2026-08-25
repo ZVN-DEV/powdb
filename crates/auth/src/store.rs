@@ -278,7 +278,7 @@ mod tests {
         let mut s = UserStore::new();
         s.create_user("alice", "correct horse", "admin").unwrap();
 
-        let median = |f: &dyn Fn() -> ()| {
+        let median = |f: &dyn Fn()| {
             let mut runs: Vec<std::time::Duration> = (0..3)
                 .map(|_| {
                     let t = std::time::Instant::now();
