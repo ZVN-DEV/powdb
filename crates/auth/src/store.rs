@@ -73,9 +73,14 @@ impl UserStore {
     /// Authenticate a user by name + candidate password.
     ///
     /// Returns `Some(&User)` only on a verified match. Unknown user or wrong
-    /// password both return `None`.
+    /// password both return `None` — and both cost one argon2 verification,
+    /// so response timing cannot enumerate usernames (an unknown name used
+    /// to return in nanoseconds against ~100ms for a known one).
     pub fn authenticate(&self, name: &str, candidate: &str) -> Option<&User> {
-        let user = self.users.get(name)?;
+        let Some(user) = self.users.get(name) else {
+            verify_password(dummy_password_hash(), candidate);
+            return None;
+        };
         if verify_password(&user.password_hash, candidate) {
             Some(user)
         } else {
@@ -171,6 +176,27 @@ impl UserStore {
     }
 }
 
+/// A real argon2id hash (of a value no caller can present: it is discarded
+/// after hashing) that [`UserStore::authenticate`] verifies unknown-user
+/// candidates against, so the unknown branch does the same work as the known
+/// one. Computed once per process; the one-time cost is one extra hash.
+fn dummy_password_hash() -> &'static str {
+    use std::sync::OnceLock;
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let throwaway = Zeroizing::new(format!(
+            "powdb-timing-equalizer-{}-{:p}",
+            std::process::id(),
+            &DUMMY
+        ));
+        // A hashing failure here cannot be surfaced (this is the "user does
+        // not exist" path); an empty PHC makes verify_password parse-fail
+        // fast, which merely restores the old timing rather than breaking
+        // authentication.
+        hash_password(&throwaway).unwrap_or_default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +265,42 @@ mod tests {
             s.create_user("a", "pw", "wizard"),
             Err(AuthError::UnknownRole(_))
         ));
+    }
+
+    /// Authenticating an unknown user must cost the same argon2 work as a
+    /// wrong password for a known user. Before the dummy-verify, the unknown
+    /// branch returned in microseconds while the known branch ran ~tens of
+    /// milliseconds of argon2id — a timing oracle that let a remote caller
+    /// enumerate usernames. Ratio-based with a wide margin (4x against a
+    /// ~1000x historical gap), so machine speed cannot flake it.
+    #[test]
+    fn unknown_user_costs_the_same_argon2_work_as_a_wrong_password() {
+        let mut s = UserStore::new();
+        s.create_user("alice", "correct horse", "admin").unwrap();
+
+        let median = |f: &dyn Fn() -> ()| {
+            let mut runs: Vec<std::time::Duration> = (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    f();
+                    t.elapsed()
+                })
+                .collect();
+            runs.sort();
+            runs[1]
+        };
+
+        let wrong = median(&|| {
+            assert!(s.authenticate("alice", "wrong password").is_none());
+        });
+        let unknown = median(&|| {
+            assert!(s.authenticate("mallory", "wrong password").is_none());
+        });
+
+        assert!(
+            unknown * 4 > wrong,
+            "unknown-user auth ({unknown:?}) must not be cheaper than \
+             wrong-password auth ({wrong:?}) — that timing gap enumerates usernames"
+        );
     }
 }
