@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Release candidates.** A `vX.Y.Z-rc.N` tag now ships a full release on
+  every channel without moving what a default install resolves to: GitHub
+  pre-release, ghcr `:rc` floating tag (`:latest` untouched), npm dist-tag
+  `next`, and a crates.io pre-release version cargo will not pick up unless
+  pinned. See RELEASES.md.
+- **`powdb-server --port 0` reports the bound port.** A new `--port-file
+  <path>` flag (env `POWDB_PORT_FILE`) writes `port=N` (plus `metrics=N` when
+  the metrics endpoint is on) after startup, and the "powdb server
+  listening" log line now reports the address actually bound rather than
+  the one requested.
+- **`docs/metrics.md`**: every metric family the Prometheus endpoint
+  exposes, held equal to the code by CI.
+
 ### Changed
 
 - **Parse errors now say where.** PowQL and SQL parser failures
