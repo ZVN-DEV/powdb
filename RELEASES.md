@@ -173,10 +173,9 @@ The steps, in order (stop the bleeding at the installs first, then annotate):
     strands the rest):
 
       for c in powdb-storage powdb-auth powdb-query powdb-sync powdb-backup \
-               powdb-server powdb cli-placeholder; do
+               powdb-server powdb powdb-cli; do
         cargo yank --version X.Y.Z "$c"
       done
-      # (the last entry is powdb-cli; spelled out to keep the dep order legible)
 
     Yanking is NOT covered by OIDC trusted publishing: it needs `cargo login`
     with a real crates.io token scoped to yank. Mint one for the operation and
