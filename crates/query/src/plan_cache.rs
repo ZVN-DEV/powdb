@@ -35,10 +35,17 @@ use rustc_hash::FxHashMap;
 /// by `canonicalize`), so SipHash is pure overhead — Fx is much cheaper for
 /// the integer-keyed lookup.
 pub struct PlanCache {
-    cache: FxHashMap<u64, PlanNode>,
+    /// Keyed by canonical hash; each entry keeps the canonical byte stream
+    /// its hash covers, re-compared on every hit (see `hash_collisions`).
+    cache: FxHashMap<u64, (Vec<u8>, PlanNode)>,
     capacity: usize,
     pub hits: u64,
     pub misses: u64,
+    /// Hits whose stored canonical form did not match the presented one: a
+    /// 64-bit FNV collision (or an engineered one). Counted separately from
+    /// `misses` so a thrashing pair of colliding shapes is observable; the
+    /// lookup itself degrades to an ordinary miss (replan from source).
+    pub hash_collisions: u64,
 }
 
 impl PlanCache {
@@ -48,6 +55,7 @@ impl PlanCache {
             capacity,
             hits: 0,
             misses: 0,
+            hash_collisions: 0,
         }
     }
 
@@ -68,7 +76,13 @@ impl PlanCache {
     /// it; the engine then plans from source on every call, which is always
     /// correct. This check runs only on the populating miss, so the hot
     /// hit-path pays nothing.
-    pub fn insert(&mut self, hash: u64, plan: PlanNode, source_literal_count: usize) {
+    pub fn insert(
+        &mut self,
+        hash: u64,
+        canonical: Vec<u8>,
+        plan: PlanNode,
+        source_literal_count: usize,
+    ) {
         // GROUP BY planning lifts aggregate arguments out of their source
         // projection positions, and the parser accepts HAVING both before and
         // after that projection. The physical plan does not retain which
@@ -98,7 +112,7 @@ impl PlanCache {
             // would matter once we have hundreds of distinct query shapes.
             self.cache.clear();
         }
-        self.cache.insert(hash, plan);
+        self.cache.insert(hash, (canonical, plan));
     }
 
     /// Look up a plan by canonical hash and return a clone with the new
@@ -112,9 +126,26 @@ impl PlanCache {
     ///
     /// The substitution is done on a **clone** of the cached plan, not the
     /// stored copy. The cached plan stays pristine for the next call.
-    pub fn get_with_substitution(&mut self, hash: u64, literals: &[Literal]) -> Option<PlanNode> {
+    pub fn get_with_substitution(
+        &mut self,
+        hash: u64,
+        canonical: &[u8],
+        literals: &[Literal],
+    ) -> Option<PlanNode> {
         match self.cache.get(&hash) {
-            Some(template) => {
+            // Verify-on-hit: the stored canonical byte stream must match the
+            // presented one. A 64-bit FNV-1a key alone is forgeable (the
+            // debug_assert on substitution count compiles out in release),
+            // and serving a colliding shape would execute the WRONG PLAN —
+            // a silent wrong answer no downstream gate catches. A mismatch
+            // is a counted miss; the engine replans from source, which is
+            // always correct.
+            Some((stored_canonical, _)) if stored_canonical.as_slice() != canonical => {
+                self.hash_collisions += 1;
+                self.misses += 1;
+                None
+            }
+            Some((_, template)) => {
                 self.hits += 1;
                 let mut plan = template.clone();
                 let mut idx = 0usize;
@@ -990,7 +1021,7 @@ fn substitute_expr(expr: &mut Expr, literals: &[Literal], idx: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonicalize::canonicalize;
+    use crate::canonicalize::{canonicalize, canonicalize_with_form};
     use crate::planner;
 
     #[test]
@@ -999,17 +1030,19 @@ mod tests {
 
         // First call: "User filter .id = 42" — miss, plan + insert.
         let q1 = "User filter .id = 42";
-        let (h1, lits1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
         let p1 = planner::plan(q1).unwrap();
-        cache.insert(h1, p1, lits1.len());
+        cache.insert(h1, canon_h1.clone(), p1, lits1.len());
 
         // Second call with a different literal — should hit and produce
         // a plan with the new literal substituted in.
         let q2 = "User filter .id = 99";
-        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2, "different literals must hash the same");
 
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         // The plan should be `IndexScan { key: Literal::Int(99) }`.
         match plan {
@@ -1027,6 +1060,65 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_collision_between_different_shapes_is_a_miss_not_a_wrong_plan() {
+        // The cache key is a 64-bit FNV-1a, which is non-cryptographic:
+        // colliding shapes are constructible by an adversary who can submit
+        // query text, and before verify-on-hit existed a collision meant
+        // executing the OTHER shape's plan — a silent wrong answer no gate
+        // (oracle, dual-path) would catch in production. Building a real
+        // collision needs a ~2^32 search, so this test files two different
+        // canonical forms under the SAME key by hand; the mechanism under
+        // test is the stored-canonical comparison, which cannot care how
+        // the key collided.
+        let mut cache = PlanCache::new(16);
+
+        let q_user = "User filter .id = 42";
+        let (h_user, canon_user, lits_user) = canonicalize_with_form(q_user).unwrap();
+        let p_user = planner::plan(q_user).unwrap();
+        cache.insert(h_user, canon_user.clone(), p_user, lits_user.len());
+
+        let q_order = "Order filter .total = 7";
+        let (_h_order, canon_order, lits_order) = canonicalize_with_form(q_order).unwrap();
+        assert_ne!(canon_user, canon_order, "sanity: different shapes");
+
+        // Simulated collision: the Order shape presents the User shape's key.
+        assert!(
+            cache
+                .get_with_substitution(h_user, &canon_order, &lits_order)
+                .is_none(),
+            "a colliding shape must miss (and replan from source), never \
+             execute the other shape's cached plan"
+        );
+        assert_eq!(cache.hash_collisions, 1, "the collision must be counted");
+
+        // The genuine same-shape hit still works, canonical form and all.
+        let (h2, canon2, lits2) = canonicalize_with_form("User filter .id = 99").unwrap();
+        assert_eq!(h2, h_user);
+        assert_eq!(canon2, canon_user);
+        assert!(cache.get_with_substitution(h2, &canon2, &lits2).is_some());
+    }
+
+    #[test]
+    fn canonicalize_with_form_bytes_are_exactly_what_the_hash_covers() {
+        // The verify-on-hit comparison is only sound if the stored bytes and
+        // the hash describe the same canonical stream: same shape => same
+        // bytes AND same hash; different shape => different bytes.
+        let (h1, c1, _) = canonicalize_with_form("User filter .id = 1").unwrap();
+        let (h2, c2, _) = canonicalize_with_form("User  filter .id =   2 # c").unwrap();
+        assert_eq!(h1, h2, "same shape must share the hash");
+        assert_eq!(c1, c2, "same shape must share the canonical bytes");
+
+        let (h3, c3, _) = canonicalize_with_form("Order filter .id = 1").unwrap();
+        assert_ne!(c1, c3, "different shapes must differ in canonical bytes");
+        assert_ne!(h1, h3);
+
+        // And the wrapper agrees with the _with_form spelling.
+        let (h4, _canon_h4, lits4) = canonicalize_with_form("User filter .id = 1").unwrap();
+        assert_eq!(h4, h1);
+        assert_eq!(lits4, vec![Literal::Int(1)]);
+    }
+
+    #[test]
     fn test_subquery_plan_not_cached() {
         // #137: `canonicalize` collects the inner `100` literal at the token
         // level, but it lives in an un-walked subquery AST that
@@ -1036,7 +1128,7 @@ mod tests {
         // would be served this plan's stale `100`.
         let mut cache = PlanCache::new(100);
         let q = "User filter .id in (Ord filter .total > 100 { .user_id })";
-        let (h, lits) = canonicalize(q).unwrap();
+        let (h, canon_h, lits) = canonicalize_with_form(q).unwrap();
         assert_eq!(lits.len(), 1, "canonicalize collects the inner literal");
         let plan = planner::plan(q).unwrap();
         assert_eq!(
@@ -1044,15 +1136,15 @@ mod tests {
             0,
             "the subquery literal is not a reachable substitution slot"
         );
-        cache.insert(h, plan, lits.len());
+        cache.insert(h, canon_h.clone(), plan, lits.len());
         assert!(cache.is_empty(), "subquery plans must not be cached (#137)");
-        assert!(cache.get_with_substitution(h, &lits).is_none());
+        assert!(cache.get_with_substitution(h, &canon_h, &lits).is_none());
     }
 
     #[test]
     fn test_cache_miss_returns_none_and_bumps_counter() {
         let mut cache = PlanCache::new(100);
-        assert!(cache.get_with_substitution(99999, &[]).is_none());
+        assert!(cache.get_with_substitution(99999, &[], &[]).is_none());
         assert_eq!(cache.misses, 1);
         assert_eq!(cache.hits, 0);
     }
@@ -1061,12 +1153,19 @@ mod tests {
     fn test_multi_literal_filter_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"User filter .age > 30 and .status = "active" { .name }"#;
-        let (h1, lits1) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
+        cache.insert(
+            h1,
+            canon_h1.clone(),
+            planner::plan(q1).unwrap(),
+            lits1.len(),
+        );
 
         let q2 = r#"User filter .age > 50 and .status = "pending" { .name }"#;
-        let (h2, lits2) = canonicalize(q2).unwrap();
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         // Walk the plan and pull out every literal — should be [50, "pending"].
         let mut found = Vec::new();
@@ -1086,7 +1185,7 @@ mod tests {
         let mut cache = PlanCache::new(100);
         let q1 = "User as u join Order as o on u.id = o.user_id \
                   group u.status having count(o.total) > 1 { u.status, n: count(o.total) }";
-        let (h1, lits1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
         let p1 = planner::plan(q1).unwrap();
 
         // Only the HAVING `1` is a substitutable literal; the slot count still
@@ -1098,15 +1197,15 @@ mod tests {
             lits1.len(),
             "group keys/args are structural, so slots == literals (#137)"
         );
-        cache.insert(h1, p1, lits1.len());
+        cache.insert(h1, canon_h1.clone(), p1, lits1.len());
         assert!(cache.is_empty(), "grouped HAVING plans must not cache");
 
         let q2 = "User as u join Order as o on u.id = o.user_id \
                   group u.status having count(o.total) > 5 { u.status, n: count(o.total) }";
-        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2, "different HAVING literal must hash the same");
 
-        assert!(cache.get_with_substitution(h2, &lits2).is_none());
+        assert!(cache.get_with_substitution(h2, &canon_h2, &lits2).is_none());
         assert_eq!(cache.hits, 0);
         assert_eq!(cache.misses, 1);
     }
@@ -1141,16 +1240,18 @@ mod tests {
         // substitutes the new literal (no panic, no stale value).
         let mut cache = PlanCache::new(100);
         let q1 = r#"Post filter .data->age > 21"#;
-        let (h1, lits1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
         let p1 = planner::plan(q1).unwrap();
         assert_eq!(count_literal_slots(&p1), lits1.len());
-        cache.insert(h1, p1, lits1.len());
+        cache.insert(h1, canon_h1.clone(), p1, lits1.len());
         assert_eq!(cache.len(), 1, "path plan must cache");
 
         let q2 = r#"Post filter .data->age > 65"#;
-        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2, "same path, different literal → same hash");
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
@@ -1162,15 +1263,20 @@ mod tests {
     fn json_path_different_path_is_a_cache_miss() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"Post filter .data->age > 21"#;
-        let (h1, lits1) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
+        cache.insert(
+            h1,
+            canon_h1.clone(),
+            planner::plan(q1).unwrap(),
+            lits1.len(),
+        );
 
         // Different key → different shape → miss (would otherwise serve a plan
         // that walks the wrong path).
         let q2 = r#"Post filter .data->year > 21"#;
-        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
         assert!(
-            cache.get_with_substitution(h2, &lits2).is_none(),
+            cache.get_with_substitution(h2, &canon_h2, &lits2).is_none(),
             "a different path must not hit the cached plan"
         );
     }
@@ -1179,15 +1285,17 @@ mod tests {
     fn expression_aggregate_literal_substitutes_on_cache_hit() {
         let mut cache = PlanCache::new(8);
         let q1 = "Post group .data->kind { total: sum(.data->age + 1) }";
-        let (h1, literals1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, literals1) = canonicalize_with_form(q1).unwrap();
         let plan1 = planner::plan(q1).unwrap();
         assert_eq!(count_literal_slots(&plan1), literals1.len());
-        cache.insert(h1, plan1, literals1.len());
+        cache.insert(h1, canon_h1.clone(), plan1, literals1.len());
 
         let q2 = "Post group .data->kind { total: sum(.data->age + 7) }";
-        let (h2, literals2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, literals2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2);
-        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &literals2)
+            .expect("hit");
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
         assert_eq!(found, vec![Literal::Int(7)]);
@@ -1198,31 +1306,35 @@ mod tests {
         let mut cache = PlanCache::new(8);
 
         let q1 = "Post filter .data->age = 21";
-        let (h1, literals1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, literals1) = canonicalize_with_form(q1).unwrap();
         let plan1 = planner::plan(q1).unwrap();
         assert!(matches!(plan1, PlanNode::ExprIndexScan { .. }));
         assert_eq!(count_literal_slots(&plan1), literals1.len());
-        cache.insert(h1, plan1, literals1.len());
+        cache.insert(h1, canon_h1.clone(), plan1, literals1.len());
 
         let q2 = "Post filter .data->age = 65";
-        let (h2, literals2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, literals2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2);
-        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &literals2)
+            .expect("hit");
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
         assert_eq!(found, vec![Literal::Int(65)]);
 
         let q3 = "Post filter .data->age >= 18 and .data->age < 65";
-        let (h3, literals3) = canonicalize(q3).unwrap();
+        let (h3, canon_h3, literals3) = canonicalize_with_form(q3).unwrap();
         let plan3 = planner::plan(q3).unwrap();
         assert!(matches!(plan3, PlanNode::ExprRangeScan { .. }));
         assert_eq!(count_literal_slots(&plan3), literals3.len());
-        cache.insert(h3, plan3, literals3.len());
+        cache.insert(h3, canon_h3.clone(), plan3, literals3.len());
 
         let q4 = "Post filter .data->age >= 25 and .data->age < 80";
-        let (h4, literals4) = canonicalize(q4).unwrap();
+        let (h4, canon_h4, literals4) = canonicalize_with_form(q4).unwrap();
         assert_eq!(h3, h4);
-        let plan = cache.get_with_substitution(h4, &literals4).expect("hit");
+        let plan = cache
+            .get_with_substitution(h4, &canon_h4, &literals4)
+            .expect("hit");
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
         assert_eq!(found, vec![Literal::Int(25), Literal::Int(80)]);
@@ -1232,16 +1344,18 @@ mod tests {
     fn ordered_expression_scan_limit_offset_substitute_in_canonical_order() {
         let mut cache = PlanCache::new(8);
         let q1 = "Post order .data->age desc limit 10 offset 2";
-        let (h1, literals1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, literals1) = canonicalize_with_form(q1).unwrap();
         let plan1 = planner::plan(q1).unwrap();
         assert!(matches!(plan1, PlanNode::OrderedExprIndexScan { .. }));
         assert_eq!(count_literal_slots(&plan1), literals1.len());
-        cache.insert(h1, plan1, literals1.len());
+        cache.insert(h1, canon_h1.clone(), plan1, literals1.len());
 
         let q2 = "Post order .data->age desc limit 20 offset 3";
-        let (h2, literals2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, literals2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2);
-        let plan = cache.get_with_substitution(h2, &literals2).expect("hit");
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &literals2)
+            .expect("hit");
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
         assert_eq!(found, vec![Literal::Int(20), Literal::Int(3)]);
@@ -1251,12 +1365,19 @@ mod tests {
     fn test_update_by_pk_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = "User filter .id = 1 update { age := 100 }";
-        let (h1, lits1) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
+        cache.insert(
+            h1,
+            canon_h1.clone(),
+            planner::plan(q1).unwrap(),
+            lits1.len(),
+        );
 
         let q2 = "User filter .id = 7 update { age := 200 }";
-        let (h2, lits2) = canonicalize(q2).unwrap();
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
@@ -1267,12 +1388,19 @@ mod tests {
     fn test_insert_substitution() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"insert User { id := 1, name := "Alice", age := 20 }"#;
-        let (h1, lits1) = canonicalize(q1).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
+        cache.insert(
+            h1,
+            canon_h1.clone(),
+            planner::plan(q1).unwrap(),
+            lits1.len(),
+        );
 
         let q2 = r#"insert User { id := 2, name := "Bob", age := 30 }"#;
-        let (h2, lits2) = canonicalize(q2).unwrap();
-        let plan = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
+        let plan = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         let mut found = Vec::new();
         collect_literals_for_test(&plan, &mut found);
@@ -1293,7 +1421,7 @@ mod tests {
     fn test_insert_uuid_sugar_cacheable_and_substitutes() {
         let mut cache = PlanCache::new(100);
         let q1 = r#"insert User { id := uuid("00000000-0000-0000-0000-000000000001") }"#;
-        let (h1, lits1) = canonicalize(q1).unwrap();
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
         assert_eq!(lits1.len(), 1, "the inner string is the only literal");
         let plan = planner::plan(q1).unwrap();
         assert_eq!(
@@ -1301,13 +1429,15 @@ mod tests {
             1,
             "Cast wrapping a Literal is a reachable substitution slot"
         );
-        cache.insert(h1, plan, lits1.len());
+        cache.insert(h1, canon_h1.clone(), plan, lits1.len());
         assert!(!cache.is_empty(), "uuid() insert must be cacheable");
 
         let q2 = r#"insert User { id := uuid("00000000-0000-0000-0000-000000000002") }"#;
-        let (h2, lits2) = canonicalize(q2).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
         assert_eq!(h1, h2, "same shape hashes identically");
-        let subst = cache.get_with_substitution(h2, &lits2).expect("hit");
+        let subst = cache
+            .get_with_substitution(h2, &canon_h2, &lits2)
+            .expect("hit");
 
         let mut found = Vec::new();
         collect_literals_for_test(&subst, &mut found);
@@ -1328,7 +1458,7 @@ mod tests {
     fn test_two_arg_cast_uuid_not_cached() {
         let mut cache = PlanCache::new(100);
         let q = r#"User filter .id = cast(.other, "uuid")"#;
-        let (h, lits) = canonicalize(q).unwrap();
+        let (h, canon_h, lits) = canonicalize_with_form(q).unwrap();
         assert_eq!(
             lits.len(),
             1,
@@ -1340,7 +1470,7 @@ mod tests {
             0,
             "the cast target is baked into the AST, not a slot"
         );
-        cache.insert(h, plan, lits.len());
+        cache.insert(h, canon_h.clone(), plan, lits.len());
         assert!(cache.is_empty(), "cast(x, \"uuid\") must not be cached");
     }
 
@@ -1354,13 +1484,28 @@ mod tests {
         // Use a different shape to force eviction.
         let q3_distinct = "User filter .id = 5";
 
-        let (h1, lits1) = canonicalize(q1).unwrap();
-        let (h2, lits2) = canonicalize(q2).unwrap();
-        let (h3, lits3) = canonicalize(q3_distinct).unwrap();
-        cache.insert(h1, planner::plan(q1).unwrap(), lits1.len());
-        cache.insert(h2, planner::plan(q2).unwrap(), lits2.len());
+        let (h1, canon_h1, lits1) = canonicalize_with_form(q1).unwrap();
+        let (h2, canon_h2, lits2) = canonicalize_with_form(q2).unwrap();
+        let (h3, canon_h3, lits3) = canonicalize_with_form(q3_distinct).unwrap();
+        cache.insert(
+            h1,
+            canon_h1.clone(),
+            planner::plan(q1).unwrap(),
+            lits1.len(),
+        );
+        cache.insert(
+            h2,
+            canon_h2.clone(),
+            planner::plan(q2).unwrap(),
+            lits2.len(),
+        );
         // Cache full → inserting a third *new* shape should clear.
-        cache.insert(h3, planner::plan(q3_distinct).unwrap(), lits3.len());
+        cache.insert(
+            h3,
+            canon_h3.clone(),
+            planner::plan(q3_distinct).unwrap(),
+            lits3.len(),
+        );
         assert!(cache.cache.contains_key(&h3));
         assert_eq!(cache.cache.len(), 1);
     }

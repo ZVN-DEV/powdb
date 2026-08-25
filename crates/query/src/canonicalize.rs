@@ -36,19 +36,71 @@ use crate::token::Token;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-#[inline]
-fn hash_byte(mut h: u64, b: u8) -> u64 {
-    h ^= b as u64;
-    h = h.wrapping_mul(FNV_PRIME);
-    h
+/// The canonical-stream consumer the token fold writes into.
+///
+/// A 64-bit FNV-1a key alone is not enough to serve a cached plan: FNV is
+/// non-cryptographic, so colliding shapes are constructible by anyone who
+/// can submit query text, and a collision would execute the *other* shape's
+/// plan — a silent wrong answer. The cache therefore stores the canonical
+/// byte stream next to each plan and re-compares it on every hit
+/// ([`crate::plan_cache::PlanCache::get_with_substitution`]).
+///
+/// Making the fold generic over this sink keeps one token→bytes mapping for
+/// both consumers: `u64` folds the hash only (shape-hash users like log
+/// redaction pay zero allocation), while [`HashAndBytes`] additionally
+/// records the exact bytes the hash covers. The per-token match arms are
+/// untouched either way, so the two can never drift apart.
+trait CanonSink: Sized {
+    fn put(self, b: u8) -> Self;
+    /// Bulk form of [`CanonSink::put`]; sinks that record bytes override it
+    /// to copy the slice in one memcpy instead of a byte at a time.
+    #[inline(always)]
+    fn put_slice(mut self, bytes: &[u8]) -> Self {
+        for b in bytes {
+            self = self.put(*b);
+        }
+        self
+    }
 }
 
-#[inline]
-fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
-    for b in bytes {
-        h = hash_byte(h, *b);
+impl CanonSink for u64 {
+    #[inline(always)]
+    fn put(mut self, b: u8) -> Self {
+        self ^= b as u64;
+        self.wrapping_mul(FNV_PRIME)
     }
-    h
+}
+
+/// Sink that folds the FNV-1a hash AND keeps the bytes it covered.
+struct HashAndBytes {
+    hash: u64,
+    bytes: Vec<u8>,
+}
+
+impl CanonSink for HashAndBytes {
+    #[inline(always)]
+    fn put(mut self, b: u8) -> Self {
+        self.hash = self.hash.put(b);
+        self.bytes.push(b);
+        self
+    }
+
+    #[inline(always)]
+    fn put_slice(mut self, bytes: &[u8]) -> Self {
+        self.hash = self.hash.put_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
+        self
+    }
+}
+
+#[inline(always)]
+fn hash_byte<S: CanonSink>(h: S, b: u8) -> S {
+    h.put(b)
+}
+
+#[inline(always)]
+fn hash_bytes<S: CanonSink>(h: S, bytes: &[u8]) -> S {
+    h.put_slice(bytes)
 }
 
 /// Lex `input`, hash the canonicalised token stream, and collect literal
@@ -58,6 +110,24 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 /// hit, [`crate::plan_cache::PlanCache::get_with_substitution`] re-binds the
 /// new literals into the cached plan.
 pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
+    let (hash, literals) = canonicalize_into(input, FNV_OFFSET)?;
+    Ok((hash, literals))
+}
+
+/// [`canonicalize`], additionally returning the canonical byte stream the
+/// hash covers. The plan cache stores these bytes next to the plan and
+/// re-compares them on every hit, so a 64-bit hash collision degrades to a
+/// cache miss (replan from source) instead of executing the wrong plan.
+pub fn canonicalize_with_form(input: &str) -> Result<(u64, Vec<u8>, Vec<Literal>), LexError> {
+    let sink = HashAndBytes {
+        hash: FNV_OFFSET,
+        bytes: Vec::with_capacity(input.len()),
+    };
+    let (sink, literals) = canonicalize_into(input, sink)?;
+    Ok((sink.hash, sink.bytes, literals))
+}
+
+fn canonicalize_into<S: CanonSink>(input: &str, sink: S) -> Result<(S, Vec<Literal>), LexError> {
     let tokens = lex(input)?;
     // Normalize `offset <lit> limit <lit>` → `limit <lit> offset <lit>`.
     // The planner always builds the same plan shape for both orderings
@@ -69,7 +139,7 @@ pub fn canonicalize(input: &str) -> Result<(u64, Vec<Literal>), LexError> {
     // normalized token stream collapses the two orderings to one entry
     // and keeps the literal vector in `[limit_lit, offset_lit]` order.
     let tokens = normalize_limit_offset_order(tokens);
-    let mut hash = FNV_OFFSET;
+    let mut hash = sink;
     // Most queries hold 0-3 literals; we pre-size to avoid allocation
     // churn on the bench's tight loops.
     let mut literals: Vec<Literal> = Vec::with_capacity(4);
@@ -170,7 +240,7 @@ fn normalize_limit_offset_order(mut tokens: Vec<Token>) -> Vec<Token> {
 /// Any other token after `->` is malformed and rejected by the parser; here
 /// it just contributes its ordinary shape tag (with no literal push) so the
 /// cache key stays deterministic.
-fn hash_path_segment(h: u64, tok: &Token) -> u64 {
+fn hash_path_segment<S: CanonSink>(h: S, tok: &Token) -> S {
     match tok {
         Token::Ident(s) => {
             let h = hash_byte(h, 0x08);
@@ -195,7 +265,7 @@ fn hash_path_segment(h: u64, tok: &Token) -> u64 {
     }
 }
 
-fn hash_token(h: u64, tok: &Token, literals: &mut Vec<Literal>) -> u64 {
+fn hash_token<S: CanonSink>(h: S, tok: &Token, literals: &mut Vec<Literal>) -> S {
     match tok {
         // Identifiers — hash tag + length + bytes so two queries with
         // different identifiers (e.g. `User` vs `Order`) get different
