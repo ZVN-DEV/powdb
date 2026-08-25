@@ -60,9 +60,10 @@ pub fn apply_retained_tail(
         .segment_identity()
         .lineage_matches(expected_identity)
     {
-        return Err(invalid_input(
-            "replica sync identity does not match retained tail history",
-        ));
+        return Err(crate::SyncError::IdentityMismatch(
+            "replica sync identity does not match retained tail history".into(),
+        )
+        .into());
     }
     catalog.ensure_no_pending_wal_records()?;
     if through_lsn < since_lsn {
@@ -162,9 +163,10 @@ pub fn seed_retained_apply_boundary(
         .segment_identity()
         .lineage_matches(expected_identity)
     {
-        return Err(invalid_input(
-            "replica sync identity does not match retained tail history",
-        ));
+        return Err(crate::SyncError::IdentityMismatch(
+            "replica sync identity does not match retained tail history".into(),
+        )
+        .into());
     }
     write_complete_apply_state(data_dir, expected_identity, safe_lsn, safe_lsn)
 }
@@ -189,9 +191,10 @@ pub fn apply_retained_units_chunk(
         .segment_identity()
         .lineage_matches(expected_identity)
     {
-        return Err(invalid_input(
-            "replica sync identity does not match retained tail history",
-        ));
+        return Err(crate::SyncError::IdentityMismatch(
+            "replica sync identity does not match retained tail history".into(),
+        )
+        .into());
     }
     catalog.ensure_no_pending_wal_records()?;
 
@@ -381,17 +384,19 @@ fn reconcile_apply_state(
         {
             return Ok(current_lsn);
         }
-        return Err(invalid_data(
-            "another retained-tail apply is in progress for this replica",
-        ));
+        return Err(crate::SyncError::ApplyInProgress(
+            "another retained-tail apply is in progress for this replica".into(),
+        )
+        .into());
     }
     if current_lsn == state.through_lsn {
         return Ok(current_lsn);
     }
     if current_lsn != state.applied_lsn {
-        return Err(invalid_data(
-            "local retained-tail apply state requires repair before retry",
-        ));
+        return Err(crate::SyncError::ApplyStateRequiresRepair(
+            "local retained-tail apply state requires repair before retry".into(),
+        )
+        .into());
     }
     write_in_progress_apply_state(
         catalog.data_dir(),
@@ -446,9 +451,10 @@ fn ensure_retained_chunk_start_boundary(
     since_lsn: u64,
 ) -> io::Result<()> {
     let Some(state) = read_apply_state(catalog.data_dir())? else {
-        return Err(invalid_data(format!(
+        return Err(crate::SyncError::UntrustedApplyBoundary(format!(
             "retained chunk start LSN {since_lsn} has no trusted local apply boundary"
-        )));
+        ))
+        .into());
     };
     state.validate()?;
     if !state.identity().lineage_matches(expected_identity) {
@@ -457,9 +463,10 @@ fn ensure_retained_chunk_start_boundary(
         ));
     }
     if state.applied_lsn != since_lsn {
-        return Err(invalid_data(format!(
+        return Err(crate::SyncError::UntrustedApplyBoundary(format!(
             "retained chunk start LSN {since_lsn} is not a trusted completed apply boundary"
-        )));
+        ))
+        .into());
     }
     // An InProgress record whose `applied_lsn` matches is the crash shape
     // where the intent never touched the catalog: `applied_lsn` carries the
@@ -677,11 +684,11 @@ fn noop_summary(since_lsn: u64, through_lsn: u64) -> RetainedTailApplySummary {
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+    crate::SyncError::InvalidRequest(message.into()).into()
 }
 
 fn invalid_data(message: impl ToString) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+    crate::SyncError::CorruptState(message.to_string()).into()
 }
 
 #[cfg(test)]
@@ -1085,6 +1092,14 @@ mod tests {
         assert!(
             err.to_string().contains("requires repair before retry"),
             "advanced catalog LSN without complete apply-state must fail closed, got: {err}"
+        );
+        let typed = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<crate::SyncError>());
+        assert!(
+            matches!(typed, Some(crate::SyncError::ApplyStateRequiresRepair(_))),
+            "hosts must be able to branch on the refusal without matching \
+             rendered text, got {typed:?}"
         );
     }
 

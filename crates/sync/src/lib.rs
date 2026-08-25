@@ -7,6 +7,7 @@
 
 pub mod apply;
 pub mod checkpoint;
+pub mod error;
 pub mod metadata;
 pub mod replica;
 pub mod retention;
@@ -22,6 +23,7 @@ pub use checkpoint::{
     checkpoint_with_retained_segments, open_preserving_retained_segments, retained_segments_dir,
     SyncCatalog, RETAINED_SEGMENTS_DIR,
 };
+pub use error::SyncError;
 pub use metadata::{
     minimum_retained_lsn, open_or_create_identity, read_identity, read_identity_snapshot,
     read_identity_snapshot_if_exists, read_replica_cursors, register_bootstrap_cursor,
