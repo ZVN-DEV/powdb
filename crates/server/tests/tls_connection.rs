@@ -108,6 +108,7 @@ async fn start_tls_server(
                             users: std::sync::Arc::new(powdb_auth::UserStore::new()),
                             shutdown_rx: &mut rx,
                             idle_timeout: Duration::from_secs(300),
+                            preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
                             query_timeout: Duration::from_secs(30),
                             rate_limiter: None,
                             peer_addr: Some(peer),

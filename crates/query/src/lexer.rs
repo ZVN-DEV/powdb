@@ -134,7 +134,17 @@ impl std::error::Error for LexError {}
 /// assert_eq!(tokens[2], Token::DotIdent("age".to_string()));
 /// ```
 pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
+    lex_with_spans(input).map(|(tokens, _)| tokens)
+}
+
+/// [`lex`], additionally returning each token's char offset in `input` (the
+/// `at position` coordinate system every lexer diagnostic already uses). The
+/// parser threads these through so its own errors can say WHERE they
+/// happened; `lex` stays span-free so hot callers (canonicalization, the
+/// plan-cache key path) pay nothing.
+pub fn lex_with_spans(input: &str) -> Result<(Vec<Token>, Vec<usize>), LexError> {
     let mut tokens = Vec::new();
+    let mut spans: Vec<usize> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0;
 
@@ -152,6 +162,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             continue;
         }
+
+        // Every recognizer below starts at the current char, so this is the
+        // span recorded for whatever token(s) this iteration emits.
+        let token_start = pos;
 
         // Backtick-quoted dot-ident: .`field name` — lets a reserved word be
         // used as a field reference in filter/order/project positions.
@@ -176,6 +190,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             pos += 1; // closing backtick
             tokens.push(Token::DotIdent(name));
+            spans.push(token_start);
             continue;
         }
 
@@ -202,6 +217,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             pos += 1; // closing backtick
             tokens.push(Token::Ident(name));
+            spans.push(token_start);
             continue;
         }
 
@@ -217,6 +233,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             let name: String = chars[start..pos].iter().collect();
             tokens.push(Token::DotIdent(name));
+            spans.push(token_start);
             continue;
         }
 
@@ -229,6 +246,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
             let name: String = chars[start..pos].iter().collect();
             tokens.push(Token::Param(name));
+            spans.push(token_start);
             continue;
         }
 
@@ -282,6 +300,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 });
             }
             tokens.push(Token::StringLit(s));
+            spans.push(token_start);
             continue;
         }
 
@@ -311,6 +330,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     position: start,
                 })?;
                 tokens.push(Token::FloatLit(value));
+                spans.push(token_start);
             } else {
                 let s: String = chars[start..pos].iter().collect();
                 let value = s.parse::<i64>().map_err(|_| LexError {
@@ -318,6 +338,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                     position: start,
                 })?;
                 tokens.push(Token::IntLit(value));
+                spans.push(token_start);
             }
             continue;
         }
@@ -429,6 +450,7 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
                 _ => Token::Ident(word),
             };
             tokens.push(token);
+            spans.push(token_start);
             continue;
         }
 
@@ -438,31 +460,37 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             match two.as_str() {
                 ":=" => {
                     tokens.push(Token::Assign);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
                 "->" => {
                     tokens.push(Token::Arrow);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
                 "!=" => {
                     tokens.push(Token::Neq);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
                 "<=" => {
                     tokens.push(Token::Lte);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
                 ">=" => {
                     tokens.push(Token::Gte);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
                 "??" => {
                     tokens.push(Token::Coalesce);
+                    spans.push(token_start);
                     pos += 2;
                     continue;
                 }
@@ -495,11 +523,13 @@ pub fn lex(input: &str) -> Result<Vec<Token>, LexError> {
             }
         };
         tokens.push(token);
+        spans.push(token_start);
         pos += 1;
     }
 
     tokens.push(Token::Eof);
-    Ok(tokens)
+    spans.push(chars.len());
+    Ok((tokens, spans))
 }
 
 /// Split a PowQL source string into individual statements on top-level `;`,

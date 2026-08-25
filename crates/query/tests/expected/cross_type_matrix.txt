@@ -621,9 +621,9 @@ c_json    =    int_2          0
 c_json    =    int_neg        0
 c_json    =    float_1_0      0
 c_json    =    float_1_5      0
-c_json    =    str_1          0
-c_json    =    str_a          0
-c_json    =    str_empty      0
+c_json    =    str_1          1
+c_json    =    str_a          ERR(invalid JSON compared with json column 'c_json': invalid JSON: unexpected character 'a')
+c_json    =    str_empty      ERR(invalid JSON compared with json column 'c_json': invalid JSON: unexpected end of input)
 c_json    =    bool_true      0
 c_json    =    bool_false     0
 c_json    =    null           1
@@ -635,9 +635,9 @@ c_json    !=   int_2          1
 c_json    !=   int_neg        1
 c_json    !=   float_1_0      1
 c_json    !=   float_1_5      1
-c_json    !=   str_1          1
-c_json    !=   str_a          1
-c_json    !=   str_empty      1
+c_json    !=   str_1          0
+c_json    !=   str_a          ERR(invalid JSON compared with json column 'c_json': invalid JSON: unexpected character 'a')
+c_json    !=   str_empty      ERR(invalid JSON compared with json column 'c_json': invalid JSON: unexpected end of input)
 c_json    !=   bool_true      1
 c_json    !=   bool_false     1
 c_json    !=   null           1
@@ -649,9 +649,9 @@ c_json    <    int_2          0
 c_json    <    int_neg        0
 c_json    <    float_1_0      0
 c_json    <    float_1_5      0
-c_json    <    str_1          0
-c_json    <    str_a          0
-c_json    <    str_empty      0
+c_json    <    str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    <    str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    <    str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    <    bool_true      0
 c_json    <    bool_false     0
 c_json    <    null           0
@@ -663,9 +663,9 @@ c_json    <=   int_2          0
 c_json    <=   int_neg        0
 c_json    <=   float_1_0      0
 c_json    <=   float_1_5      0
-c_json    <=   str_1          0
-c_json    <=   str_a          0
-c_json    <=   str_empty      0
+c_json    <=   str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    <=   str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    <=   str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    <=   bool_true      0
 c_json    <=   bool_false     0
 c_json    <=   null           0
@@ -677,9 +677,9 @@ c_json    >    int_2          1
 c_json    >    int_neg        1
 c_json    >    float_1_0      1
 c_json    >    float_1_5      1
-c_json    >    str_1          1
-c_json    >    str_a          1
-c_json    >    str_empty      1
+c_json    >    str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    >    str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    >    str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >    bool_true      1
 c_json    >    bool_false     1
 c_json    >    null           0
@@ -691,9 +691,9 @@ c_json    >=   int_2          1
 c_json    >=   int_neg        1
 c_json    >=   float_1_0      1
 c_json    >=   float_1_5      1
-c_json    >=   str_1          1
-c_json    >=   str_a          1
-c_json    >=   str_empty      1
+c_json    >=   str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    >=   str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
+c_json    >=   str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >=   bool_true      1
 c_json    >=   bool_false     1
 c_json    >=   null           0

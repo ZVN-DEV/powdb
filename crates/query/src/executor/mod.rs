@@ -6,7 +6,7 @@ mod eval;
 pub mod mem_budget;
 
 use crate::ast::*;
-use crate::canonicalize::canonicalize;
+use crate::canonicalize::canonicalize_with_form;
 use crate::plan::*;
 use crate::plan_cache::PlanCache;
 use crate::planner;
@@ -1151,12 +1151,12 @@ impl Engine {
         if !tracing::enabled!(Level::INFO) {
             // D9: try the plan cache first. Canonicalisation lexes the
             // query once; on a hit we skip the parser and planner entirely.
-            if let Ok((hash, literals)) = canonicalize(input) {
+            if let Ok((hash, canonical, literals)) = canonicalize_with_form(input) {
                 let cached = self
                     .plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .get_with_substitution(hash, &literals);
+                    .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
                     let plan = self.lower(&plan);
                     let result = self.execute_lowered(&plan);
@@ -1177,7 +1177,7 @@ impl Engine {
                 self.plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .insert(hash, raw, literals.len());
+                    .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
                 if !self.in_transaction {
                     self.catalog
@@ -1259,7 +1259,8 @@ impl Engine {
             .map_err(|e| QueryError::Parse(e.to_string()))?;
 
         if !tracing::enabled!(Level::INFO) {
-            if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+            if let Ok((hash, canonical, literals)) = canonicalize_with_form(&parsed.canonical_powql)
+            {
                 let hash = if crate::sql::statement_has_aggregate(&parsed.statement) {
                     sql_raw_cache_hash(hash)
                 } else {
@@ -1269,7 +1270,7 @@ impl Engine {
                     .plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .get_with_substitution(hash, &literals);
+                    .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
                     let plan = self.lower(&plan);
                     let result = self.execute_lowered(&plan);
@@ -1285,7 +1286,7 @@ impl Engine {
                 self.plan_cache
                     .lock()
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                    .insert(hash, raw, literals.len());
+                    .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
                 if !self.in_transaction {
                     self.catalog
@@ -1316,7 +1317,7 @@ impl Engine {
             return Err(QueryError::ReadonlyNeedsWrite);
         }
 
-        if let Ok((hash, literals)) = canonicalize(&parsed.canonical_powql) {
+        if let Ok((hash, canonical, literals)) = canonicalize_with_form(&parsed.canonical_powql) {
             let hash = if crate::sql::statement_has_aggregate(&parsed.statement) {
                 sql_raw_cache_hash(hash)
             } else {
@@ -1326,7 +1327,7 @@ impl Engine {
                 .plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .get_with_substitution(hash, &literals);
+                .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
                 let plan = self.lower(&plan);
                 return self.execute_plan_readonly(&plan);
@@ -1335,7 +1336,7 @@ impl Engine {
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, raw, literals.len());
+                .insert(hash, canonical, raw, literals.len());
             return self.execute_plan_readonly(&plan);
         }
 
@@ -1502,12 +1503,12 @@ impl Engine {
         // Try the plan cache first — identical hash scheme to
         // `execute_powql` so both paths share cache state. The mutex
         // section is just a hashmap lookup + plan clone.
-        if let Ok((hash, literals)) = canonicalize(input) {
+        if let Ok((hash, canonical, literals)) = canonicalize_with_form(input) {
             let cached = self
                 .plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .get_with_substitution(hash, &literals);
+                .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
                 let plan = self.lower(&plan);
                 return self.execute_plan_readonly(&plan);
@@ -1518,7 +1519,7 @@ impl Engine {
             self.plan_cache
                 .lock()
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
-                .insert(hash, raw, literals.len());
+                .insert(hash, canonical, raw, literals.len());
             return self.execute_plan_readonly(&plan);
         }
         // Lex error — fall through to the planner for a consistent error

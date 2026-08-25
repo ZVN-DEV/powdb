@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 powdb-query = { path = ".." }
 powdb-storage = { path = "../../storage" }
 powdb-server = { path = "../../server" }
+powdb-sync = { path = "../../sync" }
 
 # Prevent this from being discovered by the workspace
 [workspace]
@@ -67,5 +68,17 @@ doc = false
 [[bin]]
 name = "fuzz_catalog_open"
 path = "fuzz_targets/fuzz_catalog_open.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sync_segment"
+path = "fuzz_targets/fuzz_sync_segment.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_btree_open"
+path = "fuzz_targets/fuzz_btree_open.rs"
 test = false
 doc = false

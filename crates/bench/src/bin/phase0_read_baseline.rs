@@ -464,6 +464,7 @@ async fn start_server(engine: Engine, gate_permits: u32) -> BenchServer {
                                 users,
                                 shutdown_rx: &mut connection_shutdown,
                                 idle_timeout: Duration::from_secs(60),
+                                preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
                                 query_timeout: Duration::from_secs(30),
                                 rate_limiter: None,
                                 peer_addr: Some(peer),

@@ -214,3 +214,142 @@ fn user_auth_ignores_shared_password_when_users_present() {
         AuthOutcome::Rejected
     );
 }
+
+// ---- The full role × statement matrix ----
+
+/// One sample statement per [`Statement`] variant. The match is exhaustive
+/// with no wildcard, so adding a Statement variant fails compilation here
+/// until the matrix below gains a sample for it — the matrix cannot rot
+/// silently as the language grows.
+fn variant_key(stmt: &powdb_query::ast::Statement) -> &'static str {
+    use powdb_query::ast::Statement as S;
+    match stmt {
+        S::Query(_) => "Query",
+        S::Insert(_) => "Insert",
+        S::UpdateQuery(_) => "UpdateQuery",
+        S::DeleteQuery(_) => "DeleteQuery",
+        S::CreateType(_) => "CreateType",
+        S::CreateLink(_) => "CreateLink",
+        S::AlterTable(_) => "AlterTable",
+        S::DropTable(_) => "DropTable",
+        S::CreateView(_) => "CreateView",
+        S::RefreshView(_) => "RefreshView",
+        S::DropView(_) => "DropView",
+        S::Union(_) => "Union",
+        S::Upsert(_) => "Upsert",
+        S::Explain(_) => "Explain",
+        S::Begin => "Begin",
+        S::Commit => "Commit",
+        S::Rollback => "Rollback",
+        S::ListTypes => "ListTypes",
+        S::Describe(_) => "Describe",
+        S::ListLinks => "ListLinks",
+    }
+}
+
+/// Every builtin role (plus an unknown role and the no-principal legacy
+/// path) against one sample of every statement variant, with the exact
+/// allow/deny expectation written out. Pinned behaviors worth reading:
+/// transactions (`begin`/`commit`/`rollback`) classify as writes, so a
+/// readonly principal cannot open even a read-only explicit transaction —
+/// transactions gate the writer lock; and an unknown role fails closed to
+/// reads exactly like `readonly`.
+#[test]
+fn the_full_role_by_statement_matrix() {
+    // (statement, is it permitted for: admin, readwrite, readonly/unknown)
+    // The no-principal path permits everything (pre-RBAC compatibility).
+    let matrix: Vec<(&str, bool, bool, bool)> = vec![
+        // reads: everyone
+        ("User", true, true, true),
+        ("User union User", true, true, true),
+        ("explain User", true, true, true),
+        ("schema", true, true, true),
+        ("describe User", true, true, true),
+        ("schema links", true, true, true),
+        // row mutations: Write
+        (r#"insert User { name := "x" }"#, true, true, false),
+        (
+            "User filter .id = 1 update { name := \"y\" }",
+            true,
+            true,
+            false,
+        ),
+        ("User filter .id = 1 delete", true, true, false),
+        ("upsert User on .id { id := 1 }", true, true, false),
+        // explain of a mutation needs the mutation's permission
+        (r#"explain insert User { name := "x" }"#, true, true, false),
+        // transactions: classified as writes (they gate the writer lock)
+        ("begin", true, true, false),
+        ("commit", true, true, false),
+        ("rollback", true, true, false),
+        // DDL: Ddl (readwrite includes Ddl by design — an application tier
+        // owns its own schema)
+        ("type T { id: int }", true, true, false),
+        (
+            "link User.orders -> Order on id = user_id",
+            true,
+            true,
+            false,
+        ),
+        ("alter User add column status: str", true, true, false),
+        ("drop User", true, true, false),
+        ("materialized V as User", true, true, false),
+        ("refresh V", true, true, false),
+        ("drop view V", true, true, false),
+    ];
+
+    let mut covered = std::collections::BTreeSet::new();
+    for (q, admin_ok, rw_ok, ro_ok) in &matrix {
+        let stmt = parsed(q);
+        covered.insert(variant_key(&stmt));
+        for (role, expect_ok) in [
+            ("admin", *admin_ok),
+            ("readwrite", *rw_ok),
+            ("readonly", *ro_ok),
+            // Unknown roles fail closed: reads only, like readonly.
+            ("ghost", *ro_ok),
+        ] {
+            let p = principal(role);
+            let outcome = check_statement_permitted(p.as_ref(), &stmt);
+            assert_eq!(
+                outcome.is_ok(),
+                expect_ok,
+                "role {role} on `{q}`: expected permitted={expect_ok}, got {outcome:?}"
+            );
+        }
+        // Legacy shared-password / open mode: no principal, full access.
+        assert!(
+            check_statement_permitted(None, &stmt).is_ok(),
+            "no-principal must permit `{q}`"
+        );
+    }
+
+    // Every Statement variant must appear in the matrix at least once.
+    // (`variant_key`'s exhaustive match forces this list to grow with the
+    // language; this assertion forces the matrix to follow.)
+    let all = [
+        "Query",
+        "Insert",
+        "UpdateQuery",
+        "DeleteQuery",
+        "CreateType",
+        "CreateLink",
+        "AlterTable",
+        "DropTable",
+        "CreateView",
+        "RefreshView",
+        "DropView",
+        "Union",
+        "Upsert",
+        "Explain",
+        "Begin",
+        "Commit",
+        "Rollback",
+        "ListTypes",
+        "Describe",
+        "ListLinks",
+    ];
+    for key in all {
+        assert!(covered.contains(key), "no matrix sample parses to {key}");
+    }
+}

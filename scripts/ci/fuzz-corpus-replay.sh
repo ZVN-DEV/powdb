@@ -32,7 +32,7 @@ FUZZ_CRATE_DIR="${REPO_ROOT}/crates/query"
 SEEDS_DIR="${FUZZ_CRATE_DIR}/fuzz/seeds"
 
 FUZZ_TOOLCHAIN="${FUZZ_TOOLCHAIN:-nightly}"
-DEFAULT_TARGETS="fuzz_lexer fuzz_parser fuzz_roundtrip fuzz_sql fuzz_pj1 fuzz_wire fuzz_wal_replay fuzz_execute fuzz_catalog_open"
+DEFAULT_TARGETS="fuzz_lexer fuzz_parser fuzz_roundtrip fuzz_sql fuzz_pj1 fuzz_wire fuzz_wal_replay fuzz_execute fuzz_catalog_open fuzz_sync_segment fuzz_btree_open"
 TARGETS="${FUZZ_TARGETS:-${DEFAULT_TARGETS}}"
 
 FAILURES=0

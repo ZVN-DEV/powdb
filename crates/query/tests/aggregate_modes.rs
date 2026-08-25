@@ -182,7 +182,9 @@ fn symmetric_provenance_survives_nested_outer_and_multi_joins() {
         .iter()
         .find(|row| row[0] == Value::Int(99))
         .expect("orphan right row");
-    assert_eq!(orphan[1], Value::Int(0));
+    // The orphan's only `a.balance` input is the null-extended side, so its
+    // sum is Empty (SQL NULL) — not zero — as of v0.27.
+    assert_eq!(orphan[1], Value::Empty);
 
     engine
         .execute_powql("type Tag { id: int, entry_id: int }")
@@ -275,12 +277,14 @@ fn symmetric_nullable_hash_joins_match_raw_inner_and_outer_semantics() {
             Value::Int(20)
         );
     }
+    // Right row 12 matches nothing on the left: its group sums zero numeric
+    // inputs, which is Empty (SQL NULL) as of v0.27.
     assert_eq!(
         right_rows
             .iter()
             .find(|row| row[0] == Value::Int(12))
             .unwrap()[1],
-        Value::Int(0)
+        Value::Empty
     );
 }
 

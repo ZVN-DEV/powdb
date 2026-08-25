@@ -143,12 +143,19 @@ impl Engine {
                         }
                     );
                     if matches!(function, AggFunc::Sum) {
-                        // Clamping to i64::MAX here used to report a plausible
-                        // number for a total that never happened. The generic
-                        // paths raise the same error via `NumericAgg::sum`.
-                        let total =
-                            i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?;
-                        QueryResult::Scalar(Value::Int(total))
+                        if count == 0 {
+                            // No numeric row contributed: Empty (SQL NULL),
+                            // matching avg and the generic NumericAgg::sum.
+                            QueryResult::Scalar(Value::Empty)
+                        } else {
+                            // Clamping to i64::MAX here used to report a
+                            // plausible number for a total that never
+                            // happened. The generic paths raise the same
+                            // error via `NumericAgg::sum`.
+                            let total =
+                                i64::try_from(sum_i128).map_err(|_| agg_overflow_error("sum"))?;
+                            QueryResult::Scalar(Value::Int(total))
+                        }
                     } else if count == 0 {
                         QueryResult::Scalar(Value::Empty)
                     } else {
@@ -230,6 +237,7 @@ impl Engine {
                     // issue on long scans we can upgrade to Kahan–Neumaier
                     // compensated sum (~2x scalar cost, zero error growth).
                     let mut sum: f64 = 0.0;
+                    let mut count: i64 = 0;
                     agg_float_loop!(
                         self,
                         table,
@@ -239,9 +247,18 @@ impl Engine {
                         body_data_offset,
                         |v: f64| {
                             sum += v;
+                            count += 1;
                         }
                     );
-                    QueryResult::Scalar(Value::Float(sum))
+                    if count == 0 {
+                        // Empty (SQL NULL), matching avg and NumericAgg::sum.
+                        // Before this check the float loop answered 0.0 while
+                        // the generic path answered Int(0) for the same
+                        // question.
+                        QueryResult::Scalar(Value::Empty)
+                    } else {
+                        QueryResult::Scalar(Value::Float(sum))
+                    }
                 }
                 AggFunc::Avg => {
                     let mut sum: f64 = 0.0;

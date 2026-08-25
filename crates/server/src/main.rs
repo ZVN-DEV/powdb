@@ -456,6 +456,7 @@ async fn run_connection<S>(
             users,
             shutdown_rx: &mut shutdown_rx,
             idle_timeout,
+            preauth_deadline: handler::DEFAULT_PREAUTH_DEADLINE,
             query_timeout,
             rate_limiter: Some(&rate_limiter),
             peer_addr,

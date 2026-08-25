@@ -545,6 +545,8 @@ count(distinct User { .age })
 | `min` | Minimum value | `min(Table { .field })` |
 | `max` | Maximum value | `max(Table { .field })` |
 
+`sum`, `avg`, `min`, and `max` ignore null (`empty`) inputs, and when no non-null value contributes at all (no rows, or every value null) they return `empty`, not zero. This matches SQL's `SUM`/`AVG`/`MIN`/`MAX` over an empty set: "no rows" and "a total of zero" are different answers. `count` is the aggregate that answers `0` for no rows.
+
 For `sum`, `avg`, `min`, and `max`, the target expression is specified via the projection. For `count`, the projection is optional and it changes the question being asked: `count(Table)` counts rows, while `count(Table { .field })` counts rows whose `.field` is not null. `count(distinct Table { .field })` counts unique non-null values. The expression may be a stored field, a computed value, or a JSON path:
 
 ```powql
@@ -1472,6 +1474,22 @@ insert Post {
   data := "{\"author\": {\"name\": \"Ada\"}, \"tags\": [\"db\", \"powql\"], \"views\": 12}"
 }
 ```
+
+### Whole-document equality
+
+A json column compares against a string literal as a *document*: the literal
+is parsed and canonicalized exactly as it would be on insert, so key order
+and whitespace in the literal do not matter, and a literal that is not valid
+JSON is a typed error rather than an empty result.
+
+```
+Post filter .data = "{ \"views\": 12, \"author\": {\"name\": \"Ada\"} }"
+# matches documents equal to {"author":{"name":"Ada"},"views":12}
+```
+
+Only `=` and `!=` compare documents; ordered comparisons (`<`, `>`, ...)
+between a json column and text are refused. Scalars inside a document
+compare through `->` paths and `json_text`.
 
 ### Path extraction with `->`
 

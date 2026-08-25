@@ -226,8 +226,17 @@ fn parse_error_display_is_byte_exact_for_every_variant() {
             ParseError::UnexpectedToken {
                 expected: "identifier".into(),
                 got: "'}'".into(),
+                position: None,
             },
             "expected identifier, got '}'".into(),
+        ),
+        (
+            ParseError::UnexpectedToken {
+                expected: "identifier".into(),
+                got: "'}'".into(),
+                position: Some(12),
+            },
+            "at position 12: expected identifier, got '}'".into(),
         ),
         (
             ParseError::NestingDepthExceeded { max: 64 },
@@ -242,8 +251,16 @@ fn parse_error_display_is_byte_exact_for_every_variant() {
         (
             ParseError::Syntax {
                 message: "trailing comma in projection".into(),
+                position: None,
             },
             "trailing comma in projection".into(),
+        ),
+        (
+            ParseError::Syntax {
+                message: "trailing comma in projection".into(),
+                position: Some(31),
+            },
+            "at position 31: trailing comma in projection".into(),
         ),
     ];
     for (error, expected) in cases {
@@ -255,6 +272,41 @@ fn parse_error_display_is_byte_exact_for_every_variant() {
 fn parse_error_message_matches_display() {
     let error = ParseError::Syntax {
         message: "bad".into(),
+        position: None,
     };
     assert_eq!(error.message(), error.to_string());
+}
+
+/// A parse failure names WHERE it happened. The position is the char offset
+/// of the token the parser was looking at when it gave up — the same
+/// coordinate system the lexer's own `at position` diagnostics use, and the
+/// same allowlisted wire prefix.
+#[test]
+fn parse_errors_carry_the_failing_position() {
+    // `filter` cannot start a statement's tail here: the parser fails at
+    // `xyzzy`, char offset 22.
+    let err = powdb_query::parser::parse("User filter .id = 1 { xyzzy: }").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("at position "),
+        "PowQL parse errors must lead with the position, got: {msg}"
+    );
+
+    // End-of-input failures point at the end of the text.
+    let err = powdb_query::parser::parse("User filter .id =").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("at position 17: "),
+        "EOF failures point past the last char, got: {msg}"
+    );
+
+    // The SQL frontend reports positions in its own source text too — from
+    // the parser, not just the lexer (`FROM` at offset 7 is a valid token in
+    // an invalid place).
+    let err = powdb_query::sql::parse_sql("SELECT FROM t").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with("at position "),
+        "SQL parse errors must lead with the position, got: {msg}"
+    );
 }

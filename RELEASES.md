@@ -153,3 +153,81 @@ A brand-new package or crate name cannot use Trusted Publishing for its FIRST
 publish, because the registry only lets you configure a trusted publisher on a
 name that already exists. Bootstrap it once by hand, then configure. See
 docs/ci/trusted-publishing.md.
+
+## Yank / Rollback Runbook
+
+For when a shipped release turns out to carry a data-loss, corruption, or
+security bug. Precedent: v0.4.1–v0.4.3 (crash-recovery data loss), yanked and
+noted at the top of this file.
+
+**Decide first: yank, or fix forward?** Yank only when installing the version
+actively harms users (data loss, corruption, unopenable data dirs, security).
+For ordinary bugs, ship the fix as a patch release and skip this section — a
+yank breaks every lockfile that pins the version, which is its own harm.
+
+The steps, in order (stop the bleeding at the installs first, then annotate):
+
+```
+[ ] crates.io — yank ALL EIGHT crates at the bad version, not just the buggy
+    one (inter-crate deps pin the workspace version, so a partial yank
+    strands the rest):
+
+      for c in powdb-storage powdb-auth powdb-query powdb-sync powdb-backup \
+               powdb-server powdb powdb-cli; do
+        cargo yank --version X.Y.Z "$c"
+      done
+
+    Yanking is NOT covered by OIDC trusted publishing: it needs `cargo login`
+    with a real crates.io token scoped to yank. Mint one for the operation and
+    revoke it immediately after (standing policy: no stored registry tokens).
+    Yanked versions stay downloadable for existing lockfiles; new resolution
+    skips them. `cargo yank --undo` reverses a mistaken yank.
+
+[ ] npm — you cannot yank, and unpublish is restricted after 72 hours.
+    Deprecate instead, per package:
+
+      npm deprecate @zvndev/powdb-client@X.Y.Z  "DATA-LOSS BUG — use X.Y.Z+1; see CHANGELOG"
+      npm deprecate @zvndev/powdb-embedded@X.Y.Z "..."
+      npm deprecate @zvndev/powdb-sync@X.Y.Z     "..."
+
+    Like yank, deprecation needs an authenticated npm session (OIDC covers
+    publish only). Mint, use, revoke.
+
+[ ] Docker — ghcr tags cannot be yanked. Repoint `latest` at the previous
+    good release so new pulls stop getting the bad build:
+
+      docker pull ghcr.io/zvn-dev/powdb:vPREV
+      docker tag  ghcr.io/zvn-dev/powdb:vPREV ghcr.io/zvn-dev/powdb:latest
+      docker push ghcr.io/zvn-dev/powdb:latest
+
+    Leave the bad `vX.Y.Z` tag in place (deleting it breaks reproducibility
+    for anyone diagnosing the incident) — the release-notes warning below is
+    what marks it.
+
+[ ] GitHub Release — edit the vX.Y.Z release notes to LEAD with a warning
+    block naming the bug, the affected surface, and the fixed version. Mark
+    the release as a pre-release (`gh release edit vX.Y.Z --prerelease`) so it
+    loses the "Latest" badge. NEVER delete the tag: publish.yml's tag-match
+    guard and the cross-version compat CI leg both depend on released tags
+    being immutable history.
+
+[ ] Fly example (if it was deployed): redeploy the previous good version.
+
+[ ] Annotate: add the version to the yanked-versions note at the top of this
+    file (the v0.4.x block is the template), and give CHANGELOG.md's entry
+    for the bad version a **YANKED** header line stating why.
+
+[ ] Ship the fixed release. The fix release's smoke run
+    (post-publish-smoke.yml) is what closes the incident — verify each
+    registry directly, same as a normal release.
+
+[ ] Verify the rollback took: `cargo info <crate>` / the crates.io page shows
+    the version yanked, `npm view <pkg>@X.Y.Z deprecated` prints the message,
+    and `docker pull ghcr.io/zvn-dev/powdb:latest` resolves to the previous
+    good digest.
+```
+
+What NOT to do: never `npm unpublish` a version something depends on, never
+delete git tags or GitHub Releases, never force-push over a release commit,
+and never reuse a version number — the fix is always a NEW version, even if
+the bad one was live for five minutes.

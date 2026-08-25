@@ -54,6 +54,15 @@ use self::wire::{
     WireResultMode, MAX_WIRE_PAYLOAD_SIZE, WRITE_TIMEOUT,
 };
 
+/// Hard ceiling on the whole pre-auth phase of a connection — waiting for
+/// CONNECT, pre-auth Pings included. Ten seconds mirrors the TLS handshake
+/// timeout (`main.rs::TLS_HANDSHAKE_TIMEOUT`): both bound how long an
+/// unauthenticated peer may hold a connection slot. Load-balancer health
+/// checks (connect, ping, close) fit comfortably; a checker that holds one
+/// pre-auth connection open and pings forever does not, by design — it must
+/// reconnect per check.
+pub const DEFAULT_PREAUTH_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Options for a single connection, bundled to keep `handle_connection`'s
 /// argument list short.
 pub struct ConnOpts<'a> {
@@ -68,6 +77,10 @@ pub struct ConnOpts<'a> {
     pub users: Arc<UserStore>,
     pub shutdown_rx: &'a mut watch::Receiver<bool>,
     pub idle_timeout: Duration,
+    /// Ceiling on the whole pre-auth phase (see [`DEFAULT_PREAUTH_DEADLINE`]).
+    /// Before it existed, every pre-auth Ping reset the idle timer, so an
+    /// unauthenticated peer could hold a connection slot forever.
+    pub preauth_deadline: Duration,
     pub query_timeout: Duration,
     pub rate_limiter: Option<&'a AuthRateLimiter>,
     pub peer_addr: Option<std::net::SocketAddr>,
@@ -117,6 +130,7 @@ async fn serve_connection<R, W>(
         users,
         shutdown_rx,
         idle_timeout,
+        preauth_deadline,
         query_timeout,
         rate_limiter,
         peer_addr,
@@ -134,8 +148,13 @@ async fn serve_connection<R, W>(
     // Accept Ping messages before authentication so load balancers can
     // health-check without completing a full CONNECT handshake.
     // Uses the smaller pre-auth payload limit (4 KB) to prevent memory abuse.
+    // One deadline covers the whole pre-auth phase. Pings answer within it
+    // but never extend it: the idle timer used to restart on every Ping, so
+    // an unauthenticated peer could hold a connection slot forever.
+    let preauth_cutoff = Instant::now() + preauth_deadline;
     let connect_msg = loop {
-        match tokio::time::timeout(idle_timeout, Message::read_from_preauth(reader)).await {
+        let read_wait = idle_timeout.min(preauth_cutoff.saturating_duration_since(Instant::now()));
+        match tokio::time::timeout(read_wait, Message::read_from_preauth(reader)).await {
             Ok(Ok(Some(Message::Ping))) => {
                 debug!(peer = %peer, "pre-auth ping");
                 if !write_msg(writer, &Message::Pong).await {
@@ -153,7 +172,11 @@ async fn serve_connection<R, W>(
                 return;
             }
             Err(_) => {
-                warn!(peer = %peer, "idle timeout waiting for CONNECT");
+                if Instant::now() >= preauth_cutoff {
+                    warn!(peer = %peer, "pre-auth deadline expired waiting for CONNECT");
+                } else {
+                    warn!(peer = %peer, "idle timeout waiting for CONNECT");
+                }
                 return;
             }
         }

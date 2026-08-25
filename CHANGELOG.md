@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Parse errors now say where.** PowQL and SQL parser failures
+  (`expected X, got Y` and syntax refusals) lead with the same
+  `at position N:` prefix the lexer's diagnostics always had, where `N` is
+  the char offset of the token the parser stopped on. Error text that
+  previously had no location is otherwise unchanged, and errors raised from
+  synthesized token streams (no source text) stay position-free.
+
+- **A json column now compares against a string literal as a document.** The
+  literal is parsed and canonicalized exactly as on insert, so
+  `filter .j = "{ \"b\": 2, \"a\": 1 }"` matches `{"a":1,"b":2}`
+  regardless of key order or whitespace. Before, `Value` equality's strict
+  typing made every such filter silently return nothing. A literal that is
+  not valid JSON is now a typed error before any row is read, and ordered
+  comparisons (`<`, `>`, ...) between a json column and text are refused
+  rather than silently false. The corresponding oracle ledger entry
+  (`json-column-never-equals-a-string-literal`) is retired: the differential
+  oracle now holds PowDB to SQLite's answer on canonical-text equality.
+
+- **`sum` over zero non-null values now returns null, matching SQL and
+  PowDB's own `avg`.** Before, "no rows" and "a total of zero" were the same
+  answer: the generic and compiled-int paths said `0`, the compiled float
+  path said `0.0`, and every one of them disagreed with `avg` (already null)
+  and with SQL's `SUM`. This applies to PowQL `sum(...)`, SQL `SUM(...)`,
+  grouped and windowed sums, and sums over outer-join groups whose inputs are
+  entirely null-extended. `count` still answers `0` for no rows. If you
+  relied on the old default, wrap the aggregate:
+  `coalesce(sum(x), 0)` in SQL. The corresponding entry has left the oracle
+  divergence ledger: the differential oracle now holds PowDB to SQLite's
+  answer here.
+
 ## [0.26.0] - 2026-08-23
 
 **The audit round: the findings from the 2026-08-22 gold-standard audit.**

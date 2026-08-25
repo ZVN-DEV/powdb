@@ -679,25 +679,15 @@ fn agg_sum_avg_int(b: &mut Builder, rng: &mut Rng, n: usize) {
     }
 }
 
-/// The `agg_sum_avg_int` twin, with PowDB's empty-sum rule spelled in SQLite's
-/// own language so the shape can carry no ledger entry at all.
-///
-/// `agg_sum_avg_int` has one accepted difference: PowDB's `sum` over an input
-/// with no numeric rows answers `Int(0)` where SQL answers NULL. An entry is
-/// keyed on (shape, pair, fixture), so that one reason blankets every case in
-/// the shape, and an integer total that is merely *wrong* is absorbed by it
-/// without changing anything a gate can see.
-///
-/// This shape closes that. SQLite is told PowDB's rule with
-/// `coalesce(sum(..), 0)`, exactly as [`order_asc_nulls_last`] tells SQLite
-/// PowDB's NULLS LAST rule with a leading `col IS NULL` key. The empty-input
-/// difference then cannot arise, the shape needs no entry, and every remaining
-/// difference is arithmetic: a total that is off by any amount, on any input,
-/// is unexplained and fails.
-///
-/// `avg` is included untouched and needs no such treatment, because PowDB
-/// already answers `Empty` (SQL's NULL) over no numeric rows. It polices the
-/// divisor, which `sum` alone would not.
+/// The `agg_sum_avg_int` twin. Until v0.27 PowDB's `sum` over an input with
+/// no numeric rows answered `Int(0)` where SQL answers NULL; that divergence
+/// was ledgered on the plain shape, and this twin spelled PowDB's zero rule
+/// in SQLite's own language (`coalesce(sum(..), 0)`) so at least the
+/// arithmetic stayed gated. PowDB now answers `Empty` (SQL's NULL) itself —
+/// the ledger entry is gone, the coalesce is gone, and this twin is a plain
+/// re-run of the comparison. It stays in the list because removing it would
+/// shift every later shape's shared-RNG draws and reshuffle the recorded
+/// divergence profile for reasons that have nothing to do with the engine.
 ///
 /// The column pool includes the required `id`, whose values are dense, unique
 /// and never null, so at least one case per fixture aggregates an input that is
@@ -711,13 +701,7 @@ fn agg_sum_avg_int_zero_default(b: &mut Builder, rng: &mut Rng, n: usize) {
         let col = *rng.pick(&cols);
         let f = if rng.chance(1, 2) { "sum" } else { "avg" };
         let (fp, fs, fq, params) = maybe_filter(rng);
-        // Only `sum` needs the zero default. Wrapping `avg` too would invent a
-        // difference rather than remove one: both engines already answer NULL.
-        let reference = if f == "sum" {
-            format!("coalesce(sum({}), 0)", col.name)
-        } else {
-            format!("avg({})", col.name)
-        };
+        let reference = format!("{f}({})", col.name);
         b.push(Case {
             shape: "agg_sum_avg_int_zero_default",
             powql: format!("{f}({TABLE}{fp} {{ .{} }})", col.name),
@@ -1000,9 +984,10 @@ fn json_path_filter(b: &mut Builder, rng: &mut Rng, n: usize) {
     }
 }
 
-/// Equality against a whole json column. PowDB compares canonical PJ1 bytes;
-/// SQLite compares the stored text. Both sides are given the same canonical
-/// text, so they are asking the same question.
+/// Equality against a whole json column. PowDB parses the string literal to
+/// canonical PJ1 and compares documents (since v0.27); SQLite compares the
+/// stored text. Both sides are given the same canonical text, so they are
+/// asking the same question and must agree.
 fn json_whole_column_eq(b: &mut Builder, rng: &mut Rng, n: usize) {
     for _ in 0..n {
         let col = COLUMNS

@@ -94,6 +94,7 @@ fn is_ddl_statement(stmt: &powdb_query::ast::Statement) -> bool {
     matches!(
         inner,
         Statement::CreateType(_)
+            | Statement::CreateLink(_)
             | Statement::AlterTable(_)
             | Statement::DropTable(_)
             | Statement::CreateView(_)
