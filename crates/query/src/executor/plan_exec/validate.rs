@@ -661,13 +661,45 @@ fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)>
 /// cannot compare, e.g. `.name > 25` on a `str` column, which used to return
 /// every row. Mirrors the message `insert` already produces for the same class
 /// of mistake.
-fn comparison_type_error(left: &Expr, right: &Expr, ctx: &ColumnScope) -> Option<String> {
+fn comparison_type_error(
+    left: &Expr,
+    op: BinOp,
+    right: &Expr,
+    ctx: &ColumnScope,
+) -> Option<String> {
     let (column, literal) = match (left, right) {
         (column, Expr::Literal(literal)) => (column, literal),
         (Expr::Literal(literal), column) => (column, literal),
         _ => return None,
     };
     let (name, type_id) = comparable_column(column, ctx)?;
+    // A string literal against a json column compares as a document: the
+    // literal is parsed and canonicalized exactly as it would be on insert
+    // (`eval::coerce_value`), so `.j = "{ \"a\": 1 }"` matches regardless
+    // of key order or whitespace. That makes an unparseable literal a typed
+    // error here, before any row is read — the alternative was the silent
+    // empty result the oracle ledger carried as
+    // `json-column-never-equals-a-string-literal`. Ordered comparisons stay
+    // refused: documents have no order against text. Non-string literals
+    // against a json column keep today's strict inequality (a doc never
+    // equals a bare int/bool literal); scalars inside documents compare via
+    // `->` paths and `json_text`.
+    if type_id == TypeId::Json {
+        if let Literal::String(text) = literal {
+            if !matches!(op, BinOp::Eq | BinOp::Neq) {
+                return Some(format!(
+                    "cannot order json column '{name}' against a string; documents \
+                     compare with = and != only (use -> or json_text for scalars)"
+                ));
+            }
+            if let Err(e) = powdb_storage::pj1::parse_json_text(text) {
+                return Some(format!(
+                    "invalid JSON compared with json column '{name}': {e}"
+                ));
+            }
+        }
+        return None;
+    }
     let column_class = column_class(type_id);
     let literal_class = literal_class(literal);
     if column_class == TypeClass::Other || column_class == literal_class {
@@ -825,7 +857,7 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                 op,
                 BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
             ) {
-                if let Some(message) = comparison_type_error(left, right, ctx) {
+                if let Some(message) = comparison_type_error(left, *op, right, ctx) {
                     return Err(QueryError::Execution(message));
                 }
             }

@@ -1217,6 +1217,24 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             _ => ordering != O::Less,
         });
     }
+    // A json document against a string compares as a document (either
+    // orientation): the text is parsed to canonical PJ1 and byte-compared,
+    // the same coercion `coerce_value` applies on insert. Statement literals
+    // that fail to parse were already rejected by
+    // `validate_column_references`; a runtime-typed string that is not JSON
+    // (a cast, a scalar function result) simply equals no document. Only
+    // `=` / `!=` coerce — documents have no order against text, and
+    // validation refuses those shapes up front.
+    if matches!(op, BinOp::Eq | BinOp::Neq) {
+        if let (Value::Json(doc), Value::Str(text)) | (Value::Str(text), Value::Json(doc)) =
+            (left, right)
+        {
+            let eq = powdb_storage::pj1::parse_json_text(text)
+                .map(|canonical| canonical.as_slice() == &doc[..])
+                .unwrap_or(false);
+            return Value::Bool(if op == BinOp::Eq { eq } else { !eq });
+        }
+    }
     match op {
         BinOp::Eq => Value::Bool(left == right),
         BinOp::Neq => Value::Bool(left != right),

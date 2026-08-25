@@ -1475,6 +1475,22 @@ insert Post {
 }
 ```
 
+### Whole-document equality
+
+A json column compares against a string literal as a *document*: the literal
+is parsed and canonicalized exactly as it would be on insert, so key order
+and whitespace in the literal do not matter, and a literal that is not valid
+JSON is a typed error rather than an empty result.
+
+```
+Post filter .data = "{ \"views\": 12, \"author\": {\"name\": \"Ada\"} }"
+# matches documents equal to {"author":{"name":"Ada"},"views":12}
+```
+
+Only `=` and `!=` compare documents; ordered comparisons (`<`, `>`, ...)
+between a json column and text are refused. Scalars inside a document
+compare through `->` paths and `json_text`.
+
 ### Path extraction with `->`
 
 The `->` operator walks into a JSON document by object key or array index. It

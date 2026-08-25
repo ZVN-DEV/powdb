@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A json column now compares against a string literal as a document.** The
+  literal is parsed and canonicalized exactly as on insert, so
+  `filter .j = "{ \"b\": 2, \"a\": 1 }"` matches `{"a":1,"b":2}`
+  regardless of key order or whitespace. Before, `Value` equality's strict
+  typing made every such filter silently return nothing. A literal that is
+  not valid JSON is now a typed error before any row is read, and ordered
+  comparisons (`<`, `>`, ...) between a json column and text are refused
+  rather than silently false. The corresponding oracle ledger entry
+  (`json-column-never-equals-a-string-literal`) is retired: the differential
+  oracle now holds PowDB to SQLite's answer on canonical-text equality.
+
 - **`sum` over zero non-null values now returns null, matching SQL and
   PowDB's own `avg`.** Before, "no rows" and "a total of zero" were the same
   answer: the generic and compiled-int paths said `0`, the compiled float

@@ -984,9 +984,10 @@ fn json_path_filter(b: &mut Builder, rng: &mut Rng, n: usize) {
     }
 }
 
-/// Equality against a whole json column. PowDB compares canonical PJ1 bytes;
-/// SQLite compares the stored text. Both sides are given the same canonical
-/// text, so they are asking the same question.
+/// Equality against a whole json column. PowDB parses the string literal to
+/// canonical PJ1 and compares documents (since v0.27); SQLite compares the
+/// stored text. Both sides are given the same canonical text, so they are
+/// asking the same question and must agree.
 fn json_whole_column_eq(b: &mut Builder, rng: &mut Rng, n: usize) {
     for _ in 0..n {
         let col = COLUMNS

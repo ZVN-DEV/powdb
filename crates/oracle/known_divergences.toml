@@ -55,15 +55,8 @@ id = "like-is-case-sensitive"
 shape = "like_ascii_case"
 pair = "powql_vs_sqlite"
 reason = "SQLite's default LIKE folds ASCII case (a LIKE A is true); PowDB's LIKE compares characters as they are, which is what PostgreSQL LIKE does. Only ASCII case folding differs: the like_wildcard_only shape uses patterns with no ASCII letter and carries no entry, and it confirms that % and _ arity, UTF-8 character counting for _, and literal matching of multi-byte text all agree exactly."
-owner = "crates/query/src/executor/eval.rs:1313"
+owner = "crates/query/src/executor/eval.rs:1331"
 anchor = "p[pi] == '_' || p[pi] == t[ti]"
-
-[[divergence]]
-id = "json-column-never-equals-a-string-literal"
-shape = "json_whole_column_eq"
-pair = "powql_vs_sqlite"
-reason = "PowDB's Value equality is strictly typed, so a json column compared against a string literal is false for every row: `filter .j = \"{}\"` returns nothing, silently, with no type error. SQLite compares the stored JSON text and matches. Recorded, not excused: this is an open correctness question (either the literal should be coerced to json or the comparison should be a typed error) and it is reported as a probable engine bug rather than fixed here, because the fix is a semantics decision outside this lane."
-owner = "crates/storage/src/types.rs:126"
 
 [[divergence]]
 id = "sql-string-literals-take-backslash-escapes"
