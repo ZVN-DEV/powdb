@@ -828,6 +828,34 @@ jobs:
   # matrix — asan, miri, MSRV, ts-client, secret-scan, audit, examples-smoke —
   # actually blocks merges instead of running green-or-red beside an unguarded
   # required set. Add new jobs to the `needs` list below when you add them.
+  testing-feature-guard:
+    name: testing-feature guard (no test instrumentation in shipped builds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: testing-feature-guard
+
+      # The selftest proves the detector can fire (on the dev-unified tree,
+      # where `testing` is legitimately on) before the real check certifies
+      # the shipped artifacts clean — a detector that cannot fire is not a
+      # gate.
+      - name: Prove the detector can fire
+        run: bash scripts/ci/testing-feature-guard.sh --selftest
+
+      - name: Check every shipped artifact
+        run: bash scripts/ci/testing-feature-guard.sh
+
   ci-success:
     name: ci-success
     runs-on: ubuntu-24.04
@@ -854,6 +882,7 @@ jobs:
       - audit
       - deny
       - internal-content-guard
+      - testing-feature-guard
     steps:
       - name: Verify every required job succeeded
         env:
