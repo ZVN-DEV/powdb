@@ -262,12 +262,92 @@ impl InprocServer {
 // Real-binary process helpers
 // ---------------------------------------------------------------------------
 
-/// Grab an ephemeral port the OS just confirmed is free, then release it so
-/// the server can bind it. Small TOCTOU window, standard for spawn-a-server
-/// tests.
-pub fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+/// Sequence number for unique per-spawn port files.
+static PORT_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Spawn the real `powdb-server` binary on an OS-assigned port (`--port 0` +
+/// `--port-file`) and return it together with the port it actually bound.
+///
+/// Never probe a free port and re-bind it: ephemeral ports are machine-global,
+/// so with many test binaries spawning servers concurrently the released port
+/// can be handed to another test's server and this test's connection lands on
+/// a listener that is about to be killed (the `wire_error_class_from_type`
+/// ConnectionReset flake on CI). Letting the server bind port 0 and report the
+/// result removes the race entirely.
+pub fn spawn_server_bound_env(
+    data_dir: &std::path::Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (Child, u16) {
+    let (child, port, _) = spawn_server_bound_inner(data_dir, extra_args, extra_env, false);
+    (child, port)
+}
+
+/// [`spawn_server_bound_env`] without extra environment variables.
+pub fn spawn_server_bound(data_dir: &std::path::Path, extra_args: &[&str]) -> (Child, u16) {
+    spawn_server_bound_env(data_dir, extra_args, &[])
+}
+
+/// [`spawn_server_bound_env`] plus a metrics endpoint on its own OS-assigned
+/// port; returns `(child, port, metrics_port)`.
+pub fn spawn_server_bound_with_metrics(
+    data_dir: &std::path::Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (Child, u16, u16) {
+    let (child, port, metrics) = spawn_server_bound_inner(data_dir, extra_args, extra_env, true);
+    (
+        child,
+        port,
+        metrics.expect("metrics endpoint was requested"),
+    )
+}
+
+fn spawn_server_bound_inner(
+    data_dir: &std::path::Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+    metrics: bool,
+) -> (Child, u16, Option<u16>) {
+    let seq = PORT_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let port_file =
+        std::env::temp_dir().join(format!("powdb_test_ports_{}_{seq}", std::process::id()));
+    let port_file_arg = port_file.to_str().unwrap().to_string();
+    let mut args: Vec<&str> = vec!["--port-file", &port_file_arg];
+    if metrics {
+        args.extend(["--metrics-addr", "127.0.0.1:0"]);
+    }
+    args.extend_from_slice(extra_args);
+    let mut child = spawn_server_bin_env(0, data_dir, &args, extra_env);
+
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            // The write is atomic (write + rename), so any readable content
+            // is complete.
+            let mut port = None;
+            let mut metrics_port = None;
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("port=") {
+                    port = v.parse::<u16>().ok();
+                } else if let Some(v) = line.strip_prefix("metrics=") {
+                    metrics_port = v.parse::<u16>().ok();
+                }
+            }
+            let port = port.expect("port file must carry the bound port");
+            std::fs::remove_file(&port_file).ok();
+            return (child, port, metrics_port);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            std::fs::remove_file(&port_file).ok();
+            panic!("powdb-server exited before publishing its bound port: {status}");
+        }
+        assert!(
+            start.elapsed() <= Duration::from_secs(30),
+            "powdb-server did not publish its bound port within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Spawn the real `powdb-server` binary on `port`/`data_dir` with any extra

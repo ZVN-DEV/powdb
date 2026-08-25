@@ -357,11 +357,11 @@ fn fsync_dir(_dir: &Path) -> io::Result<()> {
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
+    crate::SyncError::CorruptState(message.into()).into()
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+    crate::SyncError::InvalidRequest(message.into()).into()
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@
 //! These tests run the same queries over the same data directory through both
 //! transports and demand byte-identical JSON.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -27,9 +27,42 @@ fn server_bin() -> Option<std::path::PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    l.local_addr().unwrap().port()
+/// Spawn `powdb-server` on an OS-assigned port (`--port 0` + `--port-file`)
+/// and return the child with the port it actually bound. Probing a free port
+/// and re-binding it races every other concurrently spawned server on the
+/// machine; asking the server to report its port does not.
+fn spawn_server_bound(mut cmd: Command) -> (Child, u16) {
+    let port_file = std::env::temp_dir().join(format!(
+        "powdb_cli_ports_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cmd.args(["--port", "0", "--port-file", port_file.to_str().unwrap()]);
+    let mut child = cmd.spawn().expect("failed to spawn powdb-server");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&port_file) {
+            if let Some(port) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("port=")?.parse::<u16>().ok())
+            {
+                let _ = std::fs::remove_file(&port_file);
+                return (child, port);
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = std::fs::remove_file(&port_file);
+            panic!("powdb-server exited before publishing its bound port: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "powdb-server did not publish its bound port within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_port(port: u16) {
@@ -128,13 +161,11 @@ fn embedded_and_remote_json_are_identical() {
     );
     assert_eq!(embedded_scalar, r#"{"value":1}"#);
 
-    let port = free_port();
-    let child = Command::new(server)
-        .args(["--data-dir", &data_s, "--port", &port.to_string()])
+    let mut cmd = Command::new(server);
+    cmd.args(["--data-dir", &data_s])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn powdb-server");
+        .stderr(Stdio::null());
+    let (child, port) = spawn_server_bound(cmd);
     let _guard = ServerGuard(child);
     wait_for_port(port);
     let addr = format!("127.0.0.1:{port}");

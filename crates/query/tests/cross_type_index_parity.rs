@@ -751,9 +751,9 @@ fn an_index_never_changes_a_cross_type_answer_through_the_sql_frontend() {
 /// `src/executor/`. A future ninth site therefore fails the build instead of
 /// silently regressing.
 ///
-/// `tests.rs` is excluded because the crate's own unit tests build plans
-/// deliberately, including deliberately unlowered ones, in order to test the
-/// lowering pass itself.
+/// The `tests/` module is excluded because the crate's own unit tests build
+/// plans deliberately, including deliberately unlowered ones, in order to
+/// test the lowering pass itself.
 #[test]
 fn no_execution_entry_point_can_receive_an_unlowered_plan() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -763,7 +763,15 @@ fn no_execution_entry_point_can_receive_an_unlowered_plan() {
     let mut sites: Vec<String> = Vec::new();
     let mut files = 0usize;
     visit_rust_files(&root, &mut |path| {
-        if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+        // The unit-test module (`executor/tests/`) is not executor source.
+        let in_unit_tests = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            == Some("tests");
+        if in_unit_tests {
             return;
         }
         files += 1;
@@ -848,7 +856,15 @@ fn the_only_public_plan_entry_point_lowers_what_it_is_given() {
     // the recursion targets are correctly not counted here.
     let mut public: Vec<String> = Vec::new();
     visit_rust_files(&root, &mut |path| {
-        if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+        // The unit-test module (`executor/tests/`) is not executor source.
+        let in_unit_tests = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            == Some("tests");
+        if in_unit_tests {
             return;
         }
         let text = std::fs::read_to_string(path).expect("executor source is readable");

@@ -311,7 +311,7 @@ fn retained_lag_bytes(dir: &Path, applied_lsn: u64, remote_lsn: u64) -> io::Resu
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+    crate::SyncError::InvalidRequest(message.into()).into()
 }
 
 #[cfg(test)]

@@ -20,7 +20,7 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    encode_connect, encode_query, free_port, read_response, send_sigkill, spawn_server_bin_env,
+    encode_connect, encode_query, read_response, send_sigkill, spawn_server_bound_env,
     wait_for_bind, wait_with_timeout,
 };
 use powdb_server::protocol::Message;
@@ -36,10 +36,8 @@ const MAX_INSERTS: usize = 200;
 #[tokio::test]
 async fn sigkill_mid_write_preserves_every_acknowledged_insert() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-
     // Boot the real binary in full-durability mode (explicit, see header).
-    let mut child = spawn_server_bin_env(port, tmp.path(), &[], &[("POWDB_SYNC_MODE", "full")]);
+    let (mut child, port) = spawn_server_bound_env(tmp.path(), &[], &[("POWDB_SYNC_MODE", "full")]);
     let mut stream = wait_for_bind(port, Duration::from_secs(20)).await;
 
     stream.write_all(&encode_connect("testdb")).await.unwrap();
@@ -101,8 +99,9 @@ async fn sigkill_mid_write_preserves_every_acknowledged_insert() {
 
     // Restart on the same data dir: the server must come up cleanly (WAL
     // replay) and serve every acknowledged row.
-    let mut child2 = spawn_server_bin_env(port, tmp.path(), &[], &[("POWDB_SYNC_MODE", "full")]);
-    let mut s2 = wait_for_bind(port, Duration::from_secs(20)).await;
+    let (mut child2, port2) =
+        spawn_server_bound_env(tmp.path(), &[], &[("POWDB_SYNC_MODE", "full")]);
+    let mut s2 = wait_for_bind(port2, Duration::from_secs(20)).await;
     s2.write_all(&encode_connect("testdb")).await.unwrap();
     assert_eq!(
         read_response(&mut s2).await[0],

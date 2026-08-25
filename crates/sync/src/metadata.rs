@@ -795,11 +795,11 @@ fn fsync_dir(_dir: &Path) -> io::Result<()> {
 }
 
 fn invalid_input(message: impl ToString) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
+    crate::SyncError::InvalidRequest(message.to_string()).into()
 }
 
 fn invalid_data(message: impl ToString) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+    crate::SyncError::CorruptState(message.to_string()).into()
 }
 
 #[cfg(test)]

@@ -51,6 +51,11 @@ struct Args {
     require_tls: bool,
     /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
     metrics_addr: Option<String>,
+    /// When set, write the actually-bound listener ports here after startup
+    /// (`port=N`, plus `metrics=N` when the metrics endpoint is on). Pairs
+    /// with `--port 0` so a supervisor or test harness can let the OS pick
+    /// the port without racing to re-bind a probed one.
+    port_file: Option<String>,
     /// Filesystem path for an optional Unix-domain-socket listener; `None` =
     /// off. Additive: the TCP listener always runs. UDS removes the TCP/IP
     /// stack from the same-host path (~2× lower round-trip latency).
@@ -223,6 +228,10 @@ fn parse_args() -> Args {
         .filter(|s| !s.is_empty());
     // Optional Unix-domain-socket path. Off unless set.
     let mut socket: Option<String> = std::env::var("POWDB_SOCKET").ok().filter(|s| !s.is_empty());
+    // Optional bound-port report file. Off unless set.
+    let mut port_file: Option<String> = std::env::var("POWDB_PORT_FILE")
+        .ok()
+        .filter(|s| !s.is_empty());
     // Per-query memory budget; env-only (no CLI flag).
     let query_memory_limit =
         parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
@@ -345,6 +354,14 @@ fn parse_args() -> Args {
                 }
                 socket = Some(argv[i].clone());
             }
+            "--port-file" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--port-file requires a value");
+                    std::process::exit(2);
+                }
+                port_file = Some(argv[i].clone());
+            }
             "--readonly" => {
                 read_only = true;
             }
@@ -372,6 +389,7 @@ fn parse_args() -> Args {
                 println!("        --tx-wait-timeout-ms <MS>  Max wait for a concurrent explicit transaction before BEGIN fails (default: 5000)");
                 println!("        --db-name <NAME>       Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
+                println!("        --port-file <PATH>     Write the bound listener ports to PATH after startup (use with --port 0)");
                 println!("        --readonly             Serve the data directory read-only (snapshot serving; mutations are refused)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
@@ -390,6 +408,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_DIRTY_PAGE_BUDGET    Ceiling in bytes on unflushed heap pages inside an explicit transaction (default: 256 MiB)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
+                println!("    POWDB_PORT_FILE            Write the bound listener ports here after startup (use with --port 0)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
                 println!("    POWDB_READONLY             Serve read-only (snapshot serving) when truthy (1/true/yes/on)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
@@ -420,6 +439,7 @@ fn parse_args() -> Args {
         dirty_page_budget,
         require_tls,
         metrics_addr,
+        port_file,
         socket,
         db_name,
         read_only,
@@ -778,6 +798,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // The address actually bound — identical to `addr` unless the OS chose
+    // the port (`--port 0`); logs and the port file report this one.
+    let local_addr = match listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            error!(addr = %addr, error = %e, "failed to read bound address");
+            std::process::exit(1);
+        }
+    };
 
     // Optional metrics endpoint. Construct the registry now (handlers always
     // hold an Arc<Metrics>) and bind eagerly so a port conflict fails fast at
@@ -791,6 +820,14 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+        None => None,
+    };
+    let metrics_local_addr = match metrics_listener.as_ref().map(|l| l.local_addr()) {
+        Some(Ok(a)) => Some(a),
+        Some(Err(e)) => {
+            error!(error = %e, "failed to read bound metrics address");
+            std::process::exit(1);
+        }
         None => None,
     };
 
@@ -814,8 +851,25 @@ async fn main() {
         None => None,
     };
 
+    // Publish the bound ports before announcing readiness, so anything
+    // watching the file connects to a listener that already exists. The
+    // write is atomic (write + rename): a reader never sees a partial file.
+    if let Some(path) = args.port_file.as_deref() {
+        let mut contents = format!("port={}\n", local_addr.port());
+        if let Some(maddr) = metrics_local_addr {
+            contents.push_str(&format!("metrics={}\n", maddr.port()));
+        }
+        let tmp_path = format!("{path}.tmp");
+        let written =
+            std::fs::write(&tmp_path, contents).and_then(|()| std::fs::rename(&tmp_path, path));
+        if let Err(e) = written {
+            error!(path = %path, error = %e, "failed to write port file");
+            std::process::exit(1);
+        }
+    }
+
     info!(
-        addr = %addr, data_dir = %args.data_dir, auth = auth_configured,
+        addr = %local_addr, data_dir = %args.data_dir, auth = auth_configured,
         tls = tls_enabled,
         idle_timeout = args.idle_timeout_secs, query_timeout = args.query_timeout_secs,
         "powdb server listening"
@@ -829,7 +883,7 @@ async fn main() {
     // Spawn the metrics endpoint now that the shutdown channel exists, so it
     // drains with the rest of the server on SIGINT/SIGTERM.
     if let Some(ml) = metrics_listener {
-        if let Some(maddr) = args.metrics_addr.as_deref() {
+        if let Some(maddr) = metrics_local_addr {
             info!(addr = %maddr, "metrics endpoint listening");
         }
         tokio::spawn(serve_metrics(ml, metrics.clone(), shutdown_rx.clone()));

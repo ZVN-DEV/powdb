@@ -338,7 +338,7 @@ materialized views before snapshotting.
 | `POWDB_DIRTY_PAGE_BUDGET` | `268435456` | Ceiling in bytes (256 MiB) on unflushed heap pages held in memory, shared across every table. Inside an explicit transaction those pages cannot be spilled without breaking `rollback`, so a transaction that exceeds the budget is refused with a typed error instead of growing until the process is OOM-killed. Raise it for very large bulk-load transactions, lower it on memory-capped hosts |
 | `POWDB_SOCKET` | *(off)* | Path for an additional Unix-domain-socket listener served alongside the TCP listener |
 | `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
-| `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener. **Unauthenticated**: bind it to localhost or a private network, never the public internet |
+| `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener ([metric reference](https://github.com/ZVN-DEV/powdb/blob/main/docs/metrics.md)). **Unauthenticated**: bind it to localhost or a private network, never the public internet |
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 

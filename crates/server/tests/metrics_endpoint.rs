@@ -10,17 +10,13 @@ use std::process::Child;
 use std::time::Duration;
 
 use common::{
-    encode_connect, encode_query, free_port, read_response, spawn_server_bin, wait_for_bind,
+    encode_connect, encode_query, read_response, spawn_server_bound_with_metrics, wait_for_bind,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn spawn_server(port: u16, metrics_port: u16, data_dir: &std::path::Path) -> Child {
-    spawn_server_bin(
-        port,
-        data_dir,
-        &["--metrics-addr", &format!("127.0.0.1:{metrics_port}")],
-    )
+fn spawn_server(data_dir: &std::path::Path) -> (Child, u16, u16) {
+    spawn_server_bound_with_metrics(data_dir, &[], &[])
 }
 
 /// One-shot HTTP GET against the metrics endpoint; returns the full response.
@@ -37,10 +33,7 @@ async fn scrape(port: u16, path: &str) -> String {
 #[tokio::test]
 async fn metrics_endpoint_reflects_real_queries_and_gauge_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let metrics_port = free_port();
-
-    let mut child = spawn_server(port, metrics_port, tmp.path());
+    let (mut child, port, metrics_port) = spawn_server(tmp.path());
     let mut wire = wait_for_bind(port, Duration::from_secs(20)).await;
     let _ = wait_for_bind(metrics_port, Duration::from_secs(20)).await;
 

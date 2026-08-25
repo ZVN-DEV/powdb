@@ -300,6 +300,7 @@ dependencies = [
  "powdb-storage",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]

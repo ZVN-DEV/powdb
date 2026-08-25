@@ -17,22 +17,20 @@ use std::process::Child;
 use std::time::Duration;
 
 use common::{
-    encode_connect, encode_query, free_port, read_response, send_sigterm, spawn_server_bin,
-    wait_for_bind, wait_with_timeout,
+    encode_connect, encode_query, read_response, send_sigterm, spawn_server_bound, wait_for_bind,
+    wait_with_timeout,
 };
 use tokio::io::AsyncWriteExt;
 
-fn spawn_server(port: u16, data_dir: &std::path::Path) -> Child {
-    spawn_server_bin(port, data_dir, &[])
+fn spawn_server(data_dir: &std::path::Path) -> (Child, u16) {
+    spawn_server_bound(data_dir, &[])
 }
 
 #[tokio::test]
 async fn sigterm_triggers_graceful_drain_and_preserves_committed_data() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-
     // Boot the real server binary on a fresh data dir.
-    let mut child = spawn_server(port, tmp.path());
+    let (mut child, port) = spawn_server(tmp.path());
     let mut stream = wait_for_bind(port, Duration::from_secs(20)).await;
 
     // Connect, define a type, insert + read the ack so the row is durably in
@@ -75,8 +73,8 @@ async fn sigterm_triggers_graceful_drain_and_preserves_committed_data() {
     );
 
     // The committed row must survive a restart on the same data dir.
-    let mut child2 = spawn_server(port, tmp.path());
-    let mut s2 = wait_for_bind(port, Duration::from_secs(20)).await;
+    let (mut child2, port2) = spawn_server(tmp.path());
+    let mut s2 = wait_for_bind(port2, Duration::from_secs(20)).await;
     s2.write_all(&encode_connect("testdb")).await.unwrap();
     assert_eq!(
         read_response(&mut s2).await[0],

@@ -133,6 +133,11 @@ under a released version number, so the crates cannot go first.
     `dry_run` defaults to TRUE on purpose, so it must be spelled out or nothing
     publishes. A dry run is NOT a useful rehearsal here: it fails by design for
     every crate that depends on a workspace version not yet on crates.io.
+    Either way the workflow first runs cargo-semver-checks against the
+    published crates.io baselines and refuses to publish an API change bigger
+    than the version bump allows (the point-release-over-a-break hazard). If
+    it fires on a real release, the bump is wrong: raise the version, do not
+    bypass the check.
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
@@ -153,6 +158,32 @@ A brand-new package or crate name cannot use Trusted Publishing for its FIRST
 publish, because the registry only lets you configure a trusted publisher on a
 name that already exists. Bootstrap it once by hand, then configure. See
 docs/ci/trusted-publishing.md.
+
+## Release Candidates (the rc channel)
+
+A release candidate is a full release built from a `vX.Y.Z-rc.N` tag, so
+every channel sees exactly the bits a final release would, without moving
+anything a default install resolves to. `scripts/ci/release-channel.sh`
+classifies the tag and every publishing job in `release.yml` reads its
+decision; any tag shape other than `X.Y.Z` or `X.Y.Z-rc.N` fails the
+release rather than guessing a channel.
+
+| Channel | Final `vX.Y.Z` | Candidate `vX.Y.Z-rc.N` |
+|---------|----------------|--------------------------|
+| GitHub Release | release, takes the "Latest" badge | **pre-release**, badge untouched; notes are auto-generated (no changelog section is required for an rc) |
+| ghcr.io image | `:vX.Y.Z` + moves `:latest` | `:vX.Y.Z-rc.N` + moves **`:rc`**; `:latest` untouched |
+| npm (`@zvndev/powdb-client`, `@zvndev/powdb-sync`) | dist-tag `latest` | dist-tag **`next`**; `npm install @zvndev/powdb-client` keeps resolving the last final |
+| crates.io (`publish.yml`) | normal version | pre-release version: cargo never resolves it unless a dependent pins it, so `cargo add powdb` is unaffected |
+| Embedded addon (`publish-node-addon.yml`) | dist-tag `latest` | run with the rc version; npm treats the pre-release like any other version under whichever dist-tag the workflow uses |
+
+Cutting one: bump every version to `X.Y.Z-rc.N` (workspace, TS client,
+sync client, addon; `scripts/check-version-consistency.sh` insists they
+agree), tag `vX.Y.Z-rc.N`, push the tag, then run `publish.yml` on the tag as
+usual. Promote by cutting the final `vX.Y.Z` from the same commit plus the
+version bump; nothing is re-tagged or re-labelled, the final artifacts are
+rebuilt from the final tag. A candidate that turns out bad is simply never
+followed by a final: its packages stay published under `next`/`rc` and
+harm nobody, so it needs no yank.
 
 ## Yank / Rollback Runbook
 

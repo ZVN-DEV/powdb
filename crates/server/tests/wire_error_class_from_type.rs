@@ -17,7 +17,7 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    encode_connect, encode_query, free_port, read_response, spawn_server_bin, spawn_server_bin_env,
+    encode_connect, encode_query, read_response, spawn_server_bound, spawn_server_bound_env,
     wait_for_bind, wait_with_timeout,
 };
 use powdb_server::protocol::{decode_error_class, ErrorClass, Message};
@@ -92,8 +92,7 @@ fn assert_class(frame: &[u8], expected: ErrorClass, what: &str) {
 #[tokio::test]
 async fn unique_expression_index_violation_carries_constraint_class() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin(port, tmp.path(), &[]);
+    let (mut child, port) = spawn_server_bound(tmp.path(), &[]);
     let mut stream = connect_ok(port).await;
 
     query_ok(&mut stream, "type Doc { required id: int, data: json }").await;
@@ -126,8 +125,7 @@ async fn unique_expression_index_violation_carries_constraint_class() {
 #[tokio::test]
 async fn unique_column_violation_keeps_constraint_class() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin(port, tmp.path(), &[]);
+    let (mut child, port) = spawn_server_bound(tmp.path(), &[]);
     let mut stream = connect_ok(port).await;
 
     query_ok(&mut stream, "type Uniq { unique u: int }").await;
@@ -155,8 +153,7 @@ async fn unique_column_violation_keeps_constraint_class() {
 #[tokio::test]
 async fn ddl_inside_a_transaction_keeps_execution_class() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin(port, tmp.path(), &[]);
+    let (mut child, port) = spawn_server_bound(tmp.path(), &[]);
     let mut stream = connect_ok(port).await;
 
     query_ok(&mut stream, "type Doomed { required id: int }").await;
@@ -185,9 +182,7 @@ async fn ddl_inside_a_transaction_keeps_execution_class() {
 #[tokio::test]
 async fn transaction_over_the_dirty_page_budget_keeps_limit_class() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin_env(
-        port,
+    let (mut child, port) = spawn_server_bound_env(
         tmp.path(),
         &[],
         &[("POWDB_DIRTY_PAGE_BUDGET", TINY_BUDGET_BYTES)],

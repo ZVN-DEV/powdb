@@ -13,17 +13,15 @@ mod common;
 use std::process::Child;
 use std::time::Duration;
 
-use common::{
-    encode_connect, encode_query, free_port, read_response, spawn_server_bin, wait_for_socket,
-};
+use common::{encode_connect, encode_query, read_response, spawn_server_bound, wait_for_socket};
 use tokio::io::AsyncWriteExt;
 
-fn spawn_server(port: u16, socket: &std::path::Path, data_dir: &std::path::Path) -> Child {
-    spawn_server_bin(
-        port,
+fn spawn_server(socket: &std::path::Path, data_dir: &std::path::Path) -> Child {
+    let (child, _port) = spawn_server_bound(
         data_dir,
         &["--socket", socket.to_str().expect("utf-8 socket path")],
-    )
+    );
+    child
 }
 
 #[tokio::test]
@@ -35,7 +33,7 @@ async fn server_serves_over_unix_socket() {
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let mut child = spawn_server(free_port(), &socket_path, &data_dir);
+    let mut child = spawn_server(&socket_path, &data_dir);
 
     let mut stream = wait_for_socket(&socket_path, Duration::from_secs(10)).await;
 

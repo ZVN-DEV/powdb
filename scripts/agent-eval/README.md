@@ -61,7 +61,7 @@ Each task in `tasks.json` carries one `check`:
 | `ok` | the statement runs successfully (DDL / upsert that has no row output to assert) |
 
 The output extractor in `run.py` mirrors the CLI's print format
-(`crates/cli/src/main.rs` → `print_local_result` / `print_table`): a scalar
+(`crates/cli/src/output.rs` → `print_local_result` / `print_table`): a scalar
 is a lone line; a table is `header` + `---+---` + data rows + `(N rows)`;
 empty results print `(empty set)`; mutations print `N row(s) affected`.
 
