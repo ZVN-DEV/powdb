@@ -65,6 +65,8 @@ jobs:
             fuzz_wal_replay,
             fuzz_execute,
             fuzz_catalog_open,
+            fuzz_sync_segment,
+            fuzz_btree_open,
           ]
     env:
       CARGO_TERM_COLOR: always

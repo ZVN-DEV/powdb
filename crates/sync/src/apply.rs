@@ -356,6 +356,24 @@ fn reconcile_apply_state(
     }
 
     if state.from_lsn != since_lsn || state.through_lsn != through_lsn {
+        // A crash can strand an InProgress intent for a range this call is
+        // not asking about. Two shapes are provably safe to supersede,
+        // because the catalog LSN (recovered by WAL replay) pins exactly
+        // what was durably applied:
+        //  * nothing of the intent applied: the catalog stands at the
+        //    boundary the intent's `applied_lsn` carried forward;
+        //  * all of the intent applied, but the crash landed before the
+        //    state flipped Complete: the catalog stands at the intent's
+        //    target.
+        // In both, `since_lsn == current_lsn` is a trusted boundary and the
+        // stale intent is void. Anything else (a catalog LSN strictly
+        // inside the stranded range, or a caller not starting at the
+        // recovered boundary) stays fail-closed below.
+        if current_lsn == since_lsn
+            && (current_lsn == state.applied_lsn || current_lsn == state.through_lsn)
+        {
+            return Ok(current_lsn);
+        }
         return Err(invalid_data(
             "another retained-tail apply is in progress for this replica",
         ));
@@ -431,11 +449,16 @@ fn ensure_retained_chunk_start_boundary(
             "trusted retained chunk boundary belongs to a different database history",
         ));
     }
-    if !matches!(state.status, ApplyStatus::Complete) || state.applied_lsn != since_lsn {
+    if state.applied_lsn != since_lsn {
         return Err(invalid_data(format!(
             "retained chunk start LSN {since_lsn} is not a trusted completed apply boundary"
         )));
     }
+    // An InProgress record whose `applied_lsn` matches is the crash shape
+    // where the intent never touched the catalog: `applied_lsn` carries the
+    // Complete boundary it overwrote, and the catalog-LSN check below proves
+    // the chunk rolled back. Refusing it wedged crashed replicas permanently
+    // (found by the replica kill-9 test).
     if catalog.max_lsn() != since_lsn {
         return Err(invalid_data(format!(
             "catalog LSN {} does not match retained chunk start boundary {since_lsn}",
@@ -1056,6 +1079,179 @@ mod tests {
             err.to_string().contains("requires repair before retry"),
             "advanced catalog LSN without complete apply-state must fail closed, got: {err}"
         );
+    }
+
+    /// SIGKILL between writing the InProgress intent and applying any unit:
+    /// WAL replay recovers the catalog at exactly the boundary the intent's
+    /// `applied_lsn` records. The stale intent is void — a host restarting
+    /// with a DIFFERENT target range (the natural whole-tail resume) must
+    /// not be wedged behind "another retained-tail apply is in progress".
+    #[test]
+    fn a_rolled_back_interrupted_apply_accepts_a_new_resume_range() {
+        let primary = tmp("rolledback_primary");
+        let mut primary_cat = Catalog::create(&primary).unwrap();
+        primary_cat.create_table(schema_users()).unwrap();
+        insert_range(&mut primary_cat, 0, 3);
+        let identity = open_or_create_identity(&primary).unwrap();
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let snapshot_lsn = primary_cat.max_lsn();
+
+        let replica = tmp("rolledback_replica");
+        copy_snapshot_files(&primary, &replica);
+        let identity_snapshot = read_identity_snapshot(&primary).unwrap().unwrap();
+        write_identity_snapshot(&replica, &identity_snapshot).unwrap();
+
+        insert_range(&mut primary_cat, 3, 8);
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let through_lsn = primary_cat.max_lsn();
+        let retained_dir = retained_segments_dir(&primary);
+
+        // Crash shape: intent written for some mid-range target, nothing
+        // applied (the catalog is still at the snapshot boundary).
+        write_in_progress_apply_state(
+            &replica,
+            identity.segment_identity(),
+            snapshot_lsn,
+            snapshot_lsn + 2,
+            snapshot_lsn,
+        )
+        .unwrap();
+
+        let mut reopened = open_preserving_retained_segments(&replica).unwrap();
+        assert_eq!(reopened.max_lsn(), snapshot_lsn);
+        let summary = apply_retained_tail(
+            &mut reopened,
+            &retained_dir,
+            identity.segment_identity(),
+            snapshot_lsn,
+            through_lsn,
+        )
+        .unwrap();
+        assert_eq!(summary.through_lsn, through_lsn);
+        assert_eq!(rows(&reopened), rows(&primary_cat));
+    }
+
+    /// Same crash shape, but the host retries its EXACT interrupted chunk
+    /// (the `apply_retained_units_chunk` contract). The rolled-back intent
+    /// must count as a trusted start boundary: `applied_lsn` carries the
+    /// Complete boundary it overwrote forward, and the catalog LSN proves
+    /// the chunk never touched the catalog.
+    #[test]
+    fn a_rolled_back_interrupted_chunk_can_be_retried_exactly() {
+        let primary = tmp("chunkretry_primary");
+        let mut primary_cat = Catalog::create(&primary).unwrap();
+        primary_cat.create_table(schema_users()).unwrap();
+        insert_range(&mut primary_cat, 0, 3);
+        let identity = open_or_create_identity(&primary).unwrap();
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let snapshot_lsn = primary_cat.max_lsn();
+
+        let replica = tmp("chunkretry_replica");
+        copy_snapshot_files(&primary, &replica);
+        let identity_snapshot = read_identity_snapshot(&primary).unwrap().unwrap();
+        write_identity_snapshot(&replica, &identity_snapshot).unwrap();
+
+        insert_range(&mut primary_cat, 3, 8);
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let through_lsn = primary_cat.max_lsn();
+        let retained_dir = retained_segments_dir(&primary);
+        let units = read_units_since(
+            &retained_dir,
+            identity.segment_identity(),
+            snapshot_lsn,
+            100,
+        )
+        .unwrap();
+
+        write_in_progress_apply_state(
+            &replica,
+            identity.segment_identity(),
+            snapshot_lsn,
+            through_lsn,
+            snapshot_lsn,
+        )
+        .unwrap();
+
+        let mut reopened = open_preserving_retained_segments(&replica).unwrap();
+        let summary = apply_retained_units_chunk(
+            &mut reopened,
+            identity.segment_identity(),
+            snapshot_lsn,
+            &units,
+        )
+        .unwrap();
+        assert_eq!(summary.through_lsn, through_lsn);
+        assert_eq!(rows(&reopened), rows(&primary_cat));
+    }
+
+    /// SIGKILL after the chunk's records were durably applied but before the
+    /// state flipped to Complete: the catalog stands exactly at the intent's
+    /// target. Continuing from there with a new range must work — everything
+    /// up to `state.through_lsn` is provably applied.
+    #[test]
+    fn a_completed_but_unflipped_chunk_accepts_the_next_range() {
+        let primary = tmp("unflipped_primary");
+        let mut primary_cat = Catalog::create(&primary).unwrap();
+        primary_cat.create_table(schema_users()).unwrap();
+        insert_range(&mut primary_cat, 0, 3);
+        let identity = open_or_create_identity(&primary).unwrap();
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let snapshot_lsn = primary_cat.max_lsn();
+
+        let replica = tmp("unflipped_replica");
+        copy_snapshot_files(&primary, &replica);
+        let identity_snapshot = read_identity_snapshot(&primary).unwrap().unwrap();
+        write_identity_snapshot(&replica, &identity_snapshot).unwrap();
+
+        insert_range(&mut primary_cat, 3, 5);
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let mid_lsn = primary_cat.max_lsn();
+        insert_range(&mut primary_cat, 5, 8);
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let through_lsn = primary_cat.max_lsn();
+        let retained_dir = retained_segments_dir(&primary);
+
+        // Apply the first chunk's records, then "crash" before the state
+        // flips: the intent stays InProgress while the catalog stands at
+        // its target.
+        let first_units = read_units_through(
+            &retained_dir,
+            identity.segment_identity(),
+            snapshot_lsn,
+            mid_lsn,
+            usize::MAX,
+        )
+        .unwrap();
+        let records = first_units
+            .iter()
+            .cloned()
+            .map(wal_record_from_retained_unit)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        let mut replica_cat = open_preserving_retained_segments(&replica).unwrap();
+        write_in_progress_apply_state(
+            &replica,
+            identity.segment_identity(),
+            snapshot_lsn,
+            mid_lsn,
+            snapshot_lsn,
+        )
+        .unwrap();
+        replica_cat.apply_wal_records(&records).unwrap();
+        assert_eq!(replica_cat.max_lsn(), mid_lsn);
+        drop(replica_cat);
+
+        let mut reopened = open_preserving_retained_segments(&replica).unwrap();
+        let summary = apply_retained_tail(
+            &mut reopened,
+            &retained_dir,
+            identity.segment_identity(),
+            mid_lsn,
+            through_lsn,
+        )
+        .unwrap();
+        assert_eq!(summary.through_lsn, through_lsn);
+        assert_eq!(rows(&reopened), rows(&primary_cat));
     }
 
     #[test]

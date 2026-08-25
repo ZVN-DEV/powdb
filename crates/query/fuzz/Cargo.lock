@@ -422,6 +422,7 @@ dependencies = [
  "powdb-query",
  "powdb-server",
  "powdb-storage",
+ "powdb-sync",
 ]
 
 [[package]]
