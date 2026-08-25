@@ -56,10 +56,15 @@ RUN set -eux; \
 # stay runnable across the whole arch, no SIGILL on older silicon.
 
 # Cache deps separately from source by copying manifests first.
-# powdb-server depends on storage + query + auth; powdb-cli additionally pulls
-# backup. The dep-cache stage must include the FULL dependency closure of the
-# crates we build, or the cache layer is silently incomplete (the `|| true`
-# below would hide the miss and re-resolve every build).
+# powdb-server depends on storage + query + auth + sync; powdb-cli additionally
+# pulls backup. The dep-cache stage must include the FULL dependency closure of
+# the crates we build, or workspace resolution fails and the cache layer warms
+# nothing. That exact miss shipped: sync was added to powdb-server at v0.8.0,
+# this copy list was never updated, and a `2>/dev/null || true` on the build
+# swallowed the resolution error, so every image build silently re-compiled
+# all deps. The stub build now fails the image build instead of hiding.
+# (No --locked here: with the glob workspace's other members absent, cargo must
+# trim the lock copy for this throwaway layer; the real build below is locked.)
 COPY Cargo.toml Cargo.lock ./
 COPY crates/storage/Cargo.toml crates/storage/Cargo.toml
 COPY crates/query/Cargo.toml   crates/query/Cargo.toml
@@ -67,27 +72,32 @@ COPY crates/server/Cargo.toml  crates/server/Cargo.toml
 COPY crates/cli/Cargo.toml     crates/cli/Cargo.toml
 COPY crates/auth/Cargo.toml    crates/auth/Cargo.toml
 COPY crates/backup/Cargo.toml  crates/backup/Cargo.toml
+COPY crates/sync/Cargo.toml    crates/sync/Cargo.toml
 
 # Create empty src trees so cargo can resolve+download deps without source
 RUN mkdir -p crates/storage/src crates/query/src crates/server/src crates/cli/src \
-              crates/auth/src crates/backup/src \
+              crates/auth/src crates/backup/src crates/sync/src \
  && echo 'pub fn _stub() {}' > crates/storage/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/query/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/server/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/auth/src/lib.rs \
  && echo 'pub fn _stub() {}' > crates/backup/src/lib.rs \
+ && echo 'pub fn _stub() {}' > crates/sync/src/lib.rs \
  && echo 'fn main() {}'      > crates/server/src/main.rs \
  && echo 'fn main() {}'      > crates/cli/src/main.rs \
  && . /cross-env \
- && cargo build --release --target "$(cat /rust-target)" -p powdb-server 2>/dev/null || true
+ && cargo build --release --target "$(cat /rust-target)" -p powdb-server
 
-# Now copy real source and build for real
+# Now copy real source and build for real. The stub build above trimmed its
+# throwaway copy of the lock (absent workspace members), so restore the
+# pristine one: the real build is --locked and must see the committed pins.
 COPY crates ./crates
+COPY Cargo.lock ./Cargo.lock
 RUN . /cross-env \
  && touch crates/storage/src/lib.rs crates/query/src/lib.rs crates/server/src/lib.rs \
-          crates/auth/src/lib.rs crates/backup/src/lib.rs \
+          crates/auth/src/lib.rs crates/backup/src/lib.rs crates/sync/src/lib.rs \
           crates/server/src/main.rs crates/cli/src/main.rs \
- && cargo build --release --target "$(cat /rust-target)" -p powdb-server \
+ && cargo build --release --locked --target "$(cat /rust-target)" -p powdb-server \
  && cp "target/$(cat /rust-target)/release/powdb-server" /powdb-server
 
 # ─── Runtime ────────────────────────────────────────────────────────────────
