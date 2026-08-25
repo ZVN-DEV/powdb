@@ -14,7 +14,7 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    encode_connect, encode_query, free_port, read_response, spawn_server_bin, spawn_server_bin_env,
+    encode_connect, encode_query, read_response, spawn_server_bound, spawn_server_bound_env,
     wait_for_bind,
 };
 use powdb_server::protocol::Message;
@@ -71,9 +71,7 @@ async fn run_oversized_transaction(port: u16) -> Vec<u8> {
 #[tokio::test]
 async fn env_override_lowers_the_dirty_page_budget() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin_env(
-        port,
+    let (mut child, port) = spawn_server_bound_env(
         tmp.path(),
         &[],
         &[("POWDB_DIRTY_PAGE_BUDGET", TINY_BUDGET_BYTES)],
@@ -104,8 +102,7 @@ async fn env_override_lowers_the_dirty_page_budget() {
 #[tokio::test]
 async fn the_same_transaction_fits_the_default_budget() {
     let tmp = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = spawn_server_bin(port, tmp.path(), &[]);
+    let (mut child, port) = spawn_server_bound(tmp.path(), &[]);
 
     let resp = run_oversized_transaction(port).await;
     let _ = child.kill();

@@ -13,13 +13,11 @@ mod common;
 use std::process::Child;
 use std::time::Duration;
 
-use common::{
-    encode_connect, encode_query, free_port, read_response, spawn_server_bin, wait_for_bind,
-};
+use common::{encode_connect, encode_query, read_response, spawn_server_bound, wait_for_bind};
 use tokio::io::AsyncWriteExt;
 
-fn spawn_readonly_server(port: u16, data_dir: &std::path::Path) -> Child {
-    spawn_server_bin(port, data_dir, &["--readonly"])
+fn spawn_readonly_server(data_dir: &std::path::Path) -> (Child, u16) {
+    spawn_server_bound(data_dir, &["--readonly"])
 }
 
 /// Seed a quiescent (checkpointed, WAL-clean) data directory with a table and a
@@ -81,10 +79,8 @@ async fn two_readonly_servers_serve_same_dir_and_reject_writes() {
     seed_quiescent_dir(tmp.path());
     let before = hash_data_files(tmp.path());
 
-    let port_a = free_port();
-    let port_b = free_port();
-    let mut srv_a = spawn_readonly_server(port_a, tmp.path());
-    let mut srv_b = spawn_readonly_server(port_b, tmp.path());
+    let (mut srv_a, port_a) = spawn_readonly_server(tmp.path());
+    let (mut srv_b, port_b) = spawn_readonly_server(tmp.path());
 
     let mut a = wait_for_bind(port_a, Duration::from_secs(20)).await;
     let mut b = wait_for_bind(port_b, Duration::from_secs(20)).await;
@@ -148,8 +144,7 @@ async fn kill9_during_readonly_serving_never_mutates_dir() {
     seed_quiescent_dir(tmp.path());
     let before = hash_data_files(tmp.path());
 
-    let port = free_port();
-    let mut srv = spawn_readonly_server(port, tmp.path());
+    let (mut srv, port) = spawn_readonly_server(tmp.path());
     let mut stream = wait_for_bind(port, Duration::from_secs(20)).await;
     stream.write_all(&encode_connect("testdb")).await.unwrap();
     let resp = read_response(&mut stream).await;
