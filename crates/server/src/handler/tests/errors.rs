@@ -45,6 +45,56 @@ fn cancellation_errors_surface_to_remote_clients() {
     );
 }
 
+// ---- SQL frontend walls reach remote clients ----
+
+/// Every documented "unsupported SQL" wall (the table in docs/SQL.md),
+/// executed for real and then run through the sanitizer that guards the
+/// wire. The SQL frontend's whole design is that a subset gap is a typed
+/// error naming the working alternative, never a silent wrong answer, but
+/// none of those messages had a prefix in SAFE_ERROR_PREFIXES, so a remote
+/// SQL user saw "query execution error" while an embedded caller saw the
+/// real diagnostic (docs/SQL.md even documented this gap and told users to
+/// prototype embedded). Same enumerate-by-executing shape as the link test
+/// below: rewording a message keeps it covered.
+#[test]
+fn every_documented_sql_wall_survives_the_wire_sanitizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type User { required id: int, name: str, total: int }")
+        .unwrap();
+    let walls = [
+        "SELECT CASE WHEN total > 1 THEN 1 ELSE 2 END FROM User",
+        "SELECT COALESCE(name, 'x') FROM User",
+        "SELECT COUNT(DISTINCT name) FROM User",
+        "SELECT CAST(total AS INT) FROM User",
+        "SELECT row_number() OVER (ORDER BY id) FROM User",
+        "SELECT * FROM User WHERE total IN (1, 2)",
+        "SELECT * FROM User WHERE EXISTS (SELECT id FROM User)",
+        "SELECT * FROM User WHERE total = (SELECT total FROM User)",
+        "SELECT * FROM User WHERE total BETWEEN 1 AND 2",
+        "CREATE TABLE t (a INT, UNIQUE (a))",
+        "INSERT INTO User (id, name, total) VALUES (1, 'a', 2) RETURNING id, name",
+    ];
+    let mut masked = Vec::new();
+    for statement in walls {
+        let err = engine
+            .execute_sql(statement)
+            .expect_err(&format!("`{statement}` must be refused"));
+        let message = err.to_string();
+        if sanitize_error(&message) != message {
+            masked.push(format!("  {statement}\n    -> {message}"));
+        }
+    }
+    assert!(
+        masked.is_empty(),
+        "these SQL-subset diagnostics are masked to \"query execution error\" on their way \
+         to a remote client, so only embedded callers can see what went wrong. Add a prefix \
+         to SAFE_ERROR_PREFIXES for each:\n{}",
+        masked.join("\n")
+    );
+}
+
 // ---- Entity-link diagnostics reach remote clients ----
 
 /// Build a schema with a link, ready for the failure cases below.

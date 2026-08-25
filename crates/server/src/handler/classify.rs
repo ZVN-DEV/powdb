@@ -86,6 +86,18 @@ pub(super) const SAFE_ERROR_PREFIXES: &[&str] = &[
     // link projection: it names the statement the client sent and the rewrite
     // that works. See crates/query/src/planner.rs.
     "aggregates over",
+    // The SQL frontend's subset walls (the table in docs/SQL.md): every one
+    // is a static diagnostic naming the unsupported construct the client
+    // itself wrote and the working alternative, exactly like the link
+    // prefixes above. Without these a remote SQL user got the generic
+    // "query execution error" for CASE, COALESCE, COUNT(DISTINCT), CAST,
+    // OVER, IN, EXISTS, scalar subqueries, BETWEEN, and table constraints,
+    // while an embedded caller saw the real message (docs/SQL.md used to
+    // document that gap as a caveat).
+    "sql ",
+    // The frontend's `RETURNING currently supports only \`RETURNING *\``
+    // wall, phrased from the client's own clause.
+    "returning ",
 ];
 
 /// Build the client-facing error frame: sanitized message plus the stable
