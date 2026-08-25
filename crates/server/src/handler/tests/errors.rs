@@ -364,17 +364,25 @@ fn transaction_over_the_dirty_page_budget_reaches_clients_as_a_limit() {
          class MemoryLimitExceeded already carries"
     );
 
-    // The legacy shape, for any path that still renders the refusal to
-    // text before the server sees it. It must classify identically.
-    let legacy = QueryError::StorageError(raised().to_string());
+    // The same refusal through the `From<StorageError> for io::Error`
+    // conversion (the path the P0 scan fixes use): the kind must survive
+    // that boundary too, now that the conversion carries the typed error
+    // as the source instead of stringifying it. This is what made the
+    // substring fallback deletable.
+    let via_from: std::io::Error = StorageError::TransactionTooLarge {
+        pages: 65_536,
+        limit_bytes: 268_435_456,
+    }
+    .into();
+    let converted = QueryError::from_storage_io(via_from);
     assert_eq!(
-        classify_query_error(&legacy),
+        classify_query_error(&converted),
         ErrorClass::LimitExceeded,
-        "the legacy text fallback must agree with the typed path"
+        "the From<StorageError> conversion must keep the kind classifiable"
     );
     assert_eq!(
         typed.to_string(),
-        legacy.to_string(),
+        converted.to_string(),
         "typing the refusal must not change one byte of what the client reads"
     );
     assert_eq!(
@@ -403,13 +411,21 @@ fn a_unique_violation_reaches_clients_as_a_constraint_violation() {
         "a duplicate key is the caller's data problem, not a server fault"
     );
 
-    let legacy = QueryError::StorageError(raised().to_string());
+    // Through the `From<StorageError> for io::Error` conversion as well:
+    // the kind survives, so no producer is left whose refusal could reach
+    // classification as text (the substring fallback is deleted).
+    let via_from: std::io::Error = StorageError::UniqueConstraintViolation {
+        table: "User".into(),
+        column: "email".into(),
+    }
+    .into();
+    let converted = QueryError::from_storage_io(via_from);
     assert_eq!(
-        classify_query_error(&legacy),
+        classify_query_error(&converted),
         ErrorClass::ConstraintViolation,
-        "the legacy text fallback must agree with the typed path"
+        "the From<StorageError> conversion must keep the kind classifiable"
     );
-    assert_eq!(typed.to_string(), legacy.to_string());
+    assert_eq!(typed.to_string(), converted.to_string());
 }
 
 /// A storage failure with no kind to recover must not be dressed up as one

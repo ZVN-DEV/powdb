@@ -152,35 +152,6 @@ impl StorageError {
             .downcast_ref::<StorageError>()
             .map(StorageError::kind)
     }
-
-    /// Whether `message` is the rendered form of [`Self::DdlInTransaction`].
-    ///
-    /// LEGACY FALLBACK. Classification is normally recovered from the variant
-    /// (see [`Self::kind_of_io_error`]), but not every path that turns a
-    /// storage failure into a query error carries the typed error along: some
-    /// still render it with `to_string()` first, and the variant is gone by
-    /// the time a wire error class is picked. For those, the text produced
-    /// here is the only evidence left. Keeping the predicate in this file,
-    /// beside the `#[error(...)]` string it reads, is what keeps the two in
-    /// step: `rendered_messages_identify_exactly_their_own_variant` renders a
-    /// real instance of every variant and fails if a reworded message stops
-    /// matching, or starts matching a sibling.
-    pub fn is_ddl_in_transaction_message(message: &str) -> bool {
-        message.contains("inside an explicit transaction: DDL is not transactional")
-    }
-
-    /// Whether `message` is the rendered form of [`Self::TransactionTooLarge`].
-    /// LEGACY FALLBACK; see [`Self::is_ddl_in_transaction_message`].
-    pub fn is_transaction_too_large_message(message: &str) -> bool {
-        message.contains("cannot buffer more of this transaction:")
-    }
-
-    /// Whether `message` is the rendered form of one of the unique-index
-    /// refusals. LEGACY FALLBACK; see [`Self::is_ddl_in_transaction_message`].
-    pub fn is_unique_violation_message(message: &str) -> bool {
-        message.contains("unique constraint violation on")
-            || message.contains("unique expression index violation on")
-    }
 }
 
 /// Convenience alias used throughout the storage crate.
@@ -190,7 +161,12 @@ impl From<StorageError> for std::io::Error {
     fn from(e: StorageError) -> Self {
         match e {
             StorageError::Io(io) => io,
-            other => std::io::Error::other(other.to_string()),
+            // Carry the typed error as the io::Error's SOURCE (not its
+            // rendered text), so `kind_of_io_error` can recover the variant
+            // on the far side of any `io::Result` boundary. The rendered
+            // message is byte-identical either way; the kind is what the
+            // server's wire classification runs on.
+            other => std::io::Error::other(other),
         }
     }
 }
@@ -236,46 +212,30 @@ mod tests {
         ]
     }
 
-    /// `(is_ddl_in_transaction, is_transaction_too_large, is_unique_violation)`
-    /// for a variant.
-    fn expected_predicates(err: &StorageError) -> (bool, bool, bool) {
-        match err {
-            StorageError::DdlInTransaction { .. } => (true, false, false),
-            StorageError::TransactionTooLarge { .. } => (false, true, false),
-            StorageError::UniqueConstraintViolation { .. }
-            | StorageError::UniqueExpressionIndexViolation { .. } => (false, false, true),
-            StorageError::Io(_)
-            | StorageError::CorruptData(_)
-            | StorageError::CorruptCrc { .. }
-            | StorageError::WalReplay(_)
-            | StorageError::CatalogCorrupt(_)
-            | StorageError::PageCorrupt(_)
-            | StorageError::InvalidIdentifier(_)
-            | StorageError::RowTooLarge { .. }
-            | StorageError::ValueTooLarge { .. }
-            | StorageError::OverflowCorrupt(_) => (false, false, false),
-        }
-    }
-
+    /// The `From<StorageError> for io::Error` conversion must keep the typed
+    /// error as the io::Error's SOURCE, so `kind_of_io_error` can recover the
+    /// variant on the other side of any `io::Result` boundary — with the
+    /// rendered text byte-identical to the old stringifying conversion. When
+    /// this conversion flattened to text, every refusal that crossed it lost
+    /// its kind and fell back to substring classification on the server.
     #[test]
-    fn rendered_messages_identify_exactly_their_own_variant() {
+    fn io_error_from_conversion_preserves_kind_and_text() {
         for err in one_of_every_variant() {
+            let kind = err.kind();
             let rendered = err.to_string();
-            let (ddl, too_large, unique) = expected_predicates(&err);
+            let io: std::io::Error = err.into();
             assert_eq!(
-                StorageError::is_ddl_in_transaction_message(&rendered),
-                ddl,
-                "wrong DDL-in-transaction verdict for {err:?} rendered as {rendered:?}"
+                io.to_string(),
+                rendered,
+                "conversion must not change the rendered message"
             );
+            if matches!(kind, StorageErrorKind::Io) {
+                continue; // a plain Io variant unwraps to its inner error
+            }
             assert_eq!(
-                StorageError::is_transaction_too_large_message(&rendered),
-                too_large,
-                "wrong transaction-too-large verdict for {err:?} rendered as {rendered:?}"
-            );
-            assert_eq!(
-                StorageError::is_unique_violation_message(&rendered),
-                unique,
-                "wrong unique-violation verdict for {err:?} rendered as {rendered:?}"
+                StorageError::kind_of_io_error(&io),
+                Some(kind),
+                "kind lost crossing the io::Error boundary for {rendered:?}"
             );
         }
     }
@@ -323,16 +283,17 @@ mod tests {
     }
 
     #[test]
-    fn messages_survive_the_io_error_the_engine_raises_them_through() {
-        // Both refusals cross the crate boundary inside an io::Error, which is
-        // the form whose rendering the server actually classifies.
+    fn kinds_survive_the_io_error_the_engine_raises_them_through() {
+        // Both refusals cross the crate boundary inside an io::Error, which
+        // is the form the server's wire classification actually receives.
         let ddl = std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             StorageError::DdlInTransaction { verb: "drop" },
         );
-        assert!(StorageError::is_ddl_in_transaction_message(
-            &ddl.to_string()
-        ));
+        assert_eq!(
+            StorageError::kind_of_io_error(&ddl),
+            Some(StorageErrorKind::DdlInTransaction)
+        );
 
         let too_large = std::io::Error::new(
             std::io::ErrorKind::OutOfMemory,
@@ -341,8 +302,9 @@ mod tests {
                 limit_bytes: 268_435_456,
             },
         );
-        assert!(StorageError::is_transaction_too_large_message(
-            &too_large.to_string()
-        ));
+        assert_eq!(
+            StorageError::kind_of_io_error(&too_large),
+            Some(StorageErrorKind::TransactionTooLarge)
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::protocol::{ErrorClass, Message};
 use powdb_query::result::QueryError;
-use powdb_storage::error::{StorageError, StorageErrorKind};
+use powdb_storage::error::StorageErrorKind;
 
 /// Error messages that are safe to forward to the client verbatim.
 pub(super) const SAFE_ERROR_PREFIXES: &[&str] = &[
@@ -135,9 +135,16 @@ pub(super) fn classify_query_error(e: &QueryError) -> ErrorClass {
         | QueryError::ViewError(_) => ErrorClass::Execution,
         // A storage refusal that kept its kind is classified from the kind.
         QueryError::Storage { kind, .. } => class_for_storage_kind(*kind),
-        // A storage refusal whose kind was already discarded. See
-        // `class_for_legacy_storage_text`.
-        QueryError::StorageError(err) => class_for_legacy_storage_text(err),
+        // A storage failure with no [`StorageErrorKind`] to classify on. Since
+        // `From<StorageError> for io::Error` carries the typed error as the
+        // source (error.rs), the only way to land here is a plain I/O failure
+        // (disk error, unexpected EOF): a genuine server-side fault, which is
+        // exactly what class 0 tells a driver. The substring fallback that
+        // used to sit here (`class_for_legacy_storage_text`) is gone with the
+        // last path that stringified a refusal early; the binary-level suite
+        // `wire_error_class_from_type.rs` pins every classified refusal to
+        // its class end to end, so a new early-stringify path fails there.
+        QueryError::StorageError(_) => ErrorClass::Internal,
         QueryError::Execution(msg) => {
             if msg.starts_with("unique constraint violation") {
                 ErrorClass::ConstraintViolation
@@ -183,34 +190,6 @@ fn class_for_storage_kind(kind: StorageErrorKind) -> ErrorClass {
         | StorageErrorKind::RowTooLarge
         | StorageErrorKind::ValueTooLarge
         | StorageErrorKind::OverflowCorrupt => ErrorClass::Internal,
-    }
-}
-
-/// LEGACY FALLBACK: the wire [`ErrorClass`] for a storage refusal that was
-/// rendered to text before it reached the query layer, so its kind is gone.
-///
-/// [`QueryError::Storage`] carries the kind and is what the executor produces
-/// today, but `QueryError::StorageError(String)` is still reachable: a plain
-/// [`std::io::Error`] has no storage kind to recover, and paths that stringify
-/// a failure early (the fast-path row patcher, for one) never had the typed
-/// error to begin with. Without this fallback those refusals would all collapse
-/// to [`ErrorClass::Internal`], which tells a driver the server broke when the
-/// caller merely inserted a duplicate.
-///
-/// Each predicate lives beside the `#[error(...)]` string it reads, in
-/// `crates/storage/src/error.rs`, where a test renders one instance of every
-/// variant and fails if a reworded message stops matching or starts matching a
-/// sibling. Do not add new callers of this: give the refusal a
-/// [`StorageErrorKind`] instead.
-fn class_for_legacy_storage_text(message: &str) -> ErrorClass {
-    if StorageError::is_unique_violation_message(message) {
-        ErrorClass::ConstraintViolation
-    } else if StorageError::is_transaction_too_large_message(message) {
-        ErrorClass::LimitExceeded
-    } else if StorageError::is_ddl_in_transaction_message(message) {
-        ErrorClass::Execution
-    } else {
-        ErrorClass::Internal
     }
 }
 
