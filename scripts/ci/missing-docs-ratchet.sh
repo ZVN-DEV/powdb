@@ -36,9 +36,12 @@ die() { echo "::error::missing-docs-ratchet: $*" >&2; exit 1; }
 # Count `missing documentation` diagnostics for one crate. `cargo rustc -p`
 # applies the flag to that crate alone, and cargo replays cached diagnostics
 # for a fresh unit, so a warm cache still reports the real count.
+# `--color never` is load-bearing: CI exports CARGO_TERM_COLOR=always, and
+# the ANSI prefix on a colored `warning:` line defeats the anchored grep
+# below (every crate counted zero on the first CI run; the selftest caught it).
 count_for() {
   local out
-  out="$(cargo rustc -p "$1" --lib -- -W missing_docs 2>&1)" \
+  out="$(cargo rustc --color never -p "$1" --lib -- -W missing_docs 2>&1)" \
     || die "cargo rustc failed for $1: ${out}"
   grep -c '^warning: missing documentation' <<<"${out}" || true
 }
