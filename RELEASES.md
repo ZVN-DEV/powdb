@@ -133,6 +133,11 @@ under a released version number, so the crates cannot go first.
     `dry_run` defaults to TRUE on purpose, so it must be spelled out or nothing
     publishes. A dry run is NOT a useful rehearsal here: it fails by design for
     every crate that depends on a workspace version not yet on crates.io.
+    Either way the workflow first runs cargo-semver-checks against the
+    published crates.io baselines and refuses to publish an API change bigger
+    than the version bump allows (the point-release-over-a-break hazard). If
+    it fires on a real release, the bump is wrong: raise the version, do not
+    bypass the check.
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).

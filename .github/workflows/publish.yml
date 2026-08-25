@@ -43,10 +43,48 @@ on:
 permissions: {}
 
 jobs:
+  # Blocks publishing any crate whose API changed more than its version bump
+  # allows, compared against the latest version on crates.io. This runs here
+  # (the door to crates.io) and deliberately NOT in ci.yml: versions are
+  # bumped at release time, so between releases main legitimately carries
+  # breaking changes against the published baseline, and a merge gate would
+  # sit red until the next bump. At publish time the numbers are real, so
+  # "semver requires new major/minor version" is a true verdict. The concrete
+  # hazard is a point release (x.y.Z+1) cut over an unnoticed API break —
+  # exactly what this catches. Dry runs get the same verdict, so a
+  # dry_run=true dispatch doubles as a release preflight.
+  semver:
+    name: semver-checks vs published baselines
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install cargo-semver-checks (pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL \
+            https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C "$HOME/.cargo/bin"
+          cargo semver-checks --version
+
+      - name: Check every publishable crate against its crates.io baseline
+        run: cargo semver-checks check-release --workspace
+
   publish:
     name: publish crates
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    needs: semver
     # No GitHub Actions `environment:` here on purpose. crates.io Trusted
     # Publishing matches a publisher configured with a blank environment only
     # against runs that present no environment claim; declaring one here made the
