@@ -266,6 +266,7 @@ async fn test_max_connections_backpressure() {
                         users: Arc::new(powdb_auth::UserStore::new()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(5),
+                        preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
                         query_timeout: Duration::from_secs(5),
                         rate_limiter: None,
                         peer_addr: Some(peer),
@@ -577,4 +578,86 @@ async fn test_connection_reuse_after_error() {
         }
         other => panic!("expected ResultScalar, got: {other:?}"),
     }
+}
+
+/// An unauthenticated peer must not be able to hold a connection slot open
+/// indefinitely by pinging: pre-auth Pings exist for load-balancer health
+/// checks (connect, ping, close), and each one used to reset the idle
+/// timer, so a client that never sent CONNECT could squat forever. The
+/// whole pre-auth phase — pings included — now runs under one deadline,
+/// the same ceiling the TLS handshake has always had.
+#[tokio::test]
+async fn preauth_pings_cannot_hold_a_connection_open_past_the_deadline() {
+    let (engine, _tmp) = fresh_engine();
+    let (addr, _handle) = InprocServer {
+        idle_timeout: Duration::from_secs(300),
+        preauth_deadline: Duration::from_millis(150),
+        single_conn: true,
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Ping continuously; every ping used to reset the pre-auth idle timer.
+    let start = std::time::Instant::now();
+    let mut closed = false;
+    while start.elapsed() < Duration::from_secs(2) {
+        if stream.write_all(&Message::Ping.encode()).await.is_err() {
+            closed = true;
+            break;
+        }
+        match tokio::time::timeout(Duration::from_millis(200), read_message(&mut stream)).await {
+            Ok(Some(Message::Pong)) => {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            Ok(Some(Message::Error { .. })) | Ok(None) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(other)) => panic!("unexpected pre-auth reply: {other:?}"),
+            Err(_) => {
+                // No reply within 200ms of a ping: treat as closed-in-flight.
+                closed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        closed,
+        "an unauthenticated pinging client outlived the pre-auth deadline"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the connection must be cut by the deadline, not by this test's patience"
+    );
+}
+
+/// A normal client that connects promptly is untouched by the pre-auth
+/// deadline: CONNECT within the window authenticates and the session then
+/// lives under the ordinary idle rules.
+#[tokio::test]
+async fn a_prompt_connect_is_untouched_by_the_preauth_deadline() {
+    let (engine, _tmp) = fresh_engine();
+    let (addr, _handle) = InprocServer {
+        idle_timeout: Duration::from_secs(300),
+        preauth_deadline: Duration::from_millis(500),
+        single_conn: true,
+        ..Default::default()
+    }
+    .start(engine)
+    .await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&encode_connect("testdb")).await.unwrap();
+    let msg = read_message(&mut stream).await.unwrap();
+    assert!(matches!(msg, Message::ConnectOk { .. }));
+
+    // Outlive the pre-auth deadline while authenticated; the session-level
+    // ping must still work.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    stream.write_all(&Message::Ping.encode()).await.unwrap();
+    let msg = read_message(&mut stream).await.unwrap();
+    assert!(matches!(msg, Message::Pong));
 }

@@ -156,6 +156,7 @@ pub fn unique_temp_dir(name: &str) -> std::path::PathBuf {
 pub struct InprocServer {
     pub tx_wait_timeout: Duration,
     pub idle_timeout: Duration,
+    pub preauth_deadline: Duration,
     pub query_timeout: Duration,
     pub expected_password: Option<String>,
     pub users: Arc<powdb_auth::UserStore>,
@@ -176,6 +177,7 @@ impl Default for InprocServer {
         Self {
             tx_wait_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
+            preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
             query_timeout: Duration::from_secs(30),
             expected_password: None,
             users: Arc::new(powdb_auth::UserStore::new()),
@@ -210,6 +212,7 @@ async fn serve_one(
             users: cfg.users.clone(),
             shutdown_rx: &mut rx,
             idle_timeout: cfg.idle_timeout,
+            preauth_deadline: cfg.preauth_deadline,
             query_timeout: cfg.query_timeout,
             rate_limiter: cfg.rate_limiter.as_ref(),
             peer_addr: Some(peer),
