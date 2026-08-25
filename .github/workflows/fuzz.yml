@@ -31,7 +31,7 @@ on:
       - "crates/storage/src/pj1.rs"
       - "crates/server/src/protocol.rs"
       - "crates/storage/src/wal.rs"
-      - "crates/storage/src/catalog.rs"
+      - "crates/storage/src/catalog/**"
       - "crates/query/fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:

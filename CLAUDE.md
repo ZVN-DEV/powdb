@@ -63,7 +63,7 @@ SQL text   → SQL frontend (crates/query/src/sql.rs) ──→ same PowQL AST �
 - **Heap Files** (`crates/storage/src/heap.rs`): Variable-length row storage, mmap-based scanning
 - **B+ Tree** (`crates/storage/src/btree.rs`): Disk-persisted indexes, created per-column
 - **WAL** (`crates/storage/src/wal.rs`): Write-ahead log with group commit
-- **Catalog** (`crates/storage/src/catalog.rs`): Schema registry, table/index management
+- **Catalog** (`crates/storage/src/catalog/`): Schema registry, table/index management (`mod.rs`), WAL/DDL payload codecs, catalog-file persistence
 
 ## Key Design Decisions
 

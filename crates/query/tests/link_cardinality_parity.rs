@@ -903,6 +903,16 @@ fn no_engine_source_reads_the_advisory_byte() {
     let mut inspected: Vec<String> = Vec::new();
     let mut offenders: Vec<String> = Vec::new();
     for path in &files {
+        // A unit-test module split out of its parent (`catalog/tests.rs`,
+        // `executor/tests/*.rs`) is reachable only through a
+        // `#[cfg(test)] mod tests;` declaration and is never production.
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let is_test_module = relative
+            .components()
+            .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "tests.rs");
+        if is_test_module {
+            continue;
+        }
         let text = std::fs::read_to_string(path).unwrap();
         // Only files that can hold a `LinkDef` can read a link's kind.
         if !text.contains("LinkDef") && !text.contains("LinkKind") {
@@ -917,7 +927,7 @@ fn no_engine_source_reads_the_advisory_byte() {
         // Unit tests live at the bottom of these files in a top-level
         // `#[cfg(test)] mod tests` and may assert on the byte; the rule is
         // about production decisions. Cut at that module specifically, not at
-        // the first `#[cfg(test)]` in the file: `catalog.rs` has a test-only
+        // the first `#[cfg(test)]` in the file: `catalog/mod.rs` has a test-only
         // failpoint helper near the top, and cutting there would have excluded
         // ~4000 lines of production code from the scan (it did, until a
         // deliberately planted violation in `drop_link` went unnoticed).
@@ -956,7 +966,8 @@ fn no_engine_source_reads_the_advisory_byte() {
             "crates/query/src/executor/plan_exec/dispatch.rs",
             "crates/query/src/executor/plan_exec/lowering.rs",
             "crates/query/src/executor/plan_exec/scan.rs",
-            "crates/storage/src/catalog.rs",
+            "crates/storage/src/catalog/file.rs",
+            "crates/storage/src/catalog/mod.rs",
         ],
         "the set of engine files that know what a link's cardinality is has \
          changed. That set IS the enumeration this file tests, so add the new \
