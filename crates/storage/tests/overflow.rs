@@ -136,7 +136,7 @@ fn test_crash_recovery_of_spilled_value() {
 
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("docs").unwrap().collect();
+        let rows: Vec<_> = cat.scan("docs").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1, "row must survive replay");
         assert_eq!(body_of(&rows[0].1), big.as_str());
     }
@@ -212,7 +212,7 @@ fn test_update_transitions() {
     // Survives a reopen (clean shutdown checkpoints the heap).
     drop(cat);
     let cat = Catalog::open(&dir).unwrap();
-    let rows: Vec<_> = cat.scan("docs").unwrap().collect();
+    let rows: Vec<_> = cat.scan("docs").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(body_of(&rows[0].1), "small-again");
     std::fs::remove_dir_all(&dir).ok();
@@ -382,7 +382,7 @@ fn test_rollback_discards_spilled_row() {
     cat.sync_wal().unwrap();
     cat.rollback_to_last_sync().unwrap();
 
-    let rows: Vec<_> = cat.scan("docs").unwrap().collect();
+    let rows: Vec<_> = cat.scan("docs").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(rows.len(), 1, "rolled-back big row must be gone");
     assert_eq!(body_of(&rows[0].1), "small");
     drop(cat);

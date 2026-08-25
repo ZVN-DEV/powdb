@@ -50,7 +50,7 @@ fn all_ids(cat: &Catalog) -> Vec<i64> {
     let mut ids: Vec<i64> = cat
         .scan("users")
         .unwrap()
-        .map(|(_, r)| match r[0] {
+        .map(|item| match item.unwrap().1[0] {
             Value::Int(i) => i,
             ref other => panic!("expected Int id, got {other:?}"),
         })

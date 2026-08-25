@@ -68,7 +68,7 @@ fn reopen_and_scan(dir: &Path, table: &str) -> Vec<Vec<Value>> {
     let cat = Catalog::open(dir).expect("reopen after drop must succeed");
     cat.scan(table)
         .expect("table must still be readable")
-        .map(|(_, row)| row)
+        .map(|item| item.unwrap().1)
         .collect()
 }
 

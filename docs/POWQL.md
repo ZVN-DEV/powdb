@@ -8,30 +8,32 @@ PowQL is the query language for PowDB, a Rust-native embedded database with comp
 
 ## Table of Contents
 
-1. [Quick Start](#quick-start)
-2. [Schema Definition](#schema-definition)
-3. [Queries](#queries)
-4. [Expressions](#expressions)
-5. [Aggregates](#aggregates)
-6. [GROUP BY and HAVING](#group-by-and-having)
-7. [Joins](#joins)
-8. [Nested Projections (Shaped Results)](#nested-projections-shaped-results)
-9. [Set Operations](#set-operations)
-10. [Subqueries](#subqueries)
-11. [Functions](#functions)
-12. [JSON Documents](#json-documents)
-13. [Mutations](#mutations)
-14. [Transactions](#transactions)
-15. [DDL](#ddl)
-16. [Introspection](#introspection)
-17. [Reserved Words and Quoting](#reserved-words-and-quoting)
-18. [Materialized Views](#materialized-views)
-19. [Window Functions](#window-functions)
-20. [UPSERT](#upsert)
-21. [EXPLAIN](#explain)
-22. [Prepared Queries](#prepared-queries)
-23. [Type System](#type-system)
-24. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
+1. [Comments](#comments)
+2. [Quick Start](#quick-start)
+3. [Schema Definition](#schema-definition)
+4. [Queries](#queries)
+5. [Expressions](#expressions)
+6. [Aggregates](#aggregates)
+7. [GROUP BY and HAVING](#group-by-and-having)
+8. [Joins](#joins)
+9. [Nested Projections (Shaped Results)](#nested-projections-shaped-results)
+10. [Entity Links (Relationship Traversal)](#entity-links-relationship-traversal)
+11. [Set Operations](#set-operations)
+12. [Subqueries](#subqueries)
+13. [Functions](#functions)
+14. [JSON Documents](#json-documents)
+15. [Mutations](#mutations)
+16. [Transactions](#transactions)
+17. [DDL](#ddl)
+18. [Introspection](#introspection)
+19. [Reserved Words and Quoting](#reserved-words-and-quoting)
+20. [Materialized Views](#materialized-views)
+21. [Window Functions](#window-functions)
+22. [UPSERT](#upsert)
+23. [EXPLAIN](#explain)
+24. [Prepared Queries](#prepared-queries)
+25. [Type System](#type-system)
+26. [PowQL vs SQL Cheat Sheet](#powql-vs-sql-cheat-sheet)
 
 ---
 
@@ -1299,6 +1301,22 @@ Post filter json_type(.data->tags) = "array"
 
 See [JSON Documents](#json-documents) for the full `->` extraction rules.
 
+#### json_text
+
+Render a JSON value (or the node addressed by a `->` path) as text, with SQL
+`->>` semantics: strings come back without JSON quotes, numbers and booleans
+use their canonical JSON spelling, and objects and arrays return canonical
+JSON text. A missing path and a JSON `null` both return the empty set (use
+[`json_type`](#json_type) to tell them apart):
+
+```
+Post { title: json_text(.data->title) }
+# "Hello" (not "\"Hello\"")
+
+Post { raw: json_text(.data->meta) }
+# canonical JSON text of the whole object, e.g. "{\"lang\":\"en\"}"
+```
+
 ### Math Functions
 
 #### abs
@@ -2171,13 +2189,14 @@ includes the boolean literal words `true` and `false`:
 ```
 abs, add, alter, and, as, asc, auto, avg, begin, between, case, cast, ceil,
 column, commit, concat, conflict, count, cross, date_add, date_diff, default,
-delete, dense_rank, desc, describe, distinct, drop, else, end, exists, explain,
-extract, false, filter, floor, group, having, in, index, inner, insert, is,
-join, left, length, let, like, limit, link, lower, match, materialize,
-materialized, max, min, multi, not, now, null, offset, on, or, order, outer,
-over, partition, pow, rank, refresh, required, returning, right, rollback,
-round, row_number, schema, select, sqrt, substring, sum, then, transaction,
-trim, true, type, union, unique, update, upper, upsert, view, when
+delete, dense_rank, desc, describe, distinct, drop, else, end, exists,
+explain, extract, false, filter, floor, group, having, in, index, inner,
+insert, is, join, json_text, json_type, left, length, let, like, limit, link,
+lower, match, materialize, materialized, max, min, multi, not, now, null,
+offset, on, or, order, outer, over, partition, pow, rank, raw, refresh,
+required, returning, right, rollback, round, row_number, schema, select, sqrt,
+substring, sum, then, transaction, trim, true, type, union, unique, update,
+upper, upsert, view, when
 ```
 
 ---

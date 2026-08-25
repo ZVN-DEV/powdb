@@ -97,11 +97,13 @@ fn test_mmap_write_race_no_torn_reads() {
             while !stop.load(Ordering::Relaxed) {
                 let guard = heap.read().unwrap();
                 let mut seen = 0u64;
-                guard.try_for_each_row(|_rid, data| {
-                    assert_row_invariant(&schema, data);
-                    seen += 1;
-                    std::ops::ControlFlow::Continue(())
-                });
+                guard
+                    .try_for_each_row(|_rid, data| {
+                        assert_row_invariant(&schema, data);
+                        seen += 1;
+                        std::ops::ControlFlow::Continue(())
+                    })
+                    .unwrap();
                 // The fixture only grows, so a scan must never see fewer
                 // rows than we started with.
                 assert!(
@@ -155,11 +157,13 @@ fn test_mmap_write_race_no_torn_reads() {
     // and valid in a fresh scan.
     let guard = heap.read().unwrap();
     let mut count = 0u64;
-    guard.try_for_each_row(|_rid, data| {
-        assert_row_invariant(&schema, data);
-        count += 1;
-        std::ops::ControlFlow::Continue(())
-    });
+    guard
+        .try_for_each_row(|_rid, data| {
+            assert_row_invariant(&schema, data);
+            count += 1;
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
     assert_eq!(
         count, final_id as u64,
         "final scan row count {count} != inserted {final_id}"

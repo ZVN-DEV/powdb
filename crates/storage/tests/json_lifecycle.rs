@@ -175,11 +175,25 @@ fn delete_frees_json_row() {
     let big = json(&big_json_text('D', 7000));
     let rid = cat.insert("docs", &vec![Value::Int(1), big]).unwrap();
     cat.sync_wal().unwrap();
-    assert_eq!(cat.scan("docs").unwrap().count(), 1);
+    assert_eq!(
+        cat.scan("docs")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
+        1
+    );
 
     cat.delete("docs", rid).unwrap();
     cat.sync_wal().unwrap();
-    assert_eq!(cat.scan("docs").unwrap().count(), 0);
+    assert_eq!(
+        cat.scan("docs")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
+        0
+    );
 
     drop(cat);
     std::fs::remove_dir_all(&dir).ok();
@@ -202,7 +216,7 @@ fn crash_recovery_preserves_spilled_json() {
     }
 
     let cat = Catalog::open(&dir).unwrap();
-    let rows: Vec<(RowId, Vec<Value>)> = cat.scan("docs").unwrap().collect();
+    let rows: Vec<(RowId, Vec<Value>)> = cat.scan("docs").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(rows.len(), 1, "spilled json row must recover");
     assert_eq!(rows[0].1[1], big, "recovered json must be byte-exact");
 
@@ -236,9 +250,12 @@ fn many_mixed_json_documents_survive_restart() {
     let mut got: Vec<(i64, Value)> = cat
         .scan("docs")
         .unwrap()
-        .map(|(_, row)| match &row[0] {
-            Value::Int(n) => (*n, row[1].clone()),
-            other => panic!("expected Int id, got {other:?}"),
+        .map(|item| {
+            let (_, row) = item.unwrap();
+            match &row[0] {
+                Value::Int(n) => (*n, row[1].clone()),
+                other => panic!("expected Int id, got {other:?}"),
+            }
         })
         .collect();
     got.sort_by_key(|(i, _)| *i);

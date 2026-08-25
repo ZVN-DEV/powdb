@@ -469,11 +469,12 @@ impl Engine {
                 // "Update/delete everything" — rare but legal.
                 let mut cancel = CancelCheck::new();
                 let mut rids: Vec<RowId> = Vec::new();
-                for (rid, _) in self
+                for item in self
                     .catalog
                     .scan(table)
                     .map_err(QueryError::from_storage_io)?
                 {
+                    let (rid, _) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     rids.push(rid);
                 }
@@ -559,11 +560,12 @@ impl Engine {
                         })?;
                 let mut cancel = CancelCheck::new();
                 let mut rids: Vec<RowId> = Vec::new();
-                for (rid, row) in self
+                for item in self
                     .catalog
                     .scan(table)
                     .map_err(QueryError::from_storage_io)?
                 {
+                    let (rid, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     if row[col_idx] == key_value {
                         rids.push(rid);
@@ -722,11 +724,12 @@ impl Engine {
         };
         let mut rids: Vec<RowId> = Vec::new();
         let mut cancel = CancelCheck::new();
-        for (rid, row) in self
+        for item in self
             .catalog
             .scan(table)
             .map_err(QueryError::from_storage_io)?
         {
+            let (rid, row) = item.map_err(QueryError::from_storage_io)?;
             cancel.tick()?;
             let keep = match &pred {
                 None => true,
@@ -756,11 +759,12 @@ impl Engine {
         };
         let mut matching: Vec<RowId> = Vec::new();
         let mut cancel = CancelCheck::new();
-        for (rid, row) in self
+        for item in self
             .catalog
             .scan(table)
             .map_err(QueryError::from_storage_io)?
         {
+            let (rid, row) = item.map_err(QueryError::from_storage_io)?;
             cancel.tick()?;
             let mut matched = false;
             for candidate in &rows {

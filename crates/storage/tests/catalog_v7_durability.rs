@@ -57,7 +57,13 @@ fn user_link() -> LinkDef {
 }
 
 fn row_count(catalog: &Catalog, table: &str) -> usize {
-    catalog.get_table(table).unwrap().scan().count()
+    catalog
+        .get_table(table)
+        .unwrap()
+        .scan()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap()
+        .len()
 }
 
 #[test]

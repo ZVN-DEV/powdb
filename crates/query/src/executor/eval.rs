@@ -1303,12 +1303,15 @@ pub(super) fn like_match(text: &str, pattern: &str) -> bool {
     let mut star: Option<usize> = None; // index in p of the last '%'
     let mut star_ti = 0usize; // text index when that '%' was taken
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
-            ti += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
+        // `%` must be tested before the literal branch: a literal `%` in the
+        // TEXT would otherwise consume a pattern `%` as an ordinary character
+        // and record no backtrack point (LIKE '%' then failed to match "%a").
+        if pi < p.len() && p[pi] == '%' {
             star = Some(pi);
             star_ti = ti;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            ti += 1;
             pi += 1;
         } else if let Some(s) = star {
             pi = s + 1;
@@ -1379,6 +1382,22 @@ mod tests {
         assert!(like_match("", "%"));
         assert!(like_match("ax", "a_"));
         assert!(!like_match("a", "a_"));
+    }
+
+    #[test]
+    fn test_like_match_percent_in_text_is_still_matched_by_wildcards() {
+        // The defect this pins: the literal/underscore branch ran before the
+        // `%` branch, so a pattern `%` landing on a literal `%` in the TEXT
+        // was consumed as an ordinary character with no backtrack point
+        // recorded. `LIKE '%'` must match every non-null string, including
+        // strings that start with `%`.
+        assert!(like_match("%a", "%"));
+        assert!(like_match("%%", "%"));
+        assert!(like_match("%", "%"));
+        assert!(like_match("%", "%_"), "'%_' matches any 1+ char string");
+        assert!(like_match("%abc", "%abc"));
+        assert!(like_match("a%b", "a%b"));
+        assert!(!like_match("", "%_"));
     }
 
     #[test]

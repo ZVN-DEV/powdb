@@ -79,7 +79,7 @@ fn test_crash_recovery_100_rows() {
     // ── Session 2: reopen and expect replay to restore all 100 rows ────
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(
             rows.len(),
             100,
@@ -131,7 +131,7 @@ fn test_clean_shutdown_no_replay() {
 
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(
             rows.len(),
             50,
@@ -169,7 +169,12 @@ fn test_rollback_discards_multi_page_dirty_inserts() {
             .unwrap();
         }
 
-        let visible_before_rollback = cat.scan("users").unwrap().count();
+        let visible_before_rollback = cat
+            .scan("users")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len();
         assert_eq!(
             visible_before_rollback, 40,
             "uncommitted rows should be visible inside the transaction"
@@ -177,7 +182,12 @@ fn test_rollback_discards_multi_page_dirty_inserts() {
 
         cat.rollback_to_last_sync().unwrap();
 
-        let visible_after_rollback = cat.scan("users").unwrap().count();
+        let visible_after_rollback = cat
+            .scan("users")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len();
         assert_eq!(
             visible_after_rollback, 0,
             "rollback must drop hot and buffered dirty pages"
@@ -186,7 +196,7 @@ fn test_rollback_discards_multi_page_dirty_inserts() {
 
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert!(
             rows.is_empty(),
             "rolled-back multi-page dirty inserts must not persist after reopen"
@@ -223,7 +233,11 @@ fn checkpoint_refuses_active_transaction_and_drop_does_not_persist_it() {
             "checkpoint must fail closed during an active transaction, got: {err}"
         );
         assert_eq!(
-            cat.scan("users").unwrap().count(),
+            cat.scan("users")
+                .unwrap()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
             40,
             "uncommitted rows remain visible inside the active transaction"
         );
@@ -235,7 +249,11 @@ fn checkpoint_refuses_active_transaction_and_drop_does_not_persist_it() {
     {
         let cat = Catalog::open(&dir).unwrap();
         assert_eq!(
-            cat.scan("users").unwrap().count(),
+            cat.scan("users")
+                .unwrap()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
             0,
             "active transaction rows must not persist after checkpoint refusal and drop"
         );
@@ -294,7 +312,7 @@ fn test_crash_recovery_deletes_idempotent() {
     // whose slot is already gone.
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(
             rows.len(),
             15,
@@ -320,7 +338,7 @@ fn test_crash_recovery_deletes_idempotent() {
     // so this open should be a pure no-op and the row count stays 15.
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 15);
     }
 
@@ -438,7 +456,7 @@ fn test_crash_recovery_update_by_pk_fast_path() {
         );
         // And a crude sanity check: every other row kept its original age.
         let mut saw_999 = 0;
-        for (_, r) in cat.scan("users").unwrap() {
+        for (_, r) in cat.scan("users").unwrap().map(|r| r.unwrap()) {
             if let Value::Int(999) = r[2] {
                 saw_999 += 1;
             }
@@ -508,7 +526,7 @@ fn test_crash_recovery_var_col_update() {
         let cnt_short = cat
             .scan("users")
             .unwrap()
-            .filter(|(_, r)| matches!(&r[1], Value::Str(s) if s == "x"))
+            .filter(|item| matches!(&item.as_ref().unwrap().1[1], Value::Str(s) if s == "x"))
             .count();
         assert_eq!(cnt_short, 1, "exactly one row should have the shrunk name");
     }
@@ -563,7 +581,7 @@ fn test_crash_recovery_delete_by_filter() {
 
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(
             rows.len(),
             51,
@@ -627,7 +645,7 @@ fn test_checkpoint_then_crash_no_duplicates() {
 
     {
         let cat = Catalog::open(&dir).unwrap();
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(
             rows.len(),
             40,

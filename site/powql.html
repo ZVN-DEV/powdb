@@ -48,6 +48,8 @@
         <li style="margin-bottom: 6px;"><a href="#aggregates">Aggregates</a></li>
         <li style="margin-bottom: 6px;"><a href="#group-by">GROUP BY + HAVING</a></li>
         <li style="margin-bottom: 6px;"><a href="#joins">Joins</a></li>
+        <li style="margin-bottom: 6px;"><a href="#nested">Nested Projections</a></li>
+        <li style="margin-bottom: 6px;"><a href="#links">Entity Links</a></li>
         <li style="margin-bottom: 6px;"><a href="#mutations">Mutations</a></li>
         <li style="margin-bottom: 6px;"><a href="#transactions">Transactions</a></li>
         <li style="margin-bottom: 6px;"><a href="#ddl">DDL</a></li>
@@ -274,6 +276,38 @@ User as u join Order as o on u.id = o.user_id
 
     <p>The engine automatically selects hash join (O(L+R)) for equi-joins and nested loop for non-equi predicates.</p>
 
+    <!-- Nested Projections -->
+    <h2 id="nested">Nested Projections (Shaped Results)</h2>
+    <p>A projection field can be a whole correlated child query. The result is one row per parent with its children as a native JSON array: no join fan-out to undo, no NULL-vs-empty ambiguity (a parent with zero children gets <code>[]</code>), and no JSON text round-trip.</p>
+
+    <pre><code># One row per user; orders nested as a JSON array
+User as u {
+  u.name,
+  orders: Order as o filter o.user_id = u.id
+    order o.total desc limit 3
+    { o.total, o.product_id }
+}
+# Alice, [{"product_id":102,"total":20.25},{"product_id":101,"total":9.5}]
+# Cara,  []</code></pre>
+
+    <p>Children support their own <code>filter</code>, <code>order</code>, <code>limit</code>, and <code>offset</code> per parent, and nesting composes to multiple levels. This is PowQL-only by design; SQL's SELECT list is flat.</p>
+
+    <!-- Entity Links -->
+    <h2 id="links">Entity Links (Relationship Traversal)</h2>
+    <p>Declare a relationship once, then traverse it by name. Cardinality is derived from the schema: a link onto a <code>unique</code> key is to-one and reads as a scalar path; anything else is to-many and reads as a labeled block.</p>
+
+    <pre><code># Declare once
+link Order.user -> User on user_id = id
+link User.orders -> Order on id = user_id
+
+# To-one: scalar path
+Order as o { o.id, o.user.name }
+
+# To-many: labeled block returning a JSON array
+User as u { u.name, orders: u.orders order total desc { total } }</code></pre>
+
+    <p>A scalar hop through a non-unique key is refused with a typed error naming the fix, never answered by silently multiplying rows. Inspect declared links with <code>schema links</code> or <code>describe &lt;Type&gt;</code>.</p>
+
     <!-- Mutations -->
     <h2 id="mutations">Mutations</h2>
 
@@ -386,6 +420,8 @@ User { .name, dr: dense_rank() over (partition .dept order .score desc) }
 # Aggregate windows
 User { .name, .salary, dept_avg: avg(.salary) over (partition .dept) }
 User { .name, running_total: sum(.amount) over (order .date) }</code></pre>
+
+    <p>This page is a working subset. The complete language reference (JSON documents and <code>-&gt;</code> paths, subqueries, UPSERT, EXPLAIN, prepared queries, introspection, reserved words, the full function list) is <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md" target="_blank" rel="noopener">docs/POWQL.md</a>.</p>
 
     <!-- Cheat Sheet -->
     <h2 id="cheat-sheet">PowQL vs SQL Cheat Sheet</h2>

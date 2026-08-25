@@ -41,6 +41,7 @@
     <p>The easiest way to install PowDB is from crates.io:</p>
     <pre><code class="language-bash">cargo install powdb-cli
 cargo install powdb-server</code></pre>
+    <p><strong>Prerequisite:</strong> both installs need a C toolchain and <code>cmake</code> (TLS pulls in <code>aws-lc-sys</code>; there is no feature to opt out). If the install fails inside <code>aws-lc-sys</code>, install cmake first, or use a <a href="https://github.com/ZVN-DEV/powdb/releases/latest" target="_blank" rel="noopener">prebuilt binary</a>. Embedding the engine in Rust (<code>cargo add powdb</code>) needs no C toolchain.</p>
 
     <p>Or build from source (requires Rust 1.93+; install from <a href="https://rustup.rs/" target="_blank" rel="noopener">rustup.rs</a> if needed):</p>
     <pre><code class="language-bash">git clone https://github.com/ZVN-DEV/powdb.git

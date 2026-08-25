@@ -951,7 +951,7 @@ impl Catalog {
                             let tbl = &mut self.tables[slot];
                             if !tbl.schema.columns.iter().any(|c| c.name == col.name) {
                                 let old_schema = tbl.schema.clone();
-                                let has_rows = tbl.heap.scan().next().is_some();
+                                let has_rows = tbl.heap.has_rows()?;
                                 tbl.schema.columns.push(col);
                                 tbl.refresh_layout();
                                 if has_rows {
@@ -986,7 +986,7 @@ impl Catalog {
                                     tbl.schema.columns.iter().position(|c| c.name == col_name)
                                 {
                                     let old_schema = tbl.schema.clone();
-                                    let has_rows = tbl.heap.scan().next().is_some();
+                                    let has_rows = tbl.heap.has_rows()?;
                                     tbl.schema.columns.remove(idx);
                                     for (i, c) in tbl.schema.columns.iter_mut().enumerate() {
                                         c.position = i as u16;
@@ -1587,11 +1587,14 @@ impl Catalog {
 
     /// Fill any omitted (`Empty`) auto column in `values` from the table's
     /// sequence and advance it. No-op when the table is unknown or has no auto
-    /// columns.
-    pub fn assign_auto_columns(&mut self, table: &str, values: &mut [Value]) {
+    /// columns. Fails closed if seeding the sequence requires a scan and that
+    /// scan hits an unreadable page (a silently short seed would hand out
+    /// colliding auto ids).
+    pub fn assign_auto_columns(&mut self, table: &str, values: &mut [Value]) -> io::Result<()> {
         if let Some(&slot) = self.name_to_slot.get(table) {
-            self.tables[slot].assign_auto(values);
+            self.tables[slot].assign_auto(values)?;
         }
+        Ok(())
     }
 
     /// Write the current set of schemas to disk atomically (write-then-rename).
@@ -2358,7 +2361,10 @@ impl Catalog {
         Ok(true)
     }
 
-    pub fn scan(&self, table: &str) -> io::Result<impl Iterator<Item = (RowId, Row)> + '_> {
+    pub fn scan(
+        &self,
+        table: &str,
+    ) -> io::Result<impl Iterator<Item = io::Result<(RowId, Row)>> + '_> {
         Ok(self.by_name(table)?.scan())
     }
 
@@ -2368,8 +2374,7 @@ impl Catalog {
     where
         F: FnMut(RowId, &[u8]),
     {
-        self.by_name(table)?.for_each_row_raw(f);
-        Ok(())
+        self.by_name(table)?.for_each_row_raw(f)
     }
 
     /// Zero-copy scan with early termination. The callback returns
@@ -2380,8 +2385,7 @@ impl Catalog {
     where
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
-        self.by_name(table)?.try_for_each_row_raw(f);
-        Ok(())
+        self.by_name(table)?.try_for_each_row_raw(f)
     }
 
     pub fn create_index(&mut self, table: &str, column: &str) -> io::Result<()> {
@@ -3079,7 +3083,7 @@ impl Catalog {
         // Peek at the heap to learn whether there are any existing
         // rows at all. An empty table is always safe to alter — no
         // rewrite needed, required columns are fine, etc.
-        let has_rows = tbl.heap.scan().next().is_some();
+        let has_rows = tbl.heap.has_rows()?;
 
         if has_rows && col.required {
             return Err(io::Error::new(
@@ -3204,7 +3208,7 @@ impl Catalog {
 
         // Snapshot for decoding old rows.
         let old_schema = tbl.schema.clone();
-        let has_rows = tbl.heap.scan().next().is_some();
+        let has_rows = tbl.heap.has_rows()?;
 
         // Commit the schema change.
         tbl.schema.columns.remove(idx);
@@ -4597,7 +4601,7 @@ mod tests {
         seed_quiescent_dir(dir.path());
 
         let catalog = Catalog::open_read_only(dir.path()).unwrap();
-        let rows: Vec<_> = catalog.scan("User").unwrap().collect();
+        let rows: Vec<_> = catalog.scan("User").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 2);
         // Column-index read works read-only.
         let hit = catalog
@@ -4614,7 +4618,12 @@ mod tests {
 
         {
             let catalog = Catalog::open_read_only(dir.path()).unwrap();
-            let _ = catalog.scan("User").unwrap().count();
+            let _ = catalog
+                .scan("User")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len();
             let _ = catalog
                 .index_lookup("User", "age", &Value::Int(20))
                 .unwrap();
@@ -4686,7 +4695,15 @@ mod tests {
         // Opening read-only must load the expression index without writing.
         let before = hash_dir_tree(dir.path());
         let catalog = Catalog::open_read_only(dir.path()).unwrap();
-        assert_eq!(catalog.scan("Doc").unwrap().count(), 0);
+        assert_eq!(
+            catalog
+                .scan("Doc")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            0
+        );
         drop(catalog);
         let after = hash_dir_tree(dir.path());
         assert_eq!(
@@ -5063,7 +5080,7 @@ mod tests {
         ];
 
         cat.apply_wal_records(&records).unwrap();
-        let rows: Vec<_> = cat.scan("T").unwrap().collect();
+        let rows: Vec<_> = cat.scan("T").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1[0], Value::Int(1));
         assert_eq!(rows[0].1[1], Value::Str("committed".into()));
@@ -5304,7 +5321,7 @@ mod tests {
             .unwrap();
         }
 
-        let rows: Vec<_> = cat.scan("items").unwrap().collect();
+        let rows: Vec<_> = cat.scan("items").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 50);
     }
 
@@ -5435,7 +5452,7 @@ mod tests {
         assert_eq!(schema.columns[0].type_id, TypeId::Str);
         assert_eq!(schema.columns[1].type_id, TypeId::Int);
 
-        let rows: Vec<_> = cat.scan("users").unwrap().collect();
+        let rows: Vec<_> = cat.scan("users").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -5610,14 +5627,22 @@ mod tests {
         assert_refused_in_transaction(cat.drop_table("Keep"), "drop table");
         cat.rollback_to_last_sync().unwrap();
 
-        let rows: Vec<_> = cat.scan("Keep").unwrap().collect();
+        let rows: Vec<_> = cat.scan("Keep").unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(rows.len(), 1, "rolled-back DROP must not destroy data");
         assert_eq!(rows[0].1[0], Value::Int(1));
 
         // The heap file itself must still be there for the next open.
         drop(cat);
         let reopened = Catalog::open(dir.path()).unwrap();
-        assert_eq!(reopened.scan("Keep").unwrap().count(), 1);
+        assert_eq!(
+            reopened
+                .scan("Keep")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5676,7 +5701,14 @@ mod tests {
         assert_eq!(schema.columns.len(), 2);
         assert!(!cat.has_index("Keep", "label"));
         assert!(cat.links().next().is_none());
-        assert_eq!(cat.scan("Keep").unwrap().count(), 1);
+        assert_eq!(
+            cat.scan("Keep")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5698,7 +5730,14 @@ mod tests {
         let mut tables = cat.list_tables();
         tables.sort_unstable();
         assert_eq!(tables, vec!["Keep"]);
-        assert_eq!(cat.scan("Keep").unwrap().count(), 2);
+        assert_eq!(
+            cat.scan("Keep")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -5733,10 +5772,24 @@ mod tests {
         // The refusal is not fatal: the connection rolls back and keeps working.
         cat.rollback_to_last_sync().unwrap();
         assert_eq!(cat.dirty_page_budget_bytes(), 8 * crate::page::PAGE_SIZE);
-        assert_eq!(cat.scan("Big").unwrap().count(), 0);
+        assert_eq!(
+            cat.scan("Big")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            0
+        );
         cat.insert("Big", &vec![Value::Int(1), Value::Str("after".into())])
             .unwrap();
-        assert_eq!(cat.scan("Big").unwrap().count(), 1);
+        assert_eq!(
+            cat.scan("Big")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// `drop_table` must write the catalog before it unlinks the heap.
@@ -5794,6 +5847,13 @@ mod tests {
             cat.insert("Bulk", &row).unwrap();
         }
         assert!(cat.dirty_pages_buffered() <= 8);
-        assert_eq!(cat.scan("Bulk").unwrap().count(), 5_000);
+        assert_eq!(
+            cat.scan("Bulk")
+                .unwrap()
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            5_000
+        );
     }
 }

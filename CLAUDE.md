@@ -6,7 +6,7 @@
 cargo build --workspace            # build everything
 cargo test --workspace             # run all tests (tens of minutes: roughly 35-45 on an M-series laptop, longer cold)
 cargo run --release -p powdb-compare  # benchmark vs SQLite (100K rows)
-cargo bench -p powdb-bench         # criterion benchmarks (23 benches, ~5 min of measurement,
+cargo bench -p powdb-bench         # criterion benchmarks (24 benches, 22 gated workloads; ~5 min of measurement,
                                    # plus a cold compile of the bench targets)
 ```
 
@@ -87,7 +87,7 @@ cargo test -p powdb-storage               # storage crate only
 # Wide comparison (PowDB vs SQLite, 100K rows, 15 workloads)
 cargo run --release -p powdb-compare
 
-# Criterion regression suite (23 benches, ~5 min of measurement)
+# Criterion regression suite (24 benches, 22 gated workloads; ~5 min of measurement)
 cargo bench -p powdb-bench
 
 # Check against regression baselines

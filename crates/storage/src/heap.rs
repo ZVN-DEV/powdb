@@ -1515,7 +1515,26 @@ impl HeapFile {
     /// unflushed writes. The iterator materialises the result list up front
     /// (same as before — the returned type was already an owned flat_map),
     /// so copying the hot page bytes into the result costs nothing extra.
-    pub fn scan(&self) -> impl Iterator<Item = (RowId, Vec<u8>)> + '_ {
+    ///
+    /// Fail-closed (scan-corruption fix): every page read off the disk goes
+    /// through [`Page::from_bytes_verified`], the same gate `ensure_hot`
+    /// applies to point reads. A page that cannot be read or fails
+    /// verification surfaces as an `Err` item; it used to be silently
+    /// mapped to zero rows, which turned mid-life corruption or an EIO into
+    /// a plausible-but-partial result for index rebuilds, vacuum snapshots,
+    /// and full-table queries. See `tests/scan_corruption.rs`.
+    /// Whether the heap holds at least one live row. Fail-closed: an
+    /// unreadable or unverifiable first page is an error, not "empty" —
+    /// callers gate DDL decisions on this answer.
+    pub fn has_rows(&self) -> io::Result<bool> {
+        match self.scan().next() {
+            Some(Err(e)) => Err(e),
+            Some(Ok(_)) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    pub fn scan(&self) -> impl Iterator<Item = io::Result<(RowId, Vec<u8>)>> + '_ {
         let hot_view = self
             .hot_page
             .as_ref()
@@ -1523,51 +1542,51 @@ impl HeapFile {
         (0..self.disk.num_pages()).flat_map(move |page_id| {
             // Mission C Phase 9: parked dirty pages override disk.
             if let Some(page) = self.dirty_buffer.get(&page_id) {
-                let entries: Vec<_> = page
+                let entries: Vec<io::Result<(RowId, Vec<u8>)>> = page
                     .iter()
                     .map(|(slot, data)| {
-                        (
+                        Ok((
                             RowId {
                                 page_id,
                                 slot_index: slot,
                             },
                             data.to_vec(),
-                        )
+                        ))
                     })
                     .collect();
                 return entries.into_iter();
             }
-            let entries: Vec<_> = match &hot_view {
+            let entries: Vec<io::Result<(RowId, Vec<u8>)>> = match &hot_view {
                 Some((hid, hbytes)) if *hid == page_id => iter_page_slots(hbytes.as_slice())
                     .map(|(slot, data)| {
-                        (
+                        Ok((
                             RowId {
                                 page_id,
                                 slot_index: slot,
                             },
                             data.to_vec(),
-                        )
+                        ))
                     })
                     .collect(),
-                _ => self
+                _ => match self
                     .disk
                     .read_page(page_id)
-                    .ok()
-                    .and_then(|buf| Page::from_bytes(&buf))
-                    .map(|page| {
-                        page.iter()
-                            .map(|(slot, data)| {
-                                (
-                                    RowId {
-                                        page_id,
-                                        slot_index: slot,
-                                    },
-                                    data.to_vec(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                    .and_then(|buf| Page::from_bytes_verified(&buf).map_err(io::Error::from))
+                {
+                    Ok(page) => page
+                        .iter()
+                        .map(|(slot, data)| {
+                            Ok((
+                                RowId {
+                                    page_id,
+                                    slot_index: slot,
+                                },
+                                data.to_vec(),
+                            ))
+                        })
+                        .collect(),
+                    Err(e) => vec![Err(e)],
+                },
             };
             entries.into_iter()
         })
@@ -1586,8 +1605,18 @@ impl HeapFile {
     /// Mission D6: prefer the persistent mmap set by `enable_mmap()` instead
     /// of doing mmap+munmap on every call. The bench's per-query mmap pair
     /// was a syscall pair we paid on every read query.
+    ///
+    /// Fail-closed (scan-corruption fix): the per-page-read fallback
+    /// propagates read errors and verifies pages via
+    /// [`Page::from_bytes_verified`] instead of silently skipping a page it
+    /// cannot read (see `tests/scan_corruption.rs`). The mmap paths carry a
+    /// different, deliberate contract: every page was verified by
+    /// `HeapFile::open`, an I/O error on a mapped page raises SIGBUS (loud,
+    /// never a partial result), and re-verifying CRCs per scan would forfeit
+    /// the zero-copy design, so mapped bytes are served as-is and post-open
+    /// bit rot in a mapped page is bounded by the slot-arithmetic clamps.
     #[inline]
-    pub fn try_for_each_row<F>(&self, mut f: F)
+    pub fn try_for_each_row<F>(&self, mut f: F) -> io::Result<()>
     where
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
@@ -1595,7 +1624,7 @@ impl HeapFile {
 
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
-            return;
+            return Ok(());
         }
 
         // Mission C Phase 1: if a hot page is pinned in memory, the scan
@@ -1666,7 +1695,7 @@ impl HeapFile {
                             },
                             data,
                         ) {
-                            return;
+                            return Ok(());
                         }
                     }
                 }
@@ -1684,12 +1713,12 @@ impl HeapFile {
                             },
                             data,
                         ) {
-                            return;
+                            return Ok(());
                         }
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
         // No persistent mmap — try a per-call mmap as a one-shot best effort.
@@ -1787,25 +1816,24 @@ impl HeapFile {
                         continue;
                     }
                 }
-                let buf = match self.disk.read_page(page_id) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                if let Some(page) = Page::from_bytes(&buf) {
-                    for (slot, data) in page.iter() {
-                        if let ControlFlow::Break(()) = f(
-                            RowId {
-                                page_id,
-                                slot_index: slot,
-                            },
-                            data,
-                        ) {
-                            break 'outer;
-                        }
+                // Fail closed, matching `ensure_hot`: a page that cannot be
+                // read or fails verification is an error, never a skip.
+                let buf = self.disk.read_page(page_id)?;
+                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
+                for (slot, data) in page.iter() {
+                    if let ControlFlow::Break(()) = f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    ) {
+                        break 'outer;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Zero-copy scan: calls `f` for every live row without allocating a
@@ -1819,13 +1847,13 @@ impl HeapFile {
     /// Scans of tables with unflushed writes see the latest bytes via the
     /// in-memory page rather than the stale disk page.
     #[inline]
-    pub fn for_each_row<F>(&self, mut f: F)
+    pub fn for_each_row<F>(&self, mut f: F) -> io::Result<()>
     where
         F: FnMut(RowId, &[u8]),
     {
         let num_pages = self.disk.num_pages();
         if num_pages == 0 {
-            return;
+            return Ok(());
         }
 
         let hot_view: Option<(u32, &[u8; PAGE_SIZE])> = self
@@ -1898,7 +1926,7 @@ impl HeapFile {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
 
         // No persistent mmap — try a per-call mmap as a one-shot best effort.
@@ -1984,23 +2012,22 @@ impl HeapFile {
                         continue;
                     }
                 }
-                let buf = match self.disk.read_page(page_id) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                if let Some(page) = Page::from_bytes(&buf) {
-                    for (slot, data) in page.iter() {
-                        f(
-                            RowId {
-                                page_id,
-                                slot_index: slot,
-                            },
-                            data,
-                        );
-                    }
+                // Fail closed, matching `ensure_hot`: a page that cannot
+                // be read or fails verification is an error, never a skip.
+                let buf = self.disk.read_page(page_id)?;
+                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
+                for (slot, data) in page.iter() {
+                    f(
+                        RowId {
+                            page_id,
+                            slot_index: slot,
+                        },
+                        data,
+                    );
                 }
             }
         }
+        Ok(())
     }
 
     /// Return the maximum LSN across all pages in this heap file.
@@ -2293,7 +2320,7 @@ mod tests {
             let row = vec![Value::Str(format!("user_{i}")), Value::Int(i)];
             heap.insert(&encode_row(&schema, &row)).unwrap();
         }
-        let all: Vec<_> = heap.scan().collect();
+        let all: Vec<_> = heap.scan().map(|r| r.unwrap()).collect();
         assert_eq!(all.len(), 100);
         drop(heap);
         std::fs::remove_file(&path).ok();
@@ -2318,7 +2345,13 @@ mod tests {
         heap.delete(r1).unwrap();
         assert!(heap.get(r1).is_none());
         assert!(heap.get(r2).is_some());
-        assert_eq!(heap.scan().count(), 1);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
@@ -2373,7 +2406,7 @@ mod tests {
         let expected: Vec<i64> = (0..500).step_by(2).collect();
         assert_eq!(deleted_keys, expected);
         // Remaining rows should all be odd.
-        let remaining: Vec<_> = heap.scan().collect();
+        let remaining: Vec<_> = heap.scan().map(|r| r.unwrap()).collect();
         assert_eq!(remaining.len(), 250);
         for (_, data) in &remaining {
             let row = decode_row(&schema, data);
@@ -2396,12 +2429,24 @@ mod tests {
         // Predicate never matches — zero deletions, scan count unchanged.
         let c = heap.scan_delete_matching(|_| false, |_rid, _| {}).unwrap();
         assert_eq!(c, 0);
-        assert_eq!(heap.scan().count(), 50);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            50
+        );
 
         // Predicate always matches — everything gone.
         let c = heap.scan_delete_matching(|_| true, |_rid, _| {}).unwrap();
         assert_eq!(c, 50);
-        assert_eq!(heap.scan().count(), 0);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            0
+        );
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
@@ -2445,7 +2490,13 @@ mod tests {
         }
 
         // A full scan must also see exactly the rows we inserted.
-        assert_eq!(heap.scan().count(), 2000);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            2000
+        );
 
         drop(heap);
         std::fs::remove_file(&path).ok();
@@ -2473,7 +2524,13 @@ mod tests {
             ))
             .unwrap();
         assert!(heap.get(rid).is_some());
-        assert_eq!(heap.scan().count(), 1);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
@@ -2518,7 +2575,13 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(heap.get(rid).unwrap(), old_bytes, "old row must survive");
-        assert_eq!(heap.scan().count(), 1);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            1
+        );
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
@@ -2625,7 +2688,13 @@ mod tests {
             let row = vec![Value::Str(format!("user_{i:04}")), Value::Int(i)];
             heap.insert(&encode_row(&schema, &row)).unwrap();
         }
-        assert_eq!(heap.scan().count(), 500);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            500
+        );
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
@@ -2688,7 +2757,13 @@ mod tests {
         // statements and WAL replay both depend on this.
         assert!(fill_until_budget_trips(&mut heap, 5_000).is_none());
         assert!(budget.charged_pages() <= 8);
-        assert_eq!(heap.scan().count(), 5_000);
+        assert_eq!(
+            heap.scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            5_000
+        );
 
         drop(heap);
         std::fs::remove_file(&path).ok();
@@ -2747,7 +2822,14 @@ mod tests {
         drop(heap);
 
         let reopened = HeapFile::open(&path).unwrap();
-        assert_eq!(reopened.scan().count(), 2_000);
+        assert_eq!(
+            reopened
+                .scan()
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            2_000
+        );
         drop(reopened);
         std::fs::remove_file(&path).ok();
     }

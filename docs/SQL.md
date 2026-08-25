@@ -233,14 +233,12 @@ as an explicit opt-out. The SQL frontend always lowers aggregates with raw
 semantics, so a cached plan cannot inherit PowQL's symmetric behavior based on
 which dialect ran first.
 
-> **Where you see the explicit message.** These detailed messages reach
-> **embedded** callers — the Rust `Engine::execute_sql` / `execute_sql_readonly`
-> API and the in-process `@zvndev/powdb-embedded` Node addon, which propagate the
-> `QueryError` verbatim. Over the **binary wire protocol**, the server sanitizes
-> any error text it doesn't recognize as safe down to a generic
-> `query execution error`, so a remote client (`QuerySql` / the TypeScript
-> client) sees the generic message rather than the specific unsupported-feature
-> text. Prototype SQL against the embedded API to read the exact reason.
+> **Where you see the explicit message.** Everywhere. Embedded callers — the
+> Rust `Engine::execute_sql` / `execute_sql_readonly` API and the in-process
+> `@zvndev/powdb-embedded` Node addon — get the `QueryError` verbatim, and the
+> server's wire sanitizer recognizes these unsupported-feature diagnostics as
+> safe to forward, so a remote client (`QuerySql` / the TypeScript client)
+> receives the same message text with error class 1 (parse).
 
 ## Plan-cache parity
 

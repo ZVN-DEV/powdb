@@ -130,7 +130,8 @@ fn test_mmap_scan_does_not_detect_corruption_by_design() {
     heap.try_for_each_row(|_rid, _data| {
         rows_seen += 1;
         std::ops::ControlFlow::Continue(())
-    });
+    })
+    .unwrap();
     assert_eq!(
         rows_seen, 1,
         "mmap scan yields the row without detecting corruption (by design)"

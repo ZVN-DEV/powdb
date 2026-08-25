@@ -725,7 +725,8 @@ mod tests {
         let mut rows: Vec<_> = catalog
             .scan("User")
             .unwrap()
-            .map(|(_, row)| {
+            .map(|item| {
+                let (_, row) = item.unwrap();
                 let id = match &row[0] {
                     Value::Int(id) => *id,
                     other => panic!("expected int id, got {other:?}"),

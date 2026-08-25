@@ -126,6 +126,7 @@ fn bench_seq_scan(engine: &mut Engine) {
     for _ in 0..N_SCANS {
         let matches = table
             .scan()
+            .map(|item| item.unwrap())
             .filter(|(_, row)| match &row[2] {
                 Value::Int(age) => *age > 30,
                 _ => false,
