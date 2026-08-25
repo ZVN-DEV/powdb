@@ -357,20 +357,27 @@ fn reconcile_apply_state(
 
     if state.from_lsn != since_lsn || state.through_lsn != through_lsn {
         // A crash can strand an InProgress intent for a range this call is
-        // not asking about. Two shapes are provably safe to supersede,
-        // because the catalog LSN (recovered by WAL replay) pins exactly
-        // what was durably applied:
+        // not asking about. The catalog LSN (recovered on reopen) pins
+        // exactly what was durably applied, so any crash landing inside the
+        // intent's window is safe to supersede when the caller resumes
+        // exactly at that recovered frontier:
         //  * nothing of the intent applied: the catalog stands at the
         //    boundary the intent's `applied_lsn` carried forward;
         //  * all of the intent applied, but the crash landed before the
         //    state flipped Complete: the catalog stands at the intent's
-        //    target.
-        // In both, `since_lsn == current_lsn` is a trusted boundary and the
-        // stale intent is void. Anything else (a catalog LSN strictly
-        // inside the stranded range, or a caller not starting at the
-        // recovered boundary) stays fail-closed below.
+        //    target;
+        //  * killed mid-apply: records redo into pages one at a time, so
+        //    the frontier can sit strictly inside the range. Per-page LSN
+        //    redo makes reapplying from the frontier idempotent and
+        //    completes any partially-applied transaction.
+        // In all three, `since_lsn == current_lsn` is a trusted boundary
+        // and the stale intent is void. A catalog LSN outside the intent's
+        // [applied, through] window (state regressed, or advanced past the
+        // target it never reported reaching) and a caller not starting at
+        // the recovered frontier stay fail-closed below.
         if current_lsn == since_lsn
-            && (current_lsn == state.applied_lsn || current_lsn == state.through_lsn)
+            && current_lsn >= state.applied_lsn
+            && current_lsn <= state.through_lsn
         {
             return Ok(current_lsn);
         }
@@ -1124,6 +1131,81 @@ mod tests {
             &retained_dir,
             identity.segment_identity(),
             snapshot_lsn,
+            through_lsn,
+        )
+        .unwrap();
+        assert_eq!(summary.through_lsn, through_lsn);
+        assert_eq!(rows(&reopened), rows(&primary_cat));
+    }
+
+    /// SIGKILL in the middle of `apply_wal_records`: records redo into
+    /// mmap'd pages one at a time, so the surviving catalog LSN can land
+    /// STRICTLY INSIDE the stranded intent's range (the ASan CI run of the
+    /// process-level kill-9 test landed exactly here). The catalog still
+    /// pins the durable prefix — per-page LSN redo makes reapplication
+    /// idempotent and completes any partially-applied transaction — so a
+    /// resume that starts exactly at the recovered frontier must be
+    /// accepted, not wedged behind "another retained-tail apply is in
+    /// progress" with no recovery path.
+    #[test]
+    fn a_mid_chunk_crash_resumes_from_the_recovered_frontier() {
+        let primary = tmp("frontier_primary");
+        let mut primary_cat = Catalog::create(&primary).unwrap();
+        primary_cat.create_table(schema_users()).unwrap();
+        insert_range(&mut primary_cat, 0, 3);
+        let identity = open_or_create_identity(&primary).unwrap();
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let snapshot_lsn = primary_cat.max_lsn();
+
+        let replica = tmp("frontier_replica");
+        copy_snapshot_files(&primary, &replica);
+        let identity_snapshot = read_identity_snapshot(&primary).unwrap().unwrap();
+        write_identity_snapshot(&replica, &identity_snapshot).unwrap();
+
+        insert_range(&mut primary_cat, 3, 8);
+        checkpoint_with_retained_segments(&mut primary_cat).unwrap();
+        let through_lsn = primary_cat.max_lsn();
+        let retained_dir = retained_segments_dir(&primary);
+        let units = read_units_since(
+            &retained_dir,
+            identity.segment_identity(),
+            snapshot_lsn,
+            100,
+        )
+        .unwrap();
+        assert!(units.len() > 1, "test needs a multi-unit retained tail");
+        let partial_records = units[..1]
+            .iter()
+            .cloned()
+            .map(wal_record_from_retained_unit)
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+
+        let mut replica_cat = open_preserving_retained_segments(&replica).unwrap();
+        write_in_progress_apply_state(
+            &replica,
+            identity.segment_identity(),
+            snapshot_lsn,
+            through_lsn,
+            snapshot_lsn,
+        )
+        .unwrap();
+        replica_cat.apply_wal_records(&partial_records).unwrap();
+        let frontier = replica_cat.max_lsn();
+        assert!(
+            frontier > snapshot_lsn && frontier < through_lsn,
+            "frontier must be strictly inside the stranded range \
+             ({snapshot_lsn}..{through_lsn}), got {frontier}"
+        );
+        drop(replica_cat);
+
+        let mut reopened = open_preserving_retained_segments(&replica).unwrap();
+        assert_eq!(reopened.max_lsn(), frontier);
+        let summary = apply_retained_tail(
+            &mut reopened,
+            &retained_dir,
+            identity.segment_identity(),
+            frontier,
             through_lsn,
         )
         .unwrap();

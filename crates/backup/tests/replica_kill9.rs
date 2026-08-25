@@ -203,11 +203,15 @@ fn sigkill_mid_chunked_apply_reopens_and_resumes_to_convergence() {
     // ── resume from the replica's own recovered boundary ──
     //
     // The natural restart protocol: one whole-tail apply starting at the
-    // catalog LSN WAL replay recovered. The apply-state reconciler accepts
-    // this over any crash shape a SIGKILL can leave (rolled-back intent,
-    // completed-but-unflipped intent) and stays fail-closed on a torn one —
-    // the relaxations exist because the first run of THIS test wedged on
-    // "not a trusted completed apply boundary".
+    // catalog LSN recovered on reopen. The apply-state reconciler accepts
+    // this over any crash shape a SIGKILL can leave — rolled-back intent,
+    // completed-but-unflipped intent, or a frontier mid-way through the
+    // stranded range (records redo into pages one at a time, so the kill
+    // can land between two of them) — because the recovered catalog LSN
+    // pins the durable prefix. Each relaxation exists because a run of
+    // THIS test wedged without it: the first run locally on "not a trusted
+    // completed apply boundary", the first ASan CI run on "another
+    // retained-tail apply is in progress".
     let sid = identity.segment_identity();
     let resume_from = cat.max_lsn();
     let applied = powdb_sync::apply_retained_tail(
