@@ -49,15 +49,18 @@ const WAL_POISONED_MSG: &str = "WAL poisoned by an earlier fsync failure; commit
      longer be made durable (the OS may have dropped the unsynced pages). Restart the \
      process to recover from the on-disk log";
 
-/// Address of the [`WalSyncShared`] whose next fsync must fail
-/// (self-disarming; 0 = disarmed). There is no portable way to make a real
-/// `fdatasync` return EIO/ENOSPC on demand, and the post-failure behavior —
-/// poison, never retry — is exactly what the fsyncgate tests have to
-/// observe. Scoped to one WAL's shared state so concurrent tests' fsyncs
-/// cannot steal the injection, yet global (not thread-local) so the
-/// Normal-mode background flusher thread can trip it too.
+/// Addresses of the [`WalSyncShared`]s whose next fsync must fail
+/// (each entry self-disarms when it fires). There is no portable way to make
+/// a real `fdatasync` return EIO/ENOSPC on demand, and the post-failure
+/// behavior — poison, never retry — is exactly what the fsyncgate tests have
+/// to observe. Scoped per WAL so concurrent tests' fsyncs cannot steal each
+/// other's injection (a single shared slot let a second test's arm clobber
+/// the first's), yet global (not thread-local) so the Normal-mode background
+/// flusher thread can trip it too. [`Wal::drop`] removes its own entry, so a
+/// test that arms but never fsyncs cannot leak an arm onto whatever WAL the
+/// allocator later places at the same address.
 #[cfg(test)]
-static WAL_FSYNC_FAILPOINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WAL_FSYNC_FAILPOINTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 /// Run `sync_data` on `file`, recording its duration in the process-wide
 /// counters. Every WAL fsync goes through here so the accounting cannot drift
@@ -250,9 +253,14 @@ impl WalSyncShared {
     #[cfg(test)]
     fn take_fsync_failpoint(&self) -> bool {
         let me = self as *const WalSyncShared as usize;
-        WAL_FSYNC_FAILPOINT
-            .compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let mut armed = WAL_FSYNC_FAILPOINTS.lock().unwrap();
+        match armed.iter().position(|&addr| addr == me) {
+            Some(i) => {
+                armed.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The one fsync choke point for this WAL: [`timed_sync_data`] plus the
@@ -591,10 +599,18 @@ impl Wal {
     /// injected error. Self-disarming.
     #[cfg(test)]
     fn arm_fsync_failpoint(&self) {
-        WAL_FSYNC_FAILPOINT.store(
-            Arc::as_ptr(&self.shared) as usize,
-            std::sync::atomic::Ordering::Release,
-        );
+        let me = Arc::as_ptr(&self.shared) as usize;
+        let mut armed = WAL_FSYNC_FAILPOINTS.lock().unwrap();
+        if !armed.contains(&me) {
+            armed.push(me);
+        }
+    }
+
+    /// Remove this WAL's armed failpoint, if any (see the static's docs).
+    #[cfg(test)]
+    fn disarm_fsync_failpoint(&self) {
+        let me = Arc::as_ptr(&self.shared) as usize;
+        WAL_FSYNC_FAILPOINTS.lock().unwrap().retain(|&a| a != me);
     }
 
     /// True once any fsync on this WAL has failed. The WAL is then
@@ -1139,6 +1155,8 @@ impl Drop for Wal {
             }
         }
         self.stop_flusher();
+        #[cfg(test)]
+        self.disarm_fsync_failpoint();
     }
 }
 
@@ -1523,6 +1541,58 @@ mod tests {
         assert_eq!(wal.synced_generation(), synced_after_poison);
 
         drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Two tests arming their own WALs concurrently must not steal each
+    /// other's injection: a single-slot failpoint let the second arm clobber
+    /// the first, so the first WAL's fsync silently succeeded (the CI-only
+    /// flake where both fsyncgate tests started in the same instant).
+    #[test]
+    fn arming_two_wals_keeps_both_failpoints_armed() {
+        let (mut wal_a, path_a) = temp_wal("failpoint_two_a");
+        let (mut wal_b, path_b) = temp_wal("failpoint_two_b");
+        wal_a.set_sync_mode(WalSyncMode::Full);
+        wal_b.set_sync_mode(WalSyncMode::Full);
+
+        wal_a.arm_fsync_failpoint();
+        wal_b.arm_fsync_failpoint();
+
+        wal_a.append(1, WalRecordType::Insert, b"a").unwrap();
+        wal_a
+            .flush()
+            .expect_err("the first-armed WAL must still see its injected failure");
+        wal_b.append(1, WalRecordType::Insert, b"b").unwrap();
+        wal_b
+            .flush()
+            .expect_err("the second-armed WAL must see its injected failure too");
+
+        drop(wal_a);
+        drop(wal_b);
+        std::fs::remove_file(&path_a).ok();
+        std::fs::remove_file(&path_b).ok();
+    }
+
+    /// A WAL that dies with its failpoint still armed must take the arm with
+    /// it. A stale armed address would otherwise match a later WAL that the
+    /// allocator happens to place at the same spot, injecting an fsync
+    /// failure into an unrelated test.
+    #[test]
+    fn dropping_an_armed_wal_disarms_its_failpoint() {
+        let (wal, path) = temp_wal("failpoint_drop");
+        // Holding this clone keeps the shared allocation alive across the
+        // drop, so no concurrent test's WAL can reoccupy the address and
+        // re-arm it — the containment checks below race with nothing.
+        let shared = Arc::clone(&wal.shared);
+        let addr = Arc::as_ptr(&shared) as usize;
+
+        wal.arm_fsync_failpoint();
+        assert!(WAL_FSYNC_FAILPOINTS.lock().unwrap().contains(&addr));
+        drop(wal);
+        assert!(
+            !WAL_FSYNC_FAILPOINTS.lock().unwrap().contains(&addr),
+            "dropping the WAL must remove its armed failpoint"
+        );
         std::fs::remove_file(&path).ok();
     }
 }
