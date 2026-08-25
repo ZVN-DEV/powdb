@@ -292,7 +292,15 @@ fn unique_and_non_scalar_fail_before_heap_overflow_or_catalog_activation() {
         )
         .is_err());
     assert!(!catalog.table_by_slot(0).has_overflow_rows());
-    assert_eq!(catalog.scan("Doc").unwrap().count(), 2);
+    assert_eq!(
+        catalog
+            .scan("Doc")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
+        2
+    );
 
     assert!(catalog
         .update("Doc", second, &row(2, json(r#"{"author":"Ada"}"#), ""),)

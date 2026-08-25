@@ -106,7 +106,14 @@ fn p0_inline_spill_inline_keeps_unique_index() {
     assert_eq!(str_len(&looked.unwrap()), 4000);
 
     // 2. Unfiltered scan finds exactly one row.
-    assert_eq!(cat.scan("t").unwrap().count(), 1);
+    assert_eq!(
+        cat.scan("t")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Restart: the index rebuild + persisted rows must agree.
     cat.checkpoint().unwrap();
@@ -143,7 +150,14 @@ fn p0_inline_spill_inline_keeps_unique_index() {
         .index_lookup("t", "id", &Value::Int(1))
         .unwrap()
         .is_none());
-    assert_eq!(cat.scan("t").unwrap().count(), 0);
+    assert_eq!(
+        cat.scan("t")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
+        0
+    );
 
     drop(cat);
     std::fs::remove_dir_all(&dir).ok();
@@ -401,7 +415,7 @@ fn alter_table_preserves_spilled_value() {
 
     cat.alter_table_drop_column("t", "extra").unwrap();
     // ... and survive the DROP too, still byte-exact.
-    let rows: Vec<_> = cat.scan("t").unwrap().collect();
+    let rows: Vec<_> = cat.scan("t").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(str_len(&rows[0].1), 50_000);
     assert!(matches!(&rows[0].1[1], Value::Str(s) if s.chars().all(|c| c == 'S')));
@@ -489,7 +503,7 @@ fn crash_recovery_preserves_heap_v3_and_spilled_row() {
         3,
         "heap must reopen as v3 after a chain write"
     );
-    let rows: Vec<(RowId, Vec<Value>)> = cat.scan("t").unwrap().collect();
+    let rows: Vec<(RowId, Vec<Value>)> = cat.scan("t").unwrap().map(|r| r.unwrap()).collect();
     assert_eq!(rows.len(), 1, "spilled row must recover");
     assert_eq!(str_len(&rows[0].1), 60_000);
     assert!(matches!(&rows[0].1[1], Value::Str(s) if s.chars().all(|c| c == 'C')));

@@ -57,7 +57,11 @@ fn opens_pre_0_8_0_database_without_catalog_lsn_sidecar() {
     // Reopen: a missing sidecar must not error, and every row must survive.
     let cat = Catalog::open(&dir).unwrap();
     assert_eq!(
-        cat.scan("T").unwrap().count(),
+        cat.scan("T")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
         25,
         "a pre-sidecar (v0.7.2) database must open with all rows intact"
     );
@@ -82,7 +86,11 @@ fn opens_pre_0_8_0_database_without_catalog_lsn_sidecar() {
     );
     let cat = Catalog::open(&dir).unwrap();
     assert_eq!(
-        cat.scan("T").unwrap().count(),
+        cat.scan("T")
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
+            .len(),
         26,
         "rows written after the upgrade must persist alongside the legacy rows"
     );

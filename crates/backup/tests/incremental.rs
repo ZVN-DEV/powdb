@@ -173,7 +173,7 @@ fn restore_chain_reproduces_full_state() {
     let ids: std::collections::HashSet<i64> = cat2
         .scan("T")
         .unwrap()
-        .map(|(_rid, row)| match &row[0] {
+        .map(|item| match &item.unwrap().1[0] {
             Value::Int(n) => *n,
             other => panic!("unexpected value {other:?}"),
         })

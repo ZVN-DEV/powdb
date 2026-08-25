@@ -53,9 +53,12 @@ fn insert_range(cat: &mut Catalog, start: i64, end: i64) {
 fn find_rid(cat: &Catalog, id: i64) -> RowId {
     cat.scan("User")
         .unwrap()
-        .find_map(|(rid, row)| match row.first() {
-            Some(Value::Int(found)) if *found == id => Some(rid),
-            _ => None,
+        .find_map(|item| {
+            let (rid, row) = item.unwrap();
+            match row.first() {
+                Some(Value::Int(found)) if *found == id => Some(rid),
+                _ => None,
+            }
         })
         .unwrap()
 }
@@ -83,7 +86,8 @@ fn rows(cat: &Catalog) -> Vec<(i64, String)> {
     let mut rows: Vec<_> = cat
         .scan("User")
         .unwrap()
-        .map(|(_, row)| {
+        .map(|item| {
+            let (_, row) = item.unwrap();
             let id = match &row[0] {
                 Value::Int(id) => *id,
                 other => panic!("expected id int, got {other:?}"),

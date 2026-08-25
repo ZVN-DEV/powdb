@@ -145,6 +145,7 @@ fn bench_seq_scan_filter(c: &mut Criterion) {
         b.iter(|| {
             let count = table
                 .scan()
+                .map(|item| item.unwrap())
                 .filter(|(_, row)| matches!(&row[2], Value::Int(age) if *age > 30))
                 .count();
             black_box(count)

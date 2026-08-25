@@ -294,7 +294,8 @@ impl Table {
                 } else {
                     BTree::create_non_unique(path)?
                 };
-                for (rid, row) in table.scan() {
+                for item in table.scan() {
+                    let (rid, row) = item?;
                     if !row[col_idx].is_empty() {
                         if unique {
                             bt.insert(row[col_idx].clone(), rid);
@@ -512,7 +513,11 @@ impl Table {
             .column_index(&meta.json_path.column)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "JSON root column not found"))?;
         let mut btree = BTree::create_v2(path)?;
-        let rids = self.heap.scan().map(|(rid, _)| rid).collect::<Vec<_>>();
+        let rids = self
+            .heap
+            .scan()
+            .map(|item| item.map(|(rid, _)| rid))
+            .collect::<io::Result<Vec<_>>>()?;
         for rid in rids {
             let root = self
                 .get_projected(rid, &[root_col_idx])?
@@ -705,12 +710,12 @@ impl Table {
     /// sequence and advance it. An explicitly-provided value is left as-is but
     /// still pushes the sequence past it, so later auto ids never collide with
     /// an id the caller chose. No-op when the table has no auto columns.
-    pub(crate) fn assign_auto(&mut self, values: &mut [Value]) {
+    pub(crate) fn assign_auto(&mut self, values: &mut [Value]) -> io::Result<()> {
         if !self.has_auto() {
-            return;
+            return Ok(());
         }
         if !self.auto_next_ready {
-            self.init_auto_next();
+            self.init_auto_next()?;
         }
         for (i, &is_auto) in self.auto_cols.iter().enumerate() {
             if !is_auto || i >= values.len() {
@@ -727,13 +732,14 @@ impl Table {
                 _ => {}
             }
         }
+        Ok(())
     }
 
     /// Seed each auto column's next value to one past the highest value already
     /// stored, so the sequence resumes correctly after a restart (committed
     /// rows are already replayed from the WAL by the time inserts run). An
     /// empty column starts at 1.
-    fn init_auto_next(&mut self) {
+    fn init_auto_next(&mut self) -> io::Result<()> {
         let n = self.schema.columns.len();
         let mut next = vec![1i64; n];
         let auto_idxs: Vec<usize> = self
@@ -743,7 +749,10 @@ impl Table {
             .filter_map(|(i, &a)| if a { Some(i) } else { None })
             .collect();
         if !auto_idxs.is_empty() {
-            for (_rid, row) in self.heap.scan() {
+            // Fail closed: seeding from a silently short scan would hand out
+            // auto ids that collide with existing rows.
+            for item in self.heap.scan() {
+                let (_rid, row) = item?;
                 let decoded = crate::row::decode_row(&self.schema, &row);
                 for &i in &auto_idxs {
                     if let Some(Value::Int(v)) = decoded.get(i) {
@@ -756,6 +765,7 @@ impl Table {
         }
         self.auto_next = next;
         self.auto_next_ready = true;
+        Ok(())
     }
 
     /// Recalculate the cached row layout from the current schema. Must be
@@ -808,7 +818,7 @@ impl Table {
         // mutate `self.heap` while iterating it, and the rewrite grows
         // every row (+2 bytes of offset table at minimum), so in-place
         // updates are not guaranteed.
-        let snapshot: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect();
+        let snapshot: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect::<io::Result<_>>()?;
 
         // Map from old column index → new column index, or `None` if
         // the old column was dropped by the schema change. The caller
@@ -928,7 +938,7 @@ impl Table {
             // must be reassembled (`self.scan()`) -- a v1-only `decode_row`
             // would read a spilled indexed column as `Empty` and build a btree
             // missing that key (P2).
-            let rebuilt_rows: Vec<(RowId, Vec<Value>)> = self.scan().collect();
+            let rebuilt_rows: Vec<(RowId, Vec<Value>)> = self.scan().collect::<io::Result<_>>()?;
             for (col_idx, col_name, is_int, unique) in existing {
                 // Mission 3: write the freshly rebuilt index back to its
                 // canonical `{table}_{col}.idx` file so a subsequent
@@ -1093,7 +1103,7 @@ impl Table {
                     heads.push(stub.first_page);
                 });
             }
-        });
+        })?;
         let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for head in heads {
             for pid in self.heap.overflow_chain_pages(head)? {
@@ -1293,7 +1303,7 @@ impl Table {
         // shared borrow of the heap (read_overflow_value) without conflicting
         // with a live scan iterator. Rebuild is a cold recovery path, so the
         // owned snapshot is fine.
-        let raw_rows: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect();
+        let raw_rows: Vec<(RowId, Vec<u8>)> = self.heap.scan().collect::<io::Result<_>>()?;
         let schema = &self.schema;
         let layout = &self.row_layout;
         let heap = &self.heap;
@@ -1698,11 +1708,13 @@ impl Table {
         H: FnMut(RowId, &[u8]),
     {
         if !self.expression_indexes.is_empty() {
-            let victims = self
-                .heap
-                .scan()
-                .filter(|(_, bytes)| pred(bytes))
-                .collect::<Vec<_>>();
+            let mut victims = Vec::new();
+            for item in self.heap.scan() {
+                let (rid, bytes) = item?;
+                if pred(&bytes) {
+                    victims.push((rid, bytes));
+                }
+            }
             let count = victims.len() as u64;
             for (rid, bytes) in victims {
                 user_hook(rid, &bytes);
@@ -2127,8 +2139,9 @@ impl Table {
         self.heap.format_version() >= crate::heap::HEAP_FORMAT_VERSION_WITH_OVERFLOW
     }
 
-    pub fn scan(&self) -> impl Iterator<Item = (RowId, Row)> + '_ {
-        self.heap.scan().map(|(rid, data)| {
+    pub fn scan(&self) -> impl Iterator<Item = io::Result<(RowId, Row)>> + '_ {
+        self.heap.scan().map(|item| {
+            let (rid, data) = item?;
             if crate::row::row_is_v2(&data) {
                 let row =
                     crate::row::decode_row_v2(&self.schema, &self.row_layout, &data, |stub| {
@@ -2137,9 +2150,9 @@ impl Table {
                     // A corrupt chain during a scan degrades to Empty cells rather
                     // than aborting the whole scan; `get` surfaces the typed error.
                     .unwrap_or_else(|_| vec![Value::Empty; self.schema.columns.len()]);
-                (rid, row)
+                Ok((rid, row))
             } else {
-                (rid, decode_row(&self.schema, &data))
+                Ok((rid, decode_row(&self.schema, &data)))
             }
         })
     }
@@ -2152,7 +2165,7 @@ impl Table {
     /// and needs no v2 awareness. Only the rare v2 rows pay the reassembly;
     /// v1 rows stay on the mmap zero-copy path. A row whose chain is corrupt
     /// is skipped (its typed error surfaces via `get`).
-    pub fn for_each_row_raw<F>(&self, mut f: F)
+    pub fn for_each_row_raw<F>(&self, mut f: F) -> io::Result<()>
     where
         F: FnMut(RowId, &[u8]),
     {
@@ -2169,13 +2182,13 @@ impl Table {
             } else {
                 f(rid, data);
             }
-        });
+        })
     }
 
     /// Zero-copy scan with early termination. The callback returns
     /// `ControlFlow::Break(())` to stop. Used by `Limit` fast paths. v2 rows
     /// are reassembled to v1 first (see [`Self::for_each_row_raw`]).
-    pub fn try_for_each_row_raw<F>(&self, mut f: F)
+    pub fn try_for_each_row_raw<F>(&self, mut f: F) -> io::Result<()>
     where
         F: FnMut(RowId, &[u8]) -> std::ops::ControlFlow<()>,
     {
@@ -2194,7 +2207,7 @@ impl Table {
             } else {
                 f(rid, data)
             }
-        });
+        })
     }
 
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
@@ -2276,7 +2289,8 @@ impl Table {
         };
 
         // Build index from existing data.
-        for (rid, row) in self.scan() {
+        for item in self.scan() {
+            let (rid, row) = item?;
             if !row[col_idx].is_empty() {
                 if unique {
                     btree.insert(row[col_idx].clone(), rid);

@@ -120,7 +120,13 @@ fn p0_1_spilled_row_survives_crash_replay_byte_exact() {
 
 /// First live rid of table "t" (single-row helper).
 fn row0(cat: &Catalog) -> powdb_storage::types::RowId {
-    cat.get_table("t").unwrap().scan().next().unwrap().0
+    cat.get_table("t")
+        .unwrap()
+        .scan()
+        .map(|r| r.unwrap())
+        .next()
+        .unwrap()
+        .0
 }
 
 // ── P2: no dangling index entry after deleting a row with a spilled sibling ─
@@ -148,7 +154,14 @@ fn p2_delete_with_spilled_sibling_keeps_index_consistent() {
 
     // The indexed `s` stayed inline (plan_spill keeps indexed cols inline), so
     // deleting the row must remove its `s` btree entry even though the row is v2.
-    let rid = cat.get_table("docs").unwrap().scan().next().unwrap().0;
+    let rid = cat
+        .get_table("docs")
+        .unwrap()
+        .scan()
+        .map(|r| r.unwrap())
+        .next()
+        .unwrap()
+        .0;
     cat.get_table_mut("docs").unwrap().delete(rid).unwrap();
 
     // No dangling entry: lookup by the old key finds nothing.
@@ -207,7 +220,14 @@ fn p2_create_index_after_spill_then_delete_reassembles_keys() {
 
     // Deleting the row must reassemble the spilled indexed value to remove the
     // key (a v1-only decode would extract Empty and leave it dangling).
-    let rid = cat.get_table("docs").unwrap().scan().next().unwrap().0;
+    let rid = cat
+        .get_table("docs")
+        .unwrap()
+        .scan()
+        .map(|r| r.unwrap())
+        .next()
+        .unwrap()
+        .0;
     cat.get_table_mut("docs").unwrap().delete(rid).unwrap();
     assert!(
         cat.get_table("docs")
@@ -273,7 +293,14 @@ fn sweep_reclaims_orphaned_overflow_pages_after_delete() {
     );
 
     // The surviving committed row is untouched and reads back byte-exact.
-    let keep_rid = cat.get_table("t").unwrap().scan().next().unwrap().0;
+    let keep_rid = cat
+        .get_table("t")
+        .unwrap()
+        .scan()
+        .map(|r| r.unwrap())
+        .next()
+        .unwrap()
+        .0;
     let row = cat.get_table("t").unwrap().get(keep_rid).unwrap();
     assert_eq!(row[0], Value::Int(1));
     assert_eq!(

@@ -80,11 +80,12 @@ impl Engine {
                 // must stay stoppable.
                 let mut cancel = CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in self
+                for item in self
                     .catalog
                     .scan(table)
                     .map_err(QueryError::from_storage_io)?
                 {
+                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -836,7 +837,9 @@ impl Engine {
                 // flow back through `returning`.
                 let mut all_values = all_values;
                 for values in all_values.iter_mut() {
-                    self.catalog.assign_auto_columns(table, values);
+                    self.catalog
+                        .assign_auto_columns(table, values)
+                        .map_err(QueryError::from_storage_io)?;
                 }
                 // Charge the materialized batch against the per-query memory
                 // budget before inserting — keeps multi-row insert consistent
@@ -998,7 +1001,9 @@ impl Engine {
                     // matches nothing and inserts a duplicate. The conflict
                     // branch above deliberately does not assign — an existing
                     // row keeps the key it already has.
-                    self.catalog.assign_auto_columns(table, &mut values);
+                    self.catalog
+                        .assign_auto_columns(table, &mut values)
+                        .map_err(QueryError::from_storage_io)?;
                     self.catalog
                         .insert(table, &values)
                         .map_err(QueryError::from_storage_io)?;
@@ -1636,11 +1641,12 @@ impl Engine {
                     .collect();
                 let mut cancel = CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in self
+                for item in self
                     .catalog
                     .scan(table)
                     .map_err(QueryError::from_storage_io)?
                 {
+                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -2001,7 +2007,8 @@ impl Engine {
                         })?;
                         let mut seen = std::collections::HashSet::new();
                         let mut cancel = CancelCheck::new();
-                        for (_, row) in tbl.scan() {
+                        for item in tbl.scan() {
+                            let (_, row) = item.map_err(QueryError::from_storage_io)?;
                             cancel.tick()?;
                             let v = &row[col_idx];
                             if v.is_empty() {
@@ -2311,7 +2318,8 @@ impl Engine {
                         })?;
                 let mut cancel = CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in tbl.scan() {
+                for item in tbl.scan() {
+                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     if row[col_idx] == key_value {
                         rows.push(row);
@@ -2399,7 +2407,8 @@ impl Engine {
                             (None, None) => {
                                 let mut cancel = CancelCheck::new();
                                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                                for (_, row) in tbl.scan() {
+                                for item in tbl.scan() {
+                                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                                     cancel.tick()?;
                                     rows.push(row);
                                 }
@@ -2465,7 +2474,8 @@ impl Engine {
                         })?;
                 let mut cancel = CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in tbl.scan() {
+                for item in tbl.scan() {
+                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     if range_matches(
                         &row[col_idx],
@@ -3047,11 +3057,12 @@ impl Engine {
                 // Materialize the two needed columns and charge them against
                 // the query budget like a join build side.
                 let mut narrowed: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in self
+                for item in self
                     .catalog
                     .scan(&hop.table)
                     .map_err(QueryError::from_storage_io)?
                 {
+                    let (_, row) = item.map_err(QueryError::from_storage_io)?;
                     cancel.tick()?;
                     // A NULL key never matches any FK value.
                     if row[key_idx] == Value::Empty {
@@ -3394,11 +3405,12 @@ impl Engine {
                 }
             }
         } else {
-            for (_, row) in self
+            for item in self
                 .catalog
                 .scan(&nested.table)
                 .map_err(QueryError::from_storage_io)?
             {
+                let (_, row) = item.map_err(QueryError::from_storage_io)?;
                 cancel.tick()?;
                 narrow_into(&row, &mut child_rows)?;
             }

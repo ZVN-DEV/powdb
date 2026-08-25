@@ -1589,7 +1589,8 @@ impl Engine {
                 // must stay stoppable.
                 let mut cancel = crate::cancel::CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                for item in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                    let (_, row) = item.map_err(crate::result::QueryError::from_storage_io)?;
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -1609,7 +1610,8 @@ impl Engine {
                     .collect();
                 let mut cancel = crate::cancel::CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                for item in self.catalog.scan(table).map_err(|e| e.to_string())? {
+                    let (_, row) = item.map_err(crate::result::QueryError::from_storage_io)?;
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -1708,7 +1710,8 @@ impl Engine {
                         })?;
                 let mut cancel = crate::cancel::CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in tbl.scan() {
+                for item in tbl.scan() {
+                    let (_, row) = item.map_err(crate::result::QueryError::from_storage_io)?;
                     cancel.tick()?;
                     if row[col_idx] == key_value {
                         rows.push(row);
@@ -1759,7 +1762,9 @@ impl Engine {
                                 // Unbounded both sides — equivalent to seq scan.
                                 let mut cancel = crate::cancel::CancelCheck::new();
                                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                                for (_, row) in tbl.scan() {
+                                for item in tbl.scan() {
+                                    let (_, row) =
+                                        item.map_err(crate::result::QueryError::from_storage_io)?;
                                     cancel.tick()?;
                                     rows.push(row);
                                 }
@@ -1827,7 +1832,8 @@ impl Engine {
                         })?;
                 let mut cancel = crate::cancel::CancelCheck::new();
                 let mut rows: Vec<Vec<Value>> = Vec::new();
-                for (_, row) in tbl.scan() {
+                for item in tbl.scan() {
+                    let (_, row) = item.map_err(crate::result::QueryError::from_storage_io)?;
                     cancel.tick()?;
                     if range_matches(
                         &row[col_idx],

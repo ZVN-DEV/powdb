@@ -370,11 +370,12 @@ impl Engine {
         let mut rows = Vec::new();
         let mut provenance = Vec::new();
         let mut cancel = CancelCheck::new();
-        for (rid, row) in self
+        for item in self
             .catalog
             .scan(table)
             .map_err(QueryError::from_storage_io)?
         {
+            let (rid, row) = item.map_err(QueryError::from_storage_io)?;
             cancel.tick()?;
             rows.push(row);
             provenance.push(vec![Some(rid)]);
