@@ -12,7 +12,7 @@ PowDB is an embeddable database engine written from scratch in Rust. Its native 
 
 > Most of what a SQL engine does is *translate your query* into something executable. We remove that tier. PowQL is designed so the parser's AST **is already a plan tree**: no rewriting, no cost-based planning, no bytecode VM.
 
-The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, and slower on indexed point lookups, where the front-end cost dominates the actual probe (measured 1.65us against SQLite's 208ns). The current numbers, the methodology, and the workloads PowDB loses are in `docs/benchmarks/2026-07-24-wide-bench-snapshot.md`.
+The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, and slower on indexed point lookups, where the front-end cost dominates the actual probe (measured 3.17us against SQLite's 202ns, roughly 16x; an earlier table published 1.65us/7.9x and the README documents the retraction). The current numbers, the methodology, and the workloads PowDB loses are in `docs/benchmarks/2026-07-24-wide-bench-snapshot.md`.
 
 ### When PowDB is the right choice
 

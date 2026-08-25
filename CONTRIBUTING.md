@@ -3,6 +3,7 @@
 ## Prerequisites
 
 - Rust 1.93 or newer (MSRV is `1.93`, edition 2021; enforced by the `msrv-consistency` CI check)
+- A C toolchain and `cmake`. `cargo build --workspace` compiles `powdb-server` and `powdb-cli`, which reach TLS through `tokio-rustls` -> `aws-lc-sys`, and there is currently no feature to opt out. Without cmake the very first build dies inside `aws-lc-sys`. (The engine libraries alone need no C: `cargo build -p powdb`.)
 - Docker + Docker Compose (optional, for running wide benchmarks against Postgres/MySQL)
 
 ## Quick Start
@@ -33,8 +34,8 @@ For an edit-compile loop, `cargo install bacon && bacon` (or `cargo watch -x "ch
 ```bash
 cargo build --workspace           # debug build
 cargo build --release --workspace # release build
-cargo test --workspace            # run all tests
-cargo bench -p powdb-bench        # criterion benchmarks (23 benches, ~5 min of measurement)
+cargo test --workspace            # run all tests (roughly 35-45 minutes on an M-series laptop; iterate with `cargo test -p <crate>`)
+cargo bench -p powdb-bench        # criterion benchmarks (24 benches, 22 gated workloads; ~5 min of measurement)
 cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --features mysql for MySQL)
 ```
 

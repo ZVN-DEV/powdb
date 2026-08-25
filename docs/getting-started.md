@@ -13,6 +13,8 @@ cargo install powdb-cli
 cargo install powdb-server
 ```
 
+> **Prerequisite:** both installs need a C toolchain and `cmake` (TLS support pulls in `aws-lc-sys`, and there is no feature to opt out). If the install fails inside `aws-lc-sys`, install cmake first (`brew install cmake` / `apt install cmake build-essential`), or grab a [prebuilt binary](https://github.com/ZVN-DEV/powdb/releases/latest) instead. Embedding the engine in a Rust project (`cargo add powdb`) needs no C toolchain at all.
+
 Or build from source (requires Rust 1.93+; install from [rustup.rs](https://rustup.rs/) if needed):
 
 ```bash

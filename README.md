@@ -66,14 +66,17 @@ Full language reference: [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/m
 ## Install
 
 ```bash
-# From crates.io (Rust 1.93+)
+# Embedded in a Rust project (the engine as a library; needs no C toolchain)
+cargo add powdb
+
+# CLI + server from crates.io (Rust 1.93+; needs a C toolchain and cmake, see below)
 cargo install powdb-cli
 cargo install powdb-server
 
 # TypeScript client (Node 18+): version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
-# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu; other targets build from source)
+# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu ONLY; no source fallback, `require()` throws elsewhere: use @zvndev/powdb-client there)
 npm install @zvndev/powdb-embedded
 
 # Prebuilt binaries (linux x86_64, macos aarch64)
@@ -89,6 +92,27 @@ cargo build --release
 ```
 
 Requires Rust 1.93+. This builds all crates: the storage engine, query engine, TCP server, CLI, and benchmarks.
+
+### Embedded in Rust
+
+The `powdb` crate is the whole engine as a library, no server and no C toolchain:
+
+```rust
+use powdb::{Database, QueryResult, Value};
+
+fn main() -> Result<(), powdb::Error> {
+    let mut db = Database::open("./data")?;
+    db.query("type User { required name: str, age: int }")?;
+    db.query(r#"insert User { name := "Ada", age := 36 }"#)?;
+    match db.query("count(User)")? {
+        QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+        other => panic!("unexpected: {other:?}"),
+    }
+    Ok(())
+}
+```
+
+Full embedded API docs (read-only opens, memory limits, sync modes, typed results): [docs.rs/powdb](https://docs.rs/powdb).
 
 **Building `powdb-server` or `powdb-cli` requires a C toolchain and `cmake`, and there is currently no way to opt out.** Both reach TLS through `tokio-rustls`, which pulls `aws-lc-sys`. Neither crate declares any Cargo features, so `--no-default-features` is a silent no-op: there is no `tls` feature to turn off. Making TLS optional is real work we have not done yet.
 
@@ -413,7 +437,7 @@ The engine is `powdb_query::executor::Engine`. It owns a `Catalog` (which owns `
 PowDB has a benchmark regression gate that compares every workload against checked-in baselines. Run it locally before and after touching a hot path:
 
 ```bash
-cargo bench -p powdb-bench              # criterion suite: 23 benchmarks, ~5 min of
+cargo bench -p powdb-bench              # criterion suite: 24 benchmarks (22 gated workloads), ~5 min of
                                         # measurement, plus compile on a cold target
 cargo run --release -p powdb-bench --bin compare   # regression gate
 ```
