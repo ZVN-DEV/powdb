@@ -43,6 +43,22 @@ pub fn wal_fsync_stats() -> WalFsyncStats {
     }
 }
 
+/// Error every durability claim carries once the WAL is poisoned. Kept as
+/// a constant so tests can assert on the exact contract wording.
+const WAL_POISONED_MSG: &str = "WAL poisoned by an earlier fsync failure; commits can no \
+     longer be made durable (the OS may have dropped the unsynced pages). Restart the \
+     process to recover from the on-disk log";
+
+/// Address of the [`WalSyncShared`] whose next fsync must fail
+/// (self-disarming; 0 = disarmed). There is no portable way to make a real
+/// `fdatasync` return EIO/ENOSPC on demand, and the post-failure behavior —
+/// poison, never retry — is exactly what the fsyncgate tests have to
+/// observe. Scoped to one WAL's shared state so concurrent tests' fsyncs
+/// cannot steal the injection, yet global (not thread-local) so the
+/// Normal-mode background flusher thread can trip it too.
+#[cfg(test)]
+static WAL_FSYNC_FAILPOINT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Run `sync_data` on `file`, recording its duration in the process-wide
 /// counters. Every WAL fsync goes through here so the accounting cannot drift
 /// from the actual calls.
@@ -219,15 +235,44 @@ struct WalSyncShared {
     /// The fd used for fsyncs, doubling as the group-commit leader lock.
     /// `None` only if cloning the writer's fd failed on (re)open.
     sync_file: Mutex<Option<File>>,
+    /// Sticky fsyncgate latch. Once an fsync on this WAL has failed, the OS
+    /// may have dropped the dirty pages and marked them clean, so a RETRIED
+    /// fsync would report success without the bytes ever reaching stable
+    /// storage. Set on the first failure and never cleared: every later
+    /// durability claim fails fast with [`WAL_POISONED_MSG`] instead of
+    /// issuing another fsync. Recovery is a process restart (WAL replay
+    /// reads the log that actually made it to disk).
+    sync_poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl WalSyncShared {
+    /// True (once) when the fsync failpoint is armed for THIS shared state.
+    #[cfg(test)]
+    fn take_fsync_failpoint(&self) -> bool {
+        let me = self as *const WalSyncShared as usize;
+        WAL_FSYNC_FAILPOINT
+            .compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The one fsync choke point for this WAL: [`timed_sync_data`] plus the
+    /// test-only failure injection.
+    fn fsync_file(&self, file: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if self.take_fsync_failpoint() {
+            FSYNC_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other("injected WAL fsync failure"));
+        }
+        timed_sync_data(file)
+    }
+
     fn new(sync_file: Option<File>) -> Self {
         WalSyncShared {
             dirty_gen: AtomicU64::new(0),
             synced_gen: AtomicU64::new(0),
             fsync_count: AtomicU64::new(0),
             sync_file: Mutex::new(sync_file),
+            sync_poisoned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -249,13 +294,30 @@ impl WalSyncShared {
         if self.synced_gen.load(Ordering::Acquire) >= gen {
             return Ok(());
         }
+        // Checked under the leader lock, after the covered fast paths: a
+        // generation an earlier fsync already covered IS durable and may
+        // truthfully return Ok even on a poisoned WAL.
+        if self.sync_poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(WAL_POISONED_MSG));
+        }
         let file = guard
             .as_ref()
             .ok_or_else(|| io::Error::other("WAL sync fd unavailable"))?;
         // Snapshot BEFORE the fsync: every generation registered by now has
         // its bytes in the OS file already, so this one fsync covers them all.
         let cover = self.dirty_gen.load(Ordering::Acquire);
-        timed_sync_data(file)?;
+        if let Err(e) = self.fsync_file(file) {
+            // fsyncgate: retrying after a failed fsync is unsound (the OS
+            // may have dropped the pages and would report the retry as
+            // success). Poison the WAL permanently and surface the failure.
+            self.sync_poisoned.store(true, Ordering::Release);
+            tracing::error!(
+                error = %e,
+                "WAL fsync failed; poisoning the WAL — no further commits \
+                 will be acknowledged until the process restarts"
+            );
+            return Err(e);
+        }
         self.fsync_count.fetch_add(1, Ordering::Relaxed);
         self.synced_gen.fetch_max(cover, Ordering::AcqRel);
         Ok(())
@@ -368,10 +430,16 @@ impl Flusher {
                             *stop
                         }
                     };
+                    // A concurrent Full-mode leader may have poisoned the
+                    // WAL between ticks; a poisoned WAL has nothing left for
+                    // a flusher to do.
+                    if shared.sync_poisoned.load(Ordering::Acquire) {
+                        break;
+                    }
                     // fsync if the writer has buffered new bytes since last sync.
                     let d = shared.dirty_gen.load(Ordering::Acquire);
                     if d > shared.synced_gen.load(Ordering::Acquire) {
-                        match timed_sync_data(&file) {
+                        match shared.fsync_file(&file) {
                             Ok(()) => {
                                 shared.fsync_count.fetch_add(1, Ordering::Relaxed);
                                 // fetch_max, not store: a Full-mode group
@@ -380,16 +448,21 @@ impl Flusher {
                                 shared.synced_gen.fetch_max(d, Ordering::AcqRel);
                             }
                             // In Normal mode this background fsync is the ONLY
-                            // durability point. Swallowing the error (the old
-                            // `&& .is_ok()`) meant an ENOSPC/EIO would keep the
-                            // writer acking commits that never reached stable
-                            // storage, with no signal. Surface it; synced_gen
-                            // stays un-advanced so the next tick retries.
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "WAL background fsync failed; commits since the last \
-                                 successful sync are not yet durable (will retry)"
-                            ),
+                            // durability point, and retrying a failed fsync is
+                            // unsound (fsyncgate: the OS may have dropped the
+                            // pages and would report the retry as success).
+                            // Poison the WAL — later flushes fail fast with
+                            // WAL_POISONED_MSG — and stop flushing.
+                            Err(e) => {
+                                shared.sync_poisoned.store(true, Ordering::Release);
+                                tracing::error!(
+                                    error = %e,
+                                    "WAL background fsync failed; poisoning the WAL and \
+                                     stopping the flusher — no further commits will be \
+                                     acknowledged until the process restarts"
+                                );
+                                break;
+                            }
                         }
                     }
                     if stopping {
@@ -511,6 +584,28 @@ impl Wal {
         if let Some(mut f) = self.flusher.take() {
             f.stop();
         }
+    }
+
+    /// Arm the fsync failpoint for this WAL: its next fsync — from any
+    /// thread, including the Normal-mode background flusher — fails with an
+    /// injected error. Self-disarming.
+    #[cfg(test)]
+    fn arm_fsync_failpoint(&self) {
+        WAL_FSYNC_FAILPOINT.store(
+            Arc::as_ptr(&self.shared) as usize,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// True once any fsync on this WAL has failed. The WAL is then
+    /// permanently poisoned — every later durability claim fails fast with
+    /// the same error instead of retrying the fsync (fsyncgate: a retried
+    /// fsync can report success over pages the OS already dropped). Restart
+    /// the process to recover from the on-disk log.
+    pub fn is_sync_poisoned(&self) -> bool {
+        self.shared
+            .sync_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The highest dirty generation known to be fsync-durable. Advances on
@@ -684,6 +779,14 @@ impl Wal {
         let batch = self.pending;
         if batch == 0 {
             return Ok(None);
+        }
+        // Poisoned WALs take no new durable-intent bytes: in Normal mode the
+        // ack happens right after this flush-to-OS, and the mechanism that
+        // would have made it durable is permanently gone.
+        if !matches!(self.sync_mode, WalSyncMode::Off)
+            && self.shared.sync_poisoned.load(Ordering::Acquire)
+        {
+            return Err(io::Error::other(WAL_POISONED_MSG));
         }
         // Borrow the writer only for the I/O, then drop it before touching the
         // generation counters (which borrow `self`).
@@ -1338,6 +1441,88 @@ mod tests {
             assert_eq!(records[0].data, b"persistent");
             assert_eq!(records[1].record_type, WalRecordType::Commit);
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// fsyncgate: after a failed fsync, the OS may have dropped the dirty
+    /// pages and marked them clean — a RETRIED fsync then reports success
+    /// without the data ever reaching stable storage. The only sound
+    /// response is to poison the WAL: surface the failure once, then refuse
+    /// every later durability claim until the process restarts and replays
+    /// the on-disk log.
+    #[test]
+    fn a_failed_fsync_poisons_the_wal_and_is_never_retried() {
+        let (mut wal, path) = temp_wal("fsync_poison");
+        wal.set_sync_mode(WalSyncMode::Full);
+        wal.append(1, WalRecordType::Insert, b"healthy").unwrap();
+        wal.flush().unwrap();
+        let healthy_fsyncs = wal.fsync_count();
+        assert!(healthy_fsyncs >= 1, "baseline commit must fsync");
+        assert!(!wal.is_sync_poisoned());
+
+        wal.arm_fsync_failpoint();
+        wal.append(1, WalRecordType::Insert, b"doomed").unwrap();
+        let err = wal
+            .flush()
+            .expect_err("the injected fsync failure must surface");
+        assert!(
+            err.to_string().contains("injected"),
+            "first failure surfaces the real error, got: {err}"
+        );
+        assert!(wal.is_sync_poisoned());
+
+        // The failpoint disarmed itself, so a retried fsync WOULD report
+        // success now — exactly the false durability this test forbids.
+        wal.append(1, WalRecordType::Insert, b"after").unwrap();
+        let err = wal
+            .flush()
+            .expect_err("a poisoned WAL must refuse further durability claims");
+        assert!(
+            err.to_string().contains("poisoned"),
+            "later failures name the poisoned state, got: {err}"
+        );
+        assert_eq!(
+            wal.fsync_count(),
+            healthy_fsyncs,
+            "no fsync may ever be issued after a failure"
+        );
+
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Same property through the Normal-mode background flusher: its fsync
+    /// failing must poison the WAL (stopping the flusher) rather than retry
+    /// on the next tick, and later writes must fail loudly instead of being
+    /// acked against a durability mechanism that no longer exists.
+    #[test]
+    fn a_failed_background_fsync_poisons_normal_mode() {
+        let (mut wal, path) = temp_wal("flusher_poison");
+        wal.set_sync_mode(WalSyncMode::Normal);
+
+        wal.arm_fsync_failpoint();
+        wal.append(1, WalRecordType::Insert, b"doomed").unwrap();
+        wal.flush().unwrap(); // Normal: flush-to-OS only, fsync is the flusher's
+
+        // The flusher ticks every ~10ms; poll generously for the poison.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !wal.is_sync_poisoned() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(wal.is_sync_poisoned(), "flusher fsync failure must poison");
+
+        let synced_after_poison = wal.synced_generation();
+        wal.append(1, WalRecordType::Insert, b"after").unwrap();
+        let err = wal
+            .flush()
+            .expect_err("poisoned Normal-mode WAL must refuse further commits");
+        assert!(err.to_string().contains("poisoned"), "got: {err}");
+        // Disarmed failpoint + still-running flusher would falsely advance
+        // the synced generation; the poisoned WAL must never move it again.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(wal.synced_generation(), synced_after_poison);
+
+        drop(wal);
         std::fs::remove_file(&path).ok();
     }
 }
