@@ -52,7 +52,7 @@ import {
 } from "./typed.js";
 
 /** Client library version. Compared to the server's reported version. */
-export const CLIENT_VERSION = "0.27.0-rc.1";
+export const CLIENT_VERSION = "0.27.0";
 
 /**
  * Everything this client states about itself at connect time: the wire

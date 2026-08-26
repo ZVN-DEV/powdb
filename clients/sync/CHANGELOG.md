@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.27.0 - 2026-08-26
+
 - `SUPPORTED_CATALOG_VERSION` raised from 6 to 7. The engine's catalog format
   has been v7 (persisted entity links, activated lazily per database) since
   PowDB 0.19.0, so a replica that stated this package's ceiling in its identity

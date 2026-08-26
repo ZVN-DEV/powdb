@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.27.0 - 2026-08-26
+
+No client API changes. Version moves in lockstep with the engine.
+
+Three server-side changes are visible from this client:
+
+- Every documented "unsupported SQL" wall now reaches the client verbatim
+  as wire error class `1` (`parse`), naming the construct and the working
+  alternative, instead of a generic `query execution error`.
+- A scan that hits an unreadable or corrupt page now fails with wire error
+  class `0` (`internal`) instead of silently returning a shorter result.
+- PowQL and SQL parse errors lead with `at position N:` so the failing
+  token can be located.
+
 ## 0.26.0 - 2026-08-23
 
 No client API changes. Version moves in lockstep with the engine.
