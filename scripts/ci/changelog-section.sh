@@ -45,9 +45,18 @@ section="$(awk -v want="## [${version}]" '
 
 # Trim leading and trailing blank lines so the release body does not open on
 # whitespace, and so the emptiness test below sees the real content.
-section="$(printf '%s\n' "${section}" | sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;};/\n$/ba')"
+section="$(printf '%s\n' "${section}" | awk '
+  { lines[NR] = $0 }
+  END {
+    start = 1; while (start <= NR && lines[start] ~ /^[[:space:]]*$/) start++
+    end = NR;  while (end >= start && lines[end] ~ /^[[:space:]]*$/) end--
+    for (i = start; i <= end; i++) print lines[i]
+  }')"
 
-if [[ -z "${section//[[:space:]]/}" ]]; then
+# grep, not `${section//[[:space:]]/}`: bash 3.2 (macOS) implements that
+# replacement quadratically, and on the ~11 KB v0.27.0 section it pinned a
+# CPU for minutes. Found the hard way cutting v0.27.0; CI's bash 5 masked it.
+if ! printf '%s' "${section}" | grep -q '[^[:space:]]'; then
   die "CHANGELOG.md has no content under '## [${version}]'.
        The GitHub Release body is built from that section, and publishing an
        empty body is the exact failure this check exists to prevent. Add the

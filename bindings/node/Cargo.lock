@@ -250,7 +250,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "powdb"
-version = "0.27.0-rc.1"
+version = "0.27.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-node"
-version = "0.27.0-rc.1"
+version = "0.27.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.27.0-rc.1"
+version = "0.27.0"
 dependencies = [
  "powdb-storage",
  "rustc-hash",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.27.0-rc.1"
+version = "0.27.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-sync"
-version = "0.27.0-rc.1"
+version = "0.27.0"
 dependencies = [
  "crc32fast",
  "getrandom",
