@@ -232,7 +232,9 @@ grep -qE "^## \[$current_release\]" CHANGELOG.md \
 # should not be the first time anyone discovers the body would have been empty.
 release_body="$(bash scripts/ci/changelog-section.sh "$current_release" 2>&1)" \
   || fail "scripts/ci/changelog-section.sh cannot build a GitHub Release body for $current_release: $release_body"
-[[ -n "${release_body//[[:space:]]/}" ]] \
+# grep, not `${release_body//[[:space:]]/}`: quadratic on bash 3.2 (macOS),
+# minutes of CPU on a large release section. Same fix as changelog-section.sh.
+printf '%s' "$release_body" | grep -q '[^[:space:]]' \
   || fail "the release body extracted for $current_release is empty"
 
 # The npm client ships its CHANGELOG.md in the tarball; it must at least cover
