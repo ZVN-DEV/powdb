@@ -10,6 +10,26 @@ cd "$ROOT"
 fail() { echo "version-consistency: FAIL — $*" >&2; exit 1; }
 log() { echo "version-consistency: $*"; }
 
+# X.Y.Z or X.Y.Z-rc.N -> "X.Y.x" (the SECURITY.md series). Anything else is a
+# non-zero return so a malformed version cannot pass as a series of its own.
+minor_series_of() {
+  local series
+  series="$(sed -nE 's/^([0-9]+\.[0-9]+)\.[0-9]+(-rc\.[0-9]+)?$/\1/p' <<< "$1")"
+  [[ -n "$series" ]] || return 1
+  printf '%s.x\n' "$series"
+}
+
+if [[ "${1:-}" == "--selftest" ]]; then
+  [[ "$(minor_series_of 0.27.0)" == "0.27.x" ]] || fail "selftest: 0.27.0 -> 0.27.x"
+  [[ "$(minor_series_of 0.27.0-rc.1)" == "0.27.x" ]] || fail "selftest: 0.27.0-rc.1 -> 0.27.x"
+  [[ "$(minor_series_of 1.2.3-rc.12)" == "1.2.x" ]] || fail "selftest: 1.2.3-rc.12 -> 1.2.x"
+  for bad in 0.27.0-beta.1 0.27.0-rc1 0.27 v0.27.0 ""; do
+    minor_series_of "$bad" >/dev/null 2>&1 && fail "selftest: '$bad' must not yield a series"
+  done
+  log "selftest ok (minor series derives from the X.Y prefix, rc or final; malformed refused)"
+  exit 0
+fi
+
 workspace_version="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version = "\([^"]*\)"/\1/p; }' Cargo.toml | head -1)"
 [[ -n "$workspace_version" ]] || fail "could not parse [workspace.package] version from Cargo.toml"
 log "workspace version: $workspace_version"
@@ -219,6 +239,11 @@ release_body="$(bash scripts/ci/changelog-section.sh "$current_release" 2>&1)" \
 # the latest published release so package consumers see current release notes.
 grep -qE "^## $current_release" clients/ts/CHANGELOG.md \
   || fail "clients/ts/CHANGELOG.md has no entry for published release $current_release"
+# @zvndev/powdb-sync ships its CHANGELOG.md in the tarball too (package.json
+# "files"). Nothing checked it, and it told every installer the package was
+# "NOT published to npm" three releases after it first shipped.
+grep -qE "^## $current_release" clients/sync/CHANGELOG.md \
+  || fail "clients/sync/CHANGELOG.md has no entry for published release $current_release"
 
 # SECURITY.md must list the published minor series (e.g. 0.12.x) as supported.
 # During development an unreleased workspace series must additionally remain
@@ -226,7 +251,10 @@ grep -qE "^## $current_release" clients/ts/CHANGELOG.md \
 minor_series="${current_release%.*}.x"
 grep -F ':white_check_mark:' SECURITY.md | grep -qF "$minor_series" \
   || fail "SECURITY.md does not list published series $minor_series as supported"
-next_minor_series="${workspace_version%.*}.x"
+# `${workspace_version%.*}` is wrong for a release candidate: it turns
+# 0.27.0-rc.1 into "0.27.0-rc", so the series must come from the X.Y prefix.
+next_minor_series="$(minor_series_of "$workspace_version")" \
+  || fail "workspace version $workspace_version is not X.Y.Z or X.Y.Z-rc.N"
 if [[ "$next_minor_series" != "$minor_series" ]]; then
   grep -F ':x: (unreleased)' SECURITY.md | grep -qF "$next_minor_series" \
     || fail "SECURITY.md does not mark development series $next_minor_series as unreleased"

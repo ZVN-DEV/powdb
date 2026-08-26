@@ -156,15 +156,23 @@ jobs:
           fi
           test -f index.js || { echo "::error::index.js (napi loader) missing"; exit 1; }
 
+      # Same classifier release.yml uses for the client packages: a final
+      # version publishes under `latest`, an X.Y.Z-rc.N under `next`, so an rc
+      # never becomes what a bare `npm install @zvndev/powdb-embedded`
+      # resolves to. Any other version shape fails here rather than shipping.
+      - name: Classify the release channel (final vs rc)
+        id: channel
+        run: bash scripts/ci/release-channel.sh "${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+
       - name: Publish to npm (token-less, with provenance)
         if: ${{ inputs.dry_run == false }}
         working-directory: bindings/node
-        run: npm publish --provenance --access public
+        run: npm publish --provenance --access public --tag "${{ steps.channel.outputs.npm_tag }}"
 
       - name: Dry run (pack only)
         if: ${{ inputs.dry_run == true }}
         working-directory: bindings/node
-        run: npm publish --dry-run
+        run: npm publish --dry-run --tag "${{ steps.channel.outputs.npm_tag }}"
 
       - name: Summary
         run: |
@@ -172,6 +180,6 @@ jobs:
             echo "## Dry run complete" >> "$GITHUB_STEP_SUMMARY"
             echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 3 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## Published @zvndev/powdb-embedded v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Published @zvndev/powdb-embedded v${{ inputs.version }} (dist-tag ${{ steps.channel.outputs.npm_tag }})" >> "$GITHUB_STEP_SUMMARY"
             echo "Single package with prebuilt binaries for macOS (arm64), Linux (x64/arm64). Intel mac builds from source (retired runners); Windows deferred (Unix-only engine)." >> "$GITHUB_STEP_SUMMARY"
           fi
