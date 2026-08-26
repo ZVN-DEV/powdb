@@ -12,8 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Release candidates.** A `vX.Y.Z-rc.N` tag now ships a full release on
   every channel without moving what a default install resolves to: GitHub
   pre-release, ghcr `:rc` floating tag (`:latest` untouched), npm dist-tag
-  `next`, and a crates.io pre-release version cargo will not pick up unless
-  pinned. See RELEASES.md.
+  `next` for the client and sync packages (and `publish-node-addon.yml`,
+  dispatched with the rc version, publishes the addon under `next` too),
+  and a crates.io pre-release version cargo will not pick up unless pinned.
+  See RELEASES.md.
 - **`powdb-server --port 0` reports the bound port.** A new `--port-file
   <path>` flag (env `POWDB_PORT_FILE`) writes `port=N` (plus `metrics=N` when
   the metrics endpoint is on) after startup, and the "powdb server
@@ -21,6 +23,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the one requested.
 - **`docs/metrics.md`**: every metric family the Prometheus endpoint
   exposes, held equal to the code by CI.
+- **`powdb-sync` refusals carry a typed `SyncError`.** Every error the crate
+  raises still arrives as an `io::Error` with the same message text and the
+  same `io::ErrorKind` as before, but its source is now a
+  `powdb_sync::SyncError`: `IdentityMismatch`, `ApplyInProgress`,
+  `ApplyStateRequiresRepair`, `UntrustedApplyBoundary`, plus the two
+  catch-alls `InvalidRequest` (`ErrorKind::InvalidInput`) and `CorruptState`
+  (`ErrorKind::InvalidData`). A replica host deciding between resume,
+  repair, and rebootstrap can branch on
+  `err.get_ref().and_then(|e| e.downcast_ref::<SyncError>())` instead of
+  matching rendered text. Public signatures are unchanged.
+- **A yank/rollback runbook in RELEASES.md** covering every channel: the
+  full-set crates.io yank, npm deprecation, repointing the ghcr `latest`
+  tag, demoting the GitHub Release, and the rule for yank versus
+  fix-forward.
+- **Publishing is gated by `cargo-semver-checks`.** `publish.yml` now runs
+  it (v0.50.0) against the crates.io baselines before any crate publishes,
+  so a point release cannot carry an API break; a `dry_run=true` dispatch
+  doubles as a release preflight. It sits at the publish door rather than
+  in the merge gate on purpose: between releases `main` legitimately
+  carries breaking changes against the last published version.
 
 ### Changed
 
@@ -53,6 +75,214 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `coalesce(sum(x), 0)` in SQL. The corresponding entry has left the oracle
   divergence ledger: the differential oracle now holds PowDB to SQLite's
   answer here.
+
+- **A failed WAL fsync now poisons the WAL instead of being retried.** Once
+  `fsync` fails, the OS may already have dropped the dirty pages and marked
+  them clean, so a retried `fsync` reports success over bytes that never
+  reached stable storage (the "fsyncgate" hazard), and both durability
+  paths used to retry. A failed fsync now sets a sticky poisoned flag on
+  the WAL. From then on every commit that needs durability fails fast with
+  `WAL poisoned by an earlier fsync failure; commits can no longer be made
+  durable (the OS may have dropped the unsynced pages). Restart the process
+  to recover from the on-disk log`, the background flusher stops, the WAL
+  takes no new bytes in `full` or `normal` mode, and
+  `powdb_wal_fsync_failures_total` increments (alert on it; see
+  `docs/metrics.md`). Commits an earlier fsync already covered still report
+  success truthfully. Recovery is a process restart, which replays the log
+  that actually reached disk; the engine poisons rather than aborts because
+  it also runs embedded, where killing the host is not its decision.
+  `Wal::is_sync_poisoned()` exposes the state.
+
+- **`From<StorageError> for io::Error` keeps the typed error as the source.**
+  It used to render the refusal to text, so any storage error that crossed a
+  plain `?` or `.into()` lost its variant and the server fell back to
+  substring-matching the message to pick a wire error class. The conversion
+  now wraps the `StorageError` itself (`io::Error::other(err)`): the rendered
+  text is byte-identical, and `StorageError::kind_of_io_error(&err)` recovers
+  the `StorageErrorKind` on the far side of any `io::Result` boundary. With
+  no producer left that can strip a kind, the substring fallback is deleted
+  (see Removed), and the binary-level `wire_error_class_from_type` suite pins
+  every class end to end.
+
+- Internal: `crates/storage/src/catalog.rs` is now the
+  `crates/storage/src/catalog/` module directory and the CLI's `main.rs` is
+  split into `args`, `admin`, `embedded`, `remote`, `repl`, and `output`
+  modules, both pure moves with every public path preserved
+  (`read_active_catalog_version` through a `pub use`); the executor's
+  unit tests are sharded into 14 themed files; and process tests spawn
+  `powdb-server --port 0` with `--port-file` instead of racing for a free
+  port.
+- Internal: new CI gates. `testing-feature-guard` refuses `powdb-query`'s
+  test-only `testing` feature in any shipped artifact's normal and build
+  feature graph (eight crates plus the Node addon); `missing-docs-ratchet`
+  holds each published library crate's count of undocumented public items
+  equal to `scripts/ci/missing-docs-baseline.txt`, so public-API docs only
+  ever tighten (`powdb` and `powdb-auth` are at zero and now carry
+  `#![warn(missing_docs)]`); `miri-query` runs the compiled predicate module
+  (`executor::compiled`, byte-offset filter evaluation) under miri; and two
+  fuzz targets, `fuzz_sync_segment` (`RetainedSegment::from_bytes`) and
+  `fuzz_btree_open` (`BTree::load` plus the read surface), join `fuzz.yml`
+  and the corpus-replay gate; and a `rustdoc` job builds the public docs
+  with `RUSTDOCFLAGS=-D warnings` (default features only), which nothing
+  did before, so the six intra-doc links in the public API docs that
+  pointed at private or nonexistent items and rendered as plain text on
+  docs.rs are fixed.
+
+### Fixed
+
+- **Scans fail closed on unreadable or unverifiable pages.** `HeapFile::scan`
+  mapped a failed page read or an unparseable page to zero rows from that
+  page, and the closure scans' `pread` fallback skipped read errors, so bit
+  rot or an I/O error hit mid-scan produced a silently shorter result from
+  a full-table query (and from the index-rebuild, vacuum, and DDL paths
+  built on the same scans), while the same page hit through a point read
+  errored. Scans now hold exactly the point-read standard
+  (`Page::from_bytes_verified`: CRC when the page is stamped, format
+  version always) and every consumer propagates. Engine users get a
+  `QueryError::Storage` whose kind is `PageCorrupt` (for example `page
+  corrupt: page 2 CRC32 mismatch: stored 0x..., computed 0x...`), direct
+  `powdb-storage` users a `StorageError::PageCorrupt`; over the wire it is
+  error class 0 (`internal`), a server-side fault, never a partial answer.
+  The mmap fast paths are unchanged and now document their contract. For
+  direct users of `powdb-storage` the signatures moved with it:
+  `HeapFile::scan`, `Table::scan`, and `Catalog::scan` yield
+  `io::Result` items; `for_each_row`, `try_for_each_row`,
+  `for_each_row_raw`, and `try_for_each_row_raw` return `io::Result<()>`;
+  `HeapFile::has_rows` returns `io::Result<bool>`; and
+  `Catalog::assign_auto_columns` returns `io::Result<()>`. New suite:
+  `crates/storage/tests/scan_corruption.rs`.
+
+- **`LIKE '%'` now matches text that contains a literal `%`.** The matcher
+  tested the literal branch before the `%` branch, so a pattern `%` landing
+  on a `%` in the text was consumed as an ordinary character with no
+  backtrack point: `LIKE '%'` failed to match `"%a"` and `"%%"`, and
+  `LIKE '%_'` failed to match `"%"`. The corresponding oracle ledger entry
+  (`like-pattern-percent-consumed-as-a-literal`) is retired; the
+  differential oracle now holds PowDB to SQLite's answer here.
+
+- **SQL-subset diagnostics now reach remote clients verbatim.** Every
+  documented "unsupported SQL" wall in `docs/SQL.md` (CASE, COALESCE,
+  COUNT(DISTINCT), CAST, OVER, IN, EXISTS, scalar subqueries, BETWEEN, table
+  constraints, `RETURNING <columns>`) is a static message naming the
+  construct and the working alternative, but none had a prefix in the
+  server's safe-to-forward list, so an embedded caller saw the real message
+  while a remote client saw `query execution error`. The `sql ` and
+  `returning ` prefixes are now forwarded, with error class 1 (`parse`), and
+  an enumerate-by-executing test holds every documented wall to the wire.
+  `docs/SQL.md` no longer tells you to prototype embedded to read the
+  reason.
+
+- **A plan-cache hash collision can no longer execute the wrong plan.** The
+  cache was keyed by a bare 64-bit FNV-1a hash of the canonical query, which
+  is not collision-resistant, so two different query shapes with the same
+  hash served each other's cached plan: a silent wrong answer. The cache now
+  stores the canonical byte stream beside each plan and re-compares it on
+  every hit; a mismatch is a counted miss (the query is replanned from
+  source) and increments the plan cache's public `hash_collisions` counter
+  (`PlanCache::hash_collisions`; it is not on `/metrics`). Cost on the point
+  lookup microbenchmark: `powql_point` 1.68 us to 1.76 us (+4.5%), inside
+  the regression gate.
+
+- **A crashed replica can resume.** A SIGKILL between writing the
+  `InProgress` apply intent and marking it complete left an embedded replica
+  permanently wedged: the whole-tail resume refused with `another
+  retained-tail apply is in progress for this replica`, the exact-chunk
+  retry with `retained chunk start LSN N is not a trusted completed apply
+  boundary`, and no public API could clear it. Found by a new process-level
+  kill -9 test (`crates/backup/tests/replica_kill9.rs`). A resume that
+  starts exactly at the catalog LSN WAL replay recovered, when that LSN
+  lies inside the stranded intent's `[applied, through]` window, now voids
+  the intent and proceeds; anything else stays fail-closed. Affects
+  `powdb_sync::apply_retained_tail` and
+  `apply_retained_units_chunk`, and therefore the retained-unit apply the
+  `powdb` crate and `@zvndev/powdb-embedded` expose (`applyRetainedUnits`).
+
+- **`link` statements are classified as schema definition under RBAC.** The
+  entity-link DDL was missing from the server's schema-definition check, so
+  a `readonly` principal refused a `link` statement was told `permission
+  denied: role 'readonly' cannot execute write statements` rather than
+  `... schema-definition statements`. No outcome changed for any builtin
+  role: `admin` and `readwrite` hold both Write and Ddl and `readonly` holds
+  neither, so only the message moved. The full role-by-statement matrix
+  (every builtin role, an unknown role, and the legacy no-principal path
+  against one sample of every statement kind) is now pinned by a test whose
+  exhaustive match makes a new statement kind a compile error until it is
+  classified.
+
+- **The Docker image's dependency-cache stage was silently dead.** The
+  manifest copy list never gained `crates/sync/Cargo.toml` when
+  `powdb-server` took its `powdb-sync` dependency (v0.8.0), so workspace
+  resolution failed in the stub build and a `2>/dev/null || true` swallowed
+  the error: the cache layer warmed nothing and every image build recompiled
+  all dependencies. The sync manifest is stubbed with the others, the error
+  swallowing is gone (a future miss fails the build loudly), and the real
+  build now runs `--locked` like CI and the release workflows.
+
+- **`@zvndev/powdb-sync` accepts catalog v7 servers.** Its
+  `SUPPORTED_CATALOG_VERSION` was still 6 after the engine moved to v7
+  (persisted entity links, 0.19.0), so a primary whose database had
+  activated v7 refused a replica stating this ceiling, and
+  `assertServerCatalogVersionSupported` rejected such a primary with
+  `server catalog format v7 is newer than this client supports (max v6)`.
+  Raised to 7, matching `@zvndev/powdb-client`; `test/sync.test.ts` now
+  reads `CATALOG_VERSION` out of `crates/storage/src/catalog/mod.rs` and
+  fails when the two disagree. The package treats catalog payloads as
+  opaque bytes, so nothing else changes.
+
+- **Documentation.**
+  - `json_text` was shipped but documented nowhere; it is now next to
+    `json_type` in `docs/POWQL.md`, the "complete keyword list" regained
+    `json_text`, `json_type`, and `raw`, and a new test
+    (`crates/query/tests/powql_doc_sync.rs`) holds that list equal to the
+    lexer's `POWQL_KEYWORDS`.
+  - The C toolchain and `cmake` prerequisite for `cargo install powdb-cli`
+    / `powdb-server` is stated in `docs/getting-started.md`, the site, and
+    `CONTRIBUTING.md`.
+  - The README gained the embedded-Rust front door (`cargo add powdb`, a
+    runnable snippet, the docs.rs link) and no longer claims the embedded
+    npm addon "builds from source" on other platforms (it ships no source
+    and `require()` throws; use `@zvndev/powdb-client` there).
+  - `site/powql.html` gained the Nested Projections and Entity Links
+    sections, and `docs/POWQL.md`'s table of contents the Comments and
+    Entity Links sections it lacked.
+
+### Removed
+
+- **`StorageError::is_ddl_in_transaction_message`,
+  `is_transaction_too_large_message`, and `is_unique_violation_message`
+  (`powdb-storage`).** They were the legacy fallback for classifying a
+  storage refusal after it had been rendered to text. The last path that
+  did that rendering was `From<StorageError> for io::Error`, which now
+  carries the typed error as the `io::Error`'s source (see Changed), so
+  nothing is left for a substring predicate to classify. Migration: recover
+  the variant with `StorageError::kind_of_io_error(&err)`, which returns
+  `Option<StorageErrorKind>`, or downcast the source and match it:
+  `err.get_ref().and_then(|e| e.downcast_ref::<StorageError>())`. Message
+  text is unchanged. This, together with the scan signatures under Fixed,
+  is a breaking change to a published crate's API, which is why the next
+  release is 0.27.0 rather than 0.26.1.
+
+### Security
+
+- **An unauthenticated peer can no longer hold a connection slot forever.**
+  The wait for CONNECT ran under the general idle timeout, and every
+  pre-auth Ping reset it, so a client that pinged and never authenticated
+  squatted on a slot indefinitely, while the TLS handshake has had a 10 s
+  ceiling since 0.20.0. The whole pre-auth phase of every connection, pings
+  included, now runs under one 10 s deadline (`DEFAULT_PREAUTH_DEADLINE`;
+  not configurable on the binary, library embedders set
+  `ConnOpts::preauth_deadline`). Pings are answered inside the window but
+  never extend it; expiry closes the connection and logs `pre-auth deadline
+  expired waiting for CONNECT`. Load-balancer health checks (connect, ping,
+  close) fit comfortably; a checker that parks one pre-auth connection and
+  pings it forever must reconnect per check.
+
+- **Username enumeration by timing is closed.** `UserStore::authenticate`
+  returned in nanoseconds for an unknown user and after one argon2id
+  verification (~100 ms) for a known user with a wrong password, a remote
+  timing oracle that enumerated usernames (measured at 84 ns against
+  199 ms). An unknown user now costs one argon2id verify against a
+  process-wide dummy hash, so both refusals do the same work.
 
 ## [0.26.0] - 2026-08-23
 
