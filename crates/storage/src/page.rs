@@ -700,7 +700,7 @@ pub fn slot_bytes_from_page(page_bytes: &[u8], i: u16) -> Option<&[u8]> {
 }
 
 /// Slot count of a raw page-sized slice, clamped to what the page can
-/// physically hold. See [`MAX_SLOT_COUNT`].
+/// physically hold (the crate-private `MAX_SLOT_COUNT`).
 #[inline]
 pub fn slot_count_from_page(page_bytes: &[u8]) -> u16 {
     // SAFETY: slice is exactly 2 bytes, try_into is infallible.

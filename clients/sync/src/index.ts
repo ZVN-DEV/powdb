@@ -12,9 +12,11 @@ export type SyncRepairAction = "none" | "pull" | "awaitArchive" | "rebootstrap";
  * The maximum catalog format version this client can read. This is the
  * `catalogVersion` a replica should state in its identity: the primary accepts
  * any replica whose maximum is at least the database's active catalog format,
- * and rejects an older replica.
+ * and rejects an older replica. Tracks the engine's `CATALOG_VERSION`
+ * (crates/storage/src/catalog/mod.rs); `test/sync.test.ts` fails when the two
+ * disagree.
  */
-export const SUPPORTED_CATALOG_VERSION = 6;
+export const SUPPORTED_CATALOG_VERSION = 7;
 
 /**
  * Throw when a server-reported catalog format is newer than this client can

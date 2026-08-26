@@ -47,7 +47,7 @@ impl SegmentIdentity {
     /// records the on-disk catalog format the producing database was running
     /// when the segment was published. It is deliberately excluded from
     /// [`Self::lineage_matches`]; consumers accept an older annotation and
-    /// reject a newer one via [`validate_identity`].
+    /// reject a newer one via [`Self::validate`].
     pub fn with_catalog_version(
         database_id: [u8; 16],
         primary_generation: u64,

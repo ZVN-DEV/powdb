@@ -1,7 +1,11 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   PowDBSyncError,
   PowDBSyncReplica,
+  SUPPORTED_CATALOG_VERSION,
+  assertServerCatalogVersionSupported,
   type LocalApplyRequest,
   type LocalApplyResult,
   type LocalReplica,
@@ -190,6 +194,46 @@ function replica(remote: RemoteSyncClient, local: LocalReplica): PowDBSyncReplic
 
 async function main() {
   console.log("\n@zvndev/powdb-sync — embedded replica control loop");
+
+  await test("SUPPORTED_CATALOG_VERSION matches the engine's CATALOG_VERSION", () => {
+    // Drift gate: nothing else ties this package's exported ceiling to the
+    // engine's `pub const CATALOG_VERSION`, and it sat at 6 for eight
+    // releases after the engine moved to 7 (entity links, 0.19.0).
+    const path = fileURLToPath(
+      new URL("../../../crates/storage/src/catalog/mod.rs", import.meta.url),
+    );
+    const text = readFileSync(path, "utf8");
+    const matches = [...text.matchAll(/^pub const CATALOG_VERSION: u16 = (\d+);$/gm)];
+    assert.equal(
+      matches.length,
+      1,
+      `expected exactly one \`pub const CATALOG_VERSION: u16 = N;\` in ${path}, found ${matches.length}`,
+    );
+    const engineCatalogVersion = Number(matches[0]![1]);
+    assert.equal(
+      SUPPORTED_CATALOG_VERSION,
+      engineCatalogVersion,
+      `SUPPORTED_CATALOG_VERSION (${SUPPORTED_CATALOG_VERSION}) has fallen behind the engine's CATALOG_VERSION (${engineCatalogVersion})`,
+    );
+  });
+
+  await test("assertServerCatalogVersionSupported accepts a v7 primary and rejects v8", () => {
+    // Behavior behind the gate: a primary whose database activated the
+    // entity-links format (v7) is readable; the next format is not.
+    assertServerCatalogVersionSupported(7);
+    assertServerCatalogVersionSupported(6);
+    assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION);
+    assert.throws(
+      () => assertServerCatalogVersionSupported(8),
+      new Error(
+        "server catalog format v8 is newer than this client supports (max v7); upgrade the client",
+      ),
+    );
+    // An explicit client max is honored, and a nonsense version is refused.
+    assertServerCatalogVersionSupported(5, 5);
+    assert.throws(() => assertServerCatalogVersionSupported(6, 5), /upgrade the client/);
+    assert.throws(() => assertServerCatalogVersionSupported(0), /invalid server catalog version/);
+  });
 
   await test("queryReadonly delegates to the local embedded replica", async () => {
     const log: string[] = [];

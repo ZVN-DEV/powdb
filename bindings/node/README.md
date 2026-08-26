@@ -81,7 +81,7 @@ const result = db.applyRetainedUnits({
   databaseId: "00112233445566778899aabbccddeeff",
   primaryGeneration: 1n,
   walFormatVersion: 1,
-  catalogVersion: 5,
+  catalogVersion: 7, // the newest catalog format this replica can read
   segmentFormatVersion: 1,
   units: pull.units,
 });

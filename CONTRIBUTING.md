@@ -133,6 +133,7 @@ by `scripts/ci/check-ci-success-needs.sh`, so it cannot fall behind the workflow
 - **`bench-gate-selftest`**: proves the benchmark regression gate can still fail
 - **`testing-feature-guard`**: resolves every shipped artifact's normal and build feature graph and refuses `powdb-query/testing` (test-only executor instrumentation); `scripts/ci/testing-feature-guard.sh --selftest` proves the detector fires
 - **`missing-docs-ratchet`**: each published library crate's count of undocumented public items must equal `scripts/ci/missing-docs-baseline.txt`, so public-API docs only ever tighten; `scripts/ci/missing-docs-ratchet.sh --selftest` proves the counter can see gaps
+- **`rustdoc`**: `cargo doc --workspace --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`, default features only, so a broken or private intra-doc link in the public API docs fails the build instead of rendering as plain text on docs.rs
 - **`ci-needs-completeness`**: every job defined in `ci.yml` is required by `ci-success`, and every `needs:` entry names a job that exists
 - **`secret-scan`**: gitleaks, low-noise, with a documented placeholder allowlist
 - **`audit`**: `cargo audit` against the advisory database
