@@ -11,7 +11,7 @@ name = "powdb-node"
 # detached from the root workspace: it wraps that engine and ships as
 # @zvndev/powdb-embedded at the same number. It drifted 17 minors sitting at
 # 0.8.1, so scripts/check-version-consistency.sh now asserts it.
-version = "0.26.0"
+version = "0.27.0-rc.1"
 edition = "2021"
 license = "MIT"
 publish = false
