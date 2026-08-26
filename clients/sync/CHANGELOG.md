@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.8.0 — EXPERIMENTAL (not published)
+## Unreleased
+
+- `SUPPORTED_CATALOG_VERSION` raised from 6 to 7. The engine's catalog format
+  has been v7 (persisted entity links, activated lazily per database) since
+  PowDB 0.19.0, so a replica that stated this package's ceiling in its identity
+  was refused by any primary whose database had activated v7, and
+  `assertServerCatalogVersionSupported` rejected such a primary. The package
+  treats catalog payloads as opaque bytes, so there is no decoding change.
+  `test/sync.test.ts` now reads `CATALOG_VERSION` out of
+  `crates/storage/src/catalog/mod.rs` and fails when the two disagree, so the
+  ceiling cannot silently fall behind again. The README identity example and
+  the e2e test now state `SUPPORTED_CATALOG_VERSION` instead of a literal `5`.
+
+## 0.26.0 - 2026-08-23
+
+No package API changes. The version moves in lockstep with the engine, and
+the exact peer pins on `@zvndev/powdb-client` and `@zvndev/powdb-embedded`
+moved to 0.26.0 with it.
+
+## 0.25.0 - 2026-08-16
+
+No package API changes. Engine side, the primary's replica-cursor lock
+(`upsert_replica_cursor` and friends) now waits up to 30 seconds with
+jittered exponential backoff instead of giving up after 5 seconds, so a
+replica pushing its cursor under ordinary contention no longer receives a
+spurious `WouldBlock` refusal for a lock that was merely in use.
+
+## 0.24.0 - 2026-08-15
+
+First published release of `@zvndev/powdb-sync`, in lockstep with the engine
+and with exact peer pins on `@zvndev/powdb-client` and
+`@zvndev/powdb-embedded`. The pre-publication status described under 0.8.0
+below no longer applies.
+
+## 0.8.0 (experimental, pre-publication)
 
 > **Status: experimental / beta-gated. NOT published to npm.** This is the
 > Embedded Sync Milestone 0 substrate. `@zvndev/powdb-sync` stays unpublished

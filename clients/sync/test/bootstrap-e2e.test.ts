@@ -8,7 +8,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client, type QueryResult } from "../../ts/src/index.js";
-import { PowDBSyncReplica, type SyncIdentity } from "../src/index.js";
+import {
+  PowDBSyncReplica,
+  SUPPORTED_CATALOG_VERSION,
+  type SyncIdentity,
+} from "../src/index.js";
 
 type EmbeddedDatabase = {
   queryReadonly(query: string): QueryResult;
@@ -28,7 +32,10 @@ const HOST = "127.0.0.1";
 const PASSWORD = "sync-bootstrap-e2e-secret";
 const REPLICA_ID = "js-bootstrap-e2e";
 const WAL_FORMAT_VERSION = 1;
-const CATALOG_VERSION = 5;
+// A replica states the newest catalog format it can read, not the format the
+// primary happens to be on: the primary accepts any ceiling at or above its
+// active format, so this also covers a primary that has activated v7.
+const CATALOG_VERSION = SUPPORTED_CATALOG_VERSION;
 const SEGMENT_FORMAT_VERSION = 1;
 const EMBEDDED_PACKAGE = "@zvndev/powdb-embedded";
 const REPO_LOCAL_EMBEDDED_ENTRY = "../../../bindings/node/index.js";

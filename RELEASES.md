@@ -103,6 +103,9 @@ one-time setup and the reusable standard.
 [ ] Update bindings/node/Cargo.toml version, then regenerate its Cargo.lock
 [ ] Regenerate crates/query/fuzz/Cargo.lock
 [ ] Move CHANGELOG.md notes from Unreleased to the dated version entry
+[ ] Rename the Unreleased section in clients/ts/CHANGELOG.md and
+    clients/sync/CHANGELOG.md to the dated version entry (both ship in their
+    npm tarballs and both are gated by check-version-consistency.sh)
 [ ] Update both the Next release and Current release lines in RELEASES.md
 [ ] Update doc version strings: --version pins and CLI banner transcripts in
     README.md, docs/getting-started.md, docs/powdb-vs-sqlite.md
@@ -174,14 +177,19 @@ release rather than guessing a channel.
 | ghcr.io image | `:vX.Y.Z` + moves `:latest` | `:vX.Y.Z-rc.N` + moves **`:rc`**; `:latest` untouched |
 | npm (`@zvndev/powdb-client`, `@zvndev/powdb-sync`) | dist-tag `latest` | dist-tag **`next`**; `npm install @zvndev/powdb-client` keeps resolving the last final |
 | crates.io (`publish.yml`) | normal version | pre-release version: cargo never resolves it unless a dependent pins it, so `cargo add powdb` is unaffected |
-| Embedded addon (`publish-node-addon.yml`) | dist-tag `latest` | run with the rc version; npm treats the pre-release like any other version under whichever dist-tag the workflow uses |
+| Embedded addon (`publish-node-addon.yml`) | dist-tag `latest` | dist-tag **`next`** (the workflow runs the same classifier on its `version` input and refuses any other version shape) |
 
-Cutting one: bump every version to `X.Y.Z-rc.N` (workspace, TS client,
-sync client, addon; `scripts/check-version-consistency.sh` insists they
-agree), tag `vX.Y.Z-rc.N`, push the tag, then run `publish.yml` on the tag as
-usual. Promote by cutting the final `vX.Y.Z` from the same commit plus the
-version bump; nothing is re-tagged or re-labelled, the final artifacts are
-rebuilt from the final tag. A candidate that turns out bad is simply never
+Cutting one: bump every version to `X.Y.Z-rc.N` (every item of the Release
+Checklist's version bump, lockfiles included;
+`scripts/check-version-consistency.sh` insists they agree), set
+`Next release: vX.Y.Z-rc.N (unreleased)` in this file and add the `X.Y.x | :x: (unreleased)` row to SECURITY.md (the
+consistency script derives the series from the `X.Y` prefix, so an rc and
+its final share one row), leave every `--version` pin, banner, and
+`Current release` at the last final, tag `vX.Y.Z-rc.N`, push the tag, then
+run `publish.yml` and `publish-node-addon.yml` on the tag as usual. Promote
+by cutting the final `vX.Y.Z` from the same commit plus the version bump;
+nothing is re-tagged or re-labelled, the final artifacts are rebuilt from
+the final tag. A candidate that turns out bad is simply never
 followed by a final: its packages stay published under `next`/`rc` and
 harm nobody, so it needs no yank.
 

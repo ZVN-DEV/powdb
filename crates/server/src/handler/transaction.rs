@@ -22,11 +22,12 @@ use super::wire::write_msg_with_budget;
 /// later readers.
 ///
 /// The gate also carries the maximum time ONE connection may hold it inside an
-/// explicit transaction. That bound lives here, not in [`ConnOpts`], because it
-/// is a property of the gate being held rather than of a connection: every
-/// listener (TCP, TLS, Unix socket) already clones the same gate into every
-/// connection, so the bound reaches all of them without a per-listener wiring
-/// step that a future frontend could forget.
+/// explicit transaction. That bound lives here, not in
+/// [`ConnOpts`](crate::handler::ConnOpts), because it is a property of the
+/// gate being held rather than of a connection: every listener (TCP, TLS,
+/// Unix socket) already clones the same gate into every connection, so the
+/// bound reaches all of them without a per-listener wiring step that a future
+/// frontend could forget.
 #[derive(Clone)]
 pub struct TxGate {
     pub(super) semaphore: Arc<Semaphore>,

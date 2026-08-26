@@ -19,7 +19,7 @@ or a 16-byte `Uint8Array`. The constructor validates that the local and remote
 adapters expose the required methods before any sync work starts.
 
 ```ts
-import { PowDBSyncReplica } from "@zvndev/powdb-sync";
+import { PowDBSyncReplica, SUPPORTED_CATALOG_VERSION } from "@zvndev/powdb-sync";
 import { Client } from "@zvndev/powdb-client";
 import { Database } from "@zvndev/powdb-embedded";
 
@@ -37,7 +37,7 @@ const replica = new PowDBSyncReplica({
     databaseId: "00112233445566778899aabbccddeeff",
     primaryGeneration: 1n,
     walFormatVersion: 1,
-    catalogVersion: 5,
+    catalogVersion: SUPPORTED_CATALOG_VERSION,
     segmentFormatVersion: 1,
   },
   local: {

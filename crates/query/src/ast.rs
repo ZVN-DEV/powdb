@@ -61,9 +61,10 @@ pub struct CreateLinkExpr {
 
 /// An unresolved link traversal on a projection, e.g. `orders: u.orders
 /// { total }` (block) or the parent side of a scalar path. Carried on
-/// [`NestedQuery`]/[`NestedProjection`] so the planner stays catalog-pure; the
-/// executor resolves it against the persistent catalog at query time (the
-/// correlation columns and child table are not known until then).
+/// [`NestedQuery`]/[`NestedProjection`](crate::plan::NestedProjection) so
+/// the planner stays catalog-pure; the executor resolves it against the
+/// persistent catalog at query time (the correlation columns and child
+/// table are not known until then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViaLink {
     /// The outer scan alias the link hangs off (`u` in `u.orders`).

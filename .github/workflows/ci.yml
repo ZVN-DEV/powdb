@@ -342,6 +342,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Prove the series parser can refuse a malformed version
+        run: bash scripts/check-version-consistency.sh --selftest
       - name: Check release/version metadata
         run: bash scripts/check-version-consistency.sh
 
@@ -883,6 +885,34 @@ jobs:
       - name: Every crate matches its documented-gap baseline
         run: bash scripts/ci/missing-docs-ratchet.sh
 
+  # The public rustdoc must build warning-free. Six intra-doc links pointed at
+  # private or nonexistent items for releases without anyone noticing, because
+  # nothing built the docs with warnings denied: docs.rs renders the broken
+  # link as plain text and moves on. Default features only. Never
+  # `--all-features` here: that would enable `powdb-query/testing`, which the
+  # testing-feature-guard job exists to keep out of shipped builds.
+  rustdoc:
+    name: rustdoc (public docs build warning-free)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: rustdoc
+
+      - name: cargo doc --workspace --no-deps (warnings denied)
+        run: cargo doc --workspace --no-deps --locked
+
   ci-success:
     name: ci-success
     runs-on: ubuntu-24.04
@@ -911,6 +941,7 @@ jobs:
       - internal-content-guard
       - testing-feature-guard
       - missing-docs-ratchet
+      - rustdoc
     steps:
       - name: Verify every required job succeeded
         env:

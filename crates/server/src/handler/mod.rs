@@ -98,7 +98,7 @@ pub struct ConnOpts<'a> {
 
 /// Serve one client connection, then close it.
 ///
-/// The buffered writer is owned HERE rather than inside [`serve_connection`]
+/// The buffered writer is owned HERE rather than inside `serve_connection`
 /// so that every way that function can end (a handshake it refuses, a
 /// `DISCONNECT`, a read error, a reap) passes through the same closing flush.
 /// `BufWriter` does not flush on drop, so a reply that is complete but still

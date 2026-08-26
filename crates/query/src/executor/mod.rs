@@ -632,9 +632,10 @@ impl Engine {
     ///
     /// - the catalog and every heap/index/WAL file are opened read-only
     ///   ([`Catalog::open_read_only`]), so nothing on disk is ever mutated;
-    /// - a **shared reader** [`DirLock`] is taken, so N read-only processes may
-    ///   serve the same directory concurrently, while a read-write open refuses
-    ///   to start against live readers (and readers refuse a live writer);
+    /// - a **shared reader** [`DirLock`](powdb_storage::dir_lock::DirLock) is
+    ///   taken, so N read-only processes may serve the same directory
+    ///   concurrently, while a read-write open refuses to start against live
+    ///   readers (and readers refuse a live writer);
     /// - a non-empty WAL is refused with an actionable error rather than replayed
     ///   (the directory must be recovered by a read-write engine first);
     /// - every mutating statement returns the terminal [`QueryError::ReadonlyMode`].
