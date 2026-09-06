@@ -204,15 +204,21 @@ fn parse_tx_max_lifetime(raw: &str) -> Result<Option<std::time::Duration>, Strin
     }
 }
 
-/// A byte or item count budget. Plain digits only: a suffixed value like
-/// `64MiB` used to be discarded in silence, leaving the default in force.
-fn parse_positive_count(raw: &str) -> Result<usize, String> {
-    match raw.trim().parse::<usize>() {
-        Ok(0) => Err(
-            "a whole number greater than 0 (unset the variable to keep the default)".to_string(),
-        ),
+/// A positive budget counted in `unit`. Plain digits only: a suffixed value
+/// like `64MiB` used to be discarded in silence, leaving the default in force.
+///
+/// The unit is the caller's to name because these budgets are not all bytes.
+/// One shared message told an operator who mistyped a CONNECTION ceiling to
+/// give a byte count, which is not something they can act on.
+fn parse_positive_count(unit: &'static str) -> impl Fn(&str) -> Result<usize, String> {
+    move |raw: &str| match raw.trim().parse::<usize>() {
+        Ok(0) => Err(format!(
+            "a whole number of {unit} greater than 0 (unset the variable to keep the default)"
+        )),
         Ok(n) => Ok(n),
-        Err(_) => Err("a plain whole number of bytes with no unit suffix".to_string()),
+        Err(_) => Err(format!(
+            "a plain whole number of {unit}, with no unit suffix"
+        )),
     }
 }
 
@@ -281,8 +287,9 @@ fn parse_args() -> Args {
     // other budgets. Unset keeps the default; an explicit 0 disables it.
     let tx_max_lifetime = env_setting("POWDB_TX_MAX_LIFETIME_MS", parse_tx_max_lifetime)
         .unwrap_or(Some(handler::DEFAULT_TX_MAX_LIFETIME));
-    let mut max_connections: usize = env_setting("POWDB_MAX_CONNECTIONS", parse_positive_count)
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    let mut max_connections: usize =
+        env_setting("POWDB_MAX_CONNECTIONS", parse_positive_count("connections"))
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS);
     let mut shutdown_timeout_secs: u64 = env_setting("POWDB_SHUTDOWN_TIMEOUT", parse_timeout_secs)
         .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME")
@@ -305,12 +312,15 @@ fn parse_args() -> Args {
         .ok()
         .filter(|s| !s.is_empty());
     // Per-query memory budget; env-only (no CLI flag).
-    let query_memory_limit = env_setting("POWDB_QUERY_MEMORY_LIMIT", parse_positive_count)
+    let query_memory_limit = env_setting("POWDB_QUERY_MEMORY_LIMIT", parse_positive_count("bytes"))
         .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT);
     // Fallback nested-loop join candidate-pair cap; env-only (no CLI flag).
-    let nested_loop_pair_limit = env_setting("POWDB_MAX_NESTED_LOOP_PAIRS", parse_positive_count);
+    let nested_loop_pair_limit = env_setting(
+        "POWDB_MAX_NESTED_LOOP_PAIRS",
+        parse_positive_count("candidate pairs"),
+    );
     // Dirty-page (unflushed heap page) budget; env-only (no CLI flag).
-    let dirty_page_budget = env_setting("POWDB_DIRTY_PAGE_BUDGET", parse_positive_count);
+    let dirty_page_budget = env_setting("POWDB_DIRTY_PAGE_BUDGET", parse_positive_count("pages"));
     // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = env_setting("POWDB_REQUIRE_TLS", parse_bool_setting).unwrap_or(false);
     // `POWDB_READONLY` reuses the same boolean grammar as `POWDB_REQUIRE_TLS`.
@@ -425,7 +435,11 @@ fn parse_args() -> Args {
                     eprintln!("--max-connections requires a value");
                     std::process::exit(2);
                 }
-                max_connections = flag_setting("--max-connections", &argv[i], parse_positive_count);
+                max_connections = flag_setting(
+                    "--max-connections",
+                    &argv[i],
+                    parse_positive_count("connections"),
+                );
             }
             "--shutdown-timeout" => {
                 i += 1;
@@ -1417,19 +1431,22 @@ mod tests {
         );
         for value in ["1G", "64MiB", "64m", "0", "-1"] {
             assert!(
-                parse_positive_count(value).is_err(),
+                parse_positive_count("bytes")(value).is_err(),
                 "POWDB_QUERY_MEMORY_LIMIT={value} must be refused, not silently defaulted"
             );
         }
         assert!(
-            parse_positive_count("nope").is_err(),
+            parse_positive_count("candidate pairs")("nope").is_err(),
             "POWDB_MAX_NESTED_LOOP_PAIRS"
         );
         assert!(
-            parse_positive_count("nope").is_err(),
+            parse_positive_count("pages")("nope").is_err(),
             "POWDB_DIRTY_PAGE_BUDGET"
         );
-        assert!(parse_positive_count("0").is_err(), "POWDB_MAX_CONNECTIONS");
+        assert!(
+            parse_positive_count("connections")("0").is_err(),
+            "POWDB_MAX_CONNECTIONS"
+        );
         assert!(parse_timeout_secs("0").is_err(), "POWDB_SHUTDOWN_TIMEOUT");
     }
 
@@ -1449,7 +1466,7 @@ mod tests {
         assert_eq!(parse_port(" 5433 ").unwrap(), 5433);
         assert_eq!(parse_timeout_secs("300").unwrap(), 300);
         assert_eq!(parse_wait_ms("5000").unwrap(), 5000);
-        assert_eq!(parse_positive_count("  4096  ").unwrap(), 4096);
+        assert_eq!(parse_positive_count("bytes")("  4096  ").unwrap(), 4096);
         assert_eq!(parse_sync_mode(" NORMAL ").unwrap(), WalSyncMode::Normal);
         assert_eq!(parse_sync_mode("off").unwrap(), WalSyncMode::Off);
         assert_eq!(parse_sync_mode("full").unwrap(), WalSyncMode::Full);
@@ -1538,7 +1555,7 @@ mod tests {
     /// The parsed env limit is actually applied to the constructed Engine.
     #[test]
     fn env_limit_is_applied_to_engine() {
-        let limit = parse_positive_count("2048").expect("valid");
+        let limit = parse_positive_count("bytes")("2048").expect("valid");
         let dir = std::env::temp_dir().join(format!("powdb_srv_memlimit_{}", std::process::id()));
         // Hermetic: the path is pid-derived (not unique per run), so a stale dir
         // from an earlier run, or a reused pid, must not leak into this test.
@@ -1552,7 +1569,7 @@ mod tests {
     /// is what made the 256 MiB ceiling unoverridable.
     #[test]
     fn env_dirty_page_budget_is_applied_to_engine() {
-        let budget = parse_positive_count("32768").expect("valid");
+        let budget = parse_positive_count("pages")("32768").expect("valid");
         let dir =
             std::env::temp_dir().join(format!("powdb_srv_dirtybudget_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

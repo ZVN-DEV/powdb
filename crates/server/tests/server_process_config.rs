@@ -112,6 +112,35 @@ fn help_lists_the_undocumented_settings() {
     );
 }
 
+/// The refusal has to name the right unit. Every count budget shared one
+/// message that said "bytes", so an operator who mistyped a CONNECTION ceiling
+/// was told to give a byte count.
+#[test]
+fn a_refusal_names_the_unit_the_setting_is_actually_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let args = ["--data-dir", data_dir, "--port", "0", "--bind", "127.0.0.1"];
+
+    let (code, _, stderr) = run_to_completion(&args, &[("POWDB_MAX_CONNECTIONS", "64MiB")]);
+    assert_eq!(code, Some(2));
+    assert!(
+        !stderr.contains("bytes"),
+        "a connection ceiling is not a byte count: {stderr}"
+    );
+    assert!(
+        stderr.contains("connections"),
+        "the message does not say what the value counts: {stderr}"
+    );
+
+    // The budgets that really are in bytes still say so.
+    let (code, _, stderr) = run_to_completion(&args, &[("POWDB_QUERY_MEMORY_LIMIT", "64MiB")]);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("bytes"),
+        "a memory budget must still be described in bytes: {stderr}"
+    );
+}
+
 /// A log that nobody is reading as a terminal must carry no ANSI escapes.
 #[test]
 fn no_ansi_escapes_when_stdout_is_not_a_tty() {
