@@ -266,3 +266,31 @@ fn a_numeric_literal_against_a_uuid_column_is_a_typed_error() {
         "expected a typed error naming the column, got {message}"
     );
 }
+
+/// The coercion pass runs inside `LoweredPlan::of`, which some paths reach more
+/// than once (a plan-cache hit, a prepared template, an expression-index
+/// fallback). Rewriting a second time would make those paths answer differently
+/// from a first execution of the same text, so the pass has to be idempotent on
+/// both the rewrite and the refusal.
+#[test]
+fn coercion_is_idempotent() {
+    let (_dir, engine) = fixture(true);
+    for query in [
+        r#"T filter .u = "550e8400-e29b-41d4-a716-446655440000" { .id }"#,
+        r#"T filter .b = "\\x0a0b" { .id }"#,
+        r#"count(T filter .u > "550e8400-e29b-41d4-a716-446655440000")"#,
+        r#"count(T filter .u = "not-a-uuid")"#,
+    ] {
+        let outcomes: Vec<String> = (1..=3)
+            .map(|passes| match engine.lowered_plan_text(query, passes) {
+                Ok(text) => text,
+                Err(err) => format!("refused: {err}"),
+            })
+            .collect();
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "lowering `{query}` twice changed the plan"
+        );
+        assert_eq!(outcomes[1], outcomes[2], "lowering `{query}` is not stable");
+    }
+}
