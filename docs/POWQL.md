@@ -1315,7 +1315,7 @@ JSON text. A missing path and a JSON `null` both return the empty set (use
 Post { title: json_text(.data->title) }
 # "Hello" (not "\"Hello\"")
 
-Post { raw: json_text(.data->meta) }
+Post { meta: json_text(.data->meta) }
 # canonical JSON text of the whole object, e.g. "{\"lang\":\"en\"}"
 ```
 
@@ -2191,8 +2191,13 @@ Post order .`order` asc
 alter Post add index .`order`
 ```
 
-Backticks may also contain characters that are not otherwise legal in an
-identifier, such as spaces: `` `full name` ``.
+Backticks quote a reserved word so it can be used as an identifier. They do
+not widen what a **stored** name may contain: the catalog accepts letters,
+digits and underscores only, so `` type Person { `full name`: str } `` is
+refused with `invalid column name 'full name': must contain only letters,
+digits, and underscores`, and a table name is checked the same way. Backticks
+do carry arbitrary characters in a **projection alias**, which is not stored:
+`` Post { `full name`: .title } `` returns a column headed `full name`.
 
 > In filter/projection/order positions, a plain dotted reference like `.type`
 > also works, because dotted field references bypass keyword lookup. Backtick
