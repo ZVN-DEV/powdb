@@ -15,7 +15,8 @@
 //! `DirLock::acquire` would have left it. The subcommands must fail and leave
 //! the directory untouched.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_powdb-cli")
@@ -58,15 +59,38 @@ fn seed(data_s: &str) {
     .success());
 }
 
-/// Spawn a live foreign process and plant its PID in the data dir's LOCK
-/// file, simulating a running `powdb-server` that owns the directory.
+/// Spawn a real live writer: a `powdb-cli` REPL that holds the directory's
+/// writer lock for as long as its stdin stays open.
+///
+/// Writing a live process's PID into `LOCK` is no longer enough to stand in
+/// for one. The storage lock is settled by an `flock` on the `LOCK` file, so a
+/// directory whose `LOCK` names a live process that holds no flock is
+/// correctly read as a ghost and reclaimed; a `sleep` never took the lock, so
+/// it stopped representing a running server. Only a process that really
+/// acquired the lock does.
 fn plant_live_writer(data_dir: &std::path::Path) -> std::process::Child {
-    let child = Command::new("sleep")
-        .arg("60")
+    let child = Command::new(bin())
+        .args(["--data-dir", data_dir.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn sleeper process");
-    std::fs::write(data_dir.join("LOCK"), child.id().to_string()).expect("failed to write LOCK");
-    child
+        .expect("failed to spawn a live powdb-cli writer");
+    let want = child.id().to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if std::fs::read_to_string(data_dir.join("LOCK"))
+            .map(|text| text.trim() == want)
+            .unwrap_or(false)
+        {
+            return child;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the live writer never took the data dir lock"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
