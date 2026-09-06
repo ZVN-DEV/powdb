@@ -458,6 +458,30 @@ Two related cases differ deliberately:
 aggregate reads as "no rows", so an integer total that leaves the `int64` range
 is a hard error instead: `cannot compute sum: the integer total overflows int64`.
 
+#### NaN and infinity
+
+Float columns hold the full IEEE 754 range, `NaN` and the infinities included.
+Neither has a literal spelling, but both are storable: an `update` assignment
+that produces one stores it (`update { a := .a / .b }` with `.b` zero gives
+`inf`, or `NaN` when `.a` is zero too), and it survives a restart.
+
+What they do once stored, all of it deliberate and none of it configurable:
+
+| | `inf` | `NaN` |
+|---|---|---|
+| `order .a asc` | after every finite number | **last, after `inf`** |
+| `order .a desc` | before every finite number | **first** |
+| `max` | beats every finite number | beats `inf` |
+| `min` | loses to every finite number | never wins `min` either: a column holding `NaN`, `inf` and `5` has `min` `5` |
+| `sum` / `avg` over the column | `inf` | `NaN`, for the whole aggregate |
+| `cast(.a, "str")` | `"inf"` | `"NaN"` |
+| `cast(.a, "int")` | saturates to `9223372036854775807` | **`0`** |
+
+`NaN` sorting last rather than being excluded is what makes ordering a total
+order, so paging is deterministic. `cast(NaN, "int")` being `0` is Rust's
+saturating float-to-int conversion, not a decision PowQL makes separately: `NaN`
+has no integer value and `0` is what the conversion produces.
+
 ### Logical Operators
 
 | Operator | Meaning |
@@ -1652,8 +1676,12 @@ NULLS-LAST placement: rows with a missing or JSON-null key stay at the end in
 both `asc` and `desc`. Rows that share an equal key are not reordered by
 direction either: an equal-key tie keeps its stable insertion (RID) order in
 both `asc` and `desc`, so paging through ties is deterministic. Objects and
-arrays are not valid path-index keys; index creation or a later write fails
-atomically if the indexed path resolves to one.
+arrays are not valid path-index keys. Index creation, and every later write,
+fails atomically if the indexed path resolves to one:
+`expression index key must be scalar: v1:.data->"slug"`. Atomically means the
+refused `insert` writes no row at all, so the table and the index cannot
+disagree. Plan for it before indexing a path whose shape varies across
+documents.
 Unique path indexes ignore missing and JSON-null values, like nullable unique
 column indexes.
 

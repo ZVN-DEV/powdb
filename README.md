@@ -199,7 +199,12 @@ commit
 
 On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
 
-`WalSyncMode::Off` (used by the benchmark harness to compare against SQLite `:memory:`) disables the WAL entirely and is **not durable**: never use it in production.
+The two weaker modes trade that guarantee away, and it is worth being exact about how much:
+
+- **`normal`** (`POWDB_SYNC_MODE=normal`, `WalSyncMode::Normal`) appends to the WAL but does not fsync before acknowledging. A **process** death loses nothing: the records are in the WAL, and replay finds them. Measured: 500 acknowledged inserts, `kill -9`, restart, all 500 present. What it exposes is an **OS crash or power loss**, which can lose whatever the kernel had not flushed. Writes are roughly 15-40x faster.
+- **`off`** (`POWDB_SYNC_MODE=off`, `WalSyncMode::Off`) writes no WAL at all, so there is nothing to replay and the loss window is not bounded by anything: **every row written since the last graceful close is gone** after any unclean exit. Measured on the same setup: 500 acknowledged inserts, `kill -9`, restart, `count` = 0. The table definition survived, the rows did not. The mode exists so the benchmark harness can compare against SQLite `:memory:`. Never point it at data you intend to keep.
+
+Only a graceful shutdown (SIGINT/SIGTERM, or dropping the embedded engine) checkpoints and truncates the WAL. During a run it grows monotonically: 168 KB after 2,000 single-row inserts, back to 8 bytes once SIGTERM has been handled. Size the volume for the write burst between restarts, not for the size of the data.
 
 ## PowQL
 
