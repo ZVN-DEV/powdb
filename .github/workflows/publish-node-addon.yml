@@ -225,6 +225,9 @@ jobs:
       # version publishes under `latest`, an X.Y.Z-rc.N under `next`, so an rc
       # never becomes what a bare `npm install @zvndev/powdb-embedded`
       # resolves to. Any other version shape fails here rather than shipping.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "$VERSION" >> "$GITHUB_OUTPUT"

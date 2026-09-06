@@ -252,6 +252,13 @@ jobs:
       - name: Strip the empty Unreleased section from the published CHANGELOG
         run: bash scripts/ci/strip-empty-unreleased.sh clients/ts/CHANGELOG.md
 
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -347,6 +354,13 @@ jobs:
       - name: Strip the empty Unreleased section from the published CHANGELOG
         run: bash scripts/ci/strip-empty-unreleased.sh clients/sync/CHANGELOG.md
 
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -368,6 +382,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
 
       - name: Classify the release channel (final vs rc)
         id: channel
@@ -481,6 +502,13 @@ jobs:
 
       # An rc moves the `rc` floating tag, never `latest`, so `docker pull
       # ghcr.io/zvn-dev/powdb` keeps serving the last final release.
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"

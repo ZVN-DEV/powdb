@@ -53,12 +53,24 @@ in the cycle fails the CI job (`set -euo pipefail` inside the script).
 
 ```bash
 bash scripts/check-version-consistency.sh
+bash scripts/check-version-consistency.sh --selftest   # prove the parser refuses a malformed version
 ```
 
-Checks that the workspace version, publishable inter-crate dependency versions,
-`clients/ts/package.json`, `clients/ts/src/index.ts` `CLIENT_VERSION`,
-`CHANGELOG.md`, and `RELEASES.md` all agree. CI runs this as the
-`version consistency` job, and release/publish workflows run it before packaging.
+Checks about twenty version-bearing locations against one another, not the five
+this file used to list. In rough order: the workspace version and every
+publishable crate's inter-crate pins; all three tracked `Cargo.lock` files
+(root, `bindings/node`, `crates/query/fuzz`); the three `package.json` files
+plus `CLIENT_VERSION` and the sync package's peer pins; `RELEASES.md`'s current
+and next release; the ghcr pins in `examples/deploy/`; `site/*.html`;
+`docs/FORMAT.md` and `docs/STABILITY.md` anchors; `--version` pins and CLI
+banners in the docs; the root `CHANGELOG.md` entry plus an extractable release
+body; both client `CHANGELOG.md` files; `AGENTS.md`'s "Available in released
+PowDB (vX.Y.Z)" stamp; `SECURITY.md`'s supported series; and `publish.yml`'s
+publish steps and run summary against the set of publishable crate manifests.
+
+CI runs it as the `version consistency` job, and release/publish workflows run
+it before packaging. The gates that live under `scripts/ci/` are documented in
+[`scripts/ci/README.md`](ci/README.md), including how to make each one fail.
 
 ## `quality` / `quality.sh` — one-command local quality gate
 
@@ -117,17 +129,16 @@ python3 scripts/agent-eval/run.py \
 Use these repo-local gates before opening or merging infrastructure/release PRs:
 
 ```bash
-bash scripts/check-version-consistency.sh  # workspace/crate/TS/docs version lockstep
+bash scripts/check-version-consistency.sh  # every version-bearing location, in lockstep
 scripts/quality help                       # document local quality modes
 scripts/quality --fast                     # quick non-destructive local smoke
 scripts/quality                            # default Rust fmt/check/clippy/test gate
 scripts/quality --full                     # CI-parity where local tools/deps exist
 ```
 
-`check-version-consistency.sh` fails if the workspace version, publishable
-inter-crate dependency pins, `clients/ts/package.json`, `CLIENT_VERSION`,
-`CHANGELOG.md`, or `RELEASES.md` drift apart. The CI version-consistency job and
-publish workflow call the same script so local release prep and CI share one
-source of truth.
+`check-version-consistency.sh` fails if any of the roughly twenty
+version-bearing locations listed above drift apart. The CI version-consistency
+job and the publish workflow call the same script, so local release prep and CI
+share one source of truth.
 
 `quality` and `smoke-package.sh` invoke pnpm through `npm exec --package=pnpm@10.29.3`, so they do not depend on local Corepack signing keys or a pre-existing `clients/ts/node_modules`. Optional security tools are still local-only; if `cargo-audit` or `gitleaks` are missing, the script prints install hints and skips only those optional checks.

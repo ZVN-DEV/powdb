@@ -125,6 +125,11 @@ jobs:
           # Assigned first on purpose: `read -a x <<< "$(cmd)"` swallows a
           # failing cmd and leaves an empty array, which is how a broken shard
           # map would turn into a job that runs nothing and exits 0.
+          # The shard map's own guards run first, on fixtures: they prove the
+          # coverage check still refuses an unsharded in-scope test and still
+          # ignores an out-of-scope module. A detector that stopped detecting
+          # would otherwise report "all tests selected" forever.
+          bash scripts/ci/miri-shards.sh --selftest
           shard_filters="$(bash scripts/ci/miri-shards.sh "$SHARD")"
           read -r -a filters <<< "$shard_filters"
           if (( ${#filters[@]} == 0 )); then
