@@ -261,9 +261,11 @@ jobs:
           echo "MSRV consistency OK."
 
   msrv-build:
-    name: MSRV build (cargo +<msrv> check --workspace --locked)
+    name: MSRV build + test (cargo +<msrv>)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 30, not 20: this job now compiles and runs the storage and query test
+    # suites on the MSRV toolchain, not just `cargo check`.
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -299,6 +301,19 @@ jobs:
       # toolchain.
       - name: cargo +MSRV check --workspace --locked
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
+
+      # `check` proves the workspace COMPILES on the MSRV toolchain and nothing
+      # more. The stated support claim is that PowDB works on this Rust
+      # version, and behaviour differences between compilers land in generated
+      # code, not in type checking: the engine here does its own byte-level
+      # layout, alignment and offset arithmetic, which is exactly the class of
+      # thing a codegen or std change moves. Running the two engine crates'
+      # suites turns "it builds" into "it works". Only storage and query: they
+      # hold every hand-rolled format and every executor fast path, and adding
+      # the server and CLI suites would double this job for network and
+      # process plumbing that stable already covers.
+      - name: cargo +MSRV test -p powdb-storage -p powdb-query --locked
+        run: cargo +${{ steps.msrv.outputs.version }} test -p powdb-storage -p powdb-query --locked
 
   examples-smoke:
     name: examples smoke (terraform validate + compose config + dev.sh + runnable examples)
@@ -542,9 +557,22 @@ jobs:
   # fixture with today's writer), so a wrong encoder would produce a wrong
   # fixture and a green test. This job removes the shared author.
   cross-version-compat:
-    name: cross-version compat (real released binaries)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    name: cross-version compat (real released binaries, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Both published platforms, because the thing under test is an on-disk
+    # format read by binaries users installed, and every release ships
+    # linux-x86_64 AND macos-aarch64 assets. Running only the Linux half tested
+    # one endianness, one page size and one filesystem, and left the platform
+    # most contributors develop on unverified against real released binaries.
+    # `scripts/ci/cross-version-compat.sh` already resolves the right asset
+    # suffix from `uname` and refuses a platform with no released asset.
+    strategy:
+      # A format problem on one platform must not hide the other's verdict.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    # 40, not 25: the macOS leg builds the HEAD powdb-cli on a slower runner.
+    timeout-minutes: 40
     # `gh release list` derives the tested version list. Read-only, and the
     # script falls back to a validated pinned list if the call fails.
     permissions:
@@ -562,7 +590,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-version-compat
+          shared-key: cross-version-compat-${{ matrix.os }}
 
       # The tested version list is derived from the live release list, so the
       # cache key has to come from the same call rather than a hand-copied
@@ -596,6 +624,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/compat-bins
+          # runner.os is already in the key, so the two legs cache the two
+          # different sets of released assets separately.
           key: compat-bins-${{ runner.os }}-${{ steps.compat.outputs.cache-key }}
 
       - name: Build HEAD powdb-cli
@@ -669,9 +699,21 @@ jobs:
   # "the server did not abort" assertion elsewhere in the suite actually
   # observed an unwinding test-profile binary.
   release-profile-suites:
-    name: release-profile suites (panic=abort)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    name: release-profile suites (panic=abort, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Both platforms. What this job observes is a PROCESS dying from an abort,
+    # and how a process dies is the most operating-system-specific behaviour in
+    # the suite: signal delivery, zombie reaping and the abort handler itself
+    # all differ. The script was already written to run on macOS (its TCP
+    # helpers go through python3 precisely so a developer laptop can execute
+    # it), and it was still only ever run on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    # 60, not 40: this compiles the release profile (lto, one codegen unit) for
+    # three crates' test targets, and the macOS runner is slower.
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -685,7 +727,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-profile-suites
+          shared-key: release-profile-suites-${{ matrix.os }}
 
       - name: Corruption + wire-corpus suites, release profile
         run: bash scripts/ci/release-profile-suites.sh
