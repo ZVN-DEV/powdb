@@ -19,7 +19,7 @@ The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, 
 - **Embedded / edge / serverless workloads** where query latency is a tight budget and you don't want SQLite's quirks.
 - **Single-node analytics** over tables that fit on disk. The scan path is zero-syscall (mmap) and filters are compiled to byte-level predicates.
 - **You control both sides** (the DB and the app). PowDB has no Postgres wire protocol, no ODBC, no legacy compatibility. The client is a TCP binary protocol or an in-process Engine.
-- **You want to read the code.** Eleven crates, ~145K lines of Rust (~102K outside integration-test files), no generated parsers, no plan-language IR.
+- **You want to read the code.** Eleven crates, ~155K lines of Rust (~105K of it outside the integration-test files), no generated parsers, no plan-language IR.
 
 ### When it's *not* the right choice
 
@@ -88,8 +88,8 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(PowQL only: one row per parent, children as a JSON array)* |
 | Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(PowQL only)* |
 | IN subquery | `User filter .id in (Order filter .total > 100 { .user_id })` | `SELECT * FROM User WHERE id IN (SELECT user_id FROM Order WHERE total > 100)` |
-| EXISTS | `User filter exists (Order filter .user_id = User.id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
-| UNION | `(A filter ...) union (B filter ...)` | `SELECT ... UNION SELECT ...` |
+| EXISTS | `User filter exists (Order filter .user_id = .id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
+| UNION | `A filter ... union B filter ...` | `SELECT ... UNION SELECT ...` |
 | NULL check | `User filter .age = null` / `.age != null` | `WHERE age IS NULL` / `IS NOT NULL` |
 | Update | `User filter .id = 1 update { age := 31 }` | `UPDATE User SET age = 31 WHERE id = 1` |
 | Update with expr | `User update { age := .age + 1 }` | `UPDATE User SET age = age + 1` |
@@ -107,7 +107,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `name: string!` | `required name: str` |
 | `name = "Alice"` (in insert) | `name := "Alice"` |
 | `.city == "NYC"` | `.city = "NYC"` |
-| `string`, `varchar`, `text` | `str` *(unknown names silently coerce to `str`: footgun)* |
+| `varchar`, `text`, `integer` | `str`, `str`, `int`. An unknown type name is a hard error (`type mismatch: unknown type name: 'varchar'`), not a silent coercion. `string` and `boolean` are accepted aliases for `str` and `bool` |
 | `User match T on ...` | `User inner join T on ...` (*`match` is not a keyword*) |
 | `User create_index .col` | `alter User add index .col` |
 | `User add_column x: int` | `alter User add column x: int` |
@@ -115,15 +115,17 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `AND`, `OR`, `NOT` | `and`, `or`, `not` (lowercase) |
 | `User.posts` (bare link navigation) | alias the table and label the block: `User as u { posts: u.posts { title } }`; a to-one link reads inline: `Post as p { p.user.name }` |
 | `let x := ...` | not yet implemented |
-| `count: count(.name)` (aggregate keyword as alias) | fails `expected alias name`; `sum:` fails too; use `n:`, `cnt:`, `total:` |
+| `exists (Order filter .user_id = User.id)` (qualified outer reference) | `exists (Order filter .user_id = .id)`: inside `exists`, a bare `.col` reaches the outer row. `User.id` and the aliased `u.id` are both rejected |
+| `(A filter ...) union (B filter ...)` (parenthesized branches) | `A filter ... union B filter ...`: a statement cannot start with `(` |
+| `count: count(.name)` (aggregate keyword as alias) | fails with `expected '(', got ':'`; `sum:` fails the same way; use `n:`, `cnt:`, `total:` |
 
 ---
 
 ## Type system
 
-Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`.
+Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`, `json`.
 
-**Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor/`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
+The type resolver takes the canonical names above plus two aliases, matched case-insensitively: `string` for `str` and `boolean` for `bool`. Every other name is rejected, so a typo is a hard error rather than a silent Str column: `type Bad { a: varchar }` fails with `type mismatch: unknown type name: 'varchar'`. Prefer the canonical spellings.
 
 `required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`. `unique` is a sibling prefix keyword (`required unique email: str`, either order) that auto-creates a unique B+tree index and enforces no duplicate non-null values on insert/update/upsert.
 
