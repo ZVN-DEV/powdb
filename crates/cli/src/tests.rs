@@ -479,3 +479,65 @@ fn continuation_tracking() {
     assert!(needs_continuation(r#"insert U { s := "a\" "#));
     assert!(!needs_continuation(r#"insert U { s := "a\"b" }"#));
 }
+
+/// `awaitArchive` is not a fault.
+///
+/// Retained history is archived on demand when a replica pulls, not only at a
+/// graceful shutdown, so a primary that has moved ahead of its archived tail
+/// is in a momentary state that the next pull resolves. Printing that state
+/// under a `lastSyncError:` label told operators their replication was broken
+/// when nothing was wrong, and the same wording appeared while every pull was
+/// in fact failing, so the label carried no information either way.
+#[test]
+fn await_archive_reads_as_a_momentary_state_not_an_error() {
+    let status = powdb_sync::ReplicaSyncStatus {
+        replica_id: "replica-a".into(),
+        active: true,
+        last_applied_lsn: Some(10),
+        remote_lsn: 13,
+        servable_lsn: Some(10),
+        unarchived_lsn: Some(3),
+        lag_lsn: Some(3),
+        lag_bytes: Some(0),
+        lag_ms: Some(1000),
+        stale: true,
+        repair_action: powdb_sync::SyncRepairAction::AwaitArchive,
+        last_sync_error: Some(
+            "primary has advanced, but retained history is not yet archived; retry after archive"
+                .to_string(),
+        ),
+    };
+    let text = replica_sync_status_lines(&status).join("\n");
+    assert!(
+        !text.contains("lastSyncError"),
+        "a replica waiting for an archive has not failed: {text}"
+    );
+    assert!(
+        text.contains("archived on demand"),
+        "the output must say the archive happens on demand: {text}"
+    );
+}
+
+/// A replica that really is broken still reports an error.
+#[test]
+fn a_rebootstrap_still_reports_its_error() {
+    let status = powdb_sync::ReplicaSyncStatus {
+        replica_id: "replica-b".into(),
+        active: true,
+        last_applied_lsn: Some(4),
+        remote_lsn: 40,
+        servable_lsn: None,
+        unarchived_lsn: None,
+        lag_lsn: Some(36),
+        lag_bytes: None,
+        lag_ms: Some(90_000),
+        stale: true,
+        repair_action: powdb_sync::SyncRepairAction::Rebootstrap,
+        last_sync_error: Some("retained history has a gap at lsn 5".to_string()),
+    };
+    let text = replica_sync_status_lines(&status).join("\n");
+    assert!(
+        text.contains("lastSyncError: retained history has a gap at lsn 5"),
+        "a rebootstrap must still surface its error: {text}"
+    );
+}
