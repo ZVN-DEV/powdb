@@ -57,7 +57,16 @@ const MAX_ROWS: usize = 10_000_000;
 const MAX_PARAMS: usize = 4096;
 
 /// Maximum retained units accepted in one sync pull frame.
-const MAX_SYNC_UNITS: usize = 4096;
+///
+/// A pull chunk is extended to the next commit boundary, so one frame has to
+/// be able to carry a whole transaction however large it is. At 4096 a
+/// committed transaction of ~5000 rows could never be pulled at all and the
+/// replica wedged on it permanently. This matches `MAX_SYNC_UNITS` in
+/// `clients/ts/src/protocol.ts`: the two implementations of this protocol have
+/// to agree, or one peer refuses frames the other will send. The decoder still
+/// sizes its unit vector from the payload length, not from this count, so the
+/// higher ceiling is not an allocation amplifier.
+const MAX_SYNC_UNITS: usize = 262_144;
 
 const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
 
@@ -2763,6 +2772,67 @@ mod tests {
             repair_action: WireSyncRepairAction::Pull,
             last_sync_error: None,
         }
+    }
+
+    /// A committed transaction can hold far more than 4096 retained units, and
+    /// the sync handler now extends a pull chunk to the next commit boundary
+    /// rather than cutting a transaction in half. The wire decoder has to be
+    /// able to carry that chunk, or the replica can never pull the transaction
+    /// and stays wedged on it forever.
+    ///
+    /// The ceiling is also a contract with the other implementation of this
+    /// protocol: `clients/ts/src/protocol.ts` ships `MAX_SYNC_UNITS =
+    /// 262_144`, and a peer that refuses what the other peer will send is a
+    /// protocol disagreement, not a safety limit.
+    #[test]
+    fn a_pull_chunk_larger_than_the_old_ceiling_still_decodes() {
+        assert_eq!(
+            MAX_SYNC_UNITS, 262_144,
+            "the TypeScript client accepts 262144 retained units per pull frame; \
+             a smaller ceiling here refuses chunks that client would accept"
+        );
+
+        let units: Vec<WireRetainedUnit> = (0..5000u64)
+            .map(|i| WireRetainedUnit {
+                tx_id: 42,
+                record_type: 4,
+                lsn: i + 1,
+                data: vec![0xAB; 8],
+            })
+            .collect();
+        let frame = Message::SyncPullResult {
+            status: sample_sync_status(),
+            units: units.clone(),
+            has_more: false,
+        }
+        .encode();
+        match Message::decode(&frame).unwrap() {
+            Message::SyncPullResult {
+                units: decoded,
+                has_more,
+                ..
+            } => {
+                assert_eq!(decoded, units);
+                assert!(!has_more);
+            }
+            other => panic!("expected SyncPullResult, got {other:?}"),
+        }
+    }
+
+    /// The ceiling is still a ceiling: one unit past it is refused as a limit,
+    /// not decoded into a 262145-element allocation.
+    #[test]
+    fn one_unit_past_the_ceiling_is_still_refused() {
+        let mut payload = encode_sync_status(&sample_sync_status());
+        payload.extend_from_slice(&((MAX_SYNC_UNITS as u32) + 1).to_le_bytes());
+        let mut frame = vec![MSG_SYNC_PULL_RESULT, 0];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let err = Message::decode(&frame).expect_err("an amplified count must be refused");
+        assert!(
+            err.to_string().contains("too many retained units"),
+            "unexpected refusal: {err}"
+        );
     }
 
     #[test]
