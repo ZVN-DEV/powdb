@@ -1687,9 +1687,14 @@ async fn unparsable_flood_cannot_starve_a_concurrent_reader() {
 async fn writer_admission_excludes_readers() {
     let gate = new_tx_gate();
     let metrics = Arc::new(Metrics::new());
-    let writer = acquire_begin_permit(&gate, Duration::from_secs(1), &metrics)
-        .await
-        .expect("writer admission");
+    let writer = acquire_autocommit_permit(
+        &gate,
+        AdmissionMode::Writer,
+        Duration::from_secs(1),
+        &metrics,
+    )
+    .await
+    .expect("writer admission");
     let blocked = acquire_autocommit_permit(
         &gate,
         AdmissionMode::Reader,
@@ -1725,7 +1730,13 @@ async fn queued_writer_is_not_starved_by_later_readers() {
     let writer_gate = gate.clone();
     let writer_metrics = metrics.clone();
     let mut writer = tokio::spawn(async move {
-        acquire_begin_permit(&writer_gate, Duration::from_secs(1), &writer_metrics).await
+        acquire_autocommit_permit(
+            &writer_gate,
+            AdmissionMode::Writer,
+            Duration::from_secs(1),
+            &writer_metrics,
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
 

@@ -4,19 +4,103 @@ use super::*;
 
 // ---- Explicit-transaction gate wait timeout (P-4) ----
 
+/// `begin` takes more than half the pool: enough that no second explicit
+/// transaction and no autocommit writer can start, and no more, so readers
+/// keep running beside a transaction that has written nothing.
 #[tokio::test]
 async fn begin_permit_acquires_when_gate_is_free() {
     let gate = new_tx_gate();
     let metrics = Arc::new(Metrics::new());
-    let permit = acquire_begin_permit(&gate, Duration::from_secs(5), &metrics)
+    let mut permit = Some(
+        acquire_begin_permit(&gate, Duration::from_secs(5), &metrics)
+            .await
+            .expect("should acquire a free gate"),
+    );
+    let held = gate.begin_permits() as usize;
+    assert!(
+        held * 2 > DEFAULT_TX_GATE_READER_PERMITS as usize,
+        "a begin must hold more than half the pool or two could overlap"
+    );
+    assert_eq!(
+        gate.available_permits(),
+        DEFAULT_TX_GATE_READER_PERMITS as usize - held,
+        "the rest of the pool must stay available to readers"
+    );
+
+    // The transaction's first write takes the remainder.
+    upgrade_to_exclusive(&gate, &mut permit, Duration::from_secs(5), &metrics)
         .await
-        .expect("should acquire a free gate");
-    assert_eq!(gate.available_permits(), 0, "permit must be held");
+        .expect("upgrade on an uncontended gate");
+    assert_eq!(
+        gate.available_permits(),
+        0,
+        "a transaction that has written must hold the whole gate"
+    );
+
     drop(permit);
     assert_eq!(
         gate.available_permits(),
         DEFAULT_TX_GATE_READER_PERMITS as usize,
         "permit pool must release on drop"
+    );
+}
+
+/// The upgrade at the first write is what excludes readers, and it waits for
+/// the readers already running instead of cutting them off.
+#[tokio::test]
+async fn the_first_write_waits_for_readers_then_excludes_them() {
+    let gate = new_tx_gate();
+    let metrics = Arc::new(Metrics::new());
+    let mut permit = Some(
+        acquire_begin_permit(&gate, Duration::from_secs(5), &metrics)
+            .await
+            .expect("begin admission"),
+    );
+    let reader = acquire_autocommit_permit(
+        &gate,
+        AdmissionMode::Reader,
+        Duration::from_secs(1),
+        &metrics,
+    )
+    .await
+    .expect("a reader must be admitted beside a begin-only transaction");
+
+    let upgrade_gate = gate.clone();
+    let upgrade_metrics = metrics.clone();
+    let mut upgrade = tokio::spawn(async move {
+        let outcome = upgrade_to_exclusive(
+            &upgrade_gate,
+            &mut permit,
+            Duration::from_secs(5),
+            &upgrade_metrics,
+        )
+        .await;
+        (outcome, permit)
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut upgrade)
+            .await
+            .is_err(),
+        "the first write must wait for the reader that is already running"
+    );
+
+    drop(reader);
+    let (outcome, permit) = tokio::time::timeout(Duration::from_secs(5), upgrade)
+        .await
+        .expect("the upgrade must complete once the reader releases")
+        .expect("upgrade task");
+    outcome.expect("upgrade must succeed once no reader is running");
+    assert_eq!(
+        gate.available_permits(),
+        0,
+        "a transaction that has written must exclude every reader"
+    );
+    drop(permit);
+    assert_eq!(
+        gate.available_permits(),
+        DEFAULT_TX_GATE_READER_PERMITS as usize,
+        "the whole pool must come back when the transaction ends"
     );
 }
 
