@@ -18,7 +18,7 @@ use powdb_storage::types::Value;
 use powdb_storage::wal::WalRecordType;
 use powdb_sync::{
     retained_segments_dir, write_identity_snapshot, write_segment_atomic, DatabaseIdentity,
-    IdentitySnapshot, ReplicaCursor, RetainedSegment, RetainedUnit,
+    IdentitySnapshot, ReplicaCursor, RetainedSegment, RetainedUnit, SegmentIdentity,
     RETAINED_SEGMENT_FORMAT_VERSION,
 };
 use std::sync::Mutex;

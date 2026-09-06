@@ -24,8 +24,20 @@ use super::auth::Principal;
 use super::classify::error_response;
 use super::transaction::TxGate;
 
-/// Server-side cap for private sync pull batches.
+/// The largest `maxUnits` a replica may ask for. It is a *hint*: a chunk that
+/// would end inside a transaction runs on to the commit or rollback that
+/// closes it, because a chunk cut mid-transaction is not applyable and every
+/// later pull would make the identical cut. Only [`MAX_SYNC_PULL_BYTES`] and
+/// [`MAX_SYNC_PULL_UNITS_HARD`] actually bound a chunk.
 pub(super) const MAX_SYNC_PULL_UNITS: u32 = 4096;
+
+/// Absolute ceiling on the units in one pull chunk, whatever the byte budget
+/// allows. Bounds a single request even when units are tiny, and bounds the
+/// ack range validated against a served chunk.
+pub(super) const MAX_SYNC_PULL_UNITS_HARD: u32 = 262_144;
+
+/// Units read from the retained tail per round while a chunk is being built.
+const PULL_READ_BATCH_UNITS: usize = 4096;
 
 /// Server-side cap for retained-unit payload bytes in a private sync pull.
 pub(super) const MAX_SYNC_PULL_BYTES: u64 = 16 * 1024 * 1024;
@@ -319,6 +331,77 @@ fn validate_wire_replica_id(replica_id: &str) -> Result<(), String> {
         return Err("replica id contains unsupported characters".to_string());
     }
     Ok(())
+}
+
+/// Archive committed history a replica needs but that is still only in
+/// `wal.log`.
+///
+/// Retained segments used to be written only by a checkpoint, and the only
+/// checkpoint a running primary performed was the one on graceful shutdown. So
+/// every write on a live primary sat unarchived, and a replica polling it was
+/// told `awaitArchive` forever: correct as a description, useless as an
+/// instruction, because nothing the replica could do would ever archive it.
+///
+/// A pull is the only thing that consumes archived history, so demand is the
+/// cheapest correct trigger: no timer thread, and no cost on the write path,
+/// which would otherwise pay for replication whether or not a replica exists.
+/// It runs only when a replica asks and only when something is unarchived.
+///
+/// Best effort by design. A checkpoint refuses while a transaction is open, so
+/// the archive naturally stops at the last commit; the caller then serves the
+/// history that *is* archived rather than failing the pull.
+fn archive_pending_history_for_replica(
+    engine: &Arc<RwLock<Engine>>,
+    context: SyncContext,
+) -> SyncContext {
+    if !powdb_sync::sync_state_dir(&context.data_dir).exists() {
+        return context;
+    }
+    {
+        let Ok(mut engine) = engine.write() else {
+            return context;
+        };
+        match powdb_sync::checkpoint_preserving_retained_segments_if_enabled(engine.catalog_mut()) {
+            Ok(()) => debug!("archived pending retained history on sync demand"),
+            Err(err) => debug!(
+                error = %err,
+                "could not archive pending retained history on sync demand"
+            ),
+        }
+    }
+    // Re-read what the archive may have moved. A failed re-read leaves the
+    // pre-archive snapshot in place, whose `remote_lsn` is only ever lower,
+    // and every LSN the frontend serves is clamped to it.
+    sync_context(engine).unwrap_or(context)
+}
+
+/// Whether the retained tail a replica is about to pull holds anything V1
+/// embedded sync cannot apply, so `status` predicts the pull's answer instead
+/// of leaving the replica to discover it one failed pull at a time.
+fn unapplyable_tail_reason(
+    data_dir: &Path,
+    identity: SegmentIdentity,
+    since_lsn: u64,
+    through_lsn: u64,
+) -> Option<String> {
+    if through_lsn <= since_lsn {
+        return None;
+    }
+    let units = read_units_through(
+        &retained_segments_dir(data_dir),
+        identity,
+        since_lsn,
+        through_lsn,
+        MAX_SYNC_PULL_UNITS as usize,
+    )
+    .ok()?;
+    let mut boundary = powdb_sync::V1ApplyBoundary::new();
+    for unit in &units {
+        if let Err(err) = boundary.observe(unit) {
+            return Some(err.to_string());
+        }
+    }
+    None
 }
 
 pub(super) fn sync_context(engine: &Arc<RwLock<Engine>>) -> Result<SyncContext, String> {
@@ -652,27 +735,113 @@ fn log_sync_decision(
     }
 }
 
-fn trim_to_applyable_v1_prefix(
-    raw_units: &mut Vec<RetainedUnit>,
-    wire_units: &mut Vec<WireRetainedUnit>,
-) -> Result<(), String> {
-    let mut last_error = None;
-    while !raw_units.is_empty() {
-        match validate_v1_retained_units_applyable(raw_units) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                last_error = Some(err.to_string());
-                raw_units.pop();
-                wire_units.pop();
+/// What one pull can serve from the retained tail.
+enum PullChunk {
+    /// Units to send. Empty when the tail ends inside a transaction that has
+    /// not committed yet, which is a wait, not a failure.
+    Units(Vec<WireRetainedUnit>),
+    /// Nothing in this range can ever be served to this replica: the next
+    /// transaction does not fit the byte budget, or the tail contains a record
+    /// V1 embedded sync cannot apply. Reported as a rebootstrap status with
+    /// this reason, not as a bare error, so the replica stops retrying a pull
+    /// that will always fail the same way.
+    Rebootstrap(String),
+    /// The server failed to read or encode the tail.
+    Failed(SyncErrorClass, String),
+}
+
+/// Collect the units to serve for one pull.
+///
+/// `hint_units` is where the chunk *wants* to end. It only takes effect on a
+/// transaction boundary: stopping anywhere else produces a chunk the replica
+/// must refuse, and since every later pull would cut at the same place, the
+/// replica would be wedged for good. The chunk therefore runs on to the next
+/// commit or rollback, bounded by `max_bytes` and
+/// [`MAX_SYNC_PULL_UNITS_HARD`].
+fn build_pull_chunk(
+    segment_dir: &Path,
+    identity: SegmentIdentity,
+    since_lsn: u64,
+    through_lsn: u64,
+    hint_units: usize,
+    max_bytes: u64,
+) -> PullChunk {
+    let mut boundary = powdb_sync::V1ApplyBoundary::new();
+    let mut wire_units: Vec<WireRetainedUnit> = Vec::new();
+    let mut selected_bytes = 0u64;
+    // Length of the longest prefix that ends outside every transaction.
+    let mut applyable_len = 0usize;
+    let mut cursor = since_lsn;
+    let mut budget_stopped = false;
+
+    'fill: while cursor < through_lsn {
+        let batch = match read_units_through(
+            segment_dir,
+            identity,
+            cursor,
+            through_lsn,
+            PULL_READ_BATCH_UNITS,
+        ) {
+            Ok(batch) => batch,
+            Err(err) => return PullChunk::Failed(SyncErrorClass::RetainedRead, err.to_string()),
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let exhausted = batch.len() < PULL_READ_BATCH_UNITS;
+        for unit in batch {
+            let wire_unit = wire_retained_unit(unit.clone());
+            let unit_bytes = match wire_unit.encoded_len() {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    return PullChunk::Failed(SyncErrorClass::RetainedUnitEncoding, message)
+                }
+            };
+            if selected_bytes.saturating_add(unit_bytes) > max_bytes
+                || wire_units.len() >= MAX_SYNC_PULL_UNITS_HARD as usize
+            {
+                budget_stopped = true;
+                break 'fill;
+            }
+            if let Err(err) = boundary.observe(&unit) {
+                return PullChunk::Rebootstrap(err.to_string());
+            }
+            cursor = unit.lsn;
+            selected_bytes += unit_bytes;
+            wire_units.push(wire_unit);
+            if boundary.is_closed() {
+                applyable_len = wire_units.len();
             }
         }
+        if exhausted || (wire_units.len() >= hint_units && boundary.is_closed()) {
+            break;
+        }
     }
-    if let Some(error) = last_error {
-        return Err(format!(
-            "sync pull cannot serve an applyable V1 retained chunk with current limits: {error}"
+
+    if applyable_len == 0 && budget_stopped {
+        let open = boundary
+            .open_transaction()
+            .map(|tx_id| format!("transaction {tx_id}"))
+            .unwrap_or_else(|| "the next transaction".to_string());
+        return PullChunk::Rebootstrap(format!(
+            "sync pull cannot fit {open} within the {max_bytes}-byte budget (server cap {MAX_SYNC_PULL_BYTES}); rebootstrap the replica"
         ));
     }
-    Ok(())
+    wire_units.truncate(applyable_len);
+    PullChunk::Units(wire_units)
+}
+
+/// A pull answer that tells the replica to rebootstrap and why, rather than an
+/// error frame it would retry forever.
+fn rebootstrap_pull_result(mut status: ReplicaSyncStatus, reason: String) -> SyncDecision {
+    status.stale = true;
+    status.repair_action = SyncRepairAction::Rebootstrap;
+    status.last_sync_error = Some(reason);
+    SyncDecision::ok(Message::SyncPullResult {
+        status: wire_sync_status(status),
+        units: Vec::new(),
+        has_more: false,
+    })
 }
 
 fn validate_sync_ack_applyable_boundary(
@@ -689,10 +858,13 @@ fn validate_sync_ack_applyable_boundary(
     if applied_lsn <= previous_lsn {
         return Ok(());
     }
+    // Bounded by what one pull can serve, not by the `maxUnits` hint: a chunk
+    // extended to a transaction boundary can be much longer than the hint, and
+    // the replica has to be able to acknowledge exactly what it applied.
     let range_len = applied_lsn - previous_lsn;
-    if range_len > u64::from(MAX_SYNC_PULL_UNITS) {
+    if range_len > u64::from(MAX_SYNC_PULL_UNITS_HARD) {
         return Err(format!(
-            "sync ack range contains {range_len} units; acknowledge ranges no larger than {MAX_SYNC_PULL_UNITS}"
+            "sync ack range contains {range_len} units; acknowledge ranges no larger than {MAX_SYNC_PULL_UNITS_HARD}"
         ));
     }
     let max_units =
@@ -741,18 +913,40 @@ pub(super) fn dispatch_sync_status_decision(
     if let Err((class, message)) = pre_gate.check(credential_authenticated, principal) {
         return SyncDecision::error(class, message);
     }
-    let SyncContext {
-        data_dir,
-        remote_lsn,
-        ..
-    } = match sync_context(engine) {
+    let context = match sync_context(engine) {
         Ok(context) => context,
         Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
     };
+    let SyncContext {
+        data_dir,
+        remote_lsn,
+        active_catalog_version,
+    } = archive_pending_history_for_replica(engine, context);
     match replica_sync_status(&data_dir, &replica_id, remote_lsn) {
-        Ok(status) => SyncDecision::ok(Message::SyncStatusResult {
-            status: wire_sync_status(status),
-        }),
+        Ok(mut status) => {
+            if status.repair_action == SyncRepairAction::Pull {
+                if let Ok(identity) = read_identity(&data_dir) {
+                    let expected = SegmentIdentity::with_catalog_version(
+                        identity.database_id,
+                        identity.primary_generation,
+                        active_catalog_version,
+                    );
+                    if let Some(reason) = unapplyable_tail_reason(
+                        &data_dir,
+                        expected,
+                        status.last_applied_lsn.unwrap_or(0),
+                        status.servable_lsn.unwrap_or(0),
+                    ) {
+                        status.stale = true;
+                        status.repair_action = SyncRepairAction::Rebootstrap;
+                        status.last_sync_error = Some(reason);
+                    }
+                }
+            }
+            SyncDecision::ok(Message::SyncStatusResult {
+                status: wire_sync_status(status),
+            })
+        }
         Err(err) => SyncDecision::error(SyncErrorClass::StatusRead, err.to_string()),
     }
 }
@@ -783,14 +977,15 @@ pub(super) fn dispatch_sync_pull_decision(
         return SyncDecision::error(class, message);
     }
 
+    let context = match sync_context(engine) {
+        Ok(context) => context,
+        Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
+    };
     let SyncContext {
         data_dir,
         remote_lsn,
         active_catalog_version,
-    } = match sync_context(engine) {
-        Ok(context) => context,
-        Err(message) => return SyncDecision::error(SyncErrorClass::SyncContext, message),
-    };
+    } = archive_pending_history_for_replica(engine, context);
     let status = match replica_sync_status(&data_dir, &request.replica_id, remote_lsn) {
         Ok(status) => status,
         Err(err) => {
@@ -858,74 +1053,37 @@ pub(super) fn dispatch_sync_pull_decision(
         );
     }
 
-    let effective_max_units = request.max_units.min(MAX_SYNC_PULL_UNITS) as usize;
-    let requested_through_lsn = request
-        .since_lsn
-        .saturating_add(request.max_units as u64)
-        .min(remote_lsn)
-        .min(status.servable_lsn.unwrap_or(request.since_lsn));
+    // `maxUnits` only says where the chunk would *like* to end; the boundary
+    // rule in `build_pull_chunk` decides where it actually can.
+    let hint_units = request.max_units.min(MAX_SYNC_PULL_UNITS) as usize;
+    let servable_through_lsn = remote_lsn.min(status.servable_lsn.unwrap_or(request.since_lsn));
     let segment_dir = retained_segments_dir(&data_dir);
-    if requested_through_lsn > request.since_lsn {
+    if servable_through_lsn > request.since_lsn {
         if let Err(err) = validate_retained_tail_available(
             &segment_dir,
             expected,
             request.since_lsn,
-            requested_through_lsn,
+            servable_through_lsn,
         ) {
-            let mut rebootstrap_status = status;
-            rebootstrap_status.stale = true;
-            rebootstrap_status.repair_action = SyncRepairAction::Rebootstrap;
-            rebootstrap_status.last_sync_error = Some(format!(
-                "retained history is unavailable; rebootstrap required: {err}"
-            ));
-            return SyncDecision::ok(Message::SyncPullResult {
-                status: wire_sync_status(rebootstrap_status),
-                units: Vec::new(),
-                has_more: false,
-            });
+            return rebootstrap_pull_result(
+                status,
+                format!("retained history is unavailable; rebootstrap required: {err}"),
+            );
         }
     }
 
-    let raw_units = match read_units_through(
+    let selected = match build_pull_chunk(
         &segment_dir,
         expected,
         request.since_lsn,
-        requested_through_lsn,
-        effective_max_units,
+        servable_through_lsn,
+        hint_units,
+        request.max_bytes,
     ) {
-        Ok(units) => units,
-        Err(err) => {
-            return SyncDecision::error(SyncErrorClass::RetainedRead, err.to_string());
-        }
+        PullChunk::Units(units) => units,
+        PullChunk::Rebootstrap(reason) => return rebootstrap_pull_result(status, reason),
+        PullChunk::Failed(class, message) => return SyncDecision::error(class, message),
     };
-
-    let mut selected_raw = Vec::new();
-    let mut selected = Vec::new();
-    let mut selected_bytes = 0u64;
-    for unit in raw_units {
-        let wire_unit = wire_retained_unit(unit.clone());
-        let unit_bytes = match wire_unit.encoded_len() {
-            Ok(bytes) => bytes,
-            Err(message) => {
-                return SyncDecision::error(SyncErrorClass::RetainedUnitEncoding, message);
-            }
-        };
-        if selected_bytes.saturating_add(unit_bytes) > request.max_bytes {
-            if selected.is_empty() {
-                return SyncDecision::error(
-                    SyncErrorClass::InvalidMaxBytes,
-                    "sync pull maxBytes is too small for the next retained unit",
-                );
-            }
-            break;
-        }
-        selected_bytes += unit_bytes;
-        selected_raw.push(unit);
-        selected.push(wire_unit);
-    }
-    if let Err(message) = trim_to_applyable_v1_prefix(&mut selected_raw, &mut selected) {
-        return SyncDecision::error(SyncErrorClass::RetainedChunkNotApplyable, message);
-    }
 
     let fetchable_through_lsn = status.servable_lsn.unwrap_or(remote_lsn).min(remote_lsn);
     let has_more = selected

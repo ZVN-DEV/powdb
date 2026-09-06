@@ -109,6 +109,8 @@ class MockRemote implements RemoteSyncClient {
   acks: SyncAckResult[] = [];
   queryResult: QueryResult = { kind: "ok", affected: 1n };
   queryError: unknown = null;
+  statusError: unknown = null;
+  pullError: unknown = null;
   log: string[];
 
   constructor(log: string[] = []) {
@@ -129,6 +131,7 @@ class MockRemote implements RemoteSyncClient {
   async syncStatus(replicaId: string): Promise<SyncStatus> {
     this.log.push("status");
     this.statusCalls.push(replicaId);
+    if (this.statusError !== null) throw this.statusError;
     const status = this.statuses.shift();
     assert.ok(status, "unexpected syncStatus call");
     return status;
@@ -137,6 +140,7 @@ class MockRemote implements RemoteSyncClient {
   async syncPull(request: SyncPullRequest): Promise<SyncPullResult> {
     this.log.push("pull");
     this.pullRequests.push(request);
+    if (this.pullError !== null) throw this.pullError;
     const pull = this.pulls.shift();
     assert.ok(pull, "unexpected syncPull call");
     return pull;
@@ -825,6 +829,84 @@ async function main() {
     assert.equal(result.syncError?.code, "rebootstrap_required");
     assert.equal(remote.queryCalls.length, 1);
     assert.equal(remote.statusCalls.length, 2);
+  });
+
+  await test("every entry point reports a transport failure as remote_unavailable", async () => {
+    // The client's own transport codes: `syncNow`/`status` used to let these
+    // through untranslated, so the same dead connection surfaced as
+    // `closed`/`protocol_error` here and `remote_unavailable` from the
+    // background loop.
+    for (const code of ["closed", "protocol_error", "connect_failed", "timeout"]) {
+      const transportFailure = Object.assign(new Error(`socket ${code}`), { code });
+
+      const statusRemote = new MockRemote();
+      statusRemote.statusError = transportFailure;
+      const statusReplica = replica(statusRemote, new MockLocal());
+      const fromStatus = await expectSyncError(
+        () => statusReplica.status(),
+        "remote_unavailable",
+      );
+      assert.equal(fromStatus.cause, transportFailure);
+
+      const syncRemote = new MockRemote();
+      syncRemote.statusError = transportFailure;
+      const syncReplica = replica(syncRemote, new MockLocal());
+      await expectSyncError(() => syncReplica.syncNow(), "remote_unavailable");
+
+      const pullRemote = new MockRemote();
+      pullRemote.statuses.push(
+        syncStatus({ remoteLsn: 4n, stale: true, repairAction: "pull" }),
+      );
+      pullRemote.pullError = transportFailure;
+      const pullReplica = replica(pullRemote, new MockLocal());
+      await expectSyncError(() => pullReplica.syncNow(), "remote_unavailable");
+    }
+  });
+
+  await test("a rebootstrap status naming DDL surfaces its reason", async () => {
+    const remote = new MockRemote();
+    remote.statuses.push(
+      syncStatus({
+        stale: true,
+        repairAction: "rebootstrap",
+        lastSyncError:
+          "DDL retained units are not supported by V1 embedded sync; rebootstrap or upgrade required",
+      }),
+    );
+    const err = await expectSyncError(
+      () => replica(remote, new MockLocal()).syncNow(),
+      "rebootstrap_required",
+    );
+    assert.match(err.message, /DDL retained units are not supported/);
+  });
+
+  await test("the default pull window matches the server's maxUnits ceiling", async () => {
+    const remote = new MockRemote();
+    remote.statuses.push(
+      syncStatus({ remoteLsn: 1n, stale: true, repairAction: "pull" }),
+    );
+    remote.pulls.push({
+      status: syncStatus({ remoteLsn: 1n, lastAppliedLsn: 1n }),
+      units: [retainedUnit(1n)],
+      hasMore: false,
+    });
+    remote.acks.push({
+      previousAppliedLsn: 0n,
+      appliedLsn: 1n,
+      remoteLsn: 1n,
+      advanced: true,
+      status: syncStatus({ remoteLsn: 1n, lastAppliedLsn: 1n }),
+    });
+    const db = new PowDBSyncReplica({
+      replicaId: "replica-a",
+      identity,
+      local: new MockLocal(),
+      remote,
+    });
+    await db.syncNow();
+    // 512 could not carry a 1000-row transaction, and the server refuses a
+    // chunk that cuts one, so the replica wedged on its own default.
+    assert.equal(remote.pullRequests[0]?.maxUnits, 4096);
   });
 }
 

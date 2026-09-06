@@ -1090,6 +1090,8 @@ fn every_engine_free_sync_refusal_is_also_a_pre_gate_refusal() {
 const DECLARED_SYNC_REJECTION_SITES: &[(&str, &str, usize)] = &[
     ("acquire_sync_permit", "GateTimeout", 1),
     ("acquire_sync_permit", "QueryExecution", 1),
+    ("build_pull_chunk", "RetainedRead", 1),
+    ("build_pull_chunk", "RetainedUnitEncoding", 1),
     ("classify_sync_ack_failure", "AckRejected", 1),
     ("classify_sync_ack_failure", "AckUpdate", 1),
     ("dispatch_sync_ack_decision", "AckValidation", 1),
@@ -1098,14 +1100,6 @@ const DECLARED_SYNC_REJECTION_SITES: &[(&str, &str, usize)] = &[
     ("dispatch_sync_pull_decision", "CursorLsnMismatch", 1),
     ("dispatch_sync_pull_decision", "IdentityOrFormatMismatch", 2),
     ("dispatch_sync_pull_decision", "IdentityRead", 1),
-    ("dispatch_sync_pull_decision", "InvalidMaxBytes", 1),
-    (
-        "dispatch_sync_pull_decision",
-        "RetainedChunkNotApplyable",
-        1,
-    ),
-    ("dispatch_sync_pull_decision", "RetainedRead", 1),
-    ("dispatch_sync_pull_decision", "RetainedUnitEncoding", 1),
     ("dispatch_sync_pull_decision", "StatusRead", 1),
     ("dispatch_sync_pull_decision", "SyncContext", 1),
     ("dispatch_sync_status_decision", "StatusRead", 1),
@@ -1388,6 +1382,9 @@ fn every_gated_sync_rejection_site_is_declared() {
     let mut actual: BTreeMap<(&str, String), usize> = BTreeMap::new();
     for name in [
         "acquire_sync_permit",
+        // Chunk building was lifted out of `dispatch_sync_pull_decision`, and
+        // its refusals have to stay inside the census that moved with them.
+        "build_pull_chunk",
         "classify_sync_ack_failure",
         "dispatch_sync_ack_decision",
         "dispatch_sync_pull_decision",

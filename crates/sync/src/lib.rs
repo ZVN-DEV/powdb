@@ -7,6 +7,7 @@
 
 pub mod apply;
 pub mod checkpoint;
+mod fsync;
 pub mod error;
 pub mod metadata;
 pub mod replica;
@@ -16,7 +17,7 @@ pub mod segment;
 pub use apply::{
     apply_retained_tail, apply_retained_units_chunk, seed_retained_apply_boundary,
     validate_v1_retained_tail_applyable, validate_v1_retained_units_applyable,
-    RetainedTailApplySummary,
+    RetainedTailApplySummary, V1ApplyBoundary,
 };
 pub use checkpoint::{
     archive_wal_records_for_identity, checkpoint_preserving_retained_segments_if_enabled,

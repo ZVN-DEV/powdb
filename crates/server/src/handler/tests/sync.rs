@@ -101,24 +101,45 @@ fn retained_unit_with(tx_id: u64, record_type: WalRecordType, lsn: u64) -> Retai
     }
 }
 
-fn write_sync_identity_and_tail(data_dir: &std::path::Path, through_lsn: u64) {
+/// The identity a fabricated segment must carry: the same catalog format the
+/// database is actually running, which is what the archive itself stamps. A
+/// fixture that stamped this build's newest format instead built a chain no
+/// real archive could ever extend.
+fn fixture_segment_identity(data_dir: &std::path::Path) -> SegmentIdentity {
     let identity = sync_identity();
-    write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
+    SegmentIdentity::with_catalog_version(
+        identity.database_id,
+        identity.primary_generation,
+        powdb_storage::catalog::read_active_catalog_version(data_dir).unwrap(),
+    )
+}
+
+/// Sync identity at the engine's current LSN with no retained history: the
+/// state a replica is in right after it bootstraps from a snapshot.
+///
+/// Archiving and then discarding what the engine has already written leaves
+/// the WAL empty, so the on-demand archive has nothing to add and a fabricated
+/// tail is the whole history. It also drops the `type` statement every fixture
+/// starts with, which is DDL a V1 replica could never apply.
+fn seed_sync_identity_at_current_lsn(engine: &mut Engine) {
+    let data_dir = engine.catalog().data_dir().to_path_buf();
+    write_identity_snapshot(&data_dir, &IdentitySnapshot::from_identity(sync_identity(), 1))
+        .unwrap();
+    powdb_sync::checkpoint_preserving_retained_segments_if_enabled(engine.catalog_mut()).unwrap();
+    let _ = std::fs::remove_dir_all(retained_segments_dir(&data_dir));
+}
+
+/// Replace the retained history with exactly `units`.
+fn write_sync_identity_and_units(engine: &mut Engine, units: Vec<RetainedUnit>) {
+    seed_sync_identity_at_current_lsn(engine);
+    let data_dir = engine.catalog().data_dir().to_path_buf();
+    let segment = RetainedSegment::new(fixture_segment_identity(&data_dir), units).unwrap();
+    write_segment_atomic(&retained_segments_dir(&data_dir), &segment).unwrap();
+}
+
+fn write_sync_identity_and_tail(engine: &mut Engine, through_lsn: u64) {
     let units = (1..=through_lsn).map(retained_unit).collect();
-    let segment = RetainedSegment::new(identity.segment_identity(), units).unwrap();
-    write_segment_atomic(&retained_segments_dir(data_dir), &segment).unwrap();
-}
-
-fn write_sync_identity_and_units(data_dir: &std::path::Path, units: Vec<RetainedUnit>) {
-    let identity = sync_identity();
-    write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
-    let segment = RetainedSegment::new(identity.segment_identity(), units).unwrap();
-    write_segment_atomic(&retained_segments_dir(data_dir), &segment).unwrap();
-}
-
-fn write_sync_identity_only(data_dir: &std::path::Path) {
-    let identity = sync_identity();
-    write_identity_snapshot(data_dir, &IdentitySnapshot::from_identity(identity, 1)).unwrap();
+    write_sync_identity_and_units(engine, units);
 }
 
 #[test]
@@ -160,7 +181,7 @@ fn sync_status_pull_and_ack_use_server_remote_lsn() {
         .unwrap();
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn > 0);
-    write_sync_identity_and_tail(dir.path(), remote_lsn);
+    write_sync_identity_and_tail(&mut engine, remote_lsn);
     powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
 
     let engine = Arc::new(RwLock::new(engine));
@@ -235,7 +256,7 @@ fn seed_pullable_replica(engine: &mut Engine) -> u64 {
     let data_dir = engine.catalog().data_dir().to_path_buf();
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn > 0);
-    write_sync_identity_and_tail(&data_dir, remote_lsn);
+    write_sync_identity_and_tail(engine, remote_lsn);
     powdb_sync::upsert_replica_cursor(&data_dir, ReplicaCursor::active("replica-a", 0)).unwrap();
     remote_lsn
 }
@@ -376,7 +397,7 @@ fn sync_pull_and_ack_reject_transaction_cut_boundaries() {
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn >= 3);
     write_sync_identity_and_units(
-        dir.path(),
+        &mut engine,
         vec![
             retained_unit_with(77, WalRecordType::Begin, 1),
             retained_unit_with(77, WalRecordType::Insert, 2),
@@ -388,7 +409,9 @@ fn sync_pull_and_ack_reject_transaction_cut_boundaries() {
     let engine = Arc::new(RwLock::new(engine));
     let principal = admin_principal();
     let identity = sync_identity().segment_identity();
-    let cut_pull = SyncPullRequest {
+    // `maxUnits` 2 would cut this 3-unit transaction in half. It is a hint, so
+    // the chunk runs on to the commit instead of being refused.
+    let hinted_pull = SyncPullRequest {
         replica_id: "replica-a".into(),
         since_lsn: 0,
         max_units: 2,
@@ -399,13 +422,16 @@ fn sync_pull_and_ack_reject_transaction_cut_boundaries() {
         catalog_version: identity.catalog_version,
         segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
     };
-    match dispatch_sync_pull(&engine, cut_pull, true, Some(&principal)) {
-        Message::ErrorWithClass { message, .. } => {
-            assert!(message.contains("cuts through transaction"))
+    match dispatch_sync_pull(&engine, hinted_pull, true, Some(&principal)) {
+        Message::SyncPullResult { units, .. } => {
+            assert_eq!(units.len(), 3);
+            assert_eq!(units.last().unwrap().lsn, 3);
         }
-        other => panic!("expected transaction-cut pull error, got {other:?}"),
+        other => panic!("expected the chunk to extend to the commit, got {other:?}"),
     }
 
+    // The byte budget is the one bound that cannot be stretched, so this is
+    // the case a replica must be told to rebootstrap over.
     let cut_bytes_pull = SyncPullRequest {
         replica_id: "replica-a".into(),
         since_lsn: 0,
@@ -418,10 +444,14 @@ fn sync_pull_and_ack_reject_transaction_cut_boundaries() {
         segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
     };
     match dispatch_sync_pull(&engine, cut_bytes_pull, true, Some(&principal)) {
-        Message::ErrorWithClass { message, .. } => {
-            assert!(message.contains("cuts through transaction"))
+        Message::SyncPullResult { status, units, .. } => {
+            assert!(units.is_empty());
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+            assert!(status
+                .last_sync_error
+                .is_some_and(|reason| reason.contains("transaction 77")));
         }
-        other => panic!("expected byte-capped transaction-cut pull error, got {other:?}"),
+        other => panic!("expected a byte-capped rebootstrap status, got {other:?}"),
     }
 
     let full_pull = SyncPullRequest {
@@ -496,7 +526,7 @@ fn sync_pull_byte_cap_returns_applyable_prefix_with_reused_tx_id() {
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn >= 6);
     write_sync_identity_and_units(
-        dir.path(),
+        &mut engine,
         vec![
             retained_unit_with(1, WalRecordType::Begin, 1),
             retained_unit_with(1, WalRecordType::Insert, 2),
@@ -548,7 +578,7 @@ fn sync_pull_never_serves_units_beyond_server_remote_lsn() {
     engine.execute_powql("insert SyncT { id := 1 }").unwrap();
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn > 0);
-    write_sync_identity_and_tail(dir.path(), remote_lsn + 2);
+    write_sync_identity_and_tail(&mut engine, remote_lsn + 2);
     powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
 
     let engine = Arc::new(RwLock::new(engine));
@@ -595,7 +625,11 @@ fn sync_status_reports_await_archive_when_primary_outruns_retained_tail() {
     engine.execute_powql("insert SyncT { id := 1 }").unwrap();
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn > 0);
-    write_sync_identity_only(dir.path());
+    // An empty retained tail with the WAL already archived: the state a
+    // replica still lands in when retention has trimmed ahead of it. A tail
+    // that lags only because nothing has archived yet no longer reaches the
+    // frontend at all, because status and pull archive on demand.
+    seed_sync_identity_at_current_lsn(&mut engine);
     powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
 
     let engine = Arc::new(RwLock::new(engine));
@@ -652,7 +686,7 @@ fn sync_pull_serves_partial_retained_prefix_when_archive_lags_remote_lsn() {
     let remote_lsn = engine.catalog().max_lsn();
     assert!(remote_lsn > 1);
     let servable_lsn = remote_lsn - 1;
-    write_sync_identity_and_tail(dir.path(), servable_lsn);
+    write_sync_identity_and_tail(&mut engine, servable_lsn);
     powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
 
     let engine = Arc::new(RwLock::new(engine));
@@ -698,7 +732,7 @@ fn sync_pull_rejects_cursor_or_format_mismatch() {
         .unwrap();
     engine.execute_powql("insert SyncT { id := 1 }").unwrap();
     let remote_lsn = engine.catalog().max_lsn();
-    write_sync_identity_and_tail(dir.path(), remote_lsn);
+    write_sync_identity_and_tail(&mut engine, remote_lsn);
     powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
     let engine = Arc::new(RwLock::new(engine));
     let principal = admin_principal();
@@ -736,5 +770,257 @@ fn sync_pull_rejects_cursor_or_format_mismatch() {
             assert!(message.contains("rebootstrap required"))
         }
         other => panic!("expected format mismatch error, got {other:?}"),
+    }
+}
+
+/// Build one explicit transaction as retained units: `Begin`, `rows` inserts,
+/// `Commit`, occupying LSNs 1..=rows+2.
+fn transaction_units(tx_id: u64, rows: u64) -> Vec<RetainedUnit> {
+    let mut units = vec![retained_unit_with(tx_id, WalRecordType::Begin, 1)];
+    for offset in 0..rows {
+        units.push(retained_unit_with(
+            tx_id,
+            WalRecordType::Insert,
+            2 + offset,
+        ));
+    }
+    units.push(retained_unit_with(tx_id, WalRecordType::Commit, rows + 2));
+    units
+}
+
+fn pull_for(since_lsn: u64, max_units: u32, max_bytes: u64) -> SyncPullRequest {
+    let identity = sync_identity().segment_identity();
+    SyncPullRequest {
+        replica_id: "replica-a".into(),
+        since_lsn,
+        max_units,
+        max_bytes,
+        database_id: identity.database_id,
+        primary_generation: identity.primary_generation,
+        wal_format_version: identity.wal_format_version,
+        catalog_version: identity.catalog_version,
+        segment_format_version: RETAINED_SEGMENT_FORMAT_VERSION,
+    }
+}
+
+/// Seed a data dir whose retained tail is one transaction of `rows` rows, with
+/// `replica-a` sitting at LSN 0.
+fn engine_with_one_transaction(
+    dir: &tempfile::TempDir,
+    rows: u64,
+) -> (Arc<RwLock<Engine>>, u64) {
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type SyncT { required id: int }")
+        .unwrap();
+    let units = transaction_units(77, rows);
+    let through_lsn = units.last().unwrap().lsn;
+    while engine.catalog().max_lsn() < through_lsn {
+        let id = engine.catalog().max_lsn() as i64 + 1;
+        engine
+            .catalog_mut()
+            .insert("SyncT", &vec![Value::Int(id)])
+            .unwrap();
+    }
+    write_sync_identity_and_units(&mut engine, units);
+    powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
+    (Arc::new(RwLock::new(engine)), through_lsn)
+}
+
+/// A transaction bigger than `maxUnits` used to be unservable forever: the
+/// chunk was cut at `maxUnits`, the cut landed inside the transaction, and the
+/// server refused it. Every subsequent pull made the identical cut, so the
+/// replica was wedged with `repairAction: "pull"` and no error to act on.
+/// `maxUnits` is a hint now: the chunk runs on to the commit that closes the
+/// transaction it is standing in.
+#[test]
+fn sync_pull_extends_past_max_units_to_the_transaction_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, through_lsn) = engine_with_one_transaction(&dir, 4998);
+    let principal = admin_principal();
+
+    match dispatch_sync_pull(
+        &engine,
+        pull_for(0, 512, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    ) {
+        Message::SyncPullResult { units, .. } => {
+            assert_eq!(units.len() as u64, through_lsn);
+            assert_eq!(units.last().unwrap().lsn, through_lsn);
+        }
+        other => panic!("expected the whole transaction, got {other:?}"),
+    }
+}
+
+#[test]
+fn sync_pull_serves_a_transaction_larger_than_the_unit_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, through_lsn) = engine_with_one_transaction(&dir, 50_000);
+    let principal = admin_principal();
+
+    match dispatch_sync_pull(
+        &engine,
+        pull_for(0, MAX_SYNC_PULL_UNITS, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    ) {
+        Message::SyncPullResult {
+            units, has_more, ..
+        } => {
+            assert_eq!(units.len() as u64, through_lsn);
+            assert_eq!(units.last().unwrap().lsn, through_lsn);
+            assert!(!has_more);
+        }
+        other => panic!("expected a 50002-unit chunk, got {other:?}"),
+    }
+
+    // The replica now acks a range far longer than the old 4096-unit ceiling.
+    match dispatch_sync_ack(
+        &engine,
+        "replica-a".into(),
+        through_lsn,
+        through_lsn,
+        true,
+        Some(&principal),
+    ) {
+        Message::SyncAckResult { applied_lsn, .. } => assert_eq!(applied_lsn, through_lsn),
+        other => panic!("expected the ack to be accepted, got {other:?}"),
+    }
+}
+
+/// The one case that genuinely cannot be served: a transaction too large for
+/// the byte budget. The replica has to hear "rebootstrap" with a reason, not
+/// a bare error with `repairAction: "pull"` that it will retry forever.
+#[test]
+fn sync_pull_answers_rebootstrap_when_a_transaction_cannot_fit_the_byte_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = engine_with_one_transaction(&dir, 40);
+    let principal = admin_principal();
+
+    match dispatch_sync_pull(&engine, pull_for(0, 4096, 200), true, Some(&principal)) {
+        Message::SyncPullResult { status, units, .. } => {
+            assert!(units.is_empty());
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+            assert!(status.stale);
+            let reason = status
+                .last_sync_error
+                .expect("an unservable replica must be told why");
+            assert!(
+                reason.contains("transaction"),
+                "reason must name the transaction, got: {reason}"
+            );
+        }
+        other => panic!("expected a rebootstrap status, got {other:?}"),
+    }
+}
+
+/// Committed writes used to sit in `wal.log` until the primary was shut down
+/// gracefully, so a replica against a live primary reported `awaitArchive`
+/// forever and never converged. A pull (and the status that precedes it) now
+/// archives what is committed and unarchived before answering.
+#[test]
+fn sync_against_a_live_primary_archives_committed_writes_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type SyncT { required id: int }")
+        .unwrap();
+    // Bootstrap boundary: identity established, history archived and discarded,
+    // the replica's cursor pinned to the LSN the snapshot was taken at.
+    seed_sync_identity_at_current_lsn(&mut engine);
+    let bootstrap_lsn = engine.catalog().max_lsn();
+    powdb_sync::upsert_replica_cursor(
+        dir.path(),
+        ReplicaCursor::active("replica-a", bootstrap_lsn),
+    )
+    .unwrap();
+    // Written while the primary stays up. Before archive-on-demand, nothing
+    // moved these out of wal.log until the primary shut down gracefully.
+    for id in 1..=20 {
+        engine
+            .execute_powql(&format!("insert SyncT {{ id := {id} }}"))
+            .unwrap();
+    }
+    let remote_lsn = engine.catalog().max_lsn();
+    assert!(remote_lsn > bootstrap_lsn);
+    let engine = Arc::new(RwLock::new(engine));
+    let principal = admin_principal();
+
+    let status = match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal)) {
+        Message::SyncStatusResult { status } => status,
+        other => panic!("expected sync status, got {other:?}"),
+    };
+    assert_eq!(
+        status.repair_action,
+        WireSyncRepairAction::Pull,
+        "a live primary must archive on demand instead of parking the replica on awaitArchive"
+    );
+    assert_eq!(status.servable_lsn, Some(remote_lsn));
+    assert_eq!(status.unarchived_lsn, Some(0));
+
+    match dispatch_sync_pull(
+        &engine,
+        pull_for(bootstrap_lsn, MAX_SYNC_PULL_UNITS, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    ) {
+        Message::SyncPullResult { units, .. } => {
+            assert_eq!(units.last().unwrap().lsn, remote_lsn);
+        }
+        other => panic!("expected the committed rows, got {other:?}"),
+    }
+}
+
+/// DDL in the retained tail is a rebootstrap condition, and the replica has to
+/// learn that from `status` rather than by watching every pull fail.
+#[test]
+fn sync_reports_rebootstrap_when_the_next_chunk_holds_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type SyncT { required id: int }")
+        .unwrap();
+    for id in 1..=3 {
+        engine
+            .execute_powql(&format!("insert SyncT {{ id := {id} }}"))
+            .unwrap();
+    }
+    write_sync_identity_and_units(
+        &mut engine,
+        vec![
+            retained_unit_with(0, WalRecordType::Insert, 1),
+            retained_unit_with(0, WalRecordType::DdlAddColumn, 2),
+            retained_unit_with(0, WalRecordType::Insert, 3),
+        ],
+    );
+    powdb_sync::upsert_replica_cursor(dir.path(), ReplicaCursor::active("replica-a", 0)).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    let principal = admin_principal();
+
+    let status = match dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal)) {
+        Message::SyncStatusResult { status } => status,
+        other => panic!("expected sync status, got {other:?}"),
+    };
+    assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+    let reason = status.last_sync_error.expect("DDL must be explained");
+    assert!(
+        reason.contains("DDL"),
+        "the reason must name DDL, got: {reason}"
+    );
+
+    match dispatch_sync_pull(
+        &engine,
+        pull_for(0, MAX_SYNC_PULL_UNITS, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    ) {
+        Message::SyncPullResult { status, .. } => {
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+            assert!(status
+                .last_sync_error
+                .is_some_and(|reason| reason.contains("DDL")));
+        }
+        other => panic!("expected a rebootstrap pull status, got {other:?}"),
     }
 }

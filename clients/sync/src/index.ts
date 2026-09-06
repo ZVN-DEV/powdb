@@ -223,7 +223,17 @@ export interface WriteResult {
   syncRemoteLsn?: bigint;
 }
 
-const DEFAULT_MAX_PULL_UNITS = 512;
+/**
+ * Units a pull asks for by default.
+ *
+ * `maxUnits` is a hint the primary may exceed to reach a transaction
+ * boundary, so this is a batching preference rather than a ceiling. It sat at
+ * 512 while the primary treated it as a hard cap, which made every
+ * transaction of more than ~512 units unservable: the chunk was cut inside
+ * the transaction, the primary refused it, and every retry cut in the same
+ * place.
+ */
+const DEFAULT_MAX_PULL_UNITS = 4096;
 const DEFAULT_MAX_PULL_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_PULL_ROUNDS = 32;
 const MAX_U64 = 0xffff_ffff_ffff_ffffn;
@@ -262,7 +272,7 @@ export class PowDBSyncReplica {
   }
 
   async status(opts?: { signal?: AbortSignal }): Promise<SyncStatus> {
-    return this.remote.syncStatus(this.replicaId, opts);
+    return this.remoteStatus(opts?.signal);
   }
 
   startBackgroundSync(options: BackgroundSyncOptions): BackgroundSyncHandle {
@@ -339,7 +349,7 @@ export class PowDBSyncReplica {
       options.maxPullRounds ?? this.maxPullRounds,
       "maxPullRounds",
     );
-    let status = await this.remote.syncStatus(this.replicaId, { signal: options.signal });
+    let status = await this.remoteStatus(options.signal);
     let pulls = 0;
     let units = 0;
     let appliedLsn: bigint | null = status.lastAppliedLsn;
@@ -369,16 +379,7 @@ export class PowDBSyncReplica {
       }
 
       const sinceLsn = status.lastAppliedLsn;
-      const pull = await this.remote.syncPull(
-        {
-          replicaId: this.replicaId,
-          sinceLsn,
-          maxUnits: this.maxPullUnits,
-          maxBytes: this.maxPullBytes,
-          ...this.identity,
-        },
-        { signal: options.signal },
-      );
+      const pull = await this.remotePull(sinceLsn, options.signal);
       status = pull.status;
       this.throwIfUnusableStatus(status);
 
@@ -490,6 +491,42 @@ export class PowDBSyncReplica {
         syncError,
         ...writeVisibilityFromSyncError(syncError),
       };
+    }
+  }
+
+  /**
+   * Ask the primary for this replica's status, reporting a transport failure
+   * as `remote_unavailable`.
+   *
+   * Every entry point routes through here so one dead connection cannot
+   * surface as `closed` from `status()`, `protocol_error` from `syncNow()`,
+   * and `remote_unavailable` from the background loop.
+   */
+  private async remoteStatus(signal?: AbortSignal): Promise<SyncStatus> {
+    try {
+      return await this.remote.syncStatus(this.replicaId, { signal });
+    } catch (err) {
+      throw toRemoteError(err, "sync status");
+    }
+  }
+
+  private async remotePull(
+    sinceLsn: bigint,
+    signal?: AbortSignal,
+  ): Promise<SyncPullResult> {
+    try {
+      return await this.remote.syncPull(
+        {
+          replicaId: this.replicaId,
+          sinceLsn,
+          maxUnits: this.maxPullUnits,
+          maxBytes: this.maxPullBytes,
+          ...this.identity,
+        },
+        { signal },
+      );
+    } catch (err) {
+      throw toRemoteError(err, "sync pull");
     }
   }
 
@@ -764,6 +801,27 @@ function classifyWriteError(err: unknown): PowDBSyncError {
     "commit_outcome_unknown",
     { cause: err },
   );
+}
+
+/**
+ * One code for every way the primary can be out of reach. An abort is the
+ * caller's own doing and passes through untouched.
+ */
+function toRemoteError(err: unknown, operation: string): PowDBSyncError {
+  if (err instanceof PowDBSyncError) return err;
+  if (isAbort(err)) throw err;
+  return new PowDBSyncError(
+    errorMessage(err, `${operation} failed`),
+    "remote_unavailable",
+    { cause: err },
+  );
+}
+
+function isAbort(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = "code" in err ? (err as { code?: unknown }).code : undefined;
+  const name = "name" in err ? (err as { name?: unknown }).name : undefined;
+  return code === "aborted" || name === "AbortError";
 }
 
 function toSyncError(err: unknown, fallback: PowDBSyncErrorCode): PowDBSyncError {
