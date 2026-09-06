@@ -123,8 +123,11 @@ fn fixture_segment_identity(data_dir: &std::path::Path) -> SegmentIdentity {
 /// starts with, which is DDL a V1 replica could never apply.
 fn seed_sync_identity_at_current_lsn(engine: &mut Engine) {
     let data_dir = engine.catalog().data_dir().to_path_buf();
-    write_identity_snapshot(&data_dir, &IdentitySnapshot::from_identity(sync_identity(), 1))
-        .unwrap();
+    write_identity_snapshot(
+        &data_dir,
+        &IdentitySnapshot::from_identity(sync_identity(), 1),
+    )
+    .unwrap();
     powdb_sync::checkpoint_preserving_retained_segments_if_enabled(engine.catalog_mut()).unwrap();
     let _ = std::fs::remove_dir_all(retained_segments_dir(&data_dir));
 }
@@ -778,11 +781,7 @@ fn sync_pull_rejects_cursor_or_format_mismatch() {
 fn transaction_units(tx_id: u64, rows: u64) -> Vec<RetainedUnit> {
     let mut units = vec![retained_unit_with(tx_id, WalRecordType::Begin, 1)];
     for offset in 0..rows {
-        units.push(retained_unit_with(
-            tx_id,
-            WalRecordType::Insert,
-            2 + offset,
-        ));
+        units.push(retained_unit_with(tx_id, WalRecordType::Insert, 2 + offset));
     }
     units.push(retained_unit_with(tx_id, WalRecordType::Commit, rows + 2));
     units
@@ -805,10 +804,7 @@ fn pull_for(since_lsn: u64, max_units: u32, max_bytes: u64) -> SyncPullRequest {
 
 /// Seed a data dir whose retained tail is one transaction of `rows` rows, with
 /// `replica-a` sitting at LSN 0.
-fn engine_with_one_transaction(
-    dir: &tempfile::TempDir,
-    rows: u64,
-) -> (Arc<RwLock<Engine>>, u64) {
+fn engine_with_one_transaction(dir: &tempfile::TempDir, rows: u64) -> (Arc<RwLock<Engine>>, u64) {
     let mut engine = Engine::new(dir.path()).unwrap();
     engine
         .execute_powql("type SyncT { required id: int }")
