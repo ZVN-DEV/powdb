@@ -100,8 +100,31 @@ export type NativeParam = number | bigint | string | boolean | null
  * host should recycle or restore rather than retry.
  */
 export type PowDBErrorCode =
-  /** The statement failed to parse, plan, or execute. */
+  /**
+   * Planning or execution failed: unknown table or column, type mismatch, an
+   * unsupported statement. Wire error class 2.
+   */
   | "query_failed"
+  /** The statement failed to lex or parse. Wire error class 1. */
+  | "parse_error"
+  /** A time budget elapsed. Wire error class 3. */
+  | "timeout"
+  /** A memory or size limit was exceeded. Wire error class 4. */
+  | "size_exceeded"
+  /**
+   * The database is open read-only and the statement requires a writer. Wire
+   * error class 5.
+   */
+  | "readonly_refused"
+  /** A constraint (a unique index) rejected the write. Wire error class 8. */
+  | "constraint_violation"
+  /** Execution was cancelled cooperatively. Wire error class 9. */
+  | "cancelled"
+  /**
+   * No prebuilt native binary exists for this platform. Raised by the loader
+   * before the addon is reached, so no database call has run.
+   */
+  | "unsupported_platform"
   /** `close()` has already been called on this handle. */
   | "closed"
   /** Opening the data directory failed (I/O, permissions, no catalog). */
@@ -147,13 +170,17 @@ export type PowDBErrorCode =
  * }
  * ```
  *
- * `code` is deliberately widened past {@link PowDBErrorCode}. Argument
- * coercion happens in generated binding code that runs BEFORE any addon logic,
- * so passing a value of the wrong type surfaces one of napi's own status
- * strings instead (`"StringExpected"`, `"InvalidArg"`, and siblings). Those are
- * programming errors in the calling code rather than database conditions, and
- * they are not enumerated here. Treat an unrecognized `code` as unexpected and
- * rethrow it; do not write an exhaustive `switch` that assumes otherwise.
+ * `code` is deliberately widened past {@link PowDBErrorCode}: an unrecognized
+ * code is possible and should be rethrown rather than handled by an exhaustive
+ * `switch`. Argument coercion in generated binding code raises napi's own
+ * status strings (`"StringExpected"`, `"InvalidArg"`, and siblings); the
+ * package entry point rewrites those to `"invalid_argument"`, since they mean
+ * exactly what that code means.
+ *
+ * `errorClass` is the engine's own classification, numbered exactly as the
+ * server numbers it on the wire (docs/errors.md), so the same branch works
+ * against an embedded database and a server. It is absent only on an error
+ * whose code the loader does not recognize.
  *
  * The addon throws native `Error` instances, not instances of the networked
  * client's `PowDBError` class, so `instanceof` does not cross the two
@@ -161,4 +188,5 @@ export type PowDBErrorCode =
  */
 export interface PowDBError extends Error {
   code: PowDBErrorCode | (string & {})
+  errorClass?: number
 }

@@ -17,9 +17,10 @@
     "local-first",
     "napi"
   ],
-  "main": "index.js",
+  "main": "loader.js",
   "types": "index.d.ts",
   "files": [
+    "loader.js",
     "index.js",
     "index.d.ts",
     "*.node",

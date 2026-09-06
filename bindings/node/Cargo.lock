@@ -265,6 +265,7 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "powdb",
+ "powdb-storage",
  "serde_json",
 ]
 
@@ -301,6 +302,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

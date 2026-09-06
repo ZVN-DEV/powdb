@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { Database } = require("../index.js");
+const { Database } = require("../loader.js");
 
 function freshDir() {
   return mkdtempSync(join(tmpdir(), "powdb-native-test-"));

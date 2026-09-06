@@ -17,9 +17,10 @@ use napi::ValueType;
 use napi_derive::napi;
 
 use powdb::{
-    pj1_to_text, Database as Inner, Error as PowdbError, QueryResult, RetainedApplyRequest,
-    RetainedApplyResult, RetainedUnitInput, SyncApplyIdentity, Value,
+    pj1_to_text, Database as Inner, Error as PowdbError, QueryError, QueryResult,
+    RetainedApplyRequest, RetainedApplyResult, RetainedUnitInput, SyncApplyIdentity, Value,
 };
+use powdb_storage::error::StorageErrorKind;
 
 /// Stable, machine-readable error codes. napi-rs writes an error's status
 /// string to the JS `Error.code` property, so parameterizing [`napi::Error`]
@@ -36,9 +37,24 @@ use powdb::{
 /// Keep this list in sync with the `PowDBErrorCode` union in `dts-header.d.ts`,
 /// which is what TypeScript callers see.
 mod code {
-    /// The statement failed to parse, plan, or execute. Shared with the
-    /// networked client, which uses it for a server `Error` frame.
+    /// Planning or execution failed: unknown table or column, type mismatch,
+    /// an unsupported statement. Shared with the networked client, which uses
+    /// it for a server `Error` frame it has nothing finer to say about.
     pub const QUERY_FAILED: &str = "query_failed";
+    /// The statement failed to lex or parse. Wire class 1.
+    pub const PARSE_ERROR: &str = "parse_error";
+    /// A time budget elapsed. Wire class 3. Shared with the networked client.
+    pub const TIMEOUT: &str = "timeout";
+    /// A memory or size limit was exceeded. Wire class 4. Named as the
+    /// networked client names it, so one `switch` covers both.
+    pub const SIZE_EXCEEDED: &str = "size_exceeded";
+    /// The database is open read-only and the statement requires a writer.
+    /// Wire class 5.
+    pub const READONLY_REFUSED: &str = "readonly_refused";
+    /// A constraint (a unique index) rejected the write. Wire class 8.
+    pub const CONSTRAINT_VIOLATION: &str = "constraint_violation";
+    /// Execution was cancelled cooperatively. Wire class 9.
+    pub const CANCELLED: &str = "cancelled";
     /// `close()` has already been called on this handle. Shared with the
     /// networked client.
     pub const CLOSED: &str = "closed";
@@ -71,13 +87,68 @@ type Code = &'static str;
 /// can reach JavaScript with napi's own `"GenericFailure"` placeholder code.
 type CodedError = napi::Error<Code>;
 
+/// The code for a query failure, decided by the same classification the server
+/// puts on the wire as an error class (docs/errors.md).
+///
+/// Without this every engine failure reached JavaScript as one flat
+/// `query_failed`, while the networked client exposed a class for the same
+/// error: a unique-constraint violation, a read-only refusal and a parse error
+/// were indistinguishable to an embedded caller.
+///
+/// The match is exhaustive with no wildcard arm: a new `QueryError` variant
+/// fails this build until someone decides what a caller should do about it.
+fn code_for_query_error(e: &QueryError) -> Code {
+    match e {
+        QueryError::Parse(_) => code::PARSE_ERROR,
+        QueryError::Timeout { .. } => code::TIMEOUT,
+        QueryError::Cancelled => code::CANCELLED,
+        QueryError::ReadonlyMode => code::READONLY_REFUSED,
+        QueryError::JoinLimitExceeded
+        | QueryError::NestedLoopPairLimitExceeded { .. }
+        | QueryError::SortLimitExceeded
+        | QueryError::MemoryLimitExceeded { .. } => code::SIZE_EXCEEDED,
+        QueryError::TableNotFound(_)
+        | QueryError::ColumnNotFound { .. }
+        | QueryError::TypeError(_)
+        | QueryError::IndexError(_)
+        | QueryError::ViewError(_)
+        | QueryError::Execution(_) => code::QUERY_FAILED,
+        QueryError::Storage { kind, .. } => code_for_storage_kind(*kind),
+        // A retry sentinel the facade intercepts, and a storage failure with no
+        // kind to classify on: neither is anything a caller can act on.
+        QueryError::ReadonlyNeedsWrite | QueryError::StorageError(_) => code::INTERNAL,
+    }
+}
+
+/// The code for a storage refusal, decided by its kind. Exhaustive for the same
+/// reason as `code_for_query_error`.
+fn code_for_storage_kind(kind: StorageErrorKind) -> Code {
+    match kind {
+        StorageErrorKind::UniqueConstraintViolation
+        | StorageErrorKind::UniqueExpressionIndexViolation => code::CONSTRAINT_VIOLATION,
+        StorageErrorKind::TransactionTooLarge
+        | StorageErrorKind::RowTooLarge
+        | StorageErrorKind::ValueTooLarge => code::SIZE_EXCEEDED,
+        StorageErrorKind::DdlInTransaction | StorageErrorKind::InvalidIdentifier => {
+            code::QUERY_FAILED
+        }
+        StorageErrorKind::Io
+        | StorageErrorKind::CorruptData
+        | StorageErrorKind::CorruptCrc
+        | StorageErrorKind::WalReplay
+        | StorageErrorKind::CatalogCorrupt
+        | StorageErrorKind::PageCorrupt
+        | StorageErrorKind::OverflowCorrupt => code::INTERNAL,
+    }
+}
+
 /// Map an embedded-engine error onto a JS error carrying its code. The match is
 /// exhaustive on purpose: a new `powdb::Error` variant fails this build rather
 /// than silently inheriting some other variant's code.
 fn to_napi_err(e: PowdbError) -> CodedError {
     let code = match &e {
         PowdbError::Open(_) => code::OPEN_FAILED,
-        PowdbError::Query(_) => code::QUERY_FAILED,
+        PowdbError::Query(query_error) => code_for_query_error(query_error),
         PowdbError::Poisoned => code::POISONED,
         PowdbError::OpenPanicked => code::OPEN_PANICKED,
         PowdbError::InvalidArgument(_) => code::INVALID_ARGUMENT,
@@ -102,6 +173,49 @@ fn internal(e: napi::Error) -> CodedError {
 fn open_registry() -> &'static Mutex<HashSet<PathBuf>> {
     static REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Refuse a data-dir path that cannot possibly work, with a message that says
+/// what is wrong. `Database.open("")` and `Database.open("/etc/hosts")` used to
+/// surface the raw OS error ("No such file or directory", "Not a directory"),
+/// which says nothing about what the argument was supposed to be.
+fn validate_data_dir(dir: &str) -> napi::Result<(), Code> {
+    if dir.trim().is_empty() {
+        return Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            "data directory path must not be empty",
+        ));
+    }
+    let path = Path::new(dir);
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_dir() => Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            format!("{dir} is not a directory; a PowDB data directory is a directory of its own"),
+        )),
+        // Absent is fine: open creates the directory.
+        _ => Ok(()),
+    }
+}
+
+/// Validate a byte budget arriving as a JS `number`.
+///
+/// It is taken as `f64` rather than `i64` on purpose: napi coerces `NaN` to
+/// `0` on the way to an integer, so `openWithMemoryLimit(NaN)` silently opened
+/// with a zero-byte budget instead of refusing the argument.
+fn memory_limit_bytes(limit_bytes: f64) -> napi::Result<usize, Code> {
+    if !limit_bytes.is_finite() || limit_bytes.fract() != 0.0 || limit_bytes < 0.0 {
+        return Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            format!("limitBytes must be a non-negative integer, got {limit_bytes}"),
+        ));
+    }
+    if limit_bytes > usize::MAX as f64 {
+        return Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            "limitBytes is larger than this platform can address",
+        ));
+    }
+    Ok(limit_bytes as usize)
 }
 
 /// Best-effort canonical key for a data dir that may not exist yet. Falls back
@@ -339,13 +453,20 @@ fn native_result_to_js<'env>(env: &'env Env, result: QueryResult) -> napi::Resul
 /// Map one JS parameter to a bindable engine [`Value`]. The positional
 /// parameter protocol carries only the five scalar shapes: JS `number`
 /// (integral values bind as `int`, otherwise `float`), `bigint` (`int`),
-/// `string` (`str`), `boolean` (`bool`), and `null`/`undefined` (PowQL
-/// `null`). Any other type (object, `Buffer`, symbol, function) is rejected
-/// with a clear error rather than silently coerced.
+/// `string` (`str`), `boolean` (`bool`), and `null` (PowQL `null`). Any other
+/// type -- `undefined`, object, `Buffer`, symbol, function -- is rejected with
+/// a clear error rather than silently coerced.
 fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value, Code> {
     let value_type = param.get_type().map_err(internal)?;
     match value_type {
-        ValueType::Null | ValueType::Undefined => Ok(Value::Empty),
+        ValueType::Null => Ok(Value::Empty),
+        // `undefined` used to bind as PowQL `null`, so a missing property or a
+        // hole in the array silently became a null column value instead of the
+        // mistake it almost always is. `null` still binds null.
+        ValueType::Undefined => Err(CodedError::new(
+            code::INVALID_ARGUMENT,
+            format!("parameter {} is undefined; pass null to bind a null", index + 1),
+        )),
         ValueType::Boolean => Ok(Value::Bool(unsafe { param.cast::<bool>() }.map_err(internal)?)),
         ValueType::String => Ok(Value::Str(unsafe { param.cast::<String>() }.map_err(internal)?)),
         ValueType::Number => {
@@ -528,6 +649,7 @@ impl Database {
     /// the same directory is already open elsewhere in this process.
     #[napi(factory)]
     pub fn open(dir: String) -> napi::Result<Database, Code> {
+        validate_data_dir(&dir)?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open(&dir) {
@@ -546,13 +668,9 @@ impl Database {
     /// budget in bytes (caps sort/join/GROUP BY materialization). Throws if the
     /// same directory is already open elsewhere in this process.
     #[napi(factory)]
-    pub fn open_with_memory_limit(dir: String, limit_bytes: i64) -> napi::Result<Database, Code> {
-        let limit = usize::try_from(limit_bytes).map_err(|_| {
-            CodedError::new(
-                code::INVALID_ARGUMENT,
-                "limit_bytes must be a non-negative integer",
-            )
-        })?;
+    pub fn open_with_memory_limit(dir: String, limit_bytes: f64) -> napi::Result<Database, Code> {
+        validate_data_dir(&dir)?;
+        let limit = memory_limit_bytes(limit_bytes)?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_with_memory_limit(&dir, limit) {
@@ -576,6 +694,7 @@ impl Database {
     /// first. Throws if the same directory is already open in this process.
     #[napi(factory)]
     pub fn open_read_only(dir: String) -> napi::Result<Database, Code> {
+        validate_data_dir(&dir)?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_read_only(&dir) {
@@ -595,14 +714,10 @@ impl Database {
     #[napi(factory)]
     pub fn open_read_only_with_memory_limit(
         dir: String,
-        limit_bytes: i64,
+        limit_bytes: f64,
     ) -> napi::Result<Database, Code> {
-        let limit = usize::try_from(limit_bytes).map_err(|_| {
-            CodedError::new(
-                code::INVALID_ARGUMENT,
-                "limit_bytes must be a non-negative integer",
-            )
-        })?;
+        validate_data_dir(&dir)?;
+        let limit = memory_limit_bytes(limit_bytes)?;
         let key = canonical_key(&dir);
         register_open(&key)?;
         match Inner::open_read_only_with_memory_limit(&dir, limit) {

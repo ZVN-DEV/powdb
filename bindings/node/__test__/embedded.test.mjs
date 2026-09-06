@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 // `napi build` emits index.js (a loader that picks the right platform .node).
-const { Database } = require("../index.js");
+const { Database } = require("../loader.js");
 
 function freshDir() {
   return mkdtempSync(join(tmpdir(), "powdb-embedded-test-"));
