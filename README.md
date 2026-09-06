@@ -340,7 +340,13 @@ materialized views before snapshotting.
 | `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener ([metric reference](https://github.com/ZVN-DEV/powdb/blob/main/docs/metrics.md)). **Unauthenticated**: bind it to localhost or a private network, never the public internet |
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
+| `POWDB_MAX_CONNECTIONS` | `1024` | Ceiling on concurrent connections. Same as `--max-connections` |
+| `POWDB_SHUTDOWN_TIMEOUT` | `30` | Seconds a graceful shutdown waits for connections to drain before exiting non-zero. Same as `--shutdown-timeout` |
+| `POWDB_PORT_FILE` | *(off)* | Path the server writes the bound listener ports to once it is listening, as `port=<n>` (plus `metrics=<n>` when the metrics endpoint is on). Written atomically before the ready log line, so a reader never sees a partial file. Pair it with `--port 0` to run a server on a free port in tests and scripts. Same as `--port-file` |
+| `NO_COLOR` | *(unset)* | When set, disables ANSI colour in the log. Colour is off automatically when stdout is not a terminal |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
+
+Every `POWDB_*` value above goes through the same validator as its command-line flag. A value that does not parse refuses startup and names the variable (`invalid value for POWDB_MAX_CONNECTIONS: "abc"`, exit 2); it is never silently defaulted.
 
 ### Production checklist
 

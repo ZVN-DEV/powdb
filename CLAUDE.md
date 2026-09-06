@@ -11,6 +11,9 @@ cargo bench -p powdb-bench         # criterion benchmarks (24 benches, 22 gated 
 ```
 
 Watch mode: `bacon` (or `cargo watch -x "check --workspace"`) for a recheck-on-save loop.
+The repo ships a `bacon.toml` defining the jobs worth having here: `check` (the default),
+`clippy` (all targets, `-D warnings`, spelled as ci.yml runs it), `test-query`,
+`test-storage`, `fmt` and `doc`. `bacon <job>` starts one by name.
 
 ## Architecture
 
@@ -97,6 +100,25 @@ cargo run -p powdb-bench --bin compare
 ./scripts/update-bench-baseline.sh
 ```
 
+The harness binaries read a few environment variables that exist nowhere else. Each one is
+also documented in the module doc comment at the top of the binary that reads it:
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `BENCH_N_ROWS` | `powdb-compare` | Fixture size for the SQLite comparison (default 100,000) |
+| `POWDB_JOIN_BENCH_SIZES` | `compound_join_scaling` | Comma-separated join cardinalities to sweep; required, the binary exits without it |
+| `POWDB_EXPR_INDEX_SIZES` | `expression_index_release_gate` | Comma-separated row counts to sweep; required |
+| `POWDB_EXPR_INDEX_OUTPUT` | `expression_index_release_gate` | Path the JSON report is written to |
+| `POWDB_HISTORICAL_LEGACY_ARTIFACT` | `phase0_read_baseline` | Path to the isolated pre-v0.13 JSON artifact to compare against; required |
+| `POWDB_HISTORICAL_BASELINE_LABEL` | `phase0_read_baseline` | Label recorded for that historical artifact |
+| `POWDB_BASELINE_RUN_LABEL` | `phase0_read_baseline` | Label recorded for this run (default `unlabeled`) |
+
+One more lives outside the bench crates: `POWDB_UPDATE_WIRE_VECTORS=1 cargo test -p powdb-server
+--test wire_conformance` regenerates the golden wire vectors instead of asserting against them.
+Regenerate deliberately: the vectors are the wire-compatibility gate.
+
+The server's own `POWDB_*` variables are documented in the README's environment-variable table.
+
 ## Common Patterns
 
 ### Adding a new PowQL keyword
@@ -105,7 +127,7 @@ cargo run -p powdb-bench --bin compare
 3. Add parser production to `crates/query/src/parser.rs`
 4. Add plan node (if needed) to `crates/query/src/plan.rs`
 5. Add planner case to `crates/query/src/planner.rs`
-6. Add executor case to `crates/query/src/executor/` (start in `mod.rs` / `plan_exec.rs`)
+6. Add executor case to `crates/query/src/executor/` (start in `mod.rs` / `plan_exec/dispatch.rs`; `plan_exec` is a module directory, not a file)
 
 ### Adding an executor fast path
 Fast paths match on specific `PlanNode` shapes in `execute_plan()`. Pattern-match the plan tree and handle it before the generic recursive executor. Always verify with benchmarks.

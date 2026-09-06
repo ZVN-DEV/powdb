@@ -71,6 +71,17 @@ an upgrade can turn a silently damaged directory into one that will not start.
 There is no salvage mode: restore from a backup. See
 [FORMAT.md](FORMAT.md#page-checksums).
 
+**A page that rots after the directory is open** is a separate case, and the open
+scan cannot help with it: that check is point-in-time, and reads run through an
+mmap, so the engine sees whatever a page holds at the moment it touches it.
+Up to and including 0.27.0, a row fetch whose page failed its checksum was
+reported as **no such row**, with a success status: an indexed point lookup on a
+rotted page answered zero rows, indistinguishable from a row that had been
+deleted. From 0.28.0 that path fails closed. A checksum refusal reaches the
+caller as a `PageCorrupt` error, and "no row" is reserved for a slot that really
+is deleted or out of range. Neither release repairs the page, and neither one
+promises to *notice* every kind of damage; restore from a backup.
+
 **Downgrade is not supported.** Once a lazy bump has fired, an older binary
 that does not know that version will refuse the directory with an
 `unsupported ... version` error. It fails loudly; it does not misread your data.

@@ -431,6 +431,32 @@ Use parentheses to override precedence:
 User filter (.a + .b) * .c > 0
 ```
 
+#### Integer division, overflow, and division by zero
+
+`int / int` divides and truncates toward zero (`5 / 2` is `2`, `-5 / 2` is `-2`).
+Mixing an `int` with a `float` produces a `float` (`5.0 / 2` is `2.5`).
+
+Integer arithmetic that leaves the `int64` range does **not** wrap and does not
+abort the query. `+`, `-` and `*` evaluate to `null` for that row:
+
+```
+# .x is 9223372036854775807
+User { v: .x + 1 }   # null
+User { v: .x * 2 }   # null
+```
+
+Two related cases differ deliberately:
+
+- **A literal zero divisor is refused before the query runs**, because it can
+  never be anything else: `cannot divide by zero: the divisor is the literal 0`.
+- **A zero divisor that comes from a column** is a per-row value, so it follows
+  the type: integer division by zero yields `null`, float division by zero
+  yields `inf`.
+
+`sum` is the exception to the quiet-null rule. Silently returning `null` from an
+aggregate reads as "no rows", so an integer total that leaves the `int64` range
+is a hard error instead: `cannot compute sum: the integer total overflows int64`.
+
 ### Logical Operators
 
 | Operator | Meaning |
