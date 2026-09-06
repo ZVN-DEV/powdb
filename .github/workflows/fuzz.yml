@@ -91,11 +91,23 @@ jobs:
           # this explicit input the action installs *stable* and every fuzz
           # build fails with "the option `Z` is only accepted on nightly".
           # Setting it explicitly keeps fuzz working across dependabot SHA bumps.
-          # Pinned 2026-07-24: nightly-2026-07-23 (89c61a754) ICEs in
-          # rustc_codegen_ssa while compiling tokio, killing every fuzz target
-          # at build time. nightly-2026-07-22 is the last known-good. Re-float
-          # to plain "nightly" once the upstream ICE is fixed.
-          toolchain: nightly-2026-07-22
+          #
+          # The pin is a DATED nightly rather than plain "nightly" on purpose: a
+          # campaign whose compiler changes under it cannot be compared run to
+          # run, and a floating nightly has already turned main red once when
+          # the rust-lang dist publish window opened mid-run. The
+          # `nightly-pin-freshness` job below fails as soon as this pin passes
+          # 45 days, so the pin cannot rot silently.
+          #
+          # Moved 2026-09-06. The previous pin (nightly-2026-07-22) hit 46 days
+          # and did exactly that: the 2026-09-06 nightly run failed on the
+          # freshness check. The reason for the old pin is gone -- the
+          # rustc_codegen_ssa ICE on tokio in nightly-2026-07-23 is six weeks
+          # behind us -- so this moves forward instead of re-floating.
+          # nightly-2026-09-01 is rustc 1.100.0-nightly (0dfb098f3) and builds
+          # all 11 fuzz targets under ASan. When this expires, move it forward
+          # again and restate the reason; do not raise MAX_PIN_AGE_DAYS.
+          toolchain: nightly-2026-09-01
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -132,7 +144,7 @@ jobs:
       # hashFiles() of it, deriving a key from a file the build ignored.
       - name: Verify the checked-in fuzz lockfile is current
         working-directory: crates/query/fuzz
-        run: cargo +nightly-2026-07-22 metadata --locked --format-version 1 > /dev/null
+        run: cargo +nightly-2026-09-01 metadata --locked --format-version 1 > /dev/null
 
       # `cargo fuzz` expects `<crate>/fuzz/Cargo.toml` relative to its cwd,
       # so we run from `crates/query` (the crate under test), not from
@@ -181,6 +193,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The selftest runs first, on a fixture: it proves this check still
+      # refuses a stale pin, still finds all three shapes a pin takes in these
+      # workflows (a `toolchain:` value, a `FUZZ_TOOLCHAIN` env value and a
+      # `cargo +nightly-...` invocation) and still ignores a date that appears
+      # only in a comment. Without it, a detector that quietly stopped matching
+      # would report "all floating OK" forever.
+      - name: Prove the freshness check can fail
+        run: bash scripts/ci/check-nightly-pin.sh --selftest
 
       - name: Fail if a pinned nightly has gone stale
         run: bash scripts/ci/check-nightly-pin.sh

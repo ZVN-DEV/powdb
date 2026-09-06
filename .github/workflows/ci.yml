@@ -601,10 +601,14 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          # Same pin as fuzz.yml, for the same reason (nightly-2026-07-23 ICEs
-          # in rustc_codegen_ssa on tokio). `nightly-pin-freshness` in fuzz.yml
-          # fails once this pin goes stale, so it cannot rot silently.
-          toolchain: nightly-2026-07-22
+          # Same pin as fuzz.yml, and it must stay the same: this job replays
+          # the corpus that fuzz.yml produced, so a different compiler here
+          # would replay those inputs against different code.
+          # `nightly-pin-freshness` in fuzz.yml fails once the pin goes stale,
+          # so it cannot rot silently. Moved 2026-09-06 with fuzz.yml; the
+          # reason for the old nightly-2026-07-22 pin (a tokio ICE in
+          # nightly-2026-07-23) no longer applies.
+          toolchain: nightly-2026-09-01
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -626,7 +630,7 @@ jobs:
 
       - name: Replay the checked-in corpus
         env:
-          FUZZ_TOOLCHAIN: nightly-2026-07-22
+          FUZZ_TOOLCHAIN: nightly-2026-09-01
         run: bash scripts/ci/fuzz-corpus-replay.sh
 
       - name: Upload crash artifacts on failure
