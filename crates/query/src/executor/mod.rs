@@ -261,7 +261,7 @@ use self::plan_exec::{
     cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
     literal_limit, predicate_column_indices_json, range_matches, synthesize_range_predicate,
-    validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
+    union_rows, validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
     validate_slice_counts, LoweredPlan,
 };
 
@@ -2573,29 +2573,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on right side".into()),
                 };
-                let mut combined = left_rows;
-                let mut cancel = crate::cancel::CancelCheck::new();
-                if *all {
-                    for row in right_rows {
-                        cancel.tick()?;
-                        combined.push(row);
-                    }
-                } else {
-                    let mut seen = std::collections::HashSet::new();
-                    for row in &combined {
-                        cancel.tick()?;
-                        seen.insert(row.clone());
-                    }
-                    for row in right_rows {
-                        cancel.tick()?;
-                        if seen.insert(row.clone()) {
-                            combined.push(row);
-                        }
-                    }
-                }
                 Ok(QueryResult::Rows {
                     columns: left_cols,
-                    rows: combined,
+                    rows: union_rows(left_rows, right_rows, *all)?,
                 })
             }
 

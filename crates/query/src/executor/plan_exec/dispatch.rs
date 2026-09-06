@@ -2188,32 +2188,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on right side".into()),
                 };
-                let mut combined = left_rows;
-                let mut cancel = CancelCheck::new();
-                if *all {
-                    // UNION ALL — just concatenate.
-                    for row in right_rows {
-                        cancel.tick()?;
-                        combined.push(row);
-                    }
-                } else {
-                    // UNION — deduplicate using the same HashSet approach
-                    // as DISTINCT. Value already implements Hash + Eq.
-                    let mut seen = std::collections::HashSet::new();
-                    for row in &combined {
-                        cancel.tick()?;
-                        seen.insert(row.clone());
-                    }
-                    for row in right_rows {
-                        cancel.tick()?;
-                        if seen.insert(row.clone()) {
-                            combined.push(row);
-                        }
-                    }
-                }
                 Ok(QueryResult::Rows {
                     columns: left_cols,
-                    rows: combined,
+                    rows: union_rows(left_rows, right_rows, *all)?,
                 })
             }
 

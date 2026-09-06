@@ -39,6 +39,39 @@ pub(super) fn literal_limit(count: &Expr) -> Option<usize> {
     }
 }
 
+/// Combine the two branches of a `union`.
+///
+/// Without `all` the result is a set, and a duplicate is dropped wherever it
+/// came from. Seeding the seen-set with the left branch and then testing only
+/// the right one against it kept every duplicate the left branch carried, so
+/// `T { .k } union T { .k }` answered x, x, y over rows x, x, y. Both dispatch
+/// arms carried their own copy of that loop, which is why they agreed on the
+/// wrong answer; they now share this one.
+pub(crate) fn union_rows(
+    left_rows: Vec<Vec<Value>>,
+    right_rows: Vec<Vec<Value>>,
+    all: bool,
+) -> Result<Vec<Vec<Value>>, QueryError> {
+    let mut cancel = CancelCheck::new();
+    if all {
+        let mut combined = left_rows;
+        for row in right_rows {
+            cancel.tick()?;
+            combined.push(row);
+        }
+        return Ok(combined);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut combined = Vec::with_capacity(left_rows.len() + right_rows.len());
+    for row in left_rows.into_iter().chain(right_rows) {
+        cancel.tick()?;
+        if seen.insert(row.clone()) {
+            combined.push(row);
+        }
+    }
+    Ok(combined)
+}
+
 /// Maximum number of elements sorted by the standard-library stable sort
 /// without an intervening cancellation checkpoint. Larger inputs are sorted
 /// as bounded stable runs and cooperatively merged below.
