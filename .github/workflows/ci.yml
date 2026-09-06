@@ -384,6 +384,14 @@ jobs:
       - name: Check release/version metadata
         run: bash scripts/check-version-consistency.sh
 
+      # Added as steps here rather than as a new job so `ci-success.needs` and
+      # CONTRIBUTING.md's job list stay in step; this job is the natural home
+      # for "the repo's hand-maintained lists still describe the repo".
+      - name: Prove the dependabot coverage check can fail
+        run: bash scripts/ci/check-dependabot-coverage.sh --selftest
+      - name: Every dependency manifest is watched by dependabot
+        run: bash scripts/ci/check-dependabot-coverage.sh
+
   ts-client:
     name: TypeScript client (build + tests)
     runs-on: ubuntu-24.04
