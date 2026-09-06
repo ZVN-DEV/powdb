@@ -72,7 +72,7 @@ async fn start_server(cfg: ServerConfig) -> std::net::SocketAddr {
                         engine,
                         tx_gate,
                         expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
+                        users: Arc::new(powdb_server::handler::UserDirectory::empty()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(30),
                         preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,

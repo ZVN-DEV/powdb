@@ -14,7 +14,6 @@ use crate::protocol::{
     CLIENT_CATALOG_VERSION, MAX_SUPPORTED_PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION,
     SERVER_FEATURES,
 };
-use powdb_auth::UserStore;
 use powdb_query::executor::{Engine, WalDurabilityTicket};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -24,7 +23,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 pub use self::auth::{
-    authenticate_connect, new_rate_limiter, AuthOutcome, AuthRateLimiter, Principal,
+    authenticate_connect, new_rate_limiter, AuthBucket, AuthOutcome, AuthPeer, AuthRateLimiter,
+    Principal, UserDirectory,
 };
 pub use self::transaction::{
     new_tx_gate, new_tx_gate_with_max_tx_lifetime, new_tx_gate_with_permits, TxGate,
@@ -32,7 +32,8 @@ pub use self::transaction::{
 };
 
 use self::auth::{
-    check_db_name, clear_auth_failures, is_rate_limited, record_auth_failure, DEFAULT_DB_NAME,
+    auth_retry_after_secs, check_db_name, clear_auth_failures, is_rate_limited,
+    record_auth_failure, DEFAULT_DB_NAME,
 };
 use self::classify::error_response;
 use self::query::{
@@ -95,7 +96,7 @@ pub struct ConnOpts<'a> {
     /// Multi-user store loaded from the data dir at startup. When it has users,
     /// the handshake authenticates `(username, password)` against it; when empty
     /// the server falls back to `expected_password`. Shared across connections.
-    pub users: Arc<UserStore>,
+    pub users: Arc<UserDirectory>,
     pub shutdown_rx: &'a mut watch::Receiver<bool>,
     pub idle_timeout: Duration,
     /// Ceiling on the whole pre-auth phase (see [`DEFAULT_PREAUTH_DEADLINE`]).
@@ -163,7 +164,7 @@ async fn serve_connection<R, W>(
     let peer = peer_addr
         .map(|a| a.to_string())
         .unwrap_or_else(|| "unknown".into());
-    let peer_ip = peer_addr.map(|a| a.ip());
+    let auth_peer = AuthPeer::of(peer_addr);
 
     // Wait for Connect message (with idle timeout).
     // Accept Ping messages before authentication so load balancers can
@@ -234,6 +235,9 @@ async fn serve_connection<R, W>(
     // The authenticated identity for this connection. Bound at connect time
     // and enforced on every query by `dispatch_query`.
     let principal: Option<Principal>;
+    // One snapshot of `auth.json` for this handshake, re-read first if the
+    // file changed since the last connection looked.
+    let users = users.current();
     let credential_auth_configured = !users.is_empty() || expected_password.is_some();
     match connect_msg {
         Message::Connect {
@@ -242,11 +246,14 @@ async fn serve_connection<R, W>(
             username,
         } => {
             // Check rate limiting before verifying credentials.
-            if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                if is_rate_limited(limiter, ip) {
+            if let Some(limiter) = rate_limiter {
+                if is_rate_limited(limiter, &auth_peer, username.as_deref()) {
                     warn!(peer = %peer, "rate limited: too many auth failures");
                     let err = error_response(
-                        "too many auth failures, try again later",
+                        format!(
+                            "too many auth failures, retry after {}s",
+                            auth_retry_after_secs()
+                        ),
                         ErrorClass::RateLimited,
                     );
                     write_msg(writer, &err).await;
@@ -266,8 +273,8 @@ async fn serve_connection<R, W>(
                     warn!(peer = %peer, db = %db_name, "auth rejected");
                     metrics.inc_auth_failure();
                     // Record the failure for rate limiting.
-                    if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                        record_auth_failure(limiter, ip);
+                    if let Some(limiter) = rate_limiter {
+                        record_auth_failure(limiter, &auth_peer, username.as_deref());
                     }
                     let err = error_response("authentication failed", ErrorClass::AuthFailed);
                     write_msg(writer, &err).await;
@@ -277,8 +284,8 @@ async fn serve_connection<R, W>(
                     principal: auth_principal,
                 } => {
                     // Auth succeeded — clear any prior failure count.
-                    if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                        clear_auth_failures(limiter, ip);
+                    if let Some(limiter) = rate_limiter {
+                        clear_auth_failures(limiter, &auth_peer, username.as_deref());
                     }
                     match &auth_principal {
                         Some(p) => {

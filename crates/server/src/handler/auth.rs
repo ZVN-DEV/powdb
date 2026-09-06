@@ -7,55 +7,230 @@ use powdb_query::executor::is_read_only_statement;
 use powdb_query::result::QueryError;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use tracing::{info, warn};
 
-/// Tracks per-IP authentication failure counts for rate limiting.
-pub type AuthRateLimiter = Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>;
+/// What the handshake authenticates against, kept in step with `auth.json`.
+///
+/// `powdb-cli useradd` / `passwd` / `userdel` write that file directly. The
+/// server used to load it once at startup, so against a running server a
+/// rotated password kept working and a deleted user kept logging in until
+/// somebody restarted the process, with nothing anywhere saying so. The file
+/// is re-read when its length or modification time changes, checked once per
+/// authentication attempt (which the per-peer failure limiter already bounds)
+/// and on SIGHUP.
+pub struct UserDirectory {
+    /// The data directory `auth.json` lives in. `None` for a store that is
+    /// handed over directly and never reloads (tests, embedded callers).
+    data_dir: Option<PathBuf>,
+    state: Mutex<DirectoryState>,
+}
 
-/// Maximum number of auth failures per IP within the rate-limit window.
+struct DirectoryState {
+    users: Arc<UserStore>,
+    stamp: Option<FileStamp>,
+}
+
+/// What "the file changed" means here: a different length or a different
+/// modification time. Cheap enough to check on every authentication attempt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<FileStamp> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(FileStamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+impl UserDirectory {
+    /// Load `dir/auth.json` and watch it for later changes.
+    pub fn load(dir: &Path) -> std::io::Result<Self> {
+        let users = UserStore::load(dir)?;
+        Ok(UserDirectory {
+            data_dir: Some(dir.to_path_buf()),
+            state: Mutex::new(DirectoryState {
+                users: Arc::new(users),
+                stamp: FileStamp::of(&dir.join("auth.json")),
+            }),
+        })
+    }
+
+    /// A directory that serves exactly this store and never reloads.
+    pub fn fixed(users: UserStore) -> Self {
+        UserDirectory {
+            data_dir: None,
+            state: Mutex::new(DirectoryState {
+                users: Arc::new(users),
+                stamp: None,
+            }),
+        }
+    }
+
+    /// An empty non-reloading directory: no named users, so the handshake
+    /// falls back to the shared-password (or open) path.
+    pub fn empty() -> Self {
+        Self::fixed(UserStore::new())
+    }
+
+    /// The users to authenticate against right now, re-reading `auth.json`
+    /// first if it changed since the last look.
+    pub fn current(&self) -> Arc<UserStore> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dir) = self.data_dir.as_ref() else {
+            return Arc::clone(&state.users);
+        };
+        let stamp = FileStamp::of(&dir.join("auth.json"));
+        if stamp == state.stamp {
+            return Arc::clone(&state.users);
+        }
+        match UserStore::load(dir) {
+            Ok(users) => {
+                info!(users = users.len(), "reloaded auth.json");
+                state.users = Arc::new(users);
+                state.stamp = stamp;
+            }
+            Err(e) => {
+                // Keep serving the store we have: a half-written file must not
+                // lock every user out. The stamp is left alone so the next
+                // attempt retries.
+                warn!(error = %e, "auth.json changed but could not be re-read; keeping the loaded users");
+            }
+        }
+        Arc::clone(&state.users)
+    }
+
+    /// Re-read `auth.json` unconditionally, returning the user count.
+    pub fn reload(&self) -> std::io::Result<usize> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dir) = self.data_dir.as_ref() else {
+            return Ok(state.users.len());
+        };
+        let users = UserStore::load(dir)?;
+        let count = users.len();
+        state.users = Arc::new(users);
+        state.stamp = FileStamp::of(&dir.join("auth.json"));
+        Ok(count)
+    }
+}
+
+/// Who a failed authentication attempt is counted against.
+///
+/// The bucket is keyed by (peer, username) with the peer alone kept as an
+/// outer bound at a higher threshold. Keying by peer alone meant five wrong
+/// guesses at ANY username locked the legitimate user out of that address for
+/// a minute, which is a denial of service a single bad script can cause; and a
+/// Unix-socket peer has no address at all, so it was never throttled.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AuthBucket {
+    /// One username as attempted from one peer.
+    PeerUser {
+        peer: AuthPeer,
+        user: Option<String>,
+    },
+    /// Everything that peer attempts, whatever username it names.
+    Peer(AuthPeer),
+}
+
+/// The peer half of a bucket key. A Unix-socket peer has no address, so every
+/// local connection shares one bucket rather than none.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AuthPeer {
+    Ip(IpAddr),
+    /// Any connection over the Unix domain socket.
+    UnixSocket,
+}
+
+impl AuthPeer {
+    /// The peer key for a connection, whether or not it has an address.
+    pub(super) fn of(peer_addr: Option<std::net::SocketAddr>) -> AuthPeer {
+        match peer_addr {
+            Some(addr) => AuthPeer::Ip(addr.ip()),
+            None => AuthPeer::UnixSocket,
+        }
+    }
+}
+
+/// Tracks authentication failure counts per bucket.
+pub type AuthRateLimiter = Arc<Mutex<HashMap<AuthBucket, (u32, Instant)>>>;
+
+/// Failures at ONE username from one peer before that pair is locked out.
 const MAX_AUTH_FAILURES: u32 = 5;
+
+/// Failures across ALL usernames from one peer before the whole peer is locked
+/// out. Higher than the per-user threshold on purpose: it exists to bound a
+/// sweep across many usernames, not to let one wrong username lock out
+/// another.
+const MAX_PEER_AUTH_FAILURES: u32 = 50;
 
 /// Window during which auth failures are counted (60 seconds).
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long a locked-out peer or user must wait, for the client-facing
+/// message. The window is fixed, so this is the whole of it.
+pub(super) fn auth_retry_after_secs() -> u64 {
+    AUTH_FAILURE_WINDOW.as_secs()
+}
 
 /// Create a new shared rate limiter.
 pub fn new_rate_limiter() -> AuthRateLimiter {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Check whether an IP is rate-limited and record a failure if requested.
-/// Returns `true` if the IP should be rejected.
-pub(super) fn is_rate_limited(limiter: &AuthRateLimiter, ip: IpAddr) -> bool {
+/// Whether this (peer, user) pair, or the peer as a whole, has failed too many
+/// times inside the window.
+pub(super) fn is_rate_limited(
+    limiter: &AuthRateLimiter,
+    peer: &AuthPeer,
+    user: Option<&str>,
+) -> bool {
     let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
     // Clean up stale entries while we have the lock.
     let now = Instant::now();
     map.retain(|_, (_, ts)| now.duration_since(*ts) < AUTH_FAILURE_WINDOW);
 
-    if let Some((count, _)) = map.get(&ip) {
-        *count >= MAX_AUTH_FAILURES
-    } else {
-        false
+    let over =
+        |key: &AuthBucket, limit: u32| map.get(key).is_some_and(|(count, _)| *count >= limit);
+    over(&pair_bucket(peer, user), MAX_AUTH_FAILURES)
+        || over(&AuthBucket::Peer(peer.clone()), MAX_PEER_AUTH_FAILURES)
+}
+
+fn pair_bucket(peer: &AuthPeer, user: Option<&str>) -> AuthBucket {
+    AuthBucket::PeerUser {
+        peer: peer.clone(),
+        user: user.map(str::to_string),
     }
 }
 
-/// Record an auth failure for the given IP.
-pub(super) fn record_auth_failure(limiter: &AuthRateLimiter, ip: IpAddr) {
+/// Record an auth failure against both the pair and the peer bucket.
+pub(super) fn record_auth_failure(limiter: &AuthRateLimiter, peer: &AuthPeer, user: Option<&str>) {
     let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    let entry = map.entry(ip).or_insert((0, now));
-    // Reset counter if the window has elapsed.
-    if now.duration_since(entry.1) >= AUTH_FAILURE_WINDOW {
-        *entry = (1, now);
-    } else {
-        entry.0 += 1;
+    for key in [pair_bucket(peer, user), AuthBucket::Peer(peer.clone())] {
+        let entry = map.entry(key).or_insert((0, now));
+        // Reset counter if the window has elapsed.
+        if now.duration_since(entry.1) >= AUTH_FAILURE_WINDOW {
+            *entry = (1, now);
+        } else {
+            entry.0 += 1;
+        }
     }
 }
 
-/// Clear the failure counter on successful auth.
-pub(super) fn clear_auth_failures(limiter: &AuthRateLimiter, ip: IpAddr) {
+/// Clear the failure counters a successful authentication settles: this pair,
+/// and the peer bound it contributed to.
+pub(super) fn clear_auth_failures(limiter: &AuthRateLimiter, peer: &AuthPeer, user: Option<&str>) {
     let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&ip);
+    map.remove(&pair_bucket(peer, user));
+    map.remove(&AuthBucket::Peer(peer.clone()));
 }
 
 /// Constant-time password comparison. Hashes both inputs to fixed-size

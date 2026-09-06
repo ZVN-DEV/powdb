@@ -11,8 +11,30 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
-/// Maximum number of concurrent connections.
-const MAX_CONNECTIONS: usize = 1024;
+/// Default ceiling on concurrent connections, overridable with
+/// `--max-connections` / `POWDB_MAX_CONNECTIONS`.
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+
+/// Whether the log should carry ANSI colour: only when stdout is a terminal
+/// and `NO_COLOR` is unset.
+fn use_ansi() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// Mode the Unix-domain-socket file is created with: owner and group only.
+/// The default umask leaves it 0755, so any local user could connect to a
+/// server whose data directory is 0700.
+#[cfg(unix)]
+const UNIX_SOCKET_MODE: u32 = 0o660;
+
+/// Default seconds a graceful shutdown waits for in-flight connections to
+/// drain. Past it the process stops waiting and exits non-zero rather than
+/// hanging forever, which is what an orchestrator's own kill timer would
+/// otherwise have to resolve.
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Hard deadline for the TLS handshake. A connection permit is held from the
 /// moment the socket is accepted, so a peer that connects over TLS and then
@@ -69,6 +91,13 @@ struct Args {
     /// statements return a terminal error. Set via `--readonly` or
     /// `POWDB_READONLY=1`.
     read_only: bool,
+    /// Ceiling on concurrent connections; a peer past it waits for a slot.
+    max_connections: usize,
+    /// How long a graceful shutdown waits for in-flight connections to drain
+    /// before cancelling them and exiting non-zero.
+    shutdown_timeout_secs: u64,
+    /// WAL durability mode, validated at startup.
+    sync_mode: WalSyncMode,
 }
 
 /// Default explicit-transaction gate wait (ms) when `POWDB_TX_WAIT_TIMEOUT_MS`
@@ -92,74 +121,123 @@ fn archive_wal_records_if_sync_enabled(
     }
 }
 
-/// Parse the per-query memory limit from the `POWDB_QUERY_MEMORY_LIMIT`
-/// environment value. Accepts a plain byte count; falls back to the default
-/// when unset, empty, or unparseable. Pulled out as a free function so it can
-/// be unit-tested without spawning the server.
-fn parse_query_memory_limit(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT)
+/// A configuration value that was set but is not usable, phrased identically
+/// whether it arrived as a flag or as an environment variable.
+///
+/// The two paths used to disagree: `--port abc` was refused, `POWDB_PORT=abc`
+/// silently bound 5433. Eight variables behaved that way, so a typo in a
+/// deployment's environment produced a server running on settings nobody
+/// chose, with nothing in the log to say so.
+fn invalid_setting(source: &str, value: &str, expected: &str) -> String {
+    format!("invalid value for {source}: {value:?}; expected {expected}")
 }
 
-/// Parse the `POWDB_TX_MAX_LIFETIME_MS` environment value: the ceiling on how
-/// long one connection may hold the transaction gate inside an explicit
-/// transaction before the server rolls that transaction back. An explicit `0`
+/// Refuse to start, naming the setting and the value.
+fn refuse_setting(source: &str, value: &str, expected: &str) -> ! {
+    eprintln!("{}", invalid_setting(source, value, expected));
+    std::process::exit(2);
+}
+
+/// Read an environment variable through the same validator its flag uses.
+///
+/// Unset or blank means "not configured" and keeps the default. Anything else
+/// must parse: a value that does not is a refusal to start, never a silent
+/// fallback.
+fn env_setting<T>(name: &str, parse: impl Fn(&str) -> Result<T, String>) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match parse(&raw) {
+        Ok(value) => Some(value),
+        Err(expected) => refuse_setting(name, &raw, &expected),
+    }
+}
+
+/// Read a command-line flag through the same validator its variable uses.
+fn flag_setting<T>(flag: &str, raw: &str, parse: impl Fn(&str) -> Result<T, String>) -> T {
+    match parse(raw) {
+        Ok(value) => value,
+        Err(expected) => refuse_setting(flag, raw, &expected),
+    }
+}
+
+/// A TCP port. `0` is legal and means "let the OS choose".
+fn parse_port(raw: &str) -> Result<u16, String> {
+    raw.trim()
+        .parse::<u16>()
+        .map_err(|_| "a port number between 0 and 65535".to_string())
+}
+
+/// A timeout in whole seconds. Zero is refused rather than treated as
+/// "disabled": a zero budget expires immediately, so it would close every
+/// connection (or cancel every query) the moment it was armed.
+fn parse_timeout_secs(raw: &str) -> Result<u64, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(0) => Err(
+            "a whole number of seconds greater than 0 (0 is not a way to disable the timeout)"
+                .to_string(),
+        ),
+        Ok(secs) => Ok(secs),
+        Err(_) => Err("a whole number of seconds greater than 0".to_string()),
+    }
+}
+
+/// A wait budget in milliseconds. Zero is refused for the same reason.
+fn parse_wait_ms(raw: &str) -> Result<u64, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(0) => Err("a whole number of milliseconds greater than 0".to_string()),
+        Ok(ms) => Ok(ms),
+        Err(_) => Err("a whole number of milliseconds greater than 0".to_string()),
+    }
+}
+
+/// The `POWDB_TX_MAX_LIFETIME_MS` ceiling on how long one connection may hold
+/// the transaction gate inside an explicit transaction. An explicit `0`
 /// disables the bound and restores the pre-0.22 behavior where the client
-/// chose the hold duration; unset, empty, or unparseable keeps the default
-/// (`handler::DEFAULT_TX_MAX_LIFETIME`). Pulled out as a free function so it
-/// can be unit-tested without spawning the server, mirroring
-/// [`parse_query_memory_limit`].
-fn parse_tx_max_lifetime(raw: Option<&str>) -> Option<std::time::Duration> {
-    match raw.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(value) => match value.parse::<u64>() {
-            Ok(0) => None,
-            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
-            Err(_) => Some(handler::DEFAULT_TX_MAX_LIFETIME),
-        },
-        None => Some(handler::DEFAULT_TX_MAX_LIFETIME),
+/// chose the hold duration.
+fn parse_tx_max_lifetime(raw: &str) -> Result<Option<std::time::Duration>, String> {
+    match raw.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(ms) => Ok(Some(std::time::Duration::from_millis(ms))),
+        Err(_) => Err("a whole number of milliseconds, or 0 to disable the bound".to_string()),
     }
 }
 
-/// Parse the `POWDB_MAX_NESTED_LOOP_PAIRS` environment value. Accepts a plain
-/// positive candidate-pair count; `None` (unset, empty, unparseable, or zero)
-/// leaves the engine default (`MAX_NESTED_LOOP_PAIRS`) in place. Pulled out as
-/// a free function so it can be unit-tested without spawning the server,
-/// mirroring [`parse_query_memory_limit`].
-fn parse_nested_loop_pair_limit(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+/// A byte or item count budget. Plain digits only: a suffixed value like
+/// `64MiB` used to be discarded in silence, leaving the default in force.
+fn parse_positive_count(raw: &str) -> Result<usize, String> {
+    match raw.trim().parse::<usize>() {
+        Ok(0) => Err(
+            "a whole number greater than 0 (unset the variable to keep the default)".to_string(),
+        ),
+        Ok(n) => Ok(n),
+        Err(_) => Err("a plain whole number of bytes with no unit suffix".to_string()),
+    }
 }
 
-/// Parse the `POWDB_DIRTY_PAGE_BUDGET` environment value. Accepts a plain
-/// positive byte count for the ceiling on unflushed heap pages held across
-/// every table; `None` (unset, empty, unparseable, or zero) leaves the storage
-/// default (`DEFAULT_DIRTY_PAGE_BUDGET`, 256 MiB) in place. Mirrors
-/// [`parse_nested_loop_pair_limit`].
-fn parse_dirty_page_budget(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-}
-
-/// Parse `POWDB_SYNC_MODE` (`full` | `normal` | `off`). Defaults to `Full` —
-/// the safe, fully-durable mode — on unset/empty/unknown. `normal` trades a
-/// bounded crash-loss window (OS-crash/power-loss only) for ~15–40× faster
+/// Parse `POWDB_SYNC_MODE` (`full` | `normal` | `off`). `normal` trades a
+/// bounded crash-loss window (OS-crash/power-loss only) for much faster
 /// writes; `off` disables durability entirely and is bench-only.
-fn parse_sync_mode(raw: Option<&str>) -> WalSyncMode {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("normal") => WalSyncMode::Normal,
-        Some("off") => WalSyncMode::Off,
-        _ => WalSyncMode::Full,
+fn parse_sync_mode(raw: &str) -> Result<WalSyncMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" => Ok(WalSyncMode::Full),
+        "normal" => Ok(WalSyncMode::Normal),
+        "off" => Ok(WalSyncMode::Off),
+        _ => Err("one of full, normal, off".to_string()),
     }
 }
 
-/// Parse the `POWDB_REQUIRE_TLS` env value. Truthy on `1`/`true` (any case);
-/// default off (false) for backward compatibility.
-fn parse_require_tls(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+/// A boolean setting. Both spellings are accepted so a deployment can turn a
+/// switch off explicitly; a value that is neither is refused rather than read
+/// as false, which is how `POWDB_READONLY=ture` used to serve a writable
+/// database.
+fn parse_bool_setting(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err("one of 1, true, yes, on, 0, false, no, off".to_string()),
+    }
 }
 
 /// Enforce the TLS requirement at startup. When `require_tls` is set, a server
@@ -183,10 +261,7 @@ fn check_tls_requirement(
 
 fn parse_args() -> Args {
     // Defaults from env vars (preserve old behavior), then overridden by CLI flags.
-    let mut port: u16 = std::env::var("POWDB_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5433);
+    let mut port: u16 = env_setting("POWDB_PORT", parse_port).unwrap_or(5433);
     let mut bind: String = std::env::var("POWDB_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let mut data_dir: String =
         std::env::var("POWDB_DATA").unwrap_or_else(|_| "./powdb_data".into());
@@ -196,23 +271,20 @@ fn parse_args() -> Args {
         .ok()
         .filter(|s| !s.is_empty())
         .map(Zeroizing::new);
-    let mut idle_timeout_secs: u64 = std::env::var("POWDB_IDLE_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300); // 5 min default
-    let mut query_timeout_secs: u64 = std::env::var("POWDB_QUERY_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30); // 30s default
-    let mut tx_wait_timeout_ms: u64 = std::env::var("POWDB_TX_WAIT_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
+    let mut idle_timeout_secs: u64 =
+        env_setting("POWDB_IDLE_TIMEOUT", parse_timeout_secs).unwrap_or(300); // 5 min default
+    let mut query_timeout_secs: u64 =
+        env_setting("POWDB_QUERY_TIMEOUT", parse_timeout_secs).unwrap_or(30); // 30s default
+    let mut tx_wait_timeout_ms: u64 = env_setting("POWDB_TX_WAIT_TIMEOUT_MS", parse_wait_ms)
         .unwrap_or(DEFAULT_TX_WAIT_TIMEOUT_MS);
     // Maximum explicit-transaction lifetime; env-only (no CLI flag), like the
-    // other budgets.
-    let tx_max_lifetime =
-        parse_tx_max_lifetime(std::env::var("POWDB_TX_MAX_LIFETIME_MS").ok().as_deref());
+    // other budgets. Unset keeps the default; an explicit 0 disables it.
+    let tx_max_lifetime = env_setting("POWDB_TX_MAX_LIFETIME_MS", parse_tx_max_lifetime)
+        .unwrap_or(Some(handler::DEFAULT_TX_MAX_LIFETIME));
+    let mut max_connections: usize = env_setting("POWDB_MAX_CONNECTIONS", parse_positive_count)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    let mut shutdown_timeout_secs: u64 = env_setting("POWDB_SHUTDOWN_TIMEOUT", parse_timeout_secs)
+        .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
     let mut db_name: Option<String> = std::env::var("POWDB_DB_NAME")
         .ok()
         .filter(|s| !s.is_empty());
@@ -233,18 +305,19 @@ fn parse_args() -> Args {
         .ok()
         .filter(|s| !s.is_empty());
     // Per-query memory budget; env-only (no CLI flag).
-    let query_memory_limit =
-        parse_query_memory_limit(std::env::var("POWDB_QUERY_MEMORY_LIMIT").ok().as_deref());
+    let query_memory_limit = env_setting("POWDB_QUERY_MEMORY_LIMIT", parse_positive_count)
+        .unwrap_or(DEFAULT_QUERY_MEMORY_LIMIT);
     // Fallback nested-loop join candidate-pair cap; env-only (no CLI flag).
-    let nested_loop_pair_limit =
-        parse_nested_loop_pair_limit(std::env::var("POWDB_MAX_NESTED_LOOP_PAIRS").ok().as_deref());
+    let nested_loop_pair_limit = env_setting("POWDB_MAX_NESTED_LOOP_PAIRS", parse_positive_count);
     // Dirty-page (unflushed heap page) budget; env-only (no CLI flag).
-    let dirty_page_budget =
-        parse_dirty_page_budget(std::env::var("POWDB_DIRTY_PAGE_BUDGET").ok().as_deref());
+    let dirty_page_budget = env_setting("POWDB_DIRTY_PAGE_BUDGET", parse_positive_count);
     // When set, refuse to start with a password but no TLS. Default off.
-    let require_tls = parse_require_tls(std::env::var("POWDB_REQUIRE_TLS").ok().as_deref());
-    // `POWDB_READONLY` reuses the same truthy grammar as `POWDB_REQUIRE_TLS`.
-    let mut read_only = parse_require_tls(std::env::var("POWDB_READONLY").ok().as_deref());
+    let require_tls = env_setting("POWDB_REQUIRE_TLS", parse_bool_setting).unwrap_or(false);
+    // `POWDB_READONLY` reuses the same boolean grammar as `POWDB_REQUIRE_TLS`.
+    let mut read_only = env_setting("POWDB_READONLY", parse_bool_setting).unwrap_or(false);
+    // WAL durability mode; env-only. Validated here so a typo refuses startup
+    // rather than silently serving a different durability contract.
+    let sync_mode = env_setting("POWDB_SYNC_MODE", parse_sync_mode).unwrap_or(WalSyncMode::Full);
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -256,10 +329,7 @@ fn parse_args() -> Args {
                     eprintln!("--port requires a value");
                     std::process::exit(2);
                 }
-                port = argv[i].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid port: {}", argv[i]);
-                    std::process::exit(2);
-                });
+                port = flag_setting("--port", &argv[i], parse_port);
             }
             "--data-dir" | "-d" => {
                 i += 1;
@@ -283,10 +353,7 @@ fn parse_args() -> Args {
                     eprintln!("--idle-timeout requires a value");
                     std::process::exit(2);
                 }
-                idle_timeout_secs = argv[i].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid timeout: {}", argv[i]);
-                    std::process::exit(2);
-                });
+                idle_timeout_secs = flag_setting("--idle-timeout", &argv[i], parse_timeout_secs);
             }
             "--query-timeout" => {
                 i += 1;
@@ -294,10 +361,7 @@ fn parse_args() -> Args {
                     eprintln!("--query-timeout requires a value");
                     std::process::exit(2);
                 }
-                query_timeout_secs = argv[i].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid timeout: {}", argv[i]);
-                    std::process::exit(2);
-                });
+                query_timeout_secs = flag_setting("--query-timeout", &argv[i], parse_timeout_secs);
             }
             "--tx-wait-timeout-ms" => {
                 i += 1;
@@ -305,14 +369,7 @@ fn parse_args() -> Args {
                     eprintln!("--tx-wait-timeout-ms requires a value");
                     std::process::exit(2);
                 }
-                tx_wait_timeout_ms = argv[i].parse().unwrap_or_else(|_| {
-                    eprintln!("invalid tx-wait-timeout-ms: {}", argv[i]);
-                    std::process::exit(2);
-                });
-                if tx_wait_timeout_ms == 0 {
-                    eprintln!("--tx-wait-timeout-ms must be greater than 0");
-                    std::process::exit(2);
-                }
+                tx_wait_timeout_ms = flag_setting("--tx-wait-timeout-ms", &argv[i], parse_wait_ms);
             }
             "--db-name" => {
                 i += 1;
@@ -362,6 +419,23 @@ fn parse_args() -> Args {
                 }
                 port_file = Some(argv[i].clone());
             }
+            "--max-connections" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--max-connections requires a value");
+                    std::process::exit(2);
+                }
+                max_connections = flag_setting("--max-connections", &argv[i], parse_positive_count);
+            }
+            "--shutdown-timeout" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--shutdown-timeout requires a value");
+                    std::process::exit(2);
+                }
+                shutdown_timeout_secs =
+                    flag_setting("--shutdown-timeout", &argv[i], parse_timeout_secs);
+            }
             "--readonly" => {
                 read_only = true;
             }
@@ -382,14 +456,16 @@ fn parse_args() -> Args {
                 println!("    -d, --data-dir <PATH>      Data directory (default: ./powdb_data)");
                 println!("        --tls-cert <PATH>      TLS certificate file (PEM)");
                 println!("        --tls-key <PATH>       TLS private key file (PEM)");
-                println!("        --idle-timeout <SECS>  Idle connection timeout (default: 300)");
+                println!("        --idle-timeout <SECS>  Idle connection timeout, must be > 0 (default: 300)");
                 println!(
-                    "        --query-timeout <SECS> Per-query timeout threshold metric (default: 30)"
+                    "        --query-timeout <SECS> Per-query deadline, must be > 0 (default: 30)"
                 );
                 println!("        --tx-wait-timeout-ms <MS>  Max wait for a concurrent explicit transaction before BEGIN fails (default: 5000)");
                 println!("        --db-name <NAME>       Reject a CONNECT that explicitly names a different database (default: accept any)");
                 println!("        --metrics-addr <ADDR>  Serve Prometheus /metrics on host:port (off by default)");
                 println!("        --port-file <PATH>     Write the bound listener ports to PATH after startup (use with --port 0)");
+                println!("        --max-connections <N>  Ceiling on concurrent connections (default: 1024)");
+                println!("        --shutdown-timeout <SECS>  Seconds a graceful shutdown waits for connections to drain before exiting non-zero (default: 30)");
                 println!("        --readonly             Serve the data directory read-only (snapshot serving; mutations are refused)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
@@ -397,6 +473,10 @@ fn parse_args() -> Args {
                 println!("ENVIRONMENT:");
                 println!("    POWDB_PORT, POWDB_BIND, POWDB_DATA");
                 println!("    POWDB_PASSWORD             Set password for client authentication");
+                println!("    POWDB_ADMIN_USER           Create this user with role admin at startup if absent (needs POWDB_ADMIN_PASSWORD)");
+                println!(
+                    "    POWDB_ADMIN_PASSWORD       Password for POWDB_ADMIN_USER; never logged"
+                );
                 println!("    POWDB_TLS_CERT, POWDB_TLS_KEY");
                 println!("    POWDB_REQUIRE_TLS          Refuse to start with a password but no TLS (default: off)");
                 println!("    POWDB_IDLE_TIMEOUT, POWDB_QUERY_TIMEOUT");
@@ -411,7 +491,16 @@ fn parse_args() -> Args {
                 println!("    POWDB_PORT_FILE            Write the bound listener ports here after startup (use with --port 0)");
                 println!("    POWDB_SYNC_MODE            WAL durability: full (default) | normal (bounded-loss, ~15-40x faster) | off (bench-only)");
                 println!("    POWDB_READONLY             Serve read-only (snapshot serving) when truthy (1/true/yes/on)");
+                println!("    POWDB_MAX_CONNECTIONS      Ceiling on concurrent connections (default: 1024)");
+                println!("    POWDB_SHUTDOWN_TIMEOUT     Seconds a graceful shutdown waits for connections to drain (default: 30)");
+                println!("    NO_COLOR                   Disable ANSI colour in the log (also off automatically when stdout is not a terminal)");
                 println!("    RUST_LOG=info|debug|trace  (defaults to info)");
+                println!();
+                println!("NOTES:");
+                println!("    Every POWDB_* value above goes through the same validator as its flag: a value that");
+                println!("    does not parse refuses startup naming the variable, it is never silently defaulted.");
+                println!("    0 is not a way to disable --idle-timeout or --query-timeout; both are refused.");
+                println!("    SIGHUP reloads auth.json; SIGINT/SIGTERM drain and checkpoint.");
                 std::process::exit(0);
             }
             other => {
@@ -443,6 +532,9 @@ fn parse_args() -> Args {
         socket,
         db_name,
         read_only,
+        max_connections,
+        shutdown_timeout_secs,
+        sync_mode,
     }
 }
 
@@ -456,7 +548,7 @@ async fn run_connection<S>(
     engine: Arc<RwLock<Engine>>,
     tx_gate: handler::TxGate,
     expected_password: Option<Zeroizing<String>>,
-    users: Arc<powdb_auth::UserStore>,
+    users: Arc<handler::UserDirectory>,
     mut shutdown_rx: watch::Receiver<bool>,
     idle_timeout: std::time::Duration,
     query_timeout: std::time::Duration,
@@ -561,34 +653,63 @@ where
     }
 }
 
-/// Resolve when the process receives a termination signal: SIGINT (Ctrl-C) or,
-/// on Unix, SIGTERM — the signal Docker (`docker stop`), Kubernetes (pod
-/// termination), and systemd send on stop. Awaiting only `ctrl_c()` would let
-/// SIGTERM fall through to the kernel default and kill the process before the
-/// graceful drain + checkpoint could run. On non-Unix targets only Ctrl-C is
-/// available.
-async fn shutdown_signal() {
+/// The process-level signals the server acts on.
+enum ProcessSignal {
+    /// SIGINT (Ctrl-C) or SIGTERM: drain and exit.
+    Shutdown,
+    /// SIGHUP: reload what can be reloaded and keep serving.
+    Reload,
+}
+
+/// Resolve when the process receives a signal it acts on: SIGINT (Ctrl-C) or,
+/// on Unix, SIGTERM (the signal Docker `docker stop`, Kubernetes, and systemd
+/// send) and SIGHUP. Awaiting only `ctrl_c()` would let SIGTERM fall through
+/// to the kernel default and kill the process before the graceful drain +
+/// checkpoint could run; SIGHUP had the same fate, so the conventional
+/// "reload your configuration" signal killed the server without a checkpoint.
+/// On non-Unix targets only Ctrl-C is available.
+async fn process_signal() -> ProcessSignal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
-                }
-            }
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
             Err(e) => {
-                // Failing to install the SIGTERM handler is non-fatal: fall back
-                // to SIGINT-only so the server still starts and Ctrl-C still drains.
+                // Failing to install a handler is non-fatal: fall back to
+                // SIGINT-only so the server still starts and Ctrl-C still drains.
                 warn!(error = %e, "could not install SIGTERM handler; only Ctrl-C will drain");
-                let _ = tokio::signal::ctrl_c().await;
+                None
+            }
+        };
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(error = %e, "could not install SIGHUP handler; user reloads will not work");
+                None
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => return ProcessSignal::Shutdown,
+                _ = async {
+                    match sigterm.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending().await,
+                    }
+                } => return ProcessSignal::Shutdown,
+                _ = async {
+                    match sighup.as_mut() {
+                        Some(s) => { s.recv().await; }
+                        None => std::future::pending().await,
+                    }
+                } => return ProcessSignal::Reload,
             }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        ProcessSignal::Shutdown
     }
 }
 
@@ -624,11 +745,15 @@ fn ensure_bootstrap_admin(
 #[tokio::main]
 async fn main() {
     // Initialize tracing. RUST_LOG overrides; default is info.
+    // ANSI escapes in a log nobody is reading as a terminal are noise: they
+    // land in `docker logs`, in journald, and in whatever ships them onward.
+    // `NO_COLOR` still forces them off for a real terminal.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_ansi(use_ansi())
         .init();
 
     let args = parse_args();
@@ -681,9 +806,9 @@ async fn main() {
              snapshotting. This mode is stale-by-design between snapshot swaps"
         );
     } else {
-        // WAL durability mode (POWDB_SYNC_MODE). Default Full is fully durable.
+        // WAL durability mode (POWDB_SYNC_MODE, validated in `parse_args`).
         // A read-only engine never writes, so durability configuration is moot.
-        let sync_mode = parse_sync_mode(std::env::var("POWDB_SYNC_MODE").ok().as_deref());
+        let sync_mode = args.sync_mode;
         engine.set_wal_sync_mode(sync_mode);
         match sync_mode {
             WalSyncMode::Full => info!("WAL sync mode: full (fsync every commit: fully durable)"),
@@ -733,7 +858,12 @@ async fn main() {
     if ensure_bootstrap_admin(&mut users, admin_user.clone(), admin_pass) {
         match users.save(std::path::Path::new(&args.data_dir)) {
             Ok(()) => {
-                info!(user = ?admin_user, "bootstrapped admin user from environment");
+                // Display, not Debug: `user=Some("root")` is the shape of a
+                // Rust value, not of a username.
+                info!(
+                    user = admin_user.as_deref().unwrap_or(""),
+                    "bootstrapped admin user from environment"
+                );
             }
             Err(e) => {
                 error!(error = %e, "failed to persist bootstrapped admin user");
@@ -741,13 +871,24 @@ async fn main() {
             }
         }
     }
-    if !users.is_empty() {
-        info!(users = users.len(), "multi-user authentication enabled");
+    let user_count = users.len();
+    if user_count > 0 {
+        info!(users = user_count, "multi-user authentication enabled");
     } else if args.password.is_none() {
         // TASK-09: Warn when neither a shared password nor users are configured.
-        warn!("no password configured — all connections will be accepted without authentication");
+        warn!("no password configured: all connections will be accepted without authentication");
     }
-    let users = Arc::new(users);
+    // Serve from a directory that re-reads `auth.json` when it changes, so a
+    // password rotated or a user deleted by `powdb-cli` against this running
+    // server takes effect on the next login attempt instead of at the next
+    // restart.
+    let users = match handler::UserDirectory::load(std::path::Path::new(&args.data_dir)) {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            error!(data_dir = %args.data_dir, error = %e, "failed to load user store (auth.json)");
+            std::process::exit(1);
+        }
+    };
 
     // Build TLS acceptor if both cert and key are provided.
     let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
@@ -771,7 +912,7 @@ async fn main() {
 
     let tls_enabled = tls_acceptor.is_some();
 
-    let auth_configured = args.password.is_some() || !users.is_empty();
+    let auth_configured = args.password.is_some() || user_count > 0;
 
     // Enforce TLS when required. Refuse to start (rather than silently
     // transmitting credentials in cleartext) if any auth mode is enabled without
@@ -839,7 +980,22 @@ async fn main() {
             let _ = std::fs::remove_file(path);
             match UnixListener::bind(path) {
                 Ok(l) => {
-                    info!(socket = %path, "unix domain socket listening");
+                    // The socket carries the same access as the data
+                    // directory, so it is created 0660 (owner and group)
+                    // rather than the process umask's 0755, which let any
+                    // local user open a connection.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(e) = std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(UNIX_SOCKET_MODE),
+                        ) {
+                            error!(socket = %path, error = %e, "failed to restrict unix socket permissions");
+                            std::process::exit(1);
+                        }
+                    }
+                    info!(socket = %path, mode = format!("{UNIX_SOCKET_MODE:o}"), "unix domain socket listening");
                     Some(l)
                 }
                 Err(e) => {
@@ -875,7 +1031,7 @@ async fn main() {
         "powdb server listening"
     );
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let semaphore = Arc::new(Semaphore::new(args.max_connections));
 
     // Shutdown broadcast: `false` initially, flipped to `true` on SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -899,15 +1055,49 @@ async fn main() {
     // Shared auth rate limiter.
     let rate_limiter = handler::new_rate_limiter();
 
+    // One task owns the process signals. Handling them inside the accept loop
+    // meant that whenever the loop was busy elsewhere, the signal was not
+    // being polled: a server at its connection ceiling parked on the
+    // connection semaphore and ignored SIGTERM entirely. Here the signal
+    // always lands, and the accept loop only has to watch the flag.
+    let signal_users = users.clone();
+    tokio::spawn(async move {
+        loop {
+            match process_signal().await {
+                ProcessSignal::Shutdown => {
+                    warn!("received shutdown signal, draining connections...");
+                    let _ = shutdown_tx.send(true);
+                    return;
+                }
+                ProcessSignal::Reload => match signal_users.reload() {
+                    Ok(count) => info!(signal = "SIGHUP", users = count, "reloaded auth.json"),
+                    Err(e) => warn!(
+                        signal = "SIGHUP",
+                        error = %e,
+                        "could not reload auth.json; keeping the loaded users"
+                    ),
+                },
+            }
+        }
+    });
+
+    // Two receivers: one the loop itself waits on, one the connection-slot
+    // acquire races, since both must observe the flag and `changed()` needs
+    // the receiver mutably.
+    let mut loop_shutdown = shutdown_rx.clone();
+    let mut slot_shutdown = shutdown_rx.clone();
     loop {
         tokio::select! {
             // Accept new connections.
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => break,
+                        let permit = tokio::select! {
+                            acquired = semaphore.clone().acquire_owned() => match acquired {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                            _ = slot_shutdown.changed() => break,
                         };
                         info!(peer = %peer, "accepted connection");
                         let eng = engine.clone();
@@ -968,9 +1158,12 @@ async fn main() {
             } => {
                 match result {
                     Ok((stream, _addr)) => {
-                        let permit = match semaphore.clone().acquire_owned().await {
-                            Ok(p) => p,
-                            Err(_) => break,
+                        let permit = tokio::select! {
+                            acquired = semaphore.clone().acquire_owned() => match acquired {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            },
+                            _ = slot_shutdown.changed() => break,
                         };
                         info!("accepted unix-socket connection");
                         let eng = engine.clone();
@@ -1000,11 +1193,11 @@ async fn main() {
                 }
             }
 
-            // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (docker/k8s/systemd).
-            _ = shutdown_signal() => {
-                warn!("received shutdown signal, draining connections...");
-                let _ = shutdown_tx.send(true);
-                break;
+            // Stop accepting once the signal task has flipped the flag.
+            _ = loop_shutdown.changed() => {
+                if *loop_shutdown.borrow() {
+                    break;
+                }
             }
         }
     }
@@ -1014,9 +1207,29 @@ async fn main() {
     // all connections have closed, we can acquire all permits back.
     info!(
         "waiting for {} active connection(s) to drain",
-        MAX_CONNECTIONS - semaphore.available_permits()
+        args.max_connections - semaphore.available_permits()
     );
-    let _ = semaphore.acquire_many(MAX_CONNECTIONS as u32).await;
+    let drain_budget = std::time::Duration::from_secs(args.shutdown_timeout_secs);
+    let permits = u32::try_from(args.max_connections).unwrap_or(u32::MAX);
+    let drained = tokio::time::timeout(drain_budget, semaphore.acquire_many(permits))
+        .await
+        .is_ok();
+    if !drained {
+        // Waiting forever turns a stuck statement into a hung `docker stop`
+        // that the orchestrator resolves with SIGKILL, which is the one exit
+        // that skips the checkpoint. Give up on the budget, say so, and let
+        // the exit code carry it.
+        error!(
+            shutdown_timeout_secs = args.shutdown_timeout_secs,
+            still_active = args.max_connections - semaphore.available_permits(),
+            "shutdown timeout elapsed with connections still in flight; cancelling and exiting non-zero"
+        );
+        drop(engine);
+        if let Some(path) = args.socket.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::process::exit(1);
+    }
     info!("all connections drained, shutting down");
 
     // Engine `Drop` calls `catalog.checkpoint()` which flushes heap pages
@@ -1173,69 +1386,114 @@ mod tests {
         assert!(check_tls_requirement(false, true, false).is_ok());
     }
 
+    /// One case per environment variable the audit found silently
+    /// defaulting, checked through the exact validator `parse_args` uses.
+    ///
+    /// Each row is (variable, a value that must be refused). A refusal is an
+    /// `Err` here and a non-zero exit in `parse_args`; the process test below
+    /// pins that the two are actually wired together.
     #[test]
-    fn parse_sync_mode_env() {
-        assert_eq!(parse_sync_mode(Some("normal")), WalSyncMode::Normal);
-        assert_eq!(parse_sync_mode(Some("NORMAL")), WalSyncMode::Normal);
-        assert_eq!(parse_sync_mode(Some(" normal ")), WalSyncMode::Normal);
-        assert_eq!(parse_sync_mode(Some("off")), WalSyncMode::Off);
-        assert_eq!(parse_sync_mode(Some("full")), WalSyncMode::Full);
-        // Unset / empty / unknown all fall back to the safe Full default.
-        assert_eq!(parse_sync_mode(None), WalSyncMode::Full);
-        assert_eq!(parse_sync_mode(Some("")), WalSyncMode::Full);
-        assert_eq!(parse_sync_mode(Some("bogus")), WalSyncMode::Full);
+    fn every_env_setting_refuses_a_malformed_value() {
+        assert!(parse_port("abc").is_err(), "POWDB_PORT");
+        assert!(parse_port("70000").is_err(), "POWDB_PORT out of range");
+        assert!(parse_timeout_secs("abc").is_err(), "POWDB_IDLE_TIMEOUT");
+        assert!(
+            parse_timeout_secs("0").is_err(),
+            "POWDB_IDLE_TIMEOUT=0 expires immediately; it is not a way to disable the timeout"
+        );
+        assert!(parse_timeout_secs("abc").is_err(), "POWDB_QUERY_TIMEOUT");
+        assert!(parse_timeout_secs("0").is_err(), "POWDB_QUERY_TIMEOUT=0");
+        assert!(parse_wait_ms("abc").is_err(), "POWDB_TX_WAIT_TIMEOUT_MS");
+        assert!(parse_wait_ms("0").is_err(), "POWDB_TX_WAIT_TIMEOUT_MS=0");
+        assert!(
+            parse_tx_max_lifetime("abc").is_err(),
+            "POWDB_TX_MAX_LIFETIME_MS"
+        );
+        assert!(parse_sync_mode("bogus").is_err(), "POWDB_SYNC_MODE");
+        assert!(parse_bool_setting("ture").is_err(), "POWDB_READONLY typo");
+        assert!(
+            parse_bool_setting("ture").is_err(),
+            "POWDB_REQUIRE_TLS typo"
+        );
+        for value in ["1G", "64MiB", "64m", "0", "-1"] {
+            assert!(
+                parse_positive_count(value).is_err(),
+                "POWDB_QUERY_MEMORY_LIMIT={value} must be refused, not silently defaulted"
+            );
+        }
+        assert!(
+            parse_positive_count("nope").is_err(),
+            "POWDB_MAX_NESTED_LOOP_PAIRS"
+        );
+        assert!(
+            parse_positive_count("nope").is_err(),
+            "POWDB_DIRTY_PAGE_BUDGET"
+        );
+        assert!(parse_positive_count("0").is_err(), "POWDB_MAX_CONNECTIONS");
+        assert!(parse_timeout_secs("0").is_err(), "POWDB_SHUTDOWN_TIMEOUT");
+    }
+
+    /// The refusal names the setting and the value, so an operator can find
+    /// the typo without reading the source.
+    #[test]
+    fn a_refusal_names_the_setting_and_the_value() {
+        let message = invalid_setting("POWDB_PORT", "abc", "a port number between 0 and 65535");
+        assert!(message.contains("POWDB_PORT"), "{message}");
+        assert!(message.contains("abc"), "{message}");
+        assert!(message.contains("65535"), "{message}");
     }
 
     #[test]
-    fn parse_require_tls_env() {
-        assert!(parse_require_tls(Some("1")));
-        assert!(parse_require_tls(Some("true")));
-        assert!(parse_require_tls(Some("TRUE")));
-        assert!(!parse_require_tls(Some("0")));
-        assert!(!parse_require_tls(Some("")));
-        assert!(!parse_require_tls(None));
+    fn every_env_setting_accepts_its_valid_values() {
+        assert_eq!(parse_port("0").unwrap(), 0);
+        assert_eq!(parse_port(" 5433 ").unwrap(), 5433);
+        assert_eq!(parse_timeout_secs("300").unwrap(), 300);
+        assert_eq!(parse_wait_ms("5000").unwrap(), 5000);
+        assert_eq!(parse_positive_count("  4096  ").unwrap(), 4096);
+        assert_eq!(parse_sync_mode(" NORMAL ").unwrap(), WalSyncMode::Normal);
+        assert_eq!(parse_sync_mode("off").unwrap(), WalSyncMode::Off);
+        assert_eq!(parse_sync_mode("full").unwrap(), WalSyncMode::Full);
+        for truthy in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_bool_setting(truthy).unwrap(), "{truthy}");
+        }
+        for falsy in ["0", "false", "no", "off"] {
+            assert!(!parse_bool_setting(falsy).unwrap(), "{falsy}");
+        }
     }
 
+    /// Only an explicit `0` turns the transaction-lifetime bound off. A typo
+    /// must not restore the unbounded behavior that let one connection hold
+    /// the write gate for as long as it liked; it now refuses startup.
     #[test]
-    fn memory_limit_defaults_when_unset() {
-        assert_eq!(parse_query_memory_limit(None), DEFAULT_QUERY_MEMORY_LIMIT);
-    }
-
-    #[test]
-    fn memory_limit_defaults_on_garbage() {
+    fn tx_max_lifetime_env_parsing_fails_safe() {
+        assert_eq!(parse_tx_max_lifetime("0").unwrap(), None);
         assert_eq!(
-            parse_query_memory_limit(Some("not-a-number")),
-            DEFAULT_QUERY_MEMORY_LIMIT
+            parse_tx_max_lifetime("  1500 ").unwrap(),
+            Some(std::time::Duration::from_millis(1500))
+        );
+        assert!(parse_tx_max_lifetime("not-a-number").is_err());
+        assert!(parse_tx_max_lifetime("-1").is_err());
+    }
+
+    /// The parsed value reaches the gate every connection is served through,
+    /// which is the only place the bound can be enforced from.
+    #[test]
+    fn tx_max_lifetime_reaches_the_transaction_gate() {
+        let gate = handler::new_tx_gate_with_max_tx_lifetime(
+            parse_tx_max_lifetime("1500").expect("valid"),
         );
         assert_eq!(
-            parse_query_memory_limit(Some("")),
-            DEFAULT_QUERY_MEMORY_LIMIT
+            gate.max_tx_lifetime(),
+            Some(std::time::Duration::from_millis(1500))
         );
+        let default = handler::new_tx_gate();
         assert_eq!(
-            parse_query_memory_limit(Some("0")),
-            DEFAULT_QUERY_MEMORY_LIMIT
+            default.max_tx_lifetime(),
+            Some(handler::DEFAULT_TX_MAX_LIFETIME)
         );
-    }
-
-    #[test]
-    fn memory_limit_parses_explicit_value() {
-        assert_eq!(parse_query_memory_limit(Some("1048576")), 1_048_576);
-        assert_eq!(parse_query_memory_limit(Some("  4096  ")), 4096);
-    }
-
-    #[test]
-    fn nested_loop_pair_limit_env_parsing() {
-        // Unset / empty / garbage / zero all leave the engine default (None).
-        assert_eq!(parse_nested_loop_pair_limit(None), None);
-        assert_eq!(parse_nested_loop_pair_limit(Some("")), None);
-        assert_eq!(parse_nested_loop_pair_limit(Some("not-a-number")), None);
-        assert_eq!(parse_nested_loop_pair_limit(Some("0")), None);
-        // A positive count (including a small one for testing) overrides.
-        assert_eq!(parse_nested_loop_pair_limit(Some("4")), Some(4));
-        assert_eq!(
-            parse_nested_loop_pair_limit(Some("  6400000 ")),
-            Some(6_400_000)
-        );
+        let disabled =
+            handler::new_tx_gate_with_max_tx_lifetime(parse_tx_max_lifetime("0").expect("valid"));
+        assert_eq!(disabled.max_tx_lifetime(), None);
     }
 
     #[test]
@@ -1280,75 +1538,13 @@ mod tests {
     /// The parsed env limit is actually applied to the constructed Engine.
     #[test]
     fn env_limit_is_applied_to_engine() {
-        let limit = parse_query_memory_limit(Some("2048"));
+        let limit = parse_positive_count("2048").expect("valid");
         let dir = std::env::temp_dir().join(format!("powdb_srv_memlimit_{}", std::process::id()));
         // Hermetic: the path is pid-derived (not unique per run), so a stale dir
-        // from an earlier run — or a reused pid — must not leak into this test.
+        // from an earlier run, or a reused pid, must not leak into this test.
         let _ = std::fs::remove_dir_all(&dir);
         let engine = Engine::with_memory_limit(&dir, limit).unwrap();
         assert_eq!(engine.query_memory_limit(), 2048);
-    }
-
-    #[test]
-    fn dirty_page_budget_env_parsing() {
-        // Unset / empty / garbage / zero all leave the storage default (None).
-        assert_eq!(parse_dirty_page_budget(None), None);
-        assert_eq!(parse_dirty_page_budget(Some("")), None);
-        assert_eq!(parse_dirty_page_budget(Some("not-a-number")), None);
-        assert_eq!(parse_dirty_page_budget(Some("0")), None);
-        // A positive byte count (including a small one for testing) overrides.
-        assert_eq!(parse_dirty_page_budget(Some("32768")), Some(32_768));
-        assert_eq!(
-            parse_dirty_page_budget(Some("  268435456 ")),
-            Some(268_435_456)
-        );
-    }
-
-    /// The transaction-lifetime bound fails SAFE: only an explicit `0` turns
-    /// it off. A typo must not silently restore the unbounded behavior that
-    /// let one connection hold the write gate for as long as it liked.
-    #[test]
-    fn tx_max_lifetime_env_parsing_fails_safe() {
-        assert_eq!(
-            parse_tx_max_lifetime(None),
-            Some(handler::DEFAULT_TX_MAX_LIFETIME)
-        );
-        assert_eq!(
-            parse_tx_max_lifetime(Some("")),
-            Some(handler::DEFAULT_TX_MAX_LIFETIME)
-        );
-        assert_eq!(
-            parse_tx_max_lifetime(Some("not-a-number")),
-            Some(handler::DEFAULT_TX_MAX_LIFETIME)
-        );
-        assert_eq!(
-            parse_tx_max_lifetime(Some("-1")),
-            Some(handler::DEFAULT_TX_MAX_LIFETIME)
-        );
-        // Only an explicit zero opts out.
-        assert_eq!(parse_tx_max_lifetime(Some("0")), None);
-        assert_eq!(
-            parse_tx_max_lifetime(Some("  1500 ")),
-            Some(std::time::Duration::from_millis(1500))
-        );
-    }
-
-    /// The parsed value reaches the gate every connection is served through,
-    /// which is the only place the bound can be enforced from.
-    #[test]
-    fn tx_max_lifetime_reaches_the_transaction_gate() {
-        let gate = handler::new_tx_gate_with_max_tx_lifetime(parse_tx_max_lifetime(Some("1500")));
-        assert_eq!(
-            gate.max_tx_lifetime(),
-            Some(std::time::Duration::from_millis(1500))
-        );
-        let default = handler::new_tx_gate();
-        assert_eq!(
-            default.max_tx_lifetime(),
-            Some(handler::DEFAULT_TX_MAX_LIFETIME)
-        );
-        let disabled = handler::new_tx_gate_with_max_tx_lifetime(parse_tx_max_lifetime(Some("0")));
-        assert_eq!(disabled.max_tx_lifetime(), None);
     }
 
     /// The parsed `POWDB_DIRTY_PAGE_BUDGET` value reaches the engine's catalog.
@@ -1356,7 +1552,7 @@ mod tests {
     /// is what made the 256 MiB ceiling unoverridable.
     #[test]
     fn env_dirty_page_budget_is_applied_to_engine() {
-        let budget = parse_dirty_page_budget(Some("32768")).unwrap();
+        let budget = parse_positive_count("32768").expect("valid");
         let dir =
             std::env::temp_dir().join(format!("powdb_srv_dirtybudget_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

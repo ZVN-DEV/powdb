@@ -91,7 +91,7 @@ async fn spawn_server(engine: Engine) -> (std::net::SocketAddr, tokio::task::Joi
                         engine,
                         tx_gate,
                         expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
+                        users: Arc::new(powdb_server::handler::UserDirectory::empty()),
                         shutdown_rx: &mut shutdown_rx,
                         idle_timeout: Duration::from_secs(30),
                         preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,

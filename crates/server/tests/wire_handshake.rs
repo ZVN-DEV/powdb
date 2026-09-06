@@ -44,7 +44,7 @@ async fn spawn_server(data_dir: std::path::PathBuf) -> String {
                         engine: eng,
                         tx_gate,
                         expected_password: None,
-                        users: std::sync::Arc::new(powdb_auth::UserStore::new()),
+                        users: std::sync::Arc::new(powdb_server::handler::UserDirectory::empty()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(30),
                         preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,

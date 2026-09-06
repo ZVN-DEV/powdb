@@ -11,6 +11,7 @@ mod transaction;
 mod wire;
 
 use crate::protocol::{WireParam, WireSyncRepairAction};
+use powdb_auth::UserStore;
 use powdb_query::parser;
 use powdb_query::result::{QueryError, QueryResult};
 use powdb_storage::error::StorageError;

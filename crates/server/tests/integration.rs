@@ -305,7 +305,7 @@ async fn test_user_auth_handshake() {
     // Seed a user store with one user.
     let mut store = UserStore::new();
     store.create_user("alice", "pw", "readwrite").unwrap();
-    let users = Arc::new(store);
+    let users = Arc::new(powdb_server::handler::UserDirectory::fixed(store));
 
     let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
     let engine = Arc::new(RwLock::new(engine));
@@ -452,7 +452,7 @@ async fn test_readonly_role_enforced_over_tcp() {
     store.create_user("root", "pw", "admin").unwrap();
     store.create_user("rw", "pw", "readwrite").unwrap();
     store.create_user("ro", "pw", "readonly").unwrap();
-    let users = Arc::new(store);
+    let users = Arc::new(powdb_server::handler::UserDirectory::fixed(store));
 
     let engine = powdb_query::executor::Engine::new(&data_dir).unwrap();
     let engine = Arc::new(RwLock::new(engine));

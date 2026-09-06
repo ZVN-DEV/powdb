@@ -353,3 +353,91 @@ fn the_full_role_by_statement_matrix() {
         assert!(covered.contains(key), "no matrix sample parses to {key}");
     }
 }
+
+// ---- Auth failure rate limiting ----
+
+fn ip(last: u8) -> AuthPeer {
+    AuthPeer::Ip(std::net::IpAddr::from([127, 0, 0, last]))
+}
+
+/// Five wrong guesses at one username must not lock the legitimate user out.
+///
+/// The bucket used to be keyed by source address alone, so a script guessing
+/// `admin` from an office NAT locked every real user behind that address out
+/// for a minute. Unknown usernames counted the same way, which made the
+/// lockout free to cause.
+#[test]
+fn a_wrong_username_does_not_lock_out_another_user() {
+    let limiter = new_rate_limiter();
+    let peer = ip(1);
+    for _ in 0..6 {
+        record_auth_failure(&limiter, &peer, Some("admin"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("admin")),
+        "the guessed username must be locked out"
+    );
+    assert!(
+        !is_rate_limited(&limiter, &peer, Some("alice")),
+        "a different username from the same address must still be able to log in"
+    );
+}
+
+/// The peer bucket is still there as an outer bound, at a higher threshold, so
+/// a sweep across many usernames is stopped.
+#[test]
+fn a_sweep_across_usernames_still_locks_the_peer_out() {
+    let limiter = new_rate_limiter();
+    let peer = ip(2);
+    for n in 0..60 {
+        record_auth_failure(&limiter, &peer, Some(&format!("user{n}")));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("alice")),
+        "a peer that failed at 60 different usernames must be locked out as a whole"
+    );
+    assert!(
+        !is_rate_limited(&limiter, &ip(3), Some("alice")),
+        "another address must be unaffected"
+    );
+}
+
+/// A Unix-socket peer has no address, so it used to be skipped by the limiter
+/// entirely: unlimited guesses at any credential over the local socket.
+#[test]
+fn unix_socket_peers_share_one_bucket_instead_of_none() {
+    let limiter = new_rate_limiter();
+    let peer = AuthPeer::of(None);
+    assert_eq!(peer, AuthPeer::UnixSocket);
+    for _ in 0..6 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("alice")),
+        "a unix-socket peer must be throttled like any other"
+    );
+}
+
+/// A successful login clears what that attempt contributed.
+#[test]
+fn a_successful_login_clears_the_counters() {
+    let limiter = new_rate_limiter();
+    let peer = ip(4);
+    for _ in 0..4 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    clear_auth_failures(&limiter, &peer, Some("alice"));
+    for _ in 0..4 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    assert!(
+        !is_rate_limited(&limiter, &peer, Some("alice")),
+        "the pre-success failures must not still count toward the lockout"
+    );
+}
+
+/// The refusal tells the client how long to wait, which it never did.
+#[test]
+fn the_rate_limit_window_is_stated_in_seconds() {
+    assert_eq!(auth_retry_after_secs(), 60);
+}

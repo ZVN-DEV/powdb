@@ -88,7 +88,7 @@ async fn start_single_conn_server_with_metrics(
                 engine,
                 tx_gate,
                 expected_password: expected_password.map(zeroize::Zeroizing::new),
-                users: Arc::new(powdb_auth::UserStore::new()),
+                users: Arc::new(powdb_server::handler::UserDirectory::empty()),
                 shutdown_rx: &mut shutdown_rx,
                 idle_timeout: Duration::from_secs(30),
                 preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
@@ -111,7 +111,7 @@ async fn start_multi_conn_server(
     start_multi_conn_server_with_users(
         engine,
         expected_password,
-        Arc::new(powdb_auth::UserStore::new()),
+        Arc::new(powdb_server::handler::UserDirectory::empty()),
     )
     .await
 }
@@ -119,7 +119,7 @@ async fn start_multi_conn_server(
 async fn start_multi_conn_server_with_users(
     engine: Arc<RwLock<Engine>>,
     expected_password: Option<&str>,
-    users: Arc<powdb_auth::UserStore>,
+    users: Arc<powdb_server::handler::UserDirectory>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -287,7 +287,12 @@ async fn named_user_tcp_sync_frames_enforce_roles() {
         .unwrap();
 
     let engine = Arc::new(RwLock::new(engine));
-    let addr = start_multi_conn_server_with_users(engine, None, Arc::new(users)).await;
+    let addr = start_multi_conn_server_with_users(
+        engine,
+        None,
+        Arc::new(powdb_server::handler::UserDirectory::fixed(users)),
+    )
+    .await;
 
     let mut writer = connect_as(addr, Some("writer"), Some("writer-pw")).await;
     Message::SyncStatus {
