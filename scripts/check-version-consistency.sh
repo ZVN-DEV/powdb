@@ -247,6 +247,16 @@ grep -qE "^## $current_release" clients/ts/CHANGELOG.md \
 grep -qE "^## $current_release" clients/sync/CHANGELOG.md \
   || fail "clients/sync/CHANGELOG.md has no entry for published release $current_release"
 
+# AGENTS.md stamps the feature list with the release it describes, and it is
+# the file written for AI assistants, so a stale stamp is read as fact by every
+# tool that ingests it. It sat at v0.25.0 through two releases because nothing
+# checked it. Matched with grep -F on the whole phrase: a looser match would
+# accept "(v0.25.0)" appearing anywhere else in the file.
+grep -qF "Available in released PowDB (v$current_release)" AGENTS.md \
+  || fail "AGENTS.md does not stamp its feature list with the current release.
+  expected the phrase: Available in released PowDB (v$current_release)
+  found:               $(grep -oE 'Available in released PowDB \(v[0-9.]+\)' AGENTS.md | head -1)"
+
 # SECURITY.md must list the published minor series (e.g. 0.12.x) as supported.
 # During development an unreleased workspace series must additionally remain
 # explicitly unsupported until it ships.
@@ -292,4 +302,4 @@ if [[ "$publishable_crates" != "$summary_crates" ]]; then
   summary  : $(tr '\n' ' ' <<< "$summary_crates")"
 fi
 
-log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, format/stability policies, and SECURITY.md."
+log "development version $workspace_version and published release $current_release are consistent across manifests, deploy examples, site output, changelog, release docs, format/stability policies, AGENTS.md, and SECURITY.md."
