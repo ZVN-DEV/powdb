@@ -139,6 +139,9 @@ export function legacyServerHello(): ServerHello {
 /** Maximum payload size accepted from the wire (64 MB). */
 export const MAX_PAYLOAD_SIZE = 64 * 1024 * 1024;
 
+/** Bytes of frame header before the payload: type, flags, payload length. */
+export const FRAME_HEADER_SIZE = 6;
+
 /** Maximum number of rows allowed in a single result message. */
 export const MAX_ROWS = 10_000_000;
 
@@ -163,10 +166,26 @@ export const MAX_COLUMNS = 4096;
  */
 export const MAX_RESULT_CELLS = 2_000_000;
 
+/**
+ * A result frame declaring more cells than {@link MAX_RESULT_CELLS}.
+ *
+ * Distinct from every other decode failure because it is recoverable: the
+ * framing is intact, so the client can skip the frame, fail that one query,
+ * and keep the connection. Every other decode error means the byte stream is
+ * no longer trustworthy and the connection has to go.
+ */
+export class ResultTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResultTooLargeError";
+    Object.setPrototypeOf(this, ResultTooLargeError.prototype);
+  }
+}
+
 /** Reject a declared result shape whose cell count exceeds MAX_RESULT_CELLS. */
 function checkResultCells(rowCount: number, colCount: number): void {
   if (rowCount * colCount > MAX_RESULT_CELLS) {
-    throw new Error(
+    throw new ResultTooLargeError(
       `result too large: ${rowCount * colCount} cells (${rowCount} rows x ${colCount} columns, max ${MAX_RESULT_CELLS})`,
     );
   }
@@ -175,10 +194,17 @@ function checkResultCells(rowCount: number, colCount: number): void {
 /** Maximum number of bound parameters in a QueryWithParams message. */
 export const MAX_PARAMS = 4096;
 
-/** Maximum retained units accepted in one sync pull result. */
-export const MAX_SYNC_UNITS = 4096;
+/**
+ * Maximum retained units accepted in one sync pull result.
+ *
+ * Larger than {@link MAX_SYNC_PULL_UNITS} on purpose: `maxUnits` is a hint, and
+ * the server extends a chunk past it to the commit that closes the transaction
+ * the chunk is standing in. A transaction of any size therefore arrives whole,
+ * bounded by {@link MAX_SYNC_PULL_BYTES} rather than by a unit count.
+ */
+export const MAX_SYNC_UNITS = 262_144;
 
-/** Maximum retained units accepted by the server for one sync pull request. */
+/** Maximum retained units a sync pull request may ask the server for. */
 export const MAX_SYNC_PULL_UNITS = 4096;
 
 /** Maximum retained-unit payload budget accepted by the server for one sync pull. */
@@ -516,15 +542,20 @@ export function encode(msg: Message): Buffer {
       break;
   }
 
-  const frame = Buffer.alloc(6 + payload.length);
+  const frame = Buffer.alloc(FRAME_HEADER_SIZE + payload.length);
   frame.writeUInt8(msgType, 0);
   frame.writeUInt8(0, 1); // flags
   frame.writeUInt32LE(payload.length, 2);
-  payload.copy(frame, 6);
+  payload.copy(frame, FRAME_HEADER_SIZE);
   return frame;
 }
 
 function encodeQueryWithParams(query: string, params: WireParam[]): Buffer {
+  if (params.length > MAX_PARAMS) {
+    // The count is framed as a u16, so an over-cap array would wrap and the
+    // server would read a different query than the caller wrote.
+    throw new Error(`too many parameters: ${params.length} (max ${MAX_PARAMS})`);
+  }
   const parts: Buffer[] = [encodeString(query), u16LE(params.length)];
   for (const param of params) {
     switch (param.tag) {

@@ -30,6 +30,13 @@ export type PowDBErrorCode =
   /** Type coercion on a row failed (queryTyped). */
   | "type_coercion_failed"
   /**
+   * The caller passed something the wire protocol cannot carry: a bigint
+   * outside the signed 64-bit range, a non-finite number, an unsupported
+   * parameter type. Raised before anything is written, so the connection is
+   * untouched. Fix the call, never retry it.
+   */
+  | "invalid_argument"
+  /**
    * Client and server could not agree on a wire protocol version or feature
    * set. Raised only during the handshake, never mid-session. Not transient:
    * one side has to be upgraded (the message says which).

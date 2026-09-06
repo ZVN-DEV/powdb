@@ -22,10 +22,14 @@ import {
   encode,
   tryDecode,
   legacyServerHello,
+  FRAME_HEADER_SIZE,
+  MAX_PARAMS,
+  MAX_PAYLOAD_SIZE,
   MAX_SYNC_PULL_BYTES,
   MAX_SYNC_PULL_UNITS,
   PROTOCOL_VERSION_LEGACY,
   PROTOCOL_VERSION_NEGOTIATED,
+  ResultTooLargeError,
   WIRE_FEATURE,
   type ClientHello,
   type Message,
@@ -300,7 +304,20 @@ function socketChunkToBuffer(chunk: Buffer | string): Buffer {
 }
 
 /** Map a JS {@link QueryParam} to its wire encoding. */
-function toWireParam(p: QueryParam): WireParam {
+/** Inclusive bounds of the wire's `int` param tag (a signed 64-bit integer). */
+const WIRE_INT_MIN = -(2n ** 63n);
+const WIRE_INT_MAX = 2n ** 63n - 1n;
+
+/**
+ * Convert one caller-supplied parameter to its wire form.
+ *
+ * Every rejection here happens before the frame is built, so a bad parameter
+ * can never leave a half-written request or a pending slot behind. Integral
+ * doubles above `Number.MAX_SAFE_INTEGER` are bound as floats: the double
+ * never held an exact integer in the first place, and tagging it `int` would
+ * overflow the 64-bit field the tag promises.
+ */
+function toWireParam(p: QueryParam, index: number): WireParam {
   if (p === null) return { tag: "null" };
   switch (typeof p) {
     case "string":
@@ -308,15 +325,27 @@ function toWireParam(p: QueryParam): WireParam {
     case "boolean":
       return { tag: "bool", value: p };
     case "bigint":
+      if (p < WIRE_INT_MIN || p > WIRE_INT_MAX) {
+        throw new PowDBError(
+          `parameter $${index + 1} is a bigint outside the signed 64-bit range PowDB can bind`,
+          "invalid_argument",
+        );
+      }
       return { tag: "int", value: p };
     case "number":
-      return Number.isInteger(p)
+      if (!Number.isFinite(p)) {
+        throw new PowDBError(
+          `parameter $${index + 1} is ${p}, which PowDB has no value for; bind a finite number or null`,
+          "invalid_argument",
+        );
+      }
+      return Number.isSafeInteger(p)
         ? { tag: "int", value: BigInt(p) }
         : { tag: "float", value: p };
     default:
       throw new PowDBError(
         `unsupported query parameter type: ${typeof p}`,
-        "protocol_error",
+        "invalid_argument",
       );
   }
 }
@@ -561,13 +590,31 @@ export interface ClientOptions {
    * the legacy path; leave unset in production. Defaults to `false`.
    */
   legacyHandshake?: boolean;
+  /**
+   * How many requests this client will leave unanswered on the wire at once.
+   * Defaults to {@link DEFAULT_MAX_IN_FLIGHT} (64), comfortably under the
+   * server's 128-frame read-ahead budget: a server that reaches that budget
+   * closes the connection outright, so a burst of a few hundred concurrent
+   * queries used to die mid-flight. Anything past the window waits in a local
+   * FIFO and goes out as replies come back, so `Promise.all` over any number
+   * of queries completes.
+   */
+  maxInFlight?: number;
 }
+
+/**
+ * Default in-flight window. The server's read-ahead budget is 128 frames and
+ * exceeding it closes the connection, so the client stays well below it.
+ */
+export const DEFAULT_MAX_IN_FLIGHT = 64;
 
 type Pending = {
   resolve: (msg: Message) => void;
   reject: (err: Error) => void;
   /** Set to true once the promise has been resolved or rejected. */
   settled: boolean;
+  /** The encoded request, held until the in-flight window has room for it. */
+  frame: Buffer;
 };
 
 /** Module-level set of host:port pairs we've already warned about. */
@@ -580,24 +627,51 @@ function majorOf(version: string): string {
 }
 
 /**
- * Build an AbortError. A caller-supplied custom `Error` reason
- * (`ctrl.abort(myError)`) passes through as-is to match DOM semantics. The
- * default abort reason — Node's `DOMException` named `"AbortError"` — and any
- * non-Error reason are wrapped in a `PowDBError` with code `"aborted"` so the
- * common `ctrl.abort()` case branches uniformly on `err.code === "aborted"`.
+ * Build the rejection for an aborted request. Always a `PowDBError` with code
+ * `"aborted"` so one `err.code` branch covers every abort, whatever the caller
+ * passed to `ctrl.abort(...)`; a custom reason is kept verbatim as `cause` and
+ * its text appears in the message.
  */
-function abortError(signal?: AbortSignal): Error {
-  if (signal && signal.reason !== undefined) {
-    const r = signal.reason;
-    const isDefaultAbort =
-      r instanceof DOMException && r.name === "AbortError";
-    if (r instanceof Error && !isDefaultAbort) return r;
-    return new PowDBError(
-      isDefaultAbort ? "query was aborted" : String(r),
-      "aborted",
-    );
+function abortError(signal?: AbortSignal): PowDBError {
+  const reason = signal?.reason;
+  if (reason === undefined) {
+    return new PowDBError("query was aborted", "aborted");
   }
-  return new PowDBError("query was aborted", "aborted");
+  const isDefaultAbort =
+    reason instanceof DOMException && reason.name === "AbortError";
+  if (isDefaultAbort) {
+    return new PowDBError("query was aborted", "aborted", { cause: reason });
+  }
+  const text = reason instanceof Error ? reason.message : String(reason);
+  return new PowDBError(`query was aborted: ${text}`, "aborted", {
+    cause: reason,
+  });
+}
+
+/**
+ * Total length of the frame at the head of `view`, or `null` when the buffer
+ * does not hold a whole frame with a length the wire allows. A non-null answer
+ * means the framing is intact and the frame can be skipped without losing
+ * sync with the byte stream.
+ */
+function completeFrameLength(view: Buffer): number | null {
+  if (view.length < FRAME_HEADER_SIZE) return null;
+  const payloadLen = view.readUInt32LE(2);
+  if (payloadLen > MAX_PAYLOAD_SIZE) return null;
+  const total = FRAME_HEADER_SIZE + payloadLen;
+  return view.length >= total ? total : null;
+}
+
+/**
+ * Wrap a raw socket/stream error in the client's taxonomy. Node hands back
+ * bare `EPIPE`/`ECONNRESET` errors; callers branch on `.code`, so those have
+ * to arrive as a `PowDBError` with the original kept as `cause`.
+ */
+function asPowDBError(err: Error): PowDBError {
+  if (isPowDBError(err)) return err;
+  return new PowDBError(`connection closed: ${err.message}`, "closed", {
+    cause: err,
+  });
 }
 
 /**
@@ -645,6 +719,9 @@ export class Client extends EventEmitter<ClientEvents> {
   /** Cached length of everything currently in `chunks`. */
   private totalLen = 0;
   private readonly pending: Pending[] = [];
+  /** Requests encoded but not yet written: everything past the window. */
+  private readonly queued: Pending[] = [];
+  private maxInFlight = DEFAULT_MAX_IN_FLIGHT;
   private closed = false;
   private closeError: Error | null = null;
   /** Settled once the Connect→ConnectOk handshake completes (or fails). */
@@ -716,7 +793,15 @@ export class Client extends EventEmitter<ClientEvents> {
       requireProtocolVersion = CLIENT_CAPABILITIES.minProtocolVersion,
       requireFeatures = [],
       legacyHandshake = false,
+      maxInFlight = DEFAULT_MAX_IN_FLIGHT,
     } = opts;
+
+    if (!Number.isInteger(maxInFlight) || maxInFlight < 1) {
+      throw new PowDBError(
+        `maxInFlight must be a positive integer, got ${maxInFlight}`,
+        "invalid_argument",
+      );
+    }
 
     if (path === undefined && (host === undefined || port === undefined)) {
       throw new PowDBError(
@@ -741,6 +826,7 @@ export class Client extends EventEmitter<ClientEvents> {
         };
 
     const client = new Client(socket);
+    client.maxInFlight = maxInFlight;
     client.startHandshake(
       { type: "Connect", dbName, password, username: user ?? null, hello },
       path ?? `${host}:${port}`,
@@ -1674,6 +1760,38 @@ export class Client extends EventEmitter<ClientEvents> {
 
   // ───── internals ─────────────────────────────────────────────────────────
 
+  /**
+   * Build the frame for `msg`, refusing anything the server would reject at
+   * the frame level. Returns a `PowDBError` instead of the frame when the
+   * request cannot legally go out.
+   */
+  private buildFrame(msg: Message): Buffer | PowDBError {
+    const params = "params" in msg ? msg.params : undefined;
+    if (Array.isArray(params) && params.length > MAX_PARAMS) {
+      return new PowDBError(
+        `too many parameters: ${params.length} (max ${MAX_PARAMS})`,
+        "size_exceeded",
+      );
+    }
+    let frame: Buffer;
+    try {
+      frame = encode(msg);
+    } catch (err) {
+      return new PowDBError(
+        `failed to encode ${msg.type}: ${err instanceof Error ? err.message : String(err)}`,
+        "invalid_argument",
+        { cause: err },
+      );
+    }
+    if (frame.length - FRAME_HEADER_SIZE > MAX_PAYLOAD_SIZE) {
+      return new PowDBError(
+        `request too large: ${frame.length - FRAME_HEADER_SIZE} bytes (max ${MAX_PAYLOAD_SIZE})`,
+        "size_exceeded",
+      );
+    }
+    return frame;
+  }
+
   private send(
     msg: Message,
     opts?: { signal?: AbortSignal },
@@ -1692,6 +1810,14 @@ export class Client extends EventEmitter<ClientEvents> {
       return Promise.reject(abortError(signal));
     }
 
+    // Encode BEFORE anything is queued. An encoder that throws mid-`send`
+    // used to leave a pending slot waiting for a reply the server was never
+    // asked for, which desynced the FIFO for the life of the connection.
+    const frame = this.buildFrame(msg);
+    if (frame instanceof PowDBError) {
+      return Promise.reject(frame);
+    }
+
     return new Promise((resolve, reject) => {
       const entry: Pending = {
         resolve: (m) => {
@@ -1703,16 +1829,18 @@ export class Client extends EventEmitter<ClientEvents> {
           reject(e);
         },
         settled: false,
+        frame,
       };
-      this.pending.push(entry);
 
       let onAbort: (() => void) | null = null;
       if (signal) {
         onAbort = () => {
           if (entry.settled) return;
-          // Mark settled but DO NOT remove the entry from the queue — the
-          // server will still send a reply, and onData drops replies for
-          // already-settled entries at the head of the queue.
+          // Mark settled but DO NOT remove the entry from the queue — if the
+          // frame is already on the wire the server will still reply, and
+          // onData drops replies for already-settled entries at the head of
+          // the queue. An entry still waiting for window room is skipped by
+          // `pump` instead, so nothing unasked-for is ever written.
           entry.settled = true;
           reject(abortError(signal));
         };
@@ -1730,7 +1858,24 @@ export class Client extends EventEmitter<ClientEvents> {
         };
       }
 
-      this.socket.write(encode(msg), (err) => {
+      this.queued.push(entry);
+      this.pump();
+    });
+  }
+
+  /**
+   * Write queued requests until the in-flight window is full. Order is
+   * strictly FIFO in both queues, which is what keeps `pending` aligned with
+   * the server's replies.
+   */
+  private pump(): void {
+    while (this.queued.length > 0 && this.pending.length < this.maxInFlight) {
+      const entry = this.queued.shift()!;
+      // Aborted while it waited for room: nothing was written, so there is
+      // no reply to match and it must not enter the pending FIFO.
+      if (entry.settled) continue;
+      this.pending.push(entry);
+      this.socket.write(entry.frame, (err) => {
         if (err) {
           if (entry.settled) return;
           // Writer error — the promise will also be rejected by onClose,
@@ -1742,10 +1887,11 @@ export class Client extends EventEmitter<ClientEvents> {
           // alignment with subsequent entries is preserved.
           const idx = this.pending.indexOf(entry);
           if (idx !== -1) this.pending.splice(idx, 1);
-          entry.reject(err);
+          entry.reject(asPowDBError(err));
+          this.pump();
         }
       });
-    });
+    }
   }
 
   /**
@@ -1812,8 +1958,28 @@ export class Client extends EventEmitter<ClientEvents> {
       try {
         decoded = tryDecode(view);
       } catch (err) {
-        this.onClose(err as Error);
-        return;
+        // A result the client refuses to materialize is the one decode
+        // failure that leaves the byte stream intact: the frame is fully
+        // present and self-describing, so it can be skipped and only the
+        // query that asked for it fails. Every other decode error means the
+        // stream is no longer trustworthy and the connection has to go.
+        const frameLen = completeFrameLength(view);
+        if (!(err instanceof ResultTooLargeError) || frameLen === null) {
+          this.onClose(err as Error);
+          return;
+        }
+        this.consume(frameLen);
+        const failure = new PowDBError(err.message, "size_exceeded", {
+          cause: err,
+        });
+        const entry = this.pending.shift();
+        if (entry === undefined) {
+          this.onClose(failure);
+          return;
+        }
+        if (!entry.settled) entry.reject(failure);
+        this.pump();
+        continue;
       }
       if (decoded === null) break;
 
@@ -1832,12 +1998,29 @@ export class Client extends EventEmitter<ClientEvents> {
       // rather than delivering it to a later, live query.
       const entry = this.pending.shift();
       if (entry === undefined) {
-        // No pending entry at all — the server sent an unsolicited frame.
+        // Nothing is waiting, so this frame is the server speaking first.
+        // An Error frame here is how a server announces an idle timeout, a
+        // reaped transaction, or its own shutdown: keep its text and class
+        // rather than discarding both behind a generic protocol error.
+        if (decoded.msg.type === "Error") {
+          this.onClose(
+            new PowDBError(
+              decoded.msg.message,
+              errorCodeForWireClass(decoded.msg.errorClass),
+              { wireErrorClass: decoded.msg.errorClass },
+            ),
+          );
+          return;
+        }
         this.onClose(
-          new PowDBError("received unexpected frame from server", "protocol_error"),
+          new PowDBError(
+            `received unexpected ${decoded.msg.type} frame from server`,
+            "protocol_error",
+          ),
         );
         return;
       }
+      this.pump();
       if (entry.settled) continue;
       entry.resolve(decoded.msg);
     }
@@ -1872,7 +2055,10 @@ export class Client extends EventEmitter<ClientEvents> {
     const firstClose = !this.closed;
     if (this.closed && err === null) return;
     this.closed = true;
-    let error = err ?? new PowDBError("connection closed", "closed");
+    let error =
+      err === null
+        ? new PowDBError("connection closed", "closed")
+        : asPowDBError(err);
     // A teardown before ConnectOk is a handshake failure: everything queued
     // (the handshake entry and any eagerly pipelined queries) rejects with
     // the handshake error. Auth/protocol errors already carry the precise
@@ -1891,10 +2077,14 @@ export class Client extends EventEmitter<ClientEvents> {
       );
     }
     this.closeError = error;
-    while (this.pending.length > 0) {
-      const entry = this.pending.shift()!;
-      if (!entry.settled) {
-        entry.reject(error);
+    // Everything the caller is waiting on fails, whether it reached the wire
+    // or was still waiting for room in the in-flight window.
+    for (const queue of [this.pending, this.queued]) {
+      while (queue.length > 0) {
+        const entry = queue.shift()!;
+        if (!entry.settled) {
+          entry.reject(error);
+        }
       }
     }
     if (firstClose) {
