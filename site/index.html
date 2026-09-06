@@ -499,8 +499,8 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
         <p>TLS encryption plus two auth modes: a shared password (<code>POWDB_PASSWORD</code>) or named users with roles (admin / readwrite / readonly, argon2id-hashed).</p>
       </div>
       <div class="feature-card">
-        <h3>Zero C Dependencies</h3>
-        <p>Pure Rust, end to end. No C FFI, no <code>libsqlite3-sys</code>, no bindgen. Single <code>cargo install</code> on Linux and macOS. Windows is not supported: the mmap scan path is Unix-only.</p>
+        <h3>Pure-Rust Engine</h3>
+        <p>The engine libraries are pure Rust: no C FFI, no <code>libsqlite3-sys</code>, no bindgen, and nothing to install beside a built binary. Building <code>powdb-server</code> or <code>powdb-cli</code> from source does need a C toolchain and <code>cmake</code>, because their TLS stack compiles <code>aws-lc-sys</code>. Windows is not supported: the mmap scan path is Unix-only.</p>
       </div>
       <div class="feature-card">
         <h3>Pipeline Query Language</h3>

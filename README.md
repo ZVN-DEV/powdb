@@ -9,7 +9,7 @@
 **PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its compiled execution engine measures 3-7x SQLite on aggregates and 1-3.7x on filtered scans, and roughly 16x slower than SQLite on indexed point lookups.**
 
 - **Performance** -- compiled byte-level predicates, zero-copy mmap scans, and a plan cache with literal substitution. Filter and aggregate paths skip full row decoding.
-- **Platform** -- 100% pure-Rust core, no C dependencies, embeddable and server modes, installed with a single `cargo install` on Linux and macOS. **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
+- **Platform** -- pure-Rust engine (`powdb`, `powdb-storage`, `powdb-query` pull no C at all), embeddable and server modes, installed with a single `cargo install` on Linux and macOS. A built binary needs nothing installed beside it, but building `powdb-server` or `powdb-cli` from source does need a C toolchain and `cmake` for their TLS stack; see [Install](#install). **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
 - **DX** -- PowQL is the front door: a left-to-right pipeline syntax that reads like an iterator chain.
 
 Website: **[zvn-dev.github.io/powdb](https://zvn-dev.github.io/powdb/)**
