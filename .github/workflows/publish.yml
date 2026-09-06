@@ -131,7 +131,11 @@ jobs:
   publish:
     name: publish crates
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 45, not 20: this job now also builds the release profile (lto, one
+    # codegen unit) for the durability smoke below. On a cold cache that is the
+    # longest step in the job, and a publish that times out half way through
+    # the eight crates is the worst possible failure mode.
+    timeout-minutes: 45
     needs: semver
     # No GitHub Actions `environment:` here on purpose. crates.io Trusted
     # Publishing matches a publisher configured with a blank environment only
@@ -170,9 +174,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # The release-* restore-keys are a warm start for the release build the
+          # durability smoke below needs: release.yml builds the same commit
+          # with the same RUSTFLAGS on the same tag ref, so its target cache
+          # applies. When that cache does not exist they are simply no-ops.
+          # (Comments cannot live inside the block scalar: everything under
+          # `restore-keys: |` is literal text, so a `#` line there would be
+          # offered to actions/cache as a key.)
           key: publish-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             publish-${{ runner.os }}-
+            release-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+            release-x86_64-unknown-linux-gnu-
 
       - name: Verify version matches input
         run: |
@@ -233,6 +246,26 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
+
+      # crates.io is the one irreversible channel: a published version cannot be
+      # replaced, only yanked. Every other channel in release.yml already sits
+      # behind `needs: smoke-release`; this one did not, and on v0.27.0 the
+      # crates went out 56 seconds BEFORE the durability smoke passed
+      # (publish run 32925073799 finished 03:13:13Z, release.yml's
+      # `durability smoke (release binary)` at 03:14:09Z). The two workflows are
+      # dispatched independently, so the ordering was luck.
+      #
+      # Running the smoke here rather than polling release.yml keeps the gate a
+      # property of this job: same commit, same toolchain, same RUSTFLAGS, no
+      # dependency on which workflow started first, no extra token scope, and
+      # nothing to get wrong when a publish is re-dispatched by hand after a
+      # fix. This is the gate whose absence caused the v0.4.1 to v0.4.3
+      # data-loss yanks; it must clear before anything reaches the registry.
+      - name: Build release binaries for the durability smoke
+        run: cargo build --release --locked -p powdb-cli -p powdb-server
+
+      - name: Durability smoke against release binaries (kill -9 + WAL replay)
+        run: bash scripts/smoke-release.sh
 
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
