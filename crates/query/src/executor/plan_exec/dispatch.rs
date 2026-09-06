@@ -2637,32 +2637,57 @@ impl Engine {
             }
             mismatch
         };
-        if let Some(mismatch) = mismatch {
-            let backing_is_empty = {
-                let mut scan = self
-                    .catalog
-                    .scan(name)
-                    .map_err(QueryError::from_storage_io)?;
-                scan.next().is_none()
-            };
-            if !backing_is_empty {
-                return Err(mismatch);
+        let rebuildable = self.backing_table_is_rebuildable(name);
+        let retype = match mismatch {
+            None => false,
+            Some(mismatch) => {
+                let backing_is_empty = {
+                    let mut scan = self
+                        .catalog
+                        .scan(name)
+                        .map_err(QueryError::from_storage_io)?;
+                    scan.next().is_none()
+                };
+                if !backing_is_empty || !rebuildable {
+                    return Err(mismatch);
+                }
+                true
             }
-            let schema = self.derive_view_schema(name, &columns, &rows, &query_text)?;
+        };
+        // Clear old data and insert fresh results. Mission B2: logged
+        // variant — view refreshes are a mutation and crash recovery
+        // must see them.
+        //
+        // Deleting every row leaves its bytes in place: a slotted page marks
+        // the slot and never moves `free_start` back, so each refresh appended
+        // a whole new copy of the view beside the old one and the backing heap
+        // grew without bound (113 MB from a 1 MB base table in half an hour).
+        // Rebuilding the table frees the file instead, and is also less WAL
+        // than one delete record per row. It needs plain DDL, so a backing
+        // table with indexes, or a refresh inside an explicit transaction,
+        // keeps the delete path.
+        crate::cancel::check()?;
+        if rebuildable {
+            let schema = if retype {
+                self.derive_view_schema(name, &columns, &rows, &query_text)?
+            } else {
+                self.catalog.schema(name).cloned().ok_or_else(|| {
+                    QueryError::ViewError(format!(
+                        "materialized view '{name}' has no backing table"
+                    ))
+                })?
+            };
             self.catalog
                 .drop_table(name)
                 .map_err(QueryError::from_storage_io)?;
             self.catalog
                 .create_table(schema)
                 .map_err(QueryError::from_storage_io)?;
+        } else {
+            self.catalog
+                .scan_delete_matching_logged(name, |_| true)
+                .map_err(QueryError::from_storage_io)?;
         }
-        // Clear old data and insert fresh results. Mission B2: logged
-        // variant — view refreshes are a mutation and crash recovery
-        // must see them.
-        crate::cancel::check()?;
-        self.catalog
-            .scan_delete_matching_logged(name, |_| true)
-            .map_err(QueryError::from_storage_io)?;
         for row in &rows {
             self.catalog
                 .insert(name, row)
@@ -2688,6 +2713,30 @@ impl Engine {
                 .map_err(QueryError::from_storage_io)?;
         }
         Ok(())
+    }
+
+    /// Whether a view's backing table can be dropped and recreated to reclaim
+    /// its previous materialization.
+    ///
+    /// Rebuilding is plain DDL, so it is out on three counts: inside an
+    /// explicit transaction the catalog refuses DDL outright, a secondary index
+    /// on the backing table would be silently lost, and a declared link that
+    /// names the table pins it in place. Each of those keeps the delete path,
+    /// which is correct but does not reclaim.
+    fn backing_table_is_rebuildable(&self, name: &str) -> bool {
+        if self.in_transaction {
+            return false;
+        }
+        if self
+            .catalog
+            .links()
+            .any(|link| link.owner_type == name || link.target_type == name)
+        {
+            return false;
+        }
+        self.catalog
+            .get_table(name)
+            .is_some_and(|table| table.indexes_is_empty())
     }
 
     /// Drop a materialized view: remove the backing table and unregister.
