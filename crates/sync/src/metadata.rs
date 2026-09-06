@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +9,7 @@ use powdb_storage::create_data_dir_secure;
 use serde::{Deserialize, Serialize};
 
 use crate::segment::{read_units_since, SegmentIdentity};
+use crate::fsync::fsync_dir;
 
 pub const SYNC_STATE_DIR: &str = ".powdb-sync";
 pub const IDENTITY_FILE: &str = "identity.json";
@@ -577,6 +578,12 @@ fn owner_process_alive(pid: u32) -> bool {
     if pid > libc::pid_t::MAX as u32 {
         return false;
     }
+    // SAFETY: `kill` with signal 0 sends nothing; it only asks the kernel
+    // whether `pid` names a process this user may signal. It takes two
+    // integers by value, touches no memory this process owns, and cannot
+    // fail in a way that leaves anything to clean up. `pid` was just range
+    // checked against `pid_t::MAX`, so the cast cannot wrap into a negative
+    // value, which would address a process group rather than a process.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -782,16 +789,6 @@ fn now_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn invalid_input(message: impl ToString) -> io::Error {

@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use powdb_storage::catalog::CATALOG_VERSION;
 use powdb_storage::create_data_dir_secure;
 use powdb_storage::wal::{WalRecord, WAL_FORMAT_VERSION};
+use crate::fsync::fsync_dir;
 
 const SEGMENT_MAGIC: &[u8; 4] = b"PRUL";
 const FOOTER_MAGIC: &[u8; 4] = b"RULF";
@@ -910,16 +911,6 @@ fn read_u32(bytes: &[u8], pos: usize, field: &str) -> io::Result<u32> {
         .try_into()
         .map_err(|_| invalid_data(format!("invalid {field}")))?;
     Ok(u32::from_le_bytes(arr))
-}
-
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

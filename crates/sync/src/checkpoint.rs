@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use powdb_storage::catalog::Catalog;
 use powdb_storage::wal::WalRecord;
 
+use tracing::{debug, warn};
+
 use crate::metadata::{open_or_create_identity, read_identity};
 use crate::segment::{
     read_segment_file, segment_file_name, write_segment_atomic, RetainedSegment, RetainedUnit,
@@ -34,7 +36,21 @@ impl DerefMut for SyncCatalog {
 
 impl Drop for SyncCatalog {
     fn drop(&mut self) {
-        let _ = checkpoint_preserving_retained_segments_if_enabled(&mut self.catalog);
+        let data_dir = self.catalog.data_dir().to_path_buf();
+        if let Err(err) = checkpoint_preserving_retained_segments_if_enabled(&mut self.catalog) {
+            // Nothing can be returned from a drop, and the caller has already
+            // moved on. Say so loudly instead of dropping it on the floor: the
+            // WAL still holds the unarchived records, so the next sync-aware
+            // open archives them, but any replica pulling in the meantime sees
+            // history that stops short with no explanation anywhere.
+            warn!(
+                data_dir = %data_dir.display(),
+                error = %err,
+                "sync-aware checkpoint failed while closing the catalog; \
+                 retained history stops at the last archived LSN until the \
+                 next sync-aware open"
+            );
+        }
     }
 }
 
@@ -100,6 +116,12 @@ pub fn archive_wal_records_for_identity(
     );
     let units: Vec<RetainedUnit> = records.iter().map(RetainedUnit::from).collect();
     let segment = RetainedSegment::new(segment_identity, units)?;
+    debug!(
+        start_lsn = segment.start_lsn,
+        end_lsn = segment.end_lsn,
+        units = segment.units.len(),
+        "archiving retained segment"
+    );
     write_segment_idempotent(&retained_segments_dir(data_dir), &segment).map(|_| ())
 }
 

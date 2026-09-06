@@ -9,6 +9,7 @@ use crate::metadata::{
 };
 use crate::segment::{list_segment_files, read_segment_file, SegmentIdentity};
 use crate::{DatabaseIdentity, ReplicaCursor};
+use crate::fsync::fsync_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionGcSummary {
@@ -343,16 +344,6 @@ fn validate_retained_tail(
             .checked_add(1)
             .ok_or_else(|| invalid_data("retained segment LSN overflow"))?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
