@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 static NEXT_STRUCTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -380,6 +380,19 @@ fn max_record_lsn(records: &[WalRecord]) -> Option<u64> {
 /// directly. That meant the `insert_batch_1k` hot path paid an
 /// `FxHash("User")` + bucket walk per row just to dispatch into the
 /// table — about 20-40ns out of a 233ns budget.
+/// Default WAL size that makes a finished statement checkpoint before the
+/// next one starts: 64 MiB.
+///
+/// The WAL used to be truncated only on a clean close, so a process that
+/// stayed up through a long write workload carried every record it had ever
+/// written: tens of megabytes of disk after a few hundred thousand mutations,
+/// and a replay of all of it if the process died. A bound turns both into a
+/// constant. It is deliberately generous: the checkpoint flushes every dirty
+/// heap page and index, so a small threshold would trade log size for
+/// throughput. [`Catalog::set_wal_checkpoint_bytes`] changes it, and 0
+/// restores the old grow-until-close behaviour.
+pub const DEFAULT_WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct Catalog {
     /// All tables, in insertion order. Indexed by `slot: usize`.
     tables: Vec<Table>,
@@ -409,6 +422,10 @@ pub struct Catalog {
     /// was opened? Used by `Drop` to decide whether to treat its own flush
     /// as fatal (it isn't — we still try best-effort).
     checkpointed: bool,
+    /// WAL size at which a completed statement triggers a checkpoint, or 0
+    /// to leave the log to grow until close. See
+    /// [`Self::set_wal_checkpoint_bytes`].
+    wal_checkpoint_bytes: u64,
     /// Catalog-level durable LSN. Heap page LSNs cover row mutations, but
     /// DDL-only changes can advance the WAL without touching a data page.
     durable_lsn: u64,
@@ -484,6 +501,7 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
             durable_lsn: 0,
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
@@ -617,6 +635,7 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -625,6 +644,11 @@ impl Catalog {
             read_only: false,
             dirty_budget,
         };
+        debug!(
+            directory_catalog_version = active_catalog_version,
+            writer = ?crate::format::current_format_versions(),
+            "opened data directory"
+        );
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
         // LSNs stamped by replay (catalog.rs set_page_lsn) and by DDL
@@ -741,6 +765,7 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -1300,6 +1325,13 @@ impl Catalog {
     /// Safe to call multiple times. Safe to call on a catalog that has
     /// performed zero mutations since the last checkpoint (in which case
     /// the flushes are no-ops and the truncate is a bounded syscall).
+    /// Set the WAL size at which a finished statement checkpoints, in bytes.
+    /// 0 disables the automatic checkpoint and leaves the log to grow until
+    /// the catalog is closed. Defaults to [`DEFAULT_WAL_CHECKPOINT_BYTES`].
+    pub fn set_wal_checkpoint_bytes(&mut self, bytes: u64) {
+        self.wal_checkpoint_bytes = bytes;
+    }
+
     pub fn checkpoint(&mut self) -> io::Result<()> {
         self.ensure_no_active_transaction_for_checkpoint()?;
         self.ensure_plain_checkpoint_allowed_before_flush()?;
@@ -1508,7 +1540,31 @@ impl Catalog {
                 self.wal.append(id, WalRecordType::Commit, &[])?;
             }
         }
-        self.wal.flush()
+        self.wal.flush()?;
+        self.checkpoint_if_wal_is_large()
+    }
+
+    /// Checkpoint when the log has grown past the configured threshold.
+    ///
+    /// Called at the end of every statement that commits, which is the only
+    /// point where the log is at a record boundary with nothing half-written.
+    /// Skipped inside an explicit transaction (a checkpoint there would have
+    /// to truncate records the transaction may still roll back) and skipped
+    /// for a directory that publishes retained history, where truncating
+    /// without the archive hook would discard replication state. Both of
+    /// those are refusals in `checkpoint`, and an insert must not turn into
+    /// an error just because the log happened to cross a size.
+    fn checkpoint_if_wal_is_large(&mut self) -> io::Result<()> {
+        if self.wal_checkpoint_bytes == 0 || self.active_tx_id.is_some() {
+            return Ok(());
+        }
+        if self.wal.synced_len()? < self.wal_checkpoint_bytes {
+            return Ok(());
+        }
+        if self.sync_identity_file_exists() {
+            return Ok(());
+        }
+        self.checkpoint()
     }
 
     /// Append a mutation record to the WAL buffer. **Does not flush.**

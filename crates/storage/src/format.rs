@@ -3,6 +3,12 @@
 //! Every persisted storage structure has an explicit magic/version boundary.
 //! Version `0` below means legacy 0.4.x data accepted by a compatibility
 //! reader; current writers emit the non-zero versions listed here.
+//!
+//! `Catalog::open` logs these next to the version the directory it just opened
+//! is actually at, which is the first thing worth knowing when a directory
+//! refuses to open or comes back at an unexpected version. The table in
+//! `docs/FORMAT.md` documents the same numbers, and the test below holds the
+//! two equal.
 
 use crate::btree;
 use crate::catalog;
@@ -32,4 +38,26 @@ pub const CURRENT_FORMAT_VERSIONS: FormatVersions = FormatVersions {
 
 pub fn current_format_versions() -> FormatVersions {
     CURRENT_FORMAT_VERSIONS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers `docs/FORMAT.md` publishes under "Current format versions".
+    /// A format bump has to move both, so this fails until the doc is updated.
+    #[test]
+    fn the_documented_format_versions_are_the_ones_this_build_writes() {
+        assert_eq!(
+            CURRENT_FORMAT_VERSIONS,
+            FormatVersions {
+                catalog: 7,
+                btree: 3,
+                heap_file: 2,
+                heap_page: 1,
+                row: 1,
+                wal: 1,
+            }
+        );
+    }
 }
