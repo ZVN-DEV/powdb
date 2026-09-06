@@ -1014,6 +1014,12 @@ pub(crate) fn range_matches(
     end: &Option<Value>,
     end_inc: bool,
 ) -> bool {
+    // `null` is excluded from every comparison form (docs/POWQL.md). `Value`
+    // orders `Empty` below every other value, so without this guard a range
+    // with no lower bound accepts the null rows.
+    if val.is_empty() {
+        return false;
+    }
     if let Some(ref s) = start {
         if start_inc {
             if val < s {

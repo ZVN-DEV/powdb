@@ -12,7 +12,12 @@
 //!   * **catalog state**: no index, plain btree, unique index, expression
 //!     index, materialized view;
 //!   * **physical path**: fast paths on, and fast paths forced off via the
-//!     `testing`-only [`Engine::set_force_generic_path`].
+//!     `testing`-only [`Engine::set_force_generic_path`];
+//!   * **executor**: the read-write dispatcher and the read-only mirror, which
+//!     is what a server read, an `open_read_only` handle and embedded
+//!     `query_readonly` all reach. The mirror was excused from this runner
+//!     until a null-handling divergence in its `RangeScan` arm shipped in a
+//!     release, so it is now a dimension here rather than a separate suite.
 //!
 //! and compares column names, full row values, and (where the query defines an
 //! order) row order.
@@ -324,14 +329,39 @@ impl Outcome {
     }
 }
 
-fn run(engine: &mut Engine, query: &str) -> Outcome {
-    match engine.execute_powql(query) {
+/// Which executor served the read. The read-only mirror is a separate
+/// dispatcher with its own `RangeScan`, `IndexScan` and count arms, and a
+/// server read, an `open_read_only` handle and embedded `query_readonly` all
+/// land there. It went unaudited by this runner until a null-handling
+/// divergence in its `RangeScan` arm reached a release, so it is now a third
+/// physical path here rather than something the readonly suites cover alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Api {
+    ReadWrite,
+    ReadOnly,
+}
+
+const BOTH_APIS: [Api; 2] = [Api::ReadWrite, Api::ReadOnly];
+
+fn to_outcome(result: Result<QueryResult, powdb_query::result::QueryError>) -> Outcome {
+    match result {
         Ok(QueryResult::Rows { columns, rows }) => Outcome::Rows { columns, rows },
         Ok(QueryResult::Scalar(value)) => Outcome::Scalar(value),
         Ok(QueryResult::Modified(n)) => Outcome::Modified(n),
         Ok(QueryResult::Created(name)) => Outcome::Other(format!("created {name}")),
         Ok(QueryResult::Executed { message }) => Outcome::Other(message),
         Err(err) => Outcome::Error(err.to_string()),
+    }
+}
+
+fn run(engine: &mut Engine, query: &str) -> Outcome {
+    to_outcome(engine.execute_powql(query))
+}
+
+fn run_api(engine: &mut Engine, query: &str, api: Api) -> Outcome {
+    match api {
+        Api::ReadWrite => to_outcome(engine.execute_powql(query)),
+        Api::ReadOnly => to_outcome(engine.execute_powql_readonly(query)),
     }
 }
 
@@ -676,6 +706,7 @@ fn every_access_path_and_the_generic_evaluator_agree_on_reads() {
 
     for case in READ_CASES {
         let mut observed: Vec<(Access, bool, Outcome)> = Vec::new();
+        let mut readonly: Vec<(Access, bool, Outcome)> = Vec::new();
         for (access, force_generic, engine) in engines.iter_mut() {
             let query = case.powql.replace("{t}", access.table());
 
@@ -695,7 +726,32 @@ fn every_access_path_and_the_generic_evaluator_agree_on_reads() {
                 );
             }
 
-            observed.push((*access, *force_generic, run(engine, &query)));
+            for api in BOTH_APIS {
+                let outcome = run_api(engine, &query, api);
+                match api {
+                    Api::ReadWrite => observed.push((*access, *force_generic, outcome)),
+                    Api::ReadOnly => readonly.push((*access, *force_generic, outcome)),
+                }
+            }
+        }
+
+        // 0. The read-only mirror answers the same question through its own
+        //    dispatcher, whose arms walk the relation differently (an index
+        //    where the read-write arm scans the heap). The rows are therefore a
+        //    contract and their order is one only when the query asked for it,
+        //    the same rule comparison 2 applies across catalog states.
+        for ((access, force_generic, rw), (_, _, ro)) in observed.iter().zip(readonly.iter()) {
+            let (left, right) = if case.ordered {
+                (rw.clone(), ro.clone())
+            } else {
+                (rw.order_insensitive(), ro.order_insensitive())
+            };
+            assert_eq!(
+                left, right,
+                "`{}` under {access:?} (force_generic={force_generic}): the read-only executor \
+                 disagrees with the read-write executor",
+                case.powql
+            );
         }
 
         // 1. Within one catalog state the plan tree is identical, so the two
@@ -1443,6 +1499,13 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
     "project-filter-limit",
     "project-filter-sort-limit",
     "project-over-index-scan",
+    // The read-only mirror, driven by the same corpus through
+    // `execute_powql_readonly`. Its `RangeScan` arm shipped a null-handling
+    // divergence while this runner still excused the whole mirror.
+    "readonly:count-fast-block",
+    "readonly:filter-seqscan-raw",
+    "readonly:project-over-index-scan",
+    "readonly:range-scan-scan-fallback:predicate",
     "update-byte-patch",
     "update-var-shrink",
 ];
@@ -1451,6 +1514,21 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
 /// guard has to be added to one of these two lists, so it cannot be introduced
 /// without someone deciding whether the runner covers it.
 const UNCOVERED_SITES: &[(&str, &str)] = &[
+    // The read-only mirror's own nested and lowering-shadowed guards, excused
+    // for the same reasons as their read-write twins below. The mirror's
+    // reachable sites are in SITES_REACHED_BY_THE_CORPUS.
+    (
+        "readonly:count-filter:predicate",
+        "nested inside readonly:count-fast-block",
+    ),
+    (
+        "readonly:filter-seqscan:predicate",
+        "nested inside readonly:filter-seqscan-raw",
+    ),
+    (
+        "readonly:index-scan-scan-fallback:predicate",
+        "unreachable behind plan lowering",
+    ),
     // Nested inside an outer guard: by the time compilation is attempted the
     // enclosing fast path has already declined, so these never record while the
     // switch is on. They still route through the single compile entry point,
@@ -1473,28 +1551,6 @@ const UNCOVERED_SITES: &[(&str, &str)] = &[
     (
         "project-filter-sort-limit:predicate",
         "nested inside project-filter-sort-limit",
-    ),
-    // Reached only through `Engine::open_readonly`, which serves plans from a
-    // separate mirror of the dispatcher. Covered by the readonly suites, not by
-    // this runner, whose fixtures all need to write before they can read.
-    ("readonly:count-fast-block", "read-only engine mirror"),
-    ("readonly:count-filter:predicate", "read-only engine mirror"),
-    ("readonly:filter-seqscan-raw", "read-only engine mirror"),
-    (
-        "readonly:filter-seqscan:predicate",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:index-scan-scan-fallback:predicate",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:project-over-index-scan",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:range-scan-scan-fallback:predicate",
-        "read-only engine mirror",
     ),
     // The planner emits IndexScan/RangeScan speculatively, but
     // `lower_unindexed_scans` rewrites the ones with no matching index into
@@ -1525,7 +1581,10 @@ fn sites_reached_by_the_corpus() -> Vec<&'static str> {
     for access in ALL_ACCESS {
         let mut engine = build(access, true);
         for case in READ_CASES {
-            let _ = run(&mut engine, &case.powql.replace("{t}", access.table()));
+            let query = case.powql.replace("{t}", access.table());
+            for api in BOTH_APIS {
+                let _ = run_api(&mut engine, &query, api);
+            }
         }
         reached.extend(engine.forced_generic_sites());
     }
