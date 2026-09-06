@@ -939,9 +939,11 @@ export class Client extends EventEmitter<ClientEvents> {
    * Run a PowQL statement and return the typed result.
    *
    * When `opts.signal` is provided and fires, the returned promise rejects
-   * with the signal's `reason` (or an `AbortError`). The socket is NOT
-   * destroyed — the server will still eventually send its reply, which we
-   * silently discard so other in-flight queries keep working.
+   * with a `PowDBError` whose code is `aborted` and whose `cause` is the
+   * signal's reason. The socket is NOT destroyed: a frame already on the wire
+   * still gets its reply, which is discarded, and a query still waiting for
+   * room in the in-flight window is never written at all. Either way the other
+   * in-flight queries keep working.
    */
   async query(
     query: string,

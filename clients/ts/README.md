@@ -499,8 +499,18 @@ try {
 ```
 
 The full taxonomy: `connect_failed`, `auth_failed`, `query_failed`,
-`aborted`, `size_exceeded`, `protocol_error`, `closed`, `timeout`,
-`type_coercion_failed`.
+`aborted`, `invalid_argument`, `size_exceeded`, `protocol_error`, `closed`,
+`timeout`, `type_coercion_failed`.
+
+`invalid_argument` means the call itself was unsendable: a `bigint` outside the
+signed 64-bit range, a non-finite `number`, an unsupported parameter type, more
+than 4096 parameters, or a frame larger than the 64 MB wire limit. It is raised
+before anything is written, so the connection is untouched and every other
+in-flight query is unaffected. Fix the call; never retry it.
+
+`wireErrorClass` carries the server's own numeric classification (see
+`docs/errors.md`) when the error came from a server `Error` frame, so a driver
+can branch on the class rather than on the message.
 
 `execScript` failures throw `PowDBScriptError`, a `PowDBError` subclass whose
 `code` mirrors the failing statement's error and which adds
@@ -574,12 +584,20 @@ try {
 }
 ```
 
-A plain `ctrl.abort()` throws a `PowDBError` with `code === "aborted"`. If you
-abort with a custom `Error` reason (`ctrl.abort(myError)`), that error is thrown
-as-is; any non-`Error` reason is wrapped in a `PowDBError` (`code === "aborted"`).
+Aborting always rejects with a `PowDBError` whose `code` is `"aborted"`,
+whatever the reason was. The reason is preserved on `.cause`: a plain
+`ctrl.abort()` leaves the `AbortError` `DOMException` there, and
+`ctrl.abort(myError)` leaves `myError` there and puts its message in the
+`PowDBError`'s own message. Branching on `err.code === "aborted"` is therefore
+enough; read `err.cause` when you need the reason itself.
 
-The socket stays open — the aborted query's reply is silently discarded when it
-arrives, and every other in-flight query still receives its own result.
+A signal that is already aborted rejects immediately and never enqueues the
+query, matching `fetch()`.
+
+The socket stays open. If the frame was already written, the server still
+replies and the client discards that reply; if the query was still waiting for
+room in the in-flight window, the frame is never written at all. Either way
+every other in-flight query still receives its own result.
 
 ## API
 
@@ -597,6 +615,7 @@ Returns a `Promise<Client>`. Options:
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
 | `eager` | `boolean` | `false` | Resolve as soon as the Connect frame is written instead of waiting for ConnectOk; queries pipeline behind the handshake (see Eager connect above) |
+| `maxInFlight` | `number` | `64` | How many requests may be on the wire at once. Beyond it, queries queue in the client instead of being written, so a burst cannot exhaust the socket's send buffer. Must be a positive integer |
 
 > **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
 > ≥0.4.6 (enforced roles). See the version matrix under Authentication.
