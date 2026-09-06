@@ -12,6 +12,7 @@ use std::io;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -126,6 +127,13 @@ pub fn incremental_backup(
         changed,
     };
     manifest.write(dest)?;
+    info!(
+        dest = %dest.display(),
+        base_source_lsn = base.source_lsn,
+        source_lsn,
+        changed = manifest.changed.len(),
+        "wrote incremental backup"
+    );
     Ok(manifest)
 }
 
@@ -219,6 +227,12 @@ pub fn restore_chain_with_sync_mode(
     }
 
     apply_restore_sync_mode(running_sync.as_ref(), dest, sync_mode)?;
+    info!(
+        dest = %dest.display(),
+        increments = increment_dirs.len(),
+        source_lsn = running_lsn,
+        "restored from a full backup plus increments"
+    );
 
     // 3. Validate the reconstructed DB opens (LSN invariant).
     let cat = Catalog::open(dest)?;

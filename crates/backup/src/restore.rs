@@ -2,6 +2,7 @@ use crate::manifest::{BackupManifest, SyncSnapshotMetadata, UNREFERENCED_DURABLE
 use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use std::io;
 use std::path::Path;
+use tracing::{info, warn};
 
 /// Controls how restore writes sync identity metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,7 @@ pub(crate) fn verify_and_copy_full(
         let bytes = std::fs::read(backup_dir.join(&f.name))?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
         if hash != f.blake3_hex {
+            warn!(file = %f.name, "blake3 mismatch while restoring; backup is corrupt");
             return Err(io::Error::other(format!(
                 "integrity check failed for {}: blake3 mismatch (backup is corrupt)",
                 f.name
@@ -179,6 +181,13 @@ pub fn restore_with_sync_mode(
         ));
     }
     drop(cat);
+    info!(
+        dest = %dest_data_dir.display(),
+        source_lsn = manifest.source_lsn,
+        files = manifest.files.len(),
+        ?sync_mode,
+        "restored a full backup"
+    );
     Ok(())
 }
 
