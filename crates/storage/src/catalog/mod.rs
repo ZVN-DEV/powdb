@@ -523,6 +523,20 @@ impl Catalog {
             tables.push(table);
         }
         let wal_path = data_dir.join(WAL_FILE);
+        // A WAL with no `PWAL` file header is read as a pre-v0.5.0 headerless
+        // log whose records start at byte 0. On a directory no pre-v0.5.0
+        // binary could have written, that header cannot legitimately be
+        // missing: reading the file that way parses arbitrary bytes as records
+        // and drops every un-checkpointed row without a word.
+        let post_legacy = active_catalog_version > LEGACY_CATALOG_VERSION
+            || tables.iter().any(|table| table.heap.format_version() > 1);
+        if post_legacy && crate::wal::is_headerless_log(&wal_path)? {
+            return Err(StorageError::WalReplay(format!(
+                "{}: WAL file header is missing or not PWAL, and this directory is not a pre-v0.5.0 database",
+                wal_path.display()
+            ))
+            .into());
+        }
         let wal = Wal::open(&wal_path, WAL_BATCH_SIZE)?;
         let mut cat = Catalog {
             tables,
@@ -824,6 +838,18 @@ impl Catalog {
         let mut skipped = 0usize;
         let mut skipped_uncommitted = 0usize;
         let mut saw_ddl = false;
+        // A record whose payload will not decode, or that names a table this
+        // catalog does not have, is dropped. Both used to happen in silence,
+        // which is the same shape as data loss: the row is simply not there
+        // afterwards and nothing said so.
+        let mut dropped = 0usize;
+        let mut first_dropped: Option<(usize, &'static str)> = None;
+        let mut note_dropped = |index: usize, why: &'static str| {
+            dropped += 1;
+            if first_dropped.is_none() {
+                first_dropped = Some((index, why));
+            }
+        };
         for (index, rec) in records.iter().enumerate() {
             if has_boundaries
                 && !committed_row_records[index]
@@ -866,7 +892,11 @@ impl Catalog {
                             tbl.heap.insert_at(rid, &row_bytes)?;
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_inserts += 1;
+                        } else {
+                            note_dropped(index, "insert for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "insert payload did not decode");
                     }
                 }
                 WalRecordType::Update => {
@@ -900,7 +930,11 @@ impl Catalog {
                             }
                             tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_updates += 1;
+                        } else {
+                            note_dropped(index, "update for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "update payload did not decode");
                     }
                 }
                 WalRecordType::Delete => {
@@ -920,7 +954,11 @@ impl Catalog {
                             let _ = tbl.heap.delete(rid);
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_deletes += 1;
+                        } else {
+                            note_dropped(index, "delete for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "delete payload did not decode");
                     }
                 }
                 WalRecordType::OverflowWrite => {
@@ -945,7 +983,14 @@ impl Catalog {
                             }
                             tbl.heap
                                 .write_overflow_page(page_id, next_page, &chunk, rec.lsn)?;
+                        } else {
+                            note_dropped(
+                                index,
+                                "overflow write for a table this catalog does not have",
+                            );
                         }
+                    } else {
+                        note_dropped(index, "overflow write payload did not decode");
                     }
                 }
                 WalRecordType::OverflowFree => {
@@ -956,7 +1001,14 @@ impl Catalog {
                     if let Some((table_name, pages)) = decode_overflow_free_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
                             self.tables[slot].heap.release_overflow_pages(&pages);
+                        } else {
+                            note_dropped(
+                                index,
+                                "overflow free for a table this catalog does not have",
+                            );
                         }
+                    } else {
+                        note_dropped(index, "overflow free payload did not decode");
                     }
                 }
                 WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => {
@@ -967,16 +1019,25 @@ impl Catalog {
                     if let Some((schema, defaults, auto_cols)) = decode_ddl_create_table(&rec.data)
                     {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
-                            if let Ok(mut table) = Table::create(schema, &self.data_dir) {
-                                table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
-                                table.set_defaults(defaults);
-                                table.set_auto_cols(auto_cols);
-                                let slot = self.tables.len();
-                                let name = table.schema.table_name.clone();
-                                self.tables.push(table);
-                                self.name_to_slot.insert(name, slot);
-                            }
+                            // A create that fails here is not survivable: every
+                            // later Insert for the table has nowhere to land and
+                            // was dropped in silence.
+                            let table_name = schema.table_name.clone();
+                            let mut table =
+                                Table::create(schema, &self.data_dir).map_err(|error| {
+                                    StorageError::WalReplay(format!(
+                                        "table '{table_name}': create table replay failed: {error}"
+                                    ))
+                                })?;
+                            table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
+                            table.set_defaults(defaults);
+                            table.set_auto_cols(auto_cols);
+                            let slot = self.tables.len();
+                            self.tables.push(table);
+                            self.name_to_slot.insert(table_name, slot);
                         }
+                    } else {
+                        note_dropped(index, "create table payload did not decode");
                     }
                 }
                 WalRecordType::DdlDropTable => {
@@ -1101,12 +1162,21 @@ impl Catalog {
                 }
             }
         }
+        if let Some((index, why)) = first_dropped {
+            warn!(
+                dropped,
+                first_record = index,
+                first_reason = why,
+                "WAL replay dropped records it could not apply"
+            );
+        }
         info!(
             inserts = replayed_inserts,
             updates = replayed_updates,
             deletes = replayed_deletes,
             skipped = skipped,
             skipped_uncommitted = skipped_uncommitted,
+            dropped = dropped,
             "WAL record apply complete (commit-boundary + LSN idempotent)"
         );
         if saw_ddl {

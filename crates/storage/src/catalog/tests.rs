@@ -1388,3 +1388,78 @@ fn replaying_an_insert_past_the_page_ceiling_refuses_fast() {
         "the refused record must not have grown the heap"
     );
 }
+
+/// A `DdlCreateTable` record whose table cannot be created is not survivable:
+/// every later Insert for that table has nowhere to land and used to be
+/// dropped in silence.
+#[test]
+fn replaying_a_create_table_that_cannot_be_created_refuses_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Seed")).unwrap();
+        cat.checkpoint().unwrap();
+
+        let payload =
+            encode_ddl_create_table(&ddl_guard_schema("Later"), &[None, None], &[false, false]);
+        cat.wal
+            .append(0, WalRecordType::DdlCreateTable, &payload)
+            .expect("append create record");
+        cat.wal.flush().expect("flush create record");
+        std::mem::forget(cat);
+    }
+
+    // A directory where the heap file cannot be created: put a directory in
+    // the way of the path `Table::create` needs.
+    fs::create_dir(dir.path().join("Later.heap")).unwrap();
+
+    let err = match Catalog::open(dir.path()) {
+        Ok(_) => panic!("a create that cannot run must refuse the open"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        StorageError::kind_of_io_error(&err),
+        Some(crate::error::StorageErrorKind::WalReplay),
+        "expected a WAL replay refusal, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("Later"),
+        "the refusal must name the table, got: {err}"
+    );
+}
+
+/// A record naming a table this catalog does not have is dropped, but the
+/// records around it still apply and the open still succeeds.
+#[test]
+fn replay_drops_a_record_for_an_unknown_table_and_keeps_going() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Real")).unwrap();
+        cat.checkpoint().unwrap();
+
+        let ghost = encode_wal_payload(
+            "Ghost",
+            RowId {
+                page_id: 1,
+                slot_index: 0,
+            },
+            b"whatever",
+        );
+        cat.wal
+            .append(0, WalRecordType::Insert, &ghost)
+            .expect("append ghost record");
+        cat.insert("Real", &vec![Value::Int(1), Value::Str("kept".into())])
+            .unwrap();
+        cat.sync_wal().unwrap();
+        std::mem::forget(cat);
+    }
+
+    let cat = Catalog::open(dir.path()).expect("an unroutable record must not fail the open");
+    let rows: Vec<_> = cat
+        .scan("Real")
+        .unwrap()
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the routable record must still have applied");
+}
