@@ -89,6 +89,7 @@ fn every_storage_kind_has_a_deliberate_wire_class() {
         (OverflowCorrupt, ErrorClass::Internal),
         (InvalidIdentifier, ErrorClass::Execution),
         (DdlInTransaction, ErrorClass::Execution),
+        (TableNotFound, ErrorClass::Execution),
         (RowTooLarge, ErrorClass::LimitExceeded),
         (ValueTooLarge, ErrorClass::LimitExceeded),
         (TransactionTooLarge, ErrorClass::LimitExceeded),
@@ -110,7 +111,7 @@ fn every_storage_kind_has_a_deliberate_wire_class() {
     // than silently leaving the new kind untested.
     assert_eq!(
         expected.len(),
-        14,
+        15,
         "a StorageErrorKind was added or removed; classify it above"
     );
 }

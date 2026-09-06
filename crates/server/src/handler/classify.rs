@@ -128,6 +128,7 @@ fn storage_message_is_client_derived(kind: StorageErrorKind) -> bool {
         | StorageErrorKind::DdlInTransaction
         | StorageErrorKind::TransactionTooLarge
         | StorageErrorKind::InvalidIdentifier
+        | StorageErrorKind::TableNotFound
         | StorageErrorKind::RowTooLarge
         | StorageErrorKind::ValueTooLarge => true,
         StorageErrorKind::Io
@@ -200,9 +201,9 @@ pub(super) fn class_for_storage_kind(kind: StorageErrorKind) -> ErrorClass {
         // The statement is not allowed here, or names something the caller
         // spelled wrong, and the message says what to do instead.
         // docs/errors.md class 2.
-        StorageErrorKind::DdlInTransaction | StorageErrorKind::InvalidIdentifier => {
-            ErrorClass::Execution
-        }
+        StorageErrorKind::DdlInTransaction
+        | StorageErrorKind::InvalidIdentifier
+        | StorageErrorKind::TableNotFound => ErrorClass::Execution,
         // Genuine server-side faults: disk failures and corruption, which no
         // client action resolves.
         StorageErrorKind::Io
