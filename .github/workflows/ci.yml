@@ -16,7 +16,12 @@ jobs:
   lint-test:
     name: clippy + fmt + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # 25, not 15. The macOS leg took 10.0 minutes on the last release run with a
+    # warm cache, which leaves five minutes of headroom for a cold one: that is
+    # a flake waiting to be reported as a failure, and a timeout tells you
+    # nothing about why. Raising it costs nothing when the job is healthy, and
+    # a genuinely hung job still ends.
+    timeout-minutes: 25
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-latest]
@@ -67,18 +72,24 @@ jobs:
     runs-on: ubuntu-24.04
     # miri interprets rather than executes, so this job is slow by nature. Run
     # as one job it sat at 16 to 20 minutes and owned the whole CI critical path
-    # while every other job finished inside 7. The filters are now sharded
-    # across this matrix, which is a wall-clock change only: every filter still
-    # runs on every commit, and `scripts/ci/miri-shards.sh` fails the job if the
-    # shards stop covering the canonical set or stop matching the names below.
-    # 20 minutes is roughly double the expected per-shard time, so a real hang
-    # still shows up as a timeout.
+    # while every other job finished inside 7. Sharding by MODULE only moved the
+    # problem: `btree` alone ran 11.1, 13.5 and 18.1 minutes on the last three
+    # main runs, against a 20 minute timeout, while the other two shards
+    # finished in under two. btree is now split three ways by test-name prefix
+    # as well, so no shard carries more than about a third of it.
+    #
+    # This is a wall-clock change only: every test still runs on every commit,
+    # and `scripts/ci/miri-shards.sh` fails the job if the shards stop covering
+    # the modules in scope, stop matching the names below, start overlapping,
+    # or (the guard prefix sharding needs) leave any in-scope test unselected.
+    # 20 minutes is now several times the expected per-shard time, so a real
+    # hang still shows up as a timeout.
     timeout-minutes: 20
     strategy:
       # One slow shard failing should not hide the verdict of the others.
       fail-fast: false
       matrix:
-        shard: [btree, row-page, json-types-view]
+        shard: [btree-core, btree-nonunique, btree-stats, row-page, json-types-view]
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -115,16 +126,27 @@ jobs:
             exit 1
           fi
           echo "shard $SHARD filters: ${filters[*]}"
-          # A libtest filter that matches nothing exits 0, so a renamed or
-          # deleted module would silently empty this shard instead of failing
+          # Two guards, both against the SAME target selection as the run below
+          # (no --lib): a guard that inspects a different set of targets than
+          # the run does is not evidence about the run.
+          #
+          # First, prove the shard map still covers every test miri is meant to
+          # interpret. Filters are test-name prefixes now, not whole modules, so
+          # a newly added `btree::tests::verify_something` could match nothing
+          # and never run while every shard stayed green. The unfiltered listing
+          # is the only thing that can see that, and it costs one extra --list
+          # against an already-built binary.
+          cargo +nightly miri test -p powdb-storage -- --list > /tmp/miri-listing.txt
+          bash scripts/ci/miri-shards.sh --check-listing /tmp/miri-listing.txt
+          # Second, a libtest filter that matches nothing exits 0, so a renamed
+          # or deleted module would silently empty this shard instead of failing
           # it (a `tx::tests` filter did exactly that: there is no tx module).
-          # List with the SAME target selection as the run below (no --lib):
-          # a guard that inspects a different set of targets than the run does
-          # is not evidence about the run. Require each filter to select at
-          # least one test. This runs per shard, so sharding cannot dilute it.
+          # Require each filter to select at least one test. This runs per
+          # shard, so sharding cannot dilute it. Prefix match, not "$filter::":
+          # a filter is now a name prefix such as `btree::tests::stats_`.
           listing=$(cargo +nightly miri test -p powdb-storage -- --list "${filters[@]}")
           for filter in "${filters[@]}"; do
-            if ! grep -q "^${filter}::" <<<"$listing"; then
+            if ! grep -q "^${filter}" <<<"$listing"; then
               echo "::error::miri filter '${filter}' matches no test in powdb-storage"
               exit 1
             fi
