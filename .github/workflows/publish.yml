@@ -53,6 +53,15 @@ jobs:
   # hazard is a point release (x.y.Z+1) cut over an unnoticed API break —
   # exactly what this catches. Dry runs get the same verdict, so a
   # dry_run=true dispatch doubles as a release preflight.
+  #
+  # Two guards make this a gate rather than a decoration, because for seven
+  # consecutive releases it was a decoration: on a 0.x MINOR bump
+  # cargo-semver-checks classifies the release as major and skips every lint,
+  # so the job printed "0 checks: 0 pass, 254 skip" for all eight crates and
+  # exited 0 having compared nothing. scripts/ci/semver-gate.sh now runs a
+  # fixture selftest that proves the checker can still fail, and refuses a
+  # "0 checks" verdict on a patch bump. The advisory step below lists the
+  # breaks a 0.x minor bump is allowed to have, so they reach the CHANGELOG.
   semver:
     name: semver-checks vs published baselines
     runs-on: ubuntu-24.04
@@ -77,8 +86,47 @@ jobs:
             | tar xz -C "$HOME/.cargo/bin"
           cargo semver-checks --version
 
+      # The selftest runs first, on a throwaway two-crate fixture whose patch
+      # release deletes a public function. It asserts the checker FAILS on that
+      # and PASSES on the same pair with the function kept, so a checker that
+      # has silently lost the ability to say no is caught here rather than at
+      # the next point release. See the script header for the history: this
+      # gate cleared seven releases in a row having executed 0 checks.
+      - name: Prove the semver checker can fail
+        run: bash scripts/ci/semver-gate.sh --selftest
+
+      # The real check, wrapped so that "0 checks" on a patch bump (the one
+      # shape cargo-semver-checks always lints) fails the job instead of
+      # reading as a pass, and so that a run which examined no crate at all
+      # fails too.
       - name: Check every publishable crate against its crates.io baseline
-        run: cargo semver-checks check-release --workspace
+        run: bash scripts/ci/semver-gate.sh
+
+      # Advisory, never a gate. cargo-semver-checks classifies a 0.x MINOR bump
+      # as a major release and skips every lint, which is correct (0.x minors
+      # are allowed to break) but leaves the release with no list of what
+      # broke. Forcing --release-type minor produces that list for the
+      # CHANGELOG and for the release notes.
+      #
+      # It ends in an explicit `exit 0` rather than `continue-on-error: true`:
+      # this repo has been burned by gates that could not fail, so a step that
+      # deliberately does not gate says so in its own body, where a reader of
+      # the log sees it, instead of in a YAML key they have to go look up.
+      - name: List breaking changes for the CHANGELOG (advisory, never blocks)
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          cargo semver-checks check-release --workspace --release-type minor --color never > "$log" 2>&1
+          echo "EXIT: $?" >> "$log"
+          cat "$log"
+          {
+            echo "## Semver advisory for a 0.x minor bump (not a gate)"
+            echo
+            echo '```'
+            grep -E '^--- failure |^[[:space:]]*Summary ' "$log" || echo "no breaking changes reported"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
   publish:
     name: publish crates
