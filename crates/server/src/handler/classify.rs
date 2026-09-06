@@ -1,113 +1,142 @@
-//! Client-facing error rendering: the [`SAFE_ERROR_PREFIXES`] egress
-//! allowlist and the mapping from a typed failure to its stable wire
+//! Client-facing error rendering: which typed failures reach the client
+//! verbatim, and the mapping from a typed failure to its stable wire
 //! [`ErrorClass`].
 
 use crate::protocol::{ErrorClass, Message};
 use powdb_query::result::QueryError;
 use powdb_storage::error::StorageErrorKind;
 
-/// Error messages that are safe to forward to the client verbatim.
-pub(super) const SAFE_ERROR_PREFIXES: &[&str] = &[
-    "table not found",
-    // The executor's actual phrasing is `table 'X' not found`, which the
-    // bare prefix above never matches — keep both so the real message
-    // reaches clients.
-    "table '",
-    "type '",
-    "column not found",
-    // Lexer diagnostics (`at position N: unterminated quoted identifier`)
-    // are derived purely from the client's own query text.
-    "at position",
-    "parse error",
-    "type mismatch",
-    "unknown table",
-    "unknown column",
-    "unknown function",
-    "syntax error",
-    "expected",
-    "unexpected",
-    "missing",
-    "duplicate",
-    "invalid",
-    "cannot",
-    "no such",
+/// What a client is told when the real message may carry internal state.
+pub(super) const REDACTED_MESSAGE: &str = "query execution error";
+
+/// Refusals the storage engine still raises as a bare [`std::io::Error`]
+/// string, so they reach the query layer as [`QueryError::StorageError`] with
+/// no [`StorageErrorKind`] to decide on.
+///
+/// Every other variant is decided by its type (see [`is_client_derived`]).
+/// This list exists only because those producers have not been typed yet: a
+/// plain I/O failure and a refusal the caller can fix arrive in the same
+/// variant, and a prefix is the only thing left that tells them apart. Adding
+/// a `StorageError` variant for a producer is what removes an entry here.
+const UNTYPED_STORAGE_SAFE_PREFIXES: &[&str] = &[
+    // Identifier and schema validation (`catalog::validate_identifier`,
+    // column/index/link DDL). Every one names only what the client wrote.
+    "invalid ",
+    "column ",
+    "table ",
+    "type ",
+    "index ",
+    "expression index ",
+    "unique ",
+    "cannot ",
+    "duplicate ",
     "already exists",
-    "permission denied",
+    "no such ",
+    "missing ",
+    "unknown ",
     "row too large",
-    "unique constraint violation",
-    // The expression-index twin of the line above. Both name only what the
-    // client itself declared (a column, or the indexed expression), so the
-    // expression text is exactly as safe to echo as "User.email" is. Without
-    // this entry the caller is told class 8 (a constraint rejected the write)
-    // over a generic message that names no constraint, which is worse than
-    // useless for fixing the data.
-    "unique expression index violation",
-    // Resource-limit errors carry actionable guidance (e.g. "add a LIMIT
-    // clause") and leak no internal state, so surface them verbatim instead
-    // of masking them to the generic message. See QueryError::{SortLimit,
-    // JoinLimit,MemoryLimit}Exceeded in crates/query/src/result.rs.
-    "sort input exceeds",
-    "join result exceeds",
-    "query exceeded memory budget",
-    "result too large",
-    // A failed covering fsync means the statement executed in memory but was
-    // never made durable — the client MUST be able to distinguish this from
-    // an ordinary failed query (the statement may still be visible until the
-    // server restarts). The io::Error detail leaks no internal state.
-    "wal durability sync failed",
-    // Cooperative query cancellation. Both messages are derived purely from
-    // the configured timeout / a client disconnect and leak no internal state.
-    // See QueryError::{Timeout,Cancelled} in crates/query/src/result.rs.
-    "query timeout after",
-    "query cancelled",
-    // Read-only snapshot serving refuses mutations (and reads needing a writer,
-    // e.g. a stale materialized view) with an operator-facing message that names
-    // the mode and the fix. It leaks no internal state.
-    // See QueryError::ReadonlyMode in crates/query/src/result.rs.
-    "readonly mode",
-    // Entity-link diagnostics. Every one of these is derived from the client's
-    // own statement plus catalog names the client just used, exactly like the
-    // `table '...'` / `column not found` entries above, and every one names the
-    // fix. Without these prefixes a remote client saw "query execution error"
-    // for the whole link feature while an embedded caller saw the real message,
-    // so a driver could not tell a typo from a server fault.
-    // Covers the catalog's `link '<name>' not found on owner type '<T>'`,
-    // `link '<name>' already exists on owner type '<T>'`, `link local key ...`,
-    // `link target key ...`, `link name '<name>' collides with a column ...`,
-    // the planner's `link path starts at unknown alias ...`, and the executor's
-    // `link traversal requires ...`.
+    "value too large",
+    // Entity-link diagnostics raised by the catalog: `link '<name>' not found
+    // on owner type '<T>'`, `link local key ...`, `link target key ...`,
+    // `link name '<name>' collides with a column ...`.
     "link ",
     "links ",
-    // The executor's own phrasing for a link that was never declared
-    // (`unknown link `x` on type `T``), which the bare `unknown table` /
-    // `unknown column` entries above never matched.
-    "unknown link",
-    // The planner's correct-by-default refusal of an aggregate over a nested or
-    // link projection: it names the statement the client sent and the rewrite
-    // that works. See crates/query/src/planner.rs.
-    "aggregates over",
-    // The SQL frontend's subset walls (the table in docs/SQL.md): every one
-    // is a static diagnostic naming the unsupported construct the client
-    // itself wrote and the working alternative, exactly like the link
-    // prefixes above. Without these a remote SQL user got the generic
-    // "query execution error" for CASE, COALESCE, COUNT(DISTINCT), CAST,
-    // OVER, IN, EXISTS, scalar subqueries, BETWEEN, and table constraints,
-    // while an embedded caller saw the real message (docs/SQL.md used to
-    // document that gap as a caveat).
-    "sql ",
-    // The frontend's `RETURNING currently supports only \`RETURNING *\``
-    // wall, phrased from the client's own clause.
-    "returning ",
+    // The catalog's refusal of a second `begin` on the same engine.
+    "explicit transaction is already active",
+    // Read-only (snapshot-serving) refusal from the data-file layer.
+    "cannot write: data file was opened read-only",
 ];
 
-/// Build the client-facing error frame: sanitized message plus the stable
-/// 1-byte [`ErrorClass`]. The class is orthogonal to the message text: it is
-/// derived from the typed error (or the call site), never from the message,
-/// so sanitization to a generic string does not degrade it.
+/// Build a client-facing error frame from an already-decided message and
+/// class.
 pub(super) fn error_response(message: impl Into<String>, class: ErrorClass) -> Message {
     Message::ErrorWithClass {
         message: message.into(),
         class,
+    }
+}
+
+/// The client-facing frame for a typed query failure: the message the client
+/// reads plus the class byte a driver branches on.
+pub(super) fn query_error_response(e: &QueryError) -> Message {
+    error_response(client_facing_message(e), classify_query_error(e))
+}
+
+/// The text a client is shown for a typed query failure.
+///
+/// Every failure the engine phrases from the client's own statement crosses
+/// verbatim; only messages that can carry internal state (a plain I/O error,
+/// corruption detail, the read-only retry sentinel) are replaced. The decision
+/// is made on the variant, not on the message, so rewording a diagnostic can
+/// never silently mask it — which is exactly how `column '<x>' not found`,
+/// every uuid/bytes parse error, `commit` with no transaction, and a dozen
+/// other everyday mistakes used to reach remote clients as
+/// [`REDACTED_MESSAGE`] while an embedded caller saw the real text.
+pub(super) fn client_facing_message(e: &QueryError) -> String {
+    if is_client_derived(e) {
+        e.to_string()
+    } else {
+        REDACTED_MESSAGE.to_string()
+    }
+}
+
+/// Whether this failure's message is derived from the client's own statement
+/// (or from configuration the operator chose), and therefore safe to forward.
+///
+/// The match is exhaustive with no wildcard arm: a new [`QueryError`] variant
+/// does not compile until someone decides whether its text may cross the wire.
+fn is_client_derived(e: &QueryError) -> bool {
+    match e {
+        // Phrased from the statement the client sent, the schema it just
+        // named, or a budget the operator configured.
+        QueryError::TableNotFound(_)
+        | QueryError::ColumnNotFound { .. }
+        | QueryError::TypeError(_)
+        | QueryError::IndexError(_)
+        | QueryError::ViewError(_)
+        | QueryError::Parse(_)
+        | QueryError::Execution(_)
+        | QueryError::JoinLimitExceeded
+        | QueryError::NestedLoopPairLimitExceeded { .. }
+        | QueryError::SortLimitExceeded
+        | QueryError::MemoryLimitExceeded { .. }
+        | QueryError::ReadonlyMode
+        | QueryError::Timeout { .. }
+        | QueryError::Cancelled => true,
+        // A storage refusal that kept its kind: the kind says whether the
+        // message describes the caller's request or the server's disk.
+        QueryError::Storage { kind, .. } => storage_message_is_client_derived(*kind),
+        // No kind survived, so a caller-fixable refusal and a disk failure are
+        // indistinguishable by type. Fall back to the prefix list.
+        QueryError::StorageError(message) => {
+            let lower = message.to_lowercase();
+            UNTYPED_STORAGE_SAFE_PREFIXES
+                .iter()
+                .any(|prefix| lower.starts_with(prefix))
+        }
+        // An internal retry sentinel. Its Display is a marker string the
+        // server intercepts before it can reach a client.
+        QueryError::ReadonlyNeedsWrite => false,
+    }
+}
+
+/// Whether a storage refusal of this kind describes the caller's own request.
+fn storage_message_is_client_derived(kind: StorageErrorKind) -> bool {
+    match kind {
+        StorageErrorKind::UniqueConstraintViolation
+        | StorageErrorKind::UniqueExpressionIndexViolation
+        | StorageErrorKind::DdlInTransaction
+        | StorageErrorKind::TransactionTooLarge
+        | StorageErrorKind::InvalidIdentifier
+        | StorageErrorKind::RowTooLarge
+        | StorageErrorKind::ValueTooLarge => true,
+        StorageErrorKind::Io
+        | StorageErrorKind::CorruptData
+        | StorageErrorKind::CorruptCrc
+        | StorageErrorKind::WalReplay
+        | StorageErrorKind::CatalogCorrupt
+        | StorageErrorKind::PageCorrupt
+        | StorageErrorKind::OverflowCorrupt => false,
     }
 }
 
@@ -132,28 +161,16 @@ pub(super) fn classify_query_error(e: &QueryError) -> ErrorClass {
         | QueryError::ColumnNotFound { .. }
         | QueryError::TypeError(_)
         | QueryError::IndexError(_)
-        | QueryError::ViewError(_) => ErrorClass::Execution,
+        | QueryError::ViewError(_)
+        | QueryError::Execution(_) => ErrorClass::Execution,
         // A storage refusal that kept its kind is classified from the kind.
         QueryError::Storage { kind, .. } => class_for_storage_kind(*kind),
         // A storage failure with no [`StorageErrorKind`] to classify on. Since
         // `From<StorageError> for io::Error` carries the typed error as the
-        // source (error.rs), the only way to land here is a plain I/O failure
-        // (disk error, unexpected EOF): a genuine server-side fault, which is
-        // exactly what class 0 tells a driver. The substring fallback that
-        // used to sit here (`class_for_legacy_storage_text`) is gone with the
-        // last path that stringified a refusal early; the binary-level suite
-        // `wire_error_class_from_type.rs` pins every classified refusal to
-        // its class end to end, so a new early-stringify path fails there.
+        // source (error.rs), the only way to land here is a producer that
+        // raised a bare `io::Error`: a genuine server-side fault as far as the
+        // type system can tell, which is what class 0 tells a driver.
         QueryError::StorageError(_) => ErrorClass::Internal,
-        QueryError::Execution(msg) => {
-            if msg.starts_with("unique constraint violation") {
-                ErrorClass::ConstraintViolation
-            } else if msg.starts_with("result too large") {
-                ErrorClass::LimitExceeded
-            } else {
-                ErrorClass::Execution
-            }
-        }
     }
 }
 
@@ -166,42 +183,34 @@ pub(super) fn classify_query_error(e: &QueryError) -> ErrorClass {
 /// byte is what a driver branches on, so defaulting a new refusal to
 /// [`ErrorClass::Internal`] ("the server broke, nothing to fix on your side")
 /// is a wrong answer, not a safe one.
-fn class_for_storage_kind(kind: StorageErrorKind) -> ErrorClass {
+pub(super) fn class_for_storage_kind(kind: StorageErrorKind) -> ErrorClass {
     match kind {
         // A constraint rejected the write. The caller's data is the problem
         // and the caller can fix it. docs/errors.md class 8.
         StorageErrorKind::UniqueConstraintViolation
         | StorageErrorKind::UniqueExpressionIndexViolation => ErrorClass::ConstraintViolation,
-        // A size budget was exceeded, with actionable guidance in the message
-        // (commit more often). docs/errors.md class 4.
-        StorageErrorKind::TransactionTooLarge => ErrorClass::LimitExceeded,
-        // The statement is not allowed here, and the message says what to do
-        // instead (commit or roll back first). docs/errors.md class 2.
-        StorageErrorKind::DdlInTransaction => ErrorClass::Execution,
-        // Genuine server-side faults: disk failures, corruption, and the
-        // physical row/value caps, which no client action resolves.
+        // A size budget was exceeded, with actionable guidance in the message.
+        // `RowTooLarge` and `ValueTooLarge` are the caller's data being too
+        // big for a documented cap, not a server fault: a driver told class 0
+        // retries or pages the operator, when the fix is to shrink the row.
+        // docs/errors.md class 4.
+        StorageErrorKind::TransactionTooLarge
+        | StorageErrorKind::RowTooLarge
+        | StorageErrorKind::ValueTooLarge => ErrorClass::LimitExceeded,
+        // The statement is not allowed here, or names something the caller
+        // spelled wrong, and the message says what to do instead.
+        // docs/errors.md class 2.
+        StorageErrorKind::DdlInTransaction | StorageErrorKind::InvalidIdentifier => {
+            ErrorClass::Execution
+        }
+        // Genuine server-side faults: disk failures and corruption, which no
+        // client action resolves.
         StorageErrorKind::Io
         | StorageErrorKind::CorruptData
         | StorageErrorKind::CorruptCrc
         | StorageErrorKind::WalReplay
         | StorageErrorKind::CatalogCorrupt
         | StorageErrorKind::PageCorrupt
-        | StorageErrorKind::InvalidIdentifier
-        | StorageErrorKind::RowTooLarge
-        | StorageErrorKind::ValueTooLarge
         | StorageErrorKind::OverflowCorrupt => ErrorClass::Internal,
     }
-}
-
-/// Sanitize an error message before sending it to the client.
-/// Known safe errors are passed through; everything else is replaced
-/// with a generic message to avoid leaking internal details.
-pub(super) fn sanitize_error(e: &str) -> String {
-    let lower = e.to_lowercase();
-    for prefix in SAFE_ERROR_PREFIXES {
-        if lower.starts_with(prefix) {
-            return e.to_string();
-        }
-    }
-    "query execution error".into()
 }

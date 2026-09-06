@@ -2,8 +2,9 @@
 //! reader and its in-flight read-ahead queue, and the encoding of a
 //! [`QueryResult`] into a response frame.
 
-use crate::protocol::{frame_payload_len, Message};
-use powdb_query::result::{QueryError, QueryResult};
+use super::classify::error_response;
+use crate::protocol::{frame_payload_len, ErrorClass, Message};
+use powdb_query::result::QueryResult;
 use powdb_storage::types::Value;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -16,8 +17,14 @@ pub(super) const MAX_WIRE_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 /// Frames received while a query is executing are retained for normal
 /// pipelined processing. Both limits are deliberately much smaller than the
 /// ordinary 64 MiB per-frame protocol limit: in-flight read-ahead is merely a
-/// liveness aid, not a second request buffer. Reaching either cap cancels the
-/// query and closes the connection; socket monitoring is never disabled.
+/// liveness aid, not a second request buffer.
+///
+/// Reaching either cap PAUSES read-ahead until the queue drains, so a burst
+/// of any size still completes in order. Cancelling the query and closing the
+/// connection (the previous behavior) turned an ordinary `Promise.all` of 200
+/// queries into 22 answers and an ECONNRESET, with no Error frame to say why.
+/// A client that has a frame queued here is by definition still connected, so
+/// nothing is lost by not watching its socket for the rest of the statement.
 pub(super) const MAX_IN_FLIGHT_READ_AHEAD_FRAMES: usize = 128;
 
 pub(super) const MAX_IN_FLIGHT_READ_AHEAD_BYTES: usize = 1024 * 1024;
@@ -157,16 +164,18 @@ pub(super) struct InFlightReadAhead {
 }
 
 impl InFlightReadAhead {
-    pub(super) fn len(&self) -> usize {
-        self.frames.len()
+    /// Whether another frame may be read ahead while a query runs.
+    ///
+    /// Reaching either cap pauses the read arm rather than closing the
+    /// connection. The queue may overshoot the byte cap by at most the one
+    /// frame that crosses it, which the protocol already bounds.
+    pub(super) fn has_room(&self) -> bool {
+        self.frames.len() < MAX_IN_FLIGHT_READ_AHEAD_FRAMES
+            && self.wire_bytes < MAX_IN_FLIGHT_READ_AHEAD_BYTES
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.frames.is_empty()
-    }
-
-    pub(super) fn remaining_bytes(&self) -> usize {
-        MAX_IN_FLIGHT_READ_AHEAD_BYTES.saturating_sub(self.wire_bytes)
     }
 
     pub(super) fn push_back(&mut self, frame: DecodedWireMessage) {
@@ -207,11 +216,66 @@ impl<R> FrameStream<'_, R> {
     }
 }
 
+/// Why the frame reader stopped.
+///
+/// The distinction is what a client is owed. A frame refused on its own
+/// content is the client's mistake and must be named before the connection
+/// closes; a transport failure has no reply and nowhere to put one. Before
+/// this split both ended as a bare close, so a client that sent 4097
+/// parameters and a client whose server crashed saw the same ECONNRESET.
+pub(super) enum FrameReadError {
+    /// The frame is refused on its own content: it declares more payload than
+    /// the wire limit, or its bytes do not decode.
+    Refused { reply: Message, detail: String },
+    /// The socket failed, or the peer went away mid-frame.
+    Transport(std::io::Error),
+}
+
+impl FrameReadError {
+    fn refused(detail: String, class: ErrorClass) -> Self {
+        FrameReadError::Refused {
+            reply: error_response(detail.clone(), class),
+            detail,
+        }
+    }
+
+    /// Whether the peer simply went away, as opposed to something the
+    /// operator should look at. A load balancer that opens a TCP connection
+    /// and closes it produces one of these on every probe.
+    pub(super) fn is_peer_gone(&self) -> bool {
+        match self {
+            FrameReadError::Refused { .. } => false,
+            FrameReadError::Transport(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for FrameReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameReadError::Refused { detail, .. } => f.write_str(detail),
+            FrameReadError::Transport(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for FrameReadError {
+    fn from(e: std::io::Error) -> Self {
+        FrameReadError::Transport(e)
+    }
+}
+
 pub(super) async fn read_message_cancel_safe<R>(
     reader: &mut BufReader<R>,
     buffered: &mut Vec<u8>,
     max_frame_len: usize,
-) -> std::io::Result<Option<DecodedWireMessage>>
+) -> Result<Option<DecodedWireMessage>, FrameReadError>
 where
     R: AsyncRead + Unpin,
 {
@@ -219,36 +283,35 @@ where
         if let Some(declared_payload_len) = frame_payload_len(buffered) {
             let payload_len = declared_payload_len as usize;
             if payload_len > MAX_WIRE_PAYLOAD_SIZE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                return Err(FrameReadError::refused(
                     format!("payload too large: {payload_len} bytes (max {MAX_WIRE_PAYLOAD_SIZE})"),
+                    ErrorClass::LimitExceeded,
                 ));
             }
             let frame_len = 6usize.checked_add(payload_len).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "wire frame length overflow",
+                FrameReadError::refused(
+                    "wire frame length overflow".to_string(),
+                    ErrorClass::LimitExceeded,
                 )
             })?;
             if frame_len > max_frame_len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
+                return Err(FrameReadError::refused(
                     format!(
                         "wire frame exceeds the available in-flight read-ahead budget: \
                          {frame_len} bytes (available {max_frame_len})"
                     ),
+                    ErrorClass::LimitExceeded,
                 ));
             }
             if buffered.len() >= frame_len {
                 let frame: Vec<u8> = buffered.drain(..frame_len).collect();
-                return Message::decode(&frame)
-                    .map(|message| {
-                        Some(DecodedWireMessage {
-                            message,
-                            wire_len: frame_len,
-                        })
-                    })
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                return match Message::decode(&frame) {
+                    Ok(message) => Ok(Some(DecodedWireMessage {
+                        message,
+                        wire_len: frame_len,
+                    })),
+                    Err(e) => Err(FrameReadError::refused(e.to_string(), e.class())),
+                };
             }
         }
 
@@ -263,9 +326,9 @@ where
                 .checked_add(payload_len as usize)
                 .and_then(|frame_len| frame_len.checked_sub(buffered.len()))
                 .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid buffered wire frame length",
+                    FrameReadError::refused(
+                        "invalid buffered wire frame length".to_string(),
+                        ErrorClass::LimitExceeded,
                     )
                 })?,
         };
@@ -278,10 +341,10 @@ where
                 buffered.clear();
                 return Ok(None);
             }
-            return Err(std::io::Error::new(
+            return Err(FrameReadError::Transport(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "connection closed in the middle of a wire frame",
-            ));
+            )));
         }
         buffered.extend_from_slice(&chunk[..read]);
     }
@@ -293,13 +356,34 @@ pub(super) enum ConnectionTermination {
     ReadError,
 }
 
-fn charge_response_bytes(total: &mut usize, bytes: usize) -> Result<(), QueryError> {
+/// The encoded response would not fit in one wire frame.
+///
+/// A server-side refusal with no engine error behind it: the statement
+/// succeeded and only its rendering is too big. It is its own type rather
+/// than a `QueryError::Execution` whose text the classifier had to recognize,
+/// because a substring search is what decided its wire class before, and a
+/// reworded message would silently have downgraded it to class 2.
+#[derive(Debug)]
+pub(super) struct ResponseTooLarge {
+    limit_bytes: usize,
+}
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "result too large: encoded response exceeds {} bytes; add a limit or narrower projection",
+            self.limit_bytes
+        )
+    }
+}
+
+fn charge_response_bytes(total: &mut usize, bytes: usize) -> Result<(), ResponseTooLarge> {
     *total = total.saturating_add(bytes);
     if *total > MAX_RESPONSE_PAYLOAD_SIZE {
-        return Err(QueryError::Execution(format!(
-            "result too large: encoded response exceeds {} bytes; add a limit or narrower projection",
-            MAX_RESPONSE_PAYLOAD_SIZE
-        )));
+        return Err(ResponseTooLarge {
+            limit_bytes: MAX_RESPONSE_PAYLOAD_SIZE,
+        });
     }
     Ok(())
 }
@@ -319,7 +403,7 @@ pub(super) fn native_value_body_len(value: &Value) -> usize {
 pub(super) fn query_result_to_message(
     result: QueryResult,
     result_mode: WireResultMode,
-) -> Result<Message, QueryError> {
+) -> Result<Message, ResponseTooLarge> {
     match result {
         QueryResult::Rows { columns, rows } => {
             let mut encoded_bytes = 2usize; // column count

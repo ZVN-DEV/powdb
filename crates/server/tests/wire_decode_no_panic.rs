@@ -70,7 +70,7 @@ fn typed_value(type_id: TypeId, declared_len: u32, body: &[u8]) -> Vec<u8> {
 fn must_refuse(frame: &[u8], what: &str) -> String {
     match Message::decode(frame) {
         Ok(message) => panic!("{what}: expected a decode error, got {message:?}"),
-        Err(error) => error,
+        Err(error) => error.to_string(),
     }
 }
 

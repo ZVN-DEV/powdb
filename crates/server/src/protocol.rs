@@ -374,6 +374,61 @@ pub enum ErrorClass {
     ProtocolVersion = 10,
 }
 
+/// Why a wire frame failed to decode, together with the class the client is
+/// owed for it.
+///
+/// A frame the decoder refuses is the client's own mistake, and a driver has
+/// to be able to tell "your request exceeded a cap" from "your frame was
+/// malformed". Carrying the class on the error is what lets the connection
+/// answer with a typed Error frame instead of simply closing: before this,
+/// every frame-level refusal was a silent disconnect the client read as a
+/// transport failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeError {
+    message: String,
+    class: ErrorClass,
+}
+
+impl DecodeError {
+    /// A size or count cap the frame exceeded. docs/errors.md class 4.
+    fn limit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            class: ErrorClass::LimitExceeded,
+        }
+    }
+
+    /// The wire class a client is given for this refusal.
+    pub fn class(&self) -> ErrorClass {
+        self.class
+    }
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Every refusal that is not an explicit cap is a malformed frame: the client
+/// sent something the protocol does not describe. docs/errors.md class 2.
+impl From<String> for DecodeError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            class: ErrorClass::Execution,
+        }
+    }
+}
+
+impl From<&str> for DecodeError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 impl ErrorClass {
     /// The stable wire byte for this class.
     pub fn as_u8(self) -> u8 {
@@ -820,7 +875,7 @@ impl Message {
     }
 
     /// Decode message from wire format.
-    pub fn decode(data: &[u8]) -> Result<Message, String> {
+    pub fn decode(data: &[u8]) -> Result<Message, DecodeError> {
         if data.len() < 6 {
             return Err("frame too short".into());
         }
@@ -911,7 +966,7 @@ impl Message {
                 let count = u16::from_le_bytes(count_bytes) as usize;
                 pos += 2;
                 if count > MAX_PARAMS {
-                    return Err("too many parameters".into());
+                    return Err(DecodeError::limit("too many parameters"));
                 }
                 let mut params = Vec::with_capacity(count.min(payload.len() - pos));
                 for _ in 0..count {
@@ -951,7 +1006,7 @@ impl Message {
                             WireParam::Bool(v)
                         }
                         4 => WireParam::Str(decode_string(payload, &mut pos)?),
-                        other => return Err(format!("unknown param tag: {other}")),
+                        other => return Err(format!("unknown param tag: {other}").into()),
                     };
                     params.push(p);
                 }
@@ -1018,7 +1073,7 @@ impl Message {
                 let status = decode_sync_status(payload, &mut pos)?;
                 let count = decode_u32(payload, &mut pos, "sync retained unit count")? as usize;
                 if count > MAX_SYNC_UNITS {
-                    return Err("too many retained units".into());
+                    return Err(DecodeError::limit("too many retained units"));
                 }
                 let mut units = Vec::with_capacity(count.min(payload.len().saturating_sub(pos)));
                 for _ in 0..count {
@@ -1057,7 +1112,7 @@ impl Message {
                 let col_count = u16::from_le_bytes(col_bytes) as usize;
                 pos += 2;
                 if col_count > MAX_COLUMNS {
-                    return Err("too many columns".into());
+                    return Err(DecodeError::limit("too many columns"));
                 }
                 let mut columns =
                     Vec::with_capacity(col_count.min((payload.len() - pos) / STRING_LEN_PREFIX));
@@ -1073,7 +1128,7 @@ impl Message {
                 let row_count = u32::from_le_bytes(row_bytes) as usize;
                 pos += 4;
                 if row_count > MAX_ROWS {
-                    return Err("too many rows".into());
+                    return Err(DecodeError::limit("too many rows"));
                 }
                 // Never preallocate (or iterate) proportional to an untrusted count: each row
                 // carries `col_count` length-prefixed strings of >= STRING_LEN_PREFIX bytes, so
@@ -1129,7 +1184,7 @@ impl Message {
             MSG_DISCONNECT => Ok(Message::Disconnect),
             MSG_PING => Ok(Message::Ping),
             MSG_PONG => Ok(Message::Pong),
-            _ => Err(format!("unknown message type: {msg_type:#x}")),
+            _ => Err(format!("unknown message type: {msg_type:#x}").into()),
         }
     }
 
@@ -1207,10 +1262,14 @@ fn encode_feature_list(out: &mut Vec<u8>, features: &[String]) {
     }
 }
 
-fn decode_feature_list(data: &[u8], pos: &mut usize, label: &str) -> Result<Vec<String>, String> {
+fn decode_feature_list(
+    data: &[u8],
+    pos: &mut usize,
+    label: &str,
+) -> Result<Vec<String>, DecodeError> {
     let count = decode_u16(data, pos, label)? as usize;
     if count > MAX_HELLO_FEATURES {
-        return Err(format!("too many {label} entries"));
+        return Err(DecodeError::limit(format!("too many {label} entries")));
     }
     // Every name costs at least its 4-byte length prefix, so the remaining
     // payload bounds how many can follow. This mirrors the amplification
@@ -1219,13 +1278,13 @@ fn decode_feature_list(data: &[u8], pos: &mut usize, label: &str) -> Result<Vec<
     // allocation to 64 entries, so removing this line changes only when the
     // error is raised, never whether. It is deliberately not asserted on.
     if count.saturating_mul(STRING_LEN_PREFIX) > data.len().saturating_sub(*pos) {
-        return Err(format!("{label} count exceeds payload size"));
+        return Err(format!("{label} count exceeds payload size").into());
     }
     let mut features = Vec::with_capacity(count);
     for _ in 0..count {
         let name = decode_string_strict(data, pos, label)?;
         if name.len() > MAX_FEATURE_NAME_LEN {
-            return Err(format!("{label} name too long"));
+            return Err(format!("{label} name too long").into());
         }
         features.push(name);
     }
@@ -1246,7 +1305,7 @@ fn encode_client_hello(out: &mut Vec<u8>, hello: &ClientHello) {
 /// extension point a later release appends to, so an older peer must skip
 /// them rather than reject the frame. `pos` is advanced only past what this
 /// version understands, and the caller treats the rest as consumed.
-fn decode_client_hello(data: &[u8], pos: &mut usize) -> Result<ClientHello, String> {
+fn decode_client_hello(data: &[u8], pos: &mut usize) -> Result<ClientHello, DecodeError> {
     let magic = decode_u32(data, pos, "client hello magic")?;
     if magic != HELLO_MAGIC {
         return Err("malformed CONNECT hello block".into());
@@ -1274,7 +1333,7 @@ fn encode_server_hello(out: &mut Vec<u8>, hello: &ServerHello) {
 
 /// Decode a server hello block. Trailing bytes are a future extension and are
 /// skipped, exactly as in [`decode_client_hello`].
-fn decode_server_hello(data: &[u8], pos: &mut usize) -> Result<ServerHello, String> {
+fn decode_server_hello(data: &[u8], pos: &mut usize) -> Result<ServerHello, DecodeError> {
     let magic = decode_u32(data, pos, "server hello magic")?;
     if magic != HELLO_MAGIC {
         return Err("malformed CONNECT_OK hello block".into());
@@ -1320,12 +1379,12 @@ fn encode_query_with_params(query: &str, params: &[WireParam]) -> Vec<u8> {
     buf
 }
 
-fn decode_query_with_params_exact(payload: &[u8]) -> Result<(String, Vec<WireParam>), String> {
+fn decode_query_with_params_exact(payload: &[u8]) -> Result<(String, Vec<WireParam>), DecodeError> {
     let mut pos = 0;
     let query = decode_string_strict(payload, &mut pos, "native query")?;
     let count = decode_u16(payload, &mut pos, "native param count")? as usize;
     if count > MAX_PARAMS {
-        return Err("too many parameters".into());
+        return Err(DecodeError::limit("too many parameters"));
     }
     // Every parameter consumes at least its one-byte tag.
     if count > payload.len().saturating_sub(pos) {
@@ -1350,7 +1409,7 @@ fn decode_query_with_params_exact(payload: &[u8]) -> Result<(String, Vec<WirePar
             }
             3 => WireParam::Bool(decode_bool(payload, &mut pos, "bool param")?),
             4 => WireParam::Str(decode_string_strict(payload, &mut pos, "string param")?),
-            other => return Err(format!("unknown param tag: {other}")),
+            other => return Err(format!("unknown param tag: {other}").into()),
         });
     }
     require_payload_end(payload, pos, "native parameterized query")?;
@@ -1452,11 +1511,11 @@ fn decode_typed_value(data: &[u8], pos: &mut usize) -> Result<Value, String> {
     }
 }
 
-fn decode_native_rows(payload: &[u8]) -> Result<Message, String> {
+fn decode_native_rows(payload: &[u8]) -> Result<Message, DecodeError> {
     let mut pos = 0;
     let col_count = decode_u16(payload, &mut pos, "native column count")? as usize;
     if col_count > MAX_COLUMNS {
-        return Err("too many columns".into());
+        return Err(DecodeError::limit("too many columns"));
     }
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
@@ -1468,7 +1527,7 @@ fn decode_native_rows(payload: &[u8]) -> Result<Message, String> {
     }
     let row_count = decode_u32(payload, &mut pos, "native row count")? as usize;
     if row_count > MAX_ROWS {
-        return Err("too many rows".into());
+        return Err(DecodeError::limit("too many rows"));
     }
     // Every cell has at least a one-byte type and four-byte body length.
     let minimum_row_len = col_count

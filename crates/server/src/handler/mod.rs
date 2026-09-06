@@ -50,9 +50,30 @@ use self::transaction::{
 };
 use self::wire::{
     flush_before_close, is_success_response, native_value_body_len, read_message_cancel_safe,
-    write_msg, write_msg_within, ConnectionTermination, FrameStream, InFlightReadAhead,
-    WireResultMode, MAX_WIRE_PAYLOAD_SIZE, WRITE_TIMEOUT,
+    write_msg, write_msg_within, ConnectionTermination, FrameReadError, FrameStream,
+    InFlightReadAhead, WireResultMode, MAX_WIRE_PAYLOAD_SIZE, WRITE_TIMEOUT,
 };
+
+/// Whether an I/O failure is just the peer going away.
+fn is_peer_gone_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Log a frame-read failure at the level an operator should read it as: a
+/// peer that vanished is routine, anything else is worth looking at.
+fn report_frame_read_error(peer: &str, e: &FrameReadError) {
+    if e.is_peer_gone() {
+        debug!(peer = %peer, error = %e, "peer disconnected");
+    } else {
+        warn!(peer = %peer, error = %e, "read error");
+    }
+}
 
 /// Hard ceiling on the whole pre-auth phase of a connection — waiting for
 /// CONNECT, pre-auth Pings included. Ten seconds mirrors the TLS handshake
@@ -168,7 +189,15 @@ async fn serve_connection<R, W>(
                 return;
             }
             Ok(Err(e)) => {
-                error!(peer = %peer, error = %e, "error reading CONNECT");
+                // A peer that disconnects before sending a frame is the
+                // ordinary shape of a TCP health probe (connect, close). It
+                // logged at ERROR once per probe interval on every idle
+                // container, which trains operators to ignore the level.
+                if is_peer_gone_io(&e) {
+                    debug!(peer = %peer, error = %e, "peer disconnected before CONNECT");
+                } else {
+                    error!(peer = %peer, error = %e, "error reading CONNECT");
+                }
                 return;
             }
             Err(_) => {
@@ -404,7 +433,14 @@ async fn serve_connection<R, W>(
                         Ok(Ok(Some(frame))) => frame.message,
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
-                            error!(peer = %peer, error = %e, "read error");
+                            report_frame_read_error(&peer, &e);
+                            if let FrameReadError::Refused { reply, .. } = e {
+                                // The frame was refused on its own content, so
+                                // the client has to be told which cap it hit.
+                                // The stream is desynchronized past this point;
+                                // the connection closes after the reply.
+                                write_msg_within(writer, &reply, tx_deadline).await;
+                            }
                             break;
                         }
                         Err(_) => {
@@ -798,10 +834,10 @@ async fn serve_connection<R, W>(
                     .await
                     .map(|result| result.map(|frame| frame.map(|frame| frame.message)))
                     .unwrap_or_else(|_| {
-                        Err(std::io::Error::new(
+                        Err(FrameReadError::Transport(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "timeout decoding fully-buffered frame",
-                        ))
+                        )))
                     })
                 };
                 match next_message {
@@ -813,14 +849,15 @@ async fn serve_connection<R, W>(
                         | Message::QuerySqlNative { .. }
                         | Message::QueryWithParamsNative { .. }),
                     )) => {
-                        // If another connection currently holds the TxGate,
-                        // the next statement would block on the gate with
-                        // this batch's replies still unflushed (pre-batching,
-                        // they'd already have been written). Flush first and
-                        // handle the frame on the next main-loop iteration.
-                        // Benign TOCTOU: worst case is one early flush or one
-                        // gate wait with an empty reply queue.
-                        if tx_gate.available_permits() == 0 {
+                        // If another connection currently holds any part of
+                        // the TxGate, the next statement may block on the gate
+                        // with this batch's replies still unflushed
+                        // (pre-batching, they'd already have been written).
+                        // Flush first and handle the frame on the next
+                        // main-loop iteration. Benign TOCTOU: worst case is one
+                        // early flush or one gate wait with an empty reply
+                        // queue.
+                        if tx_gate.available_permits() < tx_gate.permit_count() as usize {
                             carry = Some(next);
                             break;
                         }
@@ -837,7 +874,10 @@ async fn serve_connection<R, W>(
                         break;
                     }
                     Err(e) => {
-                        error!(peer = %peer, error = %e, "read error");
+                        report_frame_read_error(&peer, &e);
+                        if let FrameReadError::Refused { reply, .. } = e {
+                            responses.push(reply);
+                        }
                         fatal = Some(ConnectionTermination::ReadError);
                         break;
                     }
