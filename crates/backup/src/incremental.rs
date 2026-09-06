@@ -1,12 +1,12 @@
 use crate::manifest::{
-    active_durable_file_names, current_sync_snapshot_metadata, validate_catalog_transition,
-    BackupManifest, ChangedFile, IncrementManifest,
+    active_durable_file_names, current_sync_snapshot_metadata, durable_file_is_optional,
+    validate_catalog_transition, BackupManifest, ChangedFile, IncrementManifest,
 };
 use crate::restore::{
     apply_restore_sync_mode, ensure_empty_dir, validate_backup_file_name, validate_delta_file_name,
     verify_and_copy_full, RestoreSyncMode,
 };
-use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
+use powdb_storage::catalog::Catalog;
 use powdb_storage::page::{page_lsn, PAGE_SIZE};
 use std::io;
 use std::io::{Seek, SeekFrom, Write};
@@ -56,7 +56,7 @@ pub fn incremental_backup(
     for name in entries {
         let path = src.join(&name);
         if !path.exists() {
-            if name == CATALOG_LSN_FILE {
+            if durable_file_is_optional(&name) {
                 continue;
             }
             return Err(io::Error::new(

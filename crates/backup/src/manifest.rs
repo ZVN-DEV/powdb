@@ -36,7 +36,25 @@ pub(crate) fn validate_catalog_transition(base: u16, next: u16) -> io::Result<()
     Ok(())
 }
 
-/// Durable files referenced by current catalog metadata.
+/// Durable files that sit beside the catalog without being referenced by
+/// catalog metadata: the materialized-view registry and the user store. They
+/// are snapshotted whenever they exist and their absence is normal (a database
+/// with no views, or one that was never given users).
+///
+/// A restored directory that lost `views.bin` serves whatever rows the backing
+/// heaps happen to hold and cannot refresh a view; one that lost `auth.json`
+/// accepts unauthenticated connections.
+pub(crate) const UNREFERENCED_DURABLE_FILES: &[&str] = &["views.bin", "auth.json"];
+
+/// Files a data dir holds that a snapshot deliberately leaves behind: the WAL
+/// (truncated by the checkpoint that precedes every backup, so a snapshot is
+/// already a clean-shutdown image) and the writer lock. Only the coverage
+/// test below consumes this; it is the other half of the durable-file census.
+#[cfg(test)]
+const NON_SNAPSHOT_FILES: &[&str] = &["wal.log", "LOCK"];
+
+/// Durable files referenced by current catalog metadata, plus the unreferenced
+/// durable files that are present on disk.
 ///
 /// Expression-index filenames are reconstructed only from persisted table and
 /// index IDs. Stray files from a dropped or failed index are deliberately not
@@ -58,7 +76,22 @@ pub(crate) fn active_durable_file_names(catalog: &Catalog) -> BTreeSet<String> {
             }
         }
     }
+    let data_dir = catalog.data_dir();
+    for name in UNREFERENCED_DURABLE_FILES {
+        if data_dir.join(name).is_file() {
+            names.insert((*name).to_string());
+        }
+    }
     names
+}
+
+/// Whether a snapshot is allowed to omit `name` when it is absent from the
+/// source directory. The catalog LSN sidecar is absent in pristine databases
+/// with no durable statement boundary yet; the unreferenced durable files are
+/// absent whenever the feature that writes them was never used. Every other
+/// metadata-referenced file is required and its absence must fail closed.
+pub(crate) fn durable_file_is_optional(name: &str) -> bool {
+    name == CATALOG_LSN_FILE || UNREFERENCED_DURABLE_FILES.contains(&name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +323,79 @@ fn validate_sync_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest set is assembled by hand, so it can silently fall behind a
+    /// new durable file (it already had: `views.bin` and `auth.json` were both
+    /// missing). This walks a data dir that exercises every durable-file kind
+    /// and fails on anything the set does not claim, so the next durable file
+    /// added to a data dir cannot be forgotten here.
+    #[test]
+    fn manifest_set_claims_every_durable_file_in_a_data_dir() {
+        use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
+        use powdb_storage::view::{ViewDef, ViewRegistry};
+
+        let dir = std::env::temp_dir().join(format!(
+            "powdb_durable_cover_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut catalog = Catalog::create(&dir).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "T".into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog.insert("T", &vec![Value::Int(1)]).unwrap();
+        catalog.create_index("T", "id").unwrap();
+        catalog.checkpoint().unwrap();
+
+        let mut views = ViewRegistry::new(&dir);
+        views
+            .register(ViewDef {
+                name: "V".into(),
+                query: "T { .id }".into(),
+                depends_on: vec!["T".into()],
+                dirty: false,
+            })
+            .unwrap();
+        std::fs::write(dir.join("auth.json"), b"{}").unwrap();
+
+        let claimed = active_durable_file_names(&catalog);
+        let mut unclaimed: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if NON_SNAPSHOT_FILES.contains(&name.as_str()) || claimed.contains(&name) {
+                continue;
+            }
+            unclaimed.push(name);
+        }
+        unclaimed.sort();
+
+        drop(catalog);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            unclaimed.is_empty(),
+            "backup manifest set does not claim durable files {unclaimed:?}; \
+             add them to active_durable_file_names or to NON_SNAPSHOT_FILES"
+        );
+    }
+
     #[test]
     fn manifest_round_trips_and_rejects_bad_version() {
         let m = BackupManifest {

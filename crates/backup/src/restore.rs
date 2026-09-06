@@ -1,4 +1,4 @@
-use crate::manifest::{BackupManifest, SyncSnapshotMetadata};
+use crate::manifest::{BackupManifest, SyncSnapshotMetadata, UNREFERENCED_DURABLE_FILES};
 use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use std::io;
 use std::path::Path;
@@ -49,6 +49,7 @@ fn is_plain_manifest_name(name: &str) -> bool {
 pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
     let durable_name = name == "catalog.bin"
         || name == CATALOG_LSN_FILE
+        || UNREFERENCED_DURABLE_FILES.contains(&name)
         || (name.ends_with(".heap") && name.len() > ".heap".len())
         || (name.ends_with(".idx") && name.len() > ".idx".len())
         || (name.ends_with(".eidx") && name.len() > ".eidx".len());
@@ -213,6 +214,8 @@ mod tests {
         for good in [
             "catalog.bin",
             CATALOG_LSN_FILE,
+            "views.bin",
+            "auth.json",
             "User.heap",
             "User_email.idx",
             "User_7.eidx",

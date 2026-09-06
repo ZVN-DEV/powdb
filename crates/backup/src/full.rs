@@ -1,5 +1,6 @@
 use crate::manifest::{
-    active_durable_file_names, current_sync_snapshot_metadata, BackupManifest, FileEntry,
+    active_durable_file_names, current_sync_snapshot_metadata, durable_file_is_optional,
+    BackupManifest, FileEntry,
 };
 use powdb_storage::catalog::Catalog;
 use std::io;
@@ -25,10 +26,7 @@ pub fn full_backup(catalog: &mut Catalog, dest: &Path) -> io::Result<BackupManif
     for name in active_durable_file_names(catalog) {
         let source_path = src.join(&name);
         if !source_path.exists() {
-            // `catalog.lsn` is absent in pristine databases with no durable
-            // statement boundary yet. Every metadata-referenced heap/index is
-            // required and a missing one must fail closed.
-            if name == powdb_storage::catalog::CATALOG_LSN_FILE {
+            if durable_file_is_optional(&name) {
                 continue;
             }
             return Err(io::Error::new(
