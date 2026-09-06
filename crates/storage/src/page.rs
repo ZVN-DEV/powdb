@@ -22,7 +22,9 @@ pub const PAGE_HEADER_SIZE: usize = 20;
 /// the CRC and start data at `PAGE_HEADER_SIZE` (20).
 const LEGACY_HEADER_SIZE: usize = 16;
 const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
-const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
+/// Bytes one slot-directory entry costs: a u16 offset plus a u16 length.
+/// A row therefore consumes `row.len() + SLOT_ENTRY_SIZE` of a page.
+pub const SLOT_ENTRY_SIZE: usize = 4;
 const DELETED_MARKER: u16 = 0xFFFF;
 
 /// Maximum encoded row size that can ever fit in a single page: a fresh
@@ -217,6 +219,13 @@ impl Page {
         let mut data = [0u8; PAGE_SIZE];
         data.copy_from_slice(buf);
         Ok(Page { data })
+    }
+
+    /// Whether this page carries a CRC32. Pages written before checksums
+    /// shipped do not, which is why [`Self::from_bytes_verified`] cannot
+    /// refuse them outright.
+    pub fn has_checksum(&self) -> bool {
+        self.data[5] & FLAG_HAS_CHECKSUM != 0
     }
 
     /// Compute the page CRC32 and write it into the header. Must be called
@@ -478,7 +487,57 @@ impl Page {
         true
     }
 
-    /// Mark a slot as deleted. Does not reclaim space (compaction is separate).
+    /// Bytes in the data area that belong to deleted slots, or to rows an
+    /// [`Self::update`] moved to the end of the page. [`Self::compact`]
+    /// turns exactly this many bytes back into [`Self::free_space`].
+    pub fn dead_space(&self) -> usize {
+        let mut live = 0usize;
+        for i in 0..self.slot_count() {
+            let (_, length) = self.read_slot_entry(i);
+            if length != DELETED_MARKER {
+                live += length as usize;
+            }
+        }
+        (self.free_start() as usize).saturating_sub(PAGE_HEADER_SIZE + live)
+    }
+
+    /// Slide every live row down to the front of the data area, reclaiming
+    /// the bytes left behind by deletes and relocating updates.
+    ///
+    /// Slot indices are preserved, tombstones included, so every `RowId`
+    /// already handed out stays valid. Rows are moved in offset order, which
+    /// is not slot order once an update has relocated a row.
+    pub fn compact(&mut self) {
+        let count = self.slot_count();
+        let mut live: Vec<(u16, u16, u16)> = Vec::with_capacity(count as usize);
+        for slot in 0..count {
+            let (offset, length) = self.read_slot_entry(slot);
+            if length == DELETED_MARKER {
+                continue;
+            }
+            let start = offset as usize;
+            let end = start + length as usize;
+            if start < PAGE_HEADER_SIZE || end > PAGE_SIZE {
+                return;
+            }
+            live.push((offset, length, slot));
+        }
+        live.sort_unstable_by_key(|(offset, _, _)| *offset);
+        let mut cursor = PAGE_HEADER_SIZE;
+        for (offset, length, slot) in live {
+            let start = offset as usize;
+            if start != cursor {
+                self.data
+                    .copy_within(start..start + length as usize, cursor);
+                self.write_slot_entry(slot, cursor as u16, length);
+            }
+            cursor += length as usize;
+        }
+        self.set_free_start(cursor as u16);
+    }
+
+    /// Mark a slot as deleted. Does not reclaim space on its own; the space
+    /// comes back when [`Self::compact`] runs.
     pub fn delete(&mut self, slot: u16) {
         if slot < self.slot_count() {
             let (offset, _) = self.read_slot_entry(slot);

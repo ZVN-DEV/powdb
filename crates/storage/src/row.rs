@@ -140,10 +140,22 @@ fn row_body_offset(data: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// The body of a stored row, past the `PROW` prefix when there is one.
+///
+/// Infallible on purpose. The prefix is fixed width whatever the version says,
+/// so skipping it never needs the version to be one this build understands,
+/// and a row that reaches here carrying an unsupported version has already
+/// been refused by [`validate_row_format`] at the storage read boundary. This
+/// used to `expect` on that version, which under the release profile's
+/// `panic = "abort"` turned a single rotted header byte into a process kill
+/// and, on a supervised server, a restart loop.
 #[inline]
 fn row_body(data: &[u8]) -> &[u8] {
-    let offset = row_body_offset(data).expect("unsupported row format version");
-    &data[offset..]
+    if data.len() >= ROW_PREFIX_SIZE && &data[0..4] == ROW_MAGIC {
+        &data[ROW_PREFIX_SIZE..]
+    } else {
+        data
+    }
 }
 
 fn prepend_row_prefix(out: &mut Vec<u8>) {
