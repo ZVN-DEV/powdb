@@ -879,22 +879,20 @@ async fn process_signal() -> ProcessSignal {
                 None
             }
         };
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => return ProcessSignal::Shutdown,
-                _ = async {
-                    match sigterm.as_mut() {
-                        Some(s) => { s.recv().await; }
-                        None => std::future::pending().await,
-                    }
-                } => return ProcessSignal::Shutdown,
-                _ = async {
-                    match sighup.as_mut() {
-                        Some(s) => { s.recv().await; }
-                        None => std::future::pending().await,
-                    }
-                } => return ProcessSignal::Reload,
-            }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => ProcessSignal::Shutdown,
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending().await,
+                }
+            } => ProcessSignal::Shutdown,
+            _ = async {
+                match sighup.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending().await,
+                }
+            } => ProcessSignal::Reload,
         }
     }
     #[cfg(not(unix))]

@@ -75,19 +75,18 @@ fn spawn_server_on_socket(data_dir: &std::path::Path, socket: &std::path::Path) 
         .spawn()
         .expect("failed to spawn powdb-server");
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if socket.exists() && port_file.exists() {
-            return ServerGuard(child);
-        }
+    while !(socket.exists() && port_file.exists()) {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("powdb-server exited before binding: {status}");
         }
-        assert!(
-            Instant::now() < deadline,
-            "powdb-server never bound its unix socket"
-        );
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("powdb-server never bound its unix socket");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    ServerGuard(child)
 }
 
 #[test]

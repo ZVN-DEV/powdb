@@ -49,26 +49,27 @@ fn spawn_server_bound(mut cmd: Command) -> (Child, u16) {
     cmd.args(["--port", "0", "--port-file", port_file.to_str().unwrap()]);
     let mut child = cmd.spawn().expect("failed to spawn powdb-server");
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(&port_file) {
-            if let Some(port) = text
-                .lines()
-                .find_map(|l| l.strip_prefix("port=")?.parse::<u16>().ok())
-            {
-                let _ = std::fs::remove_file(&port_file);
-                return (child, port);
-            }
+    let port = loop {
+        if let Some(port) = std::fs::read_to_string(&port_file).ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("port=")?.parse::<u16>().ok())
+        }) {
+            break port;
         }
         if let Ok(Some(status)) = child.try_wait() {
             let _ = std::fs::remove_file(&port_file);
             panic!("powdb-server exited before publishing its bound port: {status}");
         }
-        assert!(
-            Instant::now() < deadline,
-            "powdb-server did not publish its bound port within 60s"
-        );
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&port_file);
+            panic!("powdb-server did not publish its bound port within 60s");
+        }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
+    let _ = std::fs::remove_file(&port_file);
+    (child, port)
 }
 
 fn wait_for_port(port: u16) {

@@ -224,10 +224,11 @@ fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> Str
         if let Ok(Some(_)) = child.try_wait() {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "powdb-server never bound"
-        );
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("powdb-server never bound");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();

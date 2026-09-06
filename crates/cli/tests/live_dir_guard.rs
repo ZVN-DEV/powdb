@@ -69,7 +69,7 @@ fn seed(data_s: &str) {
 /// it stopped representing a running server. Only a process that really
 /// acquired the lock does.
 fn plant_live_writer(data_dir: &std::path::Path) -> std::process::Child {
-    let child = Command::new(bin())
+    let mut child = Command::new(bin())
         .args(["--data-dir", data_dir.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -78,19 +78,18 @@ fn plant_live_writer(data_dir: &std::path::Path) -> std::process::Child {
         .expect("failed to spawn a live powdb-cli writer");
     let want = child.id().to_string();
     let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if std::fs::read_to_string(data_dir.join("LOCK"))
-            .map(|text| text.trim() == want)
-            .unwrap_or(false)
-        {
-            return child;
+    while std::fs::read_to_string(data_dir.join("LOCK"))
+        .map(|text| text.trim() != want)
+        .unwrap_or(true)
+    {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the live writer never took the data dir lock");
         }
-        assert!(
-            Instant::now() < deadline,
-            "the live writer never took the data dir lock"
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
+    child
 }
 
 #[test]

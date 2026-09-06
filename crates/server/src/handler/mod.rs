@@ -883,7 +883,7 @@ async fn serve_connection<R, W>(
                     Err(e) => {
                         report_frame_read_error(&peer, &e);
                         if let FrameReadError::Refused { reply, .. } = e {
-                            responses.push(reply);
+                            responses.push(*reply);
                         }
                         fatal = Some(ConnectionTermination::ReadError);
                         break;

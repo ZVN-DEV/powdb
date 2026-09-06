@@ -225,8 +225,13 @@ impl<R> FrameStream<'_, R> {
 /// parameters and a client whose server crashed saw the same ECONNRESET.
 pub(super) enum FrameReadError {
     /// The frame is refused on its own content: it declares more payload than
-    /// the wire limit, or its bytes do not decode.
-    Refused { reply: Message, detail: String },
+    /// the wire limit, or its bytes do not decode. The reply is boxed because
+    /// `Message` is a large enum and this error travels in every frame read's
+    /// `Result`.
+    Refused {
+        reply: Box<Message>,
+        detail: String,
+    },
     /// The socket failed, or the peer went away mid-frame.
     Transport(std::io::Error),
 }
@@ -234,7 +239,7 @@ pub(super) enum FrameReadError {
 impl FrameReadError {
     fn refused(detail: String, class: ErrorClass) -> Self {
         FrameReadError::Refused {
-            reply: error_response(detail.clone(), class),
+            reply: Box::new(error_response(detail.clone(), class)),
             detail,
         }
     }
