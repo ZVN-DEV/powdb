@@ -1028,25 +1028,28 @@ pub(crate) fn range_matches(
     if val.is_empty() {
         return false;
     }
+    // Each bound is tested with the operator it stands for, through the same
+    // evaluator a `Filter(SeqScan)` uses. Comparing with `Value`'s own `Ord`
+    // instead took its type-discriminant tail arm for an unrelated pair, so an
+    // index-driven range accepted rows a scan of the same predicate rejects:
+    // a JSON path holding the string "deep" satisfied `> 99.5`.
     if let Some(ref s) = start {
-        if start_inc {
-            if val < s {
-                return false;
-            }
-        } else if val <= s {
+        let op = if start_inc { BinOp::Gte } else { BinOp::Gt };
+        if !bound_holds(val, op, s) {
             return false;
         }
     }
     if let Some(ref e) = end {
-        if end_inc {
-            if val > e {
-                return false;
-            }
-        } else if val >= e {
+        let op = if end_inc { BinOp::Lte } else { BinOp::Lt };
+        if !bound_holds(val, op, e) {
             return false;
         }
     }
     true
+}
+
+fn bound_holds(val: &Value, op: BinOp, bound: &Value) -> bool {
+    eval_binop_mode(val, op, bound, CmpMode::Filter) == Value::Bool(true)
 }
 
 fn collect_plan_qualifiers(plan: &PlanNode, qualifiers: &mut HashSet<String>) {

@@ -66,8 +66,8 @@ c_int     <    bool_false     ERR(type mismatch for column 'c_int': expected Int
 c_int     <    null           0
 c_int     <    str_uuid       ERR(type mismatch for column 'c_int': expected Int, got str)
 c_int     <    str_bytes      ERR(type mismatch for column 'c_int': expected Int, got str)
-c_int     <    uuid_lit       1
-c_int     <    bytes_lit      1
+c_int     <    uuid_lit       0
+c_int     <    bytes_lit      0
 c_int     <=   int_0          0
 c_int     <=   int_1          1
 c_int     <=   int_2          1
@@ -82,8 +82,8 @@ c_int     <=   bool_false     ERR(type mismatch for column 'c_int': expected Int
 c_int     <=   null           0
 c_int     <=   str_uuid       ERR(type mismatch for column 'c_int': expected Int, got str)
 c_int     <=   str_bytes      ERR(type mismatch for column 'c_int': expected Int, got str)
-c_int     <=   uuid_lit       1
-c_int     <=   bytes_lit      1
+c_int     <=   uuid_lit       0
+c_int     <=   bytes_lit      0
 c_int     >    int_0          1
 c_int     >    int_1          0
 c_int     >    int_2          0
@@ -163,8 +163,8 @@ c_float   <    bool_false     ERR(type mismatch for column 'c_float': expected F
 c_float   <    null           0
 c_float   <    str_uuid       ERR(type mismatch for column 'c_float': expected Float, got str)
 c_float   <    str_bytes      ERR(type mismatch for column 'c_float': expected Float, got str)
-c_float   <    uuid_lit       1
-c_float   <    bytes_lit      1
+c_float   <    uuid_lit       0
+c_float   <    bytes_lit      0
 c_float   <=   int_0          0
 c_float   <=   int_1          1
 c_float   <=   int_2          1
@@ -179,8 +179,8 @@ c_float   <=   bool_false     ERR(type mismatch for column 'c_float': expected F
 c_float   <=   null           0
 c_float   <=   str_uuid       ERR(type mismatch for column 'c_float': expected Float, got str)
 c_float   <=   str_bytes      ERR(type mismatch for column 'c_float': expected Float, got str)
-c_float   <=   uuid_lit       1
-c_float   <=   bytes_lit      1
+c_float   <=   uuid_lit       0
+c_float   <=   bytes_lit      0
 c_float   >    int_0          1
 c_float   >    int_1          0
 c_float   >    int_2          0
@@ -260,8 +260,8 @@ c_str     <    bool_false     ERR(type mismatch for column 'c_str': expected Str
 c_str     <    null           0
 c_str     <    str_uuid       1
 c_str     <    str_bytes      1
-c_str     <    uuid_lit       1
-c_str     <    bytes_lit      1
+c_str     <    uuid_lit       0
+c_str     <    bytes_lit      0
 c_str     <=   int_0          ERR(type mismatch for column 'c_str': expected Str, got int)
 c_str     <=   int_1          ERR(type mismatch for column 'c_str': expected Str, got int)
 c_str     <=   int_2          ERR(type mismatch for column 'c_str': expected Str, got int)
@@ -276,8 +276,8 @@ c_str     <=   bool_false     ERR(type mismatch for column 'c_str': expected Str
 c_str     <=   null           0
 c_str     <=   str_uuid       1
 c_str     <=   str_bytes      1
-c_str     <=   uuid_lit       1
-c_str     <=   bytes_lit      1
+c_str     <=   uuid_lit       0
+c_str     <=   bytes_lit      0
 c_str     >    int_0          ERR(type mismatch for column 'c_str': expected Str, got int)
 c_str     >    int_1          ERR(type mismatch for column 'c_str': expected Str, got int)
 c_str     >    int_2          ERR(type mismatch for column 'c_str': expected Str, got int)
@@ -357,8 +357,8 @@ c_bool    <    bool_false     0
 c_bool    <    null           0
 c_bool    <    str_uuid       ERR(type mismatch for column 'c_bool': expected Bool, got str)
 c_bool    <    str_bytes      ERR(type mismatch for column 'c_bool': expected Bool, got str)
-c_bool    <    uuid_lit       1
-c_bool    <    bytes_lit      1
+c_bool    <    uuid_lit       0
+c_bool    <    bytes_lit      0
 c_bool    <=   int_0          ERR(type mismatch for column 'c_bool': expected Bool, got int)
 c_bool    <=   int_1          ERR(type mismatch for column 'c_bool': expected Bool, got int)
 c_bool    <=   int_2          ERR(type mismatch for column 'c_bool': expected Bool, got int)
@@ -373,8 +373,8 @@ c_bool    <=   bool_false     0
 c_bool    <=   null           0
 c_bool    <=   str_uuid       ERR(type mismatch for column 'c_bool': expected Bool, got str)
 c_bool    <=   str_bytes      ERR(type mismatch for column 'c_bool': expected Bool, got str)
-c_bool    <=   uuid_lit       1
-c_bool    <=   bytes_lit      1
+c_bool    <=   uuid_lit       0
+c_bool    <=   bytes_lit      0
 c_bool    >    int_0          ERR(type mismatch for column 'c_bool': expected Bool, got int)
 c_bool    >    int_1          ERR(type mismatch for column 'c_bool': expected Bool, got int)
 c_bool    >    int_2          ERR(type mismatch for column 'c_bool': expected Bool, got int)
@@ -763,35 +763,35 @@ c_json    <=   str_uuid       ERR(cannot order json column 'c_json' against a st
 c_json    <=   str_bytes      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    <=   uuid_lit       0
 c_json    <=   bytes_lit      0
-c_json    >    int_0          1
-c_json    >    int_1          1
-c_json    >    int_2          1
-c_json    >    int_neg        1
-c_json    >    float_1_0      1
-c_json    >    float_1_5      1
+c_json    >    int_0          0
+c_json    >    int_1          0
+c_json    >    int_2          0
+c_json    >    int_neg        0
+c_json    >    float_1_0      0
+c_json    >    float_1_5      0
 c_json    >    str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >    str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >    str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
-c_json    >    bool_true      1
-c_json    >    bool_false     1
+c_json    >    bool_true      0
+c_json    >    bool_false     0
 c_json    >    null           0
 c_json    >    str_uuid       ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >    str_bytes      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
-c_json    >    uuid_lit       1
-c_json    >    bytes_lit      1
-c_json    >=   int_0          1
-c_json    >=   int_1          1
-c_json    >=   int_2          1
-c_json    >=   int_neg        1
-c_json    >=   float_1_0      1
-c_json    >=   float_1_5      1
+c_json    >    uuid_lit       0
+c_json    >    bytes_lit      0
+c_json    >=   int_0          0
+c_json    >=   int_1          0
+c_json    >=   int_2          0
+c_json    >=   int_neg        0
+c_json    >=   float_1_0      0
+c_json    >=   float_1_5      0
 c_json    >=   str_1          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >=   str_a          ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >=   str_empty      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
-c_json    >=   bool_true      1
-c_json    >=   bool_false     1
+c_json    >=   bool_true      0
+c_json    >=   bool_false     0
 c_json    >=   null           0
 c_json    >=   str_uuid       ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
 c_json    >=   str_bytes      ERR(cannot order json column 'c_json' against a string; documents compare with = and != only (use -> or json_text for scalars))
-c_json    >=   uuid_lit       1
-c_json    >=   bytes_lit      1
+c_json    >=   uuid_lit       0
+c_json    >=   bytes_lit      0

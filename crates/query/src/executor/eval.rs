@@ -1231,6 +1231,20 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             _ => ordering != O::Less,
         });
     }
+    // An ordered comparison between two different types has no meaningful
+    // answer, and `Value::Ord`'s tail arm gives it one anyway: it falls back to
+    // the type discriminant, so `.j->v > 99.5` returned the rows whose value was
+    // the string "deep" and the bool true. The pairs that genuinely order across
+    // types (Int/Float, DateTime/Int) were handled just above; every other pair
+    // is false, which is what the typed-column comparisons are refused with at
+    // plan time. `Join` mode keeps `Value::Ord` so a non-equi join's ordering
+    // stays what the hash and nested-loop paths both already agree on.
+    if mode == CmpMode::Filter
+        && matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte)
+        && left.type_id() != right.type_id()
+    {
+        return Value::Bool(false);
+    }
     // A json document against a string compares as a document (either
     // orientation): the text is parsed to canonical PJ1 and byte-compared,
     // the same coercion `coerce_value` applies on insert. Statement literals
