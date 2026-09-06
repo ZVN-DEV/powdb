@@ -9,6 +9,22 @@ use super::*;
 pub(crate) enum RemoteStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// A Unix domain socket, for a server started with `--socket`. Such a
+    /// server may bind no TCP port at all.
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+/// Whether `--remote` names a Unix socket path rather than `host:port`.
+///
+/// A `host:port` never contains a path separator, and neither does an IPv6
+/// literal in brackets, so the separator settles it. `--remote ./powdb.sock`
+/// and `--remote ~/run/powdb.sock` are paths too.
+pub(crate) fn remote_is_unix_socket(addr: &str) -> bool {
+    addr.contains('/')
+        || addr.contains(std::path::MAIN_SEPARATOR)
+        || addr.starts_with('~')
+        || addr.ends_with(".sock")
 }
 
 /// Build a rustls client connector on the same tokio-rustls stack the server
@@ -117,6 +133,24 @@ pub(crate) fn tls_handshake_hint(error: &str, tls: &TlsOpts) -> String {
 /// Open the remote connection, wrapping it in TLS when requested. With TLS
 /// disabled this is exactly the plaintext `TcpStream::connect` path.
 pub(crate) async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteStream, String> {
+    #[cfg(unix)]
+    if remote_is_unix_socket(addr) {
+        // TLS terminates a TCP connection and verifies a hostname. A unix
+        // socket has neither, and the server's socket listener speaks
+        // cleartext, so asking for TLS here can only ever fail at handshake.
+        if tls.enabled {
+            return Err(format!(
+                "TLS is not used on a unix socket ({addr}): the connection is already local and \
+                 the server's socket listener speaks cleartext. Drop --tls (and POWDB_TLS, \
+                 POWDB_TLS_CA, POWDB_TLS_SERVER_NAME, which imply it)"
+            ));
+        }
+        let stream = tokio::net::UnixStream::connect(addr)
+            .await
+            .map_err(|e| format!("connection to unix socket {addr} failed: {e}"))?;
+        return Ok(RemoteStream::Unix(stream));
+    }
+
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connection failed: {e}"))?;
@@ -151,6 +185,10 @@ pub(crate) async fn exec_remote(
         }
         Ok(RemoteStream::Tls(s)) => {
             exec_remote_on(*s, db, password, username, query, session).await
+        }
+        #[cfg(unix)]
+        Ok(RemoteStream::Unix(s)) => {
+            exec_remote_on(s, db, password, username, query, session).await
         }
         Err(msg) => {
             eprintln!("Error: {msg}");
@@ -443,6 +481,8 @@ pub(crate) async fn run_remote(
     match connect_remote(&addr, tls).await {
         Ok(RemoteStream::Plain(s)) => run_remote_on(s, db, password, username, session).await,
         Ok(RemoteStream::Tls(s)) => run_remote_on(*s, db, password, username, session).await,
+        #[cfg(unix)]
+        Ok(RemoteStream::Unix(s)) => run_remote_on(s, db, password, username, session).await,
         Err(msg) => {
             eprintln!("Error: {msg}");
             std::process::exit(1);

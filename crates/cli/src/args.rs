@@ -483,7 +483,10 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("                               POWDB_READONLY");
                 println!("        --format <FMT>         Result rendering: table (default), json, or csv.");
                 println!("                               json and csv make the CLI scriptable");
-                println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
+                println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP, or pass the path");
+                println!(
+                    "                               of a `--socket` unix socket to connect locally"
+                );
                 println!("        --db <NAME>            Database name (default: default)");
                 println!("        --password <PW>        Password for remote auth, and for the user-admin");
                 println!("                               subcommands. Visible to every user on the machine in");
@@ -839,6 +842,19 @@ pub(crate) fn parse_args() -> CliArgs {
     // remote mode this process opens nothing: the server did. Accepting the
     // flag here would suggest the CLI was enforcing a restriction it has no
     // way to enforce.
+    // A unix socket carries no hostname and the server's socket listener
+    // speaks cleartext, so TLS over one can only fail at handshake time.
+    // Refusing here says which of the two settings to drop.
+    #[cfg(unix)]
+    if tls_enabled && remote.as_deref().is_some_and(remote_is_unix_socket) {
+        eprintln!("Error: TLS is not used on a unix socket: the connection is already local");
+        eprintln!(
+            "note: drop --tls (POWDB_TLS, POWDB_TLS_CA and POWDB_TLS_SERVER_NAME imply it), \
+             or connect to the server's TCP address instead"
+        );
+        std::process::exit(2);
+    }
+
     if readonly && remote.is_some() {
         eprintln!("Error: --readonly applies to an embedded data dir, not to a remote connection");
         eprintln!(
