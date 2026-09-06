@@ -293,13 +293,21 @@ fn run_concurrent_readers_see_uncorrupted_rows(
                 for _ in 0..lookups_per_thread {
                     k = (k + stride) % n;
                     let key = Value::Int(k as i64);
-                    let (_rid, row) = tbl.index_lookup("id", &key).unwrap_or_else(|| {
-                        panic!(
-                            "index_lookup for id {k} returned None \
+                    let (_rid, row) = tbl
+                        .index_lookup("id", &key)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "index_lookup for id {k} failed: {e}; \
+                                 likely a torn read from a racing seek+read"
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "index_lookup for id {k} returned None \
                                  — btree/heap disagreement, likely a \
                                  torn read from a racing seek+read"
-                        )
-                    });
+                            )
+                        });
                     assert_eq!(row.len(), 2, "expected 2 columns per row");
                     let got_id = match &row[0] {
                         Value::Int(n) => *n,
