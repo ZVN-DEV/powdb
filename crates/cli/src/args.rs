@@ -56,6 +56,10 @@ pub(crate) struct CliArgs {
     pub(crate) output: OutputMode,
     pub(crate) action: Action,
     pub(crate) tls: TlsOpts,
+    /// Open the embedded data directory read-only (`--readonly`). Mutating
+    /// statements are refused by the engine and nothing on disk is written,
+    /// which is what makes a snapshot or a restored backup safe to inspect.
+    pub(crate) readonly: bool,
 }
 
 /// TLS settings for remote mode.
@@ -182,6 +186,7 @@ pub(crate) fn parse_args() -> CliArgs {
     let mut exec: Option<String> = None;
     let mut exec_file: Option<String> = None;
     let mut dialect = Dialect::Powql;
+    let mut readonly = false;
     let mut output = OutputMode::Table;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
@@ -230,6 +235,9 @@ pub(crate) fn parse_args() -> CliArgs {
             }
             "--sql" => {
                 dialect = Dialect::Sql;
+            }
+            "--readonly" => {
+                readonly = true;
             }
             "--format" => {
                 i += 1;
@@ -343,6 +351,11 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("                               (same `;` rule: a newline continues a statement)");
                 println!("        --sql                  Treat --exec / --exec-file input as SQL, and start");
                 println!("                               the REPL in SQL mode (see docs/SQL.md for the subset)");
+                println!("        --readonly             Open the embedded data dir read-only: reads are served,");
+                println!("                               writes are refused, and nothing on disk is modified.");
+                println!("                               For snapshots and restored backups. Embedded only; a");
+                println!("                               remote server decides this with its own --readonly /");
+                println!("                               POWDB_READONLY");
                 println!("        --format <FMT>         Result rendering: table (default), json, or csv.");
                 println!("                               json and csv make the CLI scriptable");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
@@ -694,6 +707,19 @@ pub(crate) fn parse_args() -> CliArgs {
         }
     }
 
+    // Read-only is a property of how the data directory is OPENED, and in
+    // remote mode this process opens nothing: the server did. Accepting the
+    // flag here would suggest the CLI was enforcing a restriction it has no
+    // way to enforce.
+    if readonly && remote.is_some() {
+        eprintln!("Error: --readonly applies to an embedded data dir, not to a remote connection");
+        eprintln!(
+            "note: a remote session is read-only when the SERVER is: start it with --readonly \
+             or POWDB_READONLY=1"
+        );
+        std::process::exit(2);
+    }
+
     // `--exec-file <PATH>` reads a whole PowQL file (or stdin for `-`) and
     // feeds it through the same one-shot path as `--exec`, sidestepping the
     // ARG_MAX ceiling on large loads. The two flags are mutually exclusive.
@@ -737,5 +763,6 @@ pub(crate) fn parse_args() -> CliArgs {
             ca_path: tls_ca,
             server_name: tls_server_name,
         },
+        readonly,
     }
 }

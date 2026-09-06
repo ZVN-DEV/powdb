@@ -4,16 +4,59 @@ use super::*;
 
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
 
-pub(crate) fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -> i32 {
-    let mut engine = match Engine::new_with_wal_archive(
-        Path::new(data_dir),
-        archive_wal_records_if_sync_enabled,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Error: failed to initialize engine: {e}");
-            return 1;
+/// Open the embedded engine at `data_dir`, read-write or read-only.
+///
+/// The path is checked first. `Engine::open_read_only` surfaces a bare
+/// `No such file or directory (os error 2)` for a missing directory, and the
+/// read-write path fails deep inside directory creation when the path is a
+/// file; neither names the path the operator typed. A read-only open must also
+/// never CREATE the directory: handing back an empty database because the
+/// snapshot path was mistyped looks exactly like data loss.
+pub(crate) fn open_embedded_engine(data_dir: &str, readonly: bool) -> Result<Engine, i32> {
+    let path = Path::new(data_dir);
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            eprintln!("Error: {data_dir} is not a directory");
+            eprintln!("note: --data-dir takes the database directory, not a file inside it");
+            return Err(1);
         }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if readonly {
+                eprintln!("Error: data directory {data_dir} does not exist");
+                eprintln!(
+                    "note: --readonly never creates a database; check the path, or drop \
+                     --readonly to create one here"
+                );
+                return Err(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: cannot use data directory {data_dir}: {e}");
+            return Err(1);
+        }
+    }
+
+    let opened = if readonly {
+        Engine::open_read_only(path)
+    } else {
+        Engine::new_with_wal_archive(path, archive_wal_records_if_sync_enabled)
+    };
+    opened.map_err(|e| {
+        eprintln!("Error: failed to initialize engine: {e}");
+        1
+    })
+}
+
+pub(crate) fn exec_embedded(
+    data_dir: &str,
+    query: &str,
+    session: SessionOpts,
+    readonly: bool,
+) -> i32 {
+    let mut engine = match open_embedded_engine(data_dir, readonly) {
+        Ok(e) => e,
+        Err(code) => return code,
     };
     // Statement-aware splitting (#150): a `;` inside a string literal or a
     // `#` comment is not a boundary, so text-heavy rows load intact.
@@ -109,20 +152,26 @@ pub(crate) fn missing_separator_hint(source: &str, statement_count: usize) -> Op
 
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
-pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts) {
-    eprintln!("PowDB v{} — embedded mode", env!("CARGO_PKG_VERSION"));
+pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts, readonly: bool) {
+    eprintln!(
+        "PowDB v{} — embedded mode{}",
+        env!("CARGO_PKG_VERSION"),
+        if readonly { " (read-only)" } else { "" }
+    );
     eprintln!("Data directory: {data_dir}");
-    eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
-
-    let mut engine = match Engine::new_with_wal_archive(
-        Path::new(data_dir),
-        archive_wal_records_if_sync_enabled,
-    ) {
-        Ok(engine) => engine,
-        Err(e) => {
-            eprintln!("Error: failed to initialize engine: {e}");
-            std::process::exit(1);
+    // The banner used to say "Type PowQL queries" even when `--sql` had put
+    // the REPL into SQL mode, so the prompt and the instructions disagreed.
+    eprintln!(
+        "Type {} queries. Use Ctrl-D to exit. Type .help for commands.\n",
+        match session.dialect {
+            Dialect::Powql => "PowQL",
+            Dialect::Sql => "SQL",
         }
+    );
+
+    let mut engine = match open_embedded_engine(data_dir, readonly) {
+        Ok(engine) => engine,
+        Err(code) => std::process::exit(code),
     };
 
     let mut rl = match Editor::new() {
