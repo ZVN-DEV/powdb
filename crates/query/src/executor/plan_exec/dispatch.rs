@@ -4,6 +4,7 @@ use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{LinkDef, LinkKind};
 use powdb_storage::row::{decode_row, RowLayout};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use crate::executor::eval::*;
@@ -2542,7 +2543,7 @@ impl Engine {
             _ => return Err("view source query must be a SELECT".into()),
         };
         // Derive a schema for the backing table from the query result columns.
-        let schema = self.derive_view_schema(name, &columns, &rows)?;
+        let schema = self.derive_view_schema(name, &columns, &rows, query_text)?;
         // Create the backing table and insert the result rows.
         crate::cancel::check()?;
         self.catalog
@@ -2590,7 +2591,7 @@ impl Engine {
         parse_stored_view_source(name, &query_text)?;
         // Execute the source query.
         let result = self.execute_powql(&query_text)?;
-        let (_columns, rows) = match result {
+        let (columns, rows) = match result {
             QueryResult::Rows { columns, rows } => (columns, rows),
             _ => return Err("view source query must be a SELECT".into()),
         };
@@ -2600,31 +2601,60 @@ impl Engine {
         // (the base table changed, a `??` arm flipped). That has to be a
         // typed error HERE, before the old contents are destroyed, not an
         // abort or bit-reinterpreted garbage inside the insert loop below.
-        {
+        //
+        // The one case where it is not an error is a backing table that holds
+        // no rows: nothing is stored for those types to describe, so retyping
+        // it destroys nothing. That is what lets a view materialized over an
+        // empty source recover on its first real refresh instead of refusing
+        // every read from then on.
+        let mismatch = {
             let schema = self.catalog.schema(name).ok_or_else(|| {
                 QueryError::ViewError(format!("materialized view '{name}' has no backing table"))
             })?;
-            for row in &rows {
+            let mut mismatch = None;
+            'rows: for row in &rows {
                 if row.len() != schema.columns.len() {
-                    return Err(QueryError::ViewError(format!(
+                    mismatch = Some(QueryError::ViewError(format!(
                         "refresh of materialized view '{name}' produced rows with {} \
                          columns but the view stores {}; drop and recreate the view",
                         row.len(),
                         schema.columns.len()
                     )));
+                    break 'rows;
                 }
                 for (val, col) in row.iter().zip(&schema.columns) {
                     let t = val.type_id();
                     if t != powdb_storage::types::TypeId::Empty && t != col.type_id {
-                        return Err(QueryError::ViewError(format!(
+                        mismatch = Some(QueryError::ViewError(format!(
                             "refresh of materialized view '{name}' produced a {t:?} \
                              in column '{}' but the view stores {:?}; drop and \
                              recreate the view to change its column types",
                             col.name, col.type_id
                         )));
+                        break 'rows;
                     }
                 }
             }
+            mismatch
+        };
+        if let Some(mismatch) = mismatch {
+            let backing_is_empty = {
+                let mut scan = self
+                    .catalog
+                    .scan(name)
+                    .map_err(QueryError::from_storage_io)?;
+                scan.next().is_none()
+            };
+            if !backing_is_empty {
+                return Err(mismatch);
+            }
+            let schema = self.derive_view_schema(name, &columns, &rows, &query_text)?;
+            self.catalog
+                .drop_table(name)
+                .map_err(QueryError::from_storage_io)?;
+            self.catalog
+                .create_table(schema)
+                .map_err(QueryError::from_storage_io)?;
         }
         // Clear old data and insert fresh results. Mission B2: logged
         // variant — view refreshes are a mutation and crash recovery
@@ -2692,6 +2722,7 @@ impl Engine {
         name: &str,
         columns: &[String],
         rows: &[Vec<Value>],
+        query_text: &str,
     ) -> Result<Schema, QueryError> {
         use powdb_storage::types::{ColumnDef, TypeId};
         let mut types: Vec<Option<TypeId>> = vec![None; columns.len()];
@@ -2715,15 +2746,21 @@ impl Engine {
                 }
             }
         }
+        // A column the rows could not type (all null, or no rows at all) falls
+        // back to the source schema. Typing it `str` unconditionally is what
+        // froze a view materialized over zero rows into a table of strings that
+        // every later refresh then refused to write. Only a column with nothing
+        // to inherit from either -- a computed expression over no rows -- keeps
+        // `str`, and the refresh path retypes that one on its first real row.
+        let inherited = self.static_view_column_types(query_text);
         let cols: Vec<ColumnDef> = columns
             .iter()
             .enumerate()
             .map(|(i, col_name)| ColumnDef {
                 name: col_name.clone(),
-                // A column with no non-null value anywhere (or no rows at
-                // all) stores as str: it encodes every null and keeps the
-                // table readable.
-                type_id: types[i].unwrap_or(TypeId::Str),
+                type_id: types[i]
+                    .or_else(|| inherited.get(col_name).copied())
+                    .unwrap_or(TypeId::Str),
                 required: false,
                 position: i as u16,
             })
@@ -2732,6 +2769,94 @@ impl Engine {
             table_name: name.to_string(),
             columns: cols,
         })
+    }
+
+    /// The output columns a view's source query types statically, taken from
+    /// the source schema rather than from the rows that came back.
+    ///
+    /// Only pass-through references are typed here: a projection field that is
+    /// a bare or qualified scan column, or, for a plain single-table view with
+    /// no projection, every column of the source. Anything computed has no
+    /// declared type to inherit and is left to the rows.
+    fn static_view_column_types(&self, query_text: &str) -> HashMap<String, TypeId> {
+        let mut inherited = HashMap::new();
+        let Ok(Statement::Query(q)) = crate::parser::parse(query_text) else {
+            return inherited;
+        };
+        // Bare names that more than one source exposes resolve by suffix match
+        // at runtime and have no single declared type, so they are dropped.
+        let mut bare: HashMap<String, Option<TypeId>> = HashMap::new();
+        let mut qualified: HashMap<String, TypeId> = HashMap::new();
+        let mut sources: Vec<(String, String)> = vec![(
+            q.alias.clone().unwrap_or_else(|| q.source.clone()),
+            q.source.clone(),
+        )];
+        for join in &q.joins {
+            sources.push((
+                join.alias.clone().unwrap_or_else(|| join.source.clone()),
+                join.source.clone(),
+            ));
+        }
+        for (alias, table) in &sources {
+            let Some(schema) = self.catalog.schema(table) else {
+                return inherited;
+            };
+            for column in &schema.columns {
+                qualified.insert(format!("{alias}.{}", column.name), column.type_id);
+                match bare.get(&column.name) {
+                    Some(Some(previous)) if *previous == column.type_id => {}
+                    Some(_) => {
+                        bare.insert(column.name.clone(), None);
+                    }
+                    None => {
+                        bare.insert(column.name.clone(), Some(column.type_id));
+                    }
+                }
+            }
+        }
+        match &q.projection {
+            Some(fields) => {
+                for field in fields {
+                    let (output, type_id) = match &field.expr {
+                        Expr::Field(name) => (
+                            field.alias.clone().unwrap_or_else(|| name.clone()),
+                            bare.get(name).copied().flatten(),
+                        ),
+                        Expr::QualifiedField {
+                            qualifier,
+                            field: column,
+                        } => (
+                            field
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| format!("{qualifier}.{column}")),
+                            qualified.get(&format!("{qualifier}.{column}")).copied(),
+                        ),
+                        _ => continue,
+                    };
+                    if let Some(type_id) = type_id {
+                        inherited.insert(output, type_id);
+                    }
+                }
+            }
+            // With no projection the row IS the source row, but only for a
+            // plain single-table read: a join renames every column, and
+            // grouping or aggregation produces computed ones.
+            None => {
+                if q.joins.is_empty()
+                    && q.alias.is_none()
+                    && q.aggregation.is_none()
+                    && q.group_by.is_none()
+                {
+                    for (name, type_id) in bare {
+                        if let Some(type_id) = type_id {
+                            inherited.insert(name, type_id);
+                        }
+                    }
+                }
+            }
+        }
+        inherited
     }
 
     /// Extract base table dependencies from a view's source query by
