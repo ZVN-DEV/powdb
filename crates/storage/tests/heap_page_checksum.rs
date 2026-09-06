@@ -224,7 +224,10 @@ fn test_clean_page_reads_back_after_flush() {
     }
 
     let heap = HeapFile::open(&path).unwrap();
-    let data = heap.get(rid).expect("clean page row must read back");
+    let data = heap
+        .get(rid)
+        .expect("clean page must read")
+        .expect("clean page row must read back");
     assert_eq!(
         powdb_storage::row::decode_row(&schema, &data)[0],
         Value::Str("hello".into())
@@ -271,7 +274,7 @@ fn test_legacy_unstamped_page_opens() {
     // Even though the stored CRC bytes no longer match (flag is clear), the
     // page must read without a PageCorrupt error.
     let heap = HeapFile::open(&path).unwrap();
-    match heap.get(rid) {
+    match heap.get(rid).expect("legacy page must read") {
         Some(data) => assert_eq!(
             powdb_storage::row::decode_row(&schema, &data)[0],
             Value::Str("legacy".into())

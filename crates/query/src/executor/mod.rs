@@ -1668,7 +1668,7 @@ impl Engine {
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns (the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value).
-                        if let Some(row) = tbl.get(rid) {
+                        if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                             rows.push(row);
                         }
                     }
@@ -1793,7 +1793,7 @@ impl Engine {
                                 }
                             }
                             // Overflow safety (P0-3): reassemble spilled cols.
-                            if let Some(row) = tbl.get(rid) {
+                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 rows.push(row);
                             }
                         }
@@ -2051,7 +2051,7 @@ impl Engine {
                             // Overflow safety (P0-3/P0-4): reassemble via
                             // `tbl.get` so spilled projected columns return
                             // their value, not Empty / a wrapped >= 64KB blob.
-                            if let Some(full) = tbl.get(rid) {
+                            if let Some(full) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 let row: Vec<Value> =
                                     proj_indices.iter().map(|&ci| full[ci].clone()).collect();
                                 rows.push(row);

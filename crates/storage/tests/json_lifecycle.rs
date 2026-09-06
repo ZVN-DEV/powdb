@@ -79,7 +79,7 @@ fn inline_json_roundtrips_byte_exact() {
         .unwrap();
     cat.sync_wal().unwrap();
 
-    let row = cat.get("docs", rid).unwrap();
+    let row = cat.get("docs", rid).expect("read row").unwrap();
     assert_eq!(row[1], want, "inline json must round-trip byte-exact");
     // The canonical text is sorted-keys.
     assert_eq!(
@@ -109,7 +109,7 @@ fn large_json_spills_and_roundtrips() {
         "an 8 KB json document must spill to an overflow chain"
     );
 
-    let row = cat.get("docs", rid).unwrap();
+    let row = cat.get("docs", rid).expect("read row").unwrap();
     assert_eq!(row[1], big, "spilled json must reassemble byte-exact");
 
     drop(cat);

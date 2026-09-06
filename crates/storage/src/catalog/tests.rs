@@ -751,7 +751,7 @@ fn test_create_table_and_insert() {
     let row = vec![Value::Str("Alice".into()), Value::Int(30)];
     let rid = cat.insert("users", &row).unwrap();
 
-    let result = cat.get("users", rid).unwrap();
+    let result = cat.get("users", rid).expect("read row").unwrap();
     assert_eq!(result[0], Value::Str("Alice".into()));
     assert_eq!(result[1], Value::Int(30));
 }
@@ -857,8 +857,8 @@ fn test_delete_row() {
     let r1 = cat.insert("t", &vec![Value::Int(1)]).unwrap();
     let r2 = cat.insert("t", &vec![Value::Int(2)]).unwrap();
     cat.delete("t", r1).unwrap();
-    assert!(cat.get("t", r1).is_none());
-    assert!(cat.get("t", r2).is_some());
+    assert!(cat.get("t", r1).expect("read row").is_none());
+    assert!(cat.get("t", r2).expect("read row").is_some());
 }
 
 #[test]
@@ -876,7 +876,7 @@ fn test_update_row() {
     cat.create_table(schema).unwrap();
     let rid = cat.insert("t", &vec![Value::Int(1)]).unwrap();
     let new_rid = cat.update("t", rid, &vec![Value::Int(99)]).unwrap();
-    let row = cat.get("t", new_rid).unwrap();
+    let row = cat.get("t", new_rid).expect("read row").unwrap();
     assert_eq!(row[0], Value::Int(99));
 }
 
@@ -1322,5 +1322,69 @@ fn autocommit_writes_are_not_capped_by_the_dirty_page_budget() {
             .unwrap()
             .len(),
         5_000
+    );
+}
+
+/// A crafted `page_id` used to grow the heap one page at a time all the way
+/// up to it: `u32::MAX` meant a 16 TiB file and an open that never returned.
+/// The nightly fuzz run of 2026-08-30 found this as a `fuzz_wal_replay`
+/// timeout.
+#[test]
+fn replaying_an_insert_past_the_page_ceiling_refuses_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let heap_path = dir.path().join("Wild.heap");
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Wild")).unwrap();
+        cat.insert("Wild", &vec![Value::Int(1), Value::Str("a".into())])
+            .unwrap();
+        cat.checkpoint().unwrap();
+
+        // One un-checkpointed Insert aimed at the far end of the address
+        // space. No transaction boundaries, so replay treats it as committed.
+        let row = crate::row::encode_row(
+            cat.schema("Wild").unwrap(),
+            &[Value::Int(2), Value::Str("b".into())],
+        );
+        let payload = encode_wal_payload(
+            "Wild",
+            RowId {
+                page_id: u32::MAX,
+                slot_index: 0,
+            },
+            &row,
+        );
+        cat.wal
+            .append(0, WalRecordType::Insert, &payload)
+            .expect("append crafted record");
+        cat.wal.flush().expect("flush crafted record");
+        std::mem::forget(cat); // crash: the record is replayed on the next open
+    }
+
+    let heap_len_before = fs::metadata(&heap_path).unwrap().len();
+    let started = std::time::Instant::now();
+    let err = match Catalog::open(dir.path()) {
+        Ok(_) => panic!("a wild page id must refuse the open"),
+        Err(e) => e,
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        StorageError::kind_of_io_error(&err),
+        Some(crate::error::StorageErrorKind::WalReplay),
+        "expected a WAL replay refusal, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("Wild"),
+        "the refusal must name the table, got: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "refusal must be immediate, took {elapsed:?}"
+    );
+    assert_eq!(
+        fs::metadata(&heap_path).unwrap().len(),
+        heap_len_before,
+        "the refused record must not have grown the heap"
     );
 }

@@ -312,7 +312,7 @@ impl Engine {
                             // `heap.get` + `decode_column` read raw v2 bytes and
                             // returned Empty for a spilled column (or wrapped a
                             // >= 64KB value).
-                            if let Some(full) = tbl.get(rid) {
+                            if let Some(full) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 let row: Vec<Value> =
                                     proj_indices.iter().map(|&ci| full[ci].clone()).collect();
                                 rows.push(row);
@@ -941,9 +941,13 @@ impl Engine {
                     let rids = tbl.index_lookup_all(key_column, &key_value);
                     // Overflow safety (P0-3): reassemble via `tbl.get` so an
                     // upsert conflict row with a spilled column is read in full.
-                    rids.into_iter()
-                        .next()
-                        .and_then(|rid| tbl.get(rid).map(|row| (rid, row)))
+                    match rids.into_iter().next() {
+                        Some(rid) => tbl
+                            .get(rid)
+                            .map_err(QueryError::from_storage_io)?
+                            .map(|row| (rid, row)),
+                        None => None,
+                    }
                 };
 
                 if let Some((rid, mut existing_row)) = existing {
@@ -1113,7 +1117,11 @@ impl Engine {
                     // is especially unsafe inside an explicit transaction.
                     crate::cancel::check()?;
                     for rid in matching_rids {
-                        let mut row = match self.catalog.get(table, rid) {
+                        let mut row = match self
+                            .catalog
+                            .get(table, rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             Some(r) => r,
                             None => continue,
                         };
@@ -1289,7 +1297,11 @@ impl Engine {
                             }
                         }
                         for rid in fallback_rids {
-                            let mut row = match self.catalog.get(table, rid) {
+                            let mut row = match self
+                                .catalog
+                                .get(table, rid)
+                                .map_err(QueryError::from_storage_io)?
+                            {
                                 Some(r) => r,
                                 None => continue,
                             };
@@ -1372,7 +1384,11 @@ impl Engine {
                             }
                         }
                         for rid in fallback_rids {
-                            let mut row = match self.catalog.get(table, rid) {
+                            let mut row = match self
+                                .catalog
+                                .get(table, rid)
+                                .map_err(QueryError::from_storage_io)?
+                            {
                                 Some(r) => r,
                                 None => continue,
                             };
@@ -1393,7 +1409,11 @@ impl Engine {
                     // Generic literal path: decode row, apply literal values.
                     let mut count = 0u64;
                     for rid in matching_rids {
-                        let mut row = match self.catalog.get(table, rid) {
+                        let mut row = match self
+                            .catalog
+                            .get(table, rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             Some(r) => r,
                             None => continue,
                         };
@@ -1423,7 +1443,11 @@ impl Engine {
                 };
                 let mut count = 0u64;
                 for rid in matching_rids {
-                    let mut row = match self.catalog.get(table, rid) {
+                    let mut row = match self
+                        .catalog
+                        .get(table, rid)
+                        .map_err(QueryError::from_storage_io)?
+                    {
                         Some(r) => r,
                         None => continue,
                     };
@@ -1475,7 +1499,11 @@ impl Engine {
                     let mut cancel = CancelCheck::new();
                     for rid in &matching_rids {
                         cancel.tick()?;
-                        if let Some(row) = self.catalog.get(table, *rid) {
+                        if let Some(row) = self
+                            .catalog
+                            .get(table, *rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             out_rows.push(row);
                         }
                     }
@@ -2266,7 +2294,7 @@ impl Engine {
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns; the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value.
-                        if let Some(row) = tbl.get(rid) {
+                        if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                             rows.push(row);
                         }
                     }
@@ -2377,7 +2405,9 @@ impl Engine {
                             for rid in rids {
                                 cancel.tick()?;
                                 // Overflow safety (P0-3): reassemble spilled cols.
-                                if let Some(row) = tbl.get(rid) {
+                                if let Some(row) =
+                                    tbl.get(rid).map_err(QueryError::from_storage_io)?
+                                {
                                     if !row[col_idx].is_empty()
                                         && range_matches(
                                             &row[col_idx],
@@ -2434,7 +2464,7 @@ impl Engine {
                                 }
                             }
                             // Overflow safety (P0-3): reassemble spilled cols.
-                            if let Some(row) = tbl.get(rid) {
+                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 rows.push(row);
                             }
                         }
@@ -3038,7 +3068,10 @@ impl Engine {
                     if key.type_id() != col_type {
                         continue;
                     }
-                    if let Some((_, row)) = tbl.index_lookup(&hop.key_col, key) {
+                    if let Some((_, row)) = tbl
+                        .index_lookup(&hop.key_col, key)
+                        .map_err(QueryError::from_storage_io)?
+                    {
                         // A NULL key never matches any FK value.
                         if row[key_idx] == Value::Empty {
                             continue;
@@ -3399,7 +3432,7 @@ impl Engine {
                     cancel.tick()?;
                     // `tbl.get` reassembles spilled/overflow columns and
                     // tolerates a stale rid (None) like the IndexScan path.
-                    if let Some(row) = tbl.get(rid) {
+                    if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                         narrow_into(&row, &mut child_rows)?;
                     }
                 }

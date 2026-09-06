@@ -1082,20 +1082,25 @@ impl HeapFile {
     /// Mission C Phase 1: if the hot page holds `rid.page_id`, read from
     /// it directly. This is what keeps `update_by_pk` fast: the read for
     /// the old row lands on the hot page we're about to write back.
+    ///
+    /// `Ok(None)` means the slot is genuinely deleted or was never written.
+    /// A failed read or a page that fails its CRC is an `Err`: mapping either
+    /// to `None` made an indexed point lookup on a rotted page answer "no such
+    /// row" with a success status.
     #[inline]
-    pub fn get(&self, rid: RowId) -> Option<Vec<u8>> {
+    pub fn get(&self, rid: RowId) -> io::Result<Option<Vec<u8>>> {
         // Mission C: dirty hot page takes precedence over both mmap and
         // disk — it holds writes that haven't landed yet.
         if let Some(hot) = &self.hot_page {
             if hot.page_id == rid.page_id {
-                return hot.page.get(rid.slot_index).map(|d| d.to_vec());
+                return Ok(hot.page.get(rid.slot_index).map(|d| d.to_vec()));
             }
         }
 
         // Mission C Phase 9: parked dirty page is also authoritative
         // over mmap/disk.
         if let Some(page) = self.dirty_buffer.get(&rid.page_id) {
-            return page.get(rid.slot_index).map(|d| d.to_vec());
+            return Ok(page.get(rid.slot_index).map(|d| d.to_vec()));
         }
 
         // Fast path: mmap — read directly from mapped memory
@@ -1120,19 +1125,26 @@ impl HeapFile {
                 // the process). This path deliberately does NOT verify the
                 // page CRC: that is the documented mmap performance tradeoff.
                 if rid.slot_index >= crate::page::slot_count_from_page(page_bytes) {
-                    return None;
+                    return Ok(None);
                 }
-                return crate::page::slot_bytes_from_page(page_bytes, rid.slot_index)
-                    .map(|row| row.to_vec());
+                return Ok(
+                    crate::page::slot_bytes_from_page(page_bytes, rid.slot_index)
+                        .map(|row| row.to_vec()),
+                );
             }
         }
 
-        let buf = self.disk.read_page(rid.page_id).ok()?;
-        // The disk point-lookup path consults the CRC
-        // (validate-if-present) rather than trusting the bytes, so a corrupt
-        // page reads as absent instead of yielding garbage or panicking.
-        let page = Page::from_bytes_verified(&buf).ok()?;
-        page.get(rid.slot_index).map(|d| d.to_vec())
+        if rid.page_id >= self.disk.num_pages() {
+            // A rid past the end of the heap addresses a page that was never
+            // written. Absent, not an I/O failure.
+            return Ok(None);
+        }
+        let buf = self.disk.read_page(rid.page_id)?;
+        // The disk point-lookup path consults the CRC (validate-if-present)
+        // rather than trusting the bytes, so a corrupt page is refused
+        // instead of yielding garbage or panicking.
+        let page = Page::from_bytes_verified(&buf)?;
+        Ok(page.get(rid.slot_index).map(|d| d.to_vec()))
     }
 
     /// Delete a row by marking its slot as deleted.
@@ -2304,7 +2316,7 @@ mod tests {
         let row = vec![Value::Str("Alice".into()), Value::Int(30)];
         let encoded = encode_row(&schema, &row);
         let rid = heap.insert(&encoded).unwrap();
-        let data = heap.get(rid).unwrap();
+        let data = heap.get(rid).unwrap().expect("row present");
         let decoded = decode_row(&schema, &data);
         assert_eq!(decoded[0], Value::Str("Alice".into()));
         assert_eq!(decoded[1], Value::Int(30));
@@ -2343,8 +2355,8 @@ mod tests {
             ))
             .unwrap();
         heap.delete(r1).unwrap();
-        assert!(heap.get(r1).is_none());
-        assert!(heap.get(r2).is_some());
+        assert!(heap.get(r1).unwrap().is_none());
+        assert!(heap.get(r2).unwrap().is_some());
         assert_eq!(
             heap.scan()
                 .collect::<std::io::Result<Vec<_>>>()
@@ -2364,7 +2376,7 @@ mod tests {
         let rid = heap.insert(&encode_row(&schema, &row)).unwrap();
         let new_row = vec![Value::Str("Alice".into()), Value::Int(31)];
         let new_rid = heap.update(rid, &encode_row(&schema, &new_row)).unwrap();
-        let decoded = decode_row(&schema, &heap.get(new_rid).unwrap());
+        let decoded = decode_row(&schema, &heap.get(new_rid).unwrap().expect("row present"));
         assert_eq!(decoded[1], Value::Int(31));
         drop(heap);
         std::fs::remove_file(&path).ok();
@@ -2483,7 +2495,10 @@ mod tests {
         // Every row — both pre- and post-mmap — must be readable with the
         // correct contents.
         for (i, rid) in &rids {
-            let data = heap.get(*rid).unwrap_or_else(|| panic!("row {i} missing"));
+            let data = heap
+                .get(*rid)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {i} missing"));
             let decoded = decode_row(&schema, &data);
             assert_eq!(decoded[0], Value::Str(format!("seed_{i:04}")));
             assert_eq!(decoded[1], Value::Int(*i));
@@ -2523,7 +2538,7 @@ mod tests {
                 &[Value::Str("ok".into()), Value::Int(1)],
             ))
             .unwrap();
-        assert!(heap.get(rid).is_some());
+        assert!(heap.get(rid).unwrap().is_some());
         assert_eq!(
             heap.scan()
                 .collect::<std::io::Result<Vec<_>>>()
@@ -2542,7 +2557,10 @@ mod tests {
         // Exactly the max must still fit on a fresh page.
         let exact = vec![0x42u8; MAX_ROW_DATA_SIZE];
         let rid = heap.insert(&exact).unwrap();
-        assert_eq!(heap.get(rid).unwrap().len(), MAX_ROW_DATA_SIZE);
+        assert_eq!(
+            heap.get(rid).unwrap().expect("row present").len(),
+            MAX_ROW_DATA_SIZE
+        );
         // One byte more must be rejected.
         let over = vec![0x42u8; MAX_ROW_DATA_SIZE + 1];
         let err = heap.insert(&over).unwrap_err();

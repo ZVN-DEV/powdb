@@ -27,6 +27,7 @@
 use powdb_storage::heap::HeapFile;
 use powdb_storage::page::PAGE_SIZE;
 use powdb_storage::row::encode_row;
+use powdb_storage::table::Table;
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -181,7 +182,7 @@ fn open_with_out_of_range_slot_entry_does_not_abort() {
 }
 
 #[test]
-fn point_lookup_on_stale_crc_page_returns_none_instead_of_aborting() {
+fn point_lookup_on_stale_crc_page_errors_instead_of_reading_as_absent() {
     let path = tmp_path("get_crc");
     let rid = seeded_heap(&path);
 
@@ -192,14 +193,53 @@ fn point_lookup_on_stale_crc_page_returns_none_instead_of_aborting() {
     page[40] ^= 0xFF;
     write_page(&path, rid.page_id, &page);
 
+    let err = match heap.get(rid) {
+        Ok(other) => panic!("a corrupt page must not read as {other:?}"),
+        Err(e) => e,
+    };
     assert_eq!(
-        heap.get(rid),
-        None,
-        "a point lookup must consult the page CRC and refuse a corrupt page"
+        powdb_storage::error::StorageError::kind_of_io_error(&err),
+        Some(powdb_storage::error::StorageErrorKind::PageCorrupt),
+        "a CRC refusal must reach the caller as PageCorrupt, got: {err}"
     );
 
     drop(heap);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The engine-level shape of the same defect: an indexed point lookup on a
+/// row whose page rotted after open used to come back as zero rows with a
+/// success status, which reads to a client as "that row was deleted".
+#[test]
+fn indexed_point_lookup_on_corrupt_page_errors_instead_of_returning_no_rows() {
+    let dir = tmp_path("indexed_get_crc");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut table = Table::create(one_col_schema(), &dir).expect("create table");
+    table.create_index("name", &dir).expect("create index");
+    let rid = table
+        .insert(&vec![Value::Str("important_data".into())])
+        .expect("insert");
+    table.heap.flush().expect("flush");
+    // Cold state: the row is on disk and no in-memory page shadows it, so
+    // the lookup below reads the bytes we are about to rot.
+    table.heap.discard_dirty();
+
+    let heap_path = dir.join("t.heap");
+    let mut page = read_page(&heap_path, rid.page_id);
+    page[40] ^= 0xFF;
+    write_page(&heap_path, rid.page_id, &page);
+
+    let err = match table.index_lookup("name", &Value::Str("important_data".into())) {
+        Ok(other) => panic!("a corrupt page must not look up as {other:?}"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        powdb_storage::error::StorageError::kind_of_io_error(&err),
+        Some(powdb_storage::error::StorageErrorKind::PageCorrupt),
+        "an indexed lookup must surface the CRC refusal, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -235,7 +275,7 @@ fn point_lookup_with_out_of_range_slot_entry_does_not_abort() {
 
     let heap = HeapFile::open(&path).expect("unchecksummed page must still open");
     assert_eq!(
-        heap.get(rid),
+        heap.get(rid).expect("unchecksummed page must still read"),
         None,
         "a slot entry pointing outside the page must read as absent"
     );
@@ -263,7 +303,7 @@ fn mmap_point_lookup_with_wild_slot_count_does_not_abort() {
         slot_index: 60_000,
     };
     assert_eq!(
-        heap.get(wild),
+        heap.get(wild).expect("unchecksummed page must still read"),
         None,
         "a slot index past the directory's capacity must read as absent"
     );

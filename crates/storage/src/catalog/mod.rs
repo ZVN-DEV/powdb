@@ -227,6 +227,32 @@ const SYNC_IDENTITY_FILE: &str = "identity.json";
 /// to the explicit `wal.flush()` each top-level mutation does. Kept small so
 /// the tests see a predictable amount of buffering.
 const WAL_BATCH_SIZE: usize = 64;
+
+/// Cushion added to the per-replay page ceiling, on top of one page per
+/// record. Absorbs pages a crashed session allocated around the ones its
+/// records account for (a heap superblock, a batched allocation) without
+/// letting a crafted page id grow the file unboundedly.
+const REPLAY_PAGE_SLACK: u64 = 64;
+
+/// Refuse a WAL record whose target page lies beyond what the log could have
+/// legitimately grown the heap to. Both `HeapFile::insert_at` and
+/// `HeapFile::write_overflow_page` grow the file one page at a time up to the
+/// id they are handed, so an unbounded id means the open hangs while it fills
+/// the disk (a `u32::MAX` page id is 16 TiB).
+fn check_replay_page(
+    table: &str,
+    what: &str,
+    page_id: u32,
+    ceiling: u64,
+) -> Result<(), StorageError> {
+    if u64::from(page_id) > ceiling {
+        return Err(StorageError::WalReplay(format!(
+            "table '{table}': {what} record targets page {page_id}, beyond the {ceiling}-page replay ceiling"
+        )));
+    }
+    Ok(())
+}
+
 type WalArchiveCallback<'a> = &'a mut dyn FnMut(&Path, &[WalRecord]) -> io::Result<()>;
 
 fn read_durable_lsn(data_dir: &Path) -> io::Result<u64> {
@@ -775,6 +801,23 @@ impl Catalog {
             }
         }
 
+        // Upper bound on any page id a record may legitimately target. Each
+        // record can account for at most one new page (a row fits on one data
+        // page; every overflow chunk carries its own record), so a log of N
+        // records cannot have grown a heap by more than N pages past its last
+        // checkpoint. A page id beyond this came from a corrupt or crafted
+        // record: `insert_at` and `write_overflow_page` grow the file one page
+        // at a time up to the target, so a wild page id is a hang and a full
+        // disk, not a wrong answer.
+        let replay_page_ceiling = self
+            .tables
+            .iter()
+            .map(|table| u64::from(table.heap.num_pages()))
+            .max()
+            .unwrap_or(0)
+            + records.len() as u64
+            + REPLAY_PAGE_SLACK;
+
         let mut replayed_inserts = 0usize;
         let mut replayed_updates = 0usize;
         let mut replayed_deletes = 0usize;
@@ -800,6 +843,12 @@ impl Catalog {
                 WalRecordType::Insert => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "insert",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             // Already persisted on its page? Skip — re-running
                             // the insert would allocate a fresh slot and
@@ -823,6 +872,12 @@ impl Catalog {
                 WalRecordType::Update => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "update",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
@@ -851,6 +906,12 @@ impl Catalog {
                 WalRecordType::Delete => {
                     if let Some((table_name, rid, _)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "delete",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
@@ -871,6 +932,12 @@ impl Catalog {
                         decode_overflow_write_payload(&rec.data)
                     {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "overflow write",
+                                page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.overflow_page_lsn(page_id) >= rec.lsn {
                                 skipped += 1;
@@ -957,11 +1024,12 @@ impl Catalog {
                                 if has_rows {
                                     let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                     let data_dir = self.data_dir.clone();
-                                    let _ = tbl.rewrite_rows_for_schema_change(
-                                        &old_schema,
-                                        &fill,
-                                        &data_dir,
-                                    );
+                                    tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)
+                                        .map_err(|error| {
+                                            StorageError::WalReplay(format!(
+                                                "table '{table_name}': add column rewrite failed: {error}"
+                                            ))
+                                        })?;
                                 }
                             }
                             // Stamp every page with the DDL's LSN so a
@@ -971,7 +1039,11 @@ impl Catalog {
                             // by the rewrite above. See
                             // `stamp_all_pages_min_lsn` doc.
                             if rec.lsn > 0 {
-                                let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                tbl.heap.stamp_all_pages_min_lsn(rec.lsn).map_err(|error| {
+                                    StorageError::WalReplay(format!(
+                                        "table '{table_name}': add column LSN barrier failed: {error}"
+                                    ))
+                                })?;
                             }
                         }
                     }
@@ -995,15 +1067,24 @@ impl Catalog {
                                     if has_rows {
                                         let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                         let data_dir = self.data_dir.clone();
-                                        let _ = tbl.rewrite_rows_for_schema_change(
+                                        tbl.rewrite_rows_for_schema_change(
                                             &old_schema,
                                             &fill,
                                             &data_dir,
-                                        );
+                                        )
+                                        .map_err(|error| {
+                                            StorageError::WalReplay(format!(
+                                                "table '{table_name}': drop column rewrite failed: {error}"
+                                            ))
+                                        })?;
                                     }
                                 }
                                 if rec.lsn > 0 {
-                                    let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                    tbl.heap.stamp_all_pages_min_lsn(rec.lsn).map_err(|error| {
+                                        StorageError::WalReplay(format!(
+                                            "table '{table_name}': drop column LSN barrier failed: {error}"
+                                        ))
+                                    })?;
                                 }
                             }
 
@@ -1867,8 +1948,11 @@ impl Catalog {
         Ok(new_rid)
     }
 
-    pub fn get(&self, table: &str, rid: RowId) -> Option<Row> {
-        self.get_table(table)?.get(rid)
+    pub fn get(&self, table: &str, rid: RowId) -> io::Result<Option<Row>> {
+        match self.get_table(table) {
+            Some(tbl) => tbl.get(rid),
+            None => Ok(None),
+        }
     }
 
     pub fn get_projected(
@@ -2287,7 +2371,7 @@ impl Catalog {
         }
         // Step 2: snapshot the now-mutated bytes. `HeapFile::get`
         // observes the pinned hot page, so it returns the fresh row.
-        let new_bytes = match tbl.heap.get(rid) {
+        let new_bytes = match tbl.heap.get(rid)? {
             Some(b) => b,
             // Shouldn't happen — we just patched it — but be defensive.
             None => return Ok(false),
@@ -2351,7 +2435,7 @@ impl Catalog {
         if self.wal.is_off() {
             return Ok(true);
         }
-        let new_bytes = match tbl.heap.get(rid) {
+        let new_bytes = match tbl.heap.get(rid)? {
             Some(b) => b,
             None => return Ok(false),
         };
@@ -2935,7 +3019,7 @@ impl Catalog {
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
         Ok(self
             .by_name(table)?
-            .index_lookup(column, key)
+            .index_lookup(column, key)?
             .map(|(_, row)| row))
     }
 

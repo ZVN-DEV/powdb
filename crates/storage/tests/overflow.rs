@@ -69,7 +69,10 @@ fn test_roundtrip_across_spill_boundary() {
     cat.sync_wal().unwrap();
 
     for (n, rid) in &rids {
-        let row = cat.get("docs", *rid).expect("row present");
+        let row = cat
+            .get("docs", *rid)
+            .expect("read row")
+            .expect("row present");
         assert_eq!(body_of(&row).len(), *n, "length mismatch for size {n}");
         assert!(body_of(&row).bytes().all(|b| b == b'x'), "content mismatch");
     }
@@ -110,7 +113,7 @@ fn test_multi_spill_row() {
         .unwrap();
     cat.sync_wal().unwrap();
 
-    let row = cat.get("t", rid).unwrap();
+    let row = cat.get("t", rid).expect("read row").unwrap();
     assert_eq!(row[0], Value::Str(a));
     assert_eq!(row[1], Value::Bytes(b));
     drop(cat);
@@ -169,7 +172,9 @@ fn test_update_transitions() {
         .unwrap();
     cat.sync_wal().unwrap();
     assert_eq!(
-        cat.get("docs", rid).map(|r| body_of(&r).len()),
+        cat.get("docs", rid)
+            .expect("read row")
+            .map(|r| body_of(&r).len()),
         Some(20_000)
     );
 
@@ -182,7 +187,7 @@ fn test_update_transitions() {
         )
         .unwrap();
     cat.sync_wal().unwrap();
-    let row = cat.get("docs", rid).unwrap();
+    let row = cat.get("docs", rid).expect("read row").unwrap();
     assert_eq!(body_of(&row).len(), 60_000);
     assert!(body_of(&row).bytes().all(|c| c == b'b'));
 
@@ -195,7 +200,12 @@ fn test_update_transitions() {
         )
         .unwrap();
     cat.sync_wal().unwrap();
-    assert_eq!(cat.get("docs", rid).map(|r| body_of(&r).len()), Some(9_000));
+    assert_eq!(
+        cat.get("docs", rid)
+            .expect("read row")
+            .map(|r| body_of(&r).len()),
+        Some(9_000)
+    );
 
     // spilled -> inline.
     rid = cat
@@ -206,7 +216,7 @@ fn test_update_transitions() {
         )
         .unwrap();
     cat.sync_wal().unwrap();
-    let row = cat.get("docs", rid).unwrap();
+    let row = cat.get("docs", rid).expect("read row").unwrap();
     assert_eq!(body_of(&row), "small-again");
 
     // Survives a reopen (clean shutdown checkpoints the heap).
@@ -242,7 +252,9 @@ fn test_value_size_cap_rejected() {
         .unwrap();
     cat.sync_wal().unwrap();
     assert_eq!(
-        cat.get("docs", rid).map(|r| body_of(&r).to_string()),
+        cat.get("docs", rid)
+            .expect("read row")
+            .map(|r| body_of(&r).to_string()),
         Some("ok".into())
     );
     drop(cat);
@@ -289,7 +301,7 @@ fn test_sweep_reclaims_orphan_chains() {
     assert_eq!(reclaimed, 2, "sweep must reclaim exactly the orphan chain");
 
     // The live row's value is intact (its chain was NOT swept).
-    let row = cat.get("docs", keep).unwrap();
+    let row = cat.get("docs", keep).expect("read row").unwrap();
     assert_eq!(body_of(&row).len(), 40_000);
     assert!(body_of(&row).bytes().all(|b| b == b'K'));
 
@@ -354,7 +366,7 @@ fn test_delete_frees_chain_eagerly() {
     );
 
     // The untouched row is byte-exact.
-    let row = cat.get("docs", keep).unwrap();
+    let row = cat.get("docs", keep).expect("read row").unwrap();
     assert_eq!(body_of(&row).len(), 40_000);
     assert!(body_of(&row).bytes().all(|b| b == b'K'));
 

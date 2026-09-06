@@ -588,7 +588,7 @@ impl Table {
 
     pub(crate) fn preflight_update(&self, rid: RowId, values: &Row) -> io::Result<()> {
         let old_row = if self.indexed_cols.iter().any(|index| index.unique) {
-            self.get(rid)
+            self.get(rid)?
         } else {
             None
         };
@@ -1126,7 +1126,7 @@ impl Table {
         if !self.has_overflow_rows() {
             return Ok(Vec::new());
         }
-        let data = match self.heap.get(rid) {
+        let data = match self.heap.get(rid)? {
             Some(d) => d,
             None => return Ok(Vec::new()),
         };
@@ -1322,15 +1322,15 @@ impl Table {
                 // rebuild-after-spill must not build a btree of missing keys).
                 let owned;
                 let v: &Value = if crate::row::row_is_v2(raw) {
-                    match crate::row::decode_row_v2(schema, layout, raw, |stub| {
+                    // A chain that will not reassemble fails the whole
+                    // rebuild. Skipping the row instead built a column index
+                    // that was silently missing it, so every keyed access
+                    // reported the row as absent while a scan still found it.
+                    let row = crate::row::decode_row_v2(schema, layout, raw, |stub| {
                         heap.read_overflow_value(stub).map_err(io::Error::from)
-                    }) {
-                        Ok(row) => {
-                            owned = row[entry.col_idx].clone();
-                            &owned
-                        }
-                        Err(_) => continue,
-                    }
+                    })?;
+                    owned = row[entry.col_idx].clone();
+                    &owned
                 } else {
                     owned = decode_column(schema, layout, raw, entry.col_idx);
                     &owned
@@ -1387,16 +1387,24 @@ impl Table {
         Ok(())
     }
 
-    pub fn get(&self, rid: RowId) -> Option<Row> {
-        let data = self.heap.get(rid)?;
+    /// Read one row by RowId.
+    ///
+    /// `Ok(None)` means the row is deleted or was never there. A read
+    /// failure, a page that fails its CRC, and an overflow chain that will
+    /// not reassemble are all errors: mapping them to `None` turned a corrupt
+    /// row into "no such row" with a success status.
+    pub fn get(&self, rid: RowId) -> io::Result<Option<Row>> {
+        let Some(data) = self.heap.get(rid)? else {
+            return Ok(None);
+        };
         if crate::row::row_is_v2(&data) {
             // v2 row: reassemble each spilled column from its overflow chain.
             return crate::row::decode_row_v2(&self.schema, &self.row_layout, &data, |stub| {
                 self.heap.read_overflow_value(stub).map_err(io::Error::from)
             })
-            .ok();
+            .map(Some);
         }
-        Some(decode_row(&self.schema, &data))
+        Ok(Some(decode_row(&self.schema, &data)))
     }
 
     /// Read only the requested logical columns from one row.
@@ -1422,7 +1430,7 @@ impl Table {
             }
         }
 
-        let Some(data) = self.heap.get(rid) else {
+        let Some(data) = self.heap.get(rid)? else {
             return Ok(None);
         };
         let mut values: Vec<Value> = Vec::with_capacity(column_indices.len());
@@ -1948,7 +1956,7 @@ impl Table {
             true
         };
 
-        let old_row = if touches_index { self.get(rid) } else { None };
+        let old_row = if touches_index { self.get(rid)? } else { None };
 
         let new_rid = self.heap.update(rid, encoded)?;
 
@@ -2210,19 +2218,20 @@ impl Table {
         })
     }
 
-    pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
-        let entry = self.indexed_cols.iter().find(|c| c.col_name == col_name)?;
-        if entry.unique {
-            let rid = entry.btree.lookup(key)?;
-            let row = self.get(rid)?;
-            Some((rid, row))
+    pub fn index_lookup(&self, col_name: &str, key: &Value) -> io::Result<Option<(RowId, Row)>> {
+        let Some(entry) = self.indexed_cols.iter().find(|c| c.col_name == col_name) else {
+            return Ok(None);
+        };
+        let rid = if entry.unique {
+            entry.btree.lookup(key)
         } else {
             // Non-unique: return the first match (for backwards compat).
-            let rids = entry.btree.lookup_prefix(key);
-            let rid = *rids.first()?;
-            let row = self.get(rid)?;
-            Some((rid, row))
-        }
+            entry.btree.lookup_prefix(key).first().copied()
+        };
+        let Some(rid) = rid else {
+            return Ok(None);
+        };
+        Ok(self.get(rid)?.map(|row| (rid, row)))
     }
 
     /// Look up ALL matching rows for a column value. For unique indexes
@@ -2359,7 +2368,7 @@ mod projected_tests {
             Value::Bytes(vec![0xA5; 9_000]),
         ];
         let rid = table.insert(&row).expect("insert spilled row");
-        let raw = table.heap.get(rid).expect("raw row");
+        let raw = table.heap.get(rid).expect("read row").expect("raw row");
         assert!(crate::row::row_is_v2(&raw));
         assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1).is_some());
         assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 2).is_some());
@@ -2404,7 +2413,7 @@ mod projected_tests {
     #[test]
     fn projected_read_ignores_unselected_corrupt_spill() {
         let (_dir, mut table, rid, row) = projected_table();
-        let raw = table.heap.get(rid).expect("raw row");
+        let raw = table.heap.get(rid).expect("read row").expect("raw row");
         let document_stub = crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1)
             .expect("document stub");
         table

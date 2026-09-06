@@ -309,7 +309,7 @@ fn unique_and_non_scalar_fail_before_heap_overflow_or_catalog_activation() {
         .update("Doc", second, &row(2, json(r#"{"author":["bad"]}"#), ""),)
         .is_err());
     assert_eq!(
-        catalog.get("Doc", second).unwrap()[1],
+        catalog.get("Doc", second).expect("read row").unwrap()[1],
         json(r#"{"author":"Grace"}"#)
     );
     let tree = catalog.expression_index_btree("Doc", index_id).unwrap();
