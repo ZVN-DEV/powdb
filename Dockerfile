@@ -4,7 +4,15 @@
 # host arch and cross-compiles to $TARGETARCH. Under multi-arch buildx this
 # keeps the (slow) DB-engine build off QEMU emulation — only the tiny runtime
 # stage below runs emulated for the non-native arch.
-FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS builder
+#
+# Pinned by DIGEST as well as tag (multi-arch index digest for
+# rust:1.95-slim-bookworm as of 2026-09-06), so the compiler that builds the
+# shipped binary cannot be swapped under us by a tag repoint, the way the
+# runtime stage below has been since 2026-07-24. The tag is kept alongside the
+# digest for readability and is what msrv-consistency parses. Refresh both
+# together, deliberately:
+#   docker buildx imagetools inspect rust:1.95-slim-bookworm
+FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder
 
 WORKDIR /src
 
@@ -50,10 +58,14 @@ RUN set -eux; \
       } > /cross-env; \
     fi
 
-# No RUSTFLAGS/target-cpu override is set here: .cargo/config.toml (which pins
-# target-cpu=native for local dev) is never copied into the build context, so
-# cargo uses the portable baseline target-cpu for each triple — the binaries
-# stay runnable across the whole arch, no SIGILL on older silicon.
+# No RUSTFLAGS/target-cpu override is set here, and none is needed: the
+# checked-in .cargo/config.toml deliberately sets NO rustflags (it says so on
+# its first line), so cargo already uses the portable baseline target-cpu for
+# each triple and the binaries stay runnable across the whole arch, with no
+# SIGILL on older silicon. The comment that used to sit here said that file
+# "pins target-cpu=native for local dev", which was true of a version removed
+# after exactly that SIGILL incident; anyone acting on it would have added an
+# override this image does not want.
 
 # Cache deps separately from source by copying manifests first.
 # powdb-server depends on storage + query + auth + sync; powdb-cli additionally
