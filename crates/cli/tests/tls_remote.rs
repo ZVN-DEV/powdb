@@ -16,15 +16,29 @@ fn cli_bin() -> &'static str {
 
 /// Locate the `powdb-server` binary. It is not in this crate, so
 /// `CARGO_BIN_EXE_powdb-server` is unavailable; instead derive it from the CLI
-/// binary's directory (workspace binaries share a target dir). If it cannot be
-/// found, the test is skipped rather than failing (e.g. when only the CLI was
-/// built in isolation).
-fn server_bin() -> Option<std::path::PathBuf> {
+/// binary's directory, which workspace binaries share.
+///
+/// A missing binary is a hard failure, not a skip. These tests are the only
+/// coverage the remote CLI path has, and skipping them printed one line to a
+/// stderr nobody reads while the run went green: a broken remote client would
+/// have shipped with a full-looking test report. `cargo test --workspace`
+/// builds every binary, so the failure only fires when this crate was built on
+/// its own.
+fn server_bin() -> std::path::PathBuf {
     let cli = std::path::Path::new(cli_bin());
-    let dir = cli.parent()?;
+    let dir = cli
+        .parent()
+        .expect("the test binary has a parent directory");
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let candidate = dir.join(format!("powdb-server{ext}"));
-    candidate.exists().then_some(candidate)
+    assert!(
+        candidate.exists(),
+        "powdb-server is not built, so the remote half of this test would not run at all. \
+         Build it with `cargo build -p powdb-server`, or run `cargo test --workspace`, \
+         which builds every binary. Looked for {}",
+        candidate.display()
+    );
+    candidate
 }
 
 fn tmp(tag: &str) -> std::path::PathBuf {
@@ -131,10 +145,7 @@ fn stderr_str(o: &std::process::Output) -> String {
 
 #[test]
 fn cli_tls_against_tls_required_server() {
-    let Some(server) = server_bin() else {
-        eprintln!("skipping: powdb-server binary not found next to powdb-cli");
-        return;
-    };
+    let server = server_bin();
 
     let data = tmp("data");
     let data_s = data.to_str().unwrap().to_string();

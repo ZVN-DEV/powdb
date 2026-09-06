@@ -18,13 +18,31 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_powdb-cli")
 }
 
-/// Locate `powdb-server` next to the CLI binary (workspace binaries share a
-/// target dir); skip rather than fail if it is absent.
-fn server_bin() -> Option<std::path::PathBuf> {
-    let dir = std::path::Path::new(bin()).parent()?;
+/// Locate the `powdb-server` binary. It is not in this crate, so
+/// `CARGO_BIN_EXE_powdb-server` is unavailable; instead derive it from the CLI
+/// binary's directory, which workspace binaries share.
+///
+/// A missing binary is a hard failure, not a skip. These tests are the only
+/// coverage the remote CLI path has, and skipping them printed one line to a
+/// stderr nobody reads while the run went green: a broken remote client would
+/// have shipped with a full-looking test report. `cargo test --workspace`
+/// builds every binary, so the failure only fires when this crate was built on
+/// its own.
+fn server_bin() -> std::path::PathBuf {
+    let cli = std::path::Path::new(bin());
+    let dir = cli
+        .parent()
+        .expect("the test binary has a parent directory");
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let candidate = dir.join(format!("powdb-server{ext}"));
-    candidate.exists().then_some(candidate)
+    assert!(
+        candidate.exists(),
+        "powdb-server is not built, so the remote half of this test would not run at all. \
+         Build it with `cargo build -p powdb-server`, or run `cargo test --workspace`, \
+         which builds every binary. Looked for {}",
+        candidate.display()
+    );
+    candidate
 }
 
 /// Spawn `powdb-server` on an OS-assigned port (`--port 0` + `--port-file`)
@@ -128,10 +146,7 @@ const PROJECTION: &str = "J { .id, .f, .b, .s, .big, .n }";
 
 #[test]
 fn embedded_and_remote_json_are_identical() {
-    let Some(server) = server_bin() else {
-        eprintln!("powdb-server binary not found; skipping transport parity test");
-        return;
-    };
+    let server = server_bin();
 
     let data = tmp("parity");
     let data_s = data.to_str().unwrap().to_string();
