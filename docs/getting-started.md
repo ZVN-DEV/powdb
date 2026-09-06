@@ -59,6 +59,22 @@ Data is stored in `./powdb_data/` by default. You can change it with `--data-dir
 cargo run --release -p powdb-cli -- --data-dir ./my_project_data
 ```
 
+**One statement, one line.** The REPL executes each line as it is entered. It
+keeps reading continuation lines only while a `{`, `(` or `"` is still open (it
+says so: `note: unterminated statement ...`). A pipeline split across lines with
+nothing open therefore runs a line at a time, and the second line fails on its
+own:
+
+```
+powql> User
+powql> filter .age > 0
+Error: at position 0: expected statement, got 'filter'
+```
+
+Write the pipeline on one line, or put it in a file and run
+`powdb-cli --exec-file query.powql`, where newlines continue a statement and
+`;` separates statements. `--exec` follows the same rule as `--exec-file`.
+
 ---
 
 ## 3. Create a Table

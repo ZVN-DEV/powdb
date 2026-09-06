@@ -84,6 +84,10 @@ one-time setup and the reusable standard.
   publishing to crates.io is irreversible.
 - **npm (`@zvndev/powdb-client`)**: published automatically by `release.yml`
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
+- **npm (`@zvndev/powdb-sync`)**: published the same way, by `release.yml`'s
+  `npm-publish-sync` job on the same tag push. Bootstrapped by hand for 0.24.0
+  (npm cannot configure a trusted publisher for a name that does not exist yet)
+  and token-less on every release since.
 - **npm (`@zvndev/powdb-embedded`)**: published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
   runner matrix (macOS arm64, Linux x64/arm64; Intel macOS builds from source and
@@ -126,8 +130,10 @@ under a released version number, so the crates cannot go first.
 
 [ ] git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
     Pushing the tag triggers release.yml, which builds the binaries, publishes
-    the multi-arch Docker image, and publishes @zvndev/powdb-client to npm
-    token-less via OIDC. No manual npm publish for the client.
+    the multi-arch Docker image, and publishes BOTH @zvndev/powdb-client and
+    @zvndev/powdb-sync to npm token-less via OIDC. No manual npm publish for
+    either. The addon (@zvndev/powdb-embedded) is the one npm package the tag
+    does not publish; it has its own dispatch below.
 [ ] Publish the crates, dispatched ON THE TAG, in dependency order (the
     workflow already orders them: storage, auth, query, sync, backup, server,
     powdb, cli):
@@ -149,10 +155,13 @@ under a released version number, so the crates cannot go first.
     needs no OIDC setup. Do this BEFORE the smoke, which installs the addon.
 [ ] Smoke-test the LIVE registries: run post-publish-smoke.yml with the
     released version (`gh workflow run post-publish-smoke.yml -f version=X.Y.Z`).
-    It cargo-installs powdb-cli + powdb-server from crates.io and reruns the
-    durability smoke (README PowQL flow + kill -9/restart WAL replay; the gate
-    v0.4.1-v0.4.3 lacked), then npm-installs @zvndev/powdb-client and
-    @zvndev/powdb-embedded and exercises both
+    It covers all six published channels in parallel jobs: cargo-installs
+    powdb-cli + powdb-server from crates.io and reruns the durability smoke
+    (README PowQL flow + kill -9/restart WAL replay; the gate v0.4.1-v0.4.3
+    lacked), cargo-installs the `powdb` facade crate, npm-installs
+    @zvndev/powdb-client + @zvndev/powdb-embedded and @zvndev/powdb-sync, pulls
+    and runs the ghcr image, and checks the GitHub Release assets and their
+    attestation
 [ ] Verify each registry directly rather than trusting workflow exit codes:
     crates.io versions, `gh release view vX.Y.Z`, the ghcr tag list, and
     `npm view <pkg> version` for each npm package

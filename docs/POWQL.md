@@ -61,11 +61,12 @@ PowQL reads left to right. You name the table, apply operations, and project fie
 type User {
   required name: str,
   required email: str,
-  age: int
+  age: int,
+  status: str
 }
 
 # Insert a row
-insert User { name := "Alice", email := "alice@example.com", age := 30 }
+insert User { name := "Alice", email := "alice@example.com", age := 30, status := "active" }
 
 # Scan all users
 User
@@ -839,6 +840,19 @@ PowQL automatically selects the best join strategy:
 No hint syntax is needed. Use `EXPLAIN` to inspect the selected strategy. Query
 deadlines and client disconnects also cooperatively stop allowed join work.
 
+**The two caps a join can hit, and what to do about each.**
+
+| Error | Cap | Configurable |
+|---|---|---|
+| `nested-loop join would evaluate ... candidate pairs` | 6,400,000 candidate pairs, checked *before* execution | Yes, `POWDB_MAX_NESTED_LOOP_PAIRS` |
+| `join result exceeds row limit` | 1,000,000 output rows, checked *during* execution | No. It is a compile-time constant that exists to stop a Cartesian blow-up from exhausting memory |
+
+There is no knob for the second one, and the message deliberately does not
+promise one. A join producing more than a million rows is almost always a
+missing or wrong `on` predicate; narrow it, or aggregate instead of
+materializing. Sorting has the same shape of cap at 10,000,000 input rows
+(`sort input exceeds row limit`), and its message names the fix: add a `limit`.
+
 ---
 
 ## Nested Projections (Shaped Results)
@@ -1403,9 +1417,13 @@ Event filter .name = "login" update { ts := now() }
 `now()` is a runtime function, so it can only appear where expressions are
 evaluated (filters, projections, `having`, `update` assignments). **Insert**
 assignments accept literal values only: `insert Event { ts := now() }` fails
-with `expected literal value`. A `datetime` column is stored as an integer
-timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
-stamp them afterwards with `update { ts := now() }` if needed.
+with `expected literal value`. A `datetime` column is stored as **epoch
+microseconds** (see [Supported Types](#supported-types)), so seed inserted rows
+with a microsecond literal, `ts := 1767225600000000` rather than the
+seconds-since-epoch `ts := 1767225600`, and stamp them afterwards with
+`update { ts := now() }` if needed. A seconds value is accepted and stores
+cleanly, it just lands in January 1970: `extract("year", .ts)` on a row seeded
+with `1752000000` returns `1970`.
 
 Because a timestamp literal is written as that plain integer, a comparison
 against a `datetime` column compares the underlying microseconds:
@@ -1435,11 +1453,25 @@ Event { .name, next_week: date_add(.ts, 7, "days") }
 
 #### date_diff
 
-Return the difference between two datetime values in the specified unit:
+Return the difference between two datetime values in the given unit. The result
+is **the first argument minus the second**, so it is negative when the first is
+the earlier of the two:
 
 ```
-Event { .name, age_days: date_diff(.created_at, now(), "days") }
+Event { .name, age_days: date_diff(now(), .created_at, "days") }
+# a row created 10 days ago: 10
+
+Event { .name, backwards: date_diff(.created_at, now(), "days") }
+# the same row: -10
 ```
+
+The difference is computed in microseconds and then truncated toward zero by the
+unit, so a 23-hour gap is `0` days.
+
+Units, for both `date_diff` and `date_add`: `microsecond`, `millisecond`,
+`second`, `minute`, `hour`, `day`, each also accepted in the plural and as
+`us` / `ms` / `s` / `m` / `h` / `d`. There is no week, month or year unit; an
+unrecognised unit yields the empty set rather than an error.
 
 ### CAST
 

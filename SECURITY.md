@@ -142,7 +142,14 @@ PowDB supports two authentication modes:
 
 In both modes:
 
-- **Rate limiting**: authentication attempts are rate-limited to prevent brute-force attacks.
+- **Rate limiting**: failed authentication attempts are counted per peer address in a
+  fixed 60-second window. **5 failures against one username** from one peer lock that
+  (peer, username) pair out; **50 failures across all usernames** from one peer lock the
+  peer out entirely. The two thresholds differ on purpose: a wrong username swept across a
+  server must not be able to lock a real user out of their own account. A locked-out client
+  is refused with `too many auth failures, retry after 60s` (wire error class 7,
+  `rate_limited`) rather than being told whether the credentials were right. A successful
+  authentication clears both counters for that peer.
 - **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
 - **Connection limits**: the server enforces a maximum number of concurrent connections.
 

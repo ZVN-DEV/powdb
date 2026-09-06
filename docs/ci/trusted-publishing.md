@@ -55,9 +55,10 @@ and workflow run that built it. Free supply-chain transparency.
 
 ### crates.io
 
-Same idea, but configured **per crate** (a workspace with 7 published crates —
-`powdb-storage`, `powdb-auth`, `powdb-query`, `powdb-backup`, `powdb-server`,
-`powdb` (embedded facade), `powdb-cli` — needs 7 configs):
+Same idea, but configured **per crate**. PowDB publishes 8 crates, so it needs
+8 configs. In `publish.yml`'s dependency order: `powdb-storage`, `powdb-auth`,
+`powdb-query`, `powdb-sync`, `powdb-backup`, `powdb-server`, `powdb` (the
+embedded facade), `powdb-cli`.
 
 1. crates.io → each crate → **Settings → Trusted Publishing → Add**.
 2. Owner `ZVN-DEV`, repo `powdb`, workflow `publish.yml`, optional environment.

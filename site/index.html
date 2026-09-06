@@ -66,6 +66,7 @@
     <div class="install-block">
       <span class="prompt">$</span> cargo install powdb-cli
     </div>
+    <p class="hero-version">Latest release: <a href="https://github.com/ZVN-DEV/powdb/releases/latest" target="_blank" rel="noopener">v0.27.0</a></p>
   </div>
 </section>
 
@@ -516,7 +517,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
     <h2>When PowDB is not the right fit</h2>
     <p class="section-subtitle">PowDB is pre-1.0 and deliberately scoped. Be honest with yourself before adopting it:</p>
     <ul style="max-width: 720px; margin: 0 auto; padding-left: 24px; line-height: 1.8;">
-      <li><strong>Pre-1.0 format stability</strong> -- new on-disk format versions appear across minor versions. An older data directory always opens on a newer release (and upgrades lazily, without a rewrite), but a newer directory will not open on an older binary. Pin versions, and read <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md" target="_blank" rel="noopener">the stability policy</a> before upgrading.</li>
+      <li><strong>Pre-1.0 format stability</strong> -- new on-disk format versions appear across minor versions. An older data directory always opens on a newer release (and upgrades lazily, without a rewrite). The reverse is not guaranteed: a directory written by a newer release opens on an older binary only while no format bump has fired, and once one has, the older binary refuses it. Pin versions, and read <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md" target="_blank" rel="noopener">the stability policy</a> before upgrading.</li>
       <li><strong>No wire-protocol compatibility</strong> -- PowDB speaks a SQL subset (<a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md" target="_blank" rel="noopener">docs/SQL.md</a>) through its own binary protocol and embedded API, not the Postgres or MySQL wire format. Off-the-shelf ORMs, BI dashboards, JDBC drivers, and DB browsers won't connect over the wire.</li>
       <li><strong>Effectively single-node</strong> -- no sharding, no consensus, and no live replica tailing. Freshness across processes comes from snapshot refresh (restore a newer snapshot and swap, in seconds), not streaming replication. If you need live replication or sync across nodes, use <a href="https://turso.tech" target="_blank" rel="noopener">Turso</a>.</li>
       <li><strong>No MVCC, no online backup</strong> -- a single writer takes the whole write-admission gate while parallel readers run; many concurrent clients sharing one read-write database is Postgres's territory. Backups (full, incremental, PITR) are offline-only today.</li>
