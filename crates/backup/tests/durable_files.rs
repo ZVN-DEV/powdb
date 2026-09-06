@@ -89,7 +89,11 @@ fn full_backup_and_restore_preserve_materialized_views() {
     let mut e2 = Engine::new(&restored).unwrap();
     e2.execute_powql("refresh V")
         .expect("the restored view must still be refreshable");
-    assert_eq!(count(&mut e2, "count(V)"), 1, "the view must serve its rows");
+    assert_eq!(
+        count(&mut e2, "count(V)"),
+        1,
+        "the view must serve its rows"
+    );
 }
 
 #[test]

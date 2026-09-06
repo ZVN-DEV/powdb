@@ -3,13 +3,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::retained_segments_dir;
+use crate::fsync::fsync_dir;
 use crate::metadata::{
     minimum_retained_lsn, read_replica_cursors_unlocked, replace_replica_cursors_unlocked,
     with_cursor_metadata_lock,
 };
 use crate::segment::{list_segment_files, read_segment_file, SegmentIdentity};
 use crate::{DatabaseIdentity, ReplicaCursor};
-use crate::fsync::fsync_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionGcSummary {

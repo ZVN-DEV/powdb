@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use powdb_storage::create_data_dir_secure;
 use serde::{Deserialize, Serialize};
 
-use crate::segment::{read_units_since, SegmentIdentity};
 use crate::fsync::fsync_dir;
+use crate::segment::{read_units_since, SegmentIdentity};
 
 pub const SYNC_STATE_DIR: &str = ".powdb-sync";
 pub const IDENTITY_FILE: &str = "identity.json";

@@ -7,8 +7,8 @@
 
 pub mod apply;
 pub mod checkpoint;
-mod fsync;
 pub mod error;
+mod fsync;
 pub mod metadata;
 pub mod replica;
 pub mod retention;

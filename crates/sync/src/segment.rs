@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::fsync::fsync_dir;
 use powdb_storage::catalog::CATALOG_VERSION;
 use powdb_storage::create_data_dir_secure;
 use powdb_storage::wal::{WalRecord, WAL_FORMAT_VERSION};
-use crate::fsync::fsync_dir;
 
 const SEGMENT_MAGIC: &[u8; 4] = b"PRUL";
 const FOOTER_MAGIC: &[u8; 4] = b"RULF";
