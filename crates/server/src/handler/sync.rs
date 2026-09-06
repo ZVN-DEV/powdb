@@ -72,7 +72,6 @@ pub(super) enum SyncErrorClass {
     IdentityOrFormatMismatch,
     RetainedRead,
     RetainedUnitEncoding,
-    RetainedChunkNotApplyable,
     LsnAheadOfRemote,
     AckValidation,
     /// The primary refused to advance this replica's cursor for a reason the
@@ -106,7 +105,6 @@ impl SyncErrorClass {
             Self::IdentityOrFormatMismatch => "identity_or_format_mismatch",
             Self::RetainedRead => "retained_read",
             Self::RetainedUnitEncoding => "retained_unit_encoding",
-            Self::RetainedChunkNotApplyable => "retained_chunk_not_applyable",
             Self::LsnAheadOfRemote => "lsn_ahead_of_remote",
             Self::AckValidation => "ack_validation",
             Self::AckRejected => "ack_rejected",
@@ -141,7 +139,6 @@ impl SyncErrorClass {
             | Self::ActiveTransaction
             | Self::CursorLsnMismatch
             | Self::IdentityOrFormatMismatch
-            | Self::RetainedChunkNotApplyable
             | Self::LsnAheadOfRemote
             | Self::AckValidation
             // A refused cursor advance is the ack-side twin of
