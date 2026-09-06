@@ -254,12 +254,15 @@ jobs:
     # on npmjs.com for @zvndev/powdb-sync (org: ZVN-DEV, repo: powdb, workflow:
     # release.yml, env: npm-publish).
     #
-    # The package has never been published, and npm cannot configure a trusted
-    # publisher for a name that does not exist yet, so the first publish has to
-    # be a manual `npm publish` (see docs/ci/trusted-publishing.md). Until that
-    # bootstrap happens this job WARNS and skips rather than failing, so an
-    # unbootstrapped optional package cannot redden a release that is otherwise
-    # complete. It starts publishing on its own the moment the name exists.
+    # The package was bootstrapped by hand for 0.24.0 (npm cannot configure a
+    # trusted publisher for a name that does not exist yet, see
+    # docs/ci/trusted-publishing.md) and has published from here ever since.
+    # The "warn and skip if npm view fails" branch that covered the bootstrap
+    # window is gone: `npm view` fails on a registry 5xx or a network blip
+    # exactly as it does on a missing package, so keeping it meant a transient
+    # error would drop one of the three npm packages from a release and leave
+    # the run green. This job now publishes unconditionally and fails if it
+    # cannot.
     environment: npm-publish
     permissions:
       contents: read
@@ -304,18 +307,7 @@ jobs:
           done
           echo "peer pins match $tag"
 
-      - name: Has this package been bootstrapped on npm?
-        id: exists
-        run: |
-          if npm view @zvndev/powdb-sync version >/dev/null 2>&1; then
-            echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "bootstrapped=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::@zvndev/powdb-sync is not on npm yet, so this release does not include it. Publish it once by hand (npm publish --access public from clients/sync), then add the trusted publisher on npmjs.com; this job takes over from the next release."
-          fi
-
       - name: Install dependencies, build and test
-        if: steps.exists.outputs.bootstrapped == 'true'
         working-directory: clients/sync
         run: |
           corepack enable
@@ -329,7 +321,6 @@ jobs:
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Publish to npm (token-less, with provenance)
-        if: steps.exists.outputs.bootstrapped == 'true'
         working-directory: clients/sync
         run: npm publish --provenance --access public --tag "${{ steps.channel.outputs.npm_tag }}"
 
