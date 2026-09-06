@@ -25,6 +25,7 @@
     "index.d.ts",
     "*.node",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "publishConfig": {

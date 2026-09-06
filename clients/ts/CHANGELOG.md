@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### Fixed
+
+- A parameter the wire protocol cannot carry no longer desynchronizes the
+  connection. `2 ** 63`, `1e19`, `1e300` and `Number.MAX_VALUE` were tagged as
+  ints and threw a raw Node `RangeError` out of `writeBigInt64LE` after the
+  pending entry had already been queued, leaving a slot waiting for a reply the
+  server was never asked for: the next query hung and later ones took
+  `ECONNRESET`. Encoding now happens before anything is queued, an integral
+  double outside the safe-integer range binds as a float, and a `bigint` outside
+  the signed 64-bit range or a non-finite number is refused synchronously with
+  the new `invalid_argument` code.
+- A server-initiated `Error` frame (idle timeout, reaped transaction, "server
+  shutting down") arrived as `protocol_error: received unexpected frame from
+  server`, discarding the server's own text and error class. It now closes the
+  client with that text and the code its class maps to. A raw socket error is
+  wrapped as a `PowDBError` coded `closed`, with the Node error as `cause`.
+- A result larger than `MAX_RESULT_CELLS` closed the connection and poisoned the
+  client for every later call. It is the one decode failure that leaves the byte
+  stream intact, so the frame is skipped, only the query that asked for it fails
+  (with `size_exceeded`), and the connection stays up.
+- A burst past the server's frame read-ahead budget died mid-flight (200
+  concurrent queries: 22 answered, then `ECONNRESET`). Requests beyond a window
+  of `maxInFlight` (default 64) now wait in a client-side FIFO and go out as
+  replies come back.
+- `Pool` handed out idle clients whose connection had already died, costing one
+  failed `withClient` per idle client after a server restart. Pooled clients are
+  watched for teardown and evicted, and the acquire timeout is now a `PowDBError`
+  coded `timeout` rather than a bare `Error`.
+- An over-cap parameter count or an oversized frame is refused locally before
+  anything is written, instead of being sent and rejected by the server.
+- `escapeIdent("select")` returned a bare reserved word the engine then refused,
+  and it refused the backticked form too, so no spelling of a reserved table name
+  worked. Reserved words are backtick-quoted now, and an already-backticked name
+  is refused with a message saying to pass the bare name. The reserved list is
+  diffed against the engine lexer by `test/escape.test.ts`.
+- `escapeLiteral` and `escapeSqlLiteral` range-check bigints, instead of emitting
+  an integer literal above `i64::MAX` that the engine refuses at parse time.
+- Every abort rejects with a `PowDBError` coded `aborted`, with the abort reason
+  on `.cause`. `ctrl.abort(new Error(...))` used to reject with the bare `Error`,
+  so `err.code === "aborted"` did not hold for a custom reason.
+
+### Changed
+
+- `queryTyped`'s generic is no longer constrained to `TypedRow`. The bound
+  rejected the `interface` most callers declare a row type with, while claiming
+  a check the method never performed. It now matches `queryObjects`.
+- New `maxInFlight` connect option (default 64).
+
 ## 0.27.0 - 2026-08-26
 
 No client API changes. Version moves in lockstep with the engine.

@@ -123,3 +123,17 @@ pnpm run test:e2e
 repo-local `bindings/node` build artifact. The repo-local fallback is used only
 when the package is not installed; an installed package that fails to load still
 fails the test.
+
+## Links
+
+- [Changelog](https://github.com/ZVN-DEV/powdb/blob/main/clients/sync/CHANGELOG.md)
+- [`@zvndev/powdb-client`](https://www.npmjs.com/package/@zvndev/powdb-client)
+  ([source](https://github.com/ZVN-DEV/powdb/tree/main/clients/ts))
+- [`@zvndev/powdb-embedded`](https://www.npmjs.com/package/@zvndev/powdb-embedded)
+  ([source](https://github.com/ZVN-DEV/powdb/tree/main/bindings/node))
+- [Embedded sync design notes](https://github.com/ZVN-DEV/powdb/blob/main/docs/embedded-sync.md)
+- [PowDB](https://github.com/ZVN-DEV/powdb)
+
+## License
+
+MIT

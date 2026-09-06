@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Fixed
+
+- Every entry point reports a transport failure as `remote_unavailable`.
+  `status()` and `syncNow()` used to let the underlying client's error escape
+  with its own code, so a caller branching on `PowDBSyncErrorCode` saw codes that
+  are not in that union.
+- `DEFAULT_MAX_PULL_UNITS` raised from 512 to 4096, matching the server's own
+  chunk ceiling. Paired with the server-side fix below, a transaction larger than
+  the pull window is now served instead of wedging the replica.
+
+### Changed
+
+- `LocalApplyRequest` extends the new `NormalizedSyncIdentity` rather than the
+  lenient caller-facing `SyncIdentity`, so `primaryGeneration` is `bigint` and
+  not `bigint | number`. A replica always normalizes the identity before calling
+  the local adapter, so this is what was already passed at runtime; the wider
+  type only made the obvious adapter body
+  (`(request) => local.applyRetainedUnits(request)`) fail to type-check against
+  `@zvndev/powdb-embedded`.
+
+### Engine side
+
+- A committed transaction larger than the pull window can now be pulled. The
+  chunk used to be cut at `maxUnits`, the cut landed inside the transaction, the
+  primary refused it, and every retry cut in the same place, so the replica was
+  wedged for good while `status` reported `repairAction: "pull"` with
+  `lastSyncError: null`. `maxUnits` is a hint now and the chunk runs on to the
+  commit or rollback that closes the transaction, bounded by the byte budget. A
+  transaction too large for the byte budget answers with a rebootstrap status
+  naming it, instead of an error the replica would retry forever.
+- A live primary archives committed history on demand when a replica calls
+  `status` or `pull`. Retained segments were previously written only by a
+  checkpoint, and the only checkpoint a running primary performed was on graceful
+  shutdown, so a replica polling a live primary was told `awaitArchive` forever.
+- `status` reports `rebootstrap` when the tail a replica is about to pull holds a
+  record V1 embedded sync cannot apply, with the reason naming DDL, instead of
+  leaving the replica to discover it one failed pull at a time.
+
 ## 0.27.0 - 2026-08-26
 
 - `SUPPORTED_CATALOG_VERSION` raised from 6 to 7. The engine's catalog format
