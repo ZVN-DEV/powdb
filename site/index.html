@@ -70,14 +70,45 @@
   </div>
 </section>
 
-<!-- What PowQL does that SQL cannot -->
+<!-- What PowQL does differently from SQL -->
 <section class="compare-section" id="shaped-results">
   <div class="container">
-    <h2>What PowQL does that SQL cannot</h2>
+    <h2>What PowQL does differently from SQL</h2>
     <p class="section-subtitle">
       Speed is not the interesting part of PowDB, and the benchmarks below are honest about where it loses.
-      These three capabilities are the part that has no SQL spelling at all.
+      One of these four changes the answer you get. The other three change how much you have to write to get it.
     </p>
+
+    <!-- Symmetric aggregates -->
+    <div class="compare-example">
+      <p class="compare-label">Symmetric aggregates: a join cannot inflate an average</p>
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header sql">SQL</div>
+          <pre><code class="language-sql">SELECT a.tier, AVG(a.balance)
+FROM Account a JOIN Ord o ON a.id = o.account_id
+GROUP BY a.tier;
+-- 15.0. The join repeats each account once per
+-- order, so the account with 4 orders is counted
+-- four times. The true average is 20.0.</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">PowQL</div>
+          <pre><code>Account as a join Ord as o on a.id = o.account_id
+  group a.tier { a.tier, avg_bal: avg(a.balance) }
+# 20.0. Each account contributes once.
+
+# Opt back in to the joined-row number explicitly:
+avg(raw a.balance)   # 15.0</code></pre>
+        </div>
+      </div>
+      <p class="section-subtitle" style="margin-top: 16px;">
+        Balances 10, 10 and 40 with 4, 1 and 1 orders. Both numbers are legitimate answers to different
+        questions, and SQL gives you the inflated one unless you know to write a <code>DISTINCT</code>
+        subquery. PowQL makes the safe one the default and the other one explicit. PowDB's own SQL
+        frontend keeps SQL's semantics on purpose, so SQL results stay SQL-compatible.
+      </p>
+    </div>
 
     <!-- Nested projections -->
     <div class="compare-example">
@@ -90,7 +121,10 @@ FROM User u
 LEFT JOIN "Order" o ON o.user_id = u.id;
 -- Alice repeats once per order.
 -- Cara (no orders) comes back as a row of NULLs.
--- The client regroups by hand.</code></pre>
+-- The client regroups by hand.
+--
+-- A correlated subquery with json_group_array
+-- gets the same shape as PowQL, as text.</code></pre>
         </div>
         <div class="compare-card">
           <div class="compare-card-header powql">PowQL</div>
@@ -160,16 +194,18 @@ alter Post add index (.data->published_at)</code></pre>
     </div>
 
     <p class="section-subtitle" style="margin-top: 32px;">
-      <strong>Why this is structural, not syntax.</strong> Returning a tree normally costs a serialization
-      step: engines that can express it build the nested value and hand you JSON <em>text</em>, which your
-      client then parses back into objects. The engines that nest natively (DuckDB, BigQuery) are columnar
-      OLAP systems, and query compilers that target another database never own the result format at all.
-      PowDB owns the storage engine, the query executor, and the wire protocol, so a nested field stays a
-      native value from the heap to your client. There is no text round-trip to pay for because no text is
-      ever produced.
+      <strong>What is spelling and what is not.</strong> The nested shape itself is not exclusive: stock
+      SQLite produces the same output, empty array for a childless parent included, with a correlated
+      subquery and <code>json_group_array(json_object(...))</code>, and DuckDB, SurrealDB and several ORMs
+      have their own spellings. What differs here is that PowDB owns the storage engine, the executor and
+      the wire protocol, so the nested value crosses the wire as PJ1 binary and the client decodes that
+      rather than parsing JSON text. It is a binary decode instead of a text parse, not the absence of a
+      decode, and we have not published a benchmark of the difference. The aggregate above is the one item
+      on this page that changes the answer rather than the typing.
     </p>
     <p class="section-subtitle" style="margin-top: 12px;">
-      Full detail: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#nested-projections-shaped-results" target="_blank" rel="noopener">Nested projections</a>,
+      Full detail: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#grouped-aggregates-over-joins-symmetric-and-raw-semantics" target="_blank" rel="noopener">Symmetric aggregates</a>,
+      <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#nested-projections-shaped-results" target="_blank" rel="noopener">nested projections</a>,
       <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#entity-links-relationship-traversal" target="_blank" rel="noopener">entity links</a>,
       and <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md" target="_blank" rel="noopener">the PowQL reference</a>.
     </p>
@@ -453,11 +489,11 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
       </div>
       <div class="feature-card">
         <h3>Nested Projections</h3>
-        <p>PowQL-only. One row per parent with correlated children assembled into a native JSON array, with per-parent <code>order</code> and <code>limit</code> and multi-level nesting. No join fan-out to undo.</p>
+        <p>PowQL, not PowDB's SQL subset. One row per parent with correlated children assembled into a native JSON array, with per-parent <code>order</code> and <code>limit</code> and multi-level nesting. No join fan-out to undo.</p>
       </div>
       <div class="feature-card">
         <h3>Entity Links</h3>
-        <p>PowQL-only. Declare a relationship once with <code>link Order.user -&gt; User on user_id = id</code>, then traverse it by name. A scalar hop through a non-unique key is a hard error, never a silent fan-out.</p>
+        <p>PowQL, not PowDB's SQL subset. Declare a relationship once with <code>link Order.user -&gt; User on user_id = id</code>, then traverse it by name. A scalar hop through a non-unique key is a hard error, never a silent fan-out.</p>
       </div>
       <div class="feature-card">
         <h3>Native JSON (PJ1)</h3>

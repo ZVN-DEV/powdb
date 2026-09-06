@@ -1062,10 +1062,18 @@ NestedProject fields=[QualifiedField { qualifier: "u", field: "name" }, orders]
 
 ### PowQL Only
 
-Nested projections are a native PowQL capability with no SQL spelling. The SQL
-frontend deliberately has no equivalent: SQL's `SELECT` list is flat, and
-PowDB does not invent a dialect extension for it. In SQL, use a join and
-regroup client-side, or run the PowQL query directly.
+Nested projections have no spelling in **PowDB's SQL frontend**. SQL's `SELECT`
+list is flat, and PowDB does not invent a dialect extension for it: in SQL, use
+a join and regroup client-side, or run the PowQL query directly.
+
+They are not something SQL as a language cannot express. An engine with JSON
+aggregate functions produces the same shape with a correlated subquery, for
+example SQLite's
+`(SELECT json_group_array(json_object('total', o.total)) FROM "Order" o WHERE o.user_id = u.id)`,
+empty array for a childless parent included. What PowQL offers over that
+spelling is brevity, a correlation the catalog can declare once (see
+[Entity Links](#entity-links-relationship-traversal)), and a result that stays a
+typed binary value on the wire instead of JSON text the client re-parses.
 
 ---
 
@@ -1208,9 +1216,12 @@ yields `[]`. This avoids SQL's three-valued-logic surprises.
 
 ### PowQL Only
 
-Entity links are a native PowQL capability with no SQL spelling. The SQL
-frontend has no equivalent declaration or traversal syntax; use an explicit
-join.
+Entity links have no spelling in **PowDB's SQL frontend**: it has no equivalent
+declaration or traversal syntax, so use an explicit join there. The relationship
+itself is of course expressible in SQL, by writing the join condition out in
+every query. What the link changes is where the condition lives (the catalog,
+declared once) and what happens when a to-one hop is not actually to-one, which
+a join answers by silently multiplying rows and a link refuses outright.
 
 ---
 

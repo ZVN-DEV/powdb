@@ -290,7 +290,7 @@ User as u {
 # Alice, [{"product_id":102,"total":20.25},{"product_id":101,"total":9.5}]
 # Cara,  []</code></pre>
 
-    <p>Children support their own <code>filter</code>, <code>order</code>, <code>limit</code>, and <code>offset</code> per parent, and nesting composes to multiple levels. This is PowQL-only by design; SQL's SELECT list is flat.</p>
+    <p>Children support their own <code>filter</code>, <code>order</code>, <code>limit</code>, and <code>offset</code> per parent, and nesting composes to multiple levels. PowDB's SQL frontend has no equivalent by design, because a SQL SELECT list is flat. Other engines reach the same shape through a correlated subquery and a JSON aggregate function.</p>
 
     <!-- Entity Links -->
     <h2 id="links">Entity Links (Relationship Traversal)</h2>

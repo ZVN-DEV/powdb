@@ -85,8 +85,8 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Left join | `User as u left join Order as o on u.id = o.user_id` | `SELECT ... FROM User u LEFT JOIN Order o ON ...` |
 | Declare a link | `link Post.user -> User on user_id = id` | *(no SQL equivalent: a persisted, named relationship)* |
 | Traverse a to-one link | `Post as p { p.id, p.user.name }` | `SELECT p.id, u.name FROM Post p JOIN User u ON p.user_id = u.id` |
-| Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(PowQL only: one row per parent, children as a JSON array)* |
-| Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(PowQL only)* |
+| Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(no SQL-frontend equivalent: one row per parent, children as a JSON array)* |
+| Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(no SQL-frontend equivalent)* |
 | IN subquery | `User filter .id in (Order filter .total > 100 { .user_id })` | `SELECT * FROM User WHERE id IN (SELECT user_id FROM Order WHERE total > 100)` |
 | EXISTS | `User filter exists (Order filter .user_id = .id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
 | UNION | `A filter ... union B filter ...` | `SELECT ... UNION SELECT ...` |
