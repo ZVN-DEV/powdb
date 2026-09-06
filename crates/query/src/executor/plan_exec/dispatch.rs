@@ -32,7 +32,7 @@ impl Engine {
     /// Lowering is idempotent, so a caller that already has a lowered tree pays
     /// one pass and gets the same plan back.
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
-        let lowered = self.lower(plan);
+        let lowered = self.lower(plan)?;
         self.execute_lowered(&lowered)
     }
 
@@ -2743,28 +2743,170 @@ impl Engine {
     /// hold, permanently and without any error: the exact silent-wrong-answer
     /// shape the rest of the engine refuses.
     fn extract_view_deps(&self, name: &str, query_text: &str) -> Result<Vec<String>, QueryError> {
-        fn collect(statement: &Statement, deps: &mut Vec<String>) {
-            match statement {
-                Statement::Query(q) => {
-                    deps.push(q.source.clone());
-                    for join in &q.joins {
-                        deps.push(join.source.clone());
-                    }
-                }
-                // Both halves of a union are read by the view, so both have to
-                // be able to dirty it. Without this arm a `union` view was
-                // registered with no dependencies at all and never refreshed.
-                Statement::Union(u) => {
-                    collect(&u.left, deps);
-                    collect(&u.right, deps);
-                }
-                _ => {}
-            }
-        }
         let statement = parse_stored_view_source(name, query_text)?;
         let mut deps = Vec::new();
-        collect(&statement, &mut deps);
+        self.collect_statement_deps(&statement, &mut deps);
         Ok(deps)
+    }
+
+    fn collect_statement_deps(&self, statement: &Statement, deps: &mut Vec<String>) {
+        match statement {
+            Statement::Query(q) => self.collect_query_deps(q, &AliasScope::default(), deps),
+            // Both halves of a union are read by the view, so both have to be
+            // able to dirty it. Without this arm a `union` view was registered
+            // with no dependencies at all and never refreshed.
+            Statement::Union(u) => {
+                self.collect_statement_deps(&u.left, deps);
+                self.collect_statement_deps(&u.right, deps);
+            }
+            _ => {}
+        }
+    }
+
+    /// Every table one query level reads: its own source, its joins, the
+    /// sources of any subquery in its clauses, and the child and link-target
+    /// tables its projection reaches.
+    fn collect_query_deps(&self, q: &QueryExpr, outer: &AliasScope, deps: &mut Vec<String>) {
+        push_dep(deps, &q.source);
+        let mut scope = outer.clone();
+        scope.bind(q.alias.as_deref().unwrap_or(&q.source), &q.source);
+        for join in &q.joins {
+            push_dep(deps, &join.source);
+            scope.bind(join.alias.as_deref().unwrap_or(&join.source), &join.source);
+            if let Some(on) = &join.on {
+                self.collect_expr_deps(on, &scope, deps);
+            }
+        }
+        if let Some(filter) = &q.filter {
+            self.collect_expr_deps(filter, &scope, deps);
+        }
+        for field in q.projection.iter().flatten() {
+            self.collect_expr_deps(&field.expr, &scope, deps);
+        }
+        if let Some(order) = &q.order {
+            for key in &order.keys {
+                self.collect_expr_deps(&key.expr, &scope, deps);
+            }
+        }
+        if let Some(group_by) = &q.group_by {
+            for key in &group_by.keys {
+                self.collect_expr_deps(&key.expr, &scope, deps);
+            }
+            if let Some(having) = &group_by.having {
+                self.collect_expr_deps(having, &scope, deps);
+            }
+        }
+        if let Some(aggregation) = &q.aggregation {
+            if let Some(argument) = &aggregation.argument {
+                self.collect_expr_deps(argument, &scope, deps);
+            }
+        }
+    }
+
+    /// Every table an expression reads. Nested blocks, link paths and
+    /// subqueries all name tables that no scan node of this level mentions;
+    /// missing them is what left a view over the flagship PowQL shapes
+    /// permanently stale.
+    fn collect_expr_deps(&self, expr: &Expr, scope: &AliasScope, deps: &mut Vec<String>) {
+        match expr {
+            Expr::NestedQuery(nested) => {
+                let table = match &nested.via_link {
+                    Some(via) => match self.link_target(scope, &via.outer_alias, &via.link_name) {
+                        Some(target) => target,
+                        // An unresolvable link is reported when the view is
+                        // first executed; there is no table to depend on.
+                        None => return,
+                    },
+                    None => nested.source.clone(),
+                };
+                push_dep(deps, &table);
+                let mut inner = scope.clone();
+                inner.bind(&nested.alias, &table);
+                self.collect_expr_deps(&nested.filter, &inner, deps);
+                if let Some(order) = &nested.order {
+                    for key in &order.keys {
+                        self.collect_expr_deps(&key.expr, &inner, deps);
+                    }
+                }
+                for field in &nested.fields {
+                    self.collect_expr_deps(&field.expr, &inner, deps);
+                }
+            }
+            Expr::LinkPath {
+                outer_alias, links, ..
+            } => {
+                let Some(mut owner) = scope.table_of(outer_alias) else {
+                    return;
+                };
+                for link in links {
+                    let Some(target) = self
+                        .catalog
+                        .link(&owner, link)
+                        .map(|l| l.target_type.clone())
+                    else {
+                        return;
+                    };
+                    push_dep(deps, &target);
+                    owner = target;
+                }
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.collect_expr_deps(expr, scope, deps);
+                self.collect_query_deps(subquery, scope, deps);
+            }
+            Expr::ExistsSubquery { subquery, .. } => self.collect_query_deps(subquery, scope, deps),
+            Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+                self.collect_expr_deps(l, scope, deps);
+                self.collect_expr_deps(r, scope, deps);
+            }
+            Expr::UnaryOp(_, inner)
+            | Expr::FunctionCall(_, inner, _)
+            | Expr::Cast(inner, _)
+            | Expr::JsonPath { base: inner, .. } => self.collect_expr_deps(inner, scope, deps),
+            Expr::ScalarFunc(_, args) => {
+                for arg in args {
+                    self.collect_expr_deps(arg, scope, deps);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.collect_expr_deps(expr, scope, deps);
+                for item in list {
+                    self.collect_expr_deps(item, scope, deps);
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (when, then) in whens {
+                    self.collect_expr_deps(when, scope, deps);
+                    self.collect_expr_deps(then, scope, deps);
+                }
+                if let Some(else_expr) = else_expr {
+                    self.collect_expr_deps(else_expr, scope, deps);
+                }
+            }
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args.iter().chain(partition_by) {
+                    self.collect_expr_deps(arg, scope, deps);
+                }
+                for key in order_by {
+                    self.collect_expr_deps(&key.expr, scope, deps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The table a declared link points at, given the alias its owner is bound
+    /// to in this scope.
+    fn link_target(&self, scope: &AliasScope, outer_alias: &str, link: &str) -> Option<String> {
+        let owner = scope.table_of(outer_alias)?;
+        self.catalog
+            .link(&owner, link)
+            .map(|link| link.target_type.clone())
     }
 
     /// Route a parsed link declaration to the persistent catalog's
@@ -3703,4 +3845,35 @@ pub(super) fn parse_stored_view_source(name: &str, source: &str) -> Result<State
              <the original query>`."
         ))
     })
+}
+
+/// Query aliases bound to their tables while walking a view's source, so a
+/// link traversal can be resolved against its owner's declared type.
+#[derive(Clone, Default)]
+struct AliasScope {
+    bindings: Vec<(String, String)>,
+}
+
+impl AliasScope {
+    fn bind(&mut self, alias: &str, table: &str) {
+        self.bindings.push((alias.to_string(), table.to_string()));
+    }
+
+    /// The table an alias names. Later bindings shadow earlier ones, which is
+    /// what makes a nested block's own alias win over an outer one.
+    fn table_of(&self, alias: &str) -> Option<String> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(bound, _)| bound == alias)
+            .map(|(_, table)| table.clone())
+    }
+}
+
+/// Record a dependency once. The list is small and order is what the view
+/// registry persists, so this keeps insertion order rather than sorting.
+fn push_dep(deps: &mut Vec<String>, table: &str) {
+    if !deps.iter().any(|dep| dep == table) {
+        deps.push(table.to_string());
+    }
 }
