@@ -530,7 +530,7 @@ impl Engine {
         // new, so this is the first and only chance to lower. Executing the
         // template directly is what made a prepared `.price < $1` answer
         // differently from the same query executed as text.
-        let plan = self.lower(&plan);
+        let plan = self.lower(&plan)?;
         let result = self.execute_lowered(&plan);
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).

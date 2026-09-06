@@ -723,7 +723,7 @@ impl Engine {
     ) -> Result<(PlanNode, LoweredPlan), QueryError> {
         let plan =
             crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let lowered = self.lower(&plan);
+        let lowered = self.lower(&plan)?;
         Ok((plan, lowered))
     }
 
@@ -731,7 +731,7 @@ impl Engine {
     /// `planner::plan` under `src/executor/`, for the same reason.
     fn plan_text_and_lower(&self, input: &str) -> Result<(PlanNode, LoweredPlan), QueryError> {
         let plan = planner::plan(input).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let lowered = self.lower(&plan);
+        let lowered = self.lower(&plan)?;
         Ok((plan, lowered))
     }
 
@@ -739,7 +739,7 @@ impl Engine {
     /// cache, or a fallback the executor built from an already-lowered tree.
     /// Lowering is idempotent, so calling it on a plan that has been through it
     /// already is a no-op.
-    fn lower(&self, plan: &PlanNode) -> LoweredPlan {
+    fn lower(&self, plan: &PlanNode) -> Result<LoweredPlan, QueryError> {
         LoweredPlan::of(&self.catalog, plan)
     }
 
@@ -758,7 +758,7 @@ impl Engine {
     pub fn lowered_plan_text(&self, query: &str, passes: usize) -> Result<String, QueryError> {
         let (_, mut plan) = self.plan_text_and_lower(query)?;
         for _ in 1..passes.max(1) {
-            plan = self.lower(plan.node());
+            plan = self.lower(plan.node())?;
         }
         Ok(format_plan_tree(&self.catalog, plan.node(), 0))
     }
@@ -1159,7 +1159,7 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
-                    let plan = self.lower(&plan);
+                    let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
                     // Mission B (post-review): statement-boundary WAL
                     // group commit. Catalog::wal_log now only appends;
@@ -1273,7 +1273,7 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
-                    let plan = self.lower(&plan);
+                    let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
                     if !self.in_transaction {
                         self.catalog
@@ -1330,7 +1330,7 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
-                let plan = self.lower(&plan);
+                let plan = self.lower(&plan)?;
                 return self.execute_plan_readonly(&plan);
             }
             let (raw, plan) = self.plan_and_lower_cacheable(parsed.statement)?;
@@ -1511,7 +1511,7 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
-                let plan = self.lower(&plan);
+                let plan = self.lower(&plan)?;
                 return self.execute_plan_readonly(&plan);
             }
             // Miss: plan + insert + execute. The planner is pure, so this
@@ -1572,7 +1572,7 @@ impl Engine {
                 if let Some(result) = self.execute_expression_index_plan(plan, None)? {
                     return Ok(result);
                 }
-                let fallback = self.lower(plan);
+                let fallback = self.lower(plan)?;
                 self.execute_plan_readonly(&fallback)
             }
             PlanNode::SeqScan { table } => {

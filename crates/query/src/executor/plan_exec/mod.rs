@@ -297,6 +297,7 @@ impl ProvenanceRows {
 }
 
 mod aggregate;
+mod coerce;
 mod dispatch;
 mod fast_paths;
 mod join;

@@ -44,6 +44,7 @@ fn engine_only() -> Engine {
 fn lower(engine: &Engine, query: &str) -> PlanNode {
     let plan = crate::planner::plan(query).unwrap();
     super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .unwrap()
         .node()
         .clone()
 }
@@ -80,6 +81,7 @@ fn conjunction_without_any_index_is_left_byte_identical() {
     let plan = crate::planner::plan("Doc filter .data->score = 20 and .id = 1").unwrap();
     let before = format!("{plan:?}");
     let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .unwrap()
         .node()
         .clone();
     assert_eq!(
@@ -332,6 +334,7 @@ fn same_column_between_pair_merges_and_empties_the_residual() {
         predicate: between,
     };
     let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+        .unwrap()
         .node()
         .clone();
     match &lowered {
@@ -471,6 +474,7 @@ fn residual_fast_path_agrees_with_general_path() {
 
     // Fast path: the lowered plan must be driven by the expression index.
     let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &raw_plan)
+        .unwrap()
         .node()
         .clone();
     match &lowered {

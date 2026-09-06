@@ -258,6 +258,10 @@ pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
         Expr::Literal(Literal::Float(v)) => Ok(Value::Float(*v)),
         Expr::Literal(Literal::String(v)) => Ok(Value::Str(v.clone())),
         Expr::Literal(Literal::Bool(v)) => Ok(Value::Bool(*v)),
+        // A value the typed-literal coercion pass already resolved (a uuid,
+        // datetime or bytes comparison key). It is the only literal form that
+        // can address those columns' index lanes.
+        Expr::ValueLit(v) => Ok(v.clone()),
         Expr::Null => Ok(Value::Empty),
         // Const-fold cast sugar in value position: `uuid("…")`, `bytes("…")`,
         // `cast(1718000000, "datetime")`. A failed cast errors (the whole

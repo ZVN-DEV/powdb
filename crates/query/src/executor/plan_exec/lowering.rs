@@ -357,6 +357,13 @@ fn float_key_is_faithful(value: f64, probe: ProbeKind) -> bool {
 /// all of them at once. Calling it from only some of the lowering arms is what
 /// made `.price < 3` answer 0 while `.price < 3 and .id > 0` answered 2.
 fn coerce_column_index_key(col_type: TypeId, key: &Expr, probe: ProbeKind) -> Option<Expr> {
+    // A value literal reached this plan through the typed-literal coercion pass
+    // (`plan_exec::coerce`), which resolved it against this same column, so it
+    // already addresses the stored key lane. Anything else is a mismatch the
+    // pass declined to rewrite, and the index is withdrawn as usual.
+    if let Expr::ValueLit(value) = key {
+        return (value.type_id() == col_type).then(|| key.clone());
+    }
     match (key, col_type) {
         // Same-typed literal: the index key already matches the stored key.
         (Expr::Literal(Literal::Int(_)), TypeId::Int) => Some(key.clone()),
@@ -693,8 +700,9 @@ impl LoweredPlan {
     /// `tests/cross_type_index_parity.rs` holds that. Idempotence is what lets
     /// the boundary be enforced by construction instead of by auditing which
     /// paths have already lowered.
-    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Self {
-        LoweredPlan(lower_unindexed_scans(catalog, plan))
+    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Result<Self, QueryError> {
+        let coerced = super::coerce::coerce_typed_literals(catalog, plan)?;
+        Ok(LoweredPlan(lower_unindexed_scans(catalog, &coerced)))
     }
 
     /// The lowered tree, for dispatch.

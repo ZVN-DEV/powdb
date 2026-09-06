@@ -503,9 +503,9 @@ pub enum Expr {
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
     Cast(Box<Expr>, CastType),
     /// A runtime-materialized literal carrying a concrete Value. Produced only
-    /// during subquery/correlated substitution (post-planning) for values that
-    /// have no Literal form (NULL, datetime, uuid, bytes); never emitted by the
-    /// parser/canonicalizer.
+    /// after planning, by subquery/correlated substitution and by the
+    /// typed-literal coercion pass, for values that have no Literal form (NULL,
+    /// datetime, uuid, bytes); never emitted by the parser/canonicalizer.
     ValueLit(Value),
     /// The `null` literal — produces `Value::Empty`.
     Null,

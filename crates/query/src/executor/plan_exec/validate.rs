@@ -101,7 +101,11 @@ pub(crate) fn validate_json_path_types(
 /// Gather the output column names and types of every scan leaf reachable from
 /// `plan`. `SeqScan`/`IndexScan`/`RangeScan` contribute bare column names;
 /// `AliasScan` contributes `alias.field` names (the join output shape).
-fn collect_scan_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(String, TypeId)>) {
+pub(super) fn collect_scan_columns(
+    catalog: &Catalog,
+    plan: &PlanNode,
+    out: &mut Vec<(String, TypeId)>,
+) {
     match plan {
         PlanNode::SeqScan { table }
         | PlanNode::IndexScan { table, .. }
@@ -187,7 +191,7 @@ fn collect_projected_names(plan: &PlanNode, out: &mut std::collections::HashSet<
 /// A bare name falls back to the field half of a join's `alias.field` columns,
 /// mirroring the runtime resolution in [`crate::executor::eval::resolve_column_index`]
 /// so validation types the same column the evaluator will read.
-fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
+pub(super) fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
     let exact = resolve_scan_type_by(scope, |n| n == name);
     if exact.is_some() || name.contains('.') {
         return exact;
@@ -544,7 +548,7 @@ struct ColumnScope {
 /// columns of the row later clauses read, while a projection alias only names a
 /// column of the RESULT; the ambiguity check treats the two differently, see
 /// [`validate_column_references`].
-fn collect_rebound_names(
+pub(super) fn collect_rebound_names(
     plan: &PlanNode,
     out: &mut std::collections::HashSet<String>,
     computed: &mut std::collections::HashSet<String>,
