@@ -113,6 +113,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history + tags: the tag verification step below has to resolve
+          # v<version> and compare it against the dispatched commit.
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -136,6 +140,42 @@ jobs:
             exit 1
           fi
           echo "package.json version matches ${{ inputs.version }}"
+
+      # Same guard publish.yml carries, and it matters more here: this
+      # workflow publishes whatever ref was dispatched, and what it publishes
+      # is a NATIVE binary that users load into their own process. Without
+      # this, a real publish could ship an arbitrary commit (a feature branch,
+      # an unmerged fix) under a released version number, with only
+      # package.json's version string to say otherwise. Every addon release so
+      # far was dispatched on the tag by discipline alone. Dry runs only warn:
+      # they are used before tagging.
+      - name: Verify tag v${{ inputs.version }} points at this commit
+        env:
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          head_sha="$(git rev-parse HEAD)"
+          if ! tag_sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
+            msg="tag ${tag} does not exist in this repository"
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}"
+            exit 1
+          fi
+          if [ "${tag_sha}" != "${head_sha}" ]; then
+            msg="tag ${tag} points at ${tag_sha}, but this run is on ${head_sha}"
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}. Dispatch this workflow on the tag."
+            exit 1
+          fi
+          echo "tag ${tag} matches HEAD (${head_sha})"
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
