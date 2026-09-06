@@ -472,9 +472,14 @@ pub(super) fn eval_expr_mode(
             if mode == CmpMode::Filter && val.is_empty() {
                 return Value::Bool(false);
             }
+            // `x in (a, b)` is defined as `x = a or x = b`, so it has to use
+            // the same comparison the `=` path uses. Testing with `Value`'s
+            // strictly typed `PartialEq` made the two operators disagree on the
+            // same pair: `.n = 28.0` matched a stored int 28 and
+            // `.n in (28.0)` did not.
             let found = list.iter().any(|item| {
                 let iv = eval_expr_mode(item, row, columns, mode);
-                val == iv
+                eval_binop_mode(&val, BinOp::Eq, &iv, mode) == Value::Bool(true)
             });
             Value::Bool(if *negated { !found } else { found })
         }

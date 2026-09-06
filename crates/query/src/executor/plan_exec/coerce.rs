@@ -109,6 +109,42 @@ fn coerce_literal(name: &str, type_id: TypeId, literal: &Literal) -> Result<Expr
         .map_err(QueryError::Execution)
 }
 
+/// Resolve one comparison operand against a string-spelled column, or `None`
+/// when the operand is not a constant this pass can resolve.
+///
+/// The cast sugar (`uuid("…")`, `bytes("…")`) is a constant too, and it was the
+/// last spelling that stayed silently false: an int literal against a uuid
+/// column is refused, so a `bytes(...)` value against one has to be refused as
+/// well rather than quietly matching no row. A cast that already produces the
+/// column's own type is folded to a value literal, which also lets it address
+/// the index.
+fn coerce_operand(name: &str, type_id: TypeId, operand: &Expr) -> Option<Result<Expr, QueryError>> {
+    match operand {
+        Expr::Literal(literal) => Some(coerce_literal(name, type_id, literal)),
+        Expr::Cast(inner, _) if matches!(inner.as_ref(), Expr::Literal(_)) => {
+            match crate::executor::eval::literal_to_value(operand) {
+                Err(message) => Some(Err(QueryError::Execution(message))),
+                Ok(value) if value.type_id() == type_id => {
+                    // A datetime index is keyed from the `Int` the insert path
+                    // stores, so folding to a `DateTime` here would start
+                    // probing a lane the keys are not in. Same carve-out as
+                    // `coerce_literal`.
+                    if type_id == TypeId::DateTime {
+                        None
+                    } else {
+                        Some(Ok(Expr::ValueLit(value)))
+                    }
+                }
+                Ok(value) => Some(Err(QueryError::Execution(format!(
+                    "type mismatch for column '{name}': expected {type_id:?}, got {:?}",
+                    value.type_id()
+                )))),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Coerce one `(column, literal)` operand pair of an index probe or range
 /// bound, resolving the column type from the catalog rather than the plan
 /// scope (these nodes name their own table and column).
@@ -161,23 +197,15 @@ fn is_typed_comparison(op: BinOp) -> bool {
 fn coerce_expr(expr: &Expr, ctx: &TypedScope) -> Result<Expr, QueryError> {
     match expr {
         Expr::BinaryOp(left, op, right) if is_typed_comparison(*op) => {
-            if let (Some((name, type_id)), Expr::Literal(literal)) =
-                (ctx.typed_column(left), right.as_ref())
-            {
-                return Ok(Expr::BinaryOp(
-                    left.clone(),
-                    *op,
-                    Box::new(coerce_literal(&name, type_id, literal)?),
-                ));
+            if let Some((name, type_id)) = ctx.typed_column(left) {
+                if let Some(coerced) = coerce_operand(&name, type_id, right) {
+                    return Ok(Expr::BinaryOp(left.clone(), *op, Box::new(coerced?)));
+                }
             }
-            if let (Some((name, type_id)), Expr::Literal(literal)) =
-                (ctx.typed_column(right), left.as_ref())
-            {
-                return Ok(Expr::BinaryOp(
-                    Box::new(coerce_literal(&name, type_id, literal)?),
-                    *op,
-                    right.clone(),
-                ));
+            if let Some((name, type_id)) = ctx.typed_column(right) {
+                if let Some(coerced) = coerce_operand(&name, type_id, left) {
+                    return Ok(Expr::BinaryOp(Box::new(coerced?), *op, right.clone()));
+                }
             }
             Ok(Expr::BinaryOp(
                 Box::new(coerce_expr(left, ctx)?),
@@ -198,11 +226,12 @@ fn coerce_expr(expr: &Expr, ctx: &TypedScope) -> Result<Expr, QueryError> {
             let typed = ctx.typed_column(subject);
             let mut coerced = Vec::with_capacity(list.len());
             for item in list {
-                match (&typed, item) {
-                    (Some((name, type_id)), Expr::Literal(literal)) => {
-                        coerced.push(coerce_literal(name, *type_id, literal)?);
-                    }
-                    _ => coerced.push(coerce_expr(item, ctx)?),
+                match typed
+                    .as_ref()
+                    .and_then(|(name, type_id)| coerce_operand(name, *type_id, item))
+                {
+                    Some(resolved) => coerced.push(resolved?),
+                    None => coerced.push(coerce_expr(item, ctx)?),
                 }
             }
             Ok(Expr::InList {
