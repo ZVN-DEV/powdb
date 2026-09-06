@@ -93,6 +93,26 @@ impl TxGate {
         self.semaphore.available_permits()
     }
 
+    /// Permits an explicit `begin` takes before the transaction has written
+    /// anything.
+    ///
+    /// More than half the pool, so two explicit transactions can never be open
+    /// at once (the engine has exactly one) and an autocommit writer, which
+    /// takes the whole pool, still waits its turn. What is left over stays
+    /// available to readers.
+    ///
+    /// A `begin` used to take the WHOLE pool, which serialized every other
+    /// connection behind it, reads on unrelated tables and `schema` included,
+    /// until it committed or the gate budget elapsed. A transaction that has
+    /// written nothing has nothing uncommitted to hide, so that wait bought no
+    /// isolation; exclusivity is taken at the first write instead (see
+    /// [`upgrade_to_exclusive`]). With a one-permit pool the arithmetic
+    /// collapses to the whole pool, which is the historical behavior the
+    /// single-permit tests pin.
+    pub(super) fn begin_permits(&self) -> u32 {
+        (self.permit_count / 2 + 1).min(self.permit_count)
+    }
+
     pub(super) async fn acquire_many_owned(
         self,
         permits: u32,
@@ -164,7 +184,7 @@ pub(super) async fn acquire_begin_permit(
 ) -> Result<OwnedSemaphorePermit, Message> {
     match tokio::time::timeout(
         tx_wait_timeout,
-        tx_gate.clone().acquire_many_owned(tx_gate.permit_count()),
+        tx_gate.clone().acquire_many_owned(tx_gate.begin_permits()),
     )
     .await
     {
@@ -178,6 +198,58 @@ pub(super) async fn acquire_begin_permit(
             Err(error_response(
                 format!(
                     "transaction gate timeout after {}ms waiting for concurrent transaction to complete",
+                    tx_wait_timeout.as_millis()
+                ),
+                ErrorClass::Timeout,
+            ))
+        }
+    }
+}
+
+/// Take the rest of the gate for an explicit transaction that is about to
+/// write, bounded by `tx_wait_timeout`.
+///
+/// An explicit transaction becomes exclusive at its FIRST write, not at
+/// `begin`. From that write on, its rows are in the heap and uncommitted, and
+/// there is no MVCC to hide them, so every reader has to wait exactly as it
+/// did before. Until then the transaction holds only
+/// [`TxGate::begin_permits`] and readers run beside it.
+///
+/// Exclusivity is enforced by the semaphore itself rather than by a flag:
+/// holding the whole pool is what makes a concurrent reader impossible, so
+/// there is no window between "decided to write" and "readers excluded".
+///
+/// A no-op when the transaction already holds the whole pool, so the second
+/// and later writes of a transaction cost nothing.
+// `Message` is a large enum; see the note on `acquire_begin_permit`.
+#[allow(clippy::result_large_err)]
+pub(super) async fn upgrade_to_exclusive(
+    tx_gate: &TxGate,
+    tx_permit: &mut Option<OwnedSemaphorePermit>,
+    tx_wait_timeout: Duration,
+    metrics: &Arc<Metrics>,
+) -> Result<(), Message> {
+    let Some(permit) = tx_permit.as_mut() else {
+        return Ok(());
+    };
+    let held = permit.num_permits() as u32;
+    let Some(missing) = tx_gate.permit_count().checked_sub(held).filter(|n| *n > 0) else {
+        return Ok(());
+    };
+    match tokio::time::timeout(tx_wait_timeout, tx_gate.clone().acquire_many_owned(missing)).await {
+        Ok(Ok(rest)) => {
+            permit.merge(rest);
+            Ok(())
+        }
+        Ok(Err(_)) => Err(error_response(
+            "query execution error",
+            ErrorClass::Internal,
+        )),
+        Err(_) => {
+            metrics.inc_tx_gate_timeout();
+            Err(error_response(
+                format!(
+                    "transaction gate timeout after {}ms waiting for concurrent readers to finish before this transaction's first write",
                     tx_wait_timeout.as_millis()
                 ),
                 ErrorClass::Timeout,
