@@ -44,7 +44,10 @@ permissions: {}
 
 concurrency:
   group: fuzz-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull requests only, same reasoning as ci.yml: on main this group covers the
+  # nightly cron and manual dispatches, so dispatching a run cancelled the
+  # campaign already in flight and threw away its corpus.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fuzz-smoke:

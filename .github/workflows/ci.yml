@@ -10,7 +10,13 @@ permissions: {}
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull requests only. On main, back-to-back merges cancelled the earlier
+  # commit's run, leaving main's history dotted with cancelled runs that are
+  # indistinguishable at a glance from runs that failed, and no recorded
+  # verdict for the commit that was cancelled. Harmless with `strict: true`
+  # branch protection (the squash result equals the PR head tree) but it makes
+  # main's CI history unreadable, which is where you look during an incident.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-test:
@@ -866,8 +872,15 @@ jobs:
             fail=1
           fi
 
-          # (2) Optionally apply the private publication denylist without
-          # storing sensitive names in this public workflow.
+          # (2) Apply the private publication denylist without storing
+          # sensitive names in this public workflow.
+          #
+          # The regex comes from `secrets`, and secrets are not available to a
+          # `pull_request` run from a fork. This half then does not run, and it
+          # used to print "clean" anyway, so the log said the guard had passed
+          # when only the path check had. Say which halves ran, every time: the
+          # regex check still gets its verdict on the post-merge push run, and
+          # a reader of a fork PR can now see that it is pending.
           if [ -n "${PUBLICATION_DENYLIST_REGEX:-}" ]; then
             names="$(git grep -niP "$PUBLICATION_DENYLIST_REGEX" -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' || true)"
             if [ -n "$names" ]; then
@@ -875,12 +888,16 @@ jobs:
               echo "$names"
               fail=1
             fi
+            denylist_verdict="checked"
+          else
+            denylist_verdict="NOT CHECKED"
+            echo "::warning::internal-content-guard: PUBLICATION_DENYLIST_REGEX is unavailable on this event (${GITHUB_EVENT_NAME:-unknown}), so only the path check ran. Secrets are withheld from fork pull requests; the denylist half gets its verdict on the push run after merge."
           fi
 
           if [ "$fail" -ne 0 ]; then
             exit 1
           fi
-          echo "internal-content-guard: clean."
+          echo "internal-content-guard: paths clean, denylist ${denylist_verdict}."
 
   # Supply-chain policy gate: license allowlist, duplicate-version warnings,
   # and crates.io-only sources, driven by deny.toml at the repo root.

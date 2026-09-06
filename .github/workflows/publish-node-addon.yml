@@ -85,11 +85,30 @@ jobs:
         working-directory: bindings/node
         run: npm ci
 
+      # `napi build` does not forward --locked to cargo, so the checked-in lock
+      # only means something if a separate step asserts it. Without this, the
+      # published native binary could be built against a dependency set no CI
+      # run ever compiled, and the addon's lock has gone stale before: it sat at
+      # 0.21.0 through four minors. Same pattern fuzz.yml uses for cargo-fuzz,
+      # which has the same gap.
+      - name: Verify the checked-in addon lockfile is current
+        working-directory: bindings/node
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: Build native addon (release, portable)
         working-directory: bindings/node
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: npm run build
+
+      # ci.yml runs `npm test` on Linux x64 only. This matrix builds the macOS
+      # arm64 and Linux arm64 binaries that actually ship, and published them
+      # having never loaded them once. Each runner is native to the binary it
+      # just built, so the test is a real load-and-query of the artifact being
+      # uploaded rather than a proxy for it.
+      - name: Test the binary this runner just built
+        working-directory: bindings/node
+        run: npm test
 
       - name: Upload addon artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
