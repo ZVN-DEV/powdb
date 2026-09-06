@@ -594,6 +594,168 @@ async fn run_connection<S>(
     .await;
 }
 
+/// A single DER node: its tag, its contents, and whatever follows it.
+///
+/// Enough of a reader to walk to a certificate's `notAfter`. Deliberately not
+/// a general ASN.1 parser: it refuses anything it does not understand rather
+/// than guessing, and every caller treats `None` as "say nothing".
+fn der_read(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first_len, rest) = rest.split_first()?;
+    let (len, rest) = if first_len < 0x80 {
+        (usize::from(first_len), rest)
+    } else {
+        let count = usize::from(first_len & 0x7f);
+        if count == 0 || count > 4 || rest.len() < count {
+            return None;
+        }
+        let mut value = 0usize;
+        for byte in &rest[..count] {
+            value = (value << 8) | usize::from(*byte);
+        }
+        (value, &rest[count..])
+    };
+    if rest.len() < len {
+        return None;
+    }
+    Some((tag, &rest[..len], &rest[len..]))
+}
+
+/// The `notAfter` of an X.509 certificate, in unix seconds.
+fn certificate_not_after_unix(cert_der: &[u8]) -> Option<i64> {
+    let (tag, certificate, _) = der_read(cert_der)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, tbs, _) = der_read(certificate)?;
+    if tag != 0x30 {
+        return None;
+    }
+    // `[0] EXPLICIT version` is optional; everything after it is positional.
+    let (tag, _, after_version) = der_read(tbs)?;
+    let rest = if tag == 0xA0 { after_version } else { tbs };
+    let (_, _, rest) = der_read(rest)?; // serialNumber
+    let (_, _, rest) = der_read(rest)?; // signature
+    let (_, _, rest) = der_read(rest)?; // issuer
+    let (tag, validity, _) = der_read(rest)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (_, _, after_not_before) = der_read(validity)?;
+    let (tag, not_after, _) = der_read(after_not_before)?;
+    asn1_time_to_unix(tag, not_after)
+}
+
+/// An ASN.1 `UTCTime` (0x17) or `GeneralizedTime` (0x18) as unix seconds.
+fn asn1_time_to_unix(tag: u8, bytes: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (year, rest) = match tag {
+        // YYMMDDHHMMSSZ, with the RFC 5280 pivot at 50.
+        0x17 => {
+            let short: i64 = text.get(0..2)?.parse().ok()?;
+            (
+                if short >= 50 {
+                    1900 + short
+                } else {
+                    2000 + short
+                },
+                text.get(2..)?,
+            )
+        }
+        // YYYYMMDDHHMMSSZ.
+        0x18 => (text.get(0..4)?.parse().ok()?, text.get(4..)?),
+        _ => return None,
+    };
+    let month: i64 = rest.get(0..2)?.parse().ok()?;
+    let day: i64 = rest.get(2..4)?.parse().ok()?;
+    let hour: i64 = rest.get(4..6)?.parse().ok()?;
+    let minute: i64 = rest.get(6..8)?.parse().ok()?;
+    let second: i64 = match rest.get(8..10) {
+        Some(text) => text.parse().ok()?,
+        None => 0,
+    };
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Hand-rolled so reading a certificate's expiry does not
+/// cost the server a date-library dependency.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// How far ahead of expiry a certificate is still worth a warning.
+const CERT_EXPIRY_WARN_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// What to log about a certificate's remaining life, if anything.
+///
+/// A server started with an expired certificate logged `tls=true` and nothing
+/// else. Every client then failed with `certificate expired` while the server
+/// looked healthy, and nothing on the server side connected the two.
+fn certificate_expiry_warning(not_after_unix: i64, now_unix: i64) -> Option<String> {
+    let remaining = not_after_unix - now_unix;
+    if remaining <= 0 {
+        return Some(format!(
+            "TLS certificate expired {} day(s) ago; every client will refuse this server with \
+             `certificate expired`. Reissue it",
+            (-remaining) / 86_400
+        ));
+    }
+    if remaining <= CERT_EXPIRY_WARN_WINDOW_SECS {
+        return Some(format!(
+            "TLS certificate expires in {} day(s); reissue it before then or clients start \
+             refusing this server",
+            remaining / 86_400
+        ));
+    }
+    None
+}
+
+/// The DER content bytes of the `prime-field` OID, 1.2.840.10045.1.1.
+///
+/// It appears in an EC key's `FieldID`, which only an EXPLICIT parameter
+/// encoding carries: a named curve is one OID and has no `FieldID` at all.
+const OID_PRIME_FIELD: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x01, 0x01];
+
+/// Whether an EC private key states its curve as explicit parameters rather
+/// than by name.
+///
+/// Stock macOS LibreSSL and OpenSSL 1.x write explicit parameters by default,
+/// aws-lc refuses such a key, and rustls reports the refusal as `keys may not
+/// be consistent: KeyMismatch`, which points at the one thing that is not
+/// wrong: the key and the certificate match perfectly.
+fn ec_key_uses_explicit_parameters(key_der: &[u8]) -> bool {
+    key_der
+        .windows(OID_PRIME_FIELD.len())
+        .any(|window| window == OID_PRIME_FIELD)
+}
+
+/// Turn a rustls configuration failure into something an operator can act on.
+fn tls_config_error(error: &str, key_path: &str, explicit_ec_parameters: bool) -> String {
+    if explicit_ec_parameters {
+        return format!(
+            "TLS config error: {error}. The EC private key in {key_path} states its curve as \
+             explicit parameters instead of by name, which this TLS stack refuses; the key and \
+             the certificate do match. Regenerate it with `openssl genpkey -algorithm EC \
+             -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve` (stock macOS \
+             LibreSSL and OpenSSL 1.x write explicit parameters by default)"
+        );
+    }
+    if error.contains("ExtensionValueInvalid") {
+        return format!(
+            "TLS config error: {error}. That is usually a DUPLICATE basicConstraints extension, \
+             which OpenSSL 1.1 writes when a config sets it and `-addext` sets it again: reissue \
+             the certificate with a single basicConstraints extension"
+        );
+    }
+    format!("TLS config error: {error}")
+}
+
 /// Load TLS certificate and key files, returning a configured `TlsAcceptor`.
 fn build_tls_acceptor(
     cert_path: &str,
@@ -629,10 +791,25 @@ fn build_tls_acceptor(
         },
     )?;
 
+    // Say something about the certificate the server is about to serve, while
+    // there is still an operator reading the startup log.
+    if let Some(leaf) = certs.first() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Some(message) =
+            certificate_not_after_unix(leaf).and_then(|at| certificate_expiry_warning(at, now))
+        {
+            warn!(cert = %cert_path, "{message}");
+        }
+    }
+
+    let explicit_ec_parameters = ec_key_uses_explicit_parameters(key.secret_der());
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| format!("TLS config error: {e}"))?;
+        .map_err(|e| tls_config_error(&e.to_string(), key_path, explicit_ec_parameters))?;
 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
@@ -1448,6 +1625,82 @@ mod tests {
             "POWDB_MAX_CONNECTIONS"
         );
         assert!(parse_timeout_secs("0").is_err(), "POWDB_SHUTDOWN_TIMEOUT");
+    }
+
+    /// A certificate's expiry is read straight off its DER, with no date
+    /// library and no guessing.
+    #[test]
+    fn a_certificates_expiry_is_read_off_its_der() {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2031, 6, 15);
+        let cert = params.self_signed(&key).expect("self-signed cert");
+        assert_eq!(
+            certificate_not_after_unix(cert.der()),
+            Some(1_939_248_000),
+            "2031-06-15T00:00:00Z"
+        );
+    }
+
+    /// Expired, nearly expired, and fine are three different answers, and only
+    /// the first two are worth a log line.
+    #[test]
+    fn the_expiry_warning_fires_only_when_it_is_worth_reading() {
+        let now = 1_800_000_000;
+        let day = 86_400;
+        let expired = certificate_expiry_warning(now - 3 * day, now).expect("expired");
+        assert!(expired.contains("expired 3 day(s) ago"), "{expired}");
+        assert!(expired.contains("certificate expired"), "{expired}");
+
+        let soon = certificate_expiry_warning(now + 10 * day, now).expect("near expiry");
+        assert!(soon.contains("expires in 10 day(s)"), "{soon}");
+
+        assert!(certificate_expiry_warning(now + 31 * day, now).is_none());
+    }
+
+    /// A named-curve key is what a correct recipe produces, and must not be
+    /// blamed for a failure it did not cause.
+    #[test]
+    fn a_named_curve_key_is_not_reported_as_explicit() {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        assert!(!ec_key_uses_explicit_parameters(&key.serialize_der()));
+    }
+
+    /// An explicit-parameter key carries the prime-field OID inside its
+    /// FieldID. LibreSSL writes these by default and rustls reports them as
+    /// `keys may not be consistent: KeyMismatch`, blaming the one thing that
+    /// is not wrong.
+    #[test]
+    fn an_explicit_parameter_key_is_recognised_and_the_error_says_what_to_run() {
+        let mut key = vec![0x30, 0x09, 0x06, 0x07];
+        key.extend_from_slice(OID_PRIME_FIELD);
+        assert!(ec_key_uses_explicit_parameters(&key));
+
+        let message = tls_config_error(
+            "keys may not be consistent: KeyMismatch",
+            "/etc/powdb/key.pem",
+            true,
+        );
+        assert!(message.contains("ec_param_enc:named_curve"), "{message}");
+        assert!(message.contains("/etc/powdb/key.pem"), "{message}");
+        assert!(
+            message.contains("do match"),
+            "the message must say the KeyMismatch is misleading: {message}"
+        );
+    }
+
+    /// The other recipe failure worth naming.
+    #[test]
+    fn an_invalid_extension_error_names_the_duplicate_basic_constraints() {
+        let message = tls_config_error(
+            "invalid peer certificate: BadEncoding(ExtensionValueInvalid)",
+            "/etc/powdb/key.pem",
+            false,
+        );
+        assert!(message.contains("basicConstraints"), "{message}");
+        assert!(message.contains("DUPLICATE"), "{message}");
     }
 
     /// The refusal names the setting and the value, so an operator can find

@@ -164,6 +164,126 @@ fn no_ansi_escapes_when_stdout_is_not_a_tty() {
     );
 }
 
+/// The calendar date of a unix timestamp (Howard Hinnant's civil_from_days).
+/// The test needs a date a fixed number of days out and refuses to pull in a
+/// date library to get one.
+fn civil_from_unix(seconds: i64) -> (i32, u8, u8) {
+    let z = seconds.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u8, d as u8)
+}
+
+/// Write a self-signed cert/key pair whose validity ends on `not_after`, and
+/// return the two paths.
+fn write_certificate(dir: &std::path::Path, not_after: (i32, u8, u8)) -> (String, String) {
+    let key = rcgen::KeyPair::generate().expect("generate key");
+    let mut params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+    let cert = params.self_signed(&key).expect("self-signed cert");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (
+        cert_path.to_str().unwrap().to_string(),
+        key_path.to_str().unwrap().to_string(),
+    )
+}
+
+/// Start the server, wait until it has bound, then stop it and return
+/// everything it wrote to stderr.
+fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> String {
+    let port_file = std::env::temp_dir().join(format!(
+        "powdb_tlswarn_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_powdb-server"));
+    cmd.args(["--data-dir", data_dir.to_str().unwrap()])
+        .args(["--bind", "127.0.0.1", "--port", "0"])
+        .args(["--port-file", port_file.to_str().unwrap()])
+        .args(extra_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn powdb-server");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !port_file.exists() {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "powdb-server never bound"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let out = child.wait_with_output().expect("wait powdb-server");
+    let _ = std::fs::remove_file(&port_file);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// A server started with an expired certificate used to log `tls=true` and
+/// nothing else. Every client then failed with `certificate expired` while the
+/// server looked healthy, and nothing on the server side connected the two.
+#[test]
+fn an_expired_certificate_is_reported_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_certificate(dir.path(), (2021, 1, 1));
+    let logged = stderr_of_a_short_run(dir.path(), &["--tls-cert", &cert, "--tls-key", &key]);
+    assert!(
+        logged.contains("expired"),
+        "a server serving an expired certificate said nothing about it:\n{logged}"
+    );
+}
+
+/// And one that is about to expire is worth saying too, while there is still
+/// time to reissue it.
+#[test]
+fn a_certificate_near_expiry_is_reported_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let (cert, key) = write_certificate(dir.path(), civil_from_unix(now + 10 * 24 * 60 * 60));
+    let logged = stderr_of_a_short_run(dir.path(), &["--tls-cert", &cert, "--tls-key", &key]);
+    assert!(
+        logged.contains("expires in"),
+        "a certificate 10 days from expiry drew no warning:\n{logged}"
+    );
+}
+
+/// A certificate with plenty of life left says nothing, so the warning stays
+/// worth reading.
+#[test]
+fn a_fresh_certificate_is_not_warned_about() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_certificate(dir.path(), (2099, 1, 1));
+    let logged = stderr_of_a_short_run(dir.path(), &["--tls-cert", &cert, "--tls-key", &key]);
+    assert!(
+        !logged.contains("expire"),
+        "a certificate valid until 2099 drew an expiry warning:\n{logged}"
+    );
+}
+
 fn store_with(dir: &std::path::Path, name: &str, password: &str) -> UserStore {
     let mut store = UserStore::new();
     store.create_user(name, password, "admin").unwrap();
