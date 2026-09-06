@@ -234,6 +234,24 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      # The published tarball ships CHANGELOG.md, and every one so far opened
+      # with an empty `## Unreleased` heading, so the first thing a reader saw
+      # on npm was an empty promise. The heading belongs in the repository (it
+      # is where the next entry goes); it means nothing in a published
+      # artifact. This edits the working copy only, after the build and before
+      # the publish, so nothing is committed and the repository keeps its
+      # heading. A section that actually has content is left alone and says so:
+      # silently deleting real release notes would be worse than the wart.
+      # Runs first, on fixtures: it proves the rewrite removes an empty section,
+      # leaves a section that has content alone, is a no-op without a heading,
+      # and is idempotent. The dangerous direction is the second one, so it is
+      # asserted every time rather than trusted.
+      - name: Prove the CHANGELOG rewrite leaves real notes alone
+        run: bash scripts/ci/strip-empty-unreleased.sh --selftest
+
+      - name: Strip the empty Unreleased section from the published CHANGELOG
+        run: bash scripts/ci/strip-empty-unreleased.sh clients/ts/CHANGELOG.md
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -315,6 +333,19 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
           pnpm test
+
+      # Same as the client job above: the tarball ships CHANGELOG.md, and an
+      # empty `## Unreleased` heading is meaningless once published. Working
+      # copy only, nothing committed.
+      # Runs first, on fixtures: it proves the rewrite removes an empty section,
+      # leaves a section that has content alone, is a no-op without a heading,
+      # and is idempotent. The dangerous direction is the second one, so it is
+      # asserted every time rather than trusted.
+      - name: Prove the CHANGELOG rewrite leaves real notes alone
+        run: bash scripts/ci/strip-empty-unreleased.sh --selftest
+
+      - name: Strip the empty Unreleased section from the published CHANGELOG
+        run: bash scripts/ci/strip-empty-unreleased.sh clients/sync/CHANGELOG.md
 
       - name: Classify the release channel (final vs rc)
         id: channel
