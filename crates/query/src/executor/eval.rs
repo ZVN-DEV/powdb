@@ -713,8 +713,13 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             Some(Value::Str(s)) => Value::Str(s.to_lowercase()),
             _ => Value::Empty,
         },
+        // Characters, not UTF-8 bytes. `substring` and `like`'s `_` wildcard
+        // both count characters, so counting bytes here made three string
+        // operations disagree about the same string: `length("Zoe")` with a
+        // diaeresis was 4 while `like "___"` matched it and `substring(s, 1, 3)`
+        // returned all of it.
         ScalarFn::Length => match args.first() {
-            Some(Value::Str(s)) => Value::Int(s.len() as i64),
+            Some(Value::Str(s)) => Value::Int(s.chars().count() as i64),
             _ => Value::Empty,
         },
         ScalarFn::Trim => match args.first() {
