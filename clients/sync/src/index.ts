@@ -105,7 +105,25 @@ export interface RemoteSyncClient {
   syncAck(request: SyncAckRequest, opts?: { signal?: AbortSignal }): Promise<SyncAckResult>;
 }
 
-export interface LocalApplyRequest extends SyncIdentity {
+/**
+ * A {@link SyncIdentity} after normalization: every field is exactly the type
+ * the native `Database.applyRetainedUnits(...)` binding takes.
+ *
+ * `SyncIdentity` is the lenient caller-facing input type, where a u64 may
+ * arrive as a `number`. What a replica hands its local adapter has already
+ * been through `toU64`, so widening the adapter's parameter to `SyncU64` only
+ * made the obvious adapter (`(request) => local.applyRetainedUnits(request)`)
+ * fail to compile against the addon's own `bigint`.
+ */
+export interface NormalizedSyncIdentity {
+  databaseId: string | Uint8Array;
+  primaryGeneration: bigint;
+  walFormatVersion: number;
+  catalogVersion: number;
+  segmentFormatVersion: number;
+}
+
+export interface LocalApplyRequest extends NormalizedSyncIdentity {
   replicaId: string;
   sinceLsn: bigint;
   units: RetainedUnit[];
@@ -241,7 +259,7 @@ const DDL_KEYWORDS = new Set(["alter", "create", "drop", "materialize", "type"])
 
 export class PowDBSyncReplica {
   private readonly replicaId: string;
-  private readonly identity: NormalizedIdentity;
+  private readonly identity: NormalizedSyncIdentity;
   private readonly local: LocalReplica;
   private readonly remote: RemoteSyncClient;
   private readonly maxPullUnits: number;
@@ -544,15 +562,7 @@ export class PowDBSyncReplica {
   }
 }
 
-type NormalizedIdentity = {
-  databaseId: string | Uint8Array;
-  primaryGeneration: bigint;
-  walFormatVersion: number;
-  catalogVersion: number;
-  segmentFormatVersion: number;
-};
-
-function normalizeIdentity(identity: SyncIdentity): NormalizedIdentity {
+function normalizeIdentity(identity: SyncIdentity): NormalizedSyncIdentity {
   return {
     databaseId: normalizeDatabaseId(identity.databaseId),
     primaryGeneration: toU64(identity.primaryGeneration, "primaryGeneration"),

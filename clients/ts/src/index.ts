@@ -1373,6 +1373,10 @@ export class Client extends EventEmitter<ClientEvents> {
    * Returns `Row[]`, an array of objects keyed by column name (`TypedRow[]`
    * when no generic is supplied). The generic is an unchecked assertion about
    * the query's shape: the schema drives coercion, nothing validates the type.
+   * It is deliberately unconstrained, exactly like {@link queryObjects}'s. A
+   * `Row extends TypedRow` bound would reject the `interface` most callers
+   * declare their row types with, because an interface has no implicit index
+   * signature, while claiming a check this method does not perform.
    * Positional `$N` parameters are accepted in the same position as
    * {@link query}, so typed rows and injection-safe binding compose.
    *
@@ -1382,7 +1386,7 @@ export class Client extends EventEmitter<ClientEvents> {
    * Throws `PowDBError(code="query_failed")` if the query is not a
    * rows-returning query.
    */
-  async queryTyped<Row extends TypedRow = TypedRow>(
+  async queryTyped<Row = TypedRow>(
     query: string,
     schema: TypedSchema,
     paramsOrOpts?: QueryParam[] | { signal?: AbortSignal },

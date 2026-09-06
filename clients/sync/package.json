@@ -52,6 +52,7 @@
     "test": "tsx test/sync.test.ts",
     "test:native": "tsx test/native-adapter.test.ts",
     "test:e2e": "tsx test/bootstrap-e2e.test.ts",
+    "test:readme": "node ../ts/scripts/check-readme-samples.mjs",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
   },

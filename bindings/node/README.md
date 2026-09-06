@@ -149,9 +149,15 @@ const db = Database.open("./data");
 db.query("type Doc { required id: int, body: json }");
 db.query(`insert Doc { id := 1, body := "null" }`);
 
-const [cell] = db.queryNative("Doc filter .id = 1 { .body }").rows[0];
-// { type: "json", value: null, pj1: <Uint8Array> }: a JSON null,
-// which is NOT { type: "empty" } (a missing cell).
+// `kind` is the discriminant: narrow on it before reading `rows`, the same
+// way you would with the networked client's `QueryResult`.
+const doc = db.queryNative("Doc filter .id = 1 { .body }");
+if (doc.kind === "rows") {
+  const [cell] = doc.rows[0];
+  // { type: "json", value: null, pj1: <Uint8Array> }: a JSON null,
+  // which is NOT { type: "empty" } (a missing cell).
+  console.log(cell);
+}
 
 // Positional parameters are substituted as literal tokens before parsing, so
 // untrusted input can never change the query's shape.

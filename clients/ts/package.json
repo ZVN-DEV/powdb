@@ -75,6 +75,7 @@
     "test:script": "tsx test/script.test.ts",
     "test:eager": "tsx test/run-with-server.ts test/eager.test.ts",
     "test:exec-script": "tsx test/run-with-server.ts test/exec-script.test.ts",
+    "test:readme": "node scripts/check-readme-samples.mjs",
     "demo": "tsx demo/demo.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"
