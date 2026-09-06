@@ -49,6 +49,8 @@ Notes:
 - TLS is **not** terminated by Fly for raw TCP services — either enable
   PowDB's own TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY` secrets) or run behind
   a TLS-terminating proxy you control.
+  Generating a certificate PowDB accepts is not a one-liner on every platform:
+  see the TLS recipe in [SECURITY.md](../../SECURITY.md#transport-security-tls) before you start.
 - `min_machines_running = 1` keeps the database always-on; `auto_stop_machines`
   is `false` so Fly never suspends a stateful service.
 
