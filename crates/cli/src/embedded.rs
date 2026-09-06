@@ -48,11 +48,33 @@ pub(crate) fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -
                 if let Some(hint) = missing_separator_hint(query, statements.len()) {
                     eprintln!("{hint}");
                 }
-                return 1;
+                return finish_open_transaction(&mut engine, 1);
             }
         }
     }
-    0
+    finish_open_transaction(&mut engine, 0)
+}
+
+/// Close a transaction the script left open, and report it.
+///
+/// A script that ends between `begin` and `commit` has committed nothing: the
+/// engine discards the transaction when it closes. Exiting 0 told a `set -e`
+/// deploy that writes had landed when none had, and the only trace was a
+/// checkpoint-on-drop ERROR about an active transaction, which reads like an
+/// internal fault rather than the script's own mistake.
+///
+/// The engine is the authority on whether a transaction is open, so this asks
+/// it: `rollback` succeeds only when there is one to roll back.
+pub(crate) fn finish_open_transaction(engine: &mut Engine, code: i32) -> i32 {
+    if engine.execute_powql("rollback").is_err() {
+        return code;
+    }
+    eprintln!("Error: transaction still open at end of script; rolled back");
+    eprintln!(
+        "note: every write since `begin` was discarded. End the script with `commit` \
+         (or `rollback`) so its outcome is explicit."
+    );
+    1
 }
 
 /// Explain the single most common `--exec-file` mistake instead of leaving the

@@ -339,9 +339,51 @@ where
         }
     }
 
+    if close_open_remote_transaction(&mut reader, &mut writer, session.dialect, typed).await {
+        eprintln!("Error: transaction still open at end of script; rolled back");
+        eprintln!(
+            "note: every write since `begin` was discarded when this connection closed. \
+             End the script with `commit` (or `rollback`) so its outcome is explicit."
+        );
+        code = 1;
+    }
+
     let _ = Message::Disconnect.write_to(&mut writer).await;
     let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
     code
+}
+
+/// Roll back a transaction the script left open, reporting whether there was
+/// one.
+///
+/// The server discards an open transaction when the connection closes, so a
+/// script that ended between `begin` and `commit` committed nothing and used
+/// to exit 0 anyway. The server is the authority on whether a transaction is
+/// open, so this asks it: `rollback` succeeds only when there is one to roll
+/// back. A connection that is already broken answers nothing and reports
+/// nothing, because the failure has been reported already.
+pub(crate) async fn close_open_remote_transaction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    dialect: Dialect,
+    typed: bool,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let probe = query_message("rollback".to_string(), dialect, typed);
+    if probe.write_to(writer).await.is_err()
+        || tokio::io::AsyncWriteExt::flush(writer).await.is_err()
+    {
+        return false;
+    }
+    matches!(
+        Message::read_from(reader).await,
+        Ok(Some(
+            Message::ResultOk { .. } | Message::ResultMessage { .. }
+        ))
+    )
 }
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
