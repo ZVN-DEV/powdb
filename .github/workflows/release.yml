@@ -483,9 +483,16 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          # Three tags: the floating channel pointer (`latest` or `rc`), the
+          # git tag (`v0.27.0`) and the bare semver (`0.27.0`). The bare form is
+          # what every other registry in this project uses (crates.io and npm
+          # have no `v`), and what a reader who saw `0.27.0` in the CHANGELOG
+          # reaches for first; without it `docker pull ghcr.io/zvn-dev/powdb:0.27.0`
+          # fails with "manifest unknown" on a version that exists.
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.channel.outputs.docker_floating_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.semver }}
           # Populates the dynamic OCI labels declared at the end of the
           # Dockerfile. Without these the image ships the placeholder defaults
           # (0.0.0-dev / unknown), which is the honest answer for a local build

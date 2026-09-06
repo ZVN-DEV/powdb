@@ -194,13 +194,22 @@ if [ -z "${POWDB_TLS_CERT:-}" ] && [ -z "${POWDB_TLS_KEY:-}" ]; then
   }
   # Frame layout: [type][flags][payload length u32 LE]. 0x11 = PING, no payload.
   printf '\x11\x00\x00\x00\x00\x00' >&3 || exit 1
-  reply=''
-  IFS= read -r -N 1 -t 5 reply <&3 || true
-  # 0x12 = PONG
-  if [ "$reply" = $'\x12' ]; then
+  # Read the WHOLE 6-byte PONG frame, not just its first byte. Closing a socket
+  # that still has bytes queued in its receive buffer makes the kernel send RST
+  # instead of FIN, and the server logged every probe as
+  # "ERROR error reading CONNECT ... Connection reset by peer" once per
+  # interval on an idle, healthy container. Draining the frame closes with FIN,
+  # which the server records as a DEBUG "client closed before CONNECT".
+  # `read -N` cannot hold the four NUL bytes of the length field, so the frame
+  # is read through od, which is byte-exact. `timeout` bounds the read the way
+  # `read -t` used to.
+  reply="$(timeout 5 od -An -N6 -tx1 <&3 2>/dev/null | tr -d ' \n')"
+  # 0x12 = PONG. Requiring all six bytes is what makes the close clean; the
+  # type byte alone would leave five bytes unread.
+  if [ "${#reply}" -eq 12 ] && [ "${reply:0:2}" = "12" ]; then
     exit 0
   fi
-  note "wire port did not answer PING with PONG"
+  note "wire port did not answer PING with a complete PONG frame (got '${reply:-<nothing>}')"
   exit 1
 fi
 
@@ -215,6 +224,23 @@ done
 note "no powdb-server process found"
 exit 1
 HEALTHCHECK_SH
+
+# Argument shim for the entrypoint. tini's `--` ends tini's own option parsing,
+# so with ENTRYPOINT ["/usr/bin/tini", "--"] the first argument of
+# `docker run <image> --version` became the command itself and tini died with
+# `exec --version failed: No such file or directory` (exit 127). This restores
+# the ordinary `docker run <image> --flag` idiom: a first argument beginning
+# with "-" is a flag for powdb-server and gets the binary prepended, while
+# anything else (`powdb-server --help`, `bash`, an absolute path) still runs
+# verbatim, so every previously documented invocation behaves exactly as before.
+COPY --chmod=0755 <<'ENTRYPOINT_SH' /usr/local/bin/powdb-entrypoint
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  -*) set -- /usr/local/bin/powdb-server "$@" ;;
+esac
+exec "$@"
+ENTRYPOINT_SH
 
 ENV RUST_LOG=info \
     POWDB_DATA=/data \
@@ -252,5 +278,5 @@ LABEL org.opencontainers.image.title="PowDB" \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["/usr/local/bin/powdb-healthcheck"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/powdb-entrypoint"]
 CMD ["/usr/local/bin/powdb-server"]
