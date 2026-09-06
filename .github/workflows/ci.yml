@@ -559,6 +559,17 @@ jobs:
         working-directory: clients/sync
         run: npm exec --yes --package=pnpm@10.29.3 -- pnpm run build
 
+      # The three published READMEs are API documentation that nothing compiled
+      # until now, so their samples rotted: `queryTyped<User>` with an
+      # `interface` never type-checked, the addon sample read `.rows` off an
+      # un-narrowed union, and the sync adapter example could not be assigned
+      # to the addon's own parameter type. This is the only job that both
+      # builds the addon (the checker needs its generated index.d.ts) and has a
+      # TypeScript toolchain, so the check lives here.
+      - name: Type-check the README samples of all three JS packages
+        working-directory: clients/sync
+        run: npm exec --yes --package=pnpm@10.29.3 -- pnpm run test:readme
+
       - name: Run sync package tests
         working-directory: clients/sync
         env:
