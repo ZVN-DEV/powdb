@@ -347,7 +347,7 @@ materialized views before snapshotting.
 Before exposing `powdb-server` beyond `127.0.0.1`:
 
 - [ ] Configure authentication. Either set `POWDB_PASSWORD` to a strong shared secret, or define named users with roles (`powdb-cli --data-dir <dir> useradd …`; connect with `--user`). The server logs a `WARN` on startup when neither is configured and will accept any connection. See [Multi-user authentication](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md#multi-user-authentication).
-- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
+- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration. For a self-signed certificate the server and the CLI both accept, use the recipe in [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md#generating-a-self-signed-certificate-for-testing): a plain `openssl req -x509` one-liner produces a certificate every client rejects.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network, because it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.

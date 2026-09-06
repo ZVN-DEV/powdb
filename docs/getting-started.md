@@ -560,6 +560,24 @@ POWDB_ADMIN_USER=root POWDB_ADMIN_PASSWORD=changeme powdb-server --data-dir ./po
 After the admin exists, use `passwd` / `useradd` to manage the rest, and stop
 relying on the bootstrap env vars.
 
+### Encrypting the connection (TLS)
+
+The server serves TLS when `POWDB_TLS_CERT` and `POWDB_TLS_KEY` both point at a
+PEM certificate and key, and the CLI connects to it with `--tls` (plus
+`--tls-ca <ca.pem>` for a self-signed certificate):
+
+```bash
+POWDB_TLS_CERT=server.crt POWDB_TLS_KEY=server.key powdb-server --data-dir ./powdb_data
+powdb-cli --remote localhost:5433 --tls --tls-ca server.crt
+```
+
+Generating a self-signed certificate for this is fussier than it looks: a plain
+`openssl req -x509` one-liner produces a certificate the server accepts and
+every client then rejects, and the details differ between LibreSSL (stock
+macOS) and OpenSSL. Use the recipe in
+[SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md#generating-a-self-signed-certificate-for-testing),
+which is written to work on both.
+
 ### Concurrent transactions
 
 Autocommit read-only queries share server admission and can run concurrently.

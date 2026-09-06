@@ -89,17 +89,49 @@ The bundled CLI supports TLS in remote mode (since v0.17.0):
 
 Without any TLS flags the CLI behaves exactly as before and connects over plaintext TCP. On releases before v0.17.0, the bundled CLI has no TLS support and cannot reach a TLS-required server; use the TS client or a TLS-terminating tunnel instead.
 
-To generate a self-signed certificate for testing (a plain `openssl req -x509` one-liner often produces a CA-flagged certificate that rustls rejects as an end-entity cert; the `-addext` flags below avoid that):
+### Generating a self-signed certificate for testing
+
+Run `openssl version` first. The recipe below is written so that LibreSSL (what stock macOS
+ships as `/usr/bin/openssl`), OpenSSL 1.1.1 and OpenSSL 3.x all produce the same certificate,
+and two details do that work:
+
+- `-pkeyopt ec_param_enc:named_curve` puts the P-256 object identifier in the key. Without it,
+  LibreSSL writes the curve as explicit parameters, and the server's TLS stack (aws-lc) refuses
+  such a key. The refusal surfaces as a key/certificate mismatch even though the pair does match,
+  so the error text points nowhere near the cause.
+- The extensions come from a config file, not from `-addext`. OpenSSL 1.1.1's `req -x509` applies
+  its configuration's CA:TRUE `basicConstraints` *as well as* an `-addext` one, and the server
+  refuses to start on a certificate carrying two `basicConstraints` extensions.
+- Extensions have to come from somewhere. A plain `openssl req -x509` one-liner with no extension
+  flags produces a CA:TRUE certificate with no subject alternative name. The server starts with
+  it, and then every client handshake fails with `CaUsedAsEndEntity`, because a CA certificate is
+  not a valid end-entity certificate.
 
 ```bash
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -keyout server.key -out server.crt -days 365 -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-  -addext "basicConstraints=critical,CA:FALSE" \
-  -addext "keyUsage=digitalSignature" -addext "extendedKeyUsage=serverAuth"
+cat > cert.cnf <<'EOF'
+[req]
+distinguished_name = dn
+prompt = no
+x509_extensions = ext
+[dn]
+CN = localhost
+[ext]
+subjectAltName = DNS:localhost, IP:127.0.0.1
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = serverAuth
+EOF
+
+openssl req -x509 -newkey ec \
+  -pkeyopt ec_paramgen_curve:P-256 -pkeyopt ec_param_enc:named_curve -nodes \
+  -keyout server.key -out server.crt -days 365 -config cert.cnf
+
 # server: POWDB_TLS_CERT=server.crt POWDB_TLS_KEY=server.key powdb-server ...
 # client: powdb-cli --remote 127.0.0.1:5433 --tls --tls-ca server.crt ...
 ```
+
+Verified end to end (server starts, CLI connects with `--tls`, query returns rows) against
+LibreSSL 3.3.6, OpenSSL 1.1.1v, OpenSSL 3.4.1 and OpenSSL 3.6.3.
 
 ## Authentication
 
