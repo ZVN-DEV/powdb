@@ -77,6 +77,26 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
     Ok(())
 }
 
+/// Page count of a data file, refusing a length that is not a whole number of
+/// pages.
+///
+/// Every writer extends a heap one whole page at a time, so a partial trailing
+/// page is damage: a truncation, a torn extend, or a bad copy. The old
+/// `len / PAGE_SIZE` rounded it away, which turned `truncate -s 100` on a heap
+/// into a table that opened clean and answered zero rows.
+fn whole_pages(path: &Path, file: &File) -> io::Result<u32> {
+    let len = file.metadata()?.len();
+    let remainder = len % PAGE_SIZE as u64;
+    if remainder != 0 {
+        return Err(crate::error::StorageError::CorruptData(format!(
+            "{}: file length {len} is not a whole number of {PAGE_SIZE}-byte pages ({remainder} trailing bytes)",
+            path.display()
+        ))
+        .into());
+    }
+    Ok((len / PAGE_SIZE as u64) as u32)
+}
+
 /// Manages page-level I/O to a single data file.
 /// Each page is PAGE_SIZE bytes at offset = page_id * PAGE_SIZE.
 pub struct DiskManager {
@@ -105,8 +125,7 @@ impl DiskManager {
 
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let len = file.metadata()?.len();
-        let num_pages = (len / PAGE_SIZE as u64) as u32;
+        let num_pages = whole_pages(path, &file)?;
         Ok(DiskManager {
             file,
             num_pages,
@@ -120,8 +139,7 @@ impl DiskManager {
     /// as a clear message instead of a raw `EBADF`.
     pub fn open_read_only(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        let len = file.metadata()?.len();
-        let num_pages = (len / PAGE_SIZE as u64) as u32;
+        let num_pages = whole_pages(path, &file)?;
         Ok(DiskManager {
             file,
             num_pages,

@@ -46,6 +46,17 @@ pub enum StorageError {
     #[error("overflow chain corrupt: {0}")]
     OverflowCorrupt(String),
 
+    /// A statement named a table this catalog does not have.
+    ///
+    /// The caller misspelled something and can fix it, so it must not reach a
+    /// client as an internal fault. The query layer raises its own
+    /// `TableNotFound` for the name it resolves itself; this is the same
+    /// mistake reaching the same client through a storage entry point (a
+    /// `count(<table>)` over a raw scan, for one), and the two have to
+    /// classify alike.
+    #[error("table '{table}' not found")]
+    TableNotFound { table: String },
+
     /// A DDL statement was issued inside an explicit transaction. DDL is not
     /// transactional: it unlinks files and rewrites the catalog immediately,
     /// so a later ROLLBACK cannot undo it and would silently destroy data.
@@ -102,6 +113,7 @@ pub enum StorageErrorKind {
     CatalogCorrupt,
     PageCorrupt,
     InvalidIdentifier,
+    TableNotFound,
     RowTooLarge,
     ValueTooLarge,
     OverflowCorrupt,
@@ -126,6 +138,7 @@ impl StorageError {
             Self::CatalogCorrupt(_) => StorageErrorKind::CatalogCorrupt,
             Self::PageCorrupt(_) => StorageErrorKind::PageCorrupt,
             Self::InvalidIdentifier(_) => StorageErrorKind::InvalidIdentifier,
+            Self::TableNotFound { .. } => StorageErrorKind::TableNotFound,
             Self::RowTooLarge { .. } => StorageErrorKind::RowTooLarge,
             Self::ValueTooLarge { .. } => StorageErrorKind::ValueTooLarge,
             Self::OverflowCorrupt(_) => StorageErrorKind::OverflowCorrupt,
@@ -190,6 +203,9 @@ mod tests {
             StorageError::CatalogCorrupt("bad magic".into()),
             StorageError::PageCorrupt("slot past end".into()),
             StorageError::InvalidIdentifier("a b".into()),
+            StorageError::TableNotFound {
+                table: "Ghost".into(),
+            },
             StorageError::RowTooLarge {
                 size: 8192,
                 max: 4070,

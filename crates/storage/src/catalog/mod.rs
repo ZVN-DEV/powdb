@@ -86,8 +86,10 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// Version 1 files still load cleanly — they're treated as having zero
 /// indexed columns, and the next `create_index` (or implicit rebuild on
 /// first open, depending on the caller) will populate the list.
-const CATALOG_FILE: &str = "catalog.bin";
-pub const CATALOG_LSN_FILE: &str = "catalog.lsn";
+const CATALOG_FILE: &str = crate::data_dir::CATALOG_FILE;
+/// Re-export of [`crate::data_dir::CATALOG_LSN_FILE`], kept here because
+/// `powdb-backup` has imported it from this module since v0.4.5.
+pub const CATALOG_LSN_FILE: &str = crate::data_dir::CATALOG_LSN_FILE;
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// Version 4 appends a per-table column-defaults section after the indexed
 /// column list; version 5 appends an auto-increment column section after that.
@@ -219,7 +221,7 @@ pub fn expression_index_file_name(table: &str, index_id: u64) -> String {
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
-const WAL_FILE: &str = "wal.log";
+const WAL_FILE: &str = crate::data_dir::WAL_FILE;
 const SYNC_STATE_DIR: &str = ".powdb-sync";
 const SYNC_IDENTITY_FILE: &str = "identity.json";
 
@@ -254,6 +256,43 @@ fn check_replay_page(
 }
 
 type WalArchiveCallback<'a> = &'a mut dyn FnMut(&Path, &[WalRecord]) -> io::Result<()>;
+
+/// The refusal for a statement naming a table this catalog does not have.
+///
+/// Carries [`StorageError::TableNotFound`] as the `io::Error`'s source so the
+/// server classifies it as the caller's mistake (the same class the query
+/// layer's own `TableNotFound` gets) instead of an internal fault, while
+/// keeping `io::ErrorKind::NotFound` for the callers that match on it.
+fn table_not_found(table: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        StorageError::TableNotFound {
+            table: table.to_string(),
+        },
+    )
+}
+
+/// Name of the first heap or index file in `data_dir`, if there is one. Used
+/// to tell a damaged database (table files, no catalog) apart from a fresh
+/// directory (nothing at all).
+fn first_table_file(data_dir: &Path) -> io::Result<Option<String>> {
+    let entries = match fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut found: Option<String> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".heap") || name.ends_with(".idx") {
+            // Deterministic across filesystems: report the first by name.
+            if found.as_ref().is_none_or(|current| name < *current) {
+                found = Some(name);
+            }
+        }
+    }
+    Ok(found)
+}
 
 fn read_durable_lsn(data_dir: &Path) -> io::Result<u64> {
     let path = data_dir.join(CATALOG_LSN_FILE);
@@ -488,6 +527,18 @@ impl Catalog {
     fn open_inner(data_dir: &Path, archive: Option<WalArchiveCallback<'_>>) -> io::Result<Self> {
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
+            // A directory with table files but no catalog is a damaged
+            // database, not an empty one. Reported as NotFound it was
+            // indistinguishable from a fresh directory, so callers created a
+            // new catalog beside the surviving heaps and every table
+            // disappeared. CatalogCorrupt keeps that fallback off.
+            if let Some(orphan) = first_table_file(data_dir)? {
+                return Err(StorageError::CatalogCorrupt(format!(
+                    "{} is missing but table files are still here (for example {orphan}): refusing to open this directory as a new database",
+                    cat_path.display()
+                ))
+                .into());
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
         let catalog_file = read_catalog_file(&cat_path)?;
@@ -522,6 +573,23 @@ impl Catalog {
             name_to_slot.insert(name.clone(), tables.len());
             tables.push(table);
         }
+        // Since catalog v5 (the auto-increment section, which shipped well
+        // after v0.5.0 gave heaps a superblock) `Table::create` always writes
+        // page 0, so a catalogued table whose heap is zero bytes has been
+        // truncated. It used to open as an empty table and answer every query
+        // with no rows.
+        if active_catalog_version >= LEGACY_CATALOG_VERSION {
+            for table in &tables {
+                if table.heap.num_pages() == 0 {
+                    return Err(StorageError::CorruptData(format!(
+                        "table '{}': heap file is empty, but this database always writes a heap superblock",
+                        table.schema().table_name
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let wal_path = data_dir.join(WAL_FILE);
         // A WAL with no `PWAL` file header is read as a pre-v0.5.0 headerless
         // log whose records start at byte 0. On a directory no pre-v0.5.0
@@ -602,6 +670,18 @@ impl Catalog {
         crate::validate_data_dir_read_only(data_dir)?;
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
+            // A directory with table files but no catalog is a damaged
+            // database, not an empty one. Reported as NotFound it was
+            // indistinguishable from a fresh directory, so callers created a
+            // new catalog beside the surviving heaps and every table
+            // disappeared. CatalogCorrupt keeps that fallback off.
+            if let Some(orphan) = first_table_file(data_dir)? {
+                return Err(StorageError::CatalogCorrupt(format!(
+                    "{} is missing but table files are still here (for example {orphan}): refusing to open this directory as a new database",
+                    cat_path.display()
+                ))
+                .into());
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
 
@@ -1895,12 +1975,10 @@ impl Catalog {
     /// consolidates ~14 copies of that idiom into this one place.
     #[inline]
     fn by_name(&self, table: &str) -> io::Result<&Table> {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         Ok(&self.tables[slot])
     }
 
@@ -1941,12 +2019,10 @@ impl Catalog {
     }
 
     fn slot_of(&self, table: &str) -> io::Result<usize> {
-        self.name_to_slot.get(table).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })
+        self.name_to_slot
+            .get(table)
+            .copied()
+            .ok_or_else(|| table_not_found(table))
     }
 
     pub fn insert(&mut self, table: &str, values: &Row) -> io::Result<RowId> {
@@ -2150,12 +2226,10 @@ impl Catalog {
         // Resolve slot up front so we can split the borrow — the user
         // hook closes over `&mut self.wal`, which can't coexist with a
         // `by_name_mut` borrow of `self.tables`.
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         // Split-borrow the catalog fields so the hook can write into
@@ -2216,12 +2290,10 @@ impl Catalog {
                 |_, _| {},
             );
         }
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
@@ -2403,12 +2475,10 @@ impl Catalog {
     where
         F: FnOnce(&mut [u8]),
     {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         self.update_row_bytes_logged_by_slot(slot, rid, f)
     }
 
@@ -2489,12 +2559,10 @@ impl Catalog {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tbl = &mut self.tables[slot];
         let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
         if !ok {
@@ -3114,9 +3182,10 @@ impl Catalog {
         self.ensure_no_active_transaction_for_ddl("drop table")?;
         self.invalidate_structure();
         validate_table_name(name)?;
-        let slot = *self.name_to_slot.get(name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(name)
+            .ok_or_else(|| table_not_found(name))?;
         // A live relationship link that names this table (as owner or target)
         // pins it in place, the same integrity discipline indexes use. The
         // link has to go first, and PowQL has no statement that removes one,

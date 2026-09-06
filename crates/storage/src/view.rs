@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-const VIEW_FILE: &str = "views.bin";
+const VIEW_FILE: &str = crate::data_dir::VIEW_REGISTRY_FILE;
 const VIEW_MAGIC: &[u8; 4] = b"BVIW";
 const VIEW_VERSION: u16 = 1;
 
