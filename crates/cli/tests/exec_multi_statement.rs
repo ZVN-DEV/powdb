@@ -526,8 +526,8 @@ fn repl_engine_open_failure_exits_cleanly() {
     assert_eq!(out.status.code(), Some(1), "expected clean exit code 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Error: failed to initialize engine"),
-        "expected clean engine-open error, got: {stderr}"
+        stderr.contains("Error:") && stderr.contains(data_dir.to_str().unwrap()),
+        "expected a clean error naming the data dir, got: {stderr}"
     );
     assert!(!stderr.contains("panicked"), "must not panic: {stderr}");
 }

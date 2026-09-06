@@ -61,7 +61,7 @@ pub(crate) fn exec_embedded(
     // Statement-aware splitting (#150): a `;` inside a string literal or a
     // `#` comment is not a boundary, so text-heavy rows load intact.
     let statements = split_statements_in(query, session.dialect);
-    for stmt in &statements {
+    for (index, stmt) in statements.iter().enumerate() {
         // A segment that is only comments and whitespace is not a statement.
         // The engine lexes it to zero tokens and reports "expected statement,
         // got end of input", so a dump that merely *ended* with a comment line
@@ -87,6 +87,9 @@ pub(crate) fn exec_embedded(
                 print_local_result(&result, session.output);
             }
             Err(e) => {
+                if let Some(where_) = failing_statement_locator(index, statements.len(), stmt) {
+                    eprintln!("{where_}");
+                }
                 eprintln!("Error: {e}");
                 if let Some(hint) = missing_separator_hint(query, statements.len()) {
                     eprintln!("{hint}");
@@ -118,6 +121,38 @@ pub(crate) fn finish_open_transaction(engine: &mut Engine, code: i32) -> i32 {
          (or `rollback`) so its outcome is explicit."
     );
     1
+}
+
+/// Which statement of a multi-statement script failed, and what it said.
+///
+/// A one-shot load stops at the first failure, and the engine's error is
+/// about the statement, not about the script: for a dump of a few hundred
+/// statements it does not say where to look. `None` for a single statement,
+/// where there is nothing to locate.
+pub(crate) fn failing_statement_locator(
+    index: usize,
+    total: usize,
+    statement: &str,
+) -> Option<String> {
+    if total < 2 {
+        return None;
+    }
+    Some(format!(
+        "Error: statement {} of {total} failed: {}",
+        index + 1,
+        statement_excerpt(statement)
+    ))
+}
+
+/// One line of a statement, short enough to read in an error.
+pub(crate) fn statement_excerpt(statement: &str) -> String {
+    let flat = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 120 {
+        return flat;
+    }
+    let mut short: String = flat.chars().take(117).collect();
+    short.push_str("...");
+    short
 }
 
 /// Explain the single most common `--exec-file` mistake instead of leaving the
@@ -262,7 +297,7 @@ pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts, readonly: bool)
                     continue;
                 }
                 continuation_noted = false;
-                let statement = buffer.trim().to_string();
+                let statement = strip_one_trailing_semicolon(buffer.trim()).to_string();
                 buffer.clear();
                 if is_effectively_blank_in(&statement, session.dialect) {
                     continue;
@@ -332,7 +367,7 @@ pub(crate) fn run_embedded_meta(trimmed: &str, engine: &Engine) {
         cmd if cmd.starts_with(".schema") => {
             let table_name = cmd.strip_prefix(".schema").unwrap().trim();
             if table_name.is_empty() {
-                eprintln!("Usage: .schema <TABLE_NAME>");
+                eprintln!("Usage: .schema <TABLE>");
             } else if let Some(schema) = engine.catalog().schema(table_name) {
                 println!("Table: {}", schema.table_name);
                 println!("  {:<20} {:<12} Required", "Column", "Type");

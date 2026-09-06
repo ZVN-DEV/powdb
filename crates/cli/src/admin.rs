@@ -377,6 +377,33 @@ pub(crate) fn save_user_store(store: &powdb_auth::UserStore, data_dir: &str) -> 
     Ok(())
 }
 
+/// The pid recorded in `<data_dir>/LOCK`, when a process is holding this data
+/// directory as a writer.
+pub(crate) fn data_dir_holder_pid(data_dir: &str) -> Option<u32> {
+    std::fs::read_to_string(Path::new(data_dir).join("LOCK"))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Say what a live server will do with a user change written under a data
+/// directory it already has open.
+///
+/// The user-admin commands edit `auth.json` directly and take no lock, so they
+/// succeed against a running server. The server re-reads the file when it
+/// changes, but that happens at the next authentication attempt, and an
+/// operator who saw only "password updated" had no way to know when the change
+/// would take effect.
+pub(crate) fn note_live_server(data_dir: &str) {
+    if let Some(pid) = data_dir_holder_pid(data_dir) {
+        println!(
+            "note: data dir is open by process {pid}; the server reloads users on its next \
+             login attempt"
+        );
+    }
+}
+
 pub(crate) fn run_useradd(
     data_dir: &str,
     name: &str,
@@ -406,6 +433,7 @@ pub(crate) fn run_useradd(
         return code;
     }
     println!("user '{name}' created (role {role})");
+    note_live_server(data_dir);
     0
 }
 
@@ -426,6 +454,7 @@ pub(crate) fn run_userdel(data_dir: &str, name: &str) -> i32 {
         return code;
     }
     println!("user '{name}' deleted");
+    note_live_server(data_dir);
     0
 }
 
@@ -452,6 +481,7 @@ pub(crate) fn run_passwd(data_dir: &str, name: &str, password: Option<&str>) -> 
         return code;
     }
     println!("password updated for user '{name}'");
+    note_live_server(data_dir);
     0
 }
 

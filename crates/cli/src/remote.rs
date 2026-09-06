@@ -75,6 +75,45 @@ pub(crate) fn resolve_tls_server_name(
         .map_err(|_| format!("invalid TLS server name: {name}"))
 }
 
+/// What to try next after a failed TLS handshake, given what rustls said and
+/// what was already passed.
+///
+/// The old hint told you to pass `--tls-ca` even when `--tls-ca` was what had
+/// just failed, and `CaUsedAsEndEntity` (the file is the server's own leaf
+/// certificate rather than a CA) got the same generic advice as every other
+/// failure, so following it changed nothing.
+pub(crate) fn tls_handshake_hint(error: &str, tls: &TlsOpts) -> String {
+    if error.contains("CaUsedAsEndEntity") {
+        return "the file passed to --tls-ca is the server's own certificate, not a CA \
+                certificate: pass the CA that signed it. A self-signed leaf cannot be used \
+                as its own CA unless it carries basicConstraints CA:TRUE"
+            .to_string();
+    }
+    if error.contains("ExtensionValueInvalid") {
+        return "the certificate has an invalid extension, most often a DUPLICATE \
+                basicConstraints written by an `openssl req` config that sets it twice: \
+                reissue the certificate with a single basicConstraints extension"
+            .to_string();
+    }
+    if error.contains("CertExpired") || error.contains("expired") {
+        return "the server certificate is expired: reissue it".to_string();
+    }
+    let mut suggestions: Vec<&str> = Vec::new();
+    if tls.ca_path.is_none() {
+        suggestions.push("self-signed server? pass --tls-ca <ca.pem>");
+    }
+    if tls.server_name.is_none() {
+        suggestions
+            .push("connecting by IP to a hostname certificate? pass --tls-server-name <name>");
+    }
+    if suggestions.is_empty() {
+        return "--tls-ca and --tls-server-name are both already set, so the certificate \
+                itself is what the client will not accept"
+            .to_string();
+    }
+    suggestions.join("; ")
+}
+
 /// Open the remote connection, wrapping it in TLS when requested. With TLS
 /// disabled this is exactly the plaintext `TcpStream::connect` path.
 pub(crate) async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteStream, String> {
@@ -89,9 +128,8 @@ pub(crate) async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteSt
     match connector.connect(server_name, stream).await {
         Ok(s) => Ok(RemoteStream::Tls(Box::new(s))),
         Err(e) => Err(format!(
-            "TLS handshake with {addr} failed: {e} \
-             (self-signed server? pass --tls-ca <ca.pem>; connecting by IP to a \
-             hostname certificate? pass --tls-server-name <name>)"
+            "TLS handshake with {addr} failed: {e} ({})",
+            tls_handshake_hint(&e.to_string(), tls)
         )),
     }
 }
@@ -288,7 +326,7 @@ where
     let mut code = 0;
     let statements = split_statements_in(&query, session.dialect);
     let statement_count = statements.len();
-    for stmt in statements {
+    for (index, stmt) in statements.into_iter().enumerate() {
         // Comment-only segments never reach the wire, same as embedded
         // one-shot and the REPL: they are not statements, and the server
         // would answer "expected statement, got end of input".
@@ -319,6 +357,9 @@ where
                 let is_error = matches!(msg, Message::Error { .. });
                 print_remote_result(&msg, session.output);
                 if is_error {
+                    if let Some(where_) = failing_statement_locator(index, statement_count, stmt) {
+                        eprintln!("{where_}");
+                    }
                     if let Some(hint) = missing_separator_hint(&query, statement_count) {
                         eprintln!("{hint}");
                     }
@@ -559,7 +600,7 @@ pub(crate) async fn run_remote_on<S>(
                     continue;
                 }
                 continuation_noted = false;
-                let statement = buffer.trim().to_string();
+                let statement = strip_one_trailing_semicolon(buffer.trim()).to_string();
                 buffer.clear();
                 if is_effectively_blank_in(&statement, session.dialect) {
                     continue;
