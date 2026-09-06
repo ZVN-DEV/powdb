@@ -1,9 +1,12 @@
 # cargo-audit configuration.
 #
 # `cargo audit` reads this file from `.cargo/audit.toml` (relative to the repo
-# root). The CI `audit` job uses the `rustsec/audit-check` GitHub Action, which
-# does NOT read this file: it takes the same advisory IDs via its `ignore:`
-# input (see .github/workflows/ci.yml). Keep the two lists in sync.
+# root), and since 2026-09-06 the CI `audit` job runs a pinned `cargo audit` in
+# the checkout, so CI and a local run read THIS file and nothing else. It used
+# to use the `rustsec/audit-check` action, which does not read this file and
+# took the same advisory IDs through its `ignore:` input, so the suppression
+# list lived in two places that had to be kept in sync by hand. There is now
+# one list, and it is this one.
 #
 # This list is NOT the same as deny.toml's, and that is deliberate. cargo-audit
 # scans Cargo.lock, which contains every crate the workspace can resolve,

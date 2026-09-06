@@ -78,12 +78,25 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Install cargo-semver-checks (pinned)
+      # Pinned by version AND by content. This tarball is the gate standing at
+      # the door to crates.io, and it was fetched over curl and piped straight
+      # into tar: no checksum, and a GitHub release tag can be moved. Every
+      # `uses:` in this repo is pinned to a 40-hex SHA; the binary that decides
+      # whether a release is API-compatible deserves at least as much.
+      #
+      # The pipe is gone too: `curl | tar` cannot verify anything, because the
+      # bytes are consumed before there is a file to hash. Recompute after a
+      # version bump with `curl -sSfL <url> | sha256sum`.
+      - name: Install cargo-semver-checks (pinned by version and sha256)
+        env:
+          SEMVER_CHECKS_VERSION: "0.50.0"
+          SEMVER_CHECKS_SHA256: 5763f6f62310f76428ba19d42cac060c56e07a1b8e3be0394c8c686398978f48
         run: |
           set -euo pipefail
-          curl -sSfL \
-            https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz \
-            | tar xz -C "$HOME/.cargo/bin"
+          url="https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v${SEMVER_CHECKS_VERSION}/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL "$url" -o /tmp/cargo-semver-checks.tar.gz
+          echo "${SEMVER_CHECKS_SHA256}  /tmp/cargo-semver-checks.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-semver-checks.tar.gz -C "$HOME/.cargo/bin"
           cargo semver-checks --version
 
       # The selftest runs first, on a throwaway two-crate fixture whose patch

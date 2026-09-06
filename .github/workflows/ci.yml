@@ -691,8 +691,14 @@ jobs:
       # The cache above restores ~/.cargo/bin but not cargo's install-tracking
       # metadata (~/.cargo/.crates.toml), so an unconditional install sees an
       # untracked binary and hard-fails with "already exists in destination".
-      - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
+      # Version-pinned, like every other tool this pipeline installs: this
+      # binary decides what "replaying the corpus" means, and a floating build
+      # tool makes the replay's verdict a function of the day rather than of
+      # the commit, which is the one property this job exists to have.
+      - name: Install cargo-fuzz (pinned)
+        env:
+          CARGO_FUZZ_VERSION: 0.13.2
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 
       - name: Replay the checked-in corpus
         env:
@@ -797,6 +803,13 @@ jobs:
       # itself is MIT-licensed and free, so we pin and run the binary directly
       # — same `gitleaks detect` invocation as scripts/quality.sh, at $0.
       GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, taken from the release
+      # asset on 2026-09-06. Every `uses:` in this repo is pinned to a 40-hex
+      # SHA; a tarball fetched over curl and then run against the full git
+      # history deserves the same treatment, and a GitHub version tag can be
+      # moved. Recompute when GITLEAKS_VERSION changes:
+      #   curl -sSfL <url> | sha256sum
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -805,6 +818,7 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
@@ -818,7 +832,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      checks: write
+    env:
+      CARGO_TERM_COLOR: always
+      # Pin the gate's own binary. Bump deliberately, the way every other tool
+      # version in this pipeline is bumped.
+      CARGO_AUDIT_VERSION: 0.22.2
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -838,11 +856,41 @@ jobs:
       # (hard-fail), so dropping it here would redden this job. Keep in sync
       # with `.cargo/audit.toml`, which the local `cargo audit` reads and which
       # documents the bar for adding anything back.
-      - name: Run cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # rustsec/audit-check compiled cargo-audit from source on every run: 304
+      # `Compiling` lines and 3.1 minutes, for a gate binary whose version
+      # floated with whatever crates.io served that morning. A pinned install
+      # plus a cache keyed on that pin makes the tool reproducible and, after
+      # the first run, nearly free.
+      #
+      # Same verdict as before, from one list instead of two. The action did
+      # not read `.cargo/audit.toml`; it took the same advisory ID through its
+      # `ignore:` input, so the suppression lived in two places that had to be
+      # kept in sync by hand, and the file says so. A plain `cargo audit` in
+      # the checkout reads `.cargo/audit.toml`, which is where the reasoning
+      # already is, so the duplicate goes away.
+      # `checks: write` goes with the action; without it there is nothing to
+      # annotate, and the advisory text is in the job log either way.
+      - name: cargo-audit cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2026-0235
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
+
+      # `command -v` guard: the cache restores the binary but cargo's
+      # install-tracking metadata may not line up, and an unconditional install
+      # then hard-fails with "already exists in destination". Same guard the
+      # fuzz-corpus-replay job carries for cargo-fuzz.
+      - name: Install cargo-audit (pinned)
+        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+
+      - name: Run cargo audit
+        run: cargo audit
 
   # Governance gate: this is a public repo. Fail the build if internal-only
   # planning/agent artifacts get re-tracked, or if any public doc/source names
