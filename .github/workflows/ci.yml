@@ -805,6 +805,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The selftest first, on fixture workflows: a clean pair passes and
+      # thirteen mutations each fail, so a parser that has stopped seeing jobs
+      # is caught here rather than by nobody.
+      - name: Prove the needs checker can fail
+        run: bash scripts/ci/check-ci-success-needs.sh --selftest
+
       - name: Every ci.yml job must be required by ci-success
         run: bash scripts/ci/check-ci-success-needs.sh
 
@@ -1100,15 +1106,25 @@ jobs:
       - missing-docs-ratchet
       - rustdoc
     steps:
+      # ci-success checks the repo out and runs the completeness check ITSELF,
+      # which reads as belt-and-braces next to the ci-needs-completeness job
+      # and is not. The old verdict was `for result in $RESULTS`, with
+      # `RESULTS: ${{ join(needs.*.result, ' ') }}`. Delete the needs: list and
+      # that expands to the empty string, the loop iterates zero times, and it
+      # prints "All required CI jobs succeeded." ci-success is the ONE required
+      # status check on main, so that turns the merge button green with nothing
+      # behind it. ci-needs-completeness would have gone red, but it blocks
+      # nothing except through ci-success, i.e. through the list that was just
+      # deleted: the guard was circular.
+      #
+      # Running the check here breaks the circle, because it reads ci.yml on
+      # disk rather than the needs: list. --results then compares the length of
+      # the results vector against the job count parsed out of the file, so an
+      # emptied needs: list fails from inside the required check.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Verify every required job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          echo "Upstream job results: $RESULTS"
-          for result in $RESULTS; do
-            if [ "$result" != "success" ]; then
-              echo "::error::A required CI job did not succeed (results: $RESULTS)"
-              exit 1
-            fi
-          done
-          echo "All required CI jobs succeeded."
+        run: bash scripts/ci/check-ci-success-needs.sh --results "$RESULTS"
