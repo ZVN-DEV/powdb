@@ -21,6 +21,7 @@ import {
   MAX_ROWS,
   MAX_RESULT_CELLS,
   MAX_SYNC_UNITS,
+  MAX_SYNC_PULL_UNITS,
   MAX_PARAMS,
   MSG_QUERY_NATIVE,
   MSG_QUERY_PARAMS_NATIVE,
@@ -1041,6 +1042,78 @@ async function main() {
     frame.writeUInt32LE(payload.length, 2);
     payload.copy(frame, 6);
     assert.throws(() => tryDecode(frame), /too many retained units/);
+  });
+
+  await test("the sync unit ceilings, and why they differ, are the server's own", () => {
+    const rustConstant = (file: string, decl: string, name: string): number => {
+      const path = fileURLToPath(new URL(`../../../crates/server/src/${file}`, import.meta.url));
+      const text = readFileSync(path, "utf8");
+      const matches = [
+        ...text.matchAll(new RegExp(`^${decl} ${name}: u\\w+ = ([^;]+);$`, "gm")),
+      ];
+      assert.equal(matches.length, 1, `expected exactly one \`${name}\` in ${path}`);
+      const expr = matches[0]![1]!.replace(/_/g, "").trim();
+      assert.match(expr, /^\d+( \* \d+)*$/, `cannot evaluate ${name} = ${expr}`);
+      return expr.split("*").reduce((acc, part) => acc * Number(part.trim()), 1);
+    };
+
+    // What this client DECODES is the server's decoder ceiling, and what it may
+    // ASK FOR is the server's serving cap. They are deliberately different
+    // numbers, so drift in either direction has to be caught here.
+    assert.equal(
+      MAX_SYNC_UNITS,
+      rustConstant("protocol.rs", "const", "MAX_SYNC_UNITS"),
+      "MAX_SYNC_UNITS has drifted from the server's decoder ceiling",
+    );
+    assert.equal(
+      MAX_SYNC_PULL_UNITS,
+      rustConstant("handler/sync.rs", "pub\\(super\\) const", "MAX_SYNC_PULL_UNITS"),
+      "MAX_SYNC_PULL_UNITS has drifted from the server's serving cap",
+    );
+
+    // The doc comment on the decoder ceiling is the only place a reader is told
+    // why the two differ, so it has to state the reason that holds. It used to
+    // say the server extends a chunk past the serving cap to the commit that
+    // closes a transaction, so a transaction of any size arrived whole. It does
+    // not: a served chunk is capped at MAX_SYNC_PULL_UNITS because every
+    // released decoder through v0.27.0 refuses more, and a transaction that
+    // does not fit is answered with a typed rebootstrap.
+    const ownSource = readFileSync(
+      fileURLToPath(new URL("../src/protocol.ts", import.meta.url)),
+      "utf8",
+    );
+    const docAbove = (decl: string): string => {
+      const at = ownSource.indexOf(decl);
+      assert.notEqual(at, -1, `${decl} is no longer in src/protocol.ts`);
+      return ownSource
+        .slice(0, at)
+        .split("/**")
+        .pop()!
+        .replace(/^\s*\*/gm, " ")
+        .replace(/\s+/g, " ");
+    };
+    for (const decl of [
+      "export const MAX_SYNC_UNITS",
+      "export const MAX_SYNC_PULL_UNITS",
+    ]) {
+      for (const retired of [
+        /extends? a chunk past/i,
+        /transaction of any size/i,
+        /arrives whole/i,
+      ]) {
+        assert.doesNotMatch(
+          docAbove(decl),
+          retired,
+          `the ${decl} comment still describes the pull window 97cf06b capped`,
+        );
+      }
+    }
+    assert.match(
+      docAbove("export const MAX_SYNC_PULL_UNITS"),
+      /rebootstrap/i,
+      "the MAX_SYNC_PULL_UNITS comment does not say what happens to a " +
+        "transaction that does not fit the serving cap",
+    );
   });
 
   console.log("\nEmbedded sync client helpers — mock server");

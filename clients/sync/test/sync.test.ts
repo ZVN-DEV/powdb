@@ -967,6 +967,42 @@ async function main() {
     );
   });
 
+  await test("the pull-budget comments describe the window the primary serves", () => {
+    // The primary caps a served chunk at MAX_SYNC_PULL_UNITS, and this replica
+    // already asks for exactly that, so there is no headroom left for the
+    // primary to exceed the default in. A transaction that does not fit the cap
+    // comes back as a typed rebootstrap, not as an over-long chunk. Both
+    // comments here used to say the opposite, which is the one thing a reader
+    // sizing `maxPullUnits` down would act on.
+    const source = readFileSync(
+      fileURLToPath(new URL("../src/index.ts", import.meta.url)),
+      "utf8",
+    );
+    const docAbove = (decl: string): string => {
+      const at = source.indexOf(decl);
+      assert.notEqual(at, -1, `${decl} is no longer in src/index.ts`);
+      return source
+        .slice(0, at)
+        .split("/**")
+        .pop()!
+        .replace(/^\s*\*/gm, " ")
+        .replace(/\s+/g, " ");
+    };
+    for (const decl of ["maxPullUnits?: number;", "const DEFAULT_MAX_PULL_UNITS"]) {
+      const doc = docAbove(decl);
+      assert.doesNotMatch(
+        doc,
+        /may exceed/i,
+        `the comment on ${decl} still calls maxUnits a hint the primary may exceed`,
+      );
+      assert.doesNotMatch(
+        doc,
+        /(hint|preference) (rather than|not) a (ceiling|cap|limit)/i,
+        `the comment on ${decl} still calls maxUnits unbounded`,
+      );
+    }
+  });
+
   await test("maxPullBytes above the server ceiling is refused at construction", () => {
     const build = (maxPullBytes: bigint) =>
       new PowDBSyncReplica({

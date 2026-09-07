@@ -180,8 +180,12 @@ export interface PowDBSyncReplicaOptions {
   remote: RemoteSyncClient;
   /**
    * Units one pull asks for. Defaults to, and is capped at, the primary's
-   * `MAX_SYNC_PULL_UNITS` (4096). A hint the primary may exceed to reach a
-   * transaction boundary.
+   * `MAX_SYNC_PULL_UNITS` (4096), which is also the most the primary will put
+   * in one chunk. Asking for less does not cut a chunk inside a transaction:
+   * the primary runs a chunk on to the commit that closes the transaction it
+   * lands in, but only as far as that same cap. At the default there is
+   * therefore no headroom above the request left, and a transaction too large
+   * for the cap comes back as a `rebootstrap` status naming it.
    */
   maxPullUnits?: number;
   /**
@@ -253,26 +257,31 @@ export interface WriteResult {
 }
 
 /**
- * The largest `maxUnits` the primary accepts (`MAX_SYNC_PULL_UNITS` in
- * `crates/server/src/handler/sync.rs`). A larger request is refused outright,
- * so asking for one only produces a protocol error on every pull.
+ * The largest `maxUnits` the primary accepts, and the most it will serve in
+ * one chunk (`MAX_SYNC_PULL_UNITS` in `crates/server/src/handler/sync.rs`). A
+ * larger request is refused outright, so asking for one only produces a
+ * protocol error on every pull.
  */
 const MAX_PULL_UNITS_CEILING = 4096;
 
 /**
  * The largest `maxBytes` the primary accepts (`MAX_SYNC_PULL_BYTES`, same
- * file). This is the budget that actually cuts a chunk: the primary stops
- * filling on `selected_bytes + unit_bytes > max_bytes`, well before the hard
- * unit cap.
+ * file). The primary stops filling a chunk on
+ * `selected_bytes + unit_bytes > max_bytes`, so on wide rows this budget is
+ * what cuts a chunk and on narrow ones the unit cap is. Whichever cuts first,
+ * a transaction that does not fit inside it is answered with `rebootstrap`.
  */
 const MAX_PULL_BYTES_CEILING = 16 * 1024 * 1024;
 
 /**
  * Units a pull asks for by default.
  *
- * `maxUnits` is a hint the primary may exceed to reach a transaction
- * boundary, so this is a batching preference rather than a ceiling. It sat at
- * 512 while the primary treated it as a hard cap, which made every
+ * The primary runs a chunk past `maxUnits` to the commit that closes the
+ * transaction the chunk lands in, but never past `MAX_SYNC_PULL_UNITS`, which
+ * is what this default already is. So the primary cannot serve more than the
+ * default asks for, and a transaction that does not fit the cap comes back as
+ * a `rebootstrap` status rather than as an over-long chunk. The default sat at
+ * 512 while the primary treated the request as a hard cap, which made every
  * transaction of more than ~512 units unservable: the chunk was cut inside
  * the transaction, the primary refused it, and every retry cut in the same
  * place.

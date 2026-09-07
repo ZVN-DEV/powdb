@@ -197,14 +197,31 @@ export const MAX_PARAMS = 4096;
 /**
  * Maximum retained units accepted in one sync pull result.
  *
- * Larger than {@link MAX_SYNC_PULL_UNITS} on purpose: `maxUnits` is a hint, and
- * the server extends a chunk past it to the commit that closes the transaction
- * the chunk is standing in. A transaction of any size therefore arrives whole,
- * bounded by {@link MAX_SYNC_PULL_BYTES} rather than by a unit count.
+ * Deliberately larger than {@link MAX_SYNC_PULL_UNITS}, because the two answer
+ * different questions: this is what this decoder ACCEPTS, and
+ * {@link MAX_SYNC_PULL_UNITS} is the most a server will SEND. In a mixed fleet
+ * accepting more than any peer sends is safe and sending more is not, so a
+ * future negotiated large chunk has to decode here today. Mirrors
+ * `MAX_SYNC_UNITS` in `crates/server/src/protocol.rs`; the two implementations
+ * of this protocol have to agree on what they accept. Nothing is sized from
+ * the declared count, so the higher ceiling is not an allocation amplifier.
  */
 export const MAX_SYNC_UNITS = 262_144;
 
-/** Maximum retained units a sync pull request may ask the server for. */
+/**
+ * Maximum retained units in one sync pull: both the most a request may ask for
+ * and the most a server puts in one result frame.
+ *
+ * The serving half is a wire constraint, not a resource one. Every released
+ * decoder through v0.27.0 refuses a pull result declaring more than this, and
+ * here that refusal is a frame-level decode failure that drops the socket
+ * rather than a typed error, so an over-long chunk costs the connection and
+ * every retry cuts the same chunk again. A chunk that would end inside a
+ * transaction therefore runs on to the commit that closes it only as far as
+ * this cap; a transaction that does not fit is answered with a `rebootstrap`
+ * status naming it, which every peer can decode. Mirrors
+ * `MAX_SYNC_PULL_UNITS` in `crates/server/src/handler/sync.rs`.
+ */
 export const MAX_SYNC_PULL_UNITS = 4096;
 
 /** Maximum retained-unit payload budget accepted by the server for one sync pull. */
