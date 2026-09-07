@@ -7,6 +7,864 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`drop link <Owner>.<name>`**, also spelled `alter <Owner> drop link
+  <name>`, both with `if exists`. A declared entity link could be created but
+  never removed short of dropping the table.
+
+- **`powdb-cli --readonly`** opens an embedded data directory through
+  `Engine::open_read_only`, so a shell or a script can read a directory it must
+  not write. `--readonly` together with `--remote` is a usage error naming the
+  server-side setting, and a read-only open never creates the directory. A
+  missing `--data-dir`, or one that names a file, is reported as such instead
+  of surfacing a bare OS error.
+
+- **`powdb-cli --remote` accepts a Unix-domain socket path.** A path (rather
+  than `host:port`) connects over the socket `powdb-server --socket` publishes;
+  before this it failed with `connection failed: invalid socket address`, so
+  the CLI could not reach a socket-only server at all.
+
+- **`powdb-cli --password-stdin`**, accepted wherever `--password` is, and
+  refused alongside it. Only the line terminator is stripped, so a password
+  ending in spaces still works. `--password` now warns that the value is
+  visible in `ps`, without printing it.
+
+- **Per-subcommand `--help` in `powdb-cli`.** `backup --help` used to run the
+  backup and fail on a missing data directory. Every subcommand answers its own
+  help from the same strings that back the top-level `--help`.
+
+- **`--wal-checkpoint-bytes <BYTES>`** on `powdb-server` (env
+  `POWDB_WAL_CHECKPOINT_BYTES`) and on `powdb-cli`'s embedded path, with
+  `Catalog::set_wal_checkpoint_bytes`, `Catalog::wal_checkpoint_bytes` and
+  `powdb_storage::catalog::DEFAULT_WAL_CHECKPOINT_BYTES` (64 MiB) behind them.
+  The threshold is a plain byte count with no unit suffix; `0` disables the
+  automatic checkpoint and restores the grow-until-close behaviour. **It has no
+  effect in either shipped binary yet:** the automatic checkpoint is skipped
+  whenever a WAL archive hook is installed, and both `powdb-server` and
+  `powdb-cli` install one unconditionally, so the log still grows until an
+  explicit checkpoint or the close. Embedded callers that open without an
+  archive hook get the bound.
+
+- **A TLS certificate's expiry is read at startup.** `powdb-server` warns when
+  the certificate it is about to serve has expired or is close to expiring, and
+  a certificate or key it cannot use is refused with a message naming what is
+  wrong (an EC key with explicit curve parameters names the command that
+  re-encodes it, a duplicate `basicConstraints` extension is named).
+
+- **SIGHUP reloads the user store** without restarting the server, so a
+  password rotated with `powdb-cli passwd` takes effect on the next
+  authentication and a deleted user stops being able to log in. `powdb-cli`'s
+  user-admin subcommands now say so when a server holds the data directory.
+
+- **`powdb_sync::archived_through_lsn`**: the highest LSN the retained archive
+  carries, answered from segment file names alone, with no lock taken.
+
+- **`powdb-sync` and `powdb-backup` emit `tracing` spans and events**: what a
+  backup copied, which increments a restore chain applied, where a blake3
+  mismatch was found, and a warning when the sync-aware checkpoint in
+  `SyncCatalog::drop` fails. That last one previously swallowed the error
+  entirely, so retained history stopping short left no trace anywhere.
+
+- **`docker run <image> --version` works.** The image's entrypoint routes a
+  leading `-` argument to `powdb-server`, so the documented flags can be passed
+  straight to `docker run` without repeating the binary path. A first argument
+  that is not a flag is still executed as its own command, so
+  `docker run <image> sh` and the compose overrides in `examples/deploy/`
+  behave exactly as before.
+
+- **The published ghcr image is tagged with the bare version.** A `vX.Y.Z` tag
+  now also produces `ghcr.io/zvn-dev/powdb:X.Y.Z` alongside `vX.Y.Z`, `X.Y`,
+  `X` and `latest`. `examples/deploy/` and the docs have always pinned the bare
+  form; until now that tag did not exist for a fresh release until the floating
+  minor tag happened to line up.
+
+- **The publish workflow builds and smoke-tests a release binary before it
+  publishes anything.** `publish.yml` runs the same `scripts/smoke-release.sh`
+  the release workflow runs, on the same commit, before the first crate goes
+  out. crates.io publishes are irreversible, so the check that a release binary
+  actually starts, serves a query and replays its WAL now happens on the near
+  side of the door rather than minutes later in a parallel workflow.
+
+- **`post-publish-smoke.yml` checks all four channels.** It verified the CLI and
+  the two npm packages; it now also installs the `powdb` embedded facade crate
+  from crates.io and runs a query through it, asserts the npm packages'
+  dist-tags and peer pins, pulls the ghcr image for both architectures and runs
+  `--version` under emulation, and verifies the GitHub Release's assets exist,
+  are non-empty, match their published checksums and carry a valid build
+  provenance attestation.
+
+- **New CI gates**, each with a `--selftest` that CI runs immediately before the
+  real check: `scripts/ci/semver-gate.sh` (cargo-semver-checks really linted
+  something), `scripts/ci/check-dependabot-coverage.sh` (every tracked
+  dependency manifest is watched), `scripts/ci/strip-empty-unreleased.sh`, and
+  `scripts/ci/check-tool-pins.sh` (every `cargo install` in a workflow carries
+  `--version` and `--locked`, a tool installed by two workflows is pinned to the
+  same version in both, and a scan that matched no install at all fails). Four
+  `--selftest` entry points run as their own workflow steps:
+  `semver-advisory.sh` (4 cases), `check-ci-success-needs.sh` (14),
+  `internal-content-guard.sh` (6) and `check-tool-pins.sh` (8).
+
+- **The MSRV job runs the tests.** It compiled the workspace on the MSRV
+  toolchain and stopped there, so an MSRV-incompatible construct anywhere in a
+  `#[cfg(test)]` block or a dev-dependency was invisible. The clippy, ASan,
+  fuzz-replay and examples-smoke jobs also gained a second operating system.
+
+- **`clients/ts/scripts/check-readme-samples.mjs`** extracts every fenced
+  `ts`/`js` block from the three package READMEs, compiles each against the
+  package's real types under `strict`, and reports diagnostics at the README
+  line they came from. Wired up as `pnpm test:readme` in `clients/ts` and
+  `clients/sync`.
+
+- **`bindings/node/CHANGELOG.md`**, shipped in the npm tarball.
+
+### Changed
+
+- **A corrupt page read fails closed instead of answering "no such row".**
+  `HeapFile::get` and `Table::get` mapped an I/O failure and a CRC refusal to
+  `None`, and ten executor sites read `None` as "the row is deleted", so an
+  indexed point lookup on a page that rotted after the directory was opened
+  answered zero rows with a success status. Both now return
+  `io::Result<Option<..>>`, with `Ok(None)` reserved for a slot that really is
+  deleted or out of range, and every executor site propagates. The refusal
+  reaches an engine caller as a `PageCorrupt` error and a wire client as error
+  class 0 (`internal`). `Table::index_lookup` moved with them
+  (`io::Result<Option<(RowId, Row)>>`). See
+  [docs/STABILITY.md](docs/STABILITY.md).
+
+- **An arithmetic result with no int64 answer is an error, not the missing
+  value.** `+`, `-` and `*` that overflow, and `/` by a divisor that is zero for
+  some row, used to evaluate to the missing value: indistinguishable from a
+  missing column, and an `update` wrote it into a required column. All four now
+  refuse the statement, and an `update` that hits one writes no row at all.
+
+- **A comparison against NaN follows IEEE.** `=`, `<`, `>`, `<=` and `>=`
+  against NaN are false and `!=` is true, on every access path. Ordering,
+  `group`, `distinct` and index key order still place NaN in one definite
+  position, and a join on a NaN key still matches.
+
+- **Float `sum` and `avg` are accumulated with compensation.** The same rows
+  summed through a sequential scan and through an index gave two different
+  numbers on a column that mixes very large and very small values, and neither
+  was the exactly rounded total. Every float accumulator in the engine now
+  carries the lost low-order bits, so a float aggregate is the same number on
+  every access path. **Reported float aggregate results may move**, always
+  towards the exact answer. Integer sums are unchanged.
+
+- **An `int` column refuses a float that is not exactly that integer.** `30.7`
+  was stored as `30`, `-0.5` as `0` and `1e300` as `i64::MAX`, on insert and
+  update alike.
+
+- **An ordered comparison on a `bytes` column no longer uses the index.** The
+  B+tree orders bytes keys by length before content, so an index-backed
+  `.y >= "\\x0102"` silently dropped every stored value of a different length,
+  including the row holding `\xff`. `<`, `<=`, `>` and `>=` on a bytes column
+  are answered by the scan, which orders bytes bytewise as every other path
+  does. Equality still uses the index, so a point lookup keeps its plan; a range
+  over an indexed bytes column now plans a filtered scan and costs what a scan
+  costs.
+
+- **`length()` counts characters, not bytes.** `length("café")` was `5`, and
+  disagreed with `substring`, which has always been character-indexed.
+
+- **An unknown backslash escape in a string is a parse error**, in PowQL and in
+  the SQL frontend alike, in string literals and in quoted identifiers. The
+  lexer used to drop the backslash and keep the rest, so `"a\Ab"` was stored as
+  `aAb` and a quoted SQL identifier `"i\d"` silently resolved to `id`. The
+  escape set is `\'`, `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and `\uXXXX`. One
+  consequence: a `bytes` literal must be written with the doubled-backslash
+  form (`"\\x0a"`), which was always the only form that worked.
+
+- **A cast literal against a mistyped column is an error** where it was silently
+  false. `.u = bytes("...")` on a column that is not `bytes` used to match no
+  row and say nothing.
+
+- **`having` and `like` refuse a mistyped operand.** `.n like "abc"` on an int
+  column, `.s like 5`, and `having count(.id) = "x"` used to return no rows;
+  they now raise the same typed error `filter` raises.
+
+- **A pipeline clause that carries a value may be written once.**
+  `User filter .a = 1 filter .b = 2` used to keep only the second predicate and
+  answer as if the first had never been written; the same held for `order`,
+  `limit`, `offset`, `group` and the projection block. Writing one twice is now
+  a parse error. Repeated `having` still chains with `and`.
+
+- **A supplied parameter the query never references is an error.** Binding three
+  parameters to a query that mentions `$1` and `$2` used to run with the third
+  silently ignored, which hides a caller's off-by-one instead of reporting it.
+
+- **`not` over a missing value is the plain complement.** `not (.x = 1)` on a
+  row where `.x` is missing was itself missing, so the row was dropped. PowQL's
+  filter logic is two-valued everywhere else, and now here too: the row is kept.
+
+- **A projection column is named after what it computes.** `D { .j->a, .j->b }`
+  came back as two columns both called `?`, and a grouped aggregate written
+  without an alias was headed by the planner's internal `__agg_0`. SQL names an
+  unaliased aggregate the way SQL does: `count(n)`.
+
+- **A type no row of which could ever be stored is refused at `type` and at
+  `alter ... add column`.** Declaring several hundred columns used to succeed
+  and then fail on every insert, including inserts that set no value at all,
+  because the empty row already exceeded the page budget. The refusal says how
+  many bytes the columns need and how many a row may use.
+
+- **`drop <name>` on a materialized view is refused; use `drop view <name>`.**
+  It removed the backing table and left the definition behind, so the view
+  stayed registered, still went dirty on writes to its source, and reported a
+  missing table on every read, across restarts.
+
+- **A damaged data directory refuses to open instead of opening smaller.** A
+  heap whose length is not a whole number of pages was rounded down, so
+  `truncate -s 100` on a 500-row table gave a table with no rows and no error. A
+  catalogued table whose heap is zero bytes was the same defect with a length
+  that divides evenly. And a `catalog.bin` missing beside surviving heap and
+  index files reported `NotFound`, which every caller reads as "fresh
+  directory", so a new catalog was created next to the data and every table
+  vanished; that is now `CatalogCorrupt` naming `catalog.bin`, while a genuinely
+  empty directory still reports `NotFound`.
+
+- **WAL damage inside the log refuses the open; only a torn tail is
+  truncated.** A CRC failure mid-log returned the prefix before it and the log
+  was then truncated with nothing logged, which is data loss dressed as
+  recovery. Replay now looks for a valid record after the bad one, first where
+  the length field says it ends and then with a bounded byte scan. If one is
+  there the damage is inside the log and the open refuses; if nothing is there
+  it is the torn tail of the write that was in flight, which warns with the
+  offset and the discarded byte count and truncates as before. A WAL whose file
+  header is not `PWAL` was read as a pre-0.5.0 headerless log, silently dropping
+  every un-checkpointed row; a directory whose catalog or heap format is past
+  that era now refuses.
+
+- **A malformed `POWDB_*` value refuses startup.** A typo in a deployment's
+  environment used to run the server on a default nobody chose. Every setting
+  now goes through the same validator as its flag and exits 2 naming the
+  variable and the value. `0` is refused for `POWDB_IDLE_TIMEOUT` and
+  `POWDB_QUERY_TIMEOUT`; `POWDB_TX_MAX_LIFETIME_MS=0` keeps its documented
+  meaning of disabling the bound. A refusal also names the unit the setting is
+  actually in (connections, bytes, candidate pairs, pages) rather than calling
+  every one of them a byte count.
+
+- **The user store is re-read while the server runs.** `auth.json` was read once
+  at startup, so a password rotated with `powdb-cli passwd` did not take effect
+  and a deleted user could keep logging in until a restart. The server stamps
+  the file by mtime and length and re-reads it when it changes, and SIGHUP
+  forces a reload. The check is a stat on a path that is already rate limited.
+
+- **A begin-only explicit transaction no longer blocks readers.** `begin` took
+  the write-admission gate outright, so a connection that had opened a
+  transaction and not yet written made every other connection's read wait for
+  it, up to `POWDB_TX_WAIT_TIMEOUT_MS`. Reads are now admitted from a second
+  pool that only readers take from, tied to the transaction's own hold so it
+  cannot leave the door open for the next holder of the gate. The transaction's
+  first write closes that pool and drains it, which waits for the reads already
+  running and for nothing else. A read during a transaction that has written
+  still waits, and a second `begin` and an autocommit write still wait as
+  before.
+
+- **Engine error text reaches remote clients verbatim, classified by type.**
+  Egress rendering was a prefix allowlist over the message text, so any
+  diagnostic whose wording did not start with one of about 35 recognized
+  phrases arrived as the bare string `query execution error`: a mistyped column,
+  `commit` outside a transaction, a malformed `uuid` or `bytes` literal, a
+  missing required column, an unknown insert field, a negative limit, an upsert
+  on a non-unique key, a non-scalar path-index key, a refresh of an unknown
+  view. The same statement was diagnosable embedded and undiagnosable over the
+  wire. The decision now runs exhaustively on the `QueryError` variant, so
+  rewording a diagnostic can never silently mask it. Only messages that can
+  carry internal state are still redacted: a plain I/O failure, corruption
+  detail, and the read-only retry sentinel. Two classes moved with it:
+  `InvalidIdentifier` reaches clients as class 2 and `RowTooLarge` /
+  `ValueTooLarge` as class 4, where all three were class 0 (a server fault with
+  nothing to fix on your side) for what is the caller's own data. A frame-level
+  refusal now answers with an `Error` frame carrying its class rather than only
+  being logged before the close.
+
+- **The in-flight read-ahead byte budget defers a frame rather than buffering
+  it.** The read-ahead arm passed the 64 MiB wire limit as its frame bound, so
+  the 1 MiB budget only decided whether a read may start: a peer that opened a
+  statement and then announced a 64 MiB frame buffered all 64 MiB of it on that
+  connection, per connection, and `Vec::drain` never returns the capacity. A
+  frame that does not fit the remaining budget is now neither refused nor lost:
+  its header stays buffered, read-ahead pauses for the rest of the statement
+  exactly as it does when the queue is full, and the main loop reads the whole
+  frame at the full wire limit as soon as the statement finishes.
+
+- **A served sync pull chunk stays inside the wire envelope every released peer
+  decodes.** Chunking was changed this cycle so a chunk runs on to the commit or
+  rollback that closes the transaction the cut would otherwise land inside,
+  because a chunk cut inside a transaction is not applyable and wedged the
+  replica for good. The chunk is capped at 4096 units: every decoder through
+  v0.27.0 refuses a `SYNC_PULL_RESULT` declaring more than that, and a v0.27.0
+  replica pulling a larger chunk got a frame-level decode failure that drops the
+  socket with no diagnostic and repeats on every retry. A transaction that does
+  not fit is answered with the rebootstrap status the byte budget already
+  produces, naming it, rather than a bare error the replica retries forever. A
+  chunk still runs past the replica's `maxUnits` hint up to that cap, so the
+  1000-row transaction the hint-not-a-limit rule was written for is still served
+  whole. The server's own decoder ceiling is raised from 4096 to 262144 units to
+  match `clients/ts/src/protocol.ts`, so what a v0.28 peer accepts and what a
+  v0.28 primary sends are now two separate numbers: raising what is sent needs a
+  negotiated wire feature.
+
+- **`powdb-cli --exec` fails a script that ends inside an open transaction.** It
+  exited 0 while every write the script made was discarded. It now exits 1 with
+  `transaction still open at end of script; rolled back`. A script that commits
+  or rolls back explicitly is unaffected.
+
+- **`sync-status` reports `awaitArchive` as a momentary state, not an error.** A
+  replica waiting for the primary to archive has not failed, and printing it
+  under `lastSyncError` read as one. A `rebootstrap` still reports its error.
+
+- **A number binds as `int` when it is integral and inside the signed 64-bit
+  range**, in `@zvndev/powdb-client` as it already did in the embedded addon.
+  The wire client tagged a number `int` only when `Number.isSafeInteger` held.
+  Every double in `[2^53, 2^63)` is an exact integer, so the `int` tag is
+  lossless there, and the float tag cost the index: measured against a running
+  server, `filter .id = $1` with `2 ** 60` on a `required unique id: int`
+  planned `Filter(SeqScan)` over the wire and `IndexScan` in process.
+  Snowflake-shaped ids sit squarely in that range. `2 ** 63` and above still
+  bind float.
+
+- **`@zvndev/powdb-client` gains a `maxInFlight` connect option** (default 64)
+  and the `invalid_argument` error code. `queryTyped`'s generic is no longer
+  constrained to `TypedRow`: the bound rejected the `interface` most callers
+  declare a row type with, while claiming a check the method never performed.
+
+- **`@zvndev/powdb-sync` raises `DEFAULT_MAX_PULL_UNITS` from 512 to 4096**, and
+  `LocalApplyRequest` extends the new `NormalizedSyncIdentity` so
+  `primaryGeneration` is `bigint`, matching what a replica already passes.
+
+- **`@zvndev/powdb-embedded` is entered through `loader.js`** rather than the
+  generated `index.js`, and exports `SUPPORTED_PLATFORMS` and
+  `ERROR_CLASS_BY_CODE`. Anything that bypasses the loader loses the error
+  classification.
+
+- **`@zvndev/powdb-sync` builds on the same TypeScript and `@types/node` majors
+  as `@zvndev/powdb-client`**; both declare `sideEffects: false`.
+
+- **The published `powdb-query` crate no longer ships the executor's unit
+  tests**, about 300 KB of `#[cfg(test)]` source in every download.
+
+- Internal, CI and release engineering. **Dependabot watches every dependency
+  manifest**: it watched 3 of the 7, and `clients/sync`, `bindings/node` and
+  `crates/query/fuzz` were unwatched while the Dockerfile's base images were
+  pinned with nothing to move them; a new check fails if that drifts again in
+  either direction. **Third-party tooling in CI is pinned and
+  checksum-verified**: gitleaks and cargo-semver-checks are verified with
+  `sha256sum -c` (the semver-checks fetch no longer pipes `curl` into `tar`,
+  which cannot verify anything), cargo-fuzz is pinned, and `cargo audit` runs
+  from a pinned, cached binary rather than a source build of a floating
+  version, with the audit suppression living only in `.cargo/audit.toml`.
+  **The miri job is sharded five ways and its coverage is asserted**: it was one
+  job filtering on a module prefix, which is how it once spent months filtering
+  on a module that did not exist, and a new check runs the real test list
+  through the shard map and fails if any in-scope test is claimed by no shard or
+  by more than one. **The Docker builder image is digest-pinned**, like the
+  runtime image already was, and **the Docker healthcheck no longer logs an
+  error every 30 seconds** (the probe read the PONG frame's header and closed,
+  leaving bytes in the receive queue, which makes the kernel send RST instead of
+  FIN; it now drains the frame and closes cleanly). **Publish workflows read
+  their dispatch inputs through environment variables** rather than
+  interpolating them into shell text. **Concurrency groups only cancel in-flight
+  runs on pull requests**, so a push to `main` or a tag build can no longer be
+  cancelled by the next push. **The published npm packages no longer carry an
+  empty `## Unreleased` heading** in their bundled CHANGELOGs; a section with
+  content in it is left alone.
+
+### Fixed
+
+- **A repeated query no longer answers a different question.** The plan cache
+  collected a query's literals in source order and re-bound them in plan-walk
+  order, and the two disagree wherever the planner reorders clauses. The
+  everyday case was a projection above a slice: `T { x: .n + 1 } limit 5`
+  computed `.n + 1` on its first execution and `.n + 5` on every one after, and
+  `T filter ... { x: .n + 1 } limit 5 offset 0` silently started skipping five
+  rows. A projection whose literal cannot be ordered against a sort key's is no
+  longer cached at all.
+
+- **A comparison against a `datetime`, `uuid` or `bytes` column coerces its
+  literal.** `.u = "<the exact uuid>"` was false on every row, `!=` true on
+  every row, `update` and `delete` by such a key touched nothing, and the index
+  was never probed. The literal is now coerced once, where the plan enters
+  execution, so the scan, the compiled predicate, the index probe and the
+  mutation's discovery scan all read the same value; a literal that cannot be
+  coerced is the typed error `insert` already gives.
+
+- **`union` de-duplicates both branches.** `A union B` kept duplicate rows that
+  came from the left branch.
+
+- **An ordered comparison across two types is false.** `.j->v > 99.5` returned
+  the rows whose value was the string `"deep"` and the bool `true`, because the
+  fallback ordering ranked the two values by type.
+
+- **`x in (...)` answers what `x = ...` answers.** The list compared with strict
+  variant equality while `=` compares numerically, so `.n in (28.0)` and
+  `.n = 28.0` disagreed.
+
+- **A float literal can be written with an exponent.** `1e9`, `1.5E-3` and
+  `2e+10` were lexed as an integer followed by an identifier, so a query using
+  scientific notation failed with a confusing parse error. A literal whose value
+  is not finite is refused rather than becoming `inf`.
+
+- **A materialized view over an empty source is typed from its source.** Every
+  column came back `str`, so the first refresh that produced a real row failed
+  with a type error the user could not act on.
+
+- **Refreshing a materialized view reclaims the space the last one used.** A
+  view's backing table grew on every refresh, because deleted rows never
+  returned their bytes.
+
+- **A materialized view tracks its source through nested projections and link
+  traversals.** Those dependencies were not recorded, so writes to the source
+  left the view clean and it served stale rows.
+
+- **A `views.bin` that cannot be decoded refuses the open.** It was read as "no
+  materialized views", so every `materialize` ever run vanished and the next one
+  overwrote the file that still held the definitions.
+
+- **A query that reads a table that does not exist says which table.**
+  `count(Missing)` reported the storage layer's generic error and a join against
+  a missing table reported a missing *column*; every read shape now reports the
+  same typed "table not found" naming the table. It carries
+  `StorageErrorKind::TableNotFound`, so the same mistake no longer changes wire
+  error class depending on which layer noticed it (class 2 either way).
+
+- **Calling a function PowQL does not have says so.** `T { x: foo(.id) }`
+  reported `column 'foo' not found` and `T filter foo(.id) = 1` reported an
+  unexpected `(`. Both now name the function, with a suggestion when the name is
+  close to a real one.
+
+- **A link traversal outside a projection names the limitation.**
+  `Post as p filter p.author.name = "ann"` reported an unexpected trailing
+  token; it now says a link path is only usable in a projection.
+
+- **A prepared write inside a transaction no longer fsyncs at every statement.**
+  The four prepared-statement commit points called the autocommit commit
+  unconditionally, so a statement inside `begin` / `commit` flushed and fsynced
+  the WAL at every statement boundary where the identical rows written as PowQL
+  text did not. 5000 single-row inserts through a prepared statement inside one
+  transaction cost 5000 fsyncs where the text path cost 78. The two paths now
+  cost the same.
+
+- **`PRIMARY KEY` on a column works in SQL `CREATE TABLE`**, mapping to
+  `required unique`; a table-level `PRIMARY KEY (col)` now names the spelling
+  that works instead of a message about table constraints.
+
+- **SQL `CREATE TABLE` accepts the `JSON` (and `JSONB`) column type.** The JSON
+  examples in `docs/SQL.md` were unreachable through SQL DDL.
+
+- **Two processes could open one data directory for writing.** The writer
+  directory lock published its PID file first and took the kernel `flock`
+  afterwards, over whatever inode the `LOCK` path had come to name, and then
+  discarded the answer. Two servers started against the same `--data-dir` (a
+  systemd restart overlapping the old process, two containers on one bind mount)
+  could both be admitted, both opening the same heap and the same WAL. The lock
+  is taken first and is what admits a writer: the PID is written in place
+  through the locked handle, so it never names a process that does not hold the
+  directory, and a lock that is already held is a refusal rather than a shrug. A
+  lock on an inode the path no longer names is not accepted, so a previous
+  holder's cleanup cannot hand the directory to two acquirers at once. A `LOCK`
+  naming a dead or ghost PID whose lock is free is still reclaimed, so the
+  container and PID-namespace case the lock file was extended for still works.
+  On a filesystem with no advisory locking at all (some network mounts) PowDB
+  logs a warning and falls back to the PID heuristic rather than refusing to
+  open.
+
+- **`insert` could spin forever on a corrupt heap page, wedging the server.**
+  `Page::compact` refuses a page whose slot directory points outside it, and the
+  free-space search re-offered the page on the strength of the dead space it
+  could never reclaim. One insert into such a table looped inside the engine
+  write lock and blocked every other reader and writer until the process was
+  restarted, whereupon it happened again. A page that cannot be compacted now
+  leaves the free list: the rows it holds stay readable, and it is never offered
+  for new ones.
+
+- **A statement could report a durable write as failed.** The automatic
+  checkpoint that runs after a commit is housekeeping, but its failure was
+  returned through the commit's own result. An I/O failure there (a filesystem
+  that has just filled is the obvious one) told the client the write had not
+  happened when it had, and a retry on a table with no unique constraint stored
+  the row twice. The checkpoint failure is now logged, not returned; the commit
+  is durable before it runs.
+
+- **The automatic checkpoint could truncate a WAL somebody was archiving.** It
+  skipped only when PowDB's own sync was enabled, but `Engine::new_with_wal_archive`
+  installs an arbitrary archive hook, and such a caller has no `.powdb-sync`
+  directory. After enough writes the next commit truncated `wal.log` without
+  running the hook, losing every record since the last explicit checkpoint,
+  silently. A catalog opened with an archive hook no longer runs the automatic
+  checkpoint at all.
+
+- **`insert` cost no longer grows with the size of the heap.** The free-space
+  search kept one flat list of every page with 64 bytes free and walked it from
+  the front, installing each candidate until one happened to fit. For a 1 KB row
+  a page holds three rows and keeps about 990 bytes free, which is over the
+  threshold and under the row size, so every page in the heap stayed on that
+  list and every candidate was a guaranteed miss: placing one row cost one page
+  install per page in the heap. A size-segregated in-memory summary (free bytes
+  per page, 64-byte buckets, lazy deletion of stale entries) now looks only in a
+  bucket guaranteed to fit. Loading 40,000 rows of 1 KB went from 45.2 s to
+  68.7 ms, and 100 inserts into that heap from 233 ms to 147 us; at 200,000 rows
+  the same 100 inserts cost 138 us. No on-disk format change.
+
+- **Deleted space is allocatable again.** `Page::delete` only wrote a tombstone,
+  so a table that was emptied and refilled grew by the full amount a second
+  time. `Page::compact` slides live rows to the front of the data area,
+  preserving slot indices so every `RowId` stays valid, and the free-space
+  summary counts dead bytes as reclaimable so the insert path compacts a page
+  just before reusing it.
+
+- **A page written before checksums shipped is stamped on open.** Such a page
+  carried no CRC and was never rewritten, so bytes that rotted after the open
+  scan reached a decoder unchecked, and `row_body`'s `expect` on the row format
+  version aborted the process under `panic = "abort"`. `row_body` is now
+  infallible (the `PROW` prefix is fixed width whatever the version claims),
+  `HeapFile::get` validates the row format of what it reads off disk, and the
+  open scan stamps any page it finds without a CRC on a writable handle, so a
+  live database never keeps a page outside the checksum.
+
+- **The WAL is bounded during a run.** It was truncated only by an explicit
+  checkpoint, which in practice meant only on `Drop`, so a process that stayed
+  up through a long write workload carried every record it had ever written and
+  replayed all of it after a crash. A finished statement now checkpoints once
+  the durable log passes `--wal-checkpoint-bytes` (64 MiB by default). An open
+  explicit transaction, and a directory publishing retained sync history, are
+  skipped rather than turned into errors, since an insert must not fail because
+  the log crossed a size.
+
+- **WAL replay no longer drops records in silence.** A `DdlCreateTable` replay
+  that failed was swallowed and every later `Insert` for that table was dropped;
+  it now propagates, naming the table. Records that do not decode, or that name
+  a table this catalog does not have, are counted, the first one is warned with
+  its index and its reason, and the count joins the replay summary line.
+  `rebuild_indexes_from_heap` skipped a row whose overflow chain would not
+  reassemble, so crash recovery rebuilt a column index that was silently missing
+  it. DDL replay discarded the result of the row rewrite and of the page
+  stamping, so a failed migration came back as a half-migrated table that read
+  as success and panicked on the next projection. All of them propagate now.
+
+- **WAL replay refuses a page id the log could not have produced.** Replay
+  handed a record's `page_id` straight to the insert and overflow-write paths,
+  which grow the heap one page at a time up to it, so a crafted or corrupt page
+  id meant a hang and a full disk. Replay now refuses any page id past what the
+  log could have grown the heap to. The nightly fuzz artifact of 2026-08-30 is
+  checked in as a seed and refuses in 9.5 ms instead of running forever.
+
+- **Backups no longer lose materialized views or the user store.** A full or
+  incremental backup enumerated `catalog.bin`, the catalog LSN sidecar, every
+  heap and every index, and stopped there. Two durable files live beside them
+  and were never copied: `views.bin`, the materialized-view registry, and
+  `auth.json`, the user store. A restored directory therefore lost every view
+  definition (`refresh V` answered "not found", and reads of `V` served whatever
+  rows the backing heap happened to hold) and lost every user, **so a server
+  started on the restore accepted unauthenticated connections**. Both are now in
+  the manifest set, in the restore name allowlist, and on the incremental path,
+  and both are optional (copied when present). The durable file names a data
+  directory holds are now one list in `powdb_storage::data_dir`, which the
+  catalog, the view registry and the directory lock read from, so `powdb-backup`
+  no longer maintains a second copy by hand. A new test walks a data directory
+  that exercises every durable-file kind and fails on anything the manifest set
+  does not claim.
+
+- **A committed transaction larger than the sync pull window can be pulled.**
+  The chunk was cut at `maxUnits`, the cut landed inside the transaction, the
+  primary refused its own chunk, and every retry cut in the same place: the
+  replica was wedged for good while `status` reported `repairAction: "pull"`
+  with `lastSyncError: null`. Both sides capped `maxUnits` at 4096 and the JS
+  client defaulted to 512, so a 1000-row transaction already wedged it.
+  `maxUnits` is a hint now: the chunk runs on to the commit or rollback that
+  closes the transaction it is standing in, bounded by the byte budget and the
+  4096-unit chunk cap. The one case that genuinely cannot be served, a
+  transaction too large for either bound, answers with a rebootstrap status
+  naming it rather than a bare error the replica would retry forever. Ack ranges
+  are bounded separately.
+
+- **A live primary archives committed history on demand.** Retained segments
+  were written only by a checkpoint, and the only checkpoint a running primary
+  performed was on graceful shutdown, so every write on a live primary sat
+  unarchived and a replica polling it was told `awaitArchive` forever.
+  `sync-status` and `sync-pull` archive pending history when a replica asks, and
+  only when something is unarchived: the archive's own high-water mark, read
+  from segment file names before any lock is taken, gates it. Before that gate
+  the demand archive ran a full checkpoint on every frame, under the engine
+  write lock and with every transaction-gate permit held, so a replica polling
+  once a second stalled all client traffic once a second against a primary with
+  nothing new to archive. Measured on a 2000-row database over 20 idle status
+  polls, the worst wait seen by a thread contending for the engine write lock
+  fell from 5986 us to 98 us. Archiving is best effort: a checkpoint refuses
+  while a transaction is open, so the archive stops at the last commit.
+
+- **`sync-status` reports `rebootstrap` when the tail holds unapplyable DDL**,
+  with a reason naming it, instead of leaving the replica to discover it one
+  failed pull at a time.
+
+- **`@zvndev/powdb-client`: a bad parameter no longer desynchronizes the
+  connection.** `2 ** 63`, `1e19`, `1e300` and `Number.MAX_VALUE` were tagged as
+  ints and threw a raw Node `RangeError` out of `writeBigInt64LE` after the
+  pending entry had been queued, leaving a FIFO slot waiting for a reply the
+  server was never asked for: the next query hung and later ones took
+  `ECONNRESET`. Encoding now happens before anything is queued, an integral
+  double outside the safe-integer range binds as described under Changed, and an
+  out-of-range `bigint` or a non-finite number is refused synchronously as
+  `invalid_argument`.
+
+- **`@zvndev/powdb-client`: a server-initiated `Error` frame keeps its text and
+  class.** An idle timeout, a reaped transaction or "server shutting down"
+  arrived as `protocol_error: received unexpected frame from server`, throwing
+  away what the server said. Raw socket errors are wrapped as `PowDBError`
+  `closed` with the Node error as `cause`.
+
+- **`@zvndev/powdb-client`: an over-cap result no longer poisons the
+  connection.** A result past `MAX_RESULT_CELLS` (2,000,000) closed the client
+  for every later call. It is the one decode failure that leaves the byte stream
+  intact, so the frame is skipped, only the query that asked for it fails (with
+  `size_exceeded`), and the connection stays up.
+
+- **`@zvndev/powdb-client`: a burst no longer dies mid-flight.** With no
+  in-flight cap, 200 concurrent queries answered 22 and then took `ECONNRESET`
+  against the server's frame read-ahead budget. Requests past the window wait in
+  a local FIFO and go out as replies come back.
+
+- **`@zvndev/powdb-client`: the in-flight window bounds bytes as well as
+  frames.** A server's read-ahead budget is 128 frames *and* 1 MiB, and the byte
+  cap is the tighter one for anything but small statements: 64 frames of 20 KiB
+  of query text is 1.28 MiB of read-ahead while the frame count never approaches
+  128. Against a pre-0.28.0 server, which cancelled the running query and closed
+  the connection with no `Error` frame, that was the exact `ECONNRESET` the
+  window was added to prevent. The pump now also stops at `MAX_IN_FLIGHT_BYTES`
+  (1 MiB, the server's own cap), and always writes the head frame on an empty
+  window so one oversized statement cannot deadlock.
+
+- **`@zvndev/powdb-client`: `execScript` dispatch is bounded by the in-flight
+  window.** `send` stopped writing directly when the window landed: it queues the
+  encoded frame and the pump writes up to `maxInFlight` of them. The dispatch
+  loop still yielded only on socket backpressure, which the window makes
+  unreachable, so it never yielded at all: its fail-fast and abort guards could
+  not fire (a 400-statement script dispatched all 400 after statement 6 failed),
+  and every frame past the window accumulated in the client's heap (roughly
+  50 MB for a 10,000-statement script of 5 KB inserts). Dispatch now waits for
+  the reply that frees each statement's slot. The window still slides, so the
+  pipeline stays full and throughput is unchanged.
+
+- **`@zvndev/powdb-client`: `Pool` evicts dead connections.** It handed out idle
+  clients whose socket had already closed, costing one failed `withClient` per
+  idle client after a server restart. The acquire timeout is a `PowDBError`
+  coded `timeout` now, not a bare `Error`.
+
+- **`@zvndev/powdb-client`: a reserved word can be used as an identifier.**
+  `escapeIdent("select")` returned a bare keyword the engine refused, and it
+  refused the backticked form too, so no spelling of a reserved table name
+  worked; it now backtick-quotes a reserved word. `escapeSqlIdent`, twelve lines
+  below it, kept returning the bare name, so there was no injection-safe
+  spelling of a reserved-word table left in SQL either: it now returns the
+  validated name double-quoted. The SQL frontend has read `"..."` as an
+  identifier since 0.23.0 and does no case folding, so this is safe for every
+  name and needs no second keyword list. A column *type* is a keyword, not an
+  identifier, and must not be passed through it. `escapeLiteral` and
+  `escapeSqlLiteral` range-check bigints instead of emitting an integer literal
+  above `i64::MAX`.
+
+- **`@zvndev/powdb-client`: every abort is a `PowDBError` coded `aborted`,**
+  with the abort reason on `.cause`. `ctrl.abort(new Error(...))` used to reject
+  with the bare `Error`, so `err.code === "aborted"` did not hold for a custom
+  reason.
+
+- **`@zvndev/powdb-embedded`: engine failures carry the wire error class.**
+  Every one reached JavaScript as a flat `query_failed` with no class, so an
+  embedded caller could not tell a unique-constraint violation from a parse
+  error without matching on message text, while a networked caller could read
+  the class for the identical failure. Six codes were added (`parse_error`,
+  `timeout`, `size_exceeded`, `readonly_refused`, `constraint_violation`,
+  `cancelled`) and every error now carries `errorClass`. `Database.open` and its
+  three sibling factories carry it too: the loader wrapped only writable
+  function properties, and napi defines `#[napi(factory)]` statics as
+  non-writable, so the four ways to obtain a handle were the one surface with no
+  classification while the shipped `.d.ts` promised it everywhere. The exported
+  class is now a subclass owning classifying statics, with `Symbol.hasInstance`
+  kept pointing at the native class so `instanceof` is unchanged.
+
+- **`@zvndev/powdb-embedded`: rejected arguments say what is wrong.**
+  `Database.open("")` and `Database.open` on a regular file surfaced the raw OS
+  error; `openWithMemoryLimit(dir, NaN)` opened with a silently coerced
+  zero-byte budget; an `undefined` parameter bound a PowQL `null`. All are
+  `invalid_argument` now. Errors from generated argument coercion, which carried
+  napi's own status names, are reported the same way, on every entry point.
+
+- **`@zvndev/powdb-embedded`: the unsupported-platform message is honest.** It
+  blamed a known npm bug with optional dependencies, which this package does not
+  ship, sending readers to reinstall forever. It names the platforms that have
+  prebuilt binaries and carries the code `unsupported_platform`.
+
+- **`@zvndev/powdb-sync`: the default pull byte budget matches the primary's
+  ceiling.** `maxPullUnits` was raised to the server's 4096 while `maxPullBytes`
+  stayed at 4 MiB against a `MAX_SYNC_PULL_BYTES` of 16 MiB. The byte budget is
+  the one that cuts a chunk, and a chunk cut inside a transaction is not
+  applyable, so any transaction between 4 and 16 MiB (about 1,000 rows of 5 KB)
+  made the primary answer `rebootstrap` on every pull, for good, and the replica
+  re-wedged on the next transaction of that size after each bootstrap. Both
+  budgets are also range-checked against the primary's ceilings at construction,
+  which previously rejected only zero and left an over-large `maxPullBytes` to
+  fail server-side on every pull.
+
+- **`@zvndev/powdb-sync`: every entry point reports a transport failure as
+  `remote_unavailable`.** `status()` and `syncNow()` let the underlying client's
+  own code escape, so a caller branching on `PowDBSyncErrorCode` saw codes
+  outside that union.
+
+- **The README samples in all three JS packages type-check.** Each shipped one a
+  reader could not paste into a strict TypeScript project: `queryTyped<User>`
+  with an `interface` (TS2344), `.rows` off an un-narrowed `NativeQueryResult`
+  (TS2339), and a sync adapter body whose `primaryGeneration` was
+  `bigint | number` against the addon's `bigint` (TS2345). Two of the three were
+  the types being wrong.
+
+- **`powdb-cli` says which statement failed.** A multi-statement `--exec` or
+  script reported the error with nothing identifying the statement that raised
+  it; it now names the position and quotes the text. The REPL accepts one
+  trailing `;`, `.schema`'s usage line matches `.help`, and the REPL banner says
+  "Type SQL queries" when `--sql` put it in SQL mode.
+
+- **`powdb-server` and `powdb-cli` report a TLS certificate problem instead of a
+  bare handshake failure.** The CLI gives `CaUsedAsEndEntity` its own hint, and
+  the generic hint no longer suggests a flag that was already passed.
+
+- **A health probe's disconnect no longer logs as a warning.** A peer that
+  closes before `CONNECT` logs `peer disconnected before CONNECT` at DEBUG and a
+  mid-session peer that vanishes logs `peer disconnected` at DEBUG; anything
+  else is still WARN or ERROR.
+
+- **The nightly toolchain pin is current again**, and the freshness check that is
+  supposed to catch it now sees every shape a pin takes. It scanned only one of
+  them, so the `FUZZ_TOOLCHAIN` env value and the `cargo +nightly-...`
+  invocations aged silently past the limit and turned the nightly fuzz run red.
+
+- **`publish.yml`'s semver gate could not fail.** `cargo-semver-checks`
+  classifies a 0.x MINOR bump as a major change and runs zero lints, so on every
+  ordinary release the gate passed having checked nothing. It now refuses a run
+  that examined no crate or ran no check on a patch bump, and reports how many
+  crates were linted. Separately, a 0.x minor bump could be published with no
+  semver verdict at all: `cargo-semver-checks` skips every lint on a 0.x minor
+  (correctly, a 0.x minor is allowed to break), so the advisory pass is that
+  release shape's whole verdict, and it now refuses `cargo-semver-checks`
+  failing to run at all. Findings still never block.
+
+- **The "advisory, never blocks" semver step in `publish.yml` blocked**, and
+  would have failed the next crates.io publish. An inline `run:` block runs under
+  GitHub's default `bash -e {0}`, and `set -uo pipefail` does not clear the
+  inherited `-e`, so the first non-zero exit from `cargo semver-checks
+  --release-type minor` killed the shell before the log, the job summary and the
+  trailing `exit 0`. The `semver` job went red and `publish` (`needs: semver`)
+  never started. Forcing `--release-type minor` turns the major lints on, and
+  this release removes public items in published crates, so it would have fired.
+  The body now lives in `scripts/ci/semver-advisory.sh` with an explicit
+  `set +e` and a `--selftest`.
+
+- **`ci-success` could pass with an empty `needs:` list.** It is the single
+  required status check on `main`, and its verdict was `for result in $RESULTS`
+  over `join(needs.*.result, ' ')`, which iterates zero times on an empty list
+  and prints success. The job that would have caught it blocked nothing except
+  through `ci-success` itself. `ci-success` now runs the completeness check
+  directly, against `ci.yml` on disk rather than against the list it is
+  auditing. `check-ci-success-needs.sh` could also not see a job whose key line
+  carried a trailing comment (`  my-new-gate: # TODO` is valid YAML and was
+  invisible to the parser, so it was compared against neither `ci-success.needs`
+  nor CONTRIBUTING.md while the script reported every job covered); any
+  unrecognised job-key shape is now an error rather than a silent drop.
+
+- **`internal-content-guard` reported "denylist checked" when `git grep` had
+  errored and inspected nothing.** `|| true` conflated git-grep exit 1 (no
+  match) with exit 2 and above (an uncompilable PCRE in the denylist secret, a
+  git build without `-P`). The `git ls-files` half printed "paths clean" the same
+  way. Both halves now read the producing command's status directly, and the
+  guard also skipped silently when its pattern file was missing.
+
+- **Three of the five pattern scans in `check-version-consistency.sh` had no
+  "found nothing" floor.** Pinning the deploy compose file to a digest (which the
+  deploy README recommends), regenerating `site/` without the leading `v`, or
+  documenting the npm dependency as `^0.27.0` each silently emptied a scan and
+  the job still printed its ALL-PASS line. The script also now checks the
+  AGENTS.md release stamp: the "Available in released PowDB (vX.Y.Z)" line
+  drifted three minors behind and nothing noticed, and it is the line agents read
+  to decide which features exist.
+
+- **`release.yml`'s npm publish skipped itself when a registry probe failed for
+  any reason**, including a 500 or a network error, so an outage looked like a
+  successful release.
+
+- **`publish-node-addon.yml` verified a tag that it had not necessarily built.**
+  It resolved the version from the tag but built from whatever the checkout gave
+  it; it now asserts the tag resolves to the commit being built. It also asserts
+  the addon's lockfile is up to date and runs the package's tests on each
+  platform runner it publishes from.
+
+- **`release-channel.sh` accepted leading zeros** (`0.27.00`, `01.2.3`) as valid
+  SemVer, which would have published a release under a version string crates.io
+  and npm reject.
+
+- **`fuzz.yml` installed an unpinned `cargo-fuzz`** after the commit that pinned
+  the third-party tools the gates run on. It now matches ci.yml's
+  `--version 0.13.2 --locked`.
+
+- **The ghcr smoke leg checked two of the three tags its own comment demanded.**
+  The floating channel pointer (`latest` for a final, `rc` for a candidate) was
+  never pulled, so a release that moved it to the wrong digest, or never moved
+  it, passed the smoke. All three tags are now pulled and all three have their
+  `org.opencontainers.image.version` label asserted.
+
+- **Two gates that could not fail now can.** The format-version gate reads
+  `docs/FORMAT.md` instead of comparing the constants to a second copy of
+  themselves in the same file, so a bumped version with a stale table fails. The
+  data-directory mode gate asserts the warning it is named for instead of the
+  mode the code already produced without it.
+
+- **Six CLI and server tests stopped skipping themselves.** They printed one line
+  to stderr and returned when `powdb-server` was not next to the CLI binary, so
+  the only coverage the remote client path has could vanish without changing a
+  test result. A missing binary is now a hard failure naming the command that
+  builds it.
+
+### Security
+
+- **The auth rate limiter is bounded in key size and entry count.** A failed
+  `CONNECT` used to retain the whole username the peer sent as a map key for a
+  60-second window, and nothing under the 4 KB pre-auth frame limit bounded that
+  name. A key now retains at most 64 bytes of username, the table holds at most
+  4096 buckets, and it evicts deterministically at capacity (lowest failure
+  count, then oldest window, then key order), so a spray of throwaway source
+  addresses cannot clear a peer that is close to its bound. The expiry sweep runs
+  at most once a second instead of on every handshake, so a legitimate `CONNECT`
+  no longer pays an O(n) scan of a table an attacker inflated.
+
+- **A shared-password deployment counts auth failures against the peer, not the
+  username.** A server with no user store never reads the username while
+  authenticating, so counting failures against it let one address make 50
+  password guesses a minute instead of 5. It also made an unauthenticated peer
+  the author of the limiter's keys for exactly the deployment shape that has no
+  user store. Relatedly, a Unix-socket peer has no `SocketAddr` and was exempt
+  from rate limiting entirely; all socket peers now share one bucket.
+
+- **A wrong username no longer locks another user out.** Failures are counted per
+  (peer, username) at 5 per 60 seconds and per peer at 50 per 60 seconds, so a
+  username sweep from one address is still stopped without letting it lock a real
+  user out of their own account from behind a shared NAT.
+
+- **The Unix-domain socket is never connectable at the process umask.** `bind`
+  created the node at 0755 or 0775 and the `chmod` to 0660 ran afterwards, and a
+  `chmod` on a socket does not close connections already accepted on it. The
+  socket is now bound at a private staging name in the same directory
+  (`.<name>.staging-<pid>`), restricted there, and renamed into place, so the
+  published path only ever names an already-restricted socket and is never
+  briefly absent either.
+
+- **A data directory the owner cannot open is refused rather than widened.** A
+  0555, 0500 or 0000 data directory was silently `chmod`ded to 0700 and written
+  into. The change is now logged with both the old and the new mode, and 0000 is
+  refused.
+
+- **`drop link` is classified as schema definition under RBAC**, alongside
+  `create link`, so a `readonly` principal is refused with the message the rest
+  of DDL gives. No outcome changed for any builtin role.
+
 ## [0.27.0] - 2026-08-26
 
 ### Added
