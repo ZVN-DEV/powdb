@@ -26,10 +26,23 @@
 #      wrote contains what that case should contain. Reintroducing the `-e`
 #      bug makes case 1 fail, because the summary comes back empty.
 #
-# The step exists to produce the breaking-change list. A run that produced no
-# list is therefore reported as a degraded advisory pass (a `::warning::` and a
-# line in the summary saying so) rather than passing silently. It still exits
-# 0: an advisory step that can turn a release red is the bug above.
+# The step exists to produce the breaking-change list, and on the release shape
+# this repo actually cuts it is the ONLY thing that produces one. A 0.x MINOR
+# bump (0.27.0 -> 0.28.0, every release since 0.19) is classified by
+# cargo-semver-checks as a major release, so it skips every lint and
+# semver-gate.sh exits 0 having compared nothing. That is correct: a 0.x minor
+# is allowed to break. It also means that if this step produces nothing, the
+# release got no semver verdict at all from anywhere.
+#
+# So the one thing that does block here is the tool failing to RUN. Findings
+# never block, because findings are legal on a 0.x minor and blocking on them
+# is the bug above:
+#
+#   exit 0                     clean; summarised as "no breaking changes"
+#   exit 1 with a report       the normal 0.x minor; the list goes to the summary
+#   exit 1 with no report      the report format probably moved; warn, do not block
+#   exit >1                    the tool did not run; fail, because nothing else
+#                              in this job compared anything either
 #
 # Usage:
 #   semver-advisory.sh              run the forced-minor pass over the workspace
@@ -87,13 +100,28 @@ run_advisory() {
     echo '```'
   } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
-  if [ -z "${found}" ] && [ "${status}" -ne 0 ]; then
-    echo "::warning::semver-advisory: the forced-minor pass exited ${status} and produced no breaking-change list." \
-         "This step does not block the release, but the CHANGELOG has nothing from it." >&2
-  fi
-
   rm -f "${log}"
-  return 0
+
+  if [ -n "${found}" ] || [ "${status}" -eq 0 ]; then
+    return 0
+  fi
+  if [ "${status}" -eq 1 ]; then
+    # 1 is cargo-semver-checks' "there are findings" status. Reaching here with
+    # nothing parsed most likely means its report format moved, and turning a
+    # release red over a grep that stopped matching is the bug this file exists
+    # to have fixed. Say so loudly and let the release through.
+    echo "::warning::semver-advisory: the forced-minor pass exited 1 and no '--- failure' or 'Summary' line was parsed out of it." \
+         "The report format has probably changed; BREAK_PATTERN needs updating. Not blocking the release." >&2
+    return 0
+  fi
+  # Anything above 1 is the tool not running: a panic, a manifest it could not
+  # parse, a missing binary. On a 0.x minor bump semver-gate.sh lints nothing by
+  # design, so this step is the whole semver verdict, and a job that compared
+  # nothing anywhere must not report a release as checked.
+  echo "::error::semver-advisory: cargo-semver-checks exited ${status} without running." >&2
+  echo "         On a 0.x minor bump the gate skips every lint by design, so this pass is the" >&2
+  echo "         only semver verdict the release gets. There is now none." >&2
+  return 1
 }
 
 # --- selftest -------------------------------------------------------------
@@ -178,22 +206,50 @@ STUB
   }
   echo "semver-advisory: selftest case 2 OK (clean run summarised)"
 
-  # Case 3: a tool that never produced a report is reported as degraded, and
-  # still does not block.
+  # Case 3: a tool that never ran is a failure. On a 0.x minor bump
+  # semver-gate.sh lints nothing by design, so a crashed advisory pass leaves
+  # the release with no semver verdict from anywhere, and a green job would be
+  # a claim that it was checked.
   summary="${work}/summary-crashed.txt"
   : > "${summary}"
   SEMVER_CHECKS="${work}/crashed.sh" GITHUB_STEP_SUMMARY="${summary}" bash "${self}" > "${work}/out3.log" 2>&1
   status=$?
-  [ "${status}" -eq 0 ] || fail_selftest "a crashed tool made the advisory step exit ${status}"
+  [ "${status}" -ne 0 ] || {
+    sed 's/^/    /' "${work}/out3.log" >&2
+    fail_selftest "a tool that exited 101 without running left the advisory step green; the release would report as semver-checked having compared nothing"
+  }
   grep -q 'without reporting any breaking change' "${summary}" || {
     sed 's/^/    /' "${summary}" >&2
     fail_selftest "a run that produced no list did not say so in the summary; it would read as 'nothing broke'"
   }
-  grep -q '::warning::semver-advisory' "${work}/out3.log" || {
+  grep -q '::error::semver-advisory' "${work}/out3.log" || {
     sed 's/^/    /' "${work}/out3.log" >&2
-    fail_selftest "a degraded advisory pass emitted no warning annotation"
+    fail_selftest "a tool that did not run emitted no error annotation"
   }
-  echo "semver-advisory: selftest case 3 OK (degraded run announced, still exit 0)"
+  echo "semver-advisory: selftest case 3 OK (a tool that did not run fails the step)"
+
+  # Case 4: findings the grep could not parse. Exit 1 is the tool's "there are
+  # findings" status, so a pattern that stopped matching must warn, never block:
+  # turning a release red over a grep is the bug this file was extracted from.
+  cat > "${work}/reformatted.sh" <<'STUB'
+#!/bin/sh
+echo "!!! BREAKING function_missing (some future report format)"
+exit 1
+STUB
+  chmod +x "${work}/reformatted.sh"
+  summary="${work}/summary-reformatted.txt"
+  : > "${summary}"
+  SEMVER_CHECKS="${work}/reformatted.sh" GITHUB_STEP_SUMMARY="${summary}" bash "${self}" > "${work}/out4.log" 2>&1
+  status=$?
+  [ "${status}" -eq 0 ] || {
+    sed 's/^/    /' "${work}/out4.log" >&2
+    fail_selftest "an unparseable findings report exited ${status}; a grep that stopped matching must not block a release"
+  }
+  grep -q '::warning::semver-advisory' "${work}/out4.log" || {
+    sed 's/^/    /' "${work}/out4.log" >&2
+    fail_selftest "an unparseable findings report emitted no warning"
+  }
+  echo "semver-advisory: selftest case 4 OK (unparseable findings warn, do not block)"
 
   echo "semver-advisory: selftest ok"
 }
@@ -206,4 +262,3 @@ case "${1:-}" in
     exit 1
     ;;
 esac
-exit 0

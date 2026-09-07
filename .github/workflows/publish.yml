@@ -132,15 +132,22 @@ jobs:
       # shape it exists to describe. In a script the behaviour is testable, and
       # the selftest below drives it against a tool that exits 1.
       #
-      # It still ends in an explicit `exit 0` rather than
+      # It exits 0 in its own body rather than carrying
       # `continue-on-error: true`: this repo has been burned by gates that
-      # could not fail, so a step that deliberately does not gate says so in
-      # its own body, where a reader of the log sees it, instead of in a YAML
-      # key they have to go look up.
+      # could not fail, so a step that deliberately does not gate says so where
+      # a reader of the log sees it, instead of in a YAML key they have to go
+      # look up.
+      #
+      # The one thing it does refuse is cargo-semver-checks not running at all
+      # (exit > 1: a panic, an unparseable manifest, a missing binary).
+      # Findings never block, because findings are legal on a 0.x minor; but on
+      # a 0.x minor the gate above lints nothing by design, so this pass is the
+      # release's whole semver verdict, and a green job that compared nothing
+      # anywhere would be a claim that the release was checked.
       - name: Prove the advisory pass survives a failing checker
         run: bash scripts/ci/semver-advisory.sh --selftest
 
-      - name: List breaking changes for the CHANGELOG (advisory, never blocks)
+      - name: List breaking changes for the CHANGELOG (advisory, never blocks on findings)
         run: bash scripts/ci/semver-advisory.sh
 
   publish:
