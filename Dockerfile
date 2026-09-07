@@ -117,7 +117,7 @@ RUN . /cross-env \
 # 2026-07-24) so the runtime layer is reproducible and cannot be swapped under
 # us by a tag repoint. Refresh deliberately with:
 #   docker buildx imagetools inspect debian:bookworm-slim
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 # tini reaps zombies and forwards signals so SIGTERM from fly cleanly stops the server
 RUN apt-get update \
