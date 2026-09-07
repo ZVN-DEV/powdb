@@ -1,4 +1,20 @@
-//! Plan-wide validation: JSON path typing and stray-aggregate rejection.
+//! Plan-wide validation: stray-aggregate rejection, JSON path typing, column
+//! resolution and type checks, and negative slice counts.
+//!
+//! [`validate_plan`] runs all four on every execution, plan-cache hits
+//! included, because they resolve against the catalog as it is NOW: a column
+//! dropped between two executions of a cached plan must still be refused
+//! (`tests/unknown_column_errors.rs` holds that). What keeps that affordable
+//! is that the passes share one walk of the scan columns and borrow every
+//! name they resolve instead of cloning it. Each pass used to collect the scan
+//! columns for itself (three walks, plus a fourth for the join ambiguity
+//! check), cloning every column name into a fresh `String` and building hash
+//! sets of them per execution; that alone was about a quarter of a point
+//! lookup's wall time.
+
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::collections::HashMap;
 
 use crate::result::QueryError;
 use powdb_storage::catalog::Catalog;
@@ -6,6 +22,23 @@ use powdb_storage::catalog::Catalog;
 use crate::executor::eval::date_unit_micros;
 
 use super::*;
+
+/// A scan column in scope: its output name and declared type. The name is
+/// borrowed from the catalog for a plain scan and owned only for the
+/// `alias.field` shape a join produces.
+pub(super) type ScanColumn<'a> = (Cow<'a, str>, TypeId);
+
+/// Every plan-wide check, in the order they have always run, sharing a single
+/// walk of the scan columns. This is the one entry point both dispatchers
+/// call; the individual passes below are its pieces.
+pub(crate) fn validate_plan(catalog: &Catalog, plan: &PlanNode) -> Result<(), QueryError> {
+    validate_no_stray_aggregates(plan)?;
+    let mut scope = Vec::new();
+    collect_scan_columns(catalog, plan, &mut scope);
+    validate_json_path_types(plan, &scope)?;
+    validate_column_references(catalog, plan, &scope)?;
+    validate_slice_counts(plan)
+}
 
 /// Reject any aggregate `FunctionCall` that survives planning into an
 /// evaluable position (a projection field, a filter predicate, or a HAVING
@@ -87,35 +120,35 @@ fn collect_json_path_base_indices(expr: &Expr, columns: &[String], out: &mut Vec
 /// base that resolves to more than one type across joined tables, or a base
 /// that resolves to no scan column at all, is skipped. Such paths fall through
 /// to the generic evaluator, which safely yields `Empty` for a non-JSON base.
-pub(crate) fn validate_json_path_types(
-    catalog: &Catalog,
-    plan: &PlanNode,
-) -> Result<(), QueryError> {
-    let mut scope: Vec<(String, TypeId)> = Vec::new();
-    collect_scan_columns(catalog, plan, &mut scope);
-    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    collect_projected_names(plan, &mut shadowed);
-    check_plan_json_paths(plan, &scope, &shadowed)
+fn validate_json_path_types(plan: &PlanNode, scope: &[ScanColumn<'_>]) -> Result<(), QueryError> {
+    let shadowed = ShadowedNames::new(plan);
+    check_plan_json_paths(plan, scope, &shadowed)
 }
 
 /// Gather the output column names and types of every scan leaf reachable from
 /// `plan`. `SeqScan`/`IndexScan`/`RangeScan` contribute bare column names;
 /// `AliasScan` contributes `alias.field` names (the join output shape).
-fn collect_scan_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(String, TypeId)>) {
+pub(super) fn collect_scan_columns<'a>(
+    catalog: &'a Catalog,
+    plan: &PlanNode,
+    out: &mut Vec<ScanColumn<'a>>,
+) {
     match plan {
         PlanNode::SeqScan { table }
         | PlanNode::IndexScan { table, .. }
         | PlanNode::RangeScan { table, .. } => {
             if let Some(schema) = catalog.schema(table) {
+                out.reserve(schema.columns.len());
                 for c in &schema.columns {
-                    out.push((c.name.clone(), c.type_id));
+                    out.push((Cow::Borrowed(c.name.as_str()), c.type_id));
                 }
             }
         }
         PlanNode::AliasScan { table, alias } => {
             if let Some(schema) = catalog.schema(table) {
+                out.reserve(schema.columns.len());
                 for c in &schema.columns {
-                    out.push((format!("{alias}.{}", c.name), c.type_id));
+                    out.push((Cow::Owned(format!("{alias}.{}", c.name)), c.type_id));
                 }
             }
         }
@@ -139,20 +172,51 @@ fn collect_scan_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(Strin
     }
 }
 
-/// Collect the output names produced by every `Project` node, so a base name a
-/// projection could rebind to a different type is left unvalidated.
-fn collect_projected_names(plan: &PlanNode, out: &mut std::collections::HashSet<String>) {
+/// The output names of every `Project` node, so a base name a projection could
+/// rebind to a different type is left unvalidated by
+/// [`json_path_base_error`].
+///
+/// Collected on first use rather than up front: most plans carry no `->` path
+/// at all, and building the set for them on every execution was pure cost.
+struct ShadowedNames<'a> {
+    plan: &'a PlanNode,
+    names: OnceCell<Vec<Cow<'a, str>>>,
+}
+
+impl<'a> ShadowedNames<'a> {
+    fn new(plan: &'a PlanNode) -> Self {
+        Self {
+            plan,
+            names: OnceCell::new(),
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names
+            .get_or_init(|| {
+                let mut names = Vec::new();
+                collect_projected_names(self.plan, &mut names);
+                names
+            })
+            .iter()
+            .any(|shadowed| shadowed == name)
+    }
+}
+
+/// Collect the output names produced by every `Project` node; see
+/// [`ShadowedNames`].
+fn collect_projected_names<'a>(plan: &'a PlanNode, out: &mut Vec<Cow<'a, str>>) {
     if let PlanNode::Project { fields, .. } = plan {
         for f in fields {
             if let Some(a) = &f.alias {
-                out.insert(a.clone());
+                out.push(Cow::Borrowed(a.as_str()));
             } else {
                 match &f.expr {
                     Expr::Field(n) => {
-                        out.insert(n.clone());
+                        out.push(Cow::Borrowed(n.as_str()));
                     }
                     Expr::QualifiedField { qualifier, field } => {
-                        out.insert(format!("{qualifier}.{field}"));
+                        out.push(Cow::Owned(format!("{qualifier}.{field}")));
                     }
                     _ => {}
                 }
@@ -187,7 +251,7 @@ fn collect_projected_names(plan: &PlanNode, out: &mut std::collections::HashSet<
 /// A bare name falls back to the field half of a join's `alias.field` columns,
 /// mirroring the runtime resolution in [`crate::executor::eval::resolve_column_index`]
 /// so validation types the same column the evaluator will read.
-fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
+pub(super) fn resolve_scan_type(name: &str, scope: &[ScanColumn<'_>]) -> Option<TypeId> {
     let exact = resolve_scan_type_by(scope, |n| n == name);
     if exact.is_some() || name.contains('.') {
         return exact;
@@ -199,7 +263,7 @@ fn resolve_scan_type(name: &str, scope: &[(String, TypeId)]) -> Option<TypeId> {
 }
 
 fn resolve_scan_type_by(
-    scope: &[(String, TypeId)],
+    scope: &[ScanColumn<'_>],
     matches_name: impl Fn(&str) -> bool,
 ) -> Option<TypeId> {
     let mut found: Option<TypeId> = None;
@@ -219,12 +283,12 @@ fn resolve_scan_type_by(
 /// return a typed error message; otherwise `None`.
 fn json_path_base_error(
     base: &Expr,
-    scope: &[(String, TypeId)],
-    shadowed: &std::collections::HashSet<String>,
+    scope: &[ScanColumn<'_>],
+    shadowed: &ShadowedNames<'_>,
 ) -> Option<String> {
-    let name = match base {
-        Expr::Field(n) => n.clone(),
-        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+    let name: Cow<str> = match base {
+        Expr::Field(n) => Cow::Borrowed(n.as_str()),
+        Expr::QualifiedField { qualifier, field } => Cow::Owned(format!("{qualifier}.{field}")),
         // The parser flattens nested paths, so a JsonPath base is always a
         // Field/QualifiedField; anything else is left to the generic evaluator.
         _ => return None,
@@ -245,8 +309,8 @@ fn json_path_base_error(
 /// Walk `expr`, validating the base of every `JsonPath` it contains.
 fn check_expr_json_paths(
     expr: &Expr,
-    scope: &[(String, TypeId)],
-    shadowed: &std::collections::HashSet<String>,
+    scope: &[ScanColumn<'_>],
+    shadowed: &ShadowedNames<'_>,
 ) -> Result<(), QueryError> {
     match expr {
         Expr::JsonPath { base, .. } => {
@@ -309,8 +373,8 @@ fn check_expr_json_paths(
 /// Recurse `plan`, validating JSON paths in every expression-bearing field.
 fn check_plan_json_paths(
     plan: &PlanNode,
-    scope: &[(String, TypeId)],
-    shadowed: &std::collections::HashSet<String>,
+    scope: &[ScanColumn<'_>],
+    shadowed: &ShadowedNames<'_>,
 ) -> Result<(), QueryError> {
     match plan {
         PlanNode::Filter { input, predicate } => {
@@ -401,36 +465,21 @@ fn check_plan_json_paths(
 /// a plan with no resolvable scan is skipped entirely, `count(*)`'s `*`
 /// sentinel is skipped, and a name a projection or aggregation REBINDS is
 /// excluded from the type check (its scan type no longer describes it).
-pub(crate) fn validate_column_references(
-    catalog: &Catalog,
-    plan: &PlanNode,
+fn validate_column_references<'a>(
+    catalog: &'a Catalog,
+    plan: &'a PlanNode,
+    scope: &'a [ScanColumn<'a>],
 ) -> Result<(), QueryError> {
-    let mut scope: Vec<(String, TypeId)> = Vec::new();
-    collect_scan_columns(catalog, plan, &mut scope);
+    check_scanned_tables_exist(catalog, plan)?;
     if scope.is_empty() {
         // No scan resolved (DDL, a values-only insert, a view whose source is
         // not in this tree): there is nothing to resolve names against.
         return Ok(());
     }
-    // Only aliases and synthetic aggregation outputs ADD a name; an unaliased
-    // `.col` in a projection just passes a scan column through, so it must not
-    // vouch for itself (that is exactly how `User { .agee }` used to slip past
-    // and return a column of NULLs).
-    let mut rebound: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut computed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rebound = Vec::new();
+    let mut computed = Vec::new();
     collect_rebound_names(plan, &mut rebound, &mut computed);
-    let mut known: std::collections::HashSet<String> =
-        scope.iter().map(|(name, _)| name.clone()).collect();
-    // A join's scan columns are named `alias.field`, and an unqualified
-    // reference inside a join is resolved by suffix match at runtime, so the
-    // bare field name is legitimately known too.
-    for (name, _) in &scope {
-        if let Some((_, field)) = name.split_once('.') {
-            known.insert(field.to_string());
-        }
-    }
-    known.extend(rebound.iter().cloned());
-    let mut ambiguous = ambiguous_bare_names(plan, catalog);
+    let mut ambiguous = ambiguous_bare_names(plan, catalog, scope);
     // Only a COMPUTED name is exempt from the ambiguity check, never a
     // projection alias. A grouping or window node binds a real row column that
     // the rest of the plan resolves by exact name, and the grouped resolver
@@ -442,16 +491,59 @@ pub(crate) fn validate_column_references(
     // `Cust join Ord on ... { name: Cust.name, .name }` resolved the bare
     // `.name` by suffix match and answered from whichever side the plan put
     // first, while the same `.name` alone was correctly refused.
-    for name in &computed {
-        ambiguous.remove(name);
-    }
+    ambiguous.retain(|name| !computed.contains(&name.as_str()));
     let ctx = ColumnScope {
-        known,
         rebound,
         ambiguous,
-        scope,
+        scope: Cow::Borrowed(scope),
+        display: HashMap::new(),
     };
     check_plan_columns(plan, &ctx)
+}
+
+/// Every table a plan reads must exist, reported as the missing table itself.
+///
+/// Without this, a query naming a table that is not there failed on whatever it
+/// tried next and reported that instead: `count(Missing)` surfaced the storage
+/// layer's generic error (wire class 0, "an internal error") while
+/// `count(Missing filter .x = 1)` reported `TableNotFound`, and a join to a
+/// missing table reported `column 'id' not found in table 'm'`, sending the
+/// reader to look for a column in a table that was never there. Scans only:
+/// a `type` names a table that must NOT exist yet, and `drop if exists` names
+/// one that may be gone already.
+fn check_scanned_tables_exist(catalog: &Catalog, plan: &PlanNode) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::AliasScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => {
+            if catalog.schema(table).is_none() {
+                return Err(QueryError::TableNotFound(table.clone()));
+            }
+            Ok(())
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::NestedProject { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => check_scanned_tables_exist(catalog, input),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            check_scanned_tables_exist(catalog, left)?;
+            check_scanned_tables_exist(catalog, right)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Bare field names that a join exposes under more than one alias.
@@ -466,34 +558,49 @@ pub(crate) fn validate_column_references(
 /// produce separate rows and each resolves its own names, so the walk stops at
 /// a `Union`. A name a plain (unaliased) scan also exposes is resolved by exact
 /// match at runtime and is therefore never ambiguous.
-fn ambiguous_bare_names(plan: &PlanNode, catalog: &Catalog) -> std::collections::HashSet<String> {
-    let mut scope: Vec<(String, TypeId)> = Vec::new();
-    collect_join_scope_columns(catalog, plan, &mut scope);
-    let mut owners: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    let mut ambiguous = std::collections::HashSet::new();
-    for (name, _) in &scope {
+///
+/// `scope` is the whole plan's scan scope, of which the join scope is a subset.
+/// Only an alias contributes a dotted name, so a scope without one has nothing
+/// to disambiguate and the join-scope walk is skipped: that is every
+/// single-table plan.
+fn ambiguous_bare_names(
+    plan: &PlanNode,
+    catalog: &Catalog,
+    scope: &[ScanColumn<'_>],
+) -> Vec<String> {
+    if !scope.iter().any(|(name, _)| name.contains('.')) {
+        return Vec::new();
+    }
+    let mut join_scope = Vec::new();
+    collect_join_scope_columns(catalog, plan, &mut join_scope);
+    // (field, the first qualifier seen exposing it)
+    let mut owners: Vec<(&str, &str)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for (name, _) in &join_scope {
         let Some((qualifier, field)) = name.split_once('.') else {
             continue;
         };
-        match owners.get(field) {
-            Some(previous) if *previous != qualifier => {
-                ambiguous.insert(field.to_string());
+        match owners.iter().find(|(owned, _)| *owned == field) {
+            Some((_, previous)) if *previous != qualifier => {
+                if !ambiguous.iter().any(|known| known == field) {
+                    ambiguous.push(field.to_string());
+                }
             }
             Some(_) => {}
-            None => {
-                owners.insert(field, qualifier);
-            }
+            None => owners.push((field, qualifier)),
         }
     }
-    for (name, _) in &scope {
-        ambiguous.remove(name.as_str());
-    }
+    ambiguous.retain(|field| !join_scope.iter().any(|(name, _)| name == field.as_str()));
     ambiguous
 }
 
 /// [`collect_scan_columns`] restricted to one join scope: it does not cross a
 /// `Union`, whose branches each resolve names against their own row.
-fn collect_join_scope_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<(String, TypeId)>) {
+fn collect_join_scope_columns<'a>(
+    catalog: &'a Catalog,
+    plan: &PlanNode,
+    out: &mut Vec<ScanColumn<'a>>,
+) {
     match plan {
         PlanNode::Union { .. } => {}
         PlanNode::SeqScan { .. }
@@ -521,18 +628,28 @@ fn collect_join_scope_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<
 }
 
 /// Resolution context for [`validate_column_references`].
-struct ColumnScope {
-    /// Every name the plan can produce: scan columns, projection outputs, and
-    /// synthetic group/aggregate/window output names.
-    known: std::collections::HashSet<String>,
+///
+/// Every collection here is a small vector searched linearly, not a hash set:
+/// a plan resolves a handful of names against a handful of columns, and
+/// building hash tables of cloned `String`s for that on every execution cost
+/// more than the lookups it saved. Names are borrowed from the plan and the
+/// catalog for the duration of the check.
+#[derive(Clone)]
+struct ColumnScope<'a> {
     /// Names bound to a computed expression rather than passed through from a
     /// scan, so their scan type must not drive the comparison type check.
-    rebound: std::collections::HashSet<String>,
+    rebound: Vec<&'a str>,
     /// Bare field names more than one joined alias exposes; see
     /// [`ambiguous_bare_names`].
-    ambiguous: std::collections::HashSet<String>,
-    /// Scan columns with their types.
-    scope: Vec<(String, TypeId)>,
+    ambiguous: Vec<String>,
+    /// Scan columns with their types. Borrowed from the shared walk in
+    /// [`validate_plan`]; only [`having_scope`] extends it, on its own copy.
+    scope: Cow<'a, [ScanColumn<'a>]>,
+    /// How an error message spells a name the plan invented. The grouped
+    /// aggregate columns are called `__agg_0`, `__agg_1`, … in the plan, which
+    /// is a name no query, schema or result set carries, so a refusal that
+    /// quoted it pointed the reader at nothing. See [`having_scope`].
+    display: HashMap<String, String>,
 }
 
 /// Collect names bound to a computed expression: projection aliases and the
@@ -544,15 +661,15 @@ struct ColumnScope {
 /// columns of the row later clauses read, while a projection alias only names a
 /// column of the RESULT; the ambiguity check treats the two differently, see
 /// [`validate_column_references`].
-fn collect_rebound_names(
-    plan: &PlanNode,
-    out: &mut std::collections::HashSet<String>,
-    computed: &mut std::collections::HashSet<String>,
+pub(super) fn collect_rebound_names<'a>(
+    plan: &'a PlanNode,
+    out: &mut Vec<&'a str>,
+    computed: &mut Vec<&'a str>,
 ) {
     if let PlanNode::Project { fields, .. } = plan {
         for field in fields {
             if let Some(alias) = &field.alias {
-                out.insert(alias.clone());
+                out.push(alias.as_str());
             }
         }
     }
@@ -561,18 +678,18 @@ fn collect_rebound_names(
             keys, aggregates, ..
         } => {
             for key in keys {
-                out.insert(key.output_name.clone());
-                computed.insert(key.output_name.clone());
+                out.push(key.output_name.as_str());
+                computed.push(key.output_name.as_str());
             }
             for aggregate in aggregates {
-                out.insert(aggregate.output_name.clone());
-                computed.insert(aggregate.output_name.clone());
+                out.push(aggregate.output_name.as_str());
+                computed.push(aggregate.output_name.as_str());
             }
         }
         PlanNode::Window { windows, .. } => {
             for window in windows {
-                out.insert(window.output_name.clone());
-                computed.insert(window.output_name.clone());
+                out.push(window.output_name.as_str());
+                computed.push(window.output_name.as_str());
             }
         }
         _ => {}
@@ -599,10 +716,24 @@ fn collect_rebound_names(
     }
 }
 
-/// Whether `name` is resolvable in this plan.
-fn column_is_known(name: &str, ctx: &ColumnScope) -> bool {
+/// Whether `name` is resolvable in this plan: a scan column, the bare field
+/// half of a join's `alias.field` column (an unqualified reference inside a
+/// join is resolved by suffix match at runtime, so the bare name is
+/// legitimately known too), or a name a projection alias or a grouping,
+/// aggregate or window output binds.
+///
+/// Only aliases and synthetic aggregation outputs ADD a name; an unaliased
+/// `.col` in a projection just passes a scan column through, so it must not
+/// vouch for itself (that is exactly how `User { .agee }` used to slip past
+/// and return a column of NULLs).
+fn column_is_known(name: &str, ctx: &ColumnScope<'_>) -> bool {
     // `count(*)` carries `*` as a sentinel field name, not a column.
-    name == "*" || ctx.known.contains(name)
+    name == "*"
+        || ctx.scope.iter().any(|(column, _)| {
+            column.as_ref() == name
+                || matches!(column.split_once('.'), Some((_, field)) if field == name)
+        })
+        || ctx.rebound.contains(&name)
 }
 
 /// Comparability class of a column type. Types whose literal spelling is a
@@ -643,18 +774,158 @@ fn literal_type_name(literal: &Literal) -> &'static str {
 }
 
 /// If `expr` is a bare column reference that resolves to exactly one scan type
-/// and is not rebound by a projection, return its name and type.
-fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)> {
-    let name = match expr {
-        Expr::Field(name) => name.clone(),
-        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+/// and is not rebound by a projection, return the name an error should call it
+/// by and its type. The two differ only for a plan-invented name that
+/// [`ColumnScope::display`] can spell the way the query did.
+fn comparable_column<'e>(expr: &'e Expr, ctx: &ColumnScope<'_>) -> Option<(Cow<'e, str>, TypeId)> {
+    let name: Cow<'e, str> = match expr {
+        Expr::Field(name) => Cow::Borrowed(name.as_str()),
+        Expr::QualifiedField { qualifier, field } => Cow::Owned(format!("{qualifier}.{field}")),
         _ => return None,
     };
-    if ctx.rebound.contains(&name) {
+    if ctx.rebound.iter().any(|rebound| *rebound == name) {
         return None;
     }
     let type_id = resolve_scan_type(&name, &ctx.scope)?;
-    Some((name, type_id))
+    let reported = match ctx.display.get(name.as_ref()) {
+        Some(display) => Cow::Owned(display.clone()),
+        None => name,
+    };
+    Some((reported, type_id))
+}
+
+/// Reject a `like` whose subject or pattern is known not to be text.
+///
+/// `like_match` only ever runs on a `(Str, Str)` pair; every other pair
+/// evaluates to false, so `.n like "abc"` on an int column and `.s like 5`
+/// both returned an empty result where `=` returns a typed error for the same
+/// mistake. Only operands whose type is fixed before execution are judged: a
+/// computed expression, a cast, a json path or a bound parameter is left to
+/// run.
+fn like_type_error(left: &Expr, right: &Expr, ctx: &ColumnScope<'_>) -> Option<String> {
+    like_operand_error(left, ctx, "subject").or_else(|| like_operand_error(right, ctx, "pattern"))
+}
+
+fn like_operand_error(expr: &Expr, ctx: &ColumnScope<'_>, role: &str) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(_)) => None,
+        Expr::Literal(literal) => Some(format!(
+            "type mismatch: the 'like' {role} must be str, got {}",
+            literal_type_name(literal)
+        )),
+        _ => match comparable_column(expr, ctx)? {
+            (_, TypeId::Str) => None,
+            (name, type_id) => Some(format!(
+                "type mismatch for column '{name}': 'like' matches str, not {}",
+                type_id_to_name(type_id)
+            )),
+        },
+    }
+}
+
+/// Reject a `length()` whose operand is known to have no length.
+///
+/// `length` measures a `str` in characters and a `bytes` in bytes. Nothing else
+/// has a length, and the evaluator answered `Empty` for everything else, so
+/// `length(.blob)` on a `bytes` column and `length(.n)` on an int column both
+/// came back null on every row with no error to search for. `bytes` now
+/// answers; the rest is refused here, naming the column and its type the way a
+/// mistyped `like` operand already is.
+///
+/// Only operands whose type is fixed before execution are judged, the same rule
+/// `like` follows: a computed expression, a cast, a json path or a bound
+/// parameter is left to run.
+fn length_type_error(args: &[Expr], ctx: &ColumnScope<'_>) -> Option<String> {
+    match args.first()? {
+        Expr::Literal(Literal::String(_)) => None,
+        Expr::Literal(literal) => Some(format!(
+            "type mismatch: the 'length' argument must be str or bytes, got {}",
+            literal_type_name(literal)
+        )),
+        argument => match comparable_column(argument, ctx)? {
+            (_, TypeId::Str | TypeId::Bytes) => None,
+            (name, type_id) => Some(format!(
+                "type mismatch for column '{name}': 'length' measures str or bytes, not {}",
+                type_id_to_name(type_id)
+            )),
+        },
+    }
+}
+
+/// The type a grouped aggregate's output column carries, so `having` can be
+/// type-checked against it.
+fn aggregate_output_type(aggregate: &GroupAgg, input: &ColumnScope<'_>) -> Option<TypeId> {
+    match aggregate.function {
+        AggFunc::Count | AggFunc::CountDistinct => Some(TypeId::Int),
+        AggFunc::Avg => Some(TypeId::Float),
+        // A sum keeps the summed column's own type, and min/max return one of
+        // the values themselves.
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+            comparable_column(&aggregate.argument, input).map(|(_, type_id)| type_id)
+        }
+    }
+}
+
+/// The scope a `having` predicate actually resolves against: the grouped row,
+/// whose columns are the group keys and the aggregate outputs.
+///
+/// Both are in `rebound` for every other clause, because after grouping the
+/// name no longer describes the scan column it came from. For `having` that is
+/// exactly backwards: it is the only clause that reads the grouped row, and the
+/// key and aggregate output types are known here. Without them
+/// `having count(.id) = "x"` and `having .s = 5` were the one place a mistyped
+/// comparison stayed silent.
+fn having_scope<'a>(
+    ctx: &ColumnScope<'a>,
+    keys: &[GroupKey],
+    aggregates: &[GroupAgg],
+) -> ColumnScope<'a> {
+    // The key and aggregate ARGUMENTS read the pre-grouping row, where this
+    // node's own output names do not shadow anything.
+    let is_output_name = |name: &str| {
+        keys.iter().any(|key| key.output_name == name)
+            || aggregates.iter().any(|agg| agg.output_name == name)
+    };
+    let mut input = ctx.clone();
+    input.rebound.retain(|name| !is_output_name(name));
+    let mut grouped = ctx.clone();
+    for key in keys {
+        if let Some((_, type_id)) = comparable_column(&key.expr, &input) {
+            grouped.rebound.retain(|name| *name != key.output_name);
+            grouped
+                .scope
+                .to_mut()
+                .push((Cow::Owned(key.output_name.clone()), type_id));
+        }
+    }
+    for aggregate in aggregates {
+        if let Some(type_id) = aggregate_output_type(aggregate, &input) {
+            grouped
+                .rebound
+                .retain(|name| *name != aggregate.output_name);
+            grouped
+                .scope
+                .to_mut()
+                .push((Cow::Owned(aggregate.output_name.clone()), type_id));
+            grouped.display.insert(
+                aggregate.output_name.clone(),
+                aggregate_display_name(aggregate),
+            );
+        }
+    }
+    grouped
+}
+
+/// The name a refusal gives a grouped aggregate: the call the user wrote,
+/// rendered back from the plan. It is the same name an unaliased projection of
+/// the same aggregate carries in the result set (`T group .s { count(.n) }`
+/// comes back with a column called `count(.n)`), so the reader can find it.
+fn aggregate_display_name(aggregate: &GroupAgg) -> String {
+    crate::ast::projection_output_name(&Expr::FunctionCall(
+        aggregate.function,
+        Box::new(aggregate.argument.clone()),
+        aggregate.mode,
+    ))
 }
 
 /// Reject `column <cmp> literal` (either orientation) when the two sides
@@ -665,7 +936,7 @@ fn comparison_type_error(
     left: &Expr,
     op: BinOp,
     right: &Expr,
-    ctx: &ColumnScope,
+    ctx: &ColumnScope<'_>,
 ) -> Option<String> {
     let (column, literal) = match (left, right) {
         (column, Expr::Literal(literal)) => (column, literal),
@@ -724,7 +995,7 @@ enum ArithOperand {
     Unknown,
 }
 
-fn arith_operand(expr: &Expr, ctx: &ColumnScope) -> ArithOperand {
+fn arith_operand(expr: &Expr, ctx: &ColumnScope<'_>) -> ArithOperand {
     match expr {
         Expr::Literal(Literal::Int(_) | Literal::Float(_)) => ArithOperand::Numeric,
         Expr::Literal(literal) => ArithOperand::NonNumeric(literal_type_name(literal)),
@@ -772,7 +1043,7 @@ fn arithmetic_type_error(
     left: &Expr,
     op: BinOp,
     right: &Expr,
-    ctx: &ColumnScope,
+    ctx: &ColumnScope<'_>,
 ) -> Option<QueryError> {
     for operand in [left, right] {
         if let ArithOperand::NonNumeric(type_name) = arith_operand(operand, ctx) {
@@ -827,7 +1098,7 @@ fn date_add_overflow_error(args: &[Expr]) -> Option<QueryError> {
     })
 }
 
-fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> {
+fn check_expr_columns(expr: &Expr, ctx: &ColumnScope<'_>) -> Result<(), QueryError> {
     match expr {
         Expr::Field(name) => {
             if !column_is_known(name, ctx) {
@@ -836,7 +1107,7 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                     column: name.clone(),
                 });
             }
-            if ctx.ambiguous.contains(name) {
+            if ctx.ambiguous.iter().any(|ambiguous| ambiguous == name) {
                 return Err(QueryError::Execution(format!(
                     "cannot resolve column '{name}': more than one joined table exposes it, qualify it as <alias>.{name}"
                 )));
@@ -861,6 +1132,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                     return Err(QueryError::Execution(message));
                 }
             }
+            if *op == BinOp::Like {
+                if let Some(message) = like_type_error(left, right, ctx) {
+                    return Err(QueryError::Execution(message));
+                }
+            }
             if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
                 if let Some(error) = arithmetic_type_error(left, *op, right, ctx) {
                     return Err(error);
@@ -881,6 +1157,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
             if *func == ScalarFn::DateAdd {
                 if let Some(error) = date_add_overflow_error(args) {
                     return Err(error);
+                }
+            }
+            if *func == ScalarFn::Length {
+                if let Some(message) = length_type_error(args, ctx) {
+                    return Err(QueryError::Execution(message));
                 }
             }
             for arg in args {
@@ -926,7 +1207,7 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
     }
 }
 
-fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope) -> Result<(), QueryError> {
+fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope<'_>) -> Result<(), QueryError> {
     match plan {
         PlanNode::Filter { input, predicate } => {
             check_expr_columns(predicate, ctx)?;
@@ -951,7 +1232,7 @@ fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope) -> Result<(), QueryErr
                 check_expr_columns(&aggregate.argument, ctx)?;
             }
             if let Some(having) = having {
-                check_expr_columns(having, ctx)?;
+                check_expr_columns(having, &having_scope(ctx, keys, aggregates))?;
             }
             check_plan_columns(input, ctx)
         }
@@ -1000,7 +1281,7 @@ fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope) -> Result<(), QueryErr
 /// Reject a negative `limit` / `offset`. Both are cast with `as usize` at
 /// execution, so `limit -1` wrapped to `usize::MAX` and silently returned every
 /// row instead of erroring.
-pub(crate) fn validate_slice_counts(plan: &PlanNode) -> Result<(), QueryError> {
+fn validate_slice_counts(plan: &PlanNode) -> Result<(), QueryError> {
     match plan {
         PlanNode::Limit { input, count } => {
             check_non_negative(count, "limit")?;
@@ -1045,7 +1326,7 @@ fn check_non_negative(count: &Expr, what: &str) -> Result<(), QueryError> {
     }
 }
 
-pub(crate) fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
+fn validate_no_stray_aggregates(plan: &PlanNode) -> Result<(), QueryError> {
     match plan {
         PlanNode::Project { input, fields } => {
             for f in fields {

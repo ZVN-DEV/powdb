@@ -1,6 +1,6 @@
 {
   "name": "@zvndev/powdb-embedded",
-  "version": "0.27.0",
+  "version": "0.28.0-rc.1",
   "description": "Embedded PowDB — the in-process database engine for Node (no server, no socket). The SQLite-shaped front door to PowDB.",
   "license": "MIT",
   "repository": {
@@ -17,13 +17,26 @@
     "local-first",
     "napi"
   ],
-  "main": "index.js",
+  "main": "loader.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./loader.js"
+    },
+    "./loader.js": {
+      "types": "./index.d.ts",
+      "default": "./loader.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
+    "loader.js",
     "index.js",
     "index.d.ts",
     "*.node",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "publishConfig": {

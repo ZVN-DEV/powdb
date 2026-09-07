@@ -178,6 +178,7 @@ fn crash_after_relocating_update_does_not_duplicate_the_row() {
         );
         let row = cat
             .get("users", relocated_rid)
+            .expect("read row")
             .expect("relocated row must be readable at the RowId the update returned");
         assert_eq!(row[0], Value::Int(11));
         assert_eq!(

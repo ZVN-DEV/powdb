@@ -11,6 +11,18 @@ It composes two lower-level packages:
 - `@zvndev/powdb-embedded` for local readonly queries,
 - `@zvndev/powdb-client` for authenticated primary sync frames and writes.
 
+Both are **optional peer dependencies**, so installing this package alone gets
+you the control loop and nothing to run it against. Install all three, pinned
+to the same version:
+
+```bash
+npm install @zvndev/powdb-sync @zvndev/powdb-client @zvndev/powdb-embedded
+```
+
+This package is **ESM only**: it publishes an `import` condition and no CJS
+build, so `require("@zvndev/powdb-sync")` does not resolve. Use `import`, or
+`await import(...)` from CommonJS. `@zvndev/powdb-client` ships both.
+
 The native retained-unit apply binding is exposed by
 `@zvndev/powdb-embedded` as `Database.applyRetainedUnits(...)`. Pass that
 method through the local adapter. The native binding accepts the same
@@ -76,9 +88,13 @@ syncLoop.stop();
 
 ## Status
 
-This package is experimental and version-locked to PowDB `0.8.0`. Pin matching
-`@zvndev/powdb-client`, `@zvndev/powdb-embedded`, and server versions while
-dogfooding.
+This package is experimental. The four PowDB JS packages and the server are
+released together from one repository and share a version number, so pin
+`@zvndev/powdb-sync`, `@zvndev/powdb-client`, `@zvndev/powdb-embedded`, and the
+server to the same version while dogfooding. `SUPPORTED_CATALOG_VERSION` is the
+one compatibility number that is checked at runtime: a primary whose catalog
+format is newer than this package supports is rejected rather than silently
+mis-read.
 
 The control loop is unit-tested with structural adapters, including background
 sync scheduling. `test:native` exercises `PowDBSyncReplica.write(...)` through
@@ -107,3 +123,17 @@ pnpm run test:e2e
 repo-local `bindings/node` build artifact. The repo-local fallback is used only
 when the package is not installed; an installed package that fails to load still
 fails the test.
+
+## Links
+
+- [Changelog](https://github.com/ZVN-DEV/powdb/blob/main/clients/sync/CHANGELOG.md)
+- [`@zvndev/powdb-client`](https://www.npmjs.com/package/@zvndev/powdb-client)
+  ([source](https://github.com/ZVN-DEV/powdb/tree/main/clients/ts))
+- [`@zvndev/powdb-embedded`](https://www.npmjs.com/package/@zvndev/powdb-embedded)
+  ([source](https://github.com/ZVN-DEV/powdb/tree/main/bindings/node))
+- [Embedded sync design notes](https://github.com/ZVN-DEV/powdb/blob/main/docs/embedded-sync.md)
+- [PowDB](https://github.com/ZVN-DEV/powdb)
+
+## License
+
+MIT

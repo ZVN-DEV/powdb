@@ -152,7 +152,10 @@ derive_versions() {
 # Refuse a list that cannot do the job, whatever produced it.
 validate_versions() {
   local list="$1" origin="$2"
-  [[ -n "${list//[[:space:]]/}" ]] \
+  # `grep -q`, not `${list//[[:space:]]/}`: bash 3.2 (what macOS ships, and what
+  # this repo has been bitten by twice) implements that substitution in
+  # quadratic time, so it is banned here even on a forty-character string.
+  grep -q '[^[:space:]]' <<<"${list}" \
     || die "${origin} produced an empty version list; this job would test nothing"
 
   local ws ws_key floor_key newest_key tag key

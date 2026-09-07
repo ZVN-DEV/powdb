@@ -123,7 +123,9 @@ fn dos_temp_dir(name: &str) -> std::path::PathBuf {
 /// `i64::MIN / -1` overflows and panics even in release builds; with
 /// `panic = "abort"` that is a remotely-craftable server crash. The divisor is
 /// derived from a column at runtime so the executor's eval path is exercised
-/// (no constant folding can sidestep it). Must return cleanly, never panic.
+/// (no constant folding can sidestep it). Must return, never panic; the
+/// quotient has no int64 answer, so what it returns is the refusal every other
+/// overflowing expression gets.
 #[test]
 fn integer_division_overflow_does_not_crash() {
     let dir = dos_temp_dir("div_overflow");
@@ -135,9 +137,13 @@ fn integer_division_overflow_does_not_crash() {
         .execute_powql("insert T { v := -9223372036854775807 }")
         .unwrap();
     let res = engine.execute_powql("T filter ((.v - 1) / -1) = 0 { .v }");
+    let message = res
+        .map(|ok| panic!("i64::MIN / -1 has no int64 quotient, got {ok:?}"))
+        .unwrap_err()
+        .to_string();
     assert!(
-        res.is_ok(),
-        "i64::MIN / -1 must not panic the engine: {res:?}"
+        message.contains("overflows int64"),
+        "i64::MIN / -1 must not panic the engine: {message}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

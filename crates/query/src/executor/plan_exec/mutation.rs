@@ -166,8 +166,9 @@ impl Engine {
                     // Handle rows where in-place patch failed (new > old).
                     for rid in fallback_rids {
                         let mut row = match self.catalog.get(table, rid) {
-                            Some(r) => r,
-                            None => continue,
+                            Ok(Some(r)) => r,
+                            Ok(None) => continue,
+                            Err(e) => return Some(Err(QueryError::from_storage_io(e))),
                         };
                         for (idx, val) in resolved.iter() {
                             row[*idx] = val.clone();
@@ -271,7 +272,7 @@ impl Engine {
                         let mut cancel = CancelCheck::new();
                         for rid in candidates {
                             cancel.tick()?;
-                            if let Some(row) = tbl.get(rid) {
+                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 if !row[col_idx].is_empty()
                                     && range_matches(
                                         &row[col_idx],
@@ -364,7 +365,11 @@ impl Engine {
                 let mut cancel = CancelCheck::new();
                 for rid in candidates {
                     cancel.tick()?;
-                    let Some(row) = self.catalog.get(table, rid) else {
+                    let Some(row) = self
+                        .catalog
+                        .get(table, rid)
+                        .map_err(QueryError::from_storage_io)?
+                    else {
                         continue;
                     };
                     let value = eval_expr(&path_expr, &row, &all_columns);

@@ -479,3 +479,108 @@ fn continuation_tracking() {
     assert!(needs_continuation(r#"insert U { s := "a\" "#));
     assert!(!needs_continuation(r#"insert U { s := "a\"b" }"#));
 }
+
+/// `awaitArchive` is not a fault.
+///
+/// Retained history is archived on demand when a replica pulls, not only at a
+/// graceful shutdown, so a primary that has moved ahead of its archived tail
+/// is in a momentary state that the next pull resolves. Printing that state
+/// under a `lastSyncError:` label told operators their replication was broken
+/// when nothing was wrong, and the same wording appeared while every pull was
+/// in fact failing, so the label carried no information either way.
+#[test]
+fn await_archive_reads_as_a_momentary_state_not_an_error() {
+    let status = powdb_sync::ReplicaSyncStatus {
+        replica_id: "replica-a".into(),
+        active: true,
+        last_applied_lsn: Some(10),
+        remote_lsn: 13,
+        servable_lsn: Some(10),
+        unarchived_lsn: Some(3),
+        lag_lsn: Some(3),
+        lag_bytes: Some(0),
+        lag_ms: Some(1000),
+        stale: true,
+        repair_action: powdb_sync::SyncRepairAction::AwaitArchive,
+        last_sync_error: Some(
+            "primary has advanced, but retained history is not yet archived; retry after archive"
+                .to_string(),
+        ),
+    };
+    let text = replica_sync_status_lines(&status).join("\n");
+    assert!(
+        !text.contains("lastSyncError"),
+        "a replica waiting for an archive has not failed: {text}"
+    );
+    assert!(
+        text.contains("archived on demand"),
+        "the output must say the archive happens on demand: {text}"
+    );
+}
+
+/// A replica that really is broken still reports an error.
+#[test]
+fn a_rebootstrap_still_reports_its_error() {
+    let status = powdb_sync::ReplicaSyncStatus {
+        replica_id: "replica-b".into(),
+        active: true,
+        last_applied_lsn: Some(4),
+        remote_lsn: 40,
+        servable_lsn: None,
+        unarchived_lsn: None,
+        lag_lsn: Some(36),
+        lag_bytes: None,
+        lag_ms: Some(90_000),
+        stale: true,
+        repair_action: powdb_sync::SyncRepairAction::Rebootstrap,
+        last_sync_error: Some("retained history has a gap at lsn 5".to_string()),
+    };
+    let text = replica_sync_status_lines(&status).join("\n");
+    assert!(
+        text.contains("lastSyncError: retained history has a gap at lsn 5"),
+        "a rebootstrap must still surface its error: {text}"
+    );
+}
+
+/// The `--wal-checkpoint-bytes` value has to reach the catalog, or the flag is
+/// decoration. Measured while the engine is still open: a clean close
+/// checkpoints and truncates the log, so the file left behind by an exited CLI
+/// is the same size either way.
+#[test]
+fn open_embedded_engine_applies_the_wal_checkpoint_threshold() {
+    fn write_notes(dir: &std::path::Path, threshold: Option<u64>) -> u64 {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let mut engine = crate::embedded::open_embedded_engine(
+            dir.to_str().expect("utf-8 path"),
+            false,
+            threshold,
+        )
+        .expect("open");
+        engine
+            .execute_powql("type Note { required body: string }")
+            .expect("create type");
+        for i in 0..400 {
+            engine
+                .execute_powql(&format!(
+                    "insert Note {{ body := \"{}{i}\" }}",
+                    "x".repeat(64)
+                ))
+                .expect("insert");
+        }
+        std::fs::metadata(dir.join("wal.log")).expect("wal").len()
+    }
+
+    let base = std::env::temp_dir().join(format!("powdb_cli_walckpt_{}", std::process::id()));
+    let bounded = write_notes(&base.join("bounded"), Some(4096));
+    let unbounded = write_notes(&base.join("default"), None);
+    assert!(
+        bounded < unbounded,
+        "the threshold did not bound the log: {bounded} bytes with it, {unbounded} without"
+    );
+    assert!(
+        unbounded > 4096,
+        "the workload is too small to prove anything: {unbounded} bytes"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

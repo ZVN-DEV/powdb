@@ -1,6 +1,8 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
-use crate::page::{iter_page_slots, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE, PAGE_SIZE};
+use crate::page::{
+    iter_page_slots, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE, PAGE_SIZE, SLOT_ENTRY_SIZE,
+};
 use crate::row::{row_is_v2, validate_row_format};
 use crate::types::RowId;
 use rustc_hash::FxHashMap;
@@ -239,23 +241,60 @@ struct HotPage {
     dirty: bool,
 }
 
+/// Width of one free-space bucket. Narrow enough that the bucket the insert
+/// path picks wastes at most this much space per page, wide enough that the
+/// whole list is a handful of buckets.
+const FREE_BUCKET_BYTES: usize = 64;
+
+/// Number of free-space buckets: one per [`FREE_BUCKET_BYTES`] of a page,
+/// plus the top bucket for a completely empty one.
+const FREE_BUCKETS: usize = PAGE_SIZE / FREE_BUCKET_BYTES + 1;
+
+/// `bucket_of_page` entry for a page that is not on the free list.
+const NO_BUCKET: u8 = u8::MAX;
+
+/// A page with no more than this much reclaimable space is not worth
+/// offering to the insert path.
+const MIN_USEFUL_FREE: usize = 64;
+
+fn empty_free_buckets() -> Vec<Vec<u32>> {
+    (0..FREE_BUCKETS).map(|_| Vec::new()).collect()
+}
+
 /// Manages a collection of data pages for storing rows.
 /// Tracks which pages have free space for fast insertion.
 pub struct HeapFile {
     disk: DiskManager,
     first_data_page: u32,
-    /// Pages with known free space. Iteration order matters for the
-    /// `insert` fallback path, so this is a `Vec`. Membership is tracked
-    /// in `in_free_list` for O(1) `contains` checks.
-    pages_with_space: Vec<u32>,
-    /// Mission C Phase 8: sidecar bitmap parallel to `pages_with_space`
-    /// that answers "is page N already on the free-space list?" in O(1).
-    /// Indexed by page_id. Previously `delete` did a linear `contains`
-    /// over `pages_with_space` on every call — for a scattered delete
-    /// that walks every page, that's quadratic in the number of pages
-    /// with free space and shows up as a ~30% overhead on
-    /// `delete_by_filter`.
-    in_free_list: Vec<bool>,
+    /// Reclaimable bytes per page, indexed by page id: what the page could
+    /// give a new row once [`Page::compact`] has run, so it counts both the
+    /// untouched tail and the space deleted rows left behind. Zero for the
+    /// superblock, for overflow-chain pages, and for pages this heap has not
+    /// looked at.
+    free_bytes: Vec<u16>,
+    /// Size-segregated free list over `free_bytes`. Bucket `b` holds pages
+    /// that had at least `b * FREE_BUCKET_BYTES` reclaimable bytes when they
+    /// were filed, so the first bucket above the one a row falls in is
+    /// guaranteed to fit it and allocation never inspects a page that cannot
+    /// take the row.
+    ///
+    /// A page's count changes without its old entries being removed, so
+    /// entries go stale; `bucket_of_page` is the authority and a stale id is
+    /// dropped when it surfaces. That lazy deletion is what keeps every
+    /// update O(1). Before this, `insert` walked a single flat list of every
+    /// page with 64 bytes free until one happened to fit, which for rows
+    /// approaching a kilobyte meant reading the whole heap on every page
+    /// boundary.
+    free_buckets: Vec<Vec<u32>>,
+    /// Which bucket each page is filed under, or [`NO_BUCKET`] when it is not
+    /// on the free list at all.
+    bucket_of_page: Vec<u8>,
+    /// Test-only tally of how many candidate pages the free-space search
+    /// looked at since the last [`Self::take_candidate_probes`]. Insert is
+    /// meant to find a home in a bounded number of probes no matter how big
+    /// the heap is, and this is what proves it.
+    #[cfg(test)]
+    candidate_probes: usize,
     /// Optional mmap for zero-syscall reads. Activated by `enable_mmap()`.
     ///
     /// # Safety invariant
@@ -299,8 +338,11 @@ impl HeapFile {
         Ok(HeapFile {
             disk,
             first_data_page: HEAP_SUPERBLOCK_FIRST_DATA_PAGE,
-            pages_with_space: Vec::new(),
-            in_free_list: Vec::new(),
+            free_bytes: Vec::new(),
+            free_buckets: empty_free_buckets(),
+            bucket_of_page: Vec::new(),
+            #[cfg(test)]
+            candidate_probes: 0,
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
@@ -331,8 +373,7 @@ impl HeapFile {
             let page0 = disk.read_page(0)?;
             heap_first_data_page(&page0)?
         };
-        let mut pages_with_space = Vec::new();
-        let mut in_free_list = vec![false; num_pages as usize];
+        let mut free_space_by_page: Vec<(u32, usize)> = Vec::new();
         for i in first_data_page..num_pages {
             if let Ok(buf) = disk.read_page(i) {
                 // Overflow-chain pages are not data pages: they hold value
@@ -372,8 +413,7 @@ impl HeapFile {
                     // next verified read would (correctly) reject it.
                     fresh.stamp_checksum();
                     let _ = disk.write_page(i, fresh.as_bytes());
-                    pages_with_space.push(i);
-                    in_free_list[i as usize] = true;
+                    free_space_by_page.push((i, fresh.free_space()));
                     continue;
                 }
                 // Verify the CRC here (validate-if-present) instead
@@ -383,28 +423,46 @@ impl HeapFile {
                 // supervisor restart: a permanent crash loop. A typed
                 // `PageCorrupt` error, by contrast, is reportable and
                 // recoverable from a backup.
-                let page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
+                let mut page = Page::from_bytes_verified(&buf).map_err(io::Error::from)?;
                 for (_slot, row) in iter_page_slots(&buf) {
                     validate_row_format(row)?;
                 }
-                if page.free_space() > 64 {
-                    pages_with_space.push(i);
-                    in_free_list[i as usize] = true;
+                // A page written before checksums shipped carries no CRC, so
+                // nothing would notice if its bytes rotted after this open and
+                // the garbage would reach a decoder. Stamp it now, while its
+                // rows have just been validated, so a live database never
+                // keeps a page outside the CRC. A read-only handle must not
+                // write, and the snapshot it serves is not mutated behind it.
+                if !read_only && !page.has_checksum() {
+                    page.stamp_checksum();
+                    disk.write_page(i, page.as_bytes())?;
                 }
+                // Deleted rows count here as well as untouched tail space:
+                // `insert` compacts a page it picks for the sake of the
+                // former. Without that, a table that is deleted from and
+                // reloaded grows forever.
+                free_space_by_page.push((i, page.free_space() + page.dead_space()));
             }
         }
-        Ok(HeapFile {
+        let mut heap = HeapFile {
             disk,
             first_data_page,
-            pages_with_space,
-            in_free_list,
+            free_bytes: vec![0; num_pages as usize],
+            free_buckets: empty_free_buckets(),
+            bucket_of_page: vec![NO_BUCKET; num_pages as usize],
+            #[cfg(test)]
+            candidate_probes: 0,
             mmap_ptr: None,
             hot_page: None,
             dirty_buffer: FxHashMap::default(),
             dirty_budget: Arc::new(DirtyPageBudget::default()),
             free_overflow_pages: Vec::new(),
             heap_version,
-        })
+        };
+        for (page_id, free) in free_space_by_page {
+            heap.note_free_bytes(page_id, free);
+        }
+        Ok(heap)
     }
 
     /// Join `budget`, the dirty-page cap shared by every heap in a catalog.
@@ -433,34 +491,68 @@ impl HeapFile {
         self.first_data_page
     }
 
-    /// O(1) check: is `page_id` currently on the free-space list?
+    /// The bucket a page with `free` reclaimable bytes is filed under.
     #[inline]
-    fn is_in_free_list(&self, page_id: u32) -> bool {
-        self.in_free_list
-            .get(page_id as usize)
-            .copied()
-            .unwrap_or(false)
+    fn free_bucket(free: usize) -> usize {
+        (free / FREE_BUCKET_BYTES).min(FREE_BUCKETS - 1)
     }
 
-    /// Mark `page_id` as no-longer-free in the sidecar bitmap. Caller is
-    /// responsible for removing it from `pages_with_space`.
-    #[inline]
-    fn mark_not_free(&mut self, page_id: u32) {
-        if let Some(slot) = self.in_free_list.get_mut(page_id as usize) {
-            *slot = false;
-        }
-    }
-
-    /// Mark `page_id` as free in the sidecar bitmap, growing the vec if
-    /// the id is beyond current capacity. Caller is responsible for
-    /// pushing it onto `pages_with_space`.
-    #[inline]
-    fn mark_free(&mut self, page_id: u32) {
+    /// Record that `page_id` can give a new row `free` bytes after
+    /// compaction, and file it under the matching bucket. O(1): any earlier
+    /// entry for the page is left where it is and skipped when it surfaces.
+    fn note_free_bytes(&mut self, page_id: u32, free: usize) {
         let idx = page_id as usize;
-        if idx >= self.in_free_list.len() {
-            self.in_free_list.resize(idx + 1, false);
+        if idx >= self.free_bytes.len() {
+            self.free_bytes.resize(idx + 1, 0);
+            self.bucket_of_page.resize(idx + 1, NO_BUCKET);
         }
-        self.in_free_list[idx] = true;
+        let free = free.min(u16::MAX as usize);
+        self.free_bytes[idx] = free as u16;
+        // A page with less than one worthwhile row's worth of space is not
+        // filed at all: it would only ever be popped and put straight back.
+        if free <= MIN_USEFUL_FREE {
+            self.bucket_of_page[idx] = NO_BUCKET;
+            return;
+        }
+        let bucket = Self::free_bucket(free);
+        if self.bucket_of_page[idx] as usize != bucket {
+            self.bucket_of_page[idx] = bucket as u8;
+            self.free_buckets[bucket].push(page_id);
+        }
+    }
+
+    /// Move the recorded reclaimable byte count for `page_id` by `delta`.
+    /// Used by the mutation paths, which know exactly how many bytes they
+    /// took or released without having to walk the slot directory.
+    #[inline]
+    fn adjust_free_bytes(&mut self, page_id: u32, delta: i32) {
+        let current = i32::from(
+            self.free_bytes
+                .get(page_id as usize)
+                .copied()
+                .unwrap_or_default(),
+        );
+        let updated = (current + delta).clamp(0, i32::from(u16::MAX));
+        self.note_free_bytes(page_id, updated as usize);
+    }
+
+    /// Take a page the summary says is guaranteed to hold `need` bytes once
+    /// compacted, removing it from the free list. Costs at most one look per
+    /// bucket, so allocation does not get slower as the heap grows.
+    fn take_free_page(&mut self, need: usize) -> Option<u32> {
+        // Bucket `b` promises only `b * FREE_BUCKET_BYTES`, so the first
+        // bucket that certainly fits `need` is the one above it.
+        for bucket in Self::free_bucket(need) + 1..FREE_BUCKETS {
+            while let Some(page_id) = self.free_buckets[bucket].pop() {
+                let idx = page_id as usize;
+                if self.bucket_of_page.get(idx).copied() != Some(bucket as u8) {
+                    continue;
+                }
+                self.bucket_of_page[idx] = NO_BUCKET;
+                return Some(page_id);
+            }
+        }
+        None
     }
 
     /// Park the pinned hot page into the deferred-write buffer (or drop
@@ -891,6 +983,12 @@ impl HeapFile {
         self.free_overflow_pages.len()
     }
 
+    /// Read and reset the candidate-probe tally. Test-only.
+    #[cfg(test)]
+    fn take_candidate_probes(&mut self) -> usize {
+        std::mem::replace(&mut self.candidate_probes, 0)
+    }
+
     /// Total page count (including the superblock and any overflow pages).
     pub fn num_pages(&self) -> u32 {
         self.disk.num_pages()
@@ -959,40 +1057,78 @@ impl HeapFile {
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
                 let page_id = hot.page_id;
-                let became_full = hot.page.free_space() < 64;
-                if became_full {
-                    if let Some(pos) = self.pages_with_space.iter().position(|p| *p == page_id) {
-                        self.pages_with_space.swap_remove(pos);
-                    }
-                    self.mark_not_free(page_id);
-                }
+                // An insert consumes exactly the row plus its slot entry and
+                // leaves no dead space behind, so the summary moves by a
+                // known amount and never has to walk the slot directory.
+                self.adjust_free_bytes(page_id, -((row_data.len() + SLOT_ENTRY_SIZE) as i32));
                 return Ok(RowId {
                     page_id,
                     slot_index: slot,
                 });
             }
-            // Hot page is full — fall through to pages_with_space. The
-            // flush will happen inside `ensure_hot` when we load a
-            // different page.
+            // Hot page is full — fall through to the free-space summary.
+            // The flush happens inside `ensure_hot` when a different page
+            // is loaded.
         }
 
-        // Try existing pages with space.
-        for idx in 0..self.pages_with_space.len() {
-            let page_id = self.pages_with_space[idx];
+        // Ask the summary for a page that fits, rather than trying every
+        // page that has any space at all.
+        let needed = row_data.len() + SLOT_ENTRY_SIZE;
+        while let Some(page_id) = self.take_free_page(needed) {
+            #[cfg(test)]
+            {
+                self.candidate_probes += 1;
+            }
             self.ensure_hot(page_id)?;
+            // The summary counts space that deleted rows left behind, which
+            // only exists as a contiguous run once the page is compacted.
+            let compacted = {
+                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+                if hot.page.free_space() < needed && hot.page.dead_space() > 0 {
+                    let ran = hot.page.compact();
+                    hot.dirty |= ran;
+                    ran
+                } else {
+                    true
+                }
+            };
+            if !compacted {
+                // A live slot points outside the page, so its directory is
+                // corrupt and the dead space it advertises can never be given
+                // back. Re-filing the page at that number hands it straight
+                // back: `note_free_bytes` re-pushes it into the bucket
+                // `take_free_page` just popped it from, and the search spins
+                // on it forever, inside the engine write lock, on a
+                // `spawn_blocking` thread no query timeout can cancel. Drop it
+                // from the free list instead. The rows it still holds stay
+                // readable; it just stops being offered for new ones.
+                tracing::warn!(
+                    page_id,
+                    "heap page cannot be compacted (a live slot points outside it); \
+                     dropping it from the free list"
+                );
+                self.note_free_bytes(page_id, 0);
+                continue;
+            }
             let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
-                if hot.page.free_space() < 64 {
-                    self.pages_with_space.swap_remove(idx);
-                    self.mark_not_free(page_id);
-                }
+                let free = hot.page.free_space();
+                self.note_free_bytes(page_id, free);
                 return Ok(RowId {
                     page_id,
                     slot_index: slot,
                 });
             }
-            // Page doesn't fit this row; try the next one on the list.
+            // The summary overstated this page. Correct it from the page
+            // itself, capped below what this search asks for: whatever the
+            // page really holds it demonstrably could not take this row, and
+            // filing it at or above `needed` would put it back in a bucket
+            // `take_free_page(needed)` scans. The cap is what makes the loop
+            // terminate rather than an argument about who overstated what.
+            let free =
+                (hot.page.free_space() + hot.page.dead_space()).min(needed.saturating_sub(1));
+            self.note_free_bytes(page_id, free);
         }
 
         // Allocate a new page. This *grows the file*, so the persistent
@@ -1018,10 +1154,8 @@ impl HeapFile {
                 max: MAX_ROW_DATA_SIZE,
             })
         })?;
-        if page.free_space() >= 64 {
-            self.pages_with_space.push(page_id);
-            self.mark_free(page_id);
-        }
+        let free = page.free_space();
+        self.note_free_bytes(page_id, free);
         self.install_fresh_hot(page_id, page)?;
         Ok(RowId {
             page_id,
@@ -1064,10 +1198,35 @@ impl HeapFile {
             hot.page = Page::new(rid.page_id, PageType::Data);
         }
         if !hot.page.insert_at_slot(rid.slot_index, row_data) {
-            return Err(io::Error::other(format!(
-                "replay: row does not fit at {rid:?} (page {} slot {})",
-                rid.page_id, rid.slot_index
-            )));
+            // `Page::insert_at_slot` refuses on free space alone, however much
+            // reclaimable space the page holds. [`HeapFile::insert`] compacts
+            // in exactly this position, so a row can have been placed at
+            // runtime purely because compaction reclaimed what deleted rows
+            // left behind, and the RowId it chose is what the log records.
+            // Replay reaches that Insert record through here and has to be
+            // able to reproduce it: without this retry, a crash after an
+            // ordinary insert into a page with reclaimable space left the data
+            // directory unopenable. (A relocating update is logged as a Delete
+            // plus an Insert, so it makes the page and then needs it.)
+            //
+            // Compacting here is safe for everything that replays after it.
+            // `Page::compact` rewrites only the *offset* of a live slot entry,
+            // leaves every tombstone entry exactly as it is, and never touches
+            // `slot_count`, so slot indices are preserved and the later Update
+            // and Delete records in the same replay stay targeted at the rows
+            // they name.
+            let mut placed = false;
+            if hot.page.dead_space() > 0 && hot.page.compact() {
+                // The page was rewritten whether or not the row now fits.
+                hot.dirty = true;
+                placed = hot.page.insert_at_slot(rid.slot_index, row_data);
+            }
+            if !placed {
+                return Err(io::Error::other(format!(
+                    "replay: row does not fit at {rid:?} (page {} slot {})",
+                    rid.page_id, rid.slot_index
+                )));
+            }
         }
         hot.dirty = true;
         Ok(())
@@ -1082,20 +1241,25 @@ impl HeapFile {
     /// Mission C Phase 1: if the hot page holds `rid.page_id`, read from
     /// it directly. This is what keeps `update_by_pk` fast: the read for
     /// the old row lands on the hot page we're about to write back.
+    ///
+    /// `Ok(None)` means the slot is genuinely deleted or was never written.
+    /// A failed read or a page that fails its CRC is an `Err`: mapping either
+    /// to `None` made an indexed point lookup on a rotted page answer "no such
+    /// row" with a success status.
     #[inline]
-    pub fn get(&self, rid: RowId) -> Option<Vec<u8>> {
+    pub fn get(&self, rid: RowId) -> io::Result<Option<Vec<u8>>> {
         // Mission C: dirty hot page takes precedence over both mmap and
         // disk — it holds writes that haven't landed yet.
         if let Some(hot) = &self.hot_page {
             if hot.page_id == rid.page_id {
-                return hot.page.get(rid.slot_index).map(|d| d.to_vec());
+                return Ok(hot.page.get(rid.slot_index).map(|d| d.to_vec()));
             }
         }
 
         // Mission C Phase 9: parked dirty page is also authoritative
         // over mmap/disk.
         if let Some(page) = self.dirty_buffer.get(&rid.page_id) {
-            return page.get(rid.slot_index).map(|d| d.to_vec());
+            return Ok(page.get(rid.slot_index).map(|d| d.to_vec()));
         }
 
         // Fast path: mmap — read directly from mapped memory
@@ -1120,19 +1284,35 @@ impl HeapFile {
                 // the process). This path deliberately does NOT verify the
                 // page CRC: that is the documented mmap performance tradeoff.
                 if rid.slot_index >= crate::page::slot_count_from_page(page_bytes) {
-                    return None;
+                    return Ok(None);
                 }
-                return crate::page::slot_bytes_from_page(page_bytes, rid.slot_index)
-                    .map(|row| row.to_vec());
+                return Ok(
+                    crate::page::slot_bytes_from_page(page_bytes, rid.slot_index)
+                        .map(|row| row.to_vec()),
+                );
             }
         }
 
-        let buf = self.disk.read_page(rid.page_id).ok()?;
-        // The disk point-lookup path consults the CRC
-        // (validate-if-present) rather than trusting the bytes, so a corrupt
-        // page reads as absent instead of yielding garbage or panicking.
-        let page = Page::from_bytes_verified(&buf).ok()?;
-        page.get(rid.slot_index).map(|d| d.to_vec())
+        if rid.page_id >= self.disk.num_pages() {
+            // A rid past the end of the heap addresses a page that was never
+            // written. Absent, not an I/O failure.
+            return Ok(None);
+        }
+        let buf = self.disk.read_page(rid.page_id)?;
+        // The disk point-lookup path consults the CRC (validate-if-present)
+        // rather than trusting the bytes, so a corrupt page is refused
+        // instead of yielding garbage or panicking.
+        let page = Page::from_bytes_verified(&buf)?;
+        // The CRC only covers pages this build (or a recent one) wrote. A
+        // legacy page has none, so the row header is the last thing standing
+        // between rotted bytes and a decoder that trusts the version.
+        match page.get(rid.slot_index) {
+            Some(row) => {
+                validate_row_format(row)?;
+                Ok(Some(row.to_vec()))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Delete a row by marking its slot as deleted.
@@ -1142,16 +1322,13 @@ impl HeapFile {
     pub fn delete(&mut self, rid: RowId) -> io::Result<()> {
         self.ensure_hot(rid.page_id)?;
         let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+        // The row's bytes stay where they are until the page is compacted,
+        // so what the delete releases is exactly its length. The slot entry
+        // itself stays as a tombstone and is not reclaimed.
+        let released = hot.page.get(rid.slot_index).map_or(0, |row| row.len());
         hot.page.delete(rid.slot_index);
         hot.dirty = true;
-        // Mission C Phase 8: O(1) membership check via sidecar bitmap.
-        // On scattered `delete_by_filter` runs this used to be the single
-        // biggest hot-loop cost — `Vec::contains` grows linearly as pages
-        // get added to the free list.
-        if !self.is_in_free_list(rid.page_id) {
-            self.pages_with_space.push(rid.page_id);
-            self.mark_free(rid.page_id);
-        }
+        self.adjust_free_bytes(rid.page_id, released as i32);
         Ok(())
     }
 
@@ -1174,28 +1351,30 @@ impl HeapFile {
         F: FnOnce(&[u8]),
     {
         self.ensure_hot(rid.page_id)?;
-        let found = {
+        let released = {
             let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             // Run the hook under a scoped immutable borrow of the page,
             // then drop that borrow before re-borrowing mutably for
             // `delete`.
-            let has_slot = if let Some(bytes) = hot.page.get(rid.slot_index) {
+            let released = if let Some(bytes) = hot.page.get(rid.slot_index) {
                 hook(bytes);
-                true
+                Some(bytes.len())
             } else {
-                false
+                None
             };
-            if has_slot {
+            if released.is_some() {
                 hot.page.delete(rid.slot_index);
                 hot.dirty = true;
             }
-            has_slot
+            released
         };
-        if found && !self.is_in_free_list(rid.page_id) {
-            self.pages_with_space.push(rid.page_id);
-            self.mark_free(rid.page_id);
+        match released {
+            Some(released) => {
+                self.adjust_free_bytes(rid.page_id, released as i32);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(found)
     }
 
     /// Apply an in-place mutation to a row's raw bytes. The closure
@@ -1334,7 +1513,7 @@ impl HeapFile {
         let mut count = 0u64;
         for page_id in 0..num_pages {
             self.ensure_hot(page_id)?;
-            let mut any_deleted = false;
+            let mut released = 0usize;
             {
                 let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
                 // Overflow-chain pages carry value payload, not a slot
@@ -1348,7 +1527,7 @@ impl HeapFile {
                     // then a separate mutable call to `delete`. The borrow
                     // checker is happy because each borrow ends inside the
                     // same iteration.
-                    let should_delete = match hot.page.get(slot) {
+                    let matched_len = match hot.page.get(slot) {
                         Some(bytes) if pred(bytes) => {
                             hook(
                                 RowId {
@@ -1357,23 +1536,22 @@ impl HeapFile {
                                 },
                                 bytes,
                             );
-                            true
+                            Some(bytes.len())
                         }
-                        _ => false,
+                        _ => None,
                     };
-                    if should_delete {
+                    if let Some(len) = matched_len {
                         hot.page.delete(slot);
-                        any_deleted = true;
+                        released += len;
                         count += 1;
                     }
                 }
-                if any_deleted {
+                if released > 0 {
                     hot.dirty = true;
                 }
             }
-            if any_deleted && !self.is_in_free_list(page_id) {
-                self.pages_with_space.push(page_id);
-                self.mark_free(page_id);
+            if released > 0 {
+                self.adjust_free_bytes(page_id, released as i32);
             }
         }
         Ok(count)
@@ -1497,8 +1675,14 @@ impl HeapFile {
         self.ensure_hot(rid.page_id)?;
         {
             let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+            let old_len = hot.page.get(rid.slot_index).map_or(0, |row| row.len());
             if hot.page.update(rid.slot_index, row_data) {
                 hot.dirty = true;
+                // Whether the new row overwrote the old bytes or was
+                // appended at the end of the page, the reclaimable total
+                // moves by the difference between the two lengths.
+                let delta = old_len as i32 - row_data.len() as i32;
+                self.adjust_free_bytes(rid.page_id, delta);
                 return Ok(rid);
             }
         }
@@ -2304,7 +2488,7 @@ mod tests {
         let row = vec![Value::Str("Alice".into()), Value::Int(30)];
         let encoded = encode_row(&schema, &row);
         let rid = heap.insert(&encoded).unwrap();
-        let data = heap.get(rid).unwrap();
+        let data = heap.get(rid).unwrap().expect("row present");
         let decoded = decode_row(&schema, &data);
         assert_eq!(decoded[0], Value::Str("Alice".into()));
         assert_eq!(decoded[1], Value::Int(30));
@@ -2343,8 +2527,8 @@ mod tests {
             ))
             .unwrap();
         heap.delete(r1).unwrap();
-        assert!(heap.get(r1).is_none());
-        assert!(heap.get(r2).is_some());
+        assert!(heap.get(r1).unwrap().is_none());
+        assert!(heap.get(r2).unwrap().is_some());
         assert_eq!(
             heap.scan()
                 .collect::<std::io::Result<Vec<_>>>()
@@ -2364,7 +2548,7 @@ mod tests {
         let rid = heap.insert(&encode_row(&schema, &row)).unwrap();
         let new_row = vec![Value::Str("Alice".into()), Value::Int(31)];
         let new_rid = heap.update(rid, &encode_row(&schema, &new_row)).unwrap();
-        let decoded = decode_row(&schema, &heap.get(new_rid).unwrap());
+        let decoded = decode_row(&schema, &heap.get(new_rid).unwrap().expect("row present"));
         assert_eq!(decoded[1], Value::Int(31));
         drop(heap);
         std::fs::remove_file(&path).ok();
@@ -2483,7 +2667,10 @@ mod tests {
         // Every row — both pre- and post-mmap — must be readable with the
         // correct contents.
         for (i, rid) in &rids {
-            let data = heap.get(*rid).unwrap_or_else(|| panic!("row {i} missing"));
+            let data = heap
+                .get(*rid)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {i} missing"));
             let decoded = decode_row(&schema, &data);
             assert_eq!(decoded[0], Value::Str(format!("seed_{i:04}")));
             assert_eq!(decoded[1], Value::Int(*i));
@@ -2523,7 +2710,7 @@ mod tests {
                 &[Value::Str("ok".into()), Value::Int(1)],
             ))
             .unwrap();
-        assert!(heap.get(rid).is_some());
+        assert!(heap.get(rid).unwrap().is_some());
         assert_eq!(
             heap.scan()
                 .collect::<std::io::Result<Vec<_>>>()
@@ -2542,7 +2729,10 @@ mod tests {
         // Exactly the max must still fit on a fresh page.
         let exact = vec![0x42u8; MAX_ROW_DATA_SIZE];
         let rid = heap.insert(&exact).unwrap();
-        assert_eq!(heap.get(rid).unwrap().len(), MAX_ROW_DATA_SIZE);
+        assert_eq!(
+            heap.get(rid).unwrap().expect("row present").len(),
+            MAX_ROW_DATA_SIZE
+        );
         // One byte more must be rejected.
         let over = vec![0x42u8; MAX_ROW_DATA_SIZE + 1];
         let err = heap.insert(&over).unwrap_err();
@@ -2699,6 +2889,318 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// How many [`snug_row`] rows a data page holds.
+    const SNUG_ROWS_PER_PAGE: usize = 5;
+
+    /// A row sized so that exactly [`SNUG_ROWS_PER_PAGE`] fit on a page,
+    /// leaving several hundred bytes free: enough to keep the page on the
+    /// free-space list, never enough for one more row. A heap built from
+    /// these is the worst case for a first-fit search, because every
+    /// candidate it looks at is a miss.
+    fn snug_row() -> Vec<u8> {
+        let schema = user_schema();
+        let usable = PAGE_SIZE - crate::page::PAGE_HEADER_SIZE - 2;
+        for text in 600..900 {
+            let row = encode_row(&schema, &[Value::Str("x".repeat(text)), Value::Int(1)]);
+            if usable / (row.len() + 4) == SNUG_ROWS_PER_PAGE {
+                return row;
+            }
+        }
+        panic!("no row size packs {SNUG_ROWS_PER_PAGE} rows to a page");
+    }
+
+    /// Fill `heap` to exactly `pages` full data pages, then return the probe
+    /// count of one more insert: the one that has to look past every page
+    /// already on the free-space list.
+    fn probes_for_one_more_insert(heap: &mut HeapFile, row: &[u8], pages: usize) -> usize {
+        for _ in 0..pages * SNUG_ROWS_PER_PAGE {
+            heap.insert(row).unwrap();
+        }
+        assert_eq!(
+            heap.num_pages() as usize,
+            pages + 1,
+            "snug_row no longer packs {SNUG_ROWS_PER_PAGE} rows to a page"
+        );
+        heap.take_candidate_probes();
+        heap.insert(row).unwrap();
+        heap.take_candidate_probes()
+    }
+
+    /// WAL replay places a row only through [`HeapFile::insert_at`], at the
+    /// exact `RowId` the log records, and the log records whatever
+    /// [`HeapFile::insert`] chose. So every `RowId` `insert` can produce,
+    /// `insert_at` has to be able to reproduce.
+    ///
+    /// It could not. `insert` compacts a page when the row does not fit its
+    /// untouched tail but does fit the space deleted rows left behind;
+    /// `insert_at` went straight to `Page::insert_at_slot`, which refuses on
+    /// free space alone. A row placed at runtime purely because the page was
+    /// compacted therefore wrote an Insert record replay could not apply, the
+    /// replay returned an error, and the data directory failed to open. A
+    /// crash after an ordinary insert into a page with reclaimable space lost
+    /// the whole database.
+    #[test]
+    fn every_row_id_insert_produces_can_be_replayed_by_insert_at() {
+        /// One record's worth of the log this test replays, in the two shapes
+        /// `Catalog::replay_wal` actually applies to a heap.
+        enum Logged {
+            Insert(RowId, Vec<u8>),
+            Delete(RowId),
+        }
+
+        let (mut live, live_path) = temp_heap("replayable_live");
+        let (mut replay, replay_path) = temp_heap("replayable_replay");
+        let schema = user_schema();
+        let small = |i: i64| encode_row(&schema, &[Value::Str("s".repeat(20)), Value::Int(i)]);
+        let big = encode_row(&schema, &[Value::Str("b".repeat(400)), Value::Int(999)]);
+
+        let mut log: Vec<Logged> = Vec::new();
+        // Fill data page 1, taking the row that spills onto page 2 with us:
+        // replay has to place that one too.
+        let mut on_page_one: Vec<RowId> = Vec::new();
+        loop {
+            let row = small(on_page_one.len() as i64);
+            let rid = live.insert(&row).unwrap();
+            log.push(Logged::Insert(rid, row));
+            if rid.page_id != 1 {
+                break;
+            }
+            on_page_one.push(rid);
+        }
+        assert!(
+            on_page_one.len() > 20,
+            "page 1 must hold enough rows to delete 20 of them"
+        );
+        // Reclaimable space, in the shape a relocating update leaves behind:
+        // `update_logged` writes a Delete plus an Insert for exactly this.
+        for rid in on_page_one.iter().take(20) {
+            live.delete(*rid).unwrap();
+            log.push(Logged::Delete(*rid));
+        }
+
+        // The state that makes this test mean anything: the next row fits
+        // only once the deleted space is reclaimed.
+        let needed = big.len() + SLOT_ENTRY_SIZE;
+        live.ensure_hot(1).unwrap();
+        {
+            let hot = live.hot_page.as_ref().expect("ensure_hot guarantees Some");
+            assert!(
+                hot.page.free_space() < needed,
+                "precondition: the row must not fit in the untouched tail"
+            );
+            assert!(
+                hot.page.free_space() + hot.page.dead_space() >= needed,
+                "precondition: it must fit once the deleted space is reclaimed"
+            );
+        }
+
+        let grown = live.insert(&big).unwrap();
+        assert_eq!(grown.page_id, 1, "the row must land on the compacted page");
+        log.push(Logged::Insert(grown, big.clone()));
+
+        // Replay into a fresh heap exactly as `Catalog::replay_wal` does:
+        // Insert records through `insert_at`, Delete records through `delete`.
+        for record in &log {
+            match record {
+                Logged::Insert(rid, row) => replay.insert_at(*rid, row).unwrap_or_else(|e| {
+                    panic!("insert_at cannot reproduce a RowId that insert produced: {e}")
+                }),
+                Logged::Delete(rid) => replay.delete(*rid).unwrap(),
+            }
+        }
+
+        // Not merely "replay returned Ok": the replayed heap must hold the
+        // same bytes at the same RowIds as the heap the log came from.
+        let mut compared = 0;
+        for record in &log {
+            if let Logged::Insert(rid, _) = record {
+                assert_eq!(
+                    replay.get(*rid).unwrap(),
+                    live.get(*rid).unwrap(),
+                    "replayed row differs at {rid:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 20, "the comparison must cover the whole log");
+        assert_eq!(
+            replay.get(grown).unwrap(),
+            Some(big),
+            "the row that needed compaction must survive replay intact"
+        );
+
+        drop(live);
+        drop(replay);
+        std::fs::remove_file(&live_path).ok();
+        std::fs::remove_file(&replay_path).ok();
+    }
+
+    /// A page whose slot directory points outside the page cannot be
+    /// compacted, and the free-space summary still credits it with dead space
+    /// it will never give back. Re-filing it at that number puts it straight
+    /// back into the bucket the allocator took it from, so `insert` used to
+    /// spin on it forever while holding the engine write lock.
+    #[test]
+    fn insert_does_not_spin_on_a_page_that_cannot_be_compacted() {
+        use crate::page::slot_entry_offset_checked;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (mut heap, path) = temp_heap("uncompactable");
+        let schema = user_schema();
+        let mk = |i: i64| encode_row(&schema, &[Value::Str("x".repeat(180)), Value::Int(i)]);
+
+        // Fill data page 1, then step back off the page it spilled onto.
+        let mut on_page_one: Vec<RowId> = Vec::new();
+        loop {
+            let rid = heap.insert(&mk(on_page_one.len() as i64)).unwrap();
+            if rid.page_id != 1 {
+                heap.delete(rid).unwrap();
+                break;
+            }
+            on_page_one.push(rid);
+        }
+        assert!(on_page_one.len() > 4, "page 1 must hold several rows");
+        // Dead space for the allocator to offer, and a live slot to corrupt.
+        for rid in on_page_one.iter().take(3) {
+            heap.delete(*rid).unwrap();
+        }
+        let victim = *on_page_one.last().expect("page 1 holds rows");
+        drop(heap);
+
+        // Point the victim's row off the end of the page. `Page::compact`
+        // refuses such a page and `iter_page_slots` skips the slot, so the
+        // heap still opens and every other row stays readable.
+        {
+            let mut disk = DiskManager::open(&path).unwrap();
+            let mut bytes = disk.read_page(1).unwrap();
+            let entry =
+                slot_entry_offset_checked(victim.slot_index).expect("slot entry is in range");
+            // Only the offset moves: the page keeps reporting the same live
+            // bytes, the same free space and the same dead space, so the
+            // allocator still offers it exactly as it did before.
+            bytes[entry..entry + 2].copy_from_slice(&((PAGE_SIZE - 1) as u16).to_le_bytes());
+            let mut page = Page::from_bytes(&bytes).expect("page 1 decodes");
+            page.stamp_checksum();
+            disk.write_page(1, page.as_bytes()).unwrap();
+            disk.flush().unwrap();
+        }
+
+        let row = mk(9_999);
+        let needed = row.len() + SLOT_ENTRY_SIZE;
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let mut page = Page::from_bytes(&disk.read_page(1).unwrap()).unwrap();
+            assert!(
+                page.free_space() < needed,
+                "the row must not fit in the untouched tail, or nothing compacts"
+            );
+            assert!(
+                page.free_space() + page.dead_space() >= needed,
+                "the summary must still offer this page for the row"
+            );
+            assert!(!page.compact(), "the corrupted page must refuse to compact");
+        }
+
+        // The insert runs on its own thread: before the fix it never returns,
+        // and a test that hangs says nothing useful.
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let mut heap = HeapFile::open(&thread_path).unwrap();
+            let placed = heap
+                .insert(&row)
+                .map(|rid| rid.page_id)
+                .map_err(|e| e.to_string());
+            let summary = heap.free_bytes.get(1).copied();
+            let bucket = heap.bucket_of_page.get(1).copied();
+            let _ = tx.send((placed, summary, bucket));
+        });
+
+        let (placed, summary, bucket) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("insert never returned: the free-space search spun on the uncompactable page");
+        assert_ne!(
+            placed.expect("the row must still be stored"),
+            1,
+            "the uncompactable page must not be used"
+        );
+        assert_eq!(
+            summary,
+            Some(0),
+            "the uncompactable page must be credited with no reclaimable space"
+        );
+        assert_eq!(
+            bucket,
+            Some(NO_BUCKET),
+            "and it must be off the free list entirely"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn insert_does_not_walk_the_whole_heap_to_place_a_row() {
+        let row = snug_row();
+        let (mut small, small_path) = temp_heap("probe_small");
+        let small_probes = probes_for_one_more_insert(&mut small, &row, 20);
+        drop(small);
+        std::fs::remove_file(&small_path).ok();
+
+        let (mut large, large_path) = temp_heap("probe_large");
+        let large_probes = probes_for_one_more_insert(&mut large, &row, 200);
+        drop(large);
+        std::fs::remove_file(&large_path).ok();
+
+        assert!(
+            large_probes <= small_probes + 8,
+            "insert cost grows with heap size: {small_probes} probes at 20 pages, \
+             {large_probes} probes at 200 pages"
+        );
+    }
+
+    #[test]
+    fn deleting_every_row_frees_the_space_for_the_next_load() {
+        let (mut heap, path) = temp_heap("delete_reuse");
+        let schema = user_schema();
+        let rows: Vec<Vec<u8>> = (0..2000)
+            .map(|i| {
+                encode_row(
+                    &schema,
+                    &[Value::Str(format!("user_{i:04}")), Value::Int(i)],
+                )
+            })
+            .collect();
+        for row in &rows {
+            heap.insert(row).unwrap();
+        }
+        let after_first_load = heap.num_pages();
+
+        let rids: Vec<RowId> = heap
+            .scan()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .map(|(rid, _)| rid)
+            .collect();
+        assert_eq!(rids.len(), rows.len());
+        for rid in rids {
+            heap.delete(rid).unwrap();
+        }
+        for row in &rows {
+            heap.insert(row).unwrap();
+        }
+        let after_second_load = heap.num_pages();
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            after_second_load <= after_first_load + 2,
+            "reinserting into an emptied heap grew it from {after_first_load} \
+             to {after_second_load} pages"
+        );
+    }
+
     /// Fill `heap` until the shared budget refuses another buffered page,
     /// returning the error. `None` means the budget never tripped.
     fn fill_until_budget_trips(heap: &mut HeapFile, rows: usize) -> Option<io::Error> {
@@ -2847,6 +3349,165 @@ mod tests {
         heap.flush_all_dirty().unwrap();
         assert_eq!(budget.charged_pages(), 0);
 
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Not a gate: a measurement, and the number the decision to verify page
+    /// CRCs on the scan path rests on.
+    ///
+    /// ```text
+    /// cargo test -p powdb-storage --lib mmap_scan_verification_cost \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// It walks the same mapped pages twice, once the way the scan path walks
+    /// them and once with [`Page::verify_bytes`] in front, and interleaves the
+    /// two so a machine that speeds up or slows down mid-run cannot favour
+    /// either. Both loops consume the row bytes the same way, so the only
+    /// difference between them is the CRC.
+    #[test]
+    #[ignore = "timing measurement, not a correctness gate"]
+    fn mmap_scan_verification_cost() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::Instant;
+
+        let (mut heap, path) = temp_heap("verify_cost");
+        let schema = user_schema();
+        // ~120 bytes a row, so roughly 30 rows to a 4KB page.
+        for i in 0..60_000i64 {
+            let row = vec![
+                Value::Str(format!("row_{i:08}_{}", "x".repeat(96))),
+                Value::Int(i),
+            ];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        heap.flush().unwrap();
+        drop(heap);
+
+        let heap = HeapFile::open(&path).unwrap();
+        let num_pages = heap.disk.num_pages();
+        let file_len = num_pages as usize * PAGE_SIZE;
+        let fd = heap.disk.file_ref().as_raw_fd();
+        // SAFETY: `fd` is a live descriptor for a file of at least `file_len`
+        // bytes (`num_pages` pages), mapped read-only and private. The mapping
+        // is unmapped below and never outlives `heap`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        // SAFETY: the mmap above succeeded and covers `file_len` bytes.
+        let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
+
+        // What a compiled predicate costs the memory system: one byte read per
+        // cache line of the row. A callback that only sums `data.len()` reads
+        // the slot directory and never the row, which makes the baseline about
+        // twenty times faster than any real scan and the CRC look proportionally
+        // worse than it is.
+        #[inline]
+        fn touch_row(data: &[u8]) -> usize {
+            let mut acc = 0usize;
+            let mut i = 0usize;
+            while i < data.len() {
+                acc += data[i] as usize;
+                i += 64;
+            }
+            acc
+        }
+
+        let walk = |verify: bool| -> (u64, usize) {
+            let mut sink = 0usize;
+            let start = Instant::now();
+            for page_id in 0..num_pages {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                if verify {
+                    crate::page::Page::verify_bytes(page_bytes).unwrap();
+                }
+                for (_slot, data) in iter_page_slots(page_bytes) {
+                    sink += touch_row(data);
+                }
+            }
+            (start.elapsed().as_nanos() as u64, sink)
+        };
+
+        // The production entry point, for scale: this is what a full-table
+        // scan actually pays per page today, callback included.
+        let production_scan = || -> u64 {
+            let mut sink = 0usize;
+            let start = Instant::now();
+            heap.for_each_row(|_rid, data| sink += touch_row(data))
+                .unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert!(sink > 0, "the callback must actually read the rows");
+            elapsed
+        };
+
+        // One warm pass of each so the page cache and the branch predictors
+        // are in the same state for every measured pass.
+        let (_, bytes_plain) = walk(false);
+        let (_, bytes_verified) = walk(true);
+        assert_eq!(
+            bytes_plain, bytes_verified,
+            "the two loops must read the same rows, or they are not comparable"
+        );
+
+        const PASSES: usize = 21;
+        let mut plain = Vec::with_capacity(PASSES);
+        let mut verified = Vec::with_capacity(PASSES);
+        for _ in 0..PASSES {
+            plain.push(walk(false).0);
+            verified.push(walk(true).0);
+        }
+        plain.sort_unstable();
+        verified.sort_unstable();
+        let median_plain = plain[PASSES / 2];
+        let median_verified = verified[PASSES / 2];
+
+        let per_page_plain = median_plain as f64 / f64::from(num_pages);
+        let per_page_verified = median_verified as f64 / f64::from(num_pages);
+        println!("pages: {num_pages}, row bytes per pass: {bytes_plain}");
+        println!(
+            "scan without verification: {median_plain} ns median, {per_page_plain:.1} ns/page"
+        );
+        println!(
+            "scan with    verification: {median_verified} ns median, {per_page_verified:.1} ns/page"
+        );
+        println!(
+            "marginal cost of verifying: {:.1} ns/page, {:+.1}%",
+            per_page_verified - per_page_plain,
+            (median_verified as f64 / median_plain as f64 - 1.0) * 100.0
+        );
+        println!("plain    passes (ns): {plain:?}");
+        println!("verified passes (ns): {verified:?}");
+
+        let mut production = Vec::with_capacity(PASSES);
+        for _ in 0..PASSES {
+            production.push(production_scan());
+        }
+        production.sort_unstable();
+        let median_production = production[PASSES / 2];
+        let per_page_production = median_production as f64 / f64::from(num_pages);
+        println!(
+            "HeapFile::for_each_row as shipped: {median_production} ns median, \
+             {per_page_production:.1} ns/page"
+        );
+        println!(
+            "verification against that baseline: {:+.1}%",
+            (per_page_verified - per_page_plain) / per_page_production * 100.0
+        );
+
+        // SAFETY: `ptr` and `file_len` come from the successful mmap above.
+        unsafe {
+            libc::munmap(ptr, file_len);
+        }
         drop(heap);
         std::fs::remove_file(&path).ok();
     }

@@ -11,6 +11,9 @@ pub enum Statement {
     /// `link <Owner>.<name> -> <Target> on <local> = <target>`: declare a
     /// persistent entity link (catalog v7). Lowers to `Catalog::create_link`.
     CreateLink(CreateLinkExpr),
+    /// `drop link <Owner>.<name>`: remove a persistent entity link. Lowers to
+    /// `Catalog::drop_link`.
+    DropLink(DropLinkExpr),
     AlterTable(AlterTableExpr),
     DropTable(DropTableExpr),
     CreateView(CreateViewExpr),
@@ -57,6 +60,18 @@ pub struct CreateLinkExpr {
     pub local_key: String,
     /// Column on the target matched against `local_key`.
     pub target_key: String,
+}
+
+/// `drop link <Owner>.<name>`, also spelled
+/// `alter <Owner> drop link <name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropLinkExpr {
+    /// The type that declared the link.
+    pub owner: String,
+    /// The link's name on that type.
+    pub name: String,
+    /// `if exists`: a link that is already gone is not an error.
+    pub if_exists: bool,
 }
 
 /// An unresolved link traversal on a projection, e.g. `orders: u.orders
@@ -503,9 +518,9 @@ pub enum Expr {
     /// Type cast: `cast(expr, "int")` or `cast(expr, "str")` etc.
     Cast(Box<Expr>, CastType),
     /// A runtime-materialized literal carrying a concrete Value. Produced only
-    /// during subquery/correlated substitution (post-planning) for values that
-    /// have no Literal form (NULL, datetime, uuid, bytes); never emitted by the
-    /// parser/canonicalizer.
+    /// after planning, by subquery/correlated substitution and by the
+    /// typed-literal coercion pass, for values that have no Literal form (NULL,
+    /// datetime, uuid, bytes); never emitted by the parser/canonicalizer.
     ValueLit(Value),
     /// The `null` literal — produces `Value::Empty`.
     Null,
@@ -649,6 +664,147 @@ impl JsonPathIdentityV1 {
                 })
                 .collect(),
         ))
+    }
+}
+
+/// The column name an unaliased projection field carries: the field's own
+/// source text, rendered back from the AST.
+///
+/// Every projection path used to inline its own `Expr::Field(name) => name, _
+/// => "?"`, so `D { .j->a, .j->b }` came back as two columns both called `?`
+/// and a caller reading by name could not tell them apart or even say which
+/// one it had. Rendering the expression names each one after what it computes,
+/// the way an alias would, and the shapes still not rendered (a subquery, a
+/// window, a case) keep `?` rather than a name that lies.
+pub fn projection_output_name(expr: &Expr) -> String {
+    match expr {
+        // A bare column keeps its own name, with no leading dot: that is the
+        // name every caller already reads it by.
+        Expr::Field(name) => name.clone(),
+        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+        other => render_expr(other).unwrap_or_else(|| "?".into()),
+    }
+}
+
+fn render_expr(expr: &Expr) -> Option<String> {
+    Some(match expr {
+        Expr::Field(name) => format!(".{name}"),
+        Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+        Expr::Literal(literal) => render_literal(literal),
+        Expr::Null => "null".into(),
+        Expr::Param(name) => format!("${name}"),
+        Expr::BinaryOp(left, op, right) => format!(
+            "{} {} {}",
+            render_expr(left)?,
+            render_binop(*op),
+            render_expr(right)?
+        ),
+        Expr::UnaryOp(op, inner) => match op {
+            UnaryOp::Not => format!("not {}", render_expr(inner)?),
+            UnaryOp::Exists => format!("exists {}", render_expr(inner)?),
+            UnaryOp::NotExists => format!("not exists {}", render_expr(inner)?),
+            UnaryOp::IsNull => format!("{} is null", render_expr(inner)?),
+            UnaryOp::IsNotNull => format!("{} is not null", render_expr(inner)?),
+        },
+        Expr::FunctionCall(func, argument, _) => match func {
+            AggFunc::CountDistinct => format!("count(distinct {})", render_expr(argument)?),
+            _ => format!("{}({})", render_agg(*func), render_expr(argument)?),
+        },
+        Expr::ScalarFunc(func, args) => {
+            let mut rendered = Vec::with_capacity(args.len());
+            for arg in args {
+                rendered.push(render_expr(arg)?);
+            }
+            format!("{}({})", render_scalar_fn(*func), rendered.join(", "))
+        }
+        Expr::Coalesce(left, right) => {
+            format!("coalesce({}, {})", render_expr(left)?, render_expr(right)?)
+        }
+        Expr::Cast(inner, target) => format!("{}({})", render_cast(*target), render_expr(inner)?),
+        Expr::JsonPath { base, segments } => {
+            let mut out = render_expr(base)?;
+            for segment in segments {
+                out.push_str("->");
+                match segment {
+                    PathSeg::Key(key) => out.push_str(key),
+                    PathSeg::Index(index) => out.push_str(&index.to_string()),
+                }
+            }
+            out
+        }
+        _ => return None,
+    })
+}
+
+fn render_literal(literal: &Literal) -> String {
+    match literal {
+        Literal::Int(v) => v.to_string(),
+        Literal::Float(v) => v.to_string(),
+        Literal::Bool(v) => v.to_string(),
+        Literal::String(s) => format!("\"{s}\""),
+    }
+}
+
+fn render_binop(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Eq => "=",
+        BinOp::Neq => "!=",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::Lte => "<=",
+        BinOp::Gte => ">=",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Like => "like",
+    }
+}
+
+fn render_agg(func: AggFunc) -> &'static str {
+    match func {
+        AggFunc::Count | AggFunc::CountDistinct => "count",
+        AggFunc::Avg => "avg",
+        AggFunc::Sum => "sum",
+        AggFunc::Min => "min",
+        AggFunc::Max => "max",
+    }
+}
+
+fn render_scalar_fn(func: ScalarFn) -> &'static str {
+    match func {
+        ScalarFn::Upper => "upper",
+        ScalarFn::Lower => "lower",
+        ScalarFn::Length => "length",
+        ScalarFn::Trim => "trim",
+        ScalarFn::Substring => "substring",
+        ScalarFn::Concat => "concat",
+        ScalarFn::Abs => "abs",
+        ScalarFn::Round => "round",
+        ScalarFn::Ceil => "ceil",
+        ScalarFn::Floor => "floor",
+        ScalarFn::Sqrt => "sqrt",
+        ScalarFn::Pow => "pow",
+        ScalarFn::Now => "now",
+        ScalarFn::Extract => "extract",
+        ScalarFn::DateAdd => "date_add",
+        ScalarFn::DateDiff => "date_diff",
+        ScalarFn::JsonType => "json_type",
+        ScalarFn::JsonText => "json_text",
+    }
+}
+
+fn render_cast(target: CastType) -> &'static str {
+    match target {
+        CastType::Int => "int",
+        CastType::Float => "float",
+        CastType::Str => "str",
+        CastType::Bool => "bool",
+        CastType::DateTime => "datetime",
+        CastType::Uuid => "uuid",
+        CastType::Bytes => "bytes",
     }
 }
 

@@ -8,8 +8,9 @@
  * Security model:
  *   - Literals are rendered with quoting/escaping so interpolated values
  *     cannot break out of the surrounding literal.
- *   - Identifiers are validated against `^[A-Za-z_][A-Za-z0-9_]*$` and passed
- *     through unchanged. Anything else throws a `TypeError`.
+ *   - Identifiers are validated against `^[A-Za-z_][A-Za-z0-9_]*$`, and are
+ *     backtick-quoted when they collide with a PowQL keyword. Anything else
+ *     throws a `TypeError`.
  *
  * PowQL string-escape rules (verified against `crates/query/src/lexer.rs`):
  *   - Strings are delimited by `"`.
@@ -20,6 +21,58 @@
  */
 
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Every word `crates/query/src/lexer.rs` lexes as a keyword rather than an
+ * identifier. Unquoted, any of these is a parse error where a table or column
+ * name is expected, so {@link escapeIdent} backtick-quotes them.
+ *
+ * `test/escape.test.ts` diffs this list against the lexer source, so a keyword
+ * added to the engine fails the suite here rather than in a user's query.
+ */
+const RESERVED_WORDS: readonly string[] = [
+  "abs", "add", "alter", "and", "as", "asc",
+  "auto", "avg", "begin", "between", "case", "cast",
+  "ceil", "column", "commit", "concat", "conflict", "count",
+  "cross", "date_add", "date_diff", "default", "delete", "dense_rank",
+  "desc", "describe", "distinct", "drop", "else", "end",
+  "exists", "explain", "extract", "false", "filter", "floor",
+  "group", "having", "in", "index", "inner", "insert",
+  "is", "join", "json_text", "json_type", "left", "length",
+  "let", "like", "limit", "link", "lower", "match",
+  "materialize", "materialized", "max", "min", "multi", "not",
+  "now", "null", "offset", "on", "or", "order",
+  "outer", "over", "partition", "pow", "rank", "raw",
+  "refresh", "required", "returning", "right", "rollback", "round",
+  "row_number", "schema", "select", "sqrt", "substring", "sum",
+  "then", "transaction", "trim", "true", "type", "union",
+  "unique", "update", "upper", "upsert", "view", "when",
+];
+
+const RESERVED = new Set(RESERVED_WORDS);
+
+/** The reserved-word table {@link escapeIdent} quotes against. */
+export function powqlReservedWords(): readonly string[] {
+  return RESERVED_WORDS;
+}
+
+/** Inclusive bounds of a PowDB `int`, which is a signed 64-bit integer. */
+const INT_MIN = -(2n ** 63n);
+const INT_MAX = 2n ** 63n - 1n;
+
+/**
+ * Render a bigint, refusing one the engine cannot hold. An out-of-range value
+ * would otherwise be spliced into the query text as digits the engine rejects
+ * at parse time, with nothing pointing back at the call that produced it.
+ */
+function renderBigint(fn: string, value: bigint): string {
+  if (value < INT_MIN || value > INT_MAX) {
+    throw new TypeError(
+      `${fn}: bigint ${value} is outside the signed 64-bit range PowDB stores`
+    );
+  }
+  return value.toString(10);
+}
 
 /** Wrapper marking a string as an identifier (vs a literal) for `powql` tagged templates. */
 export class PowqlIdent {
@@ -32,9 +85,13 @@ export function ident(name: string): PowqlIdent {
 }
 
 /**
- * Validate a PowQL identifier (table name, field name, alias). Returns the
- * identifier unchanged on success; throws `TypeError` on any invalid input
- * (non-string, empty, or containing characters outside `[A-Za-z_][A-Za-z0-9_]*`).
+ * Render a PowQL identifier (table name, field name, alias). Returns the
+ * identifier unchanged, or backtick-quoted when it collides with a PowQL
+ * keyword — `escapeIdent("select")` gives `` `select` ``, which the lexer
+ * reads as a plain identifier. Throws `TypeError` on any invalid input
+ * (non-string, empty, or containing characters outside
+ * `[A-Za-z_][A-Za-z0-9_]*`). Pass the bare name: a value that already carries
+ * backticks is rejected rather than quoted twice.
  */
 export function escapeIdent(name: string): string {
   if (typeof name !== "string") {
@@ -46,11 +103,14 @@ export function escapeIdent(name: string): string {
     throw new TypeError("escapeIdent: identifier must not be empty");
   }
   if (!IDENT_RE.test(name)) {
+    const hint = name.includes("`")
+      ? " (pass the bare name; escapeIdent adds the backticks a keyword needs)"
+      : "";
     throw new TypeError(
-      `escapeIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)`
+      `escapeIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)${hint}`
     );
   }
-  return name;
+  return RESERVED.has(name) ? `\`${name}\`` : name;
 }
 
 /**
@@ -61,7 +121,7 @@ export function escapeIdent(name: string): string {
  * - string → `"..."` with `\` and `"` backslash-escaped (C-style, per the
  *   PowQL lexer). Backslash must be escaped first to avoid double-processing.
  * - number → decimal; rejects non-finite
- * - bigint → decimal digits
+ * - bigint → decimal digits; rejects anything outside the signed 64-bit range
  * - boolean → `true` / `false`
  * - null   → `null`
  */
@@ -90,7 +150,7 @@ export function escapeLiteral(
   }
 
   if (t === "bigint") {
-    return (value as bigint).toString(10);
+    return renderBigint("escapeLiteral", value as bigint);
   }
 
   if (t === "boolean") {
@@ -154,7 +214,7 @@ export function powql(
  *
  * - string → `'...'` with `\` doubled and `'` doubled
  * - number → decimal; rejects `NaN`/`±Infinity`
- * - bigint → decimal digits
+ * - bigint → decimal digits; rejects anything outside the signed 64-bit range
  * - boolean → `true` / `false`
  * - null → `null`
  */
@@ -185,7 +245,7 @@ export function escapeSqlLiteral(
   }
 
   if (t === "bigint") {
-    return (value as bigint).toString(10);
+    return renderBigint("escapeSqlLiteral", value as bigint);
   }
 
   if (t === "boolean") {
@@ -196,12 +256,21 @@ export function escapeSqlLiteral(
 }
 
 /**
- * Validate a SQL identifier (table, column, alias). Returns it unchanged on
- * success and throws `TypeError` otherwise.
+ * Render a SQL identifier (table, column, alias). The validated name comes back
+ * double-quoted — `escapeSqlIdent("order")` gives `"order"` — and `TypeError`
+ * is thrown on any invalid input. Pass the bare name: a value that already
+ * carries quotes is rejected rather than quoted twice.
  *
- * Identifiers are validated rather than quoted because PowDB's SQL lexer reads
- * `"..."` as a string literal, so there is no identifier-quoting syntax to fall
- * back on. Only `^[A-Za-z_][A-Za-z0-9_]*$` is accepted.
+ * The quoting is unconditional. PowDB's SQL lexer reads `"..."` as an
+ * identifier and re-emits it as a backtick-quoted PowQL word, which bypasses
+ * every keyword check downstream, so quoting is the only spelling that lets a
+ * reserved word like `order` or `group` name a table. It does no case folding,
+ * so quoting a name that needed no quoting changes nothing. Doing it always
+ * means there is no second keyword list to keep in step with the engine.
+ *
+ * Quoted identifiers need a server on 0.23.0 or newer. This is for names, not
+ * types: a column type in `CREATE TABLE` is a keyword, not an identifier, and
+ * must not be passed through here.
  */
 export function escapeSqlIdent(name: string): string {
   if (typeof name !== "string") {
@@ -211,11 +280,14 @@ export function escapeSqlIdent(name: string): string {
     throw new TypeError("escapeSqlIdent: identifier must not be empty");
   }
   if (!IDENT_RE.test(name)) {
+    const hint = name.includes('"')
+      ? " (pass the bare name; escapeSqlIdent adds the quotes a reserved word needs)"
+      : "";
     throw new TypeError(
-      `escapeSqlIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)`
+      `escapeSqlIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)${hint}`
     );
   }
-  return name;
+  return `"${name}"`;
 }
 
 /** Wrapper marking a string as a SQL identifier for the `sql` tagged template. */

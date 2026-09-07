@@ -306,10 +306,16 @@ impl CompiledLeaf {
                         .try_into()
                         .unwrap_or_else(|_| unreachable!()),
                 );
-                // `total_cmp` matches Value::Ord: NaN > everything,
-                // -0.0 < +0.0, finite order as expected. Keeps compiled
-                // WHERE identical in semantics to the generic row-decode
-                // path (which calls Value::cmp directly).
+                // IEEE: an unordered operand answers no comparison, and `!=`
+                // against it is true. The generic evaluator applies the same
+                // rule (`eval::eval_binop_mode`), so a NaN cannot answer one
+                // way when the predicate compiles and another when it does not.
+                if val.is_nan() || literal.is_nan() {
+                    return *op == BinOp::Neq;
+                }
+                // `total_cmp` matches Value::Ord: -0.0 < +0.0, finite order as
+                // expected. Keeps compiled WHERE identical in semantics to the
+                // generic row-decode path (which calls Value::cmp directly).
                 let ord = val.total_cmp(literal);
                 match op {
                     BinOp::Eq => ord.is_eq(),
@@ -493,21 +499,31 @@ fn json_compare(node: Option<&[u8]>, op: BinOp, literal: &Value) -> bool {
     if json_node_is_empty(node) {
         return false;
     }
+    // IEEE, as in `eval::eval_binop_mode`: nothing compares against NaN and
+    // `!=` against it is true. JSON has no NaN of its own, so only the literal
+    // can be one.
+    if matches!(literal, Value::Float(f) if f.is_nan()) {
+        return op == BinOp::Neq;
+    }
     match op {
         BinOp::Eq => json_scalar_eq(node, literal),
         BinOp::Neq => !json_scalar_eq(node, literal),
-        BinOp::Lt => json_scalar_cmp(node, literal) == Ordering::Less,
-        BinOp::Gt => json_scalar_cmp(node, literal) == Ordering::Greater,
-        BinOp::Lte => json_scalar_cmp(node, literal) != Ordering::Greater,
-        BinOp::Gte => json_scalar_cmp(node, literal) != Ordering::Less,
+        // An ordered comparison across two different scalar types is false, the
+        // same rule `eval::eval_binop_mode` applies. Ranking them by type
+        // discriminant, which is what `Value::Ord`'s tail arm does, made
+        // `->v > 99.5` return the string and bool rows.
+        BinOp::Lt => json_scalar_cmp(node, literal) == Some(Ordering::Less),
+        BinOp::Gt => json_scalar_cmp(node, literal) == Some(Ordering::Greater),
+        BinOp::Lte => matches!(
+            json_scalar_cmp(node, literal),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
+        BinOp::Gte => matches!(
+            json_scalar_cmp(node, literal),
+            Some(Ordering::Greater | Ordering::Equal)
+        ),
         _ => false,
     }
-}
-
-/// `TypeId`-rank comparison, the tail arm of `Value::cmp` for unrelated types.
-#[inline]
-fn type_id_cmp(a: TypeId, b: TypeId) -> Ordering {
-    (a as u8).cmp(&(b as u8))
 }
 
 /// Equality of a scalarized JSON `node` against `lit`, matching what
@@ -559,51 +575,46 @@ fn json_scalar_eq(node: Option<&[u8]>, lit: &Value) -> bool {
 /// fall back to `TypeId` rank. Zero allocation for every same-type comparison
 /// (the realistic case); cross-type paths read only the node's tag.
 #[inline]
-fn json_scalar_cmp(node: Option<&[u8]>, lit: &Value) -> Ordering {
-    let Some(n) = node else { return Ordering::Less };
+fn json_scalar_cmp(node: Option<&[u8]>, lit: &Value) -> Option<Ordering> {
+    let n = node?;
     match n.first() {
-        // JSON null scalarizes to Empty, which sorts before any literal.
-        Some(0) => Ordering::Less,
         Some(1) => cmp_bool_lit(false, lit),
         Some(2) => cmp_bool_lit(true, lit),
         Some(3) if n.len() >= 9 => {
             let a = i64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
-                Value::Int(b) => a.cmp(b),
-                Value::Float(b) => int_f64_cmp(a, *b),
-                other => type_id_cmp(TypeId::Int, other.type_id()),
+                Value::Int(b) => Some(a.cmp(b)),
+                Value::Float(b) => Some(int_f64_cmp(a, *b)),
+                _ => None,
             }
         }
         Some(4) if n.len() >= 9 => {
             let a = f64::from_le_bytes(n[1..9].try_into().unwrap());
             match lit {
-                Value::Float(b) => a.total_cmp(b),
-                Value::Int(b) => int_f64_cmp(*b, a).reverse(),
-                other => type_id_cmp(TypeId::Float, other.type_id()),
+                Value::Float(b) => Some(a.total_cmp(b)),
+                Value::Int(b) => Some(int_f64_cmp(*b, a).reverse()),
+                _ => None,
             }
         }
         Some(5) if n.len() >= 5 => {
             let len = u32::from_le_bytes(n[1..5].try_into().unwrap()) as usize;
             match (n.get(5..5 + len), lit) {
-                (Some(s), Value::Str(b)) => s.cmp(b.as_bytes()),
-                (Some(_), other) => type_id_cmp(TypeId::Str, other.type_id()),
-                // Truncated string node scalarizes to Empty.
-                (None, _) => Ordering::Less,
+                (Some(s), Value::Str(b)) => Some(s.cmp(b.as_bytes())),
+                _ => None,
             }
         }
-        // object/array node vs a scalar literal: ordered by TypeId rank.
-        Some(6) | Some(7) => type_id_cmp(TypeId::Json, lit.type_id()),
-        // Truncated/reserved/missing: the empty set.
-        _ => Ordering::Less,
+        // A JSON null, an object, an array, a truncated node: no scalar of the
+        // literal's type to order against.
+        _ => None,
     }
 }
 
 /// Order a bool JSON node against a literal per `Value::cmp`.
 #[inline]
-fn cmp_bool_lit(b: bool, lit: &Value) -> Ordering {
+fn cmp_bool_lit(b: bool, lit: &Value) -> Option<Ordering> {
     match lit {
-        Value::Bool(lb) => b.cmp(lb),
-        other => type_id_cmp(TypeId::Bool, other.type_id()),
+        Value::Bool(lb) => Some(b.cmp(lb)),
+        _ => None,
     }
 }
 

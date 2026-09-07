@@ -67,6 +67,11 @@ fn the_gate_actually_compares_something() {
 /// moment someone writes one they would silently reopen the dead zone. That is
 /// a ledger edit, not a code change, and nothing else would catch it.
 ///
+/// `json_path_filter` is a twin of the third kind: the shape was split in two
+/// so that the entry for ordering across types lands on
+/// `json_path_filter_ordered` alone, leaving equality over the same paths
+/// policed by a shape that carries nothing.
+///
 /// `filter_is_null` joins them for the same reason without being a purpose-built
 /// twin: it already asks, entry-free, exactly the question that
 /// `cmp_against_null_literal`'s entry blankets. That entry excuses one spelling
@@ -75,10 +80,11 @@ fn the_gate_actually_compares_something() {
 /// carries no entry.
 #[test]
 fn the_policing_twins_carry_no_ledger_entry() {
-    const TWINS: [&str; 3] = [
+    const TWINS: [&str; 4] = [
         "agg_sum_avg_int_zero_default",
         "filter_not_non_null",
         "filter_is_null",
+        "json_path_filter",
     ];
     let entries = parse(LEDGER).expect("known_divergences.toml must parse");
     for twin in TWINS {

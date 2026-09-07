@@ -4,6 +4,7 @@ use crate::cancel::CancelCheck;
 use crate::result::{QueryError, QueryResult};
 use powdb_storage::catalog::{LinkDef, LinkKind};
 use powdb_storage::row::{decode_row, RowLayout};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use crate::executor::eval::*;
@@ -32,7 +33,7 @@ impl Engine {
     /// Lowering is idempotent, so a caller that already has a lowered tree pays
     /// one pass and gets the same plan back.
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
-        let lowered = self.lower(plan);
+        let lowered = self.lower(plan)?;
         self.execute_lowered(&lowered)
     }
 
@@ -49,11 +50,10 @@ impl Engine {
         // FunctionCall the grouped-aggregate planner could not lower. Without
         // this, such an aggregate would reach eval_expr and silently evaluate
         // to Empty (a wrong answer). The outermost call validates the whole
-        // tree before any row is produced.
-        validate_no_stray_aggregates(plan)?;
-        validate_json_path_types(&self.catalog, plan)?;
-        validate_column_references(&self.catalog, plan)?;
-        validate_slice_counts(plan)?;
+        // tree before any row is produced; the same call also refuses unknown
+        // tables and columns, mistyped comparisons, mistyped JSON path bases
+        // and negative slice counts, against the catalog as it is right now.
+        validate_plan(&self.catalog, plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -274,10 +274,9 @@ impl Engine {
                     let proj_columns: Vec<String> = fields
                         .iter()
                         .map(|f| {
-                            f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                Expr::Field(name) => name.clone(),
-                                _ => "?".into(),
-                            })
+                            f.alias
+                                .clone()
+                                .unwrap_or_else(|| projection_output_name(&f.expr))
                         })
                         .collect();
 
@@ -312,7 +311,7 @@ impl Engine {
                             // `heap.get` + `decode_column` read raw v2 bytes and
                             // returned Empty for a spilled column (or wrapped a
                             // >= 64KB value).
-                            if let Some(full) = tbl.get(rid) {
+                            if let Some(full) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 let row: Vec<Value> =
                                     proj_indices.iter().map(|&ci| full[ci].clone()).collect();
                                 rows.push(row);
@@ -448,16 +447,12 @@ impl Engine {
                         let proj_columns: Vec<String> = fields
                             .iter()
                             .map(|f| {
-                                f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                    Expr::Field(name) => name.clone(),
-                                    // Mission E1.2: `{ u.name }` projects as the
-                                    // qualified column name so callers can still
-                                    // disambiguate across the join output.
-                                    Expr::QualifiedField { qualifier, field } => {
-                                        format!("{qualifier}.{field}")
-                                    }
-                                    _ => "?".into(),
-                                })
+                                // Mission E1.2: `{ u.name }` projects as the
+                                // qualified column name so callers can still
+                                // disambiguate across the join output.
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
                             })
                             .collect();
                         let mut cancel = CancelCheck::new();
@@ -941,9 +936,13 @@ impl Engine {
                     let rids = tbl.index_lookup_all(key_column, &key_value);
                     // Overflow safety (P0-3): reassemble via `tbl.get` so an
                     // upsert conflict row with a spilled column is read in full.
-                    rids.into_iter()
-                        .next()
-                        .and_then(|rid| tbl.get(rid).map(|row| (rid, row)))
+                    match rids.into_iter().next() {
+                        Some(rid) => tbl
+                            .get(rid)
+                            .map_err(QueryError::from_storage_io)?
+                            .map(|row| (rid, row)),
+                        None => None,
+                    }
                 };
 
                 if let Some((rid, mut existing_row)) = existing {
@@ -1112,8 +1111,17 @@ impl Engine {
                     // after a logged prefix would violate statement atomicity and
                     // is especially unsafe inside an explicit transaction.
                     crate::cancel::check()?;
+                    // Same two-pass shape as the non-returning expression path
+                    // below: compute every new row image first, so an
+                    // arithmetic fault refuses the statement instead of leaving
+                    // the rows before it written.
+                    let mut pending_rids = Vec::with_capacity(matching_rids.len());
                     for rid in matching_rids {
-                        let mut row = match self.catalog.get(table, rid) {
+                        let mut row = match self
+                            .catalog
+                            .get(table, rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             Some(r) => r,
                             None => continue,
                         };
@@ -1137,10 +1145,17 @@ impl Engine {
                                 }
                             }
                         }
-                        self.catalog
-                            .update_hinted(table, rid, &row, Some(&changed_cols))
-                            .map_err(QueryError::from_storage_io)?;
+                        pending_rids.push(rid);
                         out_rows.push(row);
+                    }
+                    if let Some(message) = take_arith_fault() {
+                        return Err(QueryError::Execution(message));
+                    }
+                    self.charge_rows(&out_rows)?;
+                    for (rid, row) in pending_rids.iter().zip(&out_rows) {
+                        self.catalog
+                            .update_hinted(table, *rid, row, Some(&changed_cols))
+                            .map_err(QueryError::from_storage_io)?;
                     }
                     self.view_registry
                         .mark_dependents_dirty(table)
@@ -1289,7 +1304,11 @@ impl Engine {
                             }
                         }
                         for rid in fallback_rids {
-                            let mut row = match self.catalog.get(table, rid) {
+                            let mut row = match self
+                                .catalog
+                                .get(table, rid)
+                                .map_err(QueryError::from_storage_io)?
+                            {
                                 Some(r) => r,
                                 None => continue,
                             };
@@ -1372,7 +1391,11 @@ impl Engine {
                             }
                         }
                         for rid in fallback_rids {
-                            let mut row = match self.catalog.get(table, rid) {
+                            let mut row = match self
+                                .catalog
+                                .get(table, rid)
+                                .map_err(QueryError::from_storage_io)?
+                            {
                                 Some(r) => r,
                                 None => continue,
                             };
@@ -1393,7 +1416,11 @@ impl Engine {
                     // Generic literal path: decode row, apply literal values.
                     let mut count = 0u64;
                     for rid in matching_rids {
-                        let mut row = match self.catalog.get(table, rid) {
+                        let mut row = match self
+                            .catalog
+                            .get(table, rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             Some(r) => r,
                             None => continue,
                         };
@@ -1421,9 +1448,23 @@ impl Engine {
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     schema_ref.columns.iter().map(|c| c.name.clone()).collect()
                 };
-                let mut count = 0u64;
+                // Every target row's new image is computed BEFORE any of them
+                // is written. The expression evaluator reports an overflow or a
+                // per-row zero divisor through `arith_fault` rather than through
+                // its return value, and writing as we go would leave the rows
+                // before the faulting one holding the `Value::Empty` it produced
+                // instead. Two passes cost the same materialization the
+                // `returning` path above already pays.
+                let (mut pending_rids, mut pending_rows) = (
+                    Vec::with_capacity(matching_rids.len()),
+                    Vec::with_capacity(matching_rids.len()),
+                );
                 for rid in matching_rids {
-                    let mut row = match self.catalog.get(table, rid) {
+                    let mut row = match self
+                        .catalog
+                        .get(table, rid)
+                        .map_err(QueryError::from_storage_io)?
+                    {
                         Some(r) => r,
                         None => continue,
                     };
@@ -1437,6 +1478,15 @@ impl Engine {
                         row[col_indices[i]] =
                             coerce_value(val, &target_cols[i]).map_err(QueryError::TypeError)?;
                     }
+                    pending_rids.push(rid);
+                    pending_rows.push(row);
+                }
+                if let Some(message) = take_arith_fault() {
+                    return Err(QueryError::Execution(message));
+                }
+                self.charge_rows(&pending_rows)?;
+                let mut count = 0u64;
+                for (rid, row) in pending_rids.into_iter().zip(pending_rows) {
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))
                         .map_err(QueryError::from_storage_io)?;
@@ -1475,7 +1525,11 @@ impl Engine {
                     let mut cancel = CancelCheck::new();
                     for rid in &matching_rids {
                         cancel.tick()?;
-                        if let Some(row) = self.catalog.get(table, *rid) {
+                        if let Some(row) = self
+                            .catalog
+                            .get(table, *rid)
+                            .map_err(QueryError::from_storage_io)?
+                        {
                             out_rows.push(row);
                         }
                     }
@@ -1817,6 +1871,7 @@ impl Engine {
                     table_name: name.clone(),
                     columns,
                 };
+                refuse_schema_with_no_room_for_a_row(&schema)?;
                 self.catalog
                     .create_table_full(schema, defaults, auto_cols)
                     .map_err(QueryError::from_storage_io)?;
@@ -1843,24 +1898,49 @@ impl Engine {
                 })
             }
 
+            PlanNode::DropLink {
+                owner,
+                name,
+                if_exists,
+            } => {
+                if *if_exists && self.catalog.link(owner, name).is_none() {
+                    return Ok(QueryResult::Executed {
+                        message: format!("link '{name}' on '{owner}' does not exist (skipped)"),
+                    });
+                }
+                self.catalog
+                    .drop_link(owner, name)
+                    .map_err(QueryError::from_storage_io)?;
+                // A cached plan may traverse the link that just went, and a
+                // materialized view built over it can no longer be recomputed.
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.clear();
+                }
+                Ok(QueryResult::Executed {
+                    message: format!("link '{name}' dropped from '{owner}'"),
+                })
+            }
+
             PlanNode::AlterTable { table, action } => match action {
                 AlterAction::AddColumn {
                     name,
                     type_name,
                     required,
                 } => {
-                    let position = self
+                    let existing = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
-                        .columns
-                        .len() as u16;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                    let position = existing.columns.len() as u16;
                     let col = ColumnDef {
                         name: name.clone(),
                         type_id: type_name_to_id(type_name).map_err(QueryError::TypeError)?,
                         required: *required,
                         position,
                     };
+                    let mut widened = existing.clone();
+                    widened.columns.push(col.clone());
+                    refuse_schema_with_no_room_for_a_row(&widened)?;
                     self.catalog
                         .alter_table_add_column(table, col)
                         .map_err(QueryError::from_storage_io)?;
@@ -2076,6 +2156,18 @@ impl Engine {
             },
 
             PlanNode::DropTable { name, if_exists } => {
+                // A materialized view is a registry entry plus a backing table
+                // that happens to share its name. `drop` reaches only the
+                // table, so it left the definition behind in `views.bin`: the
+                // view stayed registered, stayed listed, was still marked dirty
+                // by writes to its source, and every read of it reported a
+                // missing table, across restarts. One DDL drops a view whole,
+                // and this refusal is what points at it.
+                if self.view_registry.is_view(name) {
+                    return Err(QueryError::Execution(format!(
+                        "'{name}' is a materialized view; use 'drop view {name}'"
+                    )));
+                }
                 if *if_exists && self.catalog.schema(name).is_none() {
                     return Ok(QueryResult::Executed {
                         message: format!("type '{name}' does not exist (skipped)"),
@@ -2159,32 +2251,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on right side".into()),
                 };
-                let mut combined = left_rows;
-                let mut cancel = CancelCheck::new();
-                if *all {
-                    // UNION ALL — just concatenate.
-                    for row in right_rows {
-                        cancel.tick()?;
-                        combined.push(row);
-                    }
-                } else {
-                    // UNION — deduplicate using the same HashSet approach
-                    // as DISTINCT. Value already implements Hash + Eq.
-                    let mut seen = std::collections::HashSet::new();
-                    for row in &combined {
-                        cancel.tick()?;
-                        seen.insert(row.clone());
-                    }
-                    for row in right_rows {
-                        cancel.tick()?;
-                        if seen.insert(row.clone()) {
-                            combined.push(row);
-                        }
-                    }
-                }
                 Ok(QueryResult::Rows {
                     columns: left_cols,
-                    rows: combined,
+                    rows: union_rows(left_rows, right_rows, *all)?,
                 })
             }
 
@@ -2266,7 +2335,7 @@ impl Engine {
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns; the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value.
-                        if let Some(row) = tbl.get(rid) {
+                        if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                             rows.push(row);
                         }
                     }
@@ -2377,7 +2446,9 @@ impl Engine {
                             for rid in rids {
                                 cancel.tick()?;
                                 // Overflow safety (P0-3): reassemble spilled cols.
-                                if let Some(row) = tbl.get(rid) {
+                                if let Some(row) =
+                                    tbl.get(rid).map_err(QueryError::from_storage_io)?
+                                {
                                     if !row[col_idx].is_empty()
                                         && range_matches(
                                             &row[col_idx],
@@ -2434,7 +2505,7 @@ impl Engine {
                                 }
                             }
                             // Overflow safety (P0-3): reassemble spilled cols.
-                            if let Some(row) = tbl.get(rid) {
+                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 rows.push(row);
                             }
                         }
@@ -2512,7 +2583,7 @@ impl Engine {
             _ => return Err("view source query must be a SELECT".into()),
         };
         // Derive a schema for the backing table from the query result columns.
-        let schema = self.derive_view_schema(name, &columns, &rows)?;
+        let schema = self.derive_view_schema(name, &columns, &rows, query_text)?;
         // Create the backing table and insert the result rows.
         crate::cancel::check()?;
         self.catalog
@@ -2530,11 +2601,7 @@ impl Engine {
         // and `register` fsyncs `views.bin` while those rows are still only in
         // the WAL buffer. A crash in between would leave a registered, clean,
         // EMPTY view answering queries with zero rows and no error.
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         self.view_registry
             .register(ViewDef {
                 name: name.to_string(),
@@ -2560,7 +2627,7 @@ impl Engine {
         parse_stored_view_source(name, &query_text)?;
         // Execute the source query.
         let result = self.execute_powql(&query_text)?;
-        let (_columns, rows) = match result {
+        let (columns, rows) = match result {
             QueryResult::Rows { columns, rows } => (columns, rows),
             _ => return Err("view source query must be a SELECT".into()),
         };
@@ -2570,39 +2637,93 @@ impl Engine {
         // (the base table changed, a `??` arm flipped). That has to be a
         // typed error HERE, before the old contents are destroyed, not an
         // abort or bit-reinterpreted garbage inside the insert loop below.
-        {
+        //
+        // The one case where it is not an error is a backing table that holds
+        // no rows: nothing is stored for those types to describe, so retyping
+        // it destroys nothing. That is what lets a view materialized over an
+        // empty source recover on its first real refresh instead of refusing
+        // every read from then on.
+        let mismatch = {
             let schema = self.catalog.schema(name).ok_or_else(|| {
                 QueryError::ViewError(format!("materialized view '{name}' has no backing table"))
             })?;
-            for row in &rows {
+            let mut mismatch = None;
+            'rows: for row in &rows {
                 if row.len() != schema.columns.len() {
-                    return Err(QueryError::ViewError(format!(
+                    mismatch = Some(QueryError::ViewError(format!(
                         "refresh of materialized view '{name}' produced rows with {} \
                          columns but the view stores {}; drop and recreate the view",
                         row.len(),
                         schema.columns.len()
                     )));
+                    break 'rows;
                 }
                 for (val, col) in row.iter().zip(&schema.columns) {
                     let t = val.type_id();
                     if t != powdb_storage::types::TypeId::Empty && t != col.type_id {
-                        return Err(QueryError::ViewError(format!(
+                        mismatch = Some(QueryError::ViewError(format!(
                             "refresh of materialized view '{name}' produced a {t:?} \
                              in column '{}' but the view stores {:?}; drop and \
                              recreate the view to change its column types",
                             col.name, col.type_id
                         )));
+                        break 'rows;
                     }
                 }
             }
-        }
+            mismatch
+        };
+        let rebuildable = self.backing_table_is_rebuildable(name);
+        let retype = match mismatch {
+            None => false,
+            Some(mismatch) => {
+                let backing_is_empty = {
+                    let mut scan = self
+                        .catalog
+                        .scan(name)
+                        .map_err(QueryError::from_storage_io)?;
+                    scan.next().is_none()
+                };
+                if !backing_is_empty || !rebuildable {
+                    return Err(mismatch);
+                }
+                true
+            }
+        };
         // Clear old data and insert fresh results. Mission B2: logged
         // variant — view refreshes are a mutation and crash recovery
         // must see them.
+        //
+        // Deleting every row leaves its bytes in place: a slotted page marks
+        // the slot and never moves `free_start` back, so each refresh appended
+        // a whole new copy of the view beside the old one and the backing heap
+        // grew without bound (113 MB from a 1 MB base table in half an hour).
+        // Rebuilding the table frees the file instead, and is also less WAL
+        // than one delete record per row. It needs plain DDL, so a backing
+        // table with indexes, or a refresh inside an explicit transaction,
+        // keeps the delete path.
         crate::cancel::check()?;
-        self.catalog
-            .scan_delete_matching_logged(name, |_| true)
-            .map_err(QueryError::from_storage_io)?;
+        if rebuildable {
+            let schema = if retype {
+                self.derive_view_schema(name, &columns, &rows, &query_text)?
+            } else {
+                self.catalog.schema(name).cloned().ok_or_else(|| {
+                    QueryError::ViewError(format!(
+                        "materialized view '{name}' has no backing table"
+                    ))
+                })?
+            };
+            self.catalog
+                .drop_table(name)
+                .map_err(QueryError::from_storage_io)?;
+            self.catalog
+                .create_table(schema)
+                .map_err(QueryError::from_storage_io)?;
+        } else {
+            self.catalog
+                .scan_delete_matching_logged(name, |_| true)
+                .map_err(QueryError::from_storage_io)?;
+        }
         for row in &rows {
             self.catalog
                 .insert(name, row)
@@ -2628,6 +2749,30 @@ impl Engine {
                 .map_err(QueryError::from_storage_io)?;
         }
         Ok(())
+    }
+
+    /// Whether a view's backing table can be dropped and recreated to reclaim
+    /// its previous materialization.
+    ///
+    /// Rebuilding is plain DDL, so it is out on three counts: inside an
+    /// explicit transaction the catalog refuses DDL outright, a secondary index
+    /// on the backing table would be silently lost, and a declared link that
+    /// names the table pins it in place. Each of those keeps the delete path,
+    /// which is correct but does not reclaim.
+    fn backing_table_is_rebuildable(&self, name: &str) -> bool {
+        if self.in_transaction {
+            return false;
+        }
+        if self
+            .catalog
+            .links()
+            .any(|link| link.owner_type == name || link.target_type == name)
+        {
+            return false;
+        }
+        self.catalog
+            .get_table(name)
+            .is_some_and(|table| table.indexes_is_empty())
     }
 
     /// Drop a materialized view: remove the backing table and unregister.
@@ -2662,6 +2807,7 @@ impl Engine {
         name: &str,
         columns: &[String],
         rows: &[Vec<Value>],
+        query_text: &str,
     ) -> Result<Schema, QueryError> {
         use powdb_storage::types::{ColumnDef, TypeId};
         let mut types: Vec<Option<TypeId>> = vec![None; columns.len()];
@@ -2685,15 +2831,21 @@ impl Engine {
                 }
             }
         }
+        // A column the rows could not type (all null, or no rows at all) falls
+        // back to the source schema. Typing it `str` unconditionally is what
+        // froze a view materialized over zero rows into a table of strings that
+        // every later refresh then refused to write. Only a column with nothing
+        // to inherit from either -- a computed expression over no rows -- keeps
+        // `str`, and the refresh path retypes that one on its first real row.
+        let inherited = self.static_view_column_types(query_text);
         let cols: Vec<ColumnDef> = columns
             .iter()
             .enumerate()
             .map(|(i, col_name)| ColumnDef {
                 name: col_name.clone(),
-                // A column with no non-null value anywhere (or no rows at
-                // all) stores as str: it encodes every null and keeps the
-                // table readable.
-                type_id: types[i].unwrap_or(TypeId::Str),
+                type_id: types[i]
+                    .or_else(|| inherited.get(col_name).copied())
+                    .unwrap_or(TypeId::Str),
                 required: false,
                 position: i as u16,
             })
@@ -2702,6 +2854,94 @@ impl Engine {
             table_name: name.to_string(),
             columns: cols,
         })
+    }
+
+    /// The output columns a view's source query types statically, taken from
+    /// the source schema rather than from the rows that came back.
+    ///
+    /// Only pass-through references are typed here: a projection field that is
+    /// a bare or qualified scan column, or, for a plain single-table view with
+    /// no projection, every column of the source. Anything computed has no
+    /// declared type to inherit and is left to the rows.
+    fn static_view_column_types(&self, query_text: &str) -> HashMap<String, TypeId> {
+        let mut inherited = HashMap::new();
+        let Ok(Statement::Query(q)) = crate::parser::parse(query_text) else {
+            return inherited;
+        };
+        // Bare names that more than one source exposes resolve by suffix match
+        // at runtime and have no single declared type, so they are dropped.
+        let mut bare: HashMap<String, Option<TypeId>> = HashMap::new();
+        let mut qualified: HashMap<String, TypeId> = HashMap::new();
+        let mut sources: Vec<(String, String)> = vec![(
+            q.alias.clone().unwrap_or_else(|| q.source.clone()),
+            q.source.clone(),
+        )];
+        for join in &q.joins {
+            sources.push((
+                join.alias.clone().unwrap_or_else(|| join.source.clone()),
+                join.source.clone(),
+            ));
+        }
+        for (alias, table) in &sources {
+            let Some(schema) = self.catalog.schema(table) else {
+                return inherited;
+            };
+            for column in &schema.columns {
+                qualified.insert(format!("{alias}.{}", column.name), column.type_id);
+                match bare.get(&column.name) {
+                    Some(Some(previous)) if *previous == column.type_id => {}
+                    Some(_) => {
+                        bare.insert(column.name.clone(), None);
+                    }
+                    None => {
+                        bare.insert(column.name.clone(), Some(column.type_id));
+                    }
+                }
+            }
+        }
+        match &q.projection {
+            Some(fields) => {
+                for field in fields {
+                    let (output, type_id) = match &field.expr {
+                        Expr::Field(name) => (
+                            field.alias.clone().unwrap_or_else(|| name.clone()),
+                            bare.get(name).copied().flatten(),
+                        ),
+                        Expr::QualifiedField {
+                            qualifier,
+                            field: column,
+                        } => (
+                            field
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| format!("{qualifier}.{column}")),
+                            qualified.get(&format!("{qualifier}.{column}")).copied(),
+                        ),
+                        _ => continue,
+                    };
+                    if let Some(type_id) = type_id {
+                        inherited.insert(output, type_id);
+                    }
+                }
+            }
+            // With no projection the row IS the source row, but only for a
+            // plain single-table read: a join renames every column, and
+            // grouping or aggregation produces computed ones.
+            None => {
+                if q.joins.is_empty()
+                    && q.alias.is_none()
+                    && q.aggregation.is_none()
+                    && q.group_by.is_none()
+                {
+                    for (name, type_id) in bare {
+                        if let Some(type_id) = type_id {
+                            inherited.insert(name, type_id);
+                        }
+                    }
+                }
+            }
+        }
+        inherited
     }
 
     /// Extract base table dependencies from a view's source query by
@@ -2713,28 +2953,170 @@ impl Engine {
     /// hold, permanently and without any error: the exact silent-wrong-answer
     /// shape the rest of the engine refuses.
     fn extract_view_deps(&self, name: &str, query_text: &str) -> Result<Vec<String>, QueryError> {
-        fn collect(statement: &Statement, deps: &mut Vec<String>) {
-            match statement {
-                Statement::Query(q) => {
-                    deps.push(q.source.clone());
-                    for join in &q.joins {
-                        deps.push(join.source.clone());
-                    }
-                }
-                // Both halves of a union are read by the view, so both have to
-                // be able to dirty it. Without this arm a `union` view was
-                // registered with no dependencies at all and never refreshed.
-                Statement::Union(u) => {
-                    collect(&u.left, deps);
-                    collect(&u.right, deps);
-                }
-                _ => {}
-            }
-        }
         let statement = parse_stored_view_source(name, query_text)?;
         let mut deps = Vec::new();
-        collect(&statement, &mut deps);
+        self.collect_statement_deps(&statement, &mut deps);
         Ok(deps)
+    }
+
+    fn collect_statement_deps(&self, statement: &Statement, deps: &mut Vec<String>) {
+        match statement {
+            Statement::Query(q) => self.collect_query_deps(q, &AliasScope::default(), deps),
+            // Both halves of a union are read by the view, so both have to be
+            // able to dirty it. Without this arm a `union` view was registered
+            // with no dependencies at all and never refreshed.
+            Statement::Union(u) => {
+                self.collect_statement_deps(&u.left, deps);
+                self.collect_statement_deps(&u.right, deps);
+            }
+            _ => {}
+        }
+    }
+
+    /// Every table one query level reads: its own source, its joins, the
+    /// sources of any subquery in its clauses, and the child and link-target
+    /// tables its projection reaches.
+    fn collect_query_deps(&self, q: &QueryExpr, outer: &AliasScope, deps: &mut Vec<String>) {
+        push_dep(deps, &q.source);
+        let mut scope = outer.clone();
+        scope.bind(q.alias.as_deref().unwrap_or(&q.source), &q.source);
+        for join in &q.joins {
+            push_dep(deps, &join.source);
+            scope.bind(join.alias.as_deref().unwrap_or(&join.source), &join.source);
+            if let Some(on) = &join.on {
+                self.collect_expr_deps(on, &scope, deps);
+            }
+        }
+        if let Some(filter) = &q.filter {
+            self.collect_expr_deps(filter, &scope, deps);
+        }
+        for field in q.projection.iter().flatten() {
+            self.collect_expr_deps(&field.expr, &scope, deps);
+        }
+        if let Some(order) = &q.order {
+            for key in &order.keys {
+                self.collect_expr_deps(&key.expr, &scope, deps);
+            }
+        }
+        if let Some(group_by) = &q.group_by {
+            for key in &group_by.keys {
+                self.collect_expr_deps(&key.expr, &scope, deps);
+            }
+            if let Some(having) = &group_by.having {
+                self.collect_expr_deps(having, &scope, deps);
+            }
+        }
+        if let Some(aggregation) = &q.aggregation {
+            if let Some(argument) = &aggregation.argument {
+                self.collect_expr_deps(argument, &scope, deps);
+            }
+        }
+    }
+
+    /// Every table an expression reads. Nested blocks, link paths and
+    /// subqueries all name tables that no scan node of this level mentions;
+    /// missing them is what left a view over the flagship PowQL shapes
+    /// permanently stale.
+    fn collect_expr_deps(&self, expr: &Expr, scope: &AliasScope, deps: &mut Vec<String>) {
+        match expr {
+            Expr::NestedQuery(nested) => {
+                let table = match &nested.via_link {
+                    Some(via) => match self.link_target(scope, &via.outer_alias, &via.link_name) {
+                        Some(target) => target,
+                        // An unresolvable link is reported when the view is
+                        // first executed; there is no table to depend on.
+                        None => return,
+                    },
+                    None => nested.source.clone(),
+                };
+                push_dep(deps, &table);
+                let mut inner = scope.clone();
+                inner.bind(&nested.alias, &table);
+                self.collect_expr_deps(&nested.filter, &inner, deps);
+                if let Some(order) = &nested.order {
+                    for key in &order.keys {
+                        self.collect_expr_deps(&key.expr, &inner, deps);
+                    }
+                }
+                for field in &nested.fields {
+                    self.collect_expr_deps(&field.expr, &inner, deps);
+                }
+            }
+            Expr::LinkPath {
+                outer_alias, links, ..
+            } => {
+                let Some(mut owner) = scope.table_of(outer_alias) else {
+                    return;
+                };
+                for link in links {
+                    let Some(target) = self
+                        .catalog
+                        .link(&owner, link)
+                        .map(|l| l.target_type.clone())
+                    else {
+                        return;
+                    };
+                    push_dep(deps, &target);
+                    owner = target;
+                }
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.collect_expr_deps(expr, scope, deps);
+                self.collect_query_deps(subquery, scope, deps);
+            }
+            Expr::ExistsSubquery { subquery, .. } => self.collect_query_deps(subquery, scope, deps),
+            Expr::BinaryOp(l, _, r) | Expr::Coalesce(l, r) => {
+                self.collect_expr_deps(l, scope, deps);
+                self.collect_expr_deps(r, scope, deps);
+            }
+            Expr::UnaryOp(_, inner)
+            | Expr::FunctionCall(_, inner, _)
+            | Expr::Cast(inner, _)
+            | Expr::JsonPath { base: inner, .. } => self.collect_expr_deps(inner, scope, deps),
+            Expr::ScalarFunc(_, args) => {
+                for arg in args {
+                    self.collect_expr_deps(arg, scope, deps);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.collect_expr_deps(expr, scope, deps);
+                for item in list {
+                    self.collect_expr_deps(item, scope, deps);
+                }
+            }
+            Expr::Case { whens, else_expr } => {
+                for (when, then) in whens {
+                    self.collect_expr_deps(when, scope, deps);
+                    self.collect_expr_deps(then, scope, deps);
+                }
+                if let Some(else_expr) = else_expr {
+                    self.collect_expr_deps(else_expr, scope, deps);
+                }
+            }
+            Expr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                for arg in args.iter().chain(partition_by) {
+                    self.collect_expr_deps(arg, scope, deps);
+                }
+                for key in order_by {
+                    self.collect_expr_deps(&key.expr, scope, deps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The table a declared link points at, given the alias its owner is bound
+    /// to in this scope.
+    fn link_target(&self, scope: &AliasScope, outer_alias: &str, link: &str) -> Option<String> {
+        let owner = scope.table_of(outer_alias)?;
+        self.catalog
+            .link(&owner, link)
+            .map(|link| link.target_type.clone())
     }
 
     /// Route a parsed link declaration to the persistent catalog's
@@ -3038,7 +3420,10 @@ impl Engine {
                     if key.type_id() != col_type {
                         continue;
                     }
-                    if let Some((_, row)) = tbl.index_lookup(&hop.key_col, key) {
+                    if let Some((_, row)) = tbl
+                        .index_lookup(&hop.key_col, key)
+                        .map_err(QueryError::from_storage_io)?
+                    {
                         // A NULL key never matches any FK value.
                         if row[key_idx] == Value::Empty {
                             continue;
@@ -3184,7 +3569,7 @@ impl Engine {
                 NestedProjectField::Plain(f) => f
                     .alias
                     .clone()
-                    .unwrap_or_else(|| expression_output_name(&f.expr)),
+                    .unwrap_or_else(|| projection_output_name(&f.expr)),
                 NestedProjectField::Nested(nested) => nested.name.clone(),
                 NestedProjectField::Link(link) => link.name.clone(),
             })
@@ -3399,7 +3784,7 @@ impl Engine {
                     cancel.tick()?;
                     // `tbl.get` reassembles spilled/overflow columns and
                     // tolerates a stale rid (None) like the IndexScan path.
-                    if let Some(row) = tbl.get(rid) {
+                    if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                         narrow_into(&row, &mut child_rows)?;
                     }
                 }
@@ -3670,4 +4055,63 @@ pub(super) fn parse_stored_view_source(name: &str, source: &str) -> Result<State
              <the original query>`."
         ))
     })
+}
+
+/// Query aliases bound to their tables while walking a view's source, so a
+/// link traversal can be resolved against its owner's declared type.
+#[derive(Clone, Default)]
+struct AliasScope {
+    bindings: Vec<(String, String)>,
+}
+
+impl AliasScope {
+    fn bind(&mut self, alias: &str, table: &str) {
+        self.bindings.push((alias.to_string(), table.to_string()));
+    }
+
+    /// The table an alias names. Later bindings shadow earlier ones, which is
+    /// what makes a nested block's own alias win over an outer one.
+    fn table_of(&self, alias: &str) -> Option<String> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(bound, _)| bound == alias)
+            .map(|(_, table)| table.clone())
+    }
+}
+
+/// Record a dependency once. The list is small and order is what the view
+/// registry persists, so this keeps insertion order rather than sorting.
+fn push_dep(deps: &mut Vec<String>, table: &str) {
+    if !deps.iter().any(|dep| dep == table) {
+        deps.push(table.to_string());
+    }
+}
+
+/// Refuse a schema no row of which can ever be stored.
+///
+/// A row lives in one page and cannot be split across pages: overflow pages
+/// hold an individual large VALUE, not a row's own header. Once the null
+/// bitmap, the fixed-column region and the variable-offset table exceed the
+/// page's row budget on their own, every `insert` fails, including one that
+/// sets nothing at all, so the type could be declared and could never hold a
+/// row. Measured by encoding the emptiest row the schema allows rather than by
+/// re-deriving the layout arithmetic here, so it stays true if the row format
+/// changes.
+fn refuse_schema_with_no_room_for_a_row(schema: &Schema) -> Result<(), QueryError> {
+    let empty_row = vec![Value::Empty; schema.columns.len()];
+    let size = powdb_storage::row::try_encode_row(schema, &empty_row)
+        .map_err(QueryError::from_storage_io)?
+        .len();
+    if size <= powdb_storage::page::MAX_ROW_DATA_SIZE {
+        return Ok(());
+    }
+    Err(QueryError::Execution(format!(
+        "cannot store any row of '{}': its {} columns need {} bytes even with every value \
+         missing, and a row must fit {} bytes; declare fewer columns",
+        schema.table_name,
+        schema.columns.len(),
+        size,
+        powdb_storage::page::MAX_ROW_DATA_SIZE
+    )))
 }

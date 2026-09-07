@@ -10,13 +10,24 @@ permissions: {}
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull requests only. On main, back-to-back merges cancelled the earlier
+  # commit's run, leaving main's history dotted with cancelled runs that are
+  # indistinguishable at a glance from runs that failed, and no recorded
+  # verdict for the commit that was cancelled. Harmless with `strict: true`
+  # branch protection (the squash result equals the PR head tree) but it makes
+  # main's CI history unreadable, which is where you look during an incident.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint-test:
     name: clippy + fmt + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # 25, not 15. The macOS leg took 10.0 minutes on the last release run with a
+    # warm cache, which leaves five minutes of headroom for a cold one: that is
+    # a flake waiting to be reported as a failure, and a timeout tells you
+    # nothing about why. Raising it costs nothing when the job is healthy, and
+    # a genuinely hung job still ends.
+    timeout-minutes: 25
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-latest]
@@ -67,18 +78,24 @@ jobs:
     runs-on: ubuntu-24.04
     # miri interprets rather than executes, so this job is slow by nature. Run
     # as one job it sat at 16 to 20 minutes and owned the whole CI critical path
-    # while every other job finished inside 7. The filters are now sharded
-    # across this matrix, which is a wall-clock change only: every filter still
-    # runs on every commit, and `scripts/ci/miri-shards.sh` fails the job if the
-    # shards stop covering the canonical set or stop matching the names below.
-    # 20 minutes is roughly double the expected per-shard time, so a real hang
-    # still shows up as a timeout.
+    # while every other job finished inside 7. Sharding by MODULE only moved the
+    # problem: `btree` alone ran 11.1, 13.5 and 18.1 minutes on the last three
+    # main runs, against a 20 minute timeout, while the other two shards
+    # finished in under two. btree is now split three ways by test-name prefix
+    # as well, so no shard carries more than about a third of it.
+    #
+    # This is a wall-clock change only: every test still runs on every commit,
+    # and `scripts/ci/miri-shards.sh` fails the job if the shards stop covering
+    # the modules in scope, stop matching the names below, start overlapping,
+    # or (the guard prefix sharding needs) leave any in-scope test unselected.
+    # 20 minutes is now several times the expected per-shard time, so a real
+    # hang still shows up as a timeout.
     timeout-minutes: 20
     strategy:
       # One slow shard failing should not hide the verdict of the others.
       fail-fast: false
       matrix:
-        shard: [btree, row-page, json-types-view]
+        shard: [btree-core, btree-nonunique, btree-stats, row-page, json-types-view]
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -108,6 +125,11 @@ jobs:
           # Assigned first on purpose: `read -a x <<< "$(cmd)"` swallows a
           # failing cmd and leaves an empty array, which is how a broken shard
           # map would turn into a job that runs nothing and exits 0.
+          # The shard map's own guards run first, on fixtures: they prove the
+          # coverage check still refuses an unsharded in-scope test and still
+          # ignores an out-of-scope module. A detector that stopped detecting
+          # would otherwise report "all tests selected" forever.
+          bash scripts/ci/miri-shards.sh --selftest
           shard_filters="$(bash scripts/ci/miri-shards.sh "$SHARD")"
           read -r -a filters <<< "$shard_filters"
           if (( ${#filters[@]} == 0 )); then
@@ -115,16 +137,27 @@ jobs:
             exit 1
           fi
           echo "shard $SHARD filters: ${filters[*]}"
-          # A libtest filter that matches nothing exits 0, so a renamed or
-          # deleted module would silently empty this shard instead of failing
+          # Two guards, both against the SAME target selection as the run below
+          # (no --lib): a guard that inspects a different set of targets than
+          # the run does is not evidence about the run.
+          #
+          # First, prove the shard map still covers every test miri is meant to
+          # interpret. Filters are test-name prefixes now, not whole modules, so
+          # a newly added `btree::tests::verify_something` could match nothing
+          # and never run while every shard stayed green. The unfiltered listing
+          # is the only thing that can see that, and it costs one extra --list
+          # against an already-built binary.
+          cargo +nightly miri test -p powdb-storage -- --list > /tmp/miri-listing.txt
+          bash scripts/ci/miri-shards.sh --check-listing /tmp/miri-listing.txt
+          # Second, a libtest filter that matches nothing exits 0, so a renamed
+          # or deleted module would silently empty this shard instead of failing
           # it (a `tx::tests` filter did exactly that: there is no tx module).
-          # List with the SAME target selection as the run below (no --lib):
-          # a guard that inspects a different set of targets than the run does
-          # is not evidence about the run. Require each filter to select at
-          # least one test. This runs per shard, so sharding cannot dilute it.
+          # Require each filter to select at least one test. This runs per
+          # shard, so sharding cannot dilute it. Prefix match, not "$filter::":
+          # a filter is now a name prefix such as `btree::tests::stats_`.
           listing=$(cargo +nightly miri test -p powdb-storage -- --list "${filters[@]}")
           for filter in "${filters[@]}"; do
-            if ! grep -q "^${filter}::" <<<"$listing"; then
+            if ! grep -q "^${filter}" <<<"$listing"; then
               echo "::error::miri filter '${filter}' matches no test in powdb-storage"
               exit 1
             fi
@@ -239,9 +272,11 @@ jobs:
           echo "MSRV consistency OK."
 
   msrv-build:
-    name: MSRV build (cargo +<msrv> check --workspace --locked)
+    name: MSRV build + test (cargo +<msrv>)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 30, not 20: this job now compiles and runs the storage and query test
+    # suites on the MSRV toolchain, not just `cargo check`.
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -277,6 +312,19 @@ jobs:
       # toolchain.
       - name: cargo +MSRV check --workspace --locked
         run: cargo +${{ steps.msrv.outputs.version }} check --workspace --locked
+
+      # `check` proves the workspace COMPILES on the MSRV toolchain and nothing
+      # more. The stated support claim is that PowDB works on this Rust
+      # version, and behaviour differences between compilers land in generated
+      # code, not in type checking: the engine here does its own byte-level
+      # layout, alignment and offset arithmetic, which is exactly the class of
+      # thing a codegen or std change moves. Running the two engine crates'
+      # suites turns "it builds" into "it works". Only storage and query: they
+      # hold every hand-rolled format and every executor fast path, and adding
+      # the server and CLI suites would double this job for network and
+      # process plumbing that stable already covers.
+      - name: cargo +MSRV test -p powdb-storage -p powdb-query --locked
+        run: cargo +${{ steps.msrv.outputs.version }} test -p powdb-storage -p powdb-query --locked
 
   examples-smoke:
     name: examples smoke (terraform validate + compose config + dev.sh + runnable examples)
@@ -346,6 +394,22 @@ jobs:
         run: bash scripts/check-version-consistency.sh --selftest
       - name: Check release/version metadata
         run: bash scripts/check-version-consistency.sh
+
+      # Added as steps here rather than as a new job so `ci-success.needs` and
+      # CONTRIBUTING.md's job list stay in step; this job is the natural home
+      # for "the repo's hand-maintained lists still describe the repo".
+      - name: Prove the dependabot coverage check can fail
+        run: bash scripts/ci/check-dependabot-coverage.sh --selftest
+      - name: Every dependency manifest is watched by dependabot
+        run: bash scripts/ci/check-dependabot-coverage.sh
+
+      # "We pinned the tools" was a claim in a commit message rather than a
+      # check, and fuzz.yml's cargo-fuzz stayed unpinned through the commit
+      # that said otherwise. This is the check.
+      - name: Prove the tool-pin check can fail
+        run: bash scripts/ci/check-tool-pins.sh --selftest
+      - name: Every cargo install in a workflow is pinned
+        run: bash scripts/ci/check-tool-pins.sh
 
   ts-client:
     name: TypeScript client (build + tests)
@@ -503,6 +567,17 @@ jobs:
         working-directory: clients/sync
         run: npm exec --yes --package=pnpm@10.29.3 -- pnpm run build
 
+      # The three published READMEs are API documentation that nothing compiled
+      # until now, so their samples rotted: `queryTyped<User>` with an
+      # `interface` never type-checked, the addon sample read `.rows` off an
+      # un-narrowed union, and the sync adapter example could not be assigned
+      # to the addon's own parameter type. This is the only job that both
+      # builds the addon (the checker needs its generated index.d.ts) and has a
+      # TypeScript toolchain, so the check lives here.
+      - name: Type-check the README samples of all three JS packages
+        working-directory: clients/sync
+        run: npm exec --yes --package=pnpm@10.29.3 -- pnpm run test:readme
+
       - name: Run sync package tests
         working-directory: clients/sync
         env:
@@ -520,9 +595,22 @@ jobs:
   # fixture with today's writer), so a wrong encoder would produce a wrong
   # fixture and a green test. This job removes the shared author.
   cross-version-compat:
-    name: cross-version compat (real released binaries)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    name: cross-version compat (real released binaries, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Both published platforms, because the thing under test is an on-disk
+    # format read by binaries users installed, and every release ships
+    # linux-x86_64 AND macos-aarch64 assets. Running only the Linux half tested
+    # one endianness, one page size and one filesystem, and left the platform
+    # most contributors develop on unverified against real released binaries.
+    # `scripts/ci/cross-version-compat.sh` already resolves the right asset
+    # suffix from `uname` and refuses a platform with no released asset.
+    strategy:
+      # A format problem on one platform must not hide the other's verdict.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    # 40, not 25: the macOS leg builds the HEAD powdb-cli on a slower runner.
+    timeout-minutes: 40
     # `gh release list` derives the tested version list. Read-only, and the
     # script falls back to a validated pinned list if the call fails.
     permissions:
@@ -540,7 +628,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-version-compat
+          shared-key: cross-version-compat-${{ matrix.os }}
 
       # The tested version list is derived from the live release list, so the
       # cache key has to come from the same call rather than a hand-copied
@@ -574,6 +662,8 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/compat-bins
+          # runner.os is already in the key, so the two legs cache the two
+          # different sets of released assets separately.
           key: compat-bins-${{ runner.os }}-${{ steps.compat.outputs.cache-key }}
 
       - name: Build HEAD powdb-cli
@@ -601,10 +691,14 @@ jobs:
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          # Same pin as fuzz.yml, for the same reason (nightly-2026-07-23 ICEs
-          # in rustc_codegen_ssa on tokio). `nightly-pin-freshness` in fuzz.yml
-          # fails once this pin goes stale, so it cannot rot silently.
-          toolchain: nightly-2026-07-22
+          # Same pin as fuzz.yml, and it must stay the same: this job replays
+          # the corpus that fuzz.yml produced, so a different compiler here
+          # would replay those inputs against different code.
+          # `nightly-pin-freshness` in fuzz.yml fails once the pin goes stale,
+          # so it cannot rot silently. Moved 2026-09-06 with fuzz.yml; the
+          # reason for the old nightly-2026-07-22 pin (a tokio ICE in
+          # nightly-2026-07-23) no longer applies.
+          toolchain: nightly-2026-09-01
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -621,12 +715,18 @@ jobs:
       # The cache above restores ~/.cargo/bin but not cargo's install-tracking
       # metadata (~/.cargo/.crates.toml), so an unconditional install sees an
       # untracked binary and hard-fails with "already exists in destination".
-      - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
+      # Version-pinned, like every other tool this pipeline installs: this
+      # binary decides what "replaying the corpus" means, and a floating build
+      # tool makes the replay's verdict a function of the day rather than of
+      # the commit, which is the one property this job exists to have.
+      - name: Install cargo-fuzz (pinned)
+        env:
+          CARGO_FUZZ_VERSION: 0.13.2
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 
       - name: Replay the checked-in corpus
         env:
-          FUZZ_TOOLCHAIN: nightly-2026-07-22
+          FUZZ_TOOLCHAIN: nightly-2026-09-01
         run: bash scripts/ci/fuzz-corpus-replay.sh
 
       - name: Upload crash artifacts on failure
@@ -643,9 +743,21 @@ jobs:
   # "the server did not abort" assertion elsewhere in the suite actually
   # observed an unwinding test-profile binary.
   release-profile-suites:
-    name: release-profile suites (panic=abort)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    name: release-profile suites (panic=abort, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Both platforms. What this job observes is a PROCESS dying from an abort,
+    # and how a process dies is the most operating-system-specific behaviour in
+    # the suite: signal delivery, zombie reaping and the abort handler itself
+    # all differ. The script was already written to run on macOS (its TCP
+    # helpers go through python3 precisely so a developer laptop can execute
+    # it), and it was still only ever run on Linux.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    # 60, not 40: this compiles the release profile (lto, one codegen unit) for
+    # three crates' test targets, and the macOS runner is slower.
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -659,7 +771,7 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-profile-suites
+          shared-key: release-profile-suites-${{ matrix.os }}
 
       - name: Corruption + wire-corpus suites, release profile
         run: bash scripts/ci/release-profile-suites.sh
@@ -701,6 +813,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The selftest first, on fixture workflows: a clean pair passes and
+      # thirteen mutations each fail, so a parser that has stopped seeing jobs
+      # is caught here rather than by nobody.
+      - name: Prove the needs checker can fail
+        run: bash scripts/ci/check-ci-success-needs.sh --selftest
+
       - name: Every ci.yml job must be required by ci-success
         run: bash scripts/ci/check-ci-success-needs.sh
 
@@ -715,6 +833,13 @@ jobs:
       # itself is MIT-licensed and free, so we pin and run the binary directly
       # — same `gitleaks detect` invocation as scripts/quality.sh, at $0.
       GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, taken from the release
+      # asset on 2026-09-06. Every `uses:` in this repo is pinned to a 40-hex
+      # SHA; a tarball fetched over curl and then run against the full git
+      # history deserves the same treatment, and a GitHub version tag can be
+      # moved. Recompute when GITLEAKS_VERSION changes:
+      #   curl -sSfL <url> | sha256sum
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -723,6 +848,7 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version
@@ -736,7 +862,11 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      checks: write
+    env:
+      CARGO_TERM_COLOR: always
+      # Pin the gate's own binary. Bump deliberately, the way every other tool
+      # version in this pipeline is bumped.
+      CARGO_AUDIT_VERSION: 0.22.2
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -756,11 +886,41 @@ jobs:
       # (hard-fail), so dropping it here would redden this job. Keep in sync
       # with `.cargo/audit.toml`, which the local `cargo audit` reads and which
       # documents the bar for adding anything back.
-      - name: Run cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # rustsec/audit-check compiled cargo-audit from source on every run: 304
+      # `Compiling` lines and 3.1 minutes, for a gate binary whose version
+      # floated with whatever crates.io served that morning. A pinned install
+      # plus a cache keyed on that pin makes the tool reproducible and, after
+      # the first run, nearly free.
+      #
+      # Same verdict as before, from one list instead of two. The action did
+      # not read `.cargo/audit.toml`; it took the same advisory ID through its
+      # `ignore:` input, so the suppression lived in two places that had to be
+      # kept in sync by hand, and the file says so. A plain `cargo audit` in
+      # the checkout reads `.cargo/audit.toml`, which is where the reasoning
+      # already is, so the duplicate goes away.
+      # `checks: write` goes with the action; without it there is nothing to
+      # annotate, and the advisory text is in the job log either way.
+      - name: cargo-audit cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2026-0235
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
+
+      # `command -v` guard: the cache restores the binary but cargo's
+      # install-tracking metadata may not line up, and an unconditional install
+      # then hard-fails with "already exists in destination". Same guard the
+      # fuzz-corpus-replay job carries for cargo-fuzz.
+      - name: Install cargo-audit (pinned)
+        run: command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+
+      - name: Run cargo audit
+        run: cargo audit
 
   # Governance gate: this is a public repo. Fail the build if internal-only
   # planning/agent artifacts get re-tracked, or if any public doc/source names
@@ -775,36 +935,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The selftest first, on throwaway git fixtures. It proves both halves
+      # can fail, including the case that made this a script: a denylist regex
+      # git cannot compile used to leave `names` empty and print "denylist
+      # checked", so the guard stopped inspecting anything while the log said
+      # it had run. `git ls-files` outside a repository printed "paths clean"
+      # the same way.
+      - name: Prove the internal-content guard can fail
+        run: bash scripts/ci/internal-content-guard.sh --selftest
+
+      # The regex comes from `secrets`, and secrets are not available to a
+      # `pull_request` run from a fork. The denylist half then does not run,
+      # and it used to print "clean" anyway, so the log said the guard had
+      # passed when only the path check had. The script says which halves ran,
+      # every time: the regex check still gets its verdict on the post-merge
+      # push run, and a reader of a fork PR can see that it is pending.
       - name: Fail on tracked internal-only content
         env:
           PUBLICATION_DENYLIST_REGEX: ${{ secrets.PUBLICATION_DENYLIST_REGEX }}
-        run: |
-          set -uo pipefail
-          fail=0
-
-          # (1) No tracked file may live under an internal-only path.
-          paths="$(git ls-files | grep -E '^(docs/strategy/|docs/superpowers/|docs/audits/|docs/gtm-strategy\.md|\.omx/)' || true)"
-          if [ -n "$paths" ]; then
-            echo "::error::Internal-only paths are tracked in this public repo (see .gitignore):"
-            echo "$paths"
-            fail=1
-          fi
-
-          # (2) Optionally apply the private publication denylist without
-          # storing sensitive names in this public workflow.
-          if [ -n "${PUBLICATION_DENYLIST_REGEX:-}" ]; then
-            names="$(git grep -niP "$PUBLICATION_DENYLIST_REGEX" -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' || true)"
-            if [ -n "$names" ]; then
-              echo "::error::Private name found in a public file. Use neutral wording:"
-              echo "$names"
-              fail=1
-            fi
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-            exit 1
-          fi
-          echo "internal-content-guard: clean."
+        run: bash scripts/ci/internal-content-guard.sh
 
   # Supply-chain policy gate: license allowlist, duplicate-version warnings,
   # and crates.io-only sources, driven by deny.toml at the repo root.
@@ -943,15 +1092,25 @@ jobs:
       - missing-docs-ratchet
       - rustdoc
     steps:
+      # ci-success checks the repo out and runs the completeness check ITSELF,
+      # which reads as belt-and-braces next to the ci-needs-completeness job
+      # and is not. The old verdict was `for result in $RESULTS`, with
+      # `RESULTS: ${{ join(needs.*.result, ' ') }}`. Delete the needs: list and
+      # that expands to the empty string, the loop iterates zero times, and it
+      # prints "All required CI jobs succeeded." ci-success is the ONE required
+      # status check on main, so that turns the merge button green with nothing
+      # behind it. ci-needs-completeness would have gone red, but it blocks
+      # nothing except through ci-success, i.e. through the list that was just
+      # deleted: the guard was circular.
+      #
+      # Running the check here breaks the circle, because it reads ci.yml on
+      # disk rather than the needs: list. --results then compares the length of
+      # the results vector against the job count parsed out of the file, so an
+      # emptied needs: list fails from inside the required check.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Verify every required job succeeded
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          echo "Upstream job results: $RESULTS"
-          for result in $RESULTS; do
-            if [ "$result" != "success" ]; then
-              echo "::error::A required CI job did not succeed (results: $RESULTS)"
-              exit 1
-            fi
-          done
-          echo "All required CI jobs succeeded."
+        run: bash scripts/ci/check-ci-success-needs.sh --results "$RESULTS"

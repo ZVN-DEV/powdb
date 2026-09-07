@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 static NEXT_STRUCTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -86,8 +86,10 @@ fn validate_column_name(name: &str) -> io::Result<()> {
 /// Version 1 files still load cleanly — they're treated as having zero
 /// indexed columns, and the next `create_index` (or implicit rebuild on
 /// first open, depending on the caller) will populate the list.
-const CATALOG_FILE: &str = "catalog.bin";
-pub const CATALOG_LSN_FILE: &str = "catalog.lsn";
+const CATALOG_FILE: &str = crate::data_dir::CATALOG_FILE;
+/// Re-export of [`crate::data_dir::CATALOG_LSN_FILE`], kept here because
+/// `powdb-backup` has imported it from this module since v0.4.5.
+pub const CATALOG_LSN_FILE: &str = crate::data_dir::CATALOG_LSN_FILE;
 const CATALOG_MAGIC: &[u8; 4] = b"BCAT";
 /// Version 4 appends a per-table column-defaults section after the indexed
 /// column list; version 5 appends an auto-increment column section after that.
@@ -219,7 +221,7 @@ pub fn expression_index_file_name(table: &str, index_id: u64) -> String {
 
 /// Mission 2 (durability): the single shared WAL file lives under the catalog's
 /// data directory with this name. One WAL covers every table in the catalog.
-const WAL_FILE: &str = "wal.log";
+const WAL_FILE: &str = crate::data_dir::WAL_FILE;
 const SYNC_STATE_DIR: &str = ".powdb-sync";
 const SYNC_IDENTITY_FILE: &str = "identity.json";
 
@@ -227,7 +229,80 @@ const SYNC_IDENTITY_FILE: &str = "identity.json";
 /// to the explicit `wal.flush()` each top-level mutation does. Kept small so
 /// the tests see a predictable amount of buffering.
 const WAL_BATCH_SIZE: usize = 64;
+
+/// Cushion added to the per-replay page ceiling, on top of one page per
+/// record. Absorbs pages a crashed session allocated around the ones its
+/// records account for (a heap superblock, a batched allocation) without
+/// letting a crafted page id grow the file unboundedly.
+const REPLAY_PAGE_SLACK: u64 = 64;
+
+/// Refuse a WAL record whose target page lies beyond what the log could have
+/// legitimately grown the heap to. Both `HeapFile::insert_at` and
+/// `HeapFile::write_overflow_page` grow the file one page at a time up to the
+/// id they are handed, so an unbounded id means the open hangs while it fills
+/// the disk (a `u32::MAX` page id is 16 TiB).
+fn check_replay_page(
+    table: &str,
+    what: &str,
+    page_id: u32,
+    ceiling: u64,
+) -> Result<(), StorageError> {
+    if u64::from(page_id) > ceiling {
+        return Err(StorageError::WalReplay(format!(
+            "table '{table}': {what} record targets page {page_id}, beyond the {ceiling}-page replay ceiling"
+        )));
+    }
+    Ok(())
+}
+
 type WalArchiveCallback<'a> = &'a mut dyn FnMut(&Path, &[WalRecord]) -> io::Result<()>;
+
+/// A hook that publishes WAL records somewhere durable before the log that
+/// holds them is truncated.
+///
+/// Owned and shareable, unlike `WalArchiveCallback`, which is borrowed for
+/// the duration of one call. The automatic checkpoint runs long after the open
+/// that installed the hook, so it needs one it can keep. See
+/// [`Catalog::install_auto_wal_archive`].
+pub type WalArchiveHook =
+    std::sync::Arc<dyn Fn(&Path, &[WalRecord]) -> io::Result<()> + Send + Sync>;
+
+/// The refusal for a statement naming a table this catalog does not have.
+///
+/// Carries [`StorageError::TableNotFound`] as the `io::Error`'s source so the
+/// server classifies it as the caller's mistake (the same class the query
+/// layer's own `TableNotFound` gets) instead of an internal fault, while
+/// keeping `io::ErrorKind::NotFound` for the callers that match on it.
+fn table_not_found(table: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        StorageError::TableNotFound {
+            table: table.to_string(),
+        },
+    )
+}
+
+/// Name of the first heap or index file in `data_dir`, if there is one. Used
+/// to tell a damaged database (table files, no catalog) apart from a fresh
+/// directory (nothing at all).
+fn first_table_file(data_dir: &Path) -> io::Result<Option<String>> {
+    let entries = match fs::read_dir(data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut found: Option<String> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".heap") || name.ends_with(".idx") {
+            // Deterministic across filesystems: report the first by name.
+            if found.as_ref().is_none_or(|current| name < *current) {
+                found = Some(name);
+            }
+        }
+    }
+    Ok(found)
+}
 
 fn read_durable_lsn(data_dir: &Path) -> io::Result<u64> {
     let path = data_dir.join(CATALOG_LSN_FILE);
@@ -315,6 +390,19 @@ fn max_record_lsn(records: &[WalRecord]) -> Option<u64> {
 /// directly. That meant the `insert_batch_1k` hot path paid an
 /// `FxHash("User")` + bucket walk per row just to dispatch into the
 /// table — about 20-40ns out of a 233ns budget.
+/// Default WAL size that makes a finished statement checkpoint before the
+/// next one starts: 64 MiB.
+///
+/// The WAL used to be truncated only on a clean close, so a process that
+/// stayed up through a long write workload carried every record it had ever
+/// written: tens of megabytes of disk after a few hundred thousand mutations,
+/// and a replay of all of it if the process died. A bound turns both into a
+/// constant. It is deliberately generous: the checkpoint flushes every dirty
+/// heap page and index, so a small threshold would trade log size for
+/// throughput. [`Catalog::set_wal_checkpoint_bytes`] changes it, and 0
+/// restores the old grow-until-close behaviour.
+pub const DEFAULT_WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct Catalog {
     /// All tables, in insertion order. Indexed by `slot: usize`.
     tables: Vec<Table>,
@@ -344,6 +432,21 @@ pub struct Catalog {
     /// was opened? Used by `Drop` to decide whether to treat its own flush
     /// as fatal (it isn't — we still try best-effort).
     checkpointed: bool,
+    /// WAL size at which a completed statement triggers a checkpoint, or 0
+    /// to leave the log to grow until close. See
+    /// [`Self::set_wal_checkpoint_bytes`].
+    wal_checkpoint_bytes: u64,
+    /// Whether this catalog was opened through
+    /// [`Catalog::open_with_wal_archive`], i.e. whether somebody is shipping
+    /// this WAL somewhere. That hook is borrowed for the open and cannot be
+    /// kept, so on its own this only says "do not truncate behind an archive
+    /// stream you cannot publish to". See [`Self::checkpoint_if_wal_is_large`].
+    wal_archive_hook_installed: bool,
+    /// The hook the *automatic* checkpoint publishes through, when a caller has
+    /// handed the catalog one it can keep. With this set the threshold
+    /// checkpoint archives and then truncates, instead of having to leave the
+    /// log alone. See [`Self::install_auto_wal_archive`].
+    auto_wal_archive: Option<WalArchiveHook>,
     /// Catalog-level durable LSN. Heap page LSNs cover row mutations, but
     /// DDL-only changes can advance the WAL without touching a data page.
     durable_lsn: u64,
@@ -419,6 +522,9 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
+            auto_wal_archive: None,
             durable_lsn: 0,
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
@@ -456,12 +562,29 @@ impl Catalog {
         F: FnMut(&Path, &[WalRecord]) -> io::Result<()>,
     {
         let archive: WalArchiveCallback<'_> = &mut archive;
-        Self::open_inner(data_dir, Some(archive))
+        let mut catalog = Self::open_inner(data_dir, Some(archive))?;
+        // The hook is borrowed for the open, so it cannot be kept; what is
+        // kept is the fact that this WAL is being archived, which is what the
+        // automatic checkpoint has to respect.
+        catalog.wal_archive_hook_installed = true;
+        Ok(catalog)
     }
 
     fn open_inner(data_dir: &Path, archive: Option<WalArchiveCallback<'_>>) -> io::Result<Self> {
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
+            // A directory with table files but no catalog is a damaged
+            // database, not an empty one. Reported as NotFound it was
+            // indistinguishable from a fresh directory, so callers created a
+            // new catalog beside the surviving heaps and every table
+            // disappeared. CatalogCorrupt keeps that fallback off.
+            if let Some(orphan) = first_table_file(data_dir)? {
+                return Err(StorageError::CatalogCorrupt(format!(
+                    "{} is missing but table files are still here (for example {orphan}): refusing to open this directory as a new database",
+                    cat_path.display()
+                ))
+                .into());
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
         let catalog_file = read_catalog_file(&cat_path)?;
@@ -496,7 +619,38 @@ impl Catalog {
             name_to_slot.insert(name.clone(), tables.len());
             tables.push(table);
         }
+        // Since catalog v5 (the auto-increment section, which shipped well
+        // after v0.5.0 gave heaps a superblock) `Table::create` always writes
+        // page 0, so a catalogued table whose heap is zero bytes has been
+        // truncated. It used to open as an empty table and answer every query
+        // with no rows.
+        if active_catalog_version >= LEGACY_CATALOG_VERSION {
+            for table in &tables {
+                if table.heap.num_pages() == 0 {
+                    return Err(StorageError::CorruptData(format!(
+                        "table '{}': heap file is empty, but this database always writes a heap superblock",
+                        table.schema().table_name
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let wal_path = data_dir.join(WAL_FILE);
+        // A WAL with no `PWAL` file header is read as a pre-v0.5.0 headerless
+        // log whose records start at byte 0. On a directory no pre-v0.5.0
+        // binary could have written, that header cannot legitimately be
+        // missing: reading the file that way parses arbitrary bytes as records
+        // and drops every un-checkpointed row without a word.
+        let post_legacy = active_catalog_version > LEGACY_CATALOG_VERSION
+            || tables.iter().any(|table| table.heap.format_version() > 1);
+        if post_legacy && crate::wal::is_headerless_log(&wal_path)? {
+            return Err(StorageError::WalReplay(format!(
+                "{}: WAL file header is missing or not PWAL, and this directory is not a pre-v0.5.0 database",
+                wal_path.display()
+            ))
+            .into());
+        }
         let wal = Wal::open(&wal_path, WAL_BATCH_SIZE)?;
         let mut cat = Catalog {
             tables,
@@ -509,6 +663,9 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
+            auto_wal_archive: None,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -517,6 +674,11 @@ impl Catalog {
             read_only: false,
             dirty_budget,
         };
+        debug!(
+            directory_catalog_version = active_catalog_version,
+            writer = ?crate::format::current_format_versions(),
+            "opened data directory"
+        );
         cat.replay_wal(archive)?;
         // Restore WAL LSN monotonicity across the restart. Heap pages carry
         // LSNs stamped by replay (catalog.rs set_page_lsn) and by DDL
@@ -562,6 +724,18 @@ impl Catalog {
         crate::validate_data_dir_read_only(data_dir)?;
         let cat_path = data_dir.join(CATALOG_FILE);
         if !cat_path.exists() {
+            // A directory with table files but no catalog is a damaged
+            // database, not an empty one. Reported as NotFound it was
+            // indistinguishable from a fresh directory, so callers created a
+            // new catalog beside the surviving heaps and every table
+            // disappeared. CatalogCorrupt keeps that fallback off.
+            if let Some(orphan) = first_table_file(data_dir)? {
+                return Err(StorageError::CatalogCorrupt(format!(
+                    "{} is missing but table files are still here (for example {orphan}): refusing to open this directory as a new database",
+                    cat_path.display()
+                ))
+                .into());
+            }
             return Err(io::Error::new(io::ErrorKind::NotFound, "no catalog file"));
         }
 
@@ -621,6 +795,9 @@ impl Catalog {
             pending_autocommit_tx_ids: Vec::new(),
             pending_free_overflow: Vec::new(),
             checkpointed: false,
+            wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
+            auto_wal_archive: None,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -775,12 +952,41 @@ impl Catalog {
             }
         }
 
+        // Upper bound on any page id a record may legitimately target. Each
+        // record can account for at most one new page (a row fits on one data
+        // page; every overflow chunk carries its own record), so a log of N
+        // records cannot have grown a heap by more than N pages past its last
+        // checkpoint. A page id beyond this came from a corrupt or crafted
+        // record: `insert_at` and `write_overflow_page` grow the file one page
+        // at a time up to the target, so a wild page id is a hang and a full
+        // disk, not a wrong answer.
+        let replay_page_ceiling = self
+            .tables
+            .iter()
+            .map(|table| u64::from(table.heap.num_pages()))
+            .max()
+            .unwrap_or(0)
+            + records.len() as u64
+            + REPLAY_PAGE_SLACK;
+
         let mut replayed_inserts = 0usize;
         let mut replayed_updates = 0usize;
         let mut replayed_deletes = 0usize;
         let mut skipped = 0usize;
         let mut skipped_uncommitted = 0usize;
         let mut saw_ddl = false;
+        // A record whose payload will not decode, or that names a table this
+        // catalog does not have, is dropped. Both used to happen in silence,
+        // which is the same shape as data loss: the row is simply not there
+        // afterwards and nothing said so.
+        let mut dropped = 0usize;
+        let mut first_dropped: Option<(usize, &'static str)> = None;
+        let mut note_dropped = |index: usize, why: &'static str| {
+            dropped += 1;
+            if first_dropped.is_none() {
+                first_dropped = Some((index, why));
+            }
+        };
         for (index, rec) in records.iter().enumerate() {
             if has_boundaries
                 && !committed_row_records[index]
@@ -800,6 +1006,12 @@ impl Catalog {
                 WalRecordType::Insert => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "insert",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             // Already persisted on its page? Skip — re-running
                             // the insert would allocate a fresh slot and
@@ -817,12 +1029,22 @@ impl Catalog {
                             tbl.heap.insert_at(rid, &row_bytes)?;
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_inserts += 1;
+                        } else {
+                            note_dropped(index, "insert for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "insert payload did not decode");
                     }
                 }
                 WalRecordType::Update => {
                     if let Some((table_name, rid, row_bytes)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "update",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
@@ -845,12 +1067,22 @@ impl Catalog {
                             }
                             tbl.heap.set_page_lsn(new_rid.page_id, rec.lsn)?;
                             replayed_updates += 1;
+                        } else {
+                            note_dropped(index, "update for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "update payload did not decode");
                     }
                 }
                 WalRecordType::Delete => {
                     if let Some((table_name, rid, _)) = decode_wal_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "delete",
+                                rid.page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.page_lsn(rid.page_id) >= rec.lsn {
                                 skipped += 1;
@@ -859,7 +1091,11 @@ impl Catalog {
                             let _ = tbl.heap.delete(rid);
                             tbl.heap.set_page_lsn(rid.page_id, rec.lsn)?;
                             replayed_deletes += 1;
+                        } else {
+                            note_dropped(index, "delete for a table this catalog does not have");
                         }
+                    } else {
+                        note_dropped(index, "delete payload did not decode");
                     }
                 }
                 WalRecordType::OverflowWrite => {
@@ -871,6 +1107,12 @@ impl Catalog {
                         decode_overflow_write_payload(&rec.data)
                     {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
+                            check_replay_page(
+                                &table_name,
+                                "overflow write",
+                                page_id,
+                                replay_page_ceiling,
+                            )?;
                             let tbl = &mut self.tables[slot];
                             if rec.lsn > 0 && tbl.heap.overflow_page_lsn(page_id) >= rec.lsn {
                                 skipped += 1;
@@ -878,7 +1120,14 @@ impl Catalog {
                             }
                             tbl.heap
                                 .write_overflow_page(page_id, next_page, &chunk, rec.lsn)?;
+                        } else {
+                            note_dropped(
+                                index,
+                                "overflow write for a table this catalog does not have",
+                            );
                         }
+                    } else {
+                        note_dropped(index, "overflow write payload did not decode");
                     }
                 }
                 WalRecordType::OverflowFree => {
@@ -889,7 +1138,14 @@ impl Catalog {
                     if let Some((table_name, pages)) = decode_overflow_free_payload(&rec.data) {
                         if let Some(slot) = self.name_to_slot.get(&table_name).copied() {
                             self.tables[slot].heap.release_overflow_pages(&pages);
+                        } else {
+                            note_dropped(
+                                index,
+                                "overflow free for a table this catalog does not have",
+                            );
                         }
+                    } else {
+                        note_dropped(index, "overflow free payload did not decode");
                     }
                 }
                 WalRecordType::Begin | WalRecordType::Commit | WalRecordType::Rollback => {
@@ -900,16 +1156,25 @@ impl Catalog {
                     if let Some((schema, defaults, auto_cols)) = decode_ddl_create_table(&rec.data)
                     {
                         if !self.name_to_slot.contains_key(&schema.table_name) {
-                            if let Ok(mut table) = Table::create(schema, &self.data_dir) {
-                                table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
-                                table.set_defaults(defaults);
-                                table.set_auto_cols(auto_cols);
-                                let slot = self.tables.len();
-                                let name = table.schema.table_name.clone();
-                                self.tables.push(table);
-                                self.name_to_slot.insert(name, slot);
-                            }
+                            // A create that fails here is not survivable: every
+                            // later Insert for the table has nowhere to land and
+                            // was dropped in silence.
+                            let table_name = schema.table_name.clone();
+                            let mut table =
+                                Table::create(schema, &self.data_dir).map_err(|error| {
+                                    StorageError::WalReplay(format!(
+                                        "table '{table_name}': create table replay failed: {error}"
+                                    ))
+                                })?;
+                            table.heap.set_dirty_budget(Arc::clone(&self.dirty_budget));
+                            table.set_defaults(defaults);
+                            table.set_auto_cols(auto_cols);
+                            let slot = self.tables.len();
+                            self.tables.push(table);
+                            self.name_to_slot.insert(table_name, slot);
                         }
+                    } else {
+                        note_dropped(index, "create table payload did not decode");
                     }
                 }
                 WalRecordType::DdlDropTable => {
@@ -957,11 +1222,12 @@ impl Catalog {
                                 if has_rows {
                                     let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                     let data_dir = self.data_dir.clone();
-                                    let _ = tbl.rewrite_rows_for_schema_change(
-                                        &old_schema,
-                                        &fill,
-                                        &data_dir,
-                                    );
+                                    tbl.rewrite_rows_for_schema_change(&old_schema, &fill, &data_dir)
+                                        .map_err(|error| {
+                                            StorageError::WalReplay(format!(
+                                                "table '{table_name}': add column rewrite failed: {error}"
+                                            ))
+                                        })?;
                                 }
                             }
                             // Stamp every page with the DDL's LSN so a
@@ -971,7 +1237,11 @@ impl Catalog {
                             // by the rewrite above. See
                             // `stamp_all_pages_min_lsn` doc.
                             if rec.lsn > 0 {
-                                let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                tbl.heap.stamp_all_pages_min_lsn(rec.lsn).map_err(|error| {
+                                    StorageError::WalReplay(format!(
+                                        "table '{table_name}': add column LSN barrier failed: {error}"
+                                    ))
+                                })?;
                             }
                         }
                     }
@@ -995,15 +1265,24 @@ impl Catalog {
                                     if has_rows {
                                         let fill = vec![Value::Empty; tbl.schema.columns.len()];
                                         let data_dir = self.data_dir.clone();
-                                        let _ = tbl.rewrite_rows_for_schema_change(
+                                        tbl.rewrite_rows_for_schema_change(
                                             &old_schema,
                                             &fill,
                                             &data_dir,
-                                        );
+                                        )
+                                        .map_err(|error| {
+                                            StorageError::WalReplay(format!(
+                                                "table '{table_name}': drop column rewrite failed: {error}"
+                                            ))
+                                        })?;
                                     }
                                 }
                                 if rec.lsn > 0 {
-                                    let _ = tbl.heap.stamp_all_pages_min_lsn(rec.lsn);
+                                    tbl.heap.stamp_all_pages_min_lsn(rec.lsn).map_err(|error| {
+                                        StorageError::WalReplay(format!(
+                                            "table '{table_name}': drop column LSN barrier failed: {error}"
+                                        ))
+                                    })?;
                                 }
                             }
 
@@ -1020,12 +1299,21 @@ impl Catalog {
                 }
             }
         }
+        if let Some((index, why)) = first_dropped {
+            warn!(
+                dropped,
+                first_record = index,
+                first_reason = why,
+                "WAL replay dropped records it could not apply"
+            );
+        }
         info!(
             inserts = replayed_inserts,
             updates = replayed_updates,
             deletes = replayed_deletes,
             skipped = skipped,
             skipped_uncommitted = skipped_uncommitted,
+            dropped = dropped,
             "WAL record apply complete (commit-boundary + LSN idempotent)"
         );
         if saw_ddl {
@@ -1061,8 +1349,38 @@ impl Catalog {
         Ok(())
     }
 
+    /// Hand the catalog a WAL archive hook it can keep, so the automatic
+    /// checkpoint can publish the log before truncating it.
+    ///
+    /// [`Catalog::open_with_wal_archive`] only borrows its hook for the open,
+    /// which is why a catalog that had one could not run it later and had to
+    /// stop checkpointing altogether rather than destroy records nothing else
+    /// held. A caller that keeps its hook alive registers it here and gets the
+    /// threshold checkpoint back, archive first.
+    ///
+    /// Replication boundary: this is the same hook surface as
+    /// [`Self::checkpoint_with_wal_archive`] and carries the same warning. It
+    /// is for retained-history publication, not an ordinary checkpoint hook for
+    /// application code.
+    pub fn install_auto_wal_archive(&mut self, hook: WalArchiveHook) {
+        self.auto_wal_archive = Some(hook);
+    }
+
+    /// Set the WAL size at which a finished statement checkpoints, in bytes.
+    /// 0 disables the automatic checkpoint and leaves the log to grow until
+    /// the catalog is closed. Defaults to [`DEFAULT_WAL_CHECKPOINT_BYTES`].
+    pub fn set_wal_checkpoint_bytes(&mut self, bytes: u64) {
+        self.wal_checkpoint_bytes = bytes;
+    }
+
+    /// The WAL size at which a finished statement checkpoints, in bytes.
+    /// See [`Catalog::set_wal_checkpoint_bytes`].
+    pub fn wal_checkpoint_bytes(&self) -> u64 {
+        self.wal_checkpoint_bytes
+    }
+
     /// Flush every dirty heap page and truncate the WAL. This is the
-    /// "clean shutdown" point — after this returns, the on-disk heap files
+    /// "clean shutdown" point: after this returns, the on-disk heap files
     /// are fully consistent and the WAL is empty, so the next `open` will
     /// skip replay entirely.
     ///
@@ -1093,10 +1411,25 @@ impl Catalog {
     {
         self.ensure_no_active_transaction_for_checkpoint()?;
         self.commit_autocommit()?;
+        let archive: WalArchiveCallback<'_> = &mut archive;
+        self.checkpoint_archiving_committed_log(archive)
+    }
+
+    /// The archive-then-truncate half of [`Self::checkpoint_with_wal_archive`],
+    /// for a caller whose commit has already been flushed.
+    ///
+    /// Split out because the automatic checkpoint runs *from inside*
+    /// [`Self::commit_autocommit`]: routing it through the public entry point
+    /// would call `commit_autocommit` again, which would call the automatic
+    /// checkpoint again, and the recursion has no bound because nothing has
+    /// been truncated yet.
+    fn checkpoint_archiving_committed_log(
+        &mut self,
+        archive: WalArchiveCallback<'_>,
+    ) -> io::Result<()> {
         self.flush_checkpoint_state()?;
         self.wal.flush()?;
         let records = self.wal.read_all()?;
-        let archive: WalArchiveCallback<'_> = &mut archive;
         archive(&self.data_dir, &records)?;
         if let Some(max_lsn) = max_record_lsn(&records) {
             self.record_durable_lsn_at_least(max_lsn)?;
@@ -1277,7 +1610,82 @@ impl Catalog {
                 self.wal.append(id, WalRecordType::Commit, &[])?;
             }
         }
-        self.wal.flush()
+        // The durability point: once this returns, the statement is committed
+        // and replay brings it back after a crash.
+        self.wal.flush()?;
+        // Everything past that point is housekeeping, and its failure is not
+        // the statement's failure. `checkpoint_if_wal_is_large` writes every
+        // dirty heap page and index and truncates the log; on a filesystem
+        // that has just filled, that fails while the commit above stands.
+        // Returning it through this value told the caller the write had not
+        // happened when it had, and a client that retried the "failed" insert
+        // on a table with no unique constraint ended up with the row twice.
+        // The WAL is intact either way, so the next commit or the close-time
+        // checkpoint retries it.
+        if let Err(error) = self.checkpoint_if_wal_is_large() {
+            tracing::warn!(
+                %error,
+                "the automatic checkpoint after a commit failed; the commit itself is \
+                 durable and the log will be checkpointed again on the next attempt"
+            );
+        }
+        Ok(())
+    }
+
+    /// Checkpoint when the log has grown past the configured threshold.
+    ///
+    /// Called at the end of every statement that commits, which is the only
+    /// point where the log is at a record boundary with nothing half-written.
+    /// Skipped inside an explicit transaction (a checkpoint there would have
+    /// to truncate records the transaction may still roll back) and skipped
+    /// whenever the log is somebody's archive stream, where truncating without
+    /// running the archive hook would discard records nothing else holds.
+    /// Both of those are refusals in `checkpoint`, and an insert must not turn
+    /// into an error just because the log happened to cross a size.
+    ///
+    /// Sync and archiving are two different reasons, not one, and they get two
+    /// different answers.
+    ///
+    /// When PowDB's own sync is enabled the sync machinery owns checkpointing,
+    /// and this must keep out of its way: that is the `sync_identity_file`
+    /// condition, and it is a plain skip.
+    ///
+    /// An archive hook is the other thing. [`Catalog::open_with_wal_archive`]
+    /// takes an *arbitrary* one, reached from `powdb-query`'s published
+    /// `Engine::new_with_wal_archive`, and a WAL-shipping integration that
+    /// passes one has no `.powdb-sync` directory, so truncating on the identity
+    /// file alone destroyed records nothing else held, silently, with an intact
+    /// heap to hide it. The answer is to *run the hook and then truncate*, not
+    /// to stop checkpointing: both shipped binaries always pass a hook (a no-op
+    /// unless sync is on), so skipping on its presence turned the threshold off
+    /// for every real deployment and let the log grow without bound, which is
+    /// the thing the threshold exists to prevent.
+    ///
+    /// A hook that was passed to the open but never registered with
+    /// [`Self::install_auto_wal_archive`] cannot be run from here, and that is
+    /// the one case that still skips: there is no way to publish the records a
+    /// truncate would destroy.
+    fn checkpoint_if_wal_is_large(&mut self) -> io::Result<()> {
+        if self.wal_checkpoint_bytes == 0 || self.active_tx_id.is_some() {
+            return Ok(());
+        }
+        if self.wal.synced_len()? < self.wal_checkpoint_bytes {
+            return Ok(());
+        }
+        if self.sync_identity_file_exists() {
+            return Ok(());
+        }
+        // The commit that called us has already flushed, so this goes to the
+        // half of `checkpoint_with_wal_archive` that does not commit again.
+        match self.auto_wal_archive.clone() {
+            Some(hook) => {
+                let mut publish = move |dir: &Path, records: &[WalRecord]| hook(dir, records);
+                let archive: WalArchiveCallback<'_> = &mut publish;
+                self.checkpoint_archiving_committed_log(archive)
+            }
+            None if self.wal_archive_hook_installed => Ok(()),
+            None => self.checkpoint(),
+        }
     }
 
     /// Append a mutation record to the WAL buffer. **Does not flush.**
@@ -1744,12 +2152,10 @@ impl Catalog {
     /// consolidates ~14 copies of that idiom into this one place.
     #[inline]
     fn by_name(&self, table: &str) -> io::Result<&Table> {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         Ok(&self.tables[slot])
     }
 
@@ -1790,12 +2196,10 @@ impl Catalog {
     }
 
     fn slot_of(&self, table: &str) -> io::Result<usize> {
-        self.name_to_slot.get(table).copied().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })
+        self.name_to_slot
+            .get(table)
+            .copied()
+            .ok_or_else(|| table_not_found(table))
     }
 
     pub fn insert(&mut self, table: &str, values: &Row) -> io::Result<RowId> {
@@ -1867,8 +2271,16 @@ impl Catalog {
         Ok(new_rid)
     }
 
-    pub fn get(&self, table: &str, rid: RowId) -> Option<Row> {
-        self.get_table(table)?.get(rid)
+    /// Read one row by [`RowId`].
+    ///
+    /// `Ok(None)` when no live row has that id, and also when `table` does not
+    /// exist: a caller that needs to tell the two apart resolves the table
+    /// first.
+    pub fn get(&self, table: &str, rid: RowId) -> io::Result<Option<Row>> {
+        match self.get_table(table) {
+            Some(tbl) => tbl.get(rid),
+            None => Ok(None),
+        }
     }
 
     pub fn get_projected(
@@ -1996,12 +2408,10 @@ impl Catalog {
         // Resolve slot up front so we can split the borrow — the user
         // hook closes over `&mut self.wal`, which can't coexist with a
         // `by_name_mut` borrow of `self.tables`.
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         // Split-borrow the catalog fields so the hook can write into
@@ -2062,12 +2472,10 @@ impl Catalog {
                 |_, _| {},
             );
         }
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
@@ -2249,12 +2657,10 @@ impl Catalog {
     where
         F: FnOnce(&mut [u8]),
     {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         self.update_row_bytes_logged_by_slot(slot, rid, f)
     }
 
@@ -2287,7 +2693,7 @@ impl Catalog {
         }
         // Step 2: snapshot the now-mutated bytes. `HeapFile::get`
         // observes the pinned hot page, so it returns the fresh row.
-        let new_bytes = match tbl.heap.get(rid) {
+        let new_bytes = match tbl.heap.get(rid)? {
             Some(b) => b,
             // Shouldn't happen — we just patched it — but be defensive.
             None => return Ok(false),
@@ -2335,12 +2741,10 @@ impl Catalog {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
-        let slot = *self.name_to_slot.get(table).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{table}' not found"),
-            )
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(table)
+            .ok_or_else(|| table_not_found(table))?;
         let tbl = &mut self.tables[slot];
         let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
         if !ok {
@@ -2351,7 +2755,7 @@ impl Catalog {
         if self.wal.is_off() {
             return Ok(true);
         }
-        let new_bytes = match tbl.heap.get(rid) {
+        let new_bytes = match tbl.heap.get(rid)? {
             Some(b) => b,
             None => return Ok(false),
         };
@@ -2935,7 +3339,7 @@ impl Catalog {
     pub fn index_lookup(&self, table: &str, column: &str, key: &Value) -> io::Result<Option<Row>> {
         Ok(self
             .by_name(table)?
-            .index_lookup(column, key)
+            .index_lookup(column, key)?
             .map(|(_, row)| row))
     }
 
@@ -2960,9 +3364,10 @@ impl Catalog {
         self.ensure_no_active_transaction_for_ddl("drop table")?;
         self.invalidate_structure();
         validate_table_name(name)?;
-        let slot = *self.name_to_slot.get(name).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("table '{name}' not found"))
-        })?;
+        let slot = *self
+            .name_to_slot
+            .get(name)
+            .ok_or_else(|| table_not_found(name))?;
         // A live relationship link that names this table (as owner or target)
         // pins it in place, the same integrity discipline indexes use. The
         // link has to go first, and PowQL has no statement that removes one,

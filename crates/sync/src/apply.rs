@@ -615,14 +615,28 @@ fn wal_record_from_retained_unit(unit: RetainedUnit) -> io::Result<WalRecord> {
     })
 }
 
-/// Validate an already-read retained-unit slice for V1 embedded-sync apply.
+/// Where a retained-unit prefix stands relative to transaction boundaries.
 ///
-/// The slice must contain only V1-supported record types and must not end
-/// inside an explicit transaction. Server pull/ack paths use this to avoid
-/// advertising or accepting transaction-cut LSN boundaries.
-pub fn validate_v1_retained_units_applyable(units: &[RetainedUnit]) -> io::Result<()> {
-    let mut pending_tx_spans = Vec::new();
-    for unit in units {
+/// A chunk may only be served or applied when it ends outside every explicit
+/// transaction, and a chunk builder needs that answer after every unit it
+/// appends. Re-running [`validate_v1_retained_units_applyable`] on the growing
+/// prefix would make building one chunk quadratic, so the same rule lives here
+/// once, fed one unit at a time, and that function is a thin wrapper over it.
+#[derive(Debug, Default, Clone)]
+pub struct V1ApplyBoundary {
+    open_transactions: Vec<u64>,
+}
+
+impl V1ApplyBoundary {
+    /// A boundary tracker positioned before the first unit.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Account for one more unit. Errs on a record type V1 embedded sync
+    /// cannot apply, which is a rebootstrap-or-upgrade condition rather than
+    /// something a different chunk boundary could fix.
+    pub fn observe(&mut self, unit: &RetainedUnit) -> io::Result<()> {
         let record_type = WalRecordType::from_u8(unit.record_type).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -632,30 +646,62 @@ pub fn validate_v1_retained_units_applyable(units: &[RetainedUnit]) -> io::Resul
         reject_unsupported_v1_record_type(record_type)?;
         match record_type {
             WalRecordType::Begin if unit.tx_id != 0 => {
-                pending_tx_spans.push(unit.tx_id);
+                self.open_transactions.push(unit.tx_id);
             }
             WalRecordType::Insert | WalRecordType::Update | WalRecordType::Delete
-                if unit.tx_id != 0 && !pending_tx_spans.contains(&unit.tx_id) =>
+                if unit.tx_id != 0 && !self.open_transactions.contains(&unit.tx_id) =>
             {
-                pending_tx_spans.push(unit.tx_id);
+                self.open_transactions.push(unit.tx_id);
             }
             WalRecordType::Commit | WalRecordType::Rollback if unit.tx_id != 0 => {
-                if let Some(index) = pending_tx_spans
+                if let Some(index) = self
+                    .open_transactions
                     .iter()
                     .rposition(|pending_tx_id| *pending_tx_id == unit.tx_id)
                 {
-                    pending_tx_spans.remove(index);
+                    self.open_transactions.remove(index);
                 }
             }
             _ => {}
         }
+        Ok(())
     }
-    if let Some(tx_id) = pending_tx_spans.first() {
-        return Err(invalid_input(format!(
-            "retained tail cuts through transaction {tx_id}; retry with a range through its commit or rollback boundary",
-        )));
+
+    /// True when every unit seen so far closes cleanly, so a chunk ending here
+    /// is applyable.
+    pub fn is_closed(&self) -> bool {
+        self.open_transactions.is_empty()
     }
-    Ok(())
+
+    /// The oldest transaction still open, if the prefix cuts through one.
+    pub fn open_transaction(&self) -> Option<u64> {
+        self.open_transactions.first().copied()
+    }
+
+    /// The error a caller reports when it has to stop on an open transaction.
+    pub fn cut_error(&self) -> Option<io::Error> {
+        self.open_transaction().map(|tx_id| {
+            invalid_input(format!(
+                "retained tail cuts through transaction {tx_id}; retry with a range through its commit or rollback boundary",
+            ))
+        })
+    }
+}
+
+/// Validate an already-read retained-unit slice for V1 embedded-sync apply.
+///
+/// The slice must contain only V1-supported record types and must not end
+/// inside an explicit transaction. Server pull/ack paths use this to avoid
+/// advertising or accepting transaction-cut LSN boundaries.
+pub fn validate_v1_retained_units_applyable(units: &[RetainedUnit]) -> io::Result<()> {
+    let mut boundary = V1ApplyBoundary::new();
+    for unit in units {
+        boundary.observe(unit)?;
+    }
+    match boundary.cut_error() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 fn reject_unsupported_v1_record_type(record_type: WalRecordType) -> io::Result<()> {

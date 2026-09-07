@@ -224,6 +224,29 @@ impl Lit {
         })
     }
 
+    /// The same value written WITHOUT its PowQL type constructor: a plain
+    /// string, which is the spelling a user reaches for first and the one that
+    /// used to be a silently false predicate (`.u = "550e8400-..."` answered
+    /// no rows on every frontend, E1). `None` for a type whose only spelling
+    /// is the one [`Lit::powql`] already produces, so a shape can skip it
+    /// instead of generating the same case twice.
+    pub fn powql_untyped(&self) -> Option<String> {
+        match self {
+            Lit::Uuid(u) => Some(powdb_quoted(&hyphenated(u), '"')),
+            Lit::Bytes(b) => Some(powdb_quoted(&backslash_hex(b), '"')),
+            _ => None,
+        }
+    }
+
+    /// PowDB-SQL spelling of [`Lit::powql_untyped`].
+    pub fn powdb_sql_untyped(&self) -> Option<String> {
+        match self {
+            Lit::Uuid(u) => Some(powdb_quoted(&hyphenated(u), '\'')),
+            Lit::Bytes(b) => Some(powdb_quoted(&backslash_hex(b), '\'')),
+            _ => None,
+        }
+    }
+
     /// The bound-parameter form handed to SQLite. Exact by construction: no
     /// text parsing is involved on this side at all.
     pub fn sqlite_param(&self) -> rusqlite::types::Value {

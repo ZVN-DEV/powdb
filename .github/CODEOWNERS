@@ -1,0 +1,4 @@
+# Review requests for every path go to Kirby's two accounts. Branch protection
+# does not require a code-owner review (the repository has one maintainer), so
+# this file routes review requests rather than gating merges.
+* @kirbycampbell @zvndev

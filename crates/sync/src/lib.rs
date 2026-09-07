@@ -8,6 +8,7 @@
 pub mod apply;
 pub mod checkpoint;
 pub mod error;
+mod fsync;
 pub mod metadata;
 pub mod replica;
 pub mod retention;
@@ -16,7 +17,7 @@ pub mod segment;
 pub use apply::{
     apply_retained_tail, apply_retained_units_chunk, seed_retained_apply_boundary,
     validate_v1_retained_tail_applyable, validate_v1_retained_units_applyable,
-    RetainedTailApplySummary,
+    RetainedTailApplySummary, V1ApplyBoundary,
 };
 pub use checkpoint::{
     archive_wal_records_for_identity, checkpoint_preserving_retained_segments_if_enabled,
@@ -41,8 +42,9 @@ pub use retention::{
     RetentionPressureSummary,
 };
 pub use segment::{
-    list_segment_files, read_segment_file, read_units_since, read_units_through,
-    retained_tail_progress, segment_file_name, validate_retained_tail_available,
-    write_segment_atomic, RetainedSegment, RetainedTailAvailability, RetainedTailProgress,
-    RetainedUnit, SegmentFile, SegmentIdentity, RETAINED_SEGMENT_FORMAT_VERSION,
+    archived_through_lsn, list_segment_files, read_segment_file, read_units_since,
+    read_units_through, retained_tail_progress, segment_file_name,
+    validate_retained_tail_available, write_segment_atomic, RetainedSegment,
+    RetainedTailAvailability, RetainedTailProgress, RetainedUnit, SegmentFile, SegmentIdentity,
+    RETAINED_SEGMENT_FORMAT_VERSION,
 };

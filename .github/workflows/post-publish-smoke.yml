@@ -111,3 +111,228 @@ jobs:
           console.log("npm embedded smoke OK: count =", res.value);
           EOF
           node smoke.mjs
+
+  # The `powdb` facade is the SQLite-shaped in-process front door and the only
+  # published crate nothing else installs: powdb-cli and powdb-server pull
+  # storage, auth, query, sync, backup and server transitively, but nobody
+  # depends on `powdb`, so before this job it was published and never once
+  # installed from the registry. It is also the crate whose public surface is a
+  # re-export of powdb-query and powdb-storage items, which is exactly where a
+  # bad publish order or a version skew shows up first.
+  crates-facade:
+    name: crates.io powdb facade install + embedded smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # A scratch crate outside this repository, so nothing resolves through a
+      # path dependency or the workspace lock: this is the dependency graph a
+      # stranger gets.
+      - name: Depend on the published facade and run it
+        env:
+          # Env passthrough, not inline interpolation (shell-injection hygiene).
+          SMOKE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          cargo new --name powdb-facade-smoke smoke >/dev/null
+          cd smoke
+          cargo add "powdb@=$SMOKE_VERSION"
+          cat > src/main.rs <<'EOF'
+          use powdb::{Database, QueryResult, Value};
+
+          fn main() -> Result<(), powdb::Error> {
+              let dir = std::env::temp_dir().join("powdb-facade-smoke");
+              let _ = std::fs::remove_dir_all(&dir);
+              let mut db = Database::open(&dir)?;
+              db.query("type Smoke { required id: int }")?;
+              db.query("insert Smoke { id := 1 }")?;
+              db.query("insert Smoke { id := 2 }")?;
+              match db.query("count(Smoke)")? {
+                  QueryResult::Scalar(Value::Int(n)) => {
+                      assert_eq!(n, 2, "facade: count was {n}, expected 2");
+                      println!("crates.io facade smoke OK: count = {n}");
+                  }
+                  other => panic!("facade: unexpected result {other:?}"),
+              }
+              Ok(())
+          }
+          EOF
+          # No --locked: `cargo new` + `cargo add` generate the lock here, so
+          # there is no committed lock for it to honour.
+          cargo run
+
+  # @zvndev/powdb-sync has been on npm since 0.24.0 and was the one npm package
+  # this smoke never installed, which is also the package whose publish step in
+  # release.yml could skip itself silently (see the bootstrap branch removed in
+  # this sprint). An import-only check would not have caught a broken build, so
+  # this exercises real behaviour: the catalog-version guard must accept the
+  # version it declares and refuse a newer one.
+  npm-sync:
+    name: npm @zvndev/powdb-sync install + behaviour smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install the published sync package
+        env:
+          SMOKE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/npm-sync-smoke && cd /tmp/npm-sync-smoke
+          npm init -y >/dev/null
+          npm install "@zvndev/powdb-sync@$SMOKE_VERSION"
+
+      - name: Exercise the sync package
+        working-directory: /tmp/npm-sync-smoke
+        run: |
+          set -euo pipefail
+          cat > smoke.mjs <<'EOF'
+          import assert from "node:assert/strict";
+          import {
+            SUPPORTED_CATALOG_VERSION,
+            PowDBSyncError,
+            PowDBSyncReplica,
+            assertServerCatalogVersionSupported,
+          } from "@zvndev/powdb-sync";
+
+          assert.ok(PowDBSyncError, "sync: PowDBSyncError export missing");
+          assert.ok(PowDBSyncReplica, "sync: PowDBSyncReplica export missing");
+          assert.equal(typeof SUPPORTED_CATALOG_VERSION, "number",
+            "sync: SUPPORTED_CATALOG_VERSION is not a number");
+
+          // The guard must accept what the package says it supports...
+          assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION);
+          // ...and refuse a server one format ahead of it.
+          assert.throws(
+            () => assertServerCatalogVersionSupported(SUPPORTED_CATALOG_VERSION + 1),
+            /newer than this client supports/,
+            "sync: the catalog-version guard accepted a newer server",
+          );
+          console.log("npm sync smoke OK: catalog v" + SUPPORTED_CATALOG_VERSION);
+          EOF
+          node smoke.mjs
+
+  # The container is a published channel with its own tags and its own
+  # attestation, and nothing downstream of the release verified it. This pulls
+  # the image a user would pull, checks all three tags resolve, checks the OCI
+  # version label matches what was released, and runs the binary.
+  ghcr-image:
+    name: ghcr image pull + run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      # The floating channel tag is derived, not hardcoded: release.yml pushes
+      # `latest` for a final and `rc` for a candidate, and both come out of
+      # scripts/ci/release-channel.sh. Checking the repo out means this leg asks
+      # the same source of truth rather than keeping a second copy of the rule.
+      - name: Checkout (for scripts/ci/release-channel.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pull, inspect and run the published image
+        env:
+          SMOKE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/zvn-dev/powdb"
+          # No registry login on purpose: the pull must work anonymously, which
+          # is what a user gets and what a package accidentally flipped to
+          # private would fail.
+
+          # All three tags a release pushes must resolve, and this loop used to
+          # pull two of them: the floating channel pointer was named in the
+          # comment and in release.yml's tag list and checked by nothing, so a
+          # release that moved `latest` to the wrong digest, or never moved it
+          # at all, passed this smoke. The bare semver tag ("0.28.0", the
+          # spelling crates.io and npm use) was missing until the v0.28.0
+          # release, so this leg fails for anything older, which is the honest
+          # verdict rather than a skip.
+          floating="$(bash scripts/ci/release-channel.sh "$SMOKE_VERSION" | sed -n 's/^docker_floating_tag=//p')"
+          if [ -z "$floating" ]; then
+            echo "::error::could not derive the floating channel tag for '$SMOKE_VERSION'"
+            exit 1
+          fi
+          echo "floating channel tag for $SMOKE_VERSION: $floating"
+
+          for tag in "v$SMOKE_VERSION" "$SMOKE_VERSION" "$floating"; do
+            echo "--- $image:$tag"
+            docker pull "$image:$tag"
+          done
+
+          # Every one of the three must be the release under test, the floating
+          # pointer included. Pulling it only proves the tag exists; the label
+          # is what proves it points here.
+          for tag in "v$SMOKE_VERSION" "$SMOKE_VERSION" "$floating"; do
+            label="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image:$tag")"
+            if [ "$label" != "$SMOKE_VERSION" ]; then
+              echo "::error::$image:$tag has org.opencontainers.image.version '$label', expected '$SMOKE_VERSION'."
+              echo "::error::For the floating tag this means the channel pointer was not moved to this release (or was moved past it: smoke the newest release of a channel)."
+              exit 1
+            fi
+          done
+
+          # Both invocations must work: the explicit binary (every version) and
+          # a bare flag through the entrypoint shim (from 0.28.0 on, where the
+          # shim was added; before that tini failed with exit 127).
+          got="$(docker run --rm "$image:v$SMOKE_VERSION" powdb-server --version)"
+          echo "explicit binary: $got"
+          case "$got" in
+            *"$SMOKE_VERSION") ;;
+            *) echo "::error::image reported '$got', expected version $SMOKE_VERSION"; exit 1 ;;
+          esac
+
+          got="$(docker run --rm "$image:v$SMOKE_VERSION" --version)"
+          echo "bare flag: $got"
+          case "$got" in
+            *"$SMOKE_VERSION") ;;
+            *) echo "::error::'docker run <image> --version' reported '$got'"; exit 1 ;;
+          esac
+
+          gh attestation verify "oci://$image:v$SMOKE_VERSION" --repo ZVN-DEV/powdb
+
+  # The GitHub Release assets are what a user downloads when they do not have a
+  # Rust toolchain, and their checksums and attestations are the only supply
+  # chain evidence those users get. Nothing verified them after publication.
+  release-assets:
+    name: GitHub Release assets + attestation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Download, checksum, attest and run the linux binaries
+        env:
+          SMOKE_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          gh release download "v$SMOKE_VERSION" --repo ZVN-DEV/powdb
+          ls -la
+
+          # SHA256SUMS covers every published binary, including the macOS ones
+          # this runner cannot execute, so check the whole file rather than one
+          # entry: a truncated or partially uploaded release fails here.
+          sha256sum -c SHA256SUMS
+
+          for asset in powdb-cli-linux-x86_64 powdb-server-linux-x86_64; do
+            gh attestation verify "$asset" --repo ZVN-DEV/powdb
+            chmod +x "$asset"
+            got="$(./"$asset" --version)"
+            echo "$asset: $got"
+            case "$got" in
+              *"$SMOKE_VERSION") ;;
+              *) echo "::error::$asset reported '$got', expected version $SMOKE_VERSION"; exit 1 ;;
+            esac
+          done

@@ -11,7 +11,7 @@ name = "powdb-node"
 # detached from the root workspace: it wraps that engine and ships as
 # @zvndev/powdb-embedded at the same number. It drifted 17 minors sitting at
 # 0.8.1, so scripts/check-version-consistency.sh now asserts it.
-version = "0.27.0"
+version = "0.28.0-rc.1"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -24,6 +24,10 @@ crate-type = ["cdylib"]
 # The embedded facade (in-process Database + panic-safe handle). Path dep on the
 # sibling crates; rebuilt here under panic = "unwind".
 powdb = { path = "../../crates/powdb" }
+# Only for `StorageErrorKind`, which decides the wire error class of a storage
+# refusal. Already in the tree through `powdb`; naming it here is what lets the
+# addon report `constraint_violation` instead of a flat `query_failed`.
+powdb-storage = { path = "../../crates/storage" }
 # `serde-json` lets napi map a `serde_json::Value` straight to a JS value, which
 # is how a JSON result cell is handed back as a parsed JavaScript value (safe
 # integers become JS numbers, out-of-range integers BigInt: matching the

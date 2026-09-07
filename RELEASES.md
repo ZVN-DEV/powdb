@@ -3,6 +3,8 @@
 Every PowDB release ships to the following registries and platforms.
 When cutting a release, follow the checklist at the bottom.
 
+> **Next release: v0.28.0-rc.1 (unreleased).** The workspace is ahead of the published release; nothing below this line describes v0.28.0-rc.1 until it ships.
+
 > **Current release: v0.27.0.** The health check-in round: everything the 2026-08-25 product review and gold-standard audit surfaced, shipped as three remediation tiers plus release-path hardening, and the first release cut through the new rc channel (`v0.27.0-rc.1` preceded it on every lane). Correctness: scans fail closed on unreadable or unverifiable pages instead of silently returning shorter results; a plan-cache hash collision can no longer execute the wrong plan (the canonical bytes are re-compared on every hit); `sum` over zero non-null values is NULL, matching `avg` and SQL; a json column compares against a string literal as a document; `LIKE '%'` matches text containing a literal `%`; SQL-subset diagnostics reach remote clients verbatim. Durability: a failed WAL fsync poisons the WAL rather than being retried (the fsyncgate hazard), and a replica killed mid-apply can resume. Security: the whole pre-auth phase of every connection runs under one 10 s deadline, and unknown usernames cost one argon2 verify so timing no longer enumerates users. Breaking for direct `powdb-storage` users, and the reason this is 0.27.0: the three deprecated `is_*_message` predicates are gone (the typed error now rides as the `io::Error` source) and the scan surfaces return `io::Result`. `powdb-sync` refusals carry a typed `SyncError`; `@zvndev/powdb-sync` accepts catalog v7 servers with a drift gate against the engine constant. New standing gates: publish-time cargo-semver-checks, rustdoc with warnings denied, a testing-feature guard, a missing_docs ratchet that only tightens, and miri over the compiled predicate module.
 
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
@@ -84,6 +86,10 @@ one-time setup and the reusable standard.
   publishing to crates.io is irreversible.
 - **npm (`@zvndev/powdb-client`)**: published automatically by `release.yml`
   on a `v*` tag push, with provenance. No manual `npm publish`, no token to make.
+- **npm (`@zvndev/powdb-sync`)**: published the same way, by `release.yml`'s
+  `npm-publish-sync` job on the same tag push. Bootstrapped by hand for 0.24.0
+  (npm cannot configure a trusted publisher for a name that does not exist yet)
+  and token-less on every release since.
 - **npm (`@zvndev/powdb-embedded`)**: published by `publish-node-addon.yml`
   (manual `workflow_dispatch`). It first builds the native addon on a per-platform
   runner matrix (macOS arm64, Linux x64/arm64; Intel macOS builds from source and
@@ -108,10 +114,22 @@ one-time setup and the reusable standard.
     clients/sync/CHANGELOG.md to the dated version entry (both ship in their
     npm tarballs and both are gated by check-version-consistency.sh)
 [ ] Update both the Next release and Current release lines in RELEASES.md
+[ ] Update the AGENTS.md feature stamp: "Available in released PowDB (vX.Y.Z)".
+    It is the line agents read to decide which features exist, it drifted three
+    minors behind before anything noticed, and check-version-consistency.sh
+    gates it now.
 [ ] Update doc version strings: --version pins and CLI banner transcripts in
     README.md, docs/getting-started.md, docs/powdb-vs-sqlite.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
+[ ] Check the nightly fuzz runs since the last release: none red, or every
+    failing input triaged and checked in under crates/query/fuzz/seeds/.
+    fuzz.yml is not part of ci-success, so a red nightly blocks nothing on its
+    own and will sit there unless someone looks.
+[ ] Run the perf gate on the release branch and record the run URL in the
+    release PR: `gh workflow run bench.yml --ref release/vX.Y.Z`, green.
+    bench.yml is manual-only and is not a merge gate, so this is the only
+    point in the process where a performance regression can be caught.
 
 Note on the three lockfiles: bindings/node and crates/query/fuzz are detached
 workspaces, so `cargo build --workspace` never regenerates them. All three are
@@ -126,8 +144,23 @@ under a released version number, so the crates cannot go first.
 
 [ ] git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
     Pushing the tag triggers release.yml, which builds the binaries, publishes
-    the multi-arch Docker image, and publishes @zvndev/powdb-client to npm
-    token-less via OIDC. No manual npm publish for the client.
+    the multi-arch Docker image, and publishes BOTH @zvndev/powdb-client and
+    @zvndev/powdb-sync to npm token-less via OIDC. No manual npm publish for
+    either. The addon (@zvndev/powdb-embedded) is the one npm package the tag
+    does not publish; it has its own dispatch below.
+[ ] Approve the npm publish. The `npm-publish` environment requires a reviewer
+    (kirbycampbell or zvndev) and accepts deployments only from `main` and
+    `v*` tags, so release.yml pauses at its two npm jobs with "waiting for
+    review" until one of them approves, either on the run's page (Review
+    deployments) or from a terminal:
+
+      gh api -X POST repos/ZVN-DEV/powdb/actions/runs/<run-id>/pending_deployments \
+        --input - <<< '{"environment_ids":[17328437676],"state":"approved","comment":"vX.Y.Z"}'
+
+    publish-node-addon.yml below pauses at the same gate. The tags themselves
+    are covered by a repository ruleset ("release tags: admins only"): only
+    repository admins can create, move, or delete a `v*` tag, so a
+    write-access account cannot start a release or re-point one.
 [ ] Publish the crates, dispatched ON THE TAG, in dependency order (the
     workflow already orders them: storage, auth, query, sync, backup, server,
     powdb, cli):
@@ -141,7 +174,12 @@ under a released version number, so the crates cannot go first.
     published crates.io baselines and refuses to publish an API change bigger
     than the version bump allows (the point-release-over-a-break hazard). If
     it fires on a real release, the bump is wrong: raise the version, do not
-    bypass the check.
+    bypass the check. The separate advisory pass now also fails when
+    cargo-semver-checks does not run at all (exit above 1) or examines no
+    crate: on a 0.x minor bump it skips every lint by design, so "it ran and
+    found nothing" and "it never ran" used to look identical, and the advisory
+    pass is that release shape's whole verdict. Its findings still never
+    block.
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
@@ -149,10 +187,16 @@ under a released version number, so the crates cannot go first.
     needs no OIDC setup. Do this BEFORE the smoke, which installs the addon.
 [ ] Smoke-test the LIVE registries: run post-publish-smoke.yml with the
     released version (`gh workflow run post-publish-smoke.yml -f version=X.Y.Z`).
-    It cargo-installs powdb-cli + powdb-server from crates.io and reruns the
-    durability smoke (README PowQL flow + kill -9/restart WAL replay; the gate
-    v0.4.1-v0.4.3 lacked), then npm-installs @zvndev/powdb-client and
-    @zvndev/powdb-embedded and exercises both
+    It covers all six published channels in parallel jobs: cargo-installs
+    powdb-cli + powdb-server from crates.io and reruns the durability smoke
+    (README PowQL flow + kill -9/restart WAL replay; the gate v0.4.1-v0.4.3
+    lacked), cargo-installs the `powdb` facade crate, npm-installs
+    @zvndev/powdb-client + @zvndev/powdb-embedded and @zvndev/powdb-sync, pulls
+    and runs the ghcr image, and checks the GitHub Release assets and their
+    attestation. Smoke the NEWEST release of a channel: the ghcr leg now
+    asserts the floating channel pointer (`latest` for a final, `rc` for a
+    candidate) as well as the two pinned tags, so smoking an older version
+    fails that assertion by design.
 [ ] Verify each registry directly rather than trusting workflow exit codes:
     crates.io versions, `gh release view vX.Y.Z`, the ghcr tag list, and
     `npm view <pkg> version` for each npm package
@@ -186,8 +230,10 @@ Checklist's version bump, lockfiles included;
 `Next release: vX.Y.Z-rc.N (unreleased)` in this file and add the `X.Y.x | :x: (unreleased)` row to SECURITY.md (the
 consistency script derives the series from the `X.Y` prefix, so an rc and
 its final share one row), leave every `--version` pin, banner, and
-`Current release` at the last final, tag `vX.Y.Z-rc.N`, push the tag, then
-run `publish.yml` and `publish-node-addon.yml` on the tag as usual. Promote
+`Current release` at the last final, tag `vX.Y.Z-rc.N`, push the tag,
+approve the `npm-publish` deployment when release.yml pauses for it, then
+run `publish.yml` and `publish-node-addon.yml` on the tag as usual (the addon
+run pauses for the same approval). Promote
 by cutting the final `vX.Y.Z` from the same commit plus the version bump;
 nothing is re-tagged or re-labelled, the final artifacts are rebuilt from
 the final tag. A candidate that turns out bad is simply never

@@ -14,17 +14,17 @@ use crate::protocol::{
     CLIENT_CATALOG_VERSION, MAX_SUPPORTED_PROTOCOL_VERSION, MIN_SUPPORTED_PROTOCOL_VERSION,
     SERVER_FEATURES,
 };
-use powdb_auth::UserStore;
 use powdb_query::executor::{Engine, WalDurabilityTicket};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
-use tokio::sync::{watch, OwnedSemaphorePermit};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 pub use self::auth::{
-    authenticate_connect, new_rate_limiter, AuthOutcome, AuthRateLimiter, Principal,
+    authenticate_connect, new_rate_limiter, AuthBucket, AuthFailureTable, AuthOutcome, AuthPeer,
+    AuthRateLimiter, Principal, UserDirectory, MAX_AUTH_BUCKETS, MAX_AUTH_BUCKET_USER_BYTES,
 };
 pub use self::transaction::{
     new_tx_gate, new_tx_gate_with_max_tx_lifetime, new_tx_gate_with_permits, TxGate,
@@ -32,7 +32,8 @@ pub use self::transaction::{
 };
 
 use self::auth::{
-    check_db_name, clear_auth_failures, is_rate_limited, record_auth_failure, DEFAULT_DB_NAME,
+    auth_retry_after_secs, check_db_name, clear_auth_failures, is_rate_limited,
+    record_auth_failure, DEFAULT_DB_NAME,
 };
 use self::classify::error_response;
 use self::query::{
@@ -50,9 +51,30 @@ use self::transaction::{
 };
 use self::wire::{
     flush_before_close, is_success_response, native_value_body_len, read_message_cancel_safe,
-    write_msg, write_msg_within, ConnectionTermination, FrameStream, InFlightReadAhead,
-    WireResultMode, MAX_WIRE_PAYLOAD_SIZE, WRITE_TIMEOUT,
+    write_msg, write_msg_within, ConnectionTermination, FrameReadError, FrameStream,
+    InFlightReadAhead, WireResultMode, MAX_WIRE_PAYLOAD_SIZE, WRITE_TIMEOUT,
 };
+
+/// Whether an I/O failure is just the peer going away.
+fn is_peer_gone_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Log a frame-read failure at the level an operator should read it as: a
+/// peer that vanished is routine, anything else is worth looking at.
+fn report_frame_read_error(peer: &str, e: &FrameReadError) {
+    if e.is_peer_gone() {
+        debug!(peer = %peer, error = %e, "peer disconnected");
+    } else {
+        warn!(peer = %peer, error = %e, "read error");
+    }
+}
 
 /// Hard ceiling on the whole pre-auth phase of a connection — waiting for
 /// CONNECT, pre-auth Pings included. Ten seconds mirrors the TLS handshake
@@ -74,7 +96,7 @@ pub struct ConnOpts<'a> {
     /// Multi-user store loaded from the data dir at startup. When it has users,
     /// the handshake authenticates `(username, password)` against it; when empty
     /// the server falls back to `expected_password`. Shared across connections.
-    pub users: Arc<UserStore>,
+    pub users: Arc<UserDirectory>,
     pub shutdown_rx: &'a mut watch::Receiver<bool>,
     pub idle_timeout: Duration,
     /// Ceiling on the whole pre-auth phase (see [`DEFAULT_PREAUTH_DEADLINE`]).
@@ -142,7 +164,7 @@ async fn serve_connection<R, W>(
     let peer = peer_addr
         .map(|a| a.to_string())
         .unwrap_or_else(|| "unknown".into());
-    let peer_ip = peer_addr.map(|a| a.ip());
+    let auth_peer = AuthPeer::of(peer_addr);
 
     // Wait for Connect message (with idle timeout).
     // Accept Ping messages before authentication so load balancers can
@@ -168,7 +190,15 @@ async fn serve_connection<R, W>(
                 return;
             }
             Ok(Err(e)) => {
-                error!(peer = %peer, error = %e, "error reading CONNECT");
+                // A peer that disconnects before sending a frame is the
+                // ordinary shape of a TCP health probe (connect, close). It
+                // logged at ERROR once per probe interval on every idle
+                // container, which trains operators to ignore the level.
+                if is_peer_gone_io(&e) {
+                    debug!(peer = %peer, error = %e, "peer disconnected before CONNECT");
+                } else {
+                    error!(peer = %peer, error = %e, "error reading CONNECT");
+                }
                 return;
             }
             Err(_) => {
@@ -205,6 +235,9 @@ async fn serve_connection<R, W>(
     // The authenticated identity for this connection. Bound at connect time
     // and enforced on every query by `dispatch_query`.
     let principal: Option<Principal>;
+    // One snapshot of `auth.json` for this handshake, re-read first if the
+    // file changed since the last connection looked.
+    let users = users.current();
     let credential_auth_configured = !users.is_empty() || expected_password.is_some();
     match connect_msg {
         Message::Connect {
@@ -212,12 +245,30 @@ async fn serve_connection<R, W>(
             password,
             username,
         } => {
+            // Which name the limiter counts a failure against.
+            //
+            // On the shared-password (and open) path `authenticate_connect`
+            // never looks at the username, so counting it there let a peer
+            // reset its own per-user counter by varying a field that changes
+            // nothing: 50 password guesses a minute from one address instead
+            // of 5. It also made an unauthenticated peer the author of the
+            // limiter's keys for the deployment shape that has no user store
+            // at all. With no user store the failure belongs to the peer.
+            let limiter_user = if users.is_empty() {
+                None
+            } else {
+                username.as_deref()
+            };
+
             // Check rate limiting before verifying credentials.
-            if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                if is_rate_limited(limiter, ip) {
+            if let Some(limiter) = rate_limiter {
+                if is_rate_limited(limiter, &auth_peer, limiter_user) {
                     warn!(peer = %peer, "rate limited: too many auth failures");
                     let err = error_response(
-                        "too many auth failures, try again later",
+                        format!(
+                            "too many auth failures, retry after {}s",
+                            auth_retry_after_secs()
+                        ),
                         ErrorClass::RateLimited,
                     );
                     write_msg(writer, &err).await;
@@ -237,8 +288,8 @@ async fn serve_connection<R, W>(
                     warn!(peer = %peer, db = %db_name, "auth rejected");
                     metrics.inc_auth_failure();
                     // Record the failure for rate limiting.
-                    if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                        record_auth_failure(limiter, ip);
+                    if let Some(limiter) = rate_limiter {
+                        record_auth_failure(limiter, &auth_peer, limiter_user);
                     }
                     let err = error_response("authentication failed", ErrorClass::AuthFailed);
                     write_msg(writer, &err).await;
@@ -248,8 +299,8 @@ async fn serve_connection<R, W>(
                     principal: auth_principal,
                 } => {
                     // Auth succeeded — clear any prior failure count.
-                    if let (Some(limiter), Some(ip)) = (rate_limiter, peer_ip) {
-                        clear_auth_failures(limiter, ip);
+                    if let Some(limiter) = rate_limiter {
+                        clear_auth_failures(limiter, &auth_peer, limiter_user);
                     }
                     match &auth_principal {
                         Some(p) => {
@@ -332,7 +383,7 @@ async fn serve_connection<R, W>(
         }
     }
 
-    let mut tx_permit: Option<OwnedSemaphorePermit> = None;
+    let mut tx_permit: Option<transaction::TxGateHold> = None;
     // Persistent framing state makes reads cancellation-safe while they race
     // an in-flight blocking query. Frames decoded during execution retain
     // their original order here for normal pipelined processing afterwards.
@@ -404,7 +455,14 @@ async fn serve_connection<R, W>(
                         Ok(Ok(Some(frame))) => frame.message,
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
-                            error!(peer = %peer, error = %e, "read error");
+                            report_frame_read_error(&peer, &e);
+                            if let FrameReadError::Refused { reply, .. } = e {
+                                // The frame was refused on its own content, so
+                                // the client has to be told which cap it hit.
+                                // The stream is desynchronized past this point;
+                                // the connection closes after the reply.
+                                write_msg_within(writer, &reply, tx_deadline).await;
+                            }
                             break;
                         }
                         Err(_) => {
@@ -798,10 +856,10 @@ async fn serve_connection<R, W>(
                     .await
                     .map(|result| result.map(|frame| frame.map(|frame| frame.message)))
                     .unwrap_or_else(|_| {
-                        Err(std::io::Error::new(
+                        Err(FrameReadError::Transport(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "timeout decoding fully-buffered frame",
-                        ))
+                        )))
                     })
                 };
                 match next_message {
@@ -813,14 +871,15 @@ async fn serve_connection<R, W>(
                         | Message::QuerySqlNative { .. }
                         | Message::QueryWithParamsNative { .. }),
                     )) => {
-                        // If another connection currently holds the TxGate,
-                        // the next statement would block on the gate with
-                        // this batch's replies still unflushed (pre-batching,
-                        // they'd already have been written). Flush first and
-                        // handle the frame on the next main-loop iteration.
-                        // Benign TOCTOU: worst case is one early flush or one
-                        // gate wait with an empty reply queue.
-                        if tx_gate.available_permits() == 0 {
+                        // If another connection currently holds any part of
+                        // the TxGate, the next statement may block on the gate
+                        // with this batch's replies still unflushed
+                        // (pre-batching, they'd already have been written).
+                        // Flush first and handle the frame on the next
+                        // main-loop iteration. Benign TOCTOU: worst case is one
+                        // early flush or one gate wait with an empty reply
+                        // queue.
+                        if tx_gate.available_permits() < tx_gate.permit_count() as usize {
                             carry = Some(next);
                             break;
                         }
@@ -837,7 +896,10 @@ async fn serve_connection<R, W>(
                         break;
                     }
                     Err(e) => {
-                        error!(peer = %peer, error = %e, "read error");
+                        report_frame_read_error(&peer, &e);
+                        if let FrameReadError::Refused { reply, .. } = e {
+                            responses.push(*reply);
+                        }
                         fatal = Some(ConnectionTermination::ReadError);
                         break;
                     }

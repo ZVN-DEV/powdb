@@ -12,7 +12,12 @@
 //!   * **catalog state**: no index, plain btree, unique index, expression
 //!     index, materialized view;
 //!   * **physical path**: fast paths on, and fast paths forced off via the
-//!     `testing`-only [`Engine::set_force_generic_path`].
+//!     `testing`-only [`Engine::set_force_generic_path`];
+//!   * **executor**: the read-write dispatcher and the read-only mirror, which
+//!     is what a server read, an `open_read_only` handle and embedded
+//!     `query_readonly` all reach. The mirror was excused from this runner
+//!     until a null-handling divergence in its `RangeScan` arm shipped in a
+//!     release, so it is now a dimension here rather than a separate suite.
 //!
 //! and compares column names, full row values, and (where the query defines an
 //! order) row order.
@@ -324,14 +329,39 @@ impl Outcome {
     }
 }
 
-fn run(engine: &mut Engine, query: &str) -> Outcome {
-    match engine.execute_powql(query) {
+/// Which executor served the read. The read-only mirror is a separate
+/// dispatcher with its own `RangeScan`, `IndexScan` and count arms, and a
+/// server read, an `open_read_only` handle and embedded `query_readonly` all
+/// land there. It went unaudited by this runner until a null-handling
+/// divergence in its `RangeScan` arm reached a release, so it is now a third
+/// physical path here rather than something the readonly suites cover alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Api {
+    ReadWrite,
+    ReadOnly,
+}
+
+const BOTH_APIS: [Api; 2] = [Api::ReadWrite, Api::ReadOnly];
+
+fn to_outcome(result: Result<QueryResult, powdb_query::result::QueryError>) -> Outcome {
+    match result {
         Ok(QueryResult::Rows { columns, rows }) => Outcome::Rows { columns, rows },
         Ok(QueryResult::Scalar(value)) => Outcome::Scalar(value),
         Ok(QueryResult::Modified(n)) => Outcome::Modified(n),
         Ok(QueryResult::Created(name)) => Outcome::Other(format!("created {name}")),
         Ok(QueryResult::Executed { message }) => Outcome::Other(message),
         Err(err) => Outcome::Error(err.to_string()),
+    }
+}
+
+fn run(engine: &mut Engine, query: &str) -> Outcome {
+    to_outcome(engine.execute_powql(query))
+}
+
+fn run_api(engine: &mut Engine, query: &str, api: Api) -> Outcome {
+    match api {
+        Api::ReadWrite => to_outcome(engine.execute_powql(query)),
+        Api::ReadOnly => to_outcome(engine.execute_powql_readonly(query)),
     }
 }
 
@@ -676,6 +706,7 @@ fn every_access_path_and_the_generic_evaluator_agree_on_reads() {
 
     for case in READ_CASES {
         let mut observed: Vec<(Access, bool, Outcome)> = Vec::new();
+        let mut readonly: Vec<(Access, bool, Outcome)> = Vec::new();
         for (access, force_generic, engine) in engines.iter_mut() {
             let query = case.powql.replace("{t}", access.table());
 
@@ -695,7 +726,32 @@ fn every_access_path_and_the_generic_evaluator_agree_on_reads() {
                 );
             }
 
-            observed.push((*access, *force_generic, run(engine, &query)));
+            for api in BOTH_APIS {
+                let outcome = run_api(engine, &query, api);
+                match api {
+                    Api::ReadWrite => observed.push((*access, *force_generic, outcome)),
+                    Api::ReadOnly => readonly.push((*access, *force_generic, outcome)),
+                }
+            }
+        }
+
+        // 0. The read-only mirror answers the same question through its own
+        //    dispatcher, whose arms walk the relation differently (an index
+        //    where the read-write arm scans the heap). The rows are therefore a
+        //    contract and their order is one only when the query asked for it,
+        //    the same rule comparison 2 applies across catalog states.
+        for ((access, force_generic, rw), (_, _, ro)) in observed.iter().zip(readonly.iter()) {
+            let (left, right) = if case.ordered {
+                (rw.clone(), ro.clone())
+            } else {
+                (rw.order_insensitive(), ro.order_insensitive())
+            };
+            assert_eq!(
+                left, right,
+                "`{}` under {access:?} (force_generic={force_generic}): the read-only executor \
+                 disagrees with the read-write executor",
+                case.powql
+            );
         }
 
         // 1. Within one catalog state the plan tree is identical, so the two
@@ -1251,20 +1307,22 @@ fn a_float_column_compared_to_an_int_literal_answers_the_same_on_every_path() {
     }
 }
 
-/// Pinned because it is broken.
+/// A view materialized over zero rows takes its column types from the source.
 ///
-/// `materialize V as <query>` infers the view's column types from the rows the
-/// query returns right now. When it returns none, every column is typed `str`,
-/// and the wrong types are persisted: from then on any comparison against a
-/// non-string literal is a hard type error, permanently, even after the source
-/// table fills up.
+/// `materialize V as <query>` used to infer the view's column types from the
+/// rows the query returned at creation time. When it returned none, every
+/// column was persisted as `str`, so from then on any comparison against a
+/// non-string literal was a hard type error, permanently, even after the
+/// source table filled up. The types now come from the projection's static
+/// types against the base schema, so an empty materialization is typed like a
+/// full one.
 ///
 /// This is the materialized-view arm of the catalog-state axis, so it belongs
 /// with the rest of the access-path evidence. The runner above seeds its view
-/// from a non-empty table and therefore never trips it; that is exactly why it
-/// needs its own test rather than being left to chance.
+/// from a non-empty table and therefore never exercises the empty case; that
+/// is exactly why it needs its own test rather than being left to chance.
 #[test]
-fn a_view_materialized_over_zero_rows_types_every_column_as_str() {
+fn a_view_materialized_over_zero_rows_inherits_the_source_column_types() {
     let mut engine =
         Engine::new(&fresh_dir("emptyview")).expect("engine opens over a fresh temp dir");
     exec(&mut engine, "type S { required unique id: int, n: int }");
@@ -1285,34 +1343,40 @@ fn a_view_materialized_over_zero_rows_types_every_column_as_str() {
         .collect();
     assert_eq!(
         types,
-        vec!["str".to_string(), "str".to_string()],
-        "an empty materialization should inherit the source column types; it currently \
-         types everything as str"
+        vec!["int".to_string(), "int".to_string()],
+        "an empty materialization must inherit the source column types"
     );
 
-    // The consequence: the view can never be filtered on its int column again.
+    // The consequence that used to be impossible: the int column is still an
+    // int column, so a comparison against an int literal answers instead of
+    // failing.
     let filtered = run(&mut engine, "EV filter .n = 1 { .id }");
-    assert!(
-        matches!(&filtered, Outcome::Error(message) if message.contains("type mismatch")),
-        "expected the persisted str typing to make an int comparison a type error, \
-         got {filtered:?}"
+    assert_eq!(
+        filtered,
+        Outcome::Rows {
+            columns: vec!["id".to_string()],
+            rows: Vec::new(),
+        },
+        "an int comparison over an empty view should answer with no rows"
     );
 }
 
 /// The refresh side of the empty-materialization bug above, formerly a
-/// process kill.
+/// process kill and then a permanent error.
 ///
-/// Once a view has been mistyped by that bug, the first refresh with an
-/// actual row to write used to encode an `int` into a column the schema
-/// calls `str` and reach `unreachable!("variable column with non-variable
-/// value")` in the row encoder: an abort under the shipped `panic = "abort"`
-/// release profile, triggered by a plain read of the view after an unrelated
-/// insert. The refresh path now validates the fresh rows against the backing
-/// schema before touching anything, so the same sequence is a typed error on
-/// every read shape, the process stays up, and the message says what to do
-/// (drop and recreate the view).
+/// This exact sequence has failed two different ways. First, the refresh
+/// encoded an `int` into a column the empty materialization had typed `str`
+/// and reached `unreachable!("variable column with non-variable value")` in
+/// the row encoder: an abort under the shipped `panic = "abort"` release
+/// profile, triggered by a plain read of a view after an unrelated insert.
+/// Then the refresh path validated the fresh rows against the backing schema
+/// first, which turned the abort into a typed error, but the view stayed
+/// broken for good and every read of it failed. Now that an empty
+/// materialization is typed from the source schema, the sequence simply
+/// works, on every read shape. Keeping the case pinned means neither older
+/// failure can return unnoticed.
 #[test]
-fn refreshing_a_mistyped_view_is_a_typed_error_not_an_abort() {
+fn a_view_first_materialized_empty_serves_rows_once_the_source_fills() {
     let mut engine =
         Engine::new(&fresh_dir("viewpanic")).expect("engine opens over a fresh temp dir");
     exec(&mut engine, "type S { required unique id: int, n: int }");
@@ -1323,13 +1387,34 @@ fn refreshing_a_mistyped_view_is_a_typed_error_not_an_abort() {
     // (`every_read_shape_refreshes_a_dirty_materialized_view`), so each one
     // runs the refresh and each one must surface the same clean error.
     exec(&mut engine, "insert S { id := 2, n := 5 }");
-    for read in ["EV", "EV { .id }", "count(EV)", "refresh EV"] {
+    for (read, expected) in [
+        (
+            "EV",
+            Outcome::Rows {
+                columns: vec!["id".to_string(), "n".to_string()],
+                rows: vec![vec![Value::Int(2), Value::Int(5)]],
+            },
+        ),
+        (
+            "EV { .id }",
+            Outcome::Rows {
+                columns: vec!["id".to_string()],
+                rows: vec![vec![Value::Int(2)]],
+            },
+        ),
+        ("count(EV)", Outcome::Scalar(Value::Int(1))),
+    ] {
         let outcome = run(&mut engine, read);
-        assert!(
-            matches!(&outcome, Outcome::Error(message) if message.contains("drop and recreate")),
-            "expected a typed refresh error from {read:?}, got {outcome:?}"
+        assert_eq!(
+            outcome, expected,
+            "reading {read:?} after the source filled should serve the new row"
         );
     }
+    let refreshed = run(&mut engine, "refresh EV");
+    assert!(
+        matches!(&refreshed, Outcome::Other(message) if message.contains("refreshed")),
+        "an explicit refresh should succeed, got {refreshed:?}"
+    );
 }
 
 /// Every read shape must see a refreshed materialized view, whatever physical
@@ -1443,6 +1528,13 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
     "project-filter-limit",
     "project-filter-sort-limit",
     "project-over-index-scan",
+    // The read-only mirror, driven by the same corpus through
+    // `execute_powql_readonly`. Its `RangeScan` arm shipped a null-handling
+    // divergence while this runner still excused the whole mirror.
+    "readonly:count-fast-block",
+    "readonly:filter-seqscan-raw",
+    "readonly:project-over-index-scan",
+    "readonly:range-scan-scan-fallback:predicate",
     "update-byte-patch",
     "update-var-shrink",
 ];
@@ -1451,6 +1543,21 @@ const SITES_REACHED_BY_THE_CORPUS: &[&str] = &[
 /// guard has to be added to one of these two lists, so it cannot be introduced
 /// without someone deciding whether the runner covers it.
 const UNCOVERED_SITES: &[(&str, &str)] = &[
+    // The read-only mirror's own nested and lowering-shadowed guards, excused
+    // for the same reasons as their read-write twins below. The mirror's
+    // reachable sites are in SITES_REACHED_BY_THE_CORPUS.
+    (
+        "readonly:count-filter:predicate",
+        "nested inside readonly:count-fast-block",
+    ),
+    (
+        "readonly:filter-seqscan:predicate",
+        "nested inside readonly:filter-seqscan-raw",
+    ),
+    (
+        "readonly:index-scan-scan-fallback:predicate",
+        "unreachable behind plan lowering",
+    ),
     // Nested inside an outer guard: by the time compilation is attempted the
     // enclosing fast path has already declined, so these never record while the
     // switch is on. They still route through the single compile entry point,
@@ -1473,28 +1580,6 @@ const UNCOVERED_SITES: &[(&str, &str)] = &[
     (
         "project-filter-sort-limit:predicate",
         "nested inside project-filter-sort-limit",
-    ),
-    // Reached only through `Engine::open_readonly`, which serves plans from a
-    // separate mirror of the dispatcher. Covered by the readonly suites, not by
-    // this runner, whose fixtures all need to write before they can read.
-    ("readonly:count-fast-block", "read-only engine mirror"),
-    ("readonly:count-filter:predicate", "read-only engine mirror"),
-    ("readonly:filter-seqscan-raw", "read-only engine mirror"),
-    (
-        "readonly:filter-seqscan:predicate",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:index-scan-scan-fallback:predicate",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:project-over-index-scan",
-        "read-only engine mirror",
-    ),
-    (
-        "readonly:range-scan-scan-fallback:predicate",
-        "read-only engine mirror",
     ),
     // The planner emits IndexScan/RangeScan speculatively, but
     // `lower_unindexed_scans` rewrites the ones with no matching index into
@@ -1525,7 +1610,10 @@ fn sites_reached_by_the_corpus() -> Vec<&'static str> {
     for access in ALL_ACCESS {
         let mut engine = build(access, true);
         for case in READ_CASES {
-            let _ = run(&mut engine, &case.powql.replace("{t}", access.table()));
+            let query = case.powql.replace("{t}", access.table());
+            for api in BOTH_APIS {
+                let _ = run_api(&mut engine, &query, api);
+            }
         }
         reached.extend(engine.forced_generic_sites());
     }

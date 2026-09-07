@@ -15,7 +15,8 @@
 //! `DirLock::acquire` would have left it. The subcommands must fail and leave
 //! the directory untouched.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_powdb-cli")
@@ -58,15 +59,66 @@ fn seed(data_s: &str) {
     .success());
 }
 
-/// Spawn a live foreign process and plant its PID in the data dir's LOCK
-/// file, simulating a running `powdb-server` that owns the directory.
+/// Spawn a real live writer: a `powdb-cli` REPL that holds the directory's
+/// writer lock for as long as its stdin stays open.
+///
+/// Writing a live process's PID into `LOCK` is no longer enough to stand in
+/// for one. The storage lock is settled by an `flock` on the `LOCK` file, so a
+/// directory whose `LOCK` names a live process that holds no flock is
+/// correctly read as a ghost and reclaimed; a `sleep` never took the lock, so
+/// it stopped representing a running server. Only a process that really
+/// acquired the lock does.
+///
+/// Which is also why the wait is not on the child's pid appearing in `LOCK`.
+/// That file says who *claims* the directory, and reading it cannot tell a
+/// holder from a claimant; a test that starts the instant the pid lands is
+/// asserting against whatever the writer has managed to do so far. The wait is
+/// on the engine answering instead: `.tables` is served from the open catalog,
+/// so a line back on stdout means the directory is open and its lock is held,
+/// whatever order the writer does its work in.
 fn plant_live_writer(data_dir: &std::path::Path) -> std::process::Child {
-    let child = Command::new("sleep")
-        .arg("60")
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = Command::new(bin())
+        .args(["--data-dir", data_dir.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn sleeper process");
-    std::fs::write(data_dir.join("LOCK"), child.id().to_string()).expect("failed to write LOCK");
-    child
+        .expect("failed to spawn a live powdb-cli writer");
+
+    // `as_mut`, not `take`: dropping the child's stdin is EOF to the REPL, and
+    // the REPL exiting is the one thing these tests must not let happen.
+    let stdin = child.stdin.as_mut().expect("stdin was piped");
+    stdin
+        .write_all(b".tables\n")
+        .expect("the live writer must accept a line");
+    stdin.flush().expect("the live writer must accept a line");
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let (answered, wait_for_answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Drains to EOF rather than stopping at the first line: dropping the
+        // read end of the pipe would give the writer EPIPE on its next line of
+        // output and kill it, which is the one thing these tests must not do.
+        let mut answered = Some(answered);
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                if let Some(answered) = answered.take() {
+                    let _ = answered.send(());
+                }
+            }
+        }
+    });
+
+    match wait_for_answer.recv_timeout(Duration::from_secs(60)) {
+        Ok(_) => child,
+        Err(reason) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the live writer never opened the data dir: {reason:?}");
+        }
+    }
 }
 
 #[test]
@@ -98,8 +150,11 @@ fn backup_refuses_data_dir_held_by_live_writer() {
         .map(|m| m.len())
         .ok();
     assert_eq!(
-        wal_len_before, wal_len_after,
-        "backup mutated the live directory's wal.log despite being refused"
+        wal_len_before,
+        wal_len_after,
+        "backup mutated the live directory's wal.log despite being refused; \
+         backup said: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
         !dest.join("manifest.json").exists(),

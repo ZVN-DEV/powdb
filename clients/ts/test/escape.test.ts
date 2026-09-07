@@ -7,8 +7,12 @@
  */
 
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   escapeIdent,
+  powqlReservedWords,
   escapeLiteral,
   escapeSqlIdent,
   escapeSqlLiteral,
@@ -112,9 +116,11 @@ async function main() {
   });
 
   await test("large bigint", () => {
+    // The old expectation here (12345678901234567890n) is above i64::MAX, so
+    // the literal it produced was one the engine refused at parse time.
     assert.equal(
-      escapeLiteral(12345678901234567890n),
-      "12345678901234567890"
+      escapeLiteral(1234567890123456789n),
+      "1234567890123456789"
     );
   });
 
@@ -353,11 +359,12 @@ async function main() {
     assert.throws(() => escapeSqlLiteral({} as any), TypeError);
   });
 
-  await test("escapeSqlIdent validates instead of quoting", () => {
-    // PowDB's SQL lexer reads a double-quoted run as a string, so there is no
-    // identifier-quoting syntax to fall back on: invalid names must throw.
-    assert.equal(escapeSqlIdent("User"), "User");
-    assert.equal(escapeSqlIdent("_x1"), "_x1");
+  await test("escapeSqlIdent double-quotes the name it validates", () => {
+    // The SQL frontend lexes a double-quoted run as an identifier (it re-emits
+    // it as a backticked PowQL word), so quoting is what makes a reserved word
+    // usable. Invalid names still throw.
+    assert.equal(escapeSqlIdent("User"), '"User"');
+    assert.equal(escapeSqlIdent("_x1"), '"_x1"');
     assert.throws(() => escapeSqlIdent("users; drop table x"), TypeError);
     assert.throws(() => escapeSqlIdent('u"'), TypeError);
     assert.throws(() => escapeSqlIdent(""), TypeError);
@@ -365,9 +372,33 @@ async function main() {
     assert.throws(() => escapeSqlIdent(7 as any), TypeError);
   });
 
+  await test("escapeSqlIdent makes a reserved word usable as a table name", () => {
+    // Bare `order` is a parse error where a SQL table name is expected, and
+    // IDENT_RE refuses a hand-quoted '"order"', so before quoting there was no
+    // spelling of this table that went through the safe API at all.
+    assert.equal(escapeSqlIdent("order"), '"order"');
+    assert.equal(escapeSqlIdent("select"), '"select"');
+    assert.equal(escapeSqlIdent("group"), '"group"');
+    // Every PowQL keyword reaches the same trap: the quoted name is a Word.
+    for (const word of powqlReservedWords()) {
+      assert.equal(escapeSqlIdent(word), `"${word}"`);
+    }
+  });
+
+  await test("an already-quoted SQL name is refused with a pointed message", () => {
+    assert.throws(() => escapeSqlIdent('"order"'), /pass the bare name/);
+  });
+
   await test("sql template escapes literals and identifiers", () => {
     const q = sql`SELECT * FROM ${sqlIdent("User")} WHERE name = ${"o'neil"} AND age > ${25}`;
-    assert.equal(q, "SELECT * FROM User WHERE name = 'o''neil' AND age > 25");
+    assert.equal(q, `SELECT * FROM "User" WHERE name = 'o''neil' AND age > 25`);
+  });
+
+  await test("sql template names a reserved-word table", () => {
+    assert.equal(
+      sql`SELECT * FROM ${sqlIdent("order")}`,
+      'SELECT * FROM "order"',
+    );
   });
 
   await test("sql template traps a classic injection payload in one literal", () => {
@@ -377,6 +408,76 @@ async function main() {
 
   await test("sql template rejects a PowQL ident wrapper", () => {
     assert.throws(() => sql`SELECT * FROM ${ident("User")}`, TypeError);
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nreserved words");
+  // ──────────────────────────────────────────────────────────
+
+  await test("a reserved word is backtick-quoted, not passed through", () => {
+    assert.equal(escapeIdent("select"), "`select`");
+    assert.equal(escapeIdent("order"), "`order`");
+    assert.equal(escapeIdent("type"), "`type`");
+    assert.equal(escapeIdent("count"), "`count`");
+  });
+
+  await test("an ordinary identifier is still passed through unquoted", () => {
+    assert.equal(escapeIdent("User"), "User");
+    assert.equal(escapeIdent("_private"), "_private");
+    assert.equal(escapeIdent("selected"), "selected");
+    // Keyword matching is exact: the lexer only reserves the lowercase form.
+    assert.equal(escapeIdent("Select"), "Select");
+  });
+
+  await test("powql quotes a reserved identifier through ident()", () => {
+    assert.equal(powql`${ident("select")} { .id }`, "`select` { .id }");
+  });
+
+  await test("an already-backticked name is refused with a pointed message", () => {
+    assert.throws(
+      () => escapeIdent("`select`"),
+      /pass the bare name/,
+    );
+  });
+
+  await test("the reserved list matches the engine lexer's keywords", () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const lexer = readFileSync(
+      path.resolve(here, "..", "..", "..", "crates", "query", "src", "lexer.rs"),
+      "utf8",
+    );
+    const start = lexer.indexOf("let token = match word.as_str() {");
+    const end = lexer.indexOf("_ => Token::Ident(word),", start);
+    assert.ok(start !== -1 && end !== -1, "keyword table not found in lexer.rs");
+    const shipped = [
+      ...new Set(
+        Array.from(
+          lexer.slice(start, end).matchAll(/"([a-z_0-9]+)" =>/g),
+          (m) => m[1] as string,
+        ),
+      ),
+    ].sort();
+    assert.deepEqual(
+      [...powqlReservedWords()].sort(),
+      shipped,
+      "RESERVED_WORDS has drifted from crates/query/src/lexer.rs",
+    );
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nbigint range");
+  // ──────────────────────────────────────────────────────────
+
+  await test("escapeLiteral refuses a bigint outside the signed 64-bit range", () => {
+    assert.throws(() => escapeLiteral(2n ** 63n), /outside the signed 64-bit range/);
+    assert.throws(() => escapeLiteral(-(2n ** 63n) - 1n), /outside the signed 64-bit range/);
+    assert.equal(escapeLiteral(2n ** 63n - 1n), "9223372036854775807");
+    assert.equal(escapeLiteral(-(2n ** 63n)), "-9223372036854775808");
+  });
+
+  await test("escapeSqlLiteral refuses the same values", () => {
+    assert.throws(() => escapeSqlLiteral(2n ** 63n), /outside the signed 64-bit range/);
+    assert.equal(escapeSqlLiteral(-(2n ** 63n)), "-9223372036854775808");
   });
 
   // ──────────────────────────────────────────────────────────

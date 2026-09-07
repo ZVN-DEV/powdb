@@ -1,0 +1,40 @@
+# bacon.toml: the recheck-on-save loop CLAUDE.md recommends.
+#
+# `bacon` with no argument runs the default job below; `bacon <job>` picks one
+# by name. The clippy and fmt jobs are spelled exactly as ci.yml runs them
+# (minus --locked, which is a CI concern), so a green bacon means a green gate.
+#
+# Install: cargo install --locked bacon
+
+default_job = "check"
+
+[jobs.check]
+command = ["cargo", "check", "--workspace", "--all-targets", "--color", "always"]
+need_stdout = false
+
+[jobs.clippy]
+command = [
+    "cargo", "clippy", "--workspace", "--all-targets", "--color", "always",
+    "--", "-D", "warnings",
+]
+need_stdout = false
+
+# The two crates that carry most of the engine. The whole-workspace suite takes
+# tens of minutes, which is not a save loop.
+[jobs.test-query]
+command = ["cargo", "test", "-p", "powdb-query", "--color", "always"]
+need_stdout = true
+
+[jobs.test-storage]
+command = ["cargo", "test", "-p", "powdb-storage", "--color", "always"]
+need_stdout = true
+
+[jobs.fmt]
+command = ["cargo", "fmt", "--all", "--", "--check"]
+need_stdout = true
+
+# ci.yml runs this with RUSTDOCFLAGS="-D warnings"; export that in your shell to
+# match the gate exactly.
+[jobs.doc]
+command = ["cargo", "doc", "--workspace", "--no-deps", "--color", "always"]
+need_stdout = false

@@ -2,9 +2,11 @@
  * Live embedded-sync wire test against a real powdb-server.
  *
  * This covers the JavaScript client helpers over the real Rust server instead
- * of the protocol mock in protocol.test.ts. The server is restarted after the
- * post-bootstrap write so Engine::Drop performs the sync-aware checkpoint that
- * archives retained WAL units before the pull.
+ * of the protocol mock in protocol.test.ts. A live primary archives committed
+ * history on demand, so the write is servable on the very next status call
+ * with no restart in between; the server is still restarted before the pull
+ * to prove that what a replica was told survives one (the retained segments
+ * are on disk, not in memory).
  */
 
 import * as fsp from "node:fs/promises";
@@ -237,16 +239,24 @@ async function main() {
         await client.query("insert LiveSync { id := 1, synced := true }"),
         1,
       );
-      const beforeArchive = await client.syncStatus(REPLICA_ID);
-      assert.ok(beforeArchive.remoteLsn > baselineLsn, "insert should advance LSN");
-      assert.equal(beforeArchive.lastAppliedLsn, baselineLsn);
-      assert.equal(beforeArchive.repairAction, "awaitArchive");
-      const remoteAfterWrite = beforeArchive.remoteLsn;
+      // The status call itself archives the pending write: nothing sits in
+      // `awaitArchive` on a live primary that merely has not restarted yet.
+      const afterWrite = await client.syncStatus(REPLICA_ID);
+      assert.ok(afterWrite.remoteLsn > baselineLsn, "insert should advance LSN");
+      assert.equal(afterWrite.lastAppliedLsn, baselineLsn);
+      assert.equal(afterWrite.repairAction, "pull");
+      assert.ok(
+        afterWrite.servableLsn !== null && afterWrite.servableLsn >= afterWrite.remoteLsn,
+        "status should archive the post-bootstrap write on demand",
+      );
+      assert.equal(afterWrite.unarchivedLsn, 0n);
+      const remoteAfterWrite = afterWrite.remoteLsn;
 
       await client.close();
       await stopServer(server);
       server = undefined;
 
+      // A restart must not move anything the replica has already been told.
       server = await startServer(port, dataDir);
       client = await connect(port);
       const ready = await client.syncStatus(REPLICA_ID);
@@ -255,7 +265,7 @@ async function main() {
       assert.equal(ready.repairAction, "pull");
       assert.ok(
         ready.servableLsn !== null && ready.servableLsn >= remoteAfterWrite,
-        "restart checkpoint should archive the post-bootstrap write",
+        "the archive written on demand should survive a restart",
       );
 
       const pull = await client.syncPull({

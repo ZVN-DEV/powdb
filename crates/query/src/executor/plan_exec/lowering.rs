@@ -93,27 +93,85 @@ fn probe_cap(total_entries: u64) -> usize {
     hot_threshold(total_entries).saturating_add(1) as usize
 }
 
+/// Cap meaning "count as far as the index's own [`probe_cap`] allows": the
+/// full skew probe, used by `explain` and by the lone-equality hot guard.
+const FULL_PROBE_CAP: usize = usize::MAX;
+
+/// Counting cap the conjunction chooser starts from. Grown by
+/// [`next_rank_cap`] until the ranking is settled (see [`settle_estimates`]);
+/// the first round already separates a point-shaped conjunct from a hot one.
+const INITIAL_RANK_CAP: usize = 16;
+
+/// Rows an equality probe is estimated to return, and whether a larger
+/// counting cap could still change the number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EqEstimate {
+    /// Estimated rows (lower is more selective).
+    rows: u64,
+    /// `true` when `rows` is exact, was never counted (unique, sentinel,
+    /// average, unknown), or was counted at the index's full [`probe_cap`],
+    /// which is the estimate's ceiling by design. `false` when the count
+    /// saturated at a smaller cap, so `rows` is only a lower bound.
+    settled: bool,
+    /// The index's full [`probe_cap`]: the cap at which a count is settled no
+    /// matter what it finds. Zero for an estimate that was never counted.
+    full_cap: usize,
+}
+
+impl EqEstimate {
+    fn settled(rows: u64) -> Self {
+        Self {
+            rows,
+            settled: true,
+            full_cap: 0,
+        }
+    }
+
+    /// A leaf-walk count taken with `cap` entries allowed, against an index
+    /// whose full skew probe is `full_cap`.
+    fn counted(count: usize, cap: usize, full_cap: usize) -> Self {
+        Self {
+            rows: count as u64,
+            settled: count < cap || cap >= full_cap,
+            full_cap,
+        }
+    }
+}
+
 /// Skew-aware rows an equality probe of `key` returns against the plain-column
-/// index `(table, column)`. Unique -> 1; the empty/missing sentinel -> its exact
-/// side-list length; a concrete non-empty literal -> the EXACT index count
-/// capped at `probe_cap` (a hot literal saturates at the cap). Falls back to the
+/// index `(table, column)`, walking at most `cap` index entries (clamped to
+/// the index's [`probe_cap`]). Unique -> 1; the empty/missing sentinel -> its
+/// exact side-list length; a concrete non-empty literal -> the EXACT index
+/// count below the cap (a hot literal saturates at it). Falls back to the
 /// uniform average only when `key` is not a countable literal (e.g. an
 /// unsubstituted parameter), preserving prior behavior there. Single skew-aware
 /// source shared by the conjunction chooser and the `explain` annotation so the
 /// ranking and the printed value never disagree.
-fn column_eq_est(catalog: &Catalog, table: &str, column: &str, key: &Expr, unique: bool) -> u64 {
+fn column_eq_est(
+    catalog: &Catalog,
+    table: &str,
+    column: &str,
+    key: &Expr,
+    unique: bool,
+    cap: usize,
+) -> EqEstimate {
     let Some(stats) = catalog.index_stats(table, column) else {
-        return UNKNOWN_EST;
+        return EqEstimate::settled(UNKNOWN_EST);
     };
     if unique {
-        return 1;
+        return EqEstimate::settled(1);
     }
     match literal_to_value(key) {
-        Ok(Value::Empty) => stats.empty_count,
-        Ok(value) => catalog
-            .index_key_count_capped(table, column, &value, probe_cap(stats.total_entries))
-            .map_or_else(|| eq_est_rows(&stats, false, false), |count| count as u64),
-        Err(_) => eq_est_rows(&stats, false, false),
+        Ok(Value::Empty) => EqEstimate::settled(stats.empty_count),
+        Ok(value) => {
+            let full_cap = probe_cap(stats.total_entries);
+            let cap = cap.min(full_cap);
+            match catalog.index_key_count_capped(table, column, &value, cap) {
+                Some(count) => EqEstimate::counted(count, cap, full_cap),
+                None => EqEstimate::settled(eq_est_rows(&stats, false, false)),
+            }
+        }
+        Err(_) => EqEstimate::settled(eq_est_rows(&stats, false, false)),
     }
 }
 
@@ -143,24 +201,31 @@ fn hot_lone_equality(catalog: &Catalog, table: &str, column: &str, key: &Expr) -
 
 /// Skew-aware equality estimate for an expression (JSON-path) index, mirroring
 /// `column_eq_est`.
-fn expr_eq_est(catalog: &Catalog, table: &str, index_id: u64, unique: bool, key: &Expr) -> u64 {
+fn expr_eq_est(
+    catalog: &Catalog,
+    table: &str,
+    index_id: u64,
+    unique: bool,
+    key: &Expr,
+    cap: usize,
+) -> EqEstimate {
     let Some(stats) = catalog.expression_index_stats(table, index_id) else {
-        return UNKNOWN_EST;
+        return EqEstimate::settled(UNKNOWN_EST);
     };
     if unique {
-        return 1;
+        return EqEstimate::settled(1);
     }
     match literal_to_value(key) {
-        Ok(Value::Empty) => stats.empty_count,
-        Ok(value) => catalog
-            .expression_index_key_count_capped(
-                table,
-                index_id,
-                &value,
-                probe_cap(stats.total_entries),
-            )
-            .map_or_else(|| eq_est_rows(&stats, false, false), |count| count as u64),
-        Err(_) => eq_est_rows(&stats, false, false),
+        Ok(Value::Empty) => EqEstimate::settled(stats.empty_count),
+        Ok(value) => {
+            let full_cap = probe_cap(stats.total_entries);
+            let cap = cap.min(full_cap);
+            match catalog.expression_index_key_count_capped(table, index_id, &value, cap) {
+                Some(count) => EqEstimate::counted(count, cap, full_cap),
+                None => EqEstimate::settled(eq_est_rows(&stats, false, false)),
+            }
+        }
+        Err(_) => EqEstimate::settled(eq_est_rows(&stats, false, false)),
     }
 }
 
@@ -186,22 +251,142 @@ fn eq_est_rows(stats: &IndexStats, unique: bool, empty_probe: bool) -> u64 {
     }
 }
 
-/// Estimated rows an equality candidate's index probe returns, used to rank
-/// conjunction drivers by selectivity. `tier == 0` marks a unique index (the
-/// uniqueness source shared with `explain`). Skew-aware: a non-unique probe
-/// counts the actual literal (capped) instead of the old uniform average.
-fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, tier: u8) -> u64 {
+/// Estimated rows an equality candidate's index probe returns when at most
+/// `cap` index entries may be walked, used to rank conjunction drivers by
+/// selectivity. Skew-aware: a non-unique probe counts the actual literal
+/// (capped) instead of the old uniform average; uniqueness comes from the same
+/// catalog source `explain` prints.
+fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, cap: usize) -> EqEstimate {
     match scan {
         PlanNode::IndexScan { table, column, key } => {
-            column_eq_est(catalog, table, column, key, tier == 0)
+            let unique = catalog.is_index_unique(table, column) == Some(true);
+            column_eq_est(catalog, table, column, key, unique, cap)
         }
         PlanNode::ExprIndexScan { table, path, key } => {
             match resolve_expression_index(catalog, table, path) {
-                Some(meta) => expr_eq_est(catalog, table, meta.index_id, meta.unique, key),
-                None => UNKNOWN_EST,
+                Some(meta) => expr_eq_est(catalog, table, meta.index_id, meta.unique, key, cap),
+                None => EqEstimate::settled(UNKNOWN_EST),
             }
         }
-        _ => UNKNOWN_EST,
+        _ => EqEstimate::settled(UNKNOWN_EST),
+    }
+}
+
+/// Settle the estimates of a set of non-unique equality candidates, spending
+/// the smallest counting cap that decides their ranking.
+///
+/// `count_at(candidate, cap)` is the candidate's estimate counted with at most
+/// `cap` entries walked; it must report `settled` once `cap` reaches the
+/// candidate's own full [`probe_cap`]. Returns the estimates in candidate
+/// order. A loser's number may be a lower bound (the cap it saturated at); the
+/// ranking never needs more, and nothing else reads it.
+///
+/// The estimate's exact count is bounded at half the index, and that bound was
+/// paid in full on every execution for a hot literal: a 50/50 boolean next to a
+/// per-row-unique JSON path walked ~10K index entries per query to learn what
+/// the path's count of 1 already decided, which took the point-shaped
+/// `conjunction_s4_selective_path` workload from 2.7 us to 60 us. Lowering runs
+/// per execution (plan-cache hits included), so the walk was per execution too.
+///
+/// Rounds grow the cap from [`INITIAL_RANK_CAP`] (see [`next_rank_cap`]) and
+/// stop once the smallest `(rows, build order)` estimate is settled. That pick
+/// is the one the full-cap ranking makes: a settled exact count is strictly
+/// below every competitor still saturated at a cap at least that large, a
+/// count settled at its own full cap is that index's ceiling exactly as the
+/// full probe reports it, and a saturated tie is never settled, so it goes
+/// another round until only build order can separate the candidates. The unit
+/// tests below hold this agreement over a grid of counts and caps.
+///
+/// Each round restarts its leaf walks from the root, so a candidate pays every
+/// cap it saturated at before the one that settles it. A candidate settling
+/// exactly at count `c` therefore walks under `3c` entries in total (its
+/// saturated caps sum to less than the settling cap, which is under `2c`), and
+/// a hot candidate that never settles below its full probe walks under 1.5x
+/// that probe, because [`next_rank_cap`] stops doubling and jumps to the full
+/// probe before the small rounds can add up to more than half of it.
+fn settle_estimates(n: usize, mut count_at: impl FnMut(usize, usize) -> EqEstimate) -> Vec<u64> {
+    let mut estimates = vec![
+        EqEstimate {
+            rows: 0,
+            settled: false,
+            full_cap: 0,
+        };
+        n
+    ];
+    let mut cap = INITIAL_RANK_CAP;
+    loop {
+        for (i, estimate) in estimates.iter_mut().enumerate() {
+            if !estimate.settled {
+                *estimate = count_at(i, cap);
+            }
+        }
+        let Some(best) = (0..n).min_by_key(|&i| (estimates[i].rows, i)) else {
+            return Vec::new();
+        };
+        if estimates[best].settled {
+            return estimates
+                .into_iter()
+                .map(|estimate| estimate.rows)
+                .collect();
+        }
+        // The smallest estimate is unsettled, so every unsettled candidate
+        // saturated at `cap` (a settled one would have to be at least as
+        // large to lose to it, and a smaller settled one would have won).
+        let largest_full_cap = estimates
+            .iter()
+            .filter(|estimate| !estimate.settled)
+            .map(|estimate| estimate.full_cap)
+            .max()
+            .unwrap_or(0);
+        cap = next_rank_cap(cap, largest_full_cap);
+    }
+}
+
+/// The cap for the round after one in which every unsettled candidate
+/// saturated at `cap`, given the largest full [`probe_cap`] still unsettled.
+///
+/// Doubling keeps a moderately selective conjunct cheap next to a hot one (a
+/// literal matching 500 rows beside one matching 33K settles after walking
+/// about 2K entries instead of 33K), but each doubled round restarts the walk,
+/// so when every candidate is hot the rounds would add up to about twice the
+/// full probe. Once the doubled cap would reach a quarter of the largest full
+/// probe still in play, the rounds so far have cost under half of it, so the
+/// next round goes straight to the full probe: the all-hot case then walks
+/// under 1.5x what the full probe alone walked, and settles for certain.
+fn next_rank_cap(cap: usize, largest_full_cap: usize) -> usize {
+    let doubled = cap.saturating_mul(2);
+    if doubled.saturating_mul(4) >= largest_full_cap {
+        FULL_PROBE_CAP
+    } else {
+        doubled
+    }
+}
+
+/// Fill in the estimates of the non-unique equality candidates, but only when
+/// the ranking turns on them: a unique equality (tier 0) outranks every
+/// non-unique one whatever its count, and a lone non-unique equality outranks
+/// every range candidate (tier 2). Both skip the index walk entirely.
+fn settle_non_unique_equalities(catalog: &Catalog, candidates: &mut [ConjunctionCandidate]) {
+    if candidates.iter().any(|candidate| candidate.tier == 0) {
+        return;
+    }
+    let probed: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.tier == 1)
+        .map(|(i, _)| i)
+        .collect();
+    if probed.len() < 2 {
+        return;
+    }
+    let rows = {
+        let candidates = &*candidates;
+        settle_estimates(probed.len(), |k, cap| {
+            eq_candidate_est(catalog, &candidates[probed[k]].plan, cap)
+        })
+    };
+    for (k, &i) in probed.iter().enumerate() {
+        candidates[i].est = rows[k];
     }
 }
 
@@ -357,6 +542,29 @@ fn float_key_is_faithful(value: f64, probe: ProbeKind) -> bool {
 /// all of them at once. Calling it from only some of the lowering arms is what
 /// made `.price < 3` answer 0 while `.price < 3 and .id > 0` answered 2.
 fn coerce_column_index_key(col_type: TypeId, key: &Expr, probe: ProbeKind) -> Option<Expr> {
+    // A `bytes` index cannot answer an ordered comparison at all, whatever the
+    // literal says. `Btree::encode_composite_value` writes a four-byte length
+    // before the bytes, so index order is length first while the scan orders
+    // bytes bytewise: the one-byte key `\xff` sorts before the two-byte key
+    // `\x0102` in the index and after it in the scan. A bound built from any
+    // literal therefore skipped every stored value of a different length, in
+    // silence. Equality is unaffected because the encoding is injective, so an
+    // exact key still probes exactly the entries it names.
+    if col_type == TypeId::Bytes
+        && matches!(
+            probe,
+            ProbeKind::LowerBound { .. } | ProbeKind::UpperBound { .. }
+        )
+    {
+        return None;
+    }
+    // A value literal reached this plan through the typed-literal coercion pass
+    // (`plan_exec::coerce`), which resolved it against this same column, so it
+    // already addresses the stored key lane. Anything else is a mismatch the
+    // pass declined to rewrite, and the index is withdrawn as usual.
+    if let Expr::ValueLit(value) = key {
+        return (value.type_id() == col_type).then(|| key.clone());
+    }
     match (key, col_type) {
         // Same-typed literal: the index key already matches the stored key.
         (Expr::Literal(Literal::Int(_)), TypeId::Int) => Some(key.clone()),
@@ -524,12 +732,13 @@ struct ConjunctionCandidate {
 ///
 /// Selection ranks candidates by `(tier, estimated rows, build order)`: a
 /// unique equality estimates 1, a non-unique equality estimates the EXACT count
-/// of its literal (capped via a bounded `O(threshold)` index walk, so a hot
-/// Zipfian value no longer hides behind the uniform average), and a range
-/// estimates its index's full size so an equality still wins. Ranking is
-/// tier-first (equality before range, unique before non-unique) then estimate
-/// then conjunct order. A wrong pick is only ever slower, never wrong: the
-/// residual re-checks the full conjunction on each fetched row.
+/// of its literal (a bounded index walk, so a hot Zipfian value no longer hides
+/// behind the uniform average; the walk is only as long as the ranking needs,
+/// see [`settle_estimates`]), and a range estimates its index's full size so
+/// an equality still wins. Ranking is tier-first (equality before range,
+/// unique before non-unique) then estimate then conjunct order. A wrong pick
+/// is only ever slower, never wrong: the residual re-checks the full
+/// conjunction on each fetched row.
 fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> Option<PlanNode> {
     let mut conjuncts: Vec<&Expr> = Vec::new();
     flatten_and(predicate, &mut conjuncts);
@@ -547,7 +756,10 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
             // uncoercible key drops the candidate to the correct scan.
             if let Some(scan) = coerce_candidate_keys(catalog, scan) {
                 if let Some(tier) = eq_candidate_tier(catalog, &scan) {
-                    let est = eq_candidate_est(catalog, &scan, tier);
+                    // A unique index returns at most one row. Non-unique
+                    // estimates are counted by `settle_non_unique_equalities`
+                    // below, and only when the ranking turns on them.
+                    let est = if tier == 0 { 1 } else { UNKNOWN_EST };
                     candidates.push(ConjunctionCandidate {
                         plan: scan,
                         consumed: vec![i],
@@ -627,6 +839,8 @@ fn lower_conjunction_scan(catalog: &Catalog, table: &str, predicate: &Expr) -> O
         });
     }
 
+    settle_non_unique_equalities(catalog, &mut candidates);
+
     // Rank by (tier, estimated rows, build order): a unique equality (tier 0)
     // beats any non-unique probe, a non-unique equality (tier 1) beats a range
     // (tier 2), and within a tier the lower skew-aware estimate wins. Tier leads
@@ -693,8 +907,9 @@ impl LoweredPlan {
     /// `tests/cross_type_index_parity.rs` holds that. Idempotence is what lets
     /// the boundary be enforced by construction instead of by auditing which
     /// paths have already lowered.
-    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Self {
-        LoweredPlan(lower_unindexed_scans(catalog, plan))
+    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Result<Self, QueryError> {
+        let coerced = super::coerce::coerce_typed_literals(catalog, plan)?;
+        Ok(LoweredPlan(lower_unindexed_scans(catalog, &coerced)))
     }
 
     /// The lowered tree, for dispatch.
@@ -1014,25 +1229,34 @@ pub(crate) fn range_matches(
     end: &Option<Value>,
     end_inc: bool,
 ) -> bool {
+    // `null` is excluded from every comparison form (docs/POWQL.md). `Value`
+    // orders `Empty` below every other value, so without this guard a range
+    // with no lower bound accepts the null rows.
+    if val.is_empty() {
+        return false;
+    }
+    // Each bound is tested with the operator it stands for, through the same
+    // evaluator a `Filter(SeqScan)` uses. Comparing with `Value`'s own `Ord`
+    // instead took its type-discriminant tail arm for an unrelated pair, so an
+    // index-driven range accepted rows a scan of the same predicate rejects:
+    // a JSON path holding the string "deep" satisfied `> 99.5`.
     if let Some(ref s) = start {
-        if start_inc {
-            if val < s {
-                return false;
-            }
-        } else if val <= s {
+        let op = if start_inc { BinOp::Gte } else { BinOp::Gt };
+        if !bound_holds(val, op, s) {
             return false;
         }
     }
     if let Some(ref e) = end {
-        if end_inc {
-            if val > e {
-                return false;
-            }
-        } else if val >= e {
+        let op = if end_inc { BinOp::Lte } else { BinOp::Lt };
+        if !bound_holds(val, op, e) {
             return false;
         }
     }
     true
+}
+
+fn bound_holds(val: &Value, op: BinOp, bound: &Value) -> bool {
+    eval_binop_mode(val, op, bound, CmpMode::Filter) == Value::Bool(true)
 }
 
 fn collect_plan_qualifiers(plan: &PlanNode, qualifiers: &mut HashSet<String>) {
@@ -1270,7 +1494,8 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
             match catalog.index_stats(table, column) {
                 Some(stats) => {
                     let unique = catalog.is_index_unique(table, column) == Some(true);
-                    let est = column_eq_est(catalog, table, column, key, unique);
+                    let est =
+                        column_eq_est(catalog, table, column, key, unique, FULL_PROBE_CAP).rows;
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys
@@ -1317,7 +1542,8 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
                     .map(|stats| (m.index_id, m.unique, stats))
             }) {
                 Some((index_id, unique, stats)) => {
-                    let est = expr_eq_est(catalog, table, index_id, unique, key);
+                    let est =
+                        expr_eq_est(catalog, table, index_id, unique, key, FULL_PROBE_CAP).rows;
                     format!(
                         "{base} est_rows={est} entries={} distinct={}",
                         stats.total_entries, stats.distinct_keys
@@ -1590,6 +1816,9 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
         } => {
             format!("{indent}CreateLink {owner}.{name} -> {target} on {local_key} = {target_key}")
         }
+        PlanNode::DropLink { owner, name, .. } => {
+            format!("{indent}DropLink {owner}.{name}")
+        }
         PlanNode::AlterTable { table, action } => {
             format!("{indent}AlterTable table={table} action={action:?}")
         }
@@ -1621,5 +1850,258 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
         PlanNode::Begin => format!("{indent}Begin"),
         PlanNode::Commit => format!("{indent}Commit"),
         PlanNode::Rollback => format!("{indent}Rollback"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One fake index for one equality candidate: the literal's true count and
+    /// the index's full skew probe (`probe_cap` of its size).
+    struct FakeIndex {
+        count: usize,
+        full_cap: usize,
+    }
+
+    /// Drive `settle_estimates` over fake indexes through the exact `counted`
+    /// construction the real probes use. Returns the settled rows and the total
+    /// index entries the rounds walked (what the leaf walk would have cost).
+    fn settle(indexes: &[FakeIndex]) -> (Vec<u64>, usize) {
+        let mut walked = 0usize;
+        let rows = settle_estimates(indexes.len(), |i, cap| {
+            let cap = cap.min(indexes[i].full_cap);
+            let count = indexes[i].count.min(cap);
+            walked += count;
+            EqEstimate::counted(count, cap, indexes[i].full_cap)
+        });
+        (rows, walked)
+    }
+
+    fn winner(rows: &[u64]) -> usize {
+        (0..rows.len())
+            .min_by_key(|&i| (rows[i], i))
+            .expect("at least one candidate")
+    }
+
+    /// The ranking the full skew probe makes: every count taken to its own
+    /// `probe_cap`, ties to build order.
+    fn full_probe_winner(indexes: &[FakeIndex]) -> usize {
+        (0..indexes.len())
+            .min_by_key(|&i| (indexes[i].count.min(indexes[i].full_cap), i))
+            .expect("at least one candidate")
+    }
+
+    /// The S4 shape: a 50/50 boolean (10K of 20K rows) textually first, a
+    /// per-row-unique JSON path second. The full probe walked the boolean to
+    /// its 10,001-entry cap on every execution to learn what the path's count
+    /// of 1 already decided. The first round must settle it.
+    #[test]
+    fn a_point_shaped_conjunct_settles_against_a_hot_one_in_the_first_round() {
+        let (rows, walked) = settle(&[
+            FakeIndex {
+                count: 10_000,
+                full_cap: 10_001,
+            },
+            FakeIndex {
+                count: 1,
+                full_cap: 10_001,
+            },
+        ]);
+        assert_eq!(winner(&rows), 1, "the unique-per-row path drives: {rows:?}");
+        assert_eq!(rows[1], 1, "the winner's estimate is exact");
+        assert!(
+            walked <= INITIAL_RANK_CAP + 1,
+            "one round at the initial cap decides it, walked {walked} entries"
+        );
+    }
+
+    /// Every round restarts the leaf walk, so all-hot candidates pay the small
+    /// rounds on top of the full probe. The jump in `next_rank_cap` keeps that
+    /// under 1.5x the full probe (here 2 x 10,000 entries).
+    #[test]
+    fn an_all_hot_tie_reaches_the_full_cap_and_keeps_build_order() {
+        let hot = || FakeIndex {
+            count: 10_000,
+            full_cap: 10_001,
+        };
+        let (rows, walked) = settle(&[hot(), hot()]);
+        assert!(
+            walked <= 30_000,
+            "the doubling rounds must not add up past half the full probe: walked {walked}"
+        );
+        assert_eq!(
+            rows,
+            vec![10_000, 10_000],
+            "both counts are exact at the full cap"
+        );
+        assert_eq!(
+            winner(&rows),
+            0,
+            "a full tie goes to the earliest-built candidate"
+        );
+    }
+
+    /// Two counts saturating at the same cap look tied, but the full probe
+    /// separates them. The round must not settle on the tie.
+    #[test]
+    fn a_tie_at_the_cap_is_not_settled_until_a_count_is_exact() {
+        let (rows, _) = settle(&[
+            FakeIndex {
+                count: 40,
+                full_cap: 10_001,
+            },
+            FakeIndex {
+                count: 32,
+                full_cap: 10_001,
+            },
+        ]);
+        assert_eq!(rows, vec![40, 32]);
+        assert_eq!(winner(&rows), 1);
+    }
+
+    /// The case doubling exists for: a moderately selective conjunct (500 rows)
+    /// beside an unselective one (33K of 100K rows, below the full probe of
+    /// 50,001 so the full probe walked all 33K exactly). Doubling settles it
+    /// after walking about 2K entries; the jump must not fire early here.
+    #[test]
+    fn a_moderate_conjunct_beside_a_hot_one_settles_long_before_the_full_probe() {
+        let (rows, walked) = settle(&[
+            FakeIndex {
+                count: 33_333,
+                full_cap: 50_001,
+            },
+            FakeIndex {
+                count: 500,
+                full_cap: 50_001,
+            },
+        ]);
+        assert_eq!(winner(&rows), 1);
+        assert_eq!(rows[1], 500, "the winner's estimate is exact");
+        assert!(
+            walked < 2_500,
+            "the full probe walked 33,833 entries here; doubling walked {walked}"
+        );
+    }
+
+    /// Two hot candidates on indexes of very different sizes: the jump is
+    /// keyed to the LARGEST full probe still unsettled, so the small index
+    /// settles at its own full cap during the doubling rounds and wins without
+    /// the big index ever walking to its full probe.
+    #[test]
+    fn a_hot_small_index_beside_a_hot_big_one_settles_without_the_big_full_probe() {
+        let (rows, walked) = settle(&[
+            FakeIndex {
+                count: 10_000,
+                full_cap: 10_001,
+            },
+            FakeIndex {
+                count: 40,
+                full_cap: 33,
+            },
+        ]);
+        assert_eq!(
+            rows[1], 33,
+            "settled at its own full cap, the full probe's ceiling"
+        );
+        assert_eq!(winner(&rows), 1);
+        assert!(walked < 300, "walked {walked}");
+    }
+
+    #[test]
+    fn next_rank_cap_doubles_then_jumps_to_the_full_probe() {
+        assert_eq!(next_rank_cap(16, 10_001), 32);
+        assert_eq!(next_rank_cap(1_024, 10_001), 2_048);
+        // 4,096 x 4 >= 10,001: the small rounds so far (16..=2,048) sum to
+        // under half the full probe, so the next round is the full probe.
+        assert_eq!(next_rank_cap(2_048, 10_001), FULL_PROBE_CAP);
+        assert_eq!(next_rank_cap(16, 33), FULL_PROBE_CAP);
+        assert_eq!(next_rank_cap(16, 0), FULL_PROBE_CAP);
+    }
+
+    /// A small index whose full cap is below the round's cap settles at that
+    /// cap: it is the ceiling the full probe reports, and it wins here exactly
+    /// as the full probe would rank it.
+    #[test]
+    fn a_small_index_settles_at_its_own_full_cap() {
+        let (rows, _) = settle(&[
+            FakeIndex {
+                count: 15,
+                full_cap: 10,
+            },
+            FakeIndex {
+                count: 12,
+                full_cap: 10_001,
+            },
+        ]);
+        assert_eq!(rows, vec![10, 12]);
+        assert_eq!(winner(&rows), 0);
+    }
+
+    /// The claim the optimisation rests on: the progressive ranking picks the
+    /// candidate the full-cap ranking picks, for every combination of counts
+    /// (below, at and above every cap boundary) and index sizes, two and three
+    /// candidates at a time.
+    #[test]
+    fn progressive_ranking_agrees_with_the_full_probe_ranking() {
+        let counts = [
+            0usize, 1, 2, 15, 16, 17, 31, 32, 33, 100, 5_000, 10_000, 20_000,
+        ];
+        let caps = [10usize, 33, 10_001];
+        let mut cases = 0usize;
+        for &a in &counts {
+            for &b in &counts {
+                for &ca in &caps {
+                    for &cb in &caps {
+                        let pair = [
+                            FakeIndex {
+                                count: a,
+                                full_cap: ca,
+                            },
+                            FakeIndex {
+                                count: b,
+                                full_cap: cb,
+                            },
+                        ];
+                        let (rows, _) = settle(&pair);
+                        assert_eq!(
+                            winner(&rows),
+                            full_probe_winner(&pair),
+                            "counts ({a}, {b}) caps ({ca}, {cb}) rows {rows:?}"
+                        );
+                        cases += 1;
+                        for &c in &counts {
+                            let triple = [
+                                FakeIndex {
+                                    count: a,
+                                    full_cap: ca,
+                                },
+                                FakeIndex {
+                                    count: b,
+                                    full_cap: cb,
+                                },
+                                FakeIndex {
+                                    count: c,
+                                    full_cap: 10_001,
+                                },
+                            ];
+                            let (rows, _) = settle(&triple);
+                            assert_eq!(
+                                winner(&rows),
+                                full_probe_winner(&triple),
+                                "counts ({a}, {b}, {c}) caps ({ca}, {cb}) rows {rows:?}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 10_000, "the grid actually ran: {cases} cases");
+    }
+
+    #[test]
+    fn no_candidates_settle_to_nothing() {
+        assert!(settle(&[]).0.is_empty());
     }
 }

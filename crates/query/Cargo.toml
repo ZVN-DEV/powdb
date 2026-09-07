@@ -11,6 +11,9 @@ readme = "../../README.md"
 keywords = ["database", "powdb", "powql", "query-engine", "parser"]
 categories = ["database", "database-implementations", "parser-implementations"]
 documentation = "https://docs.rs/powdb-query"
+# The executor's unit-test shards are `#[cfg(test)]` only: about 300 KB that
+# every consumer of the published crate would download and never build.
+exclude = ["src/executor/tests/**"]
 
 [features]
 # Test-only instrumentation. Enables `Engine::set_force_generic_path`, which
@@ -21,7 +24,7 @@ documentation = "https://docs.rs/powdb-query"
 testing = []
 
 [dependencies]
-powdb-storage = { version = "0.27.0", path = "../storage" }
+powdb-storage = { version = "0.28.0-rc.1", path = "../storage" }
 thiserror.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true

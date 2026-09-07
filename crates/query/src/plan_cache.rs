@@ -102,6 +102,14 @@ impl PlanCache {
         if nested_projection_defeats_cache(&plan) {
             return;
         }
+        // A projection may be written before or after `order`, and the plan
+        // keeps no record of which, so when both carry a literal the walk
+        // cannot know which one the source wrote first. Same reasoning as
+        // grouped HAVING above: replanning is cheaper than ever serving
+        // silently rebound literals.
+        if projection_and_sort_literals_are_ambiguous(&plan) {
+            return;
+        }
         if count_literal_slots(&plan) != source_literal_count {
             return;
         }
@@ -274,6 +282,49 @@ fn count_nested_projection(nested: &crate::plan::NestedProjection, n: &mut usize
     }
 }
 
+/// Whether the plan has a literal in a projection field AND a literal in a
+/// sort key, the one pair whose source order the plan cannot reconstruct.
+fn projection_and_sort_literals_are_ambiguous(plan: &PlanNode) -> bool {
+    let (mut projection, mut sort) = (false, false);
+    scan_literal_clauses(plan, &mut projection, &mut sort);
+    projection && sort
+}
+
+fn scan_literal_clauses(plan: &PlanNode, projection: &mut bool, sort: &mut bool) {
+    match plan {
+        PlanNode::Project { input, fields } => {
+            *projection |= fields.iter().any(|field| expr_has_literal(&field.expr));
+            scan_literal_clauses(input, projection, sort);
+        }
+        PlanNode::Sort { input, keys } => {
+            *sort |= keys.iter().any(|key| expr_has_literal(&key.expr));
+            scan_literal_clauses(input, projection, sort);
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::NestedProject { input, .. }
+        | PlanNode::Explain { input } => scan_literal_clauses(input, projection, sort),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            scan_literal_clauses(left, projection, sort);
+            scan_literal_clauses(right, projection, sort);
+        }
+        _ => {}
+    }
+}
+
+fn expr_has_literal(expr: &Expr) -> bool {
+    let mut n = 0usize;
+    count_expr(expr, &mut n);
+    n > 0
+}
+
 fn contains_grouped_having(plan: &PlanNode) -> bool {
     match plan {
         PlanNode::GroupBy {
@@ -308,6 +359,7 @@ fn contains_grouped_having(plan: &PlanNode) -> bool {
         | PlanNode::Upsert { .. }
         | PlanNode::CreateTable { .. }
         | PlanNode::CreateLink { .. }
+        | PlanNode::DropLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
         | PlanNode::ListLinks
@@ -398,11 +450,44 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
                         idx,
                     );
                 }
+            } else if let PlanNode::Limit {
+                input: limited,
+                count,
+            } = input.as_mut()
+            {
+                // `{ ... } limit N offset M` writes the projection first, but
+                // the planner puts `Project` ON TOP of `Limit(Offset(..))`.
+                // A plain child-then-local walk therefore reached the limit
+                // before the projection and bound the projection's literal to
+                // it: the second execution of `D { x: .n + 1 } limit 5`
+                // answered `.n + 5`, and one with an offset skipped rows
+                // nobody asked it to skip. Walk what is under the slice, then
+                // the projection, then the counts.
+                if let PlanNode::Offset {
+                    input: inner,
+                    count: off_count,
+                } = limited.as_mut()
+                {
+                    substitute_plan(inner, literals, idx);
+                    substitute_fields(fields, literals, idx);
+                    substitute_expr(count, literals, idx);
+                    substitute_expr(off_count, literals, idx);
+                } else {
+                    substitute_plan(limited, literals, idx);
+                    substitute_fields(fields, literals, idx);
+                    substitute_expr(count, literals, idx);
+                }
+            } else if let PlanNode::Offset {
+                input: inner,
+                count,
+            } = input.as_mut()
+            {
+                substitute_plan(inner, literals, idx);
+                substitute_fields(fields, literals, idx);
+                substitute_expr(count, literals, idx);
             } else {
                 substitute_plan(input, literals, idx);
-                for f in fields {
-                    substitute_expr(&mut f.expr, literals, idx);
-                }
+                substitute_fields(fields, literals, idx);
             }
         }
         PlanNode::NestedProject { input, fields } => {
@@ -526,6 +611,7 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         }
         PlanNode::CreateTable { .. } => {}
         PlanNode::CreateLink { .. } => {}
+        PlanNode::DropLink { .. } => {}
         PlanNode::CreateView { .. } => {}
         PlanNode::RefreshView { .. } => {}
         PlanNode::DropView { .. } => {}
@@ -552,6 +638,16 @@ pub(crate) fn substitute_plan(plan: &mut PlanNode, literals: &[Literal], idx: &m
         }
         PlanNode::ListTypes | PlanNode::Describe { .. } | PlanNode::ListLinks => {}
         PlanNode::Begin | PlanNode::Commit | PlanNode::Rollback => {}
+    }
+}
+
+fn substitute_fields(
+    fields: &mut [crate::plan::ProjectField],
+    literals: &[Literal],
+    idx: &mut usize,
+) {
+    for field in fields {
+        substitute_expr(&mut field.expr, literals, idx);
     }
 }
 
@@ -781,6 +877,7 @@ fn count_plan(plan: &PlanNode, n: &mut usize) {
         PlanNode::Delete { input, .. } => count_plan(input, n),
         PlanNode::CreateTable { .. } => {}
         PlanNode::CreateLink { .. } => {}
+        PlanNode::DropLink { .. } => {}
         PlanNode::AlterTable { .. } => {}
         PlanNode::DropTable { .. } => {}
         PlanNode::CreateView { .. } => {}
@@ -1660,6 +1757,7 @@ mod tests {
             PlanNode::Delete { input, .. } => collect_literals_for_test(input, out),
             PlanNode::CreateTable { .. } => {}
             PlanNode::CreateLink { .. } => {}
+            PlanNode::DropLink { .. } => {}
             PlanNode::AlterTable { .. } => {}
             PlanNode::DropTable { .. } => {}
             PlanNode::CreateView { .. } => {}

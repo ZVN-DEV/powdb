@@ -93,12 +93,35 @@ fn projected_on_both_paths(query: &str) -> Value {
 
 // ─── integer overflow in the row evaluator ──────────────────────────────────
 
+/// The error a query raises, asserted to be the same with fast paths on and
+/// off, for the same reason [`projected_on_both_paths`] compares answers.
+fn refused_on_both_paths(query: &str) -> String {
+    let mut fast = engine_with_edges();
+    let first = fast
+        .execute_powql(query)
+        .map(|ok| panic!("`{query}` should have been refused, got {ok:?}"))
+        .unwrap_err()
+        .to_string();
+    let mut generic = engine_with_edges();
+    generic.set_force_generic_path(true);
+    let second = generic
+        .execute_powql(query)
+        .map(|ok| panic!("`{query}` should have been refused, got {ok:?}"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        first, second,
+        "`{query}` was refused differently with fast paths on and off"
+    );
+    first
+}
+
 #[test]
-fn integer_overflow_in_a_projection_is_missing_not_a_clamped_number() {
-    // `saturating_add` reported `i64::MAX` for a sum that is not `i64::MAX`.
-    // Missing is the convention the same evaluator already uses for `Div` with
-    // no representable answer, for `abs(i64::MIN)`, and for a `date_add` whose
-    // unit multiply overflows.
+fn integer_overflow_in_a_projection_is_an_error() {
+    // `saturating_add` reported `i64::MAX` for a sum that is not `i64::MAX`;
+    // `Empty` then reported it as a missing value, which is indistinguishable
+    // from a missing column and which an `update` wrote into a required one.
+    // The aggregate accumulator refuses the same overflow, so all of them do.
     for query in [
         "A { x: .big + 1 }",
         "A { x: 1 + .big }",
@@ -108,10 +131,10 @@ fn integer_overflow_in_a_projection_is_missing_not_a_clamped_number() {
         "A { x: .big - .small }",
         "A { x: .big * .big }",
     ] {
-        assert_eq!(
-            projected_on_both_paths(query),
-            Value::Empty,
-            "`{query}` produced a number for an arithmetic result that has none"
+        let message = refused_on_both_paths(query);
+        assert!(
+            message.contains("overflows int64"),
+            "`{query}` was refused with {message}"
         );
     }
 }

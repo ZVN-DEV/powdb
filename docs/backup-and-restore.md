@@ -120,17 +120,28 @@ A chain restore is checked before it writes a usable database:
 
 A backup directory contains a copy of the database's durable files plus a manifest:
 
-| File | Contents |
-|---|---|
-| `catalog.bin` | Schema registry (tables, columns, indexes, entity links). |
-| `catalog.lsn` | Catalog durability high-water-mark sidecar (8-byte LSN, new in 0.8.0). |
-| `*.heap` | One heap file per table — the row data. |
-| `*.idx` | One index file per B+tree index. |
-| `manifest.json` | Integrity record (see below). |
+| File | Contents | Present |
+|---|---|---|
+| `catalog.bin` | Schema registry (tables, columns, indexes, entity links). | Always |
+| `catalog.lsn` | Catalog durability high-water-mark sidecar (8-byte LSN, new in 0.8.0). | When the source has it (absent in a pristine database) |
+| `*.heap` | One heap file per table, the row data. | One per table |
+| `*.idx` | One index file per B+tree column index. | One per column index |
+| `*.eidx` | One index file per expression index (including JSON path indexes). | One per expression index |
+| `views.bin` | The materialized-view registry: every `materialize` definition. | When the source has it |
+| `auth.json` | The user and role store: named users, roles, argon2id password hashes. | When the source has it |
+| `manifest.json` | Integrity record (see below). | Always |
 
-The active write-ahead log (`wal.log`) is **intentionally not copied**. Backup checkpoints first, which truncates the WAL, so the copied files already reflect every committed write.
+`views.bin` and `auth.json` are new to the set in this release. Before it, a full or incremental backup enumerated the catalog, the LSN sidecar, the heaps and the indexes and stopped there, so a restored directory lost **every materialized-view definition** (`refresh V` answered "not found", and reads of `V` served whatever rows the backing heap happened to hold) and **every user, which means a server started on the restore accepted unauthenticated connections**. If you hold backups taken by 0.27.0 or earlier, treat their user store and view definitions as absent and recreate both after a restore.
 
-The `manifest.json` records, for each copied file, its name, byte length, and blake3 hash. It also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable — the same number printed by `backup` (`at lsn 128` above).
+Both are optional in the sense that they are copied when the source directory has them: a database with no views, or one that was never given users, simply has no such file. Everything else in the table fails the backup with `catalog references missing durable file <name>` rather than being skipped.
+
+A backup deliberately leaves three things behind:
+
+- The active write-ahead log (`wal.log`). Backup checkpoints first, which truncates the WAL, so the copied files already reflect every committed write.
+- The writer lock (`LOCK`) and the `readers/` directory. They describe the process that took the backup and mean nothing in a restored copy.
+- The `.powdb-sync/` directory: replica cursors and retained replication segments. A restored directory therefore has no retained history of its own. That is deliberate for the replica-bootstrap flow, where the replica restores the snapshot and then catches up from the **primary's** retained history, which stays on the primary.
+
+The `manifest.json` records, for each copied file, its name, raw byte length, and blake3 hash. Nothing is compressed, so the length is the file's size on disk. Restore verifies the hash; the length is recorded for inspection, not as a second check. It also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable, the same number printed by `backup` (`at lsn 128` above).
 
 ---
 

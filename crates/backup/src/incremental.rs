@@ -1,17 +1,18 @@
 use crate::manifest::{
-    active_durable_file_names, current_sync_snapshot_metadata, validate_catalog_transition,
-    BackupManifest, ChangedFile, IncrementManifest,
+    active_durable_file_names, current_sync_snapshot_metadata, durable_file_is_optional,
+    validate_catalog_transition, BackupManifest, ChangedFile, IncrementManifest,
 };
 use crate::restore::{
     apply_restore_sync_mode, ensure_empty_dir, validate_backup_file_name, validate_delta_file_name,
     verify_and_copy_full, RestoreSyncMode,
 };
-use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
+use powdb_storage::catalog::Catalog;
 use powdb_storage::page::{page_lsn, PAGE_SIZE};
 use std::io;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -56,7 +57,7 @@ pub fn incremental_backup(
     for name in entries {
         let path = src.join(&name);
         if !path.exists() {
-            if name == CATALOG_LSN_FILE {
+            if durable_file_is_optional(&name) {
                 continue;
             }
             return Err(io::Error::new(
@@ -126,6 +127,13 @@ pub fn incremental_backup(
         changed,
     };
     manifest.write(dest)?;
+    info!(
+        dest = %dest.display(),
+        base_source_lsn = base.source_lsn,
+        source_lsn,
+        changed = manifest.changed.len(),
+        "wrote incremental backup"
+    );
     Ok(manifest)
 }
 
@@ -219,6 +227,12 @@ pub fn restore_chain_with_sync_mode(
     }
 
     apply_restore_sync_mode(running_sync.as_ref(), dest, sync_mode)?;
+    info!(
+        dest = %dest.display(),
+        increments = increment_dirs.len(),
+        source_lsn = running_lsn,
+        "restored from a full backup plus increments"
+    );
 
     // 3. Validate the reconstructed DB opens (LSN invariant).
     let cat = Catalog::open(dest)?;

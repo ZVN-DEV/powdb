@@ -63,8 +63,10 @@ const SQL_RAW_CACHE_SALT: u64 = 0x7261_772d_7371_6c01;
 fn sql_raw_cache_hash(hash: u64) -> u64 {
     hash ^ SQL_RAW_CACHE_SALT
 }
-type WalArchiveHook =
-    Arc<dyn Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync>;
+/// Re-exported rather than re-declared: `Catalog::install_auto_wal_archive`
+/// takes this exact type, and a second hand-written copy of it here is a
+/// parity that has to be maintained by hand.
+use powdb_storage::catalog::WalArchiveHook;
 
 /// Maximum number of rows a join may produce before the executor aborts.
 /// Prevents Cartesian-product blowups (e.g. `T cross join T` on 10K rows
@@ -261,8 +263,7 @@ use self::plan_exec::{
     cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
     literal_limit, predicate_column_indices_json, range_matches, synthesize_range_predicate,
-    validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
-    validate_slice_counts, LoweredPlan,
+    union_rows, validate_plan, LoweredPlan,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -281,6 +282,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::DeleteQuery(_)
         | Statement::CreateType(_)
         | Statement::CreateLink(_)
+        | Statement::DropLink(_)
         | Statement::AlterTable(_)
         | Statement::DropTable(_)
         | Statement::CreateView(_)
@@ -368,6 +370,7 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
         | PlanNode::Delete { .. }
         | PlanNode::CreateTable { .. }
         | PlanNode::CreateLink { .. }
+        | PlanNode::DropLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
         | PlanNode::ListLinks
@@ -402,8 +405,28 @@ fn catalog_file_present(data_dir: &Path) -> bool {
     data_dir.join("catalog.bin").exists()
 }
 
-fn open_view_registry(data_dir: &Path) -> ViewRegistry {
-    let mut registry = ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+/// Open the view registry, refusing the whole database when the file is there
+/// but unreadable.
+///
+/// [`ViewRegistry::open`] already answers "no views" for an absent file, so an
+/// error here means `views.bin` exists and did not decode. Treating that as an
+/// empty registry lost every `materialize` statement ever run: reads of a view
+/// name reported an unknown table, the backing tables stayed on disk with
+/// nothing to refresh them, and the next `materialize` overwrote the file that
+/// still held the definitions. A damaged heap and a missing catalog both refuse
+/// the open (see `new_inner`), and so does this.
+fn open_view_registry(data_dir: &Path) -> io::Result<ViewRegistry> {
+    let mut registry = ViewRegistry::open(data_dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{} could not be read ({e}); it defines this database's materialized views,                  so it must be restored or removed before the database can be opened",
+                data_dir
+                    .join(powdb_storage::data_dir::VIEW_REGISTRY_FILE)
+                    .display()
+            ),
+        )
+    })?;
     let unreadable: Vec<String> = registry
         .list_views()
         .iter()
@@ -422,7 +445,7 @@ fn open_view_registry(data_dir: &Path) -> ViewRegistry {
         );
         registry.mark_dirty_in_memory(&name);
     }
-    registry
+    Ok(registry)
 }
 
 /// Names of the dirty materialized views this plan scans, taken from table
@@ -587,7 +610,7 @@ impl Engine {
             }
             None => Catalog::open(data_dir),
         };
-        let catalog = match catalog_result {
+        let mut catalog = match catalog_result {
             Ok(c) => {
                 info!(data_dir = %data_dir.display(), "engine reopened existing database");
                 c
@@ -607,7 +630,14 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        let view_registry = open_view_registry(data_dir);
+        // `Catalog::open_with_wal_archive` borrows its hook for the open and
+        // cannot keep it, so a catalog that had one used to stop checkpointing
+        // altogether rather than truncate records it could not publish. Hand it
+        // one it can keep: the automatic checkpoint archives, then truncates.
+        if let Some(hook) = &wal_archive_hook {
+            catalog.install_auto_wal_archive(Arc::clone(hook));
+        }
+        let view_registry = open_view_registry(data_dir)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -650,7 +680,7 @@ impl Engine {
         let dir_lock = powdb_storage::dir_lock::DirLock::acquire_reader(data_dir)?;
         let catalog = Catalog::open_read_only(data_dir)?;
         info!(data_dir = %data_dir.display(), "engine opened read-only for snapshot serving");
-        let view_registry = open_view_registry(data_dir);
+        let view_registry = open_view_registry(data_dir)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -723,7 +753,7 @@ impl Engine {
     ) -> Result<(PlanNode, LoweredPlan), QueryError> {
         let plan =
             crate::planner::plan_statement(stmt).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let lowered = self.lower(&plan);
+        let lowered = self.lower(&plan)?;
         Ok((plan, lowered))
     }
 
@@ -731,7 +761,7 @@ impl Engine {
     /// `planner::plan` under `src/executor/`, for the same reason.
     fn plan_text_and_lower(&self, input: &str) -> Result<(PlanNode, LoweredPlan), QueryError> {
         let plan = planner::plan(input).map_err(|e| QueryError::Parse(e.to_string()))?;
-        let lowered = self.lower(&plan);
+        let lowered = self.lower(&plan)?;
         Ok((plan, lowered))
     }
 
@@ -739,7 +769,7 @@ impl Engine {
     /// cache, or a fallback the executor built from an already-lowered tree.
     /// Lowering is idempotent, so calling it on a plan that has been through it
     /// already is a no-op.
-    fn lower(&self, plan: &PlanNode) -> LoweredPlan {
+    fn lower(&self, plan: &PlanNode) -> Result<LoweredPlan, QueryError> {
         LoweredPlan::of(&self.catalog, plan)
     }
 
@@ -758,7 +788,7 @@ impl Engine {
     pub fn lowered_plan_text(&self, query: &str, passes: usize) -> Result<String, QueryError> {
         let (_, mut plan) = self.plan_text_and_lower(query)?;
         for _ in 1..passes.max(1) {
-            plan = self.lower(plan.node());
+            plan = self.lower(plan.node())?;
         }
         Ok(format_plan_tree(&self.catalog, plan.node(), 0))
     }
@@ -770,7 +800,25 @@ impl Engine {
     /// system says was lowered.
     fn execute_lowered(&mut self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
         self.refresh_dirty_views_read_by(plan.node())?;
-        self.dispatch_mut(plan.node())
+        let result = self.dispatch_mut(plan.node());
+        Self::raise_arith_fault(result)
+    }
+
+    /// Turn a fault the expression evaluator recorded during `result` into the
+    /// error it had no channel to report itself.
+    ///
+    /// An overflowing `+` or a per-row zero divisor evaluates to `Value::Empty`,
+    /// which is indistinguishable from a missing column: the row came back with
+    /// a NULL in a projection, matched nothing in a predicate, and an `update`
+    /// wrote that NULL into a required column. An existing error wins, because
+    /// it is the more specific one; either way the slot is cleared.
+    fn raise_arith_fault(
+        result: Result<QueryResult, QueryError>,
+    ) -> Result<QueryResult, QueryError> {
+        match (result, take_arith_fault()) {
+            (Ok(_), Some(message)) => Err(QueryError::Execution(message)),
+            (result, _) => result,
+        }
     }
 
     /// Refresh every stale materialized view this plan is about to read, before
@@ -1021,7 +1069,8 @@ impl Engine {
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.clear();
         }
-        self.view_registry = open_view_registry(self.catalog.data_dir());
+        self.view_registry =
+            open_view_registry(self.catalog.data_dir()).map_err(QueryError::from_storage_io)?;
         Ok(QueryResult::Executed {
             message: "transaction rolled back".to_string(),
         })
@@ -1096,6 +1145,20 @@ impl Engine {
         }
     }
 
+    /// The statement boundary. An autocommit statement is durable before it
+    /// returns; inside an explicit transaction the boundary belongs to
+    /// `commit`, so nothing is flushed here. Flushing per statement inside a
+    /// transaction buys no durability (an unfinished transaction is rolled
+    /// back on replay) and costs one fsync per row.
+    fn commit_statement(&mut self) -> Result<(), QueryError> {
+        if self.in_transaction {
+            return Ok(());
+        }
+        self.catalog
+            .commit_autocommit()
+            .map_err(QueryError::from_storage_io)
+    }
+
     /// Parse + plan + execute a PowQL query.
     ///
     /// # Examples
@@ -1159,18 +1222,14 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
-                    let plan = self.lower(&plan);
+                    let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
                     // Mission B (post-review): statement-boundary WAL
                     // group commit. Catalog::wal_log now only appends;
                     // the fsync happens here exactly once per statement.
                     // `sync_wal` is a no-op when nothing was buffered
                     // (pure reads pay zero fsync).
-                    if !self.in_transaction {
-                        self.catalog
-                            .commit_autocommit()
-                            .map_err(QueryError::from_storage_io)?;
-                    }
+                    self.commit_statement()?;
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -1180,22 +1239,14 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                if !self.in_transaction {
-                    self.catalog
-                        .commit_autocommit()
-                        .map_err(QueryError::from_storage_io)?;
-                }
+                self.commit_statement()?;
                 return result;
             }
             // Lex error — fall through to the planner so the caller gets a
             // consistent error shape.
             let (_, plan) = self.plan_text_and_lower(input)?;
             let result = self.execute_lowered(&plan);
-            if !self.in_transaction {
-                self.catalog
-                    .commit_autocommit()
-                    .map_err(QueryError::from_storage_io)?;
-            }
+            self.commit_statement()?;
             return result;
         }
 
@@ -1213,11 +1264,7 @@ impl Engine {
 
         let exec_start = Instant::now();
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         let exec_us = exec_start.elapsed().as_micros();
 
         let total_us = total_start.elapsed().as_micros();
@@ -1273,13 +1320,9 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .get_with_substitution(hash, &canonical, &literals);
                 if let Some(plan) = cached {
-                    let plan = self.lower(&plan);
+                    let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
-                    if !self.in_transaction {
-                        self.catalog
-                            .commit_autocommit()
-                            .map_err(QueryError::from_storage_io)?;
-                    }
+                    self.commit_statement()?;
                     return result;
                 }
 
@@ -1289,22 +1332,14 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                if !self.in_transaction {
-                    self.catalog
-                        .commit_autocommit()
-                        .map_err(QueryError::from_storage_io)?;
-                }
+                self.commit_statement()?;
                 return result;
             }
         }
 
         let plan = self.plan_and_lower(parsed.statement)?;
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         result
     }
 
@@ -1330,7 +1365,7 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
-                let plan = self.lower(&plan);
+                let plan = self.lower(&plan)?;
                 return self.execute_plan_readonly(&plan);
             }
             let (raw, plan) = self.plan_and_lower_cacheable(parsed.statement)?;
@@ -1366,11 +1401,7 @@ impl Engine {
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = self.plan_and_lower(stmt)?;
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         result
     }
 
@@ -1511,7 +1542,7 @@ impl Engine {
                 .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                 .get_with_substitution(hash, &canonical, &literals);
             if let Some(plan) = cached {
-                let plan = self.lower(&plan);
+                let plan = self.lower(&plan)?;
                 return self.execute_plan_readonly(&plan);
             }
             // Miss: plan + insert + execute. The planner is pure, so this
@@ -1540,7 +1571,7 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
-        self.dispatch_readonly(plan.node())
+        Self::raise_arith_fault(self.dispatch_readonly(plan.node()))
     }
 
     /// The read-path dispatch itself. Takes a bare `&PlanNode` because it is
@@ -1559,12 +1590,11 @@ impl Engine {
         if plan_reads_dirty_view(plan, &self.view_registry) {
             return Err(QueryError::ReadonlyNeedsWrite);
         }
-        // Mirror the mutable path: reject a stray aggregate FunctionCall before
-        // evaluating any row (see execute_plan for the rationale).
-        validate_no_stray_aggregates(plan)?;
-        validate_json_path_types(&self.catalog, plan)?;
-        validate_column_references(&self.catalog, plan)?;
-        validate_slice_counts(plan)?;
+        // Mirror the mutable path: reject a stray aggregate FunctionCall, an
+        // unknown table or column, a mistyped comparison or JSON path base and
+        // a negative slice count before evaluating any row (see `dispatch_mut`
+        // for the rationale).
+        validate_plan(&self.catalog, plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -1572,7 +1602,7 @@ impl Engine {
                 if let Some(result) = self.execute_expression_index_plan(plan, None)? {
                     return Ok(result);
                 }
-                let fallback = self.lower(plan);
+                let fallback = self.lower(plan)?;
                 self.execute_plan_readonly(&fallback)
             }
             PlanNode::SeqScan { table } => {
@@ -1668,7 +1698,7 @@ impl Engine {
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns (the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value).
-                        if let Some(row) = tbl.get(rid) {
+                        if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                             rows.push(row);
                         }
                     }
@@ -1793,7 +1823,7 @@ impl Engine {
                                 }
                             }
                             // Overflow safety (P0-3): reassemble spilled cols.
-                            if let Some(row) = tbl.get(rid) {
+                            if let Some(row) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 rows.push(row);
                             }
                         }
@@ -2016,10 +2046,9 @@ impl Engine {
                     let proj_columns: Vec<String> = fields
                         .iter()
                         .map(|f| {
-                            f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                Expr::Field(name) => name.clone(),
-                                _ => "?".into(),
-                            })
+                            f.alias
+                                .clone()
+                                .unwrap_or_else(|| projection_output_name(&f.expr))
                         })
                         .collect();
 
@@ -2051,7 +2080,7 @@ impl Engine {
                             // Overflow safety (P0-3/P0-4): reassemble via
                             // `tbl.get` so spilled projected columns return
                             // their value, not Empty / a wrapped >= 64KB blob.
-                            if let Some(full) = tbl.get(rid) {
+                            if let Some(full) = tbl.get(rid).map_err(QueryError::from_storage_io)? {
                                 let row: Vec<Value> =
                                     proj_indices.iter().map(|&ci| full[ci].clone()).collect();
                                 rows.push(row);
@@ -2168,13 +2197,9 @@ impl Engine {
                         let proj_columns: Vec<String> = fields
                             .iter()
                             .map(|f| {
-                                f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                    Expr::Field(name) => name.clone(),
-                                    Expr::QualifiedField { qualifier, field } => {
-                                        format!("{qualifier}.{field}")
-                                    }
-                                    _ => "?".into(),
-                                })
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
                             })
                             .collect();
                         let mut cancel = crate::cancel::CancelCheck::new();
@@ -2573,29 +2598,9 @@ impl Engine {
                     QueryResult::Rows { columns, rows } => (columns, rows),
                     _ => return Err("UNION requires query results on right side".into()),
                 };
-                let mut combined = left_rows;
-                let mut cancel = crate::cancel::CancelCheck::new();
-                if *all {
-                    for row in right_rows {
-                        cancel.tick()?;
-                        combined.push(row);
-                    }
-                } else {
-                    let mut seen = std::collections::HashSet::new();
-                    for row in &combined {
-                        cancel.tick()?;
-                        seen.insert(row.clone());
-                    }
-                    for row in right_rows {
-                        cancel.tick()?;
-                        if seen.insert(row.clone()) {
-                            combined.push(row);
-                        }
-                    }
-                }
                 Ok(QueryResult::Rows {
                     columns: left_cols,
-                    rows: combined,
+                    rows: union_rows(left_rows, right_rows, *all)?,
                 })
             }
 
@@ -2626,6 +2631,7 @@ impl Engine {
             | PlanNode::Upsert { .. }
             | PlanNode::CreateTable { .. }
             | PlanNode::CreateLink { .. }
+            | PlanNode::DropLink { .. }
             | PlanNode::AlterTable { .. }
             | PlanNode::DropTable { .. }
             | PlanNode::CreateView { .. }

@@ -21,9 +21,12 @@ import {
   MAX_ROWS,
   MAX_RESULT_CELLS,
   MAX_SYNC_UNITS,
+  MAX_SYNC_PULL_UNITS,
+  MAX_PARAMS,
   MSG_QUERY_NATIVE,
   MSG_QUERY_PARAMS_NATIVE,
   MSG_QUERY_SQL_NATIVE,
+  MSG_RESULT_ROWS,
   MSG_RESULT_ROWS_NATIVE,
   MSG_RESULT_SCALAR_NATIVE,
   type Message,
@@ -34,6 +37,8 @@ import {
   Client,
   Pool,
   PowDBError,
+  DEFAULT_MAX_IN_FLIGHT,
+  MAX_IN_FLIGHT_BYTES,
   isPowDBError,
   assertServerCatalogVersionSupported,
   serverCapabilityMismatch,
@@ -230,6 +235,164 @@ function echoServer(delayMs = 20): net.Server {
     });
     sock.on("error", () => {});
   });
+}
+
+/**
+ * Handshakes with a negotiating ConnectOk, then answers every request frame
+ * with `ResultOk`. Records each request and the high-water mark of frames it
+ * has received but not yet answered, which is how the in-flight window tests
+ * prove the client stops writing past its cap.
+ */
+function queryServer(replyDelayMs = 0): {
+  server: net.Server;
+  received: Message[];
+  stats: {
+    inFlight: number;
+    maxInFlight: number;
+    inFlightBytes: number;
+    maxInFlightBytes: number;
+  };
+  sockets: Set<net.Socket>;
+} {
+  const received: Message[] = [];
+  // Bytes as well as frames: the server's read-ahead budget has both caps and
+  // the byte one is the tighter of the two for anything but a tiny query.
+  const stats = {
+    inFlight: 0,
+    maxInFlight: 0,
+    inFlightBytes: 0,
+    maxInFlightBytes: 0,
+  };
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((sock) => {
+    sockets.add(sock);
+    sock.on("close", () => sockets.delete(sock));
+    let scratch = Buffer.alloc(0);
+    sock.on("data", (chunk) => {
+      let collected;
+      try {
+        collected = collectFrames(scratch, Buffer.from(chunk));
+      } catch {
+        // A frame this server refuses to decode is a frame the real server
+        // would refuse too: drop the connection rather than kill the harness.
+        sock.destroy();
+        return;
+      }
+      scratch = collected.rest;
+      for (const msg of collected.messages) {
+        received.push(msg);
+        if (msg.type === "Connect") {
+          sock.write(encode(negotiatedConnectOk()));
+          continue;
+        }
+        if (msg.type === "Disconnect") {
+          sock.end();
+          continue;
+        }
+        stats.inFlight++;
+        stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+        const wireLen = encode(msg).length;
+        stats.inFlightBytes += wireLen;
+        stats.maxInFlightBytes = Math.max(
+          stats.maxInFlightBytes,
+          stats.inFlightBytes,
+        );
+        const answer = () => {
+          stats.inFlight--;
+          stats.inFlightBytes -= wireLen;
+          if (!sock.destroyed) {
+            sock.write(encode({ type: "ResultOk", affected: 0n }));
+          }
+        };
+        if (replyDelayMs > 0) setTimeout(answer, replyDelayMs);
+        else answer();
+      }
+    });
+    sock.on("error", () => {});
+  });
+  return { server, received, stats, sockets };
+}
+
+function listenOn(server: net.Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve());
+  });
+}
+
+function closeServer(
+  server: net.Server,
+  sockets?: Set<net.Socket>,
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (sockets !== undefined) {
+      for (const sock of [...sockets]) sock.destroy();
+    }
+    server.close(() => resolve());
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function nextCloseEvent(
+  client: Client,
+  ms: number,
+): Promise<{ error: Error | null }> {
+  return withTimeout(
+    new Promise<{ error: Error | null }>((resolve) => {
+      client.once("close", resolve);
+    }),
+    ms,
+  );
+}
+
+/** Let queued socket close events run before asserting on pool bookkeeping. */
+function settleCloseEvents(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+/**
+ * A well-framed `ResultRows` frame declaring more cells than the client is
+ * willing to materialize. The row bytes are all empty-string length prefixes,
+ * so the frame is only as large as the shape check requires.
+ */
+function oversizedResultRowsFrame(rows: number, cols: number): Buffer {
+  const names: Buffer[] = [];
+  for (let c = 0; c < cols; c++) {
+    const name = Buffer.from(`c${c}`, "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32LE(name.length, 0);
+    names.push(len, name);
+  }
+  const header = Buffer.alloc(2);
+  header.writeUInt16LE(cols, 0);
+  const rowCount = Buffer.alloc(4);
+  rowCount.writeUInt32LE(rows, 0);
+  const cells = Buffer.alloc(rows * cols * 4);
+  const payload = Buffer.concat([header, ...names, rowCount, cells]);
+  const frame = Buffer.alloc(6 + payload.length);
+  frame.writeUInt8(MSG_RESULT_ROWS, 0);
+  frame.writeUInt8(0, 1);
+  frame.writeUInt32LE(payload.length, 2);
+  payload.copy(frame, 6);
+  return frame;
 }
 
 /** Handshakes, then stays silent — any Query hangs until aborted. */
@@ -881,6 +1044,78 @@ async function main() {
     assert.throws(() => tryDecode(frame), /too many retained units/);
   });
 
+  await test("the sync unit ceilings, and why they differ, are the server's own", () => {
+    const rustConstant = (file: string, decl: string, name: string): number => {
+      const path = fileURLToPath(new URL(`../../../crates/server/src/${file}`, import.meta.url));
+      const text = readFileSync(path, "utf8");
+      const matches = [
+        ...text.matchAll(new RegExp(`^${decl} ${name}: u\\w+ = ([^;]+);$`, "gm")),
+      ];
+      assert.equal(matches.length, 1, `expected exactly one \`${name}\` in ${path}`);
+      const expr = matches[0]![1]!.replace(/_/g, "").trim();
+      assert.match(expr, /^\d+( \* \d+)*$/, `cannot evaluate ${name} = ${expr}`);
+      return expr.split("*").reduce((acc, part) => acc * Number(part.trim()), 1);
+    };
+
+    // What this client DECODES is the server's decoder ceiling, and what it may
+    // ASK FOR is the server's serving cap. They are deliberately different
+    // numbers, so drift in either direction has to be caught here.
+    assert.equal(
+      MAX_SYNC_UNITS,
+      rustConstant("protocol.rs", "const", "MAX_SYNC_UNITS"),
+      "MAX_SYNC_UNITS has drifted from the server's decoder ceiling",
+    );
+    assert.equal(
+      MAX_SYNC_PULL_UNITS,
+      rustConstant("handler/sync.rs", "pub\\(super\\) const", "MAX_SYNC_PULL_UNITS"),
+      "MAX_SYNC_PULL_UNITS has drifted from the server's serving cap",
+    );
+
+    // The doc comment on the decoder ceiling is the only place a reader is told
+    // why the two differ, so it has to state the reason that holds. It used to
+    // say the server extends a chunk past the serving cap to the commit that
+    // closes a transaction, so a transaction of any size arrived whole. It does
+    // not: a served chunk is capped at MAX_SYNC_PULL_UNITS because every
+    // released decoder through v0.27.0 refuses more, and a transaction that
+    // does not fit is answered with a typed rebootstrap.
+    const ownSource = readFileSync(
+      fileURLToPath(new URL("../src/protocol.ts", import.meta.url)),
+      "utf8",
+    );
+    const docAbove = (decl: string): string => {
+      const at = ownSource.indexOf(decl);
+      assert.notEqual(at, -1, `${decl} is no longer in src/protocol.ts`);
+      return ownSource
+        .slice(0, at)
+        .split("/**")
+        .pop()!
+        .replace(/^\s*\*/gm, " ")
+        .replace(/\s+/g, " ");
+    };
+    for (const decl of [
+      "export const MAX_SYNC_UNITS",
+      "export const MAX_SYNC_PULL_UNITS",
+    ]) {
+      for (const retired of [
+        /extends? a chunk past/i,
+        /transaction of any size/i,
+        /arrives whole/i,
+      ]) {
+        assert.doesNotMatch(
+          docAbove(decl),
+          retired,
+          `the ${decl} comment still describes the pull window 97cf06b capped`,
+        );
+      }
+    }
+    assert.match(
+      docAbove("export const MAX_SYNC_PULL_UNITS"),
+      /rebootstrap/i,
+      "the MAX_SYNC_PULL_UNITS comment does not say what happens to a " +
+        "transaction that does not fit the serving cap",
+    );
+  });
+
   console.log("\nEmbedded sync client helpers — mock server");
 
   await test("Client syncStatus/syncPull/syncAck send and decode sync frames", async () => {
@@ -1199,7 +1434,9 @@ async function main() {
       await client.query("anything", { signal: controller.signal });
     } catch (err) {
       rejected = true;
-      assert.equal((err as Error).message, "nope");
+      assert.ok(isPowDBError(err), `rejected with ${err}, not a PowDBError`);
+      assert.equal((err as PowDBError).code, "aborted");
+      assert.match((err as PowDBError).message, /nope/);
     }
     assert.ok(rejected, "pre-aborted signal should reject immediately");
 
@@ -1292,7 +1529,7 @@ async function main() {
     await new Promise<void>((r) => server.close(() => r()));
   });
 
-  await test("custom abort reason passes through unchanged", async () => {
+  await test("a custom abort reason is wrapped, keeping the reason as cause", async () => {
     const server = silentServer();
     const port = await listen(server);
     const client = await Client.connect({
@@ -1310,7 +1547,10 @@ async function main() {
     } catch (err) {
       caught = err;
     }
-    assert.equal(caught, custom);
+    assert.ok(isPowDBError(caught), `rejected with ${caught}, not a PowDBError`);
+    assert.equal((caught as PowDBError).code, "aborted");
+    assert.match((caught as PowDBError).message, /my custom reason/);
+    assert.equal((caught as PowDBError).cause, custom);
 
     await client.close();
     await new Promise<void>((r) => server.close(() => r()));
@@ -1975,6 +2215,590 @@ async function main() {
       shipped,
       "WIRE_ERROR_CLASS does not match the server's ErrorClass numbering",
     );
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nParameter binding — out-of-range and non-finite values");
+  // ──────────────────────────────────────────────────────────
+
+  await test("a bigint outside the signed 64-bit range is rejected before anything is queued", async () => {
+    const { server } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      for (const bad of [2n ** 63n, -(2n ** 63n) - 1n]) {
+        const err = await client
+          .query("Val filter .id = $1 { .id }", [bad])
+          .then(
+            () => null,
+            (e: unknown) => e,
+          );
+        assert.ok(isPowDBError(err), `${bad} threw ${err}, not a PowDBError`);
+        assert.equal((err as PowDBError).code, "invalid_argument");
+      }
+      // The connection must still work: a rejected parameter may never
+      // leave a pending slot waiting for a reply that never comes.
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("integral doubles outside the int64 range bind as float", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      // 2^63 is one past i64::MAX, so the int tag has no room for it.
+      for (const big of [2 ** 63, -(2 ** 63) - 2048, 1e19, 1e300, Number.MAX_VALUE]) {
+        await withTimeout(client.query("Val filter .f = $1 { .id }", [big]), 2000);
+      }
+      const params = received
+        .filter((m) => m.type === "QueryWithParams")
+        .map((m) => (m as { params: { tag: string }[] }).params[0]!.tag);
+      assert.deepEqual(params, ["float", "float", "float", "float", "float"]);
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("an integral double above 2^53 still binds as int", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      // Every double in this range is an exact integer, so the int tag holds
+      // it losslessly -- and the tag is what decides the plan: an int literal
+      // probes the B+tree on an `int` column, a float literal falls back to a
+      // filtered sequential scan. Snowflake-shaped ids sit right here.
+      const values = [2 ** 53, 2 ** 60, 2 ** 63 - 1024, -(2 ** 63)];
+      for (const value of values) {
+        await withTimeout(client.query("Val filter .id = $1 { .id }", [value]), 2000);
+      }
+      const params = received
+        .filter((m) => m.type === "QueryWithParams")
+        .map((m) => (m as { params: { tag: string; value: bigint }[] }).params[0]!);
+      assert.deepEqual(
+        params,
+        values.map((value) => ({ tag: "int", value: BigInt(value) })),
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the number-to-param rule matches the embedded addon's", () => {
+    // The two bindings are hand-kept twins: the same JS number has to reach
+    // the engine with the same tag whether it goes over the wire or through
+    // the in-process addon, or one of them silently loses the index.
+    const lib = readFileSync(
+      fileURLToPath(new URL("../../../bindings/node/src/lib.rs", import.meta.url)),
+      "utf8",
+    );
+    const rule = lib.match(/if (n\.is_finite\(\)[^{]*)\{\s*\n\s*Ok\(Value::Int/);
+    assert.ok(rule, "the addon's number-to-param rule is no longer where this test looks");
+    assert.equal(
+      rule[1]!.replace(/\s+/g, " ").trim(),
+      "n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64",
+      "bindings/node/src/lib.rs changed its number rule; toWireParam has to move with it",
+    );
+  });
+
+  await test("safe integers still bind as int", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      await withTimeout(client.query("Val filter .id = $1", [42]), 2000);
+      await withTimeout(client.query("Val filter .id = $1", [-0]), 2000);
+      await withTimeout(client.query("Val filter .id = $1", [7n]), 2000);
+      const params = received
+        .filter((m) => m.type === "QueryWithParams")
+        .map((m) => (m as { params: { tag: string }[] }).params[0]!);
+      assert.deepEqual(
+        params,
+        [
+          { tag: "int", value: 42n },
+          { tag: "int", value: 0n },
+          { tag: "int", value: 7n },
+        ],
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("NaN and the infinities are rejected as invalid_argument", async () => {
+    const { server } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+        const err = await client.query("Val filter .f = $1", [bad]).then(
+          () => null,
+          (e: unknown) => e,
+        );
+        assert.ok(isPowDBError(err), `${bad} threw ${err}, not a PowDBError`);
+        assert.equal((err as PowDBError).code, "invalid_argument");
+      }
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("queryNative rejects the same values without desyncing", async () => {
+    const { server } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const err = await client.queryNative("Val filter .id = $1", [2n ** 64n]).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err));
+      assert.equal((err as PowDBError).code, "invalid_argument");
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nClient-side frame pre-checks");
+  // ──────────────────────────────────────────────────────────
+
+  await test("more than MAX_PARAMS parameters fails locally with size_exceeded", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const params = new Array(MAX_PARAMS + 1).fill(1);
+      const err = await client.query("Val filter .id = $1", params).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err), `threw ${err}, not a PowDBError`);
+      assert.equal((err as PowDBError).code, "size_exceeded");
+      assert.ok(
+        !received.some((m) => m.type === "QueryWithParams"),
+        "an over-cap frame must never reach the server",
+      );
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("a frame over MAX_PAYLOAD_SIZE fails locally with size_exceeded", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const err = await client.query("x".repeat(MAX_PAYLOAD_SIZE + 1)).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err), `threw ${err}, not a PowDBError`);
+      assert.equal((err as PowDBError).code, "size_exceeded");
+      assert.ok(
+        !received.some((m) => m.type === "Query"),
+        "an oversized frame must never reach the server",
+      );
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("encode refuses to write a parameter count it cannot frame", () => {
+    assert.throws(
+      () =>
+        encode({
+          type: "QueryWithParams",
+          query: "q",
+          params: new Array(MAX_PARAMS + 1).fill({ tag: "null" }),
+        }),
+      /too many parameters/,
+    );
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nServer-initiated frames and socket teardown");
+  // ──────────────────────────────────────────────────────────
+
+  await test("an unsolicited Error frame closes the client with the server's text", async () => {
+    const server = net.createServer((sock) => {
+      sock.once("data", () => {
+        sock.write(encode(negotiatedConnectOk()));
+        setTimeout(() => {
+          if (!sock.destroyed) {
+            sock.write(
+              encode({
+                type: "Error",
+                message: "connection idle for 300s; closing",
+                errorClass: WIRE_ERROR_CLASS.timeout,
+              }),
+            );
+          }
+        }, 10);
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const closed = await nextCloseEvent(client, 2000);
+      assert.ok(
+        isPowDBError(closed.error),
+        `close carried ${closed.error}, not a PowDBError`,
+      );
+      const err = closed.error as PowDBError;
+      assert.match(err.message, /connection idle for 300s/);
+      assert.equal(err.code, "timeout");
+      assert.equal(err.wireErrorClass, WIRE_ERROR_CLASS.timeout);
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("an unsolicited non-Error frame is still a protocol error", async () => {
+    const server = net.createServer((sock) => {
+      sock.once("data", () => {
+        sock.write(encode(negotiatedConnectOk()));
+        setTimeout(() => {
+          if (!sock.destroyed) {
+            sock.write(encode({ type: "ResultOk", affected: 0n }));
+          }
+        }, 10);
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const closed = await nextCloseEvent(client, 2000);
+      assert.ok(isPowDBError(closed.error));
+      assert.equal((closed.error as PowDBError).code, "protocol_error");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("a reset connection rejects in-flight queries with a PowDBError", async () => {
+    const server = net.createServer((sock) => {
+      let scratch = Buffer.alloc(0);
+      sock.on("data", (chunk) => {
+        const collected = collectFrames(scratch, Buffer.from(chunk));
+        scratch = collected.rest;
+        for (const msg of collected.messages) {
+          if (msg.type === "Connect") {
+            sock.write(encode(negotiatedConnectOk()));
+          } else if (msg.type === "Query") {
+            sock.resetAndDestroy();
+          }
+        }
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const err = await client.query("boom").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err), `rejected with ${err}, not a PowDBError`);
+      assert.equal((err as PowDBError).code, "closed");
+      assert.ok((err as PowDBError).cause instanceof Error, "the raw socket error must be the cause");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nResult cell cap does not kill the connection");
+  // ──────────────────────────────────────────────────────────
+
+  await test("an over-cap result rejects one query and leaves the client usable", async () => {
+    const rows = 300_000;
+    const cols = 7;
+    const server = net.createServer((sock) => {
+      let scratch = Buffer.alloc(0);
+      sock.on("data", (chunk) => {
+        const collected = collectFrames(scratch, Buffer.from(chunk));
+        scratch = collected.rest;
+        for (const msg of collected.messages) {
+          if (msg.type === "Connect") {
+            sock.write(encode(negotiatedConnectOk()));
+          } else if (msg.type === "Query" && msg.query === "huge") {
+            sock.write(oversizedResultRowsFrame(rows, cols));
+          } else if (msg.type === "Query") {
+            sock.write(encode({ type: "ResultOk", affected: 0n }));
+          } else if (msg.type === "Disconnect") {
+            sock.end();
+          }
+        }
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const err = await client.query("huge").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err), `rejected with ${err}, not a PowDBError`);
+      assert.equal((err as PowDBError).code, "size_exceeded");
+      assert.match((err as PowDBError).message, /result too large/);
+      const after = await withTimeout(client.query("still alive"), 2000);
+      assert.equal(after.kind, "ok");
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nIn-flight window");
+  // ──────────────────────────────────────────────────────────
+
+  await test("500 concurrent queries all resolve within the in-flight window", async () => {
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const results = await withTimeout(
+        Promise.all(
+          Array.from({ length: 500 }, (_, i) => client.query(`q${i}`)),
+        ),
+        30_000,
+      );
+      assert.equal(results.length, 500);
+      assert.ok(
+        stats.maxInFlight <= 64,
+        `client wrote ${stats.maxInFlight} unanswered frames, cap is 64`,
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the in-flight window is configurable and preserves reply order", async () => {
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      maxInFlight: 4,
+    });
+    try {
+      const results = await withTimeout(
+        Promise.all(Array.from({ length: 40 }, (_, i) => client.query(`q${i}`))),
+        10_000,
+      );
+      assert.equal(results.length, 40);
+      assert.ok(
+        stats.maxInFlight <= 4,
+        `client wrote ${stats.maxInFlight} unanswered frames, cap is 4`,
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the in-flight window bounds unanswered bytes, not only frames", async () => {
+    // 64 frames of 20 KiB is 1.28 MiB of read-ahead, and a pre-0.28.0 server
+    // cancels the running query and closes the connection at 1 MiB with no
+    // Error frame -- the exact ECONNRESET this window exists to prevent. The
+    // frame count never gets near its own cap on traffic like this.
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const text = "q".repeat(20 * 1024);
+      const results = await withTimeout(
+        Promise.all(Array.from({ length: 200 }, (_, i) => client.query(`${text}${i}`))),
+        30_000,
+      );
+      assert.equal(results.length, 200);
+      assert.ok(
+        stats.maxInFlightBytes < 1024 * 1024,
+        `client left ${stats.maxInFlightBytes} unanswered bytes on the wire, cap is 1 MiB`,
+      );
+      // The byte budget, not the frame count, is what bound this burst.
+      assert.ok(
+        stats.maxInFlight < 64,
+        `frame count ${stats.maxInFlight} reached the window, so bytes were never the binding cap`,
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("a single frame larger than the byte budget still goes out", async () => {
+    // The budget may never deadlock a client whose one and only query is
+    // bigger than it: with nothing in flight, the head frame always writes.
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const result = await withTimeout(client.query("q".repeat(2 * 1024 * 1024)), 30_000);
+      assert.equal(result.kind, "ok");
+      assert.ok(stats.maxInFlightBytes > 1024 * 1024);
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the window's caps are the ones the server actually enforces", () => {
+    const path = fileURLToPath(
+      new URL("../../../crates/server/src/handler/wire.rs", import.meta.url),
+    );
+    const text = readFileSync(path, "utf8");
+    const constant = (name: string): number => {
+      const matches = [
+        ...text.matchAll(
+          new RegExp(`^pub\\(super\\) const ${name}: usize = ([^;]+);$`, "gm"),
+        ),
+      ];
+      assert.equal(matches.length, 1, `expected exactly one \`${name}\` in ${path}`);
+      const expr = matches[0]![1]!.replace(/_/g, "").trim();
+      assert.match(expr, /^\d+( \* \d+)*$/, `cannot evaluate ${name} = ${expr}`);
+      return expr.split("*").reduce((acc, part) => acc * Number(part.trim()), 1);
+    };
+    assert.ok(
+      DEFAULT_MAX_IN_FLIGHT < constant("MAX_IN_FLIGHT_READ_AHEAD_FRAMES"),
+      "the default window no longer sits under the server's frame cap",
+    );
+    assert.ok(
+      MAX_IN_FLIGHT_BYTES <= constant("MAX_IN_FLIGHT_READ_AHEAD_BYTES"),
+      "the client's byte budget no longer sits under the server's byte cap",
+    );
+  });
+
+  await test("queries queued behind the window reject when the connection dies", async () => {
+    const server = net.createServer((sock) => {
+      let scratch = Buffer.alloc(0);
+      sock.on("data", (chunk) => {
+        const collected = collectFrames(scratch, Buffer.from(chunk));
+        scratch = collected.rest;
+        for (const msg of collected.messages) {
+          if (msg.type === "Connect") {
+            sock.write(encode(negotiatedConnectOk()));
+          } else if (msg.type === "Query") {
+            sock.resetAndDestroy();
+          }
+        }
+      });
+      sock.on("error", () => {});
+    });
+    const port = await listen(server);
+    const client = await Client.connect({
+      host: "127.0.0.1",
+      port,
+      maxInFlight: 2,
+    });
+    try {
+      const settled = await withTimeout(
+        Promise.allSettled(
+          Array.from({ length: 20 }, (_, i) => client.query(`q${i}`)),
+        ),
+        5000,
+      );
+      assert.equal(settled.length, 20);
+      for (const outcome of settled) {
+        assert.equal(outcome.status, "rejected");
+        const reason = (outcome as PromiseRejectedResult).reason;
+        assert.ok(isPowDBError(reason), `queued query rejected with ${reason}`);
+      }
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────
+  console.log("\nPool health");
+  // ──────────────────────────────────────────────────────────
+
+  await test("the pool evicts idle clients whose connection died", async () => {
+    const first = queryServer();
+    const port = await listen(first.server);
+    const pool = new Pool({ host: "127.0.0.1", port, max: 2 });
+    try {
+      const a = await pool.acquire();
+      const b = await pool.acquire();
+      pool.release(a);
+      pool.release(b);
+      assert.equal(pool.idle, 2);
+
+      await closeServer(first.server, first.sockets);
+      await settleCloseEvents();
+
+      assert.equal(pool.idle, 0, "dead clients must not stay in the idle set");
+      assert.equal(pool.size, 0, "an evicted client must give its slot back");
+
+      const second = queryServer();
+      await listenOn(second.server, port);
+      try {
+        const result = await withTimeout(
+          pool.withClient((c) => c.query("after restart")),
+          5000,
+        );
+        assert.equal(result.kind, "ok");
+      } finally {
+        await closeServer(second.server, second.sockets);
+      }
+    } finally {
+      await pool.close();
+    }
+  });
+
+  await test("an acquire timeout is a PowDBError", async () => {
+    const { server } = queryServer();
+    const port = await listen(server);
+    const pool = new Pool({
+      host: "127.0.0.1",
+      port,
+      max: 1,
+      acquireTimeoutMs: 25,
+    });
+    try {
+      const held = await pool.acquire();
+      const err = await pool.acquire().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      assert.ok(isPowDBError(err), `acquire rejected with ${err}`);
+      assert.equal((err as PowDBError).code, "timeout");
+      assert.match((err as PowDBError).message, /pool acquire timeout/);
+      pool.release(held);
+    } finally {
+      await pool.close();
+      await closeServer(server);
+    }
   });
 
   console.log("\n" + "═".repeat(50));

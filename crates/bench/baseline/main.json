@@ -3,101 +3,99 @@
   "runner": "depot-ubuntu-24.04-4",
   "rustflags": "-C target-cpu=x86-64-v2",
   "arch": "x86_64",
-  "rustc": "1.95.0",
-  "updated": "2026-07-14",
-  "commit": "9a14c4a",
+  "rustc": "1.98.1",
+  "updated": "2026-09-07",
+  "commit": "f37c437",
+  "git_sha": "f37c437",
+  "source_run": "bench.yml run 34167015205 (Depot, https://github.com/ZVN-DEV/powdb/actions/runs/34167015205)",
   "workloads": {
     "insert_10k": {
-      "ns_per_iter": 857408.65,
-      "ops_per_sec": 1166
+      "ns_per_iter": 880511.526272578,
+      "ops_per_sec": 1136
     },
     "btree_lookup": {
-      "ns_per_iter": 183.85,
-      "ops_per_sec": 5439217
+      "ns_per_iter": 169.19222939571335,
+      "ops_per_sec": 5910437
     },
     "seq_scan_filter": {
-      "ns_per_iter": 4663585.14,
-      "ops_per_sec": 214
+      "ns_per_iter": 4231009.0,
+      "ops_per_sec": 236
     },
     "powql_point": {
-      "ns_per_iter": 1165.84,
-      "ops_per_sec": 857751
+      "ns_per_iter": 1438.920547140452,
+      "ops_per_sec": 694965
     },
     "powql_filter_only": {
-      "ns_per_iter": 11409790.7,
-      "ops_per_sec": 88
+      "ns_per_iter": 11912132.9,
+      "ops_per_sec": 84
     },
     "powql_filter_projection": {
-      "ns_per_iter": 5832449.89,
-      "ops_per_sec": 171
+      "ns_per_iter": 6023585.166666666,
+      "ops_per_sec": 166
     },
     "powql_aggregation": {
-      "ns_per_iter": 561420.48,
-      "ops_per_sec": 1781
+      "ns_per_iter": 531740.6047252747,
+      "ops_per_sec": 1881
     },
     "point_lookup_nonindexed": {
-      "ns_per_iter": 599721.18,
-      "ops_per_sec": 1667
+      "ns_per_iter": 568600.5006720431,
+      "ops_per_sec": 1759
     },
     "scan_filter_project_top100": {
-      "ns_per_iter": 15010.7,
-      "ops_per_sec": 66619
+      "ns_per_iter": 16583.135995989305,
+      "ops_per_sec": 60302
     },
     "scan_filter_sort_limit10": {
-      "ns_per_iter": 2415040.02,
-      "ops_per_sec": 414
+      "ns_per_iter": 2259564.238095238,
+      "ops_per_sec": 443
     },
     "agg_sum": {
-      "ns_per_iter": 378853.01,
-      "ops_per_sec": 2640
+      "ns_per_iter": 365944.8072100313,
+      "ops_per_sec": 2733
     },
     "agg_avg": {
-      "ns_per_iter": 641375.54,
-      "ops_per_sec": 1559
+      "ns_per_iter": 617079.5304252199,
+      "ops_per_sec": 1621
     },
     "agg_min": {
-      "ns_per_iter": 386688.54,
-      "ops_per_sec": 2586
+      "ns_per_iter": 394014.86161616165,
+      "ops_per_sec": 2538
     },
     "agg_max": {
-      "ns_per_iter": 377038.63,
-      "ops_per_sec": 2652
+      "ns_per_iter": 365141.40213675215,
+      "ops_per_sec": 2739
     },
     "multi_col_and_filter": {
-      "ns_per_iter": 2036365.16,
-      "ops_per_sec": 491
+      "ns_per_iter": 2090395.1,
+      "ops_per_sec": 478
     },
     "conjunction_index_residual": {
-      "ns_per_iter": 220853.64,
-      "ops_per_sec": 4527,
-      "source": "depot-run-29463423181-2026-07-16"
+      "ns_per_iter": 242954.95097920694,
+      "ops_per_sec": 4116
     },
     "conjunction_s4_selective_path": {
-      "ns_per_iter": 2770.82,
-      "ops_per_sec": 360904,
-      "source": "depot-run-29490533258-2026-07-16"
+      "ns_per_iter": 4807.740599539307,
+      "ops_per_sec": 207998
     },
     "insert_single": {
-      "ns_per_iter": 235.78,
-      "ops_per_sec": 4241242
+      "ns_per_iter": 238.3653436351321,
+      "ops_per_sec": 4195241
     },
     "insert_batch_1k": {
-      "ns_per_iter": 490914.38,
-      "ops_per_sec": 2037
+      "ns_per_iter": 222514.38586956522,
+      "ops_per_sec": 4494
     },
     "update_by_pk": {
-      "ns_per_iter": 1157.99,
-      "ops_per_sec": 863565
+      "ns_per_iter": 1615.7376813770875,
+      "ops_per_sec": 618912
     },
     "update_by_filter": {
-      "ns_per_iter": 1035372.26,
-      "ops_per_sec": 966
+      "ns_per_iter": 1067642.2969726562,
+      "ops_per_sec": 937
     },
     "delete_by_filter": {
-      "ns_per_iter": 89655.08,
-      "ops_per_sec": 11154
+      "ns_per_iter": 101498.19711538462,
+      "ops_per_sec": 9852
     }
-  },
-  "git_sha": "d77d09a",
-  "source_run": "bench.yml run 29380092439 (Depot)"
+  }
 }

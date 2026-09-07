@@ -60,15 +60,25 @@ server_alive() {
 
 # Portable TCP helpers.
 #
-# The obvious spelling for both of these is bash's `/dev/tcp/host/port`, and it
-# is wrong here: Apple ships bash 3.2 built WITHOUT net redirections, so on
-# macOS `/dev/tcp` is "no such file or directory" even while the port is
-# plainly listening. The readiness probe below would then never succeed, and
-# this job would report "the release server did not start" on every developer
-# laptop while passing in CI. A gate that only its CI runner can execute is a
-# gate nobody can debug, and the wire-frame loop would silently send zero bytes
-# and still count them. python3 is already a hard requirement of step 2, so the
-# socket work goes through it instead.
+# The obvious spelling for both of these is bash's `/dev/tcp/host/port`. These
+# go through python3 instead, and the reason recorded here used to be wrong:
+# it claimed Apple's bash 3.2 is built WITHOUT net redirections. It is not.
+# Measured on bash 3.2.57(1)-release (arm64-apple-darwin), `/dev/tcp` connects
+# to a live listener and reports "Connection refused" for a dead one, which is
+# working net redirection, not a missing feature. Nobody should trust a comment
+# that is false about the platform the script now runs on in CI.
+#
+# The real reasons to use python3 here:
+#
+#   1. python3 is already a hard requirement of step 2 (it parses cargo's
+#      artifact JSON), so this adds no dependency.
+#   2. `/dev/tcp` has no connect timeout. A readiness probe against a port
+#      nothing is listening on would block on the kernel's default connect
+#      timeout instead of failing in one second and retrying, which is the
+#      difference between a five-second startup wait and a job timeout.
+#   3. tcp_send_file needs a half-close (shutdown(SHUT_WR)) so the server sees
+#      end-of-request and answers on its own terms rather than being reset
+#      mid-response. bash redirections cannot express a half-close at all.
 
 # tcp_probe <port>: exit 0 when something accepts a connection on the port.
 tcp_probe() {

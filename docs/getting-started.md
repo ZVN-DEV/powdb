@@ -59,6 +59,22 @@ Data is stored in `./powdb_data/` by default. You can change it with `--data-dir
 cargo run --release -p powdb-cli -- --data-dir ./my_project_data
 ```
 
+**One statement, one line.** The REPL executes each line as it is entered. It
+keeps reading continuation lines only while a `{`, `(` or `"` is still open (it
+says so: `note: unterminated statement ...`). A pipeline split across lines with
+nothing open therefore runs a line at a time, and the second line fails on its
+own:
+
+```
+powql> User
+powql> filter .age > 0
+Error: at position 0: expected statement, got 'filter'
+```
+
+Write the pipeline on one line, or put it in a file and run
+`powdb-cli --exec-file query.powql`, where newlines continue a statement and
+`;` separates statements. `--exec` follows the same rule as `--exec-file`.
+
 ---
 
 ## 3. Create a Table
@@ -121,9 +137,9 @@ powql> insert User { name := "Grace", email := "grace@example.com" }
 1 row affected
 ```
 
-> **Multi-row insert:** you can also insert many rows in one statement by separating row blocks with commas -- `insert User { ... }, { ... }, { ... }`. One statement means one WAL fsync and one network round trip, and validation is all-or-nothing. See [INSERT in the PowQL reference](POWQL.md#insert).
+> **Multi-row insert:** you can also insert many rows in one statement by separating row blocks with commas -- `insert User { ... }, { ... }, { ... }`. One statement means one network round trip and all-or-nothing validation. It does not mean one fsync: each row is its own WAL record and the log fsyncs every 64 records. See [INSERT in the PowQL reference](POWQL.md#insert).
 
-> **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- they share a single fsync at commit and run dozens of times faster, still fully durable. See [Transactions](POWQL.md#transactions).
+> **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- a statement inside one does not fsync, so the batch costs roughly one fsync per 64 rows instead of one per row, and runs dozens of times faster while staying fully durable. See [Transactions](POWQL.md#transactions).
 
 ---
 
@@ -559,6 +575,24 @@ POWDB_ADMIN_USER=root POWDB_ADMIN_PASSWORD=changeme powdb-server --data-dir ./po
 
 After the admin exists, use `passwd` / `useradd` to manage the rest, and stop
 relying on the bootstrap env vars.
+
+### Encrypting the connection (TLS)
+
+The server serves TLS when `POWDB_TLS_CERT` and `POWDB_TLS_KEY` both point at a
+PEM certificate and key, and the CLI connects to it with `--tls` (plus
+`--tls-ca <ca.pem>` for a self-signed certificate):
+
+```bash
+POWDB_TLS_CERT=server.crt POWDB_TLS_KEY=server.key powdb-server --data-dir ./powdb_data
+powdb-cli --remote localhost:5433 --tls --tls-ca server.crt
+```
+
+Generating a self-signed certificate for this is fussier than it looks: a plain
+`openssl req -x509` one-liner produces a certificate the server accepts and
+every client then rejects, and the details differ between LibreSSL (stock
+macOS) and OpenSSL. Use the recipe in
+[SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md#generating-a-self-signed-certificate-for-testing),
+which is written to work on both.
 
 ### Concurrent transactions
 

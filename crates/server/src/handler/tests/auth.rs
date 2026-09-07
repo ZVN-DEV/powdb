@@ -230,6 +230,7 @@ fn variant_key(stmt: &powdb_query::ast::Statement) -> &'static str {
         S::DeleteQuery(_) => "DeleteQuery",
         S::CreateType(_) => "CreateType",
         S::CreateLink(_) => "CreateLink",
+        S::DropLink(_) => "DropLink",
         S::AlterTable(_) => "AlterTable",
         S::DropTable(_) => "DropTable",
         S::CreateView(_) => "CreateView",
@@ -291,6 +292,7 @@ fn the_full_role_by_statement_matrix() {
             true,
             false,
         ),
+        ("drop link User.orders", true, true, false),
         ("alter User add column status: str", true, true, false),
         ("drop User", true, true, false),
         ("materialized V as User", true, true, false),
@@ -334,6 +336,7 @@ fn the_full_role_by_statement_matrix() {
         "DeleteQuery",
         "CreateType",
         "CreateLink",
+        "DropLink",
         "AlterTable",
         "DropTable",
         "CreateView",
@@ -352,4 +355,171 @@ fn the_full_role_by_statement_matrix() {
     for key in all {
         assert!(covered.contains(key), "no matrix sample parses to {key}");
     }
+}
+
+// ---- Auth failure rate limiting ----
+
+fn ip(last: u8) -> AuthPeer {
+    AuthPeer::Ip(std::net::IpAddr::from([127, 0, 0, last]))
+}
+
+/// Five wrong guesses at one username must not lock the legitimate user out.
+///
+/// The bucket used to be keyed by source address alone, so a script guessing
+/// `admin` from an office NAT locked every real user behind that address out
+/// for a minute. Unknown usernames counted the same way, which made the
+/// lockout free to cause.
+#[test]
+fn a_wrong_username_does_not_lock_out_another_user() {
+    let limiter = new_rate_limiter();
+    let peer = ip(1);
+    for _ in 0..6 {
+        record_auth_failure(&limiter, &peer, Some("admin"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("admin")),
+        "the guessed username must be locked out"
+    );
+    assert!(
+        !is_rate_limited(&limiter, &peer, Some("alice")),
+        "a different username from the same address must still be able to log in"
+    );
+}
+
+/// The peer bucket is still there as an outer bound, at a higher threshold, so
+/// a sweep across many usernames is stopped.
+#[test]
+fn a_sweep_across_usernames_still_locks_the_peer_out() {
+    let limiter = new_rate_limiter();
+    let peer = ip(2);
+    for n in 0..60 {
+        record_auth_failure(&limiter, &peer, Some(&format!("user{n}")));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("alice")),
+        "a peer that failed at 60 different usernames must be locked out as a whole"
+    );
+    assert!(
+        !is_rate_limited(&limiter, &ip(3), Some("alice")),
+        "another address must be unaffected"
+    );
+}
+
+/// A Unix-socket peer has no address, so it used to be skipped by the limiter
+/// entirely: unlimited guesses at any credential over the local socket.
+#[test]
+fn unix_socket_peers_share_one_bucket_instead_of_none() {
+    let limiter = new_rate_limiter();
+    let peer = AuthPeer::of(None);
+    assert_eq!(peer, AuthPeer::UnixSocket);
+    for _ in 0..6 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &peer, Some("alice")),
+        "a unix-socket peer must be throttled like any other"
+    );
+}
+
+/// A successful login clears what that attempt contributed.
+#[test]
+fn a_successful_login_clears_the_counters() {
+    let limiter = new_rate_limiter();
+    let peer = ip(4);
+    for _ in 0..4 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    clear_auth_failures(&limiter, &peer, Some("alice"));
+    for _ in 0..4 {
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    assert!(
+        !is_rate_limited(&limiter, &peer, Some("alice")),
+        "the pre-success failures must not still count toward the lockout"
+    );
+}
+
+/// A username longer than a key may hold is truncated, not retained whole.
+///
+/// The name arrives on a CONNECT frame from a peer that has not authenticated,
+/// so its length is the attacker's to choose. Truncation shares a bucket
+/// between names with the same prefix, which can only tighten the limiter.
+#[test]
+fn a_long_username_is_truncated_before_it_becomes_a_key() {
+    let limiter = new_rate_limiter();
+    let peer = ip(5);
+    let long = "u".repeat(4000);
+    record_auth_failure(&limiter, &peer, Some(&long));
+    let table = limiter.lock().unwrap();
+    assert!(
+        table.retained_user_bytes() <= MAX_AUTH_BUCKET_USER_BYTES,
+        "one failure retained {} bytes of username",
+        table.retained_user_bytes()
+    );
+}
+
+/// Truncation cuts on a character boundary, so a multi-byte name still makes
+/// a key rather than panicking on a slice through the middle of a codepoint.
+#[test]
+fn a_multibyte_username_is_cut_on_a_character_boundary() {
+    let limiter = new_rate_limiter();
+    let peer = ip(6);
+    // "€" is three bytes, so byte 64 lands inside a character.
+    record_auth_failure(&limiter, &peer, Some(&"€".repeat(200)));
+    let table = limiter.lock().unwrap();
+    assert!(table.retained_user_bytes() <= MAX_AUTH_BUCKET_USER_BYTES);
+    assert!(!table.is_empty());
+}
+
+/// The table is bounded in entries as well as in key size.
+///
+/// One peer is bounded by its own failure limit, but the number of peers is
+/// not: a single IPv6 /64 supplies more source addresses than any table could
+/// hold, and every entry outlives the connection that created it.
+#[test]
+fn the_failure_table_is_bounded_across_unbounded_peers() {
+    let limiter = new_rate_limiter();
+    for n in 0..(MAX_AUTH_BUCKETS as u128 * 2) {
+        let peer = AuthPeer::Ip(std::net::IpAddr::from(std::net::Ipv6Addr::from(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + n,
+        )));
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    let table = limiter.lock().unwrap();
+    assert!(
+        table.len() <= MAX_AUTH_BUCKETS,
+        "the table grew to {} buckets against a {MAX_AUTH_BUCKETS} cap",
+        table.len()
+    );
+    assert!(!table.is_empty(), "eviction must not empty the table");
+}
+
+/// Eviction keeps the peers closest to their bound.
+///
+/// A spray of one-failure buckets from throwaway addresses must not be able
+/// to forget a peer that is one guess away from being locked out.
+#[test]
+fn eviction_drops_the_buckets_furthest_from_a_lockout() {
+    let limiter = new_rate_limiter();
+    let hot = ip(7);
+    for _ in 0..MAX_PEER_AUTH_FAILURES {
+        record_auth_failure(&limiter, &hot, Some("alice"));
+    }
+    assert!(is_rate_limited(&limiter, &hot, Some("alice")));
+    for n in 0..(MAX_AUTH_BUCKETS as u128 * 2) {
+        let peer = AuthPeer::Ip(std::net::IpAddr::from(std::net::Ipv6Addr::from(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + n,
+        )));
+        record_auth_failure(&limiter, &peer, Some("spray"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &hot, Some("alice")),
+        "a spray of throwaway addresses must not clear a standing lockout"
+    );
+}
+
+/// The refusal tells the client how long to wait, which it never did.
+#[test]
+fn the_rate_limit_window_is_stated_in_seconds() {
+    assert_eq!(auth_retry_after_secs(), 60);
 }

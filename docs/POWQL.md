@@ -61,11 +61,12 @@ PowQL reads left to right. You name the table, apply operations, and project fie
 type User {
   required name: str,
   required email: str,
-  age: int
+  age: int,
+  status: str
 }
 
 # Insert a row
-insert User { name := "Alice", email := "alice@example.com", age := 30 }
+insert User { name := "Alice", email := "alice@example.com", age := 30, status := "active" }
 
 # Scan all users
 User
@@ -211,6 +212,30 @@ User { .name, double_age: .age * 2 }
 User { .name, info: concat(.name, " age=", .age) }
 ```
 
+**An unaliased column is named after what it computes.** A bare field drops its
+dot (`User { .name }` is headed `name`); anything else is headed by the
+expression as written, dot included:
+
+| Projection | Column name |
+|---|---|
+| `{ .id }` | `id` |
+| `{ .j->a }` | `.j->a` |
+| `{ .n + 1 }` | `.n + 1` |
+| `{ upper(.s) }` | `upper(.s)` |
+| `{ cast(.n, "str") }` | `str(.n)` |
+| `group .s { count(.n) }` | `count(.n)` |
+
+Before this release an unaliased expression was headed `?` and an unaliased
+grouped aggregate was headed by the planner's internal `__agg_0`. Two shapes to
+know about: a single-table alias is dropped before naming, so `D as d { d.id }`
+is headed `id` rather than `d.id`; and a subquery, a window function or a `case`
+expression still comes back as `?`. Alias explicitly if you depend on the
+header.
+
+The SQL frontend names an unaliased **aggregate** with the SQL spelling instead
+(`count(n)`, `count(*)`); every other unaliased expression inherits the PowQL
+spelling above. See [SQL.md](SQL.md#result-column-names).
+
 ### Ordering
 
 Sort results using `order` with one or more expressions. Default direction is ascending. Use `asc` or `desc` explicitly:
@@ -262,6 +287,24 @@ SQL equivalent:
 SELECT name, email, age FROM User WHERE age > 18 ORDER BY name ASC LIMIT 100 OFFSET 20
 ```
 
+**Each clause is written once.** `filter`, `order`, `limit`, `offset`, `group`
+and the projection block may each appear at most once in a pipeline; writing one
+twice is a parse error:
+
+```
+User filter .a = 1 filter .b = 2
+# at position 19: 'filter' appears more than once in one pipeline;
+# each clause is written once, so combine them into one
+```
+
+Before this release the second one silently won and the first was answered as if
+it had never been written. Combine them instead: `filter .a = 1 and .b = 2`,
+`order .a, .b`. The rule holds in a nested pipeline and in an aggregate's
+argument pipeline as well.
+
+`having` is the exception and still chains with `and` when written more than
+once. `distinct` may also be repeated, because repeating it changes nothing.
+
 ---
 
 ## Expressions
@@ -290,9 +333,51 @@ o.total
 | Type | Examples |
 |---|---|
 | Integer | `42`, `-7`, `0` |
-| Float | `3.14`, `-0.5` |
+| Float | `3.14`, `-0.5`, `1e9`, `1.5E-3`, `2e+10` |
 | String | `"hello"`, `"Alice"` |
 | Boolean | `true`, `false` |
+
+A float may be written with an exponent: `e` or `E`, an optional sign, and at
+least one digit. `1e` on its own is not a float; it lexes as `1` followed by the
+identifier `e`. A literal whose value is not finite is refused at lex time
+rather than becoming `inf`: `float literal out of range: 1e400`.
+
+There is **no literal spelling for NaN or infinity**. `nan`, `inf` and
+`infinity` are read as column names. Both values are still storable, because
+float arithmetic produces them: `update F set { f := .f / .z }` with `.z` holding
+`0.0` writes `inf`, and `0.0 / 0.0` writes NaN. Both survive a restart. Their
+comparison behaviour is under
+[Comparison Operators](#comparison-operators).
+
+**Negative zero is its own float.** `-0.0` is a literal, and `-0.0 = 0.0` is
+false, because two floats are compared by their total order. But `-0.0 = 0` is
+**true**, because an int compared with a float is compared numerically and
+exactly, and `-0.0` denotes the number zero. So `= 0` and `= 0.0` select
+different rows from the same float column. `-0.0` also sorts strictly below
+`+0.0`, and `distinct` and `group` treat the two as separate values.
+
+#### String escapes
+
+The escape set is `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and `\uXXXX` (exactly
+four hex digits, case-insensitive). **Any other escape is a parse error**:
+``unknown escape '\x' in string literal; PowQL supports \" \\ \n \t \r \0 and \uXXXX``.
+
+Until this release an unrecognized escape silently dropped its backslash and
+kept the rest, so `"a\Ab"` was stored as `aAb` and `"\u0041"` as `u0041`. There
+is no reading under which that was what the author wrote.
+
+`\uXXXX` must name a real Unicode character, so an unpaired surrogate is
+refused: `\uD800` gives ``invalid \u escape in string literal: expected four hex
+digits naming a Unicode character, got "D800"``.
+
+PowQL has no single-quoted string, so it has no `\'`. The SQL frontend's set is
+this one plus `\'`; see [SQL.md](SQL.md).
+
+**Consequence for `bytes` literals.** A `bytes` value is written as
+Postgres-style hex with a doubled backslash, `"\\x0a0b"`, which was always the
+only form that worked and is now the only form that parses: a single `\x0a` is
+an unknown escape. The column's own refusal names the format it wants:
+``column 'b' is bytes -- expected Postgres bytea hex (\x-prefixed, even length), got "..."``.
 
 ### Parameters
 
@@ -311,6 +396,16 @@ literal token for the supplied value *before* parsing, so an
 injection-shaped string is inert data and can never change the query's
 shape. A `null` parameter binds PowQL `null`. A placeholder with no
 matching argument (or a `$0`) is a clean parse error.
+
+**A supplied parameter the query never references is also an error**, so a
+caller's off-by-one is reported rather than hidden. Binding three parameters to
+a query that mentions `$1` and `$2` gives `3 parameters supplied but the query
+references only $2`; a gap in the middle gives `2 parameters supplied but the
+query never references $1`; binding to a query with no placeholders at all
+gives `1 parameter supplied but the query references none`. All three are
+parse-time errors, so they arrive with wire error class 1. The same placeholder
+written twice counts as referenced once. Supplying too few is unchanged:
+`query references $2 but only 1 parameter(s) were supplied`.
 
 Over the wire this is the `client.query(powql, params)` form (see
 [AGENTS.md](../AGENTS.md) for the client API and the `QueryWithParams`
@@ -343,6 +438,36 @@ or through an index). This applies to comparisons only: `group by`,
 `distinct`, and join keys keep int and float distinct, so `1` and `1.0` are
 one value to a filter and two values to a grouping. Other type pairs are not
 coerced; use `cast` where you need one.
+
+**An ordered comparison between two different types is false.** `<`, `<=`, `>`
+and `>=` on values of unlike type match nothing, rather than falling back on an
+ordering by type name. Before this release `.j->v > 99.5` returned the rows
+whose value was the string `"deep"` and the bool `true`, because that fallback
+ranked them by type. `=` and `!=` are separate: they compare strictly per
+variant, except for the two documented pairs, int against float (numeric) and
+json against str (parsed as a document). Where an operand's type is known before
+the query runs, a mismatch is a typed error rather than an empty result:
+`.n like "abc"` on an int column gives
+`type mismatch for column 'n': 'like' matches str, not int`, and `.s like 5`
+gives `type mismatch: the 'like' pattern must be str, got int`. The same holds
+in `having`. A cast, a json path or a bound parameter is left to run, because
+its type is not fixed until then.
+
+#### NaN
+
+A comparison against NaN follows IEEE 754. `=`, `<`, `>`, `<=` and `>=` against
+NaN are **false**, including `nan = nan`, and `!=` is **true**. That holds on
+every access path: the interpreter, the compiled predicate, the compiled JSON
+leaf, and an index range scan, which routes each bound through the same
+evaluator. An index equality probe cannot be faithful for a non-finite key, so
+the index is withdrawn and the scan answers instead.
+
+Ordering is separate from comparison, and still places NaN in one definite
+position: it is the **largest** float, so it sorts last ascending and first
+descending. A missing value is separate again and sorts last in **both**
+directions. `distinct` and `group` treat NaNs as one value (bit patterns that
+differ count as different values), and a join on NaN keys **does** match,
+because a join key is matched on identity rather than by the IEEE rule.
 
 #### NULL / missing values in comparisons
 
@@ -431,6 +556,71 @@ Use parentheses to override precedence:
 User filter (.a + .b) * .c > 0
 ```
 
+#### Integer division, overflow, and division by zero
+
+`int / int` divides and truncates toward zero (`5 / 2` is `2`, `-5 / 2` is `-2`).
+Mixing an `int` with a `float` produces a `float` (`5.0 / 2` is `2.5`).
+
+Integer arithmetic that leaves the `int64` range does **not** wrap, and it is
+**not** the missing value either. `+`, `-`, `*` and `/` fail the statement:
+
+```
+# .x is 9223372036854775807
+User { v: .x + 1 }   # cannot compute a sum: the integer result overflows int64
+User { v: .x * 2 }   # cannot compute a product: the integer result overflows int64
+```
+
+The label names the operation: `a sum`, `a difference`, `a product`, or
+`a quotient` (the quotient case is `i64::MIN / -1`, the one division that
+overflows). Before this release each of these evaluated to the missing value for
+that row, which is indistinguishable from a missing column, and an `update` wrote
+it into a required column. An `update` that hits one now writes no row at all.
+
+Division by zero splits three ways:
+
+- **A literal zero divisor is refused before the query runs**, because it can
+  never be anything else: `cannot divide by zero: the divisor is the literal 0`.
+  This holds for `0` and for `0.0`, so `.f / 0.0` is refused too.
+- **An integer divisor that is zero for some row** fails the statement:
+  `cannot divide by zero: the divisor is zero for at least one row`. It used to
+  yield the missing value.
+- **A float divisor that is zero for some row yields `inf`**, which is what
+  IEEE 754 says and what every float path in the engine does. Only the literal
+  spelling is refused.
+
+PowQL has no modulo operator: there is no `%`, in either frontend.
+
+`sum` was already a hard error on integer overflow, and stays one:
+`cannot compute sum: the integer total overflows int64`. Silently returning
+`null` from an aggregate reads as "no rows".
+
+#### NaN and infinity
+
+Float columns hold the full IEEE 754 range, `NaN` and the infinities included.
+Neither has a literal spelling, but both are storable: an `update` assignment
+that produces one stores it (`update { a := .a / .b }` with `.b` zero gives
+`inf`, or `NaN` when `.a` is zero too), and it survives a restart.
+
+What they do once stored, all of it deliberate and none of it configurable:
+
+| | `inf` | `NaN` |
+|---|---|---|
+| `order .a asc` | after every finite number | **last, after `inf`** |
+| `order .a desc` | before every finite number | **first** |
+| `max` | beats every finite number | beats `inf` |
+| `min` | loses to every finite number | never wins `min` either: a column holding `NaN`, `inf` and `5` has `min` `5` |
+| `sum` / `avg` over the column | `inf` | `NaN`, for the whole aggregate |
+| `cast(.a, "str")` | `"inf"` | `"NaN"` |
+| `cast(.a, "int")` | saturates to `9223372036854775807` | **`0`** |
+
+`NaN` sorting last rather than being excluded is what makes ordering a total
+order, so paging is deterministic. `cast(NaN, "int")` being `0` is Rust's
+saturating float-to-int conversion, not a decision PowQL makes separately: `NaN`
+has no integer value and `0` is what the conversion produces.
+
+*Comparing* against `NaN` is a separate rule and follows IEEE rather than this
+ordering: see [NaN](#nan) under Comparison Operators.
+
 ### Logical Operators
 
 | Operator | Meaning |
@@ -443,6 +633,23 @@ User filter (.a + .b) * .c > 0
 User filter .age > 25 and .status = "active"
 User filter .age < 20 or .age > 60
 User filter not .active
+```
+
+**`not` over a missing value is the plain complement.** PowQL's filter logic is
+two-valued, so `not X` keeps exactly the rows `X` drops. On a row where `.x` is
+missing, `.x = 1` is false, so `not (.x = 1)` is **true** and the row is kept.
+Before this release `not` over a missing value was itself missing, and the row
+was dropped.
+
+This is why `not (.x = 1)` and `.x != 1` are not the same predicate. They agree
+on every row that has an `.x`, and differ on exactly the rows that do not: `!=`
+excludes them (see [NULL / missing values in
+comparisons](#null--missing-values-in-comparisons)), `not` keeps them.
+
+```
+# .x present on rows 1 and 2, missing on row 3
+User filter not (.x = 1)   # rows 2 and 3
+User filter .x != 1        # row 2 only
 ```
 
 ### NULL Checks
@@ -813,6 +1020,19 @@ PowQL automatically selects the best join strategy:
 No hint syntax is needed. Use `EXPLAIN` to inspect the selected strategy. Query
 deadlines and client disconnects also cooperatively stop allowed join work.
 
+**The two caps a join can hit, and what to do about each.**
+
+| Error | Cap | Configurable |
+|---|---|---|
+| `nested-loop join would evaluate ... candidate pairs` | 6,400,000 candidate pairs, checked *before* execution | Yes, `POWDB_MAX_NESTED_LOOP_PAIRS` |
+| `join result exceeds row limit` | 1,000,000 output rows, checked *during* execution | No. It is a compile-time constant that exists to stop a Cartesian blow-up from exhausting memory |
+
+There is no knob for the second one, and the message deliberately does not
+promise one. A join producing more than a million rows is almost always a
+missing or wrong `on` predicate; narrow it, or aggregate instead of
+materializing. Sorting has the same shape of cap at 10,000,000 input rows
+(`sort input exceeds row limit`), and its message names the fix: add a `limit`.
+
 ---
 
 ## Nested Projections (Shaped Results)
@@ -998,10 +1218,18 @@ NestedProject fields=[QualifiedField { qualifier: "u", field: "name" }, orders]
 
 ### PowQL Only
 
-Nested projections are a native PowQL capability with no SQL spelling. The SQL
-frontend deliberately has no equivalent: SQL's `SELECT` list is flat, and
-PowDB does not invent a dialect extension for it. In SQL, use a join and
-regroup client-side, or run the PowQL query directly.
+Nested projections have no spelling in **PowDB's SQL frontend**. SQL's `SELECT`
+list is flat, and PowDB does not invent a dialect extension for it: in SQL, use
+a join and regroup client-side, or run the PowQL query directly.
+
+They are not something SQL as a language cannot express. An engine with JSON
+aggregate functions produces the same shape with a correlated subquery, for
+example SQLite's
+`(SELECT json_group_array(json_object('total', o.total)) FROM "Order" o WHERE o.user_id = u.id)`,
+empty array for a childless parent included. What PowQL offers over that
+spelling is brevity, a correlation the catalog can declare once (see
+[Entity Links](#entity-links-relationship-traversal)), and a result that stays a
+typed binary value on the wire instead of JSON text the client re-parses.
 
 ---
 
@@ -1038,6 +1266,24 @@ alter Order add link user -> User on user_id = id
 
 Declaring a link validates that both types and both columns exist, and that the
 name does not collide with a column or another link on the owner.
+
+### Dropping a link
+
+Two spellings, both accepting `if exists`:
+
+```
+drop link Post.author                 # note the dot: <Owner>.<name>
+drop link if exists Post.author       # `if exists` goes before the owner
+alter Post drop link author           # bare name, no dot
+alter Post drop link if exists author
+```
+
+Success reports `link 'author' dropped from 'Post'`. Without `if exists`, a link
+that is not there is an error (`link 'nope' not found on owner type 'Post'`);
+with it, the statement reports `link 'nope' on 'Post' does not exist (skipped)`.
+
+Until this release a declared link could be created but never removed short of
+dropping the table.
 
 ### Cardinality is derived, not declared
 
@@ -1142,11 +1388,32 @@ A missing or NULL key at any hop yields **Empty** (the same Empty that never
 matches a filter comparison); rows are never dropped. A childless to-many parent
 yields `[]`. This avoids SQL's three-valued-logic surprises.
 
+### A link path is only usable in a projection
+
+`filter`, `order` and `group` cannot traverse a link. Join the target type and
+use its own columns instead. The refusal names the limitation:
+
+```
+Post as p filter p.author.name = "ann" { p.title }
+# at position 25: link traversal 'p.author.name' is only supported in a
+# projection; `filter`, `order` and `group` cannot traverse a link, so join
+# the target type and use its own columns
+```
+
+Before this release that reported an unexpected trailing token, which said
+nothing about what was wrong. The unqualified spelling of the same mistake,
+`Post filter .author.name = "ann"`, gives the same explanation, quoting its own
+path. The two spellings lex differently and are parsed in different places, so
+the wording lives in one function both of them call.
+
 ### PowQL Only
 
-Entity links are a native PowQL capability with no SQL spelling. The SQL
-frontend has no equivalent declaration or traversal syntax; use an explicit
-join.
+Entity links have no spelling in **PowDB's SQL frontend**: it has no equivalent
+declaration or traversal syntax, so use an explicit join there. The relationship
+itself is of course expressible in SQL, by writing the join condition out in
+every query. What the link changes is where the condition lives (the catalog,
+declared once) and what happens when a to-one hop is not actually to-one, which
+a join answers by silently multiplying rows and a link refuses outright.
 
 ---
 
@@ -1251,11 +1518,35 @@ User { low: lower(.email) }
 
 #### length
 
-Return the character length of a string:
+Return the length of a string in **characters**, not bytes:
 
 ```
 User { .name, len: length(.name) }
 ```
+
+`length("café")` is 4, not 5. It is counted in Unicode scalar values, the
+same unit `substring` indexes in, so the two agree: `substring(.s, 1, length(.s))`
+is the whole string for any text. Before this release `length` counted bytes and
+`substring` counted characters, so they disagreed on anything outside ASCII.
+
+`length` of a `bytes` value is its byte count. A `bytes` value has exactly one
+length and there is no unit to confuse it with, so the two units cannot meet: no
+single value is ever both text and bytes.
+
+Every other type has no length, and asking for one is refused rather than
+answered:
+
+```
+User { n: length(.age) }
+# type mismatch for column 'age': 'length' measures str or bytes, not int
+```
+
+`int`, `float`, `bool`, `datetime`, `uuid` and `json` are all refused this way. A
+`json` document is refused rather than measured because it has no one obvious
+length (the array's? the key count? the serialized text?), and the `->` paths
+already spell each of those. Only operands whose type is fixed before the query
+runs are judged, so a cast, a bound parameter or a json path is still left to
+run. Before this release all of these answered null on every row, with no error.
 
 #### trim
 
@@ -1315,7 +1606,7 @@ JSON text. A missing path and a JSON `null` both return the empty set (use
 Post { title: json_text(.data->title) }
 # "Hello" (not "\"Hello\"")
 
-Post { raw: json_text(.data->meta) }
+Post { meta: json_text(.data->meta) }
 # canonical JSON text of the whole object, e.g. "{\"lang\":\"en\"}"
 ```
 
@@ -1377,9 +1668,13 @@ Event filter .name = "login" update { ts := now() }
 `now()` is a runtime function, so it can only appear where expressions are
 evaluated (filters, projections, `having`, `update` assignments). **Insert**
 assignments accept literal values only: `insert Event { ts := now() }` fails
-with `expected literal value`. A `datetime` column is stored as an integer
-timestamp, so seed inserted rows with a literal like `ts := 1752000000` and
-stamp them afterwards with `update { ts := now() }` if needed.
+with `expected literal value`. A `datetime` column is stored as **epoch
+microseconds** (see [Supported Types](#supported-types)), so seed inserted rows
+with a microsecond literal, `ts := 1767225600000000` rather than the
+seconds-since-epoch `ts := 1767225600`, and stamp them afterwards with
+`update { ts := now() }` if needed. A seconds value is accepted and stores
+cleanly, it just lands in January 1970: `extract("year", .ts)` on a row seeded
+with `1752000000` returns `1970`.
 
 Because a timestamp literal is written as that plain integer, a comparison
 against a `datetime` column compares the underlying microseconds:
@@ -1409,11 +1704,25 @@ Event { .name, next_week: date_add(.ts, 7, "days") }
 
 #### date_diff
 
-Return the difference between two datetime values in the specified unit:
+Return the difference between two datetime values in the given unit. The result
+is **the first argument minus the second**, so it is negative when the first is
+the earlier of the two:
 
 ```
-Event { .name, age_days: date_diff(.created_at, now(), "days") }
+Event { .name, age_days: date_diff(now(), .created_at, "days") }
+# a row created 10 days ago: 10
+
+Event { .name, backwards: date_diff(.created_at, now(), "days") }
+# the same row: -10
 ```
+
+The difference is computed in microseconds and then truncated toward zero by the
+unit, so a 23-hour gap is `0` days.
+
+Units, for both `date_diff` and `date_add`: `microsecond`, `millisecond`,
+`second`, `minute`, `hour`, `day`, each also accepted in the plural and as
+`us` / `ms` / `s` / `m` / `h` / `d`. There is no week, month or year unit; an
+unrecognised unit yields the empty set rather than an error.
 
 ### CAST
 
@@ -1594,8 +1903,12 @@ NULLS-LAST placement: rows with a missing or JSON-null key stay at the end in
 both `asc` and `desc`. Rows that share an equal key are not reordered by
 direction either: an equal-key tie keeps its stable insertion (RID) order in
 both `asc` and `desc`, so paging through ties is deterministic. Objects and
-arrays are not valid path-index keys; index creation or a later write fails
-atomically if the indexed path resolves to one.
+arrays are not valid path-index keys. Index creation, and every later write,
+fails atomically if the indexed path resolves to one:
+`expression index key must be scalar: v1:.data->"slug"`. Atomically means the
+refused `insert` writes no row at all, so the table and the index cannot
+disagree. Plan for it before indexing a path whose shape varies across
+documents.
 Unique path indexes ignore missing and JSON-null values, like nullable unique
 column indexes.
 
@@ -1644,9 +1957,11 @@ insert User
   { name := "Carol", email := "carol@example.com", age := 41 }
 ```
 
-A multi-row insert is **one statement = one WAL fsync** (vs one fsync per
-single-row autocommit statement), so it's the fastest durable way to bulk-load,
-and over a network connection it's **one round trip** instead of N. It's also
+A multi-row insert is **one statement** rather than N, so it is the fastest
+durable way to bulk-load, and over a network connection it is **one round trip**
+instead of N. It is not one fsync: each row is its own WAL record, and the log
+fsyncs every 64 records, so a 5000-row batch costs roughly 78 fsyncs against the
+5000 the same rows cost as separate autocommit statements. It's also
 **all-or-nothing on validation**: if any row is invalid (missing a required
 field, unknown column, bad type), the whole statement fails and *no* rows are
 inserted. The result reports the number of rows inserted. (A mid-write *storage*
@@ -1845,17 +2160,21 @@ configuration table in the README.
 ### Concurrency behavior
 
 Reads run in parallel, but PowDB has no MVCC and serializes writers through a
-single write-admission gate. An **explicit** transaction holds that gate for its
-entire lifetime: from `begin` until `commit` or `rollback`, every other
-connection that needs the gate, readers included, waits. Autocommit is
-different: an autocommit writer releases admission before it waits on the fsync,
-so it does not pin the gate across a slow disk sync.
+single write-admission gate. An **explicit** transaction holds that gate from
+`begin` until `commit` or `rollback`, so every other connection that needs to
+write waits for it. Reads are admitted from a separate pool until the
+transaction's **first write**; that write closes the pool and drains it, waiting
+for the reads already running and for nothing else, and from then on readers
+wait too. Autocommit is different: an autocommit writer releases admission
+before it waits on the fsync, so it does not pin the gate across a slow disk
+sync.
 
 Two rules follow:
 
 - **Keep explicit transactions short.** Do the writes, `commit`, and get out. A
-  transaction left open (waiting on application logic or a slow client) blocks
-  every reader for as long as it stays open.
+  transaction that has written and is then left open (waiting on application
+  logic or a slow client) blocks every reader for as long as it stays open. A
+  `begin` that has not written yet does not.
 - **Prefer autocommit on read-mostly paths.** Wrap statements in `begin` /
   `commit` only when you need atomicity or bulk-load throughput. Do not hold a
   transaction open across reads.
@@ -1924,7 +2243,12 @@ server-side reaper, so an embedded transaction lives until the caller ends it.
 
 By default PowDB runs in `WalSyncMode::Full`: every autocommit statement fsyncs the write-ahead log before returning, so each write is durable on its own. That fsync is the bottleneck for single-row writes -- on real disks, autocommit inserts top out around a few hundred rows per second.
 
-Inside a transaction, the fsync is deferred to `commit`. All statements between `begin` and `commit` share one fsync, so wrapping a bulk load in a transaction is dramatically faster while staying fully durable:
+Inside a transaction, a statement does not fsync: the durability point is the
+`commit`. It is not one fsync for the whole transaction, though. The WAL flushes
+and fsyncs whenever its append buffer reaches 64 records, inside a transaction as
+much as outside one, and a written row is one record, so a 5000-row transaction
+costs roughly 78 fsyncs. That is still dramatically faster than 5000, and it is
+fully durable either way:
 
 ```
 begin
@@ -1975,6 +2299,22 @@ type User if not exists {
 `if not exists` never redefines an existing type; the original schema is left
 untouched.
 
+**A type no row of which could ever be stored is refused at declaration.** A
+row must fit one 4 KB page, which leaves 4070 bytes for its data, and a row
+carries a fixed per-column cost even when every value is missing. Declaring more
+columns than that budget allows used to succeed and then fail on every insert,
+including an insert that set no value at all. The refusal names both numbers:
+
+```
+cannot store any row of 'W': its 601 columns need 4894 bytes even with every
+value missing, and a row must fit 4070 bytes; declare fewer columns
+```
+
+Nothing is created when it fires. The same check runs on
+`alter <T> add column`, so a table cannot be widened past the budget either, and
+the SQL frontend inherits it. A row whose *values* are large is a different
+matter and is handled by overflow pages; this is about the columns themselves.
+
 ### ALTER TABLE
 
 Add or drop columns on an existing table.
@@ -2015,6 +2355,17 @@ alter User add index if not exists .email  # accepted for symmetry
 ```
 
 Indexes are persistent (BIDX format in the data directory) and survive restart. Re-running `add index` on an existing index is already a no-op, so `if not exists` is accepted but does not change behavior.
+
+**One exception to "range scans use indexes automatically": a `bytes` column.**
+Index keys for a variable-length type carry a length prefix, so the index orders
+bytes keys by length before content, while every other path orders them
+bytewise. That disagreement made an index-backed `.y >= "\\x0102"` silently drop
+every stored value of a different length, the row holding `\\xff` included. `<`,
+`<=`, `>` and `>=` on a bytes column are therefore answered by the scan, which
+gets the order right, and the plan is a filtered scan rather than a range scan.
+Equality still uses the index: that encoding is injective, so a point lookup
+keeps its plan and its speed. A `uuid` column is unaffected and keeps its index
+for bounds, because a uuid key is a fixed 16 bytes with no length prefix.
 
 Index a scalar JSON path by parenthesizing the complete expression:
 
@@ -2063,6 +2414,14 @@ drop if exists User                        # no-op if the type is absent
 ```
 
 Dropping a type that does not exist is an error unless you add `if exists`.
+
+**`drop` will not remove a materialized view.** `drop V` on a view is refused
+with `'V' is a materialized view; use 'drop view V'`, and `drop if exists V`
+gives the same refusal rather than treating it as absent. Before this release it
+removed the view's backing table and left the definition behind, so the view
+stayed registered, still went dirty on writes to its source, and reported a
+missing table on every read, across restarts. See
+[Materialized Views](#materialized-views).
 
 ---
 
@@ -2191,8 +2550,13 @@ Post order .`order` asc
 alter Post add index .`order`
 ```
 
-Backticks may also contain characters that are not otherwise legal in an
-identifier, such as spaces: `` `full name` ``.
+Backticks quote a reserved word so it can be used as an identifier. They do
+not widen what a **stored** name may contain: the catalog accepts letters,
+digits and underscores only, so `` type Person { `full name`: str } `` is
+refused with `invalid column name 'full name': must contain only letters,
+digits, and underscores`, and a table name is checked the same way. Backticks
+do carry arbitrary characters in a **projection alias**, which is not stored:
+`` Post { `full name`: .title } `` returns a column headed `full name`.
 
 > In filter/projection/order positions, a plain dotted reference like `.type`
 > also works, because dotted field references bypass keyword lookup. Backtick
@@ -2441,7 +2805,18 @@ PowQL has eight data types plus a null representation.
 
 - `concat` coerces all arguments to strings: `concat(.name, " age=", .age)` produces `"Alice age=30"`.
 - Arithmetic on mixed int/float promotes to float.
-- Comparisons between incompatible types evaluate to false.
+- Ordered comparisons (`<`, `<=`, `>`, `>=`) between incompatible types evaluate
+  to false. `=` and `!=` compare strictly per type, except int against float
+  (numeric) and json against str (parsed as a document).
+- **An `int` column refuses a float that is not exactly that integer**, on
+  insert and on update alike: `column 'n' is int and 30.7 is not a whole number
+  in range; write an integer`. Before this release `30.7` was stored as `30`,
+  `-0.5` as `0`, and `1e300` as `i64::MAX`. `30.0` is still accepted and stores
+  `30`.
+- A literal compared against a `datetime`, `uuid` or `bytes` column is coerced
+  once, before execution, so the scan, the compiled predicate, the index probe
+  and a mutation's discovery scan all read the same value. A literal that cannot
+  be coerced is a typed error rather than a filter that quietly matches nothing.
 
 ---
 

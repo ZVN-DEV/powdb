@@ -44,3 +44,58 @@ updates:
     groups:
       dev:
         dependency-type: "development"
+
+  # `/clients/ts` was the only npm manifest covered. These two publish to npm
+  # as well, and `bindings/node` additionally carries its own detached Cargo
+  # workspace, so nothing here saw its Rust dependencies either.
+  - package-ecosystem: npm
+    directory: /clients/sync
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev:
+        dependency-type: "development"
+
+  - package-ecosystem: npm
+    directory: /bindings/node
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev:
+        dependency-type: "development"
+
+  # ───────────────── Detached Cargo workspaces ─────────────
+  # Neither of these is a member of the root workspace, so the cargo entry at
+  # the top of this file does not see them and their locks aged on their own.
+  # bindings/node builds the published native addon; crates/query/fuzz builds
+  # the fuzz targets, and its lock is asserted with `cargo metadata --locked`
+  # in both fuzz jobs, so a stale one is a build failure rather than a quiet
+  # drift.
+  - package-ecosystem: cargo
+    directory: /bindings/node
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch:
+        update-types: ["patch"]
+
+  - package-ecosystem: cargo
+    directory: /crates/query/fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch:
+        update-types: ["patch"]
+
+  # ────────────────────────── Docker ───────────────────────
+  # The Dockerfile pins its builder and runtime images. Without this entry a
+  # base image with a published CVE stays pinned until somebody remembers.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

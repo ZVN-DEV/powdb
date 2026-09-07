@@ -200,7 +200,10 @@ fn p0_inline_spill_inline_keeps_nonunique_index() {
         1,
         "non-unique index must find the relocated row"
     );
-    let row = cat.get("t", hits[0]).expect("indexed rid must be live");
+    let row = cat
+        .get("t", hits[0])
+        .expect("read row")
+        .expect("indexed rid must be live");
     assert_eq!(str_len(&row), 4000);
 
     drop(cat);
@@ -323,7 +326,7 @@ fn p1_churn_update_is_bounded() {
     );
 
     // Live value byte-exact.
-    let row = cat.get("t", rid).unwrap();
+    let row = cat.get("t", rid).expect("read row").unwrap();
     assert_eq!(str_len(&row), 20_000);
     let expected = (b'a' + (59 % 26)) as char;
     assert!(matches!(&row[1], Value::Str(s) if s.chars().all(|c| c == expected)));
@@ -362,7 +365,10 @@ fn p1_rollback_of_spilling_update_is_safe() {
     cat.rollback_to_last_sync().unwrap();
 
     // Original value survives byte-exact.
-    let row = cat.get("t", rid).expect("row must survive rollback");
+    let row = cat
+        .get("t", rid)
+        .expect("read row")
+        .expect("row must survive rollback");
     assert_eq!(str_len(&row), 30_000);
     assert!(matches!(&row[1], Value::Str(s) if s.chars().all(|c| c == 'O')));
 
@@ -409,7 +415,10 @@ fn alter_table_preserves_spilled_value() {
     )
     .unwrap();
     // The 50K value must survive the ADD (re-spilled under the new shape).
-    let row = cat.get("t", rid).expect("row present after ADD");
+    let row = cat
+        .get("t", rid)
+        .expect("read row")
+        .expect("row present after ADD");
     assert_eq!(str_len(&row), 50_000);
     assert!(matches!(&row[1], Value::Str(s) if s.chars().all(|c| c == 'S')));
 
@@ -563,6 +572,7 @@ fn p1_byte_patch_primitive_refuses_v2_row() {
     // The refusal is a no-op: the spilled value is byte-intact.
     let row = cat
         .get("t", rid)
+        .expect("read row")
         .expect("row still present after refused patch");
     assert_eq!(str_len(&row), 5000);
     assert!(matches!(&row[1], Value::Str(s) if s.chars().all(|c| c == 'z')));

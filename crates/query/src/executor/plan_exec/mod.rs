@@ -27,7 +27,7 @@ pub(crate) fn counts_every_row(argument: Option<&Expr>) -> bool {
 /// A fast path that carries its own bound must **decline** on `None` and let the
 /// generic `PlanNode::Limit` arm run: that arm is the single place that reports
 /// `limit must be integer literal`, and negative counts are already refused up
-/// front by [`validate_slice_counts`]. Substituting `usize::MAX` for a count the
+/// front by `validate_slice_counts` (`validate.rs`). Substituting `usize::MAX` for a count the
 /// fast path could not read is what made `F limit 1 + 1 { .id }` answer the whole
 /// table while the same query without the projection was rejected, and because
 /// the top-N heap takes its capacity from the same number, it also lifted the
@@ -37,6 +37,39 @@ pub(super) fn literal_limit(count: &Expr) -> Option<usize> {
         Expr::Literal(Literal::Int(value)) if *value >= 0 => Some(*value as usize),
         _ => None,
     }
+}
+
+/// Combine the two branches of a `union`.
+///
+/// Without `all` the result is a set, and a duplicate is dropped wherever it
+/// came from. Seeding the seen-set with the left branch and then testing only
+/// the right one against it kept every duplicate the left branch carried, so
+/// `T { .k } union T { .k }` answered x, x, y over rows x, x, y. Both dispatch
+/// arms carried their own copy of that loop, which is why they agreed on the
+/// wrong answer; they now share this one.
+pub(crate) fn union_rows(
+    left_rows: Vec<Vec<Value>>,
+    right_rows: Vec<Vec<Value>>,
+    all: bool,
+) -> Result<Vec<Vec<Value>>, QueryError> {
+    let mut cancel = CancelCheck::new();
+    if all {
+        let mut combined = left_rows;
+        for row in right_rows {
+            cancel.tick()?;
+            combined.push(row);
+        }
+        return Ok(combined);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut combined = Vec::with_capacity(left_rows.len() + right_rows.len());
+    for row in left_rows.into_iter().chain(right_rows) {
+        cancel.tick()?;
+        if seen.insert(row.clone()) {
+            combined.push(row);
+        }
+    }
+    Ok(combined)
 }
 
 /// Maximum number of elements sorted by the standard-library stable sort
@@ -297,6 +330,7 @@ impl ProvenanceRows {
 }
 
 mod aggregate;
+mod coerce;
 mod dispatch;
 mod fast_paths;
 mod join;
@@ -320,7 +354,4 @@ pub(crate) use join::execute_materialized_join;
 pub(crate) use lowering::{
     format_plan_tree, range_matches, synthesize_range_predicate, LoweredPlan,
 };
-pub(crate) use validate::{
-    predicate_column_indices_json, validate_column_references, validate_json_path_types,
-    validate_no_stray_aggregates, validate_slice_counts,
-};
+pub(crate) use validate::{predicate_column_indices_json, validate_plan};

@@ -15,7 +15,9 @@
 # Raising a ratio ceiling is a separate, deliberate commit.
 #
 # POLICY: baseline/main.json may only be rebaselined from a Depot run of
-# bench.yml (see CLAUDE.md). This script records the fingerprint of the host
+# bench.yml (see CLAUDE.md). update-bench-baseline-from-depot.sh <run id> is
+# the script that does that, from the run's uploaded criterion estimates; this
+# one exists for the Depot runner itself. This script records the fingerprint of the host
 # it actually runs on (runner from POWDB_BENCH_RUNNER, RUSTFLAGS as set, arch
 # measured from the compare binary). It never fabricates the Depot values, so
 # a baseline produced on a laptop will be refused by the comparator. That is
@@ -34,28 +36,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BASELINE_FILE="${REPO_ROOT}/crates/bench/baseline/main.json"
 CRITERION_DIR="${REPO_ROOT}/target/criterion"
 
-WORKLOADS=(
-  insert_10k
-  btree_lookup
-  seq_scan_filter
-  powql_point
-  powql_filter_only
-  powql_filter_projection
-  powql_aggregation
-  point_lookup_nonindexed
-  scan_filter_project_top100
-  scan_filter_sort_limit10
-  agg_sum
-  agg_avg
-  agg_min
-  agg_max
-  multi_col_and_filter
-  insert_single
-  insert_batch_1k
-  update_by_pk
-  update_by_filter
-  delete_by_filter
-)
+# The gated workload list comes from the comparator, which is the only thing
+# that actually enforces it. A hand-copied list here can only go wrong in one
+# direction: a short copy drops workloads from main.json, and the comparator
+# treats a workload with no baseline entry as a first-run CAPTURE, so it prints
+# a number and passes instead of gating. The list is populated below, after
+# the build, because asking the binary requires compiling it.
+WORKLOADS=()
+
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required but not installed." >&2
@@ -63,6 +51,45 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 cd "${REPO_ROOT}"
+
+echo "===> asking the comparator which workloads it gates"
+# Capture to a file first: reading the exit code through a pipe or a process
+# substitution reads the WRONG process. If --list-workloads ever stops being
+# handled, the binary falls through to an ordinary comparison run and its
+# report lands on stdout, which would be read as a list of workload names.
+WORKLOAD_LIST="$(mktemp "${TMPDIR:-/tmp}/powdb-workloads-XXXXXX")"
+set +e
+cargo run -q -p powdb-bench --bin compare -- --list-workloads > "${WORKLOAD_LIST}"
+LIST_STATUS=$?
+set -e
+if [[ ${LIST_STATUS} -ne 0 ]]; then
+  echo "error: 'compare --list-workloads' exited ${LIST_STATUS}." >&2
+  rm -f "${WORKLOAD_LIST}"
+  exit 1
+fi
+while IFS= read -r w; do
+  [[ -z "${w}" ]] && continue
+  # A workload id is a bare lowercase identifier. Anything else means the
+  # binary printed something other than the list, and accepting it would write
+  # main.json entries under invented names. A real workload would then have no
+  # baseline, and the comparator passes an unbaselined workload in CAPTURE
+  # mode, so the gate would silently stop guarding everything.
+  if [[ ! "${w}" =~ ^[a-z][a-z0-9_]*$ ]]; then
+    echo "error: 'compare --list-workloads' printed a line that is not a workload" >&2
+    echo "       name: ${w}" >&2
+    echo "       Refusing to rebaseline from output this script cannot trust." >&2
+    rm -f "${WORKLOAD_LIST}"
+    exit 1
+  fi
+  WORKLOADS+=("${w}")
+done < "${WORKLOAD_LIST}"
+rm -f "${WORKLOAD_LIST}"
+if [[ ${#WORKLOADS[@]} -eq 0 ]]; then
+  echo "error: the comparator reported no gated workloads; refusing to write an" >&2
+  echo "       empty baseline, which would disable the gate entirely." >&2
+  exit 1
+fi
+echo "     ${#WORKLOADS[@]} workloads"
 
 echo "===> running cargo bench -p powdb-bench (this takes ~60s)"
 cargo bench -p powdb-bench --quiet

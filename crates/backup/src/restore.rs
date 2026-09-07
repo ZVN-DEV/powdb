@@ -1,7 +1,8 @@
-use crate::manifest::{BackupManifest, SyncSnapshotMetadata};
+use crate::manifest::{BackupManifest, SyncSnapshotMetadata, UNREFERENCED_DURABLE_FILES};
 use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
 use std::io;
 use std::path::Path;
+use tracing::{info, warn};
 
 /// Controls how restore writes sync identity metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +48,9 @@ fn is_plain_manifest_name(name: &str) -> bool {
 }
 
 pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
-    let durable_name = name == "catalog.bin"
+    let durable_name = name == powdb_storage::data_dir::CATALOG_FILE
         || name == CATALOG_LSN_FILE
+        || UNREFERENCED_DURABLE_FILES.contains(&name)
         || (name.ends_with(".heap") && name.len() > ".heap".len())
         || (name.ends_with(".idx") && name.len() > ".idx".len())
         || (name.ends_with(".eidx") && name.len() > ".eidx".len());
@@ -89,6 +91,7 @@ pub(crate) fn verify_and_copy_full(
         let bytes = std::fs::read(backup_dir.join(&f.name))?;
         let hash = blake3::hash(&bytes).to_hex().to_string();
         if hash != f.blake3_hex {
+            warn!(file = %f.name, "blake3 mismatch while restoring; backup is corrupt");
             return Err(io::Error::other(format!(
                 "integrity check failed for {}: blake3 mismatch (backup is corrupt)",
                 f.name
@@ -103,7 +106,7 @@ pub(crate) fn verify_restored_sync_catalog(
     sync: &SyncSnapshotMetadata,
     dest_data_dir: &Path,
 ) -> io::Result<()> {
-    let catalog_bytes = std::fs::read(dest_data_dir.join("catalog.bin"))?;
+    let catalog_bytes = std::fs::read(dest_data_dir.join(powdb_storage::data_dir::CATALOG_FILE))?;
     let catalog_hash = blake3::hash(&catalog_bytes).to_hex().to_string();
     if catalog_hash != sync.catalog_blake3_hex {
         return Err(io::Error::new(
@@ -178,6 +181,13 @@ pub fn restore_with_sync_mode(
         ));
     }
     drop(cat);
+    info!(
+        dest = %dest_data_dir.display(),
+        source_lsn = manifest.source_lsn,
+        files = manifest.files.len(),
+        ?sync_mode,
+        "restored a full backup"
+    );
     Ok(())
 }
 
@@ -213,6 +223,8 @@ mod tests {
         for good in [
             "catalog.bin",
             CATALOG_LSN_FILE,
+            "views.bin",
+            "auth.json",
             "User.heap",
             "User_email.idx",
             "User_7.eidx",

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::fsync::fsync_dir;
 use powdb_storage::catalog::CATALOG_VERSION;
 use powdb_storage::create_data_dir_secure;
 use powdb_storage::wal::{WalRecord, WAL_FORMAT_VERSION};
@@ -394,6 +395,20 @@ pub fn list_segment_files(dir: &Path) -> io::Result<Vec<SegmentFile>> {
     }
     files.sort_by_key(|file| (file.start_lsn, file.end_lsn));
     Ok(files)
+}
+
+/// The highest LSN the retained archive already carries, or 0 if it carries
+/// nothing.
+///
+/// Answered from segment file NAMES alone: a `read_dir` and a parse, no
+/// segment body is opened. That makes it cheap enough to ask before deciding
+/// whether a checkpoint is worth taking the engine write lock for.
+pub fn archived_through_lsn(dir: &Path) -> io::Result<u64> {
+    Ok(list_segment_files(dir)?
+        .iter()
+        .map(|file| file.end_lsn)
+        .max()
+        .unwrap_or(0))
 }
 
 pub fn read_units_since(
@@ -910,16 +925,6 @@ fn read_u32(bytes: &[u8], pos: usize, field: &str) -> io::Result<u32> {
         .try_into()
         .map_err(|_| invalid_data(format!("invalid {field}")))?;
     Ok(u32::from_le_bytes(arr))
-}
-
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {

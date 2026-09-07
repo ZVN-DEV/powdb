@@ -170,7 +170,8 @@ fn legacy_heap_without_superblock_and_legacy_rows_still_opens() {
             page_id: 0,
             slot_index: slot,
         })
-        .unwrap();
+        .expect("read row")
+        .expect("row present");
     assert_eq!(
         powdb_storage::row::decode_row(&sch, &bytes)[0],
         Value::Str("legacy".into())

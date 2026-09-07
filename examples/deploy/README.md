@@ -49,6 +49,8 @@ Notes:
 - TLS is **not** terminated by Fly for raw TCP services — either enable
   PowDB's own TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY` secrets) or run behind
   a TLS-terminating proxy you control.
+  Generating a certificate PowDB accepts is not a one-liner on every platform:
+  see the TLS recipe in [SECURITY.md](../../SECURITY.md#transport-security-tls) before you start.
 - `min_machines_running = 1` keeps the database always-on; `auto_stop_machines`
   is `false` so Fly never suspends a stateful service.
 
@@ -78,10 +80,13 @@ The image also declares a `HEALTHCHECK`, so `docker ps` reports a health column.
 It probes `GET /health` on the metrics listener when `POWDB_METRICS_ADDR` is set.
 Without it, the probe falls back to a pre-authentication PING/PONG exchange on
 the wire port, which proves the server is answering rather than merely holding
-the socket open. That fallback costs one `accepted connection` log line per
-interval. If TLS is required, neither probe applies (the healthcheck speaks
-neither TLS nor HTTP over it), so it degrades to process liveness and says so on
-stderr. To get the richest probe and the quietest logs, add
+the socket open. That fallback costs one `accepted connection` INFO line per
+interval and nothing else: it reads the whole PONG frame before closing, so the
+connection ends in a clean FIN rather than the RST that used to be logged as
+`ERROR error reading CONNECT` on every probe of an idle, healthy container.
+If TLS is required, neither probe applies (the healthcheck speaks neither TLS
+nor HTTP over it), so it degrades to process liveness and says so on stderr.
+To get the richest probe and the quietest logs, add
 `-e POWDB_METRICS_ADDR=127.0.0.1:9090` to the command above (bind it to loopback
 unless you intend to expose the unauthenticated metrics endpoint).
 

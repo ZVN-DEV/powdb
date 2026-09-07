@@ -199,7 +199,7 @@ powql> sum(User filter .age > 25 { .age })
 powql> insert User { name := "Alice", email := "alice@example.com", age := 30 }
 powql> insert User { name := "Bob", email := "bob@example.com", age := 25 }
 powql> commit</code></pre>
-    <p>Everything between <code>begin</code> and <code>commit</code> applies atomically -- either all statements succeed or none do. Use <code>rollback</code> instead of <code>commit</code> to discard uncommitted changes. Batching writes in a transaction shares a single WAL fsync at commit, which makes bulk loads roughly 50x faster with identical durability.</p>
+    <p>Everything between <code>begin</code> and <code>commit</code> applies atomically -- either all statements succeed or none do. Use <code>rollback</code> instead of <code>commit</code> to discard uncommitted changes. A statement inside a transaction does not fsync on its own, so a bulk load costs roughly one fsync per 64 rows instead of one per row, which makes it about 50x faster with identical durability.</p>
     <p>Full details: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#transactions" target="_blank" rel="noopener">Transactions in the PowQL reference</a>.</p>
 
     <!-- Step 12: Server Mode -->

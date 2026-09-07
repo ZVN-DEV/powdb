@@ -423,13 +423,76 @@ fn lex_sql_with_spans(input: &str) -> Result<(Vec<SqlTok>, Vec<usize>), ParseErr
                     break;
                 }
                 if chars[i] == '\\' && i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    match next {
-                        'n' => s.push('\n'),
-                        't' => s.push('\t'),
-                        other => s.push(other),
+                    // The same escape set the PowQL lexer accepts, and the
+                    // same refusal. Collapsing an unrecognised `\X` to `X`
+                    // rewrote the user's own text on the way in, and it made
+                    // the two frontends disagree about one source text:
+                    // PowQL refused `"back\slash"` while SQL read it as
+                    // `backslash`.
+                    match chars[i + 1] {
+                        '\'' => {
+                            s.push('\'');
+                            i += 2;
+                        }
+                        '"' => {
+                            s.push('"');
+                            i += 2;
+                        }
+                        '\\' => {
+                            s.push('\\');
+                            i += 2;
+                        }
+                        'n' => {
+                            s.push('\n');
+                            i += 2;
+                        }
+                        't' => {
+                            s.push('\t');
+                            i += 2;
+                        }
+                        'r' => {
+                            s.push('\r');
+                            i += 2;
+                        }
+                        '0' => {
+                            s.push('\0');
+                            i += 2;
+                        }
+                        'u' => {
+                            let digits: String = chars
+                                .get(i + 2..i + 6)
+                                .map(|hex| hex.iter().collect())
+                                .unwrap_or_default();
+                            let scalar = (digits.len() == 4)
+                                .then(|| u32::from_str_radix(&digits, 16).ok())
+                                .flatten()
+                                .and_then(char::from_u32);
+                            match scalar {
+                                Some(c) => {
+                                    s.push(c);
+                                    i += 6;
+                                }
+                                None => {
+                                    return Err(ParseError::Lex {
+                                        message: format!(
+                                            "invalid \\u escape in string literal: expected four \
+                                             hex digits naming a Unicode character, got \"{digits}\""
+                                        ),
+                                        position: i,
+                                    });
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(ParseError::Lex {
+                                message: format!(
+                                    "unknown escape '\\{other}' in string literal; SQL \
+                                     supports \\' \\\" \\\\ \\n \\t \\r \\0 and \\uXXXX"
+                                ),
+                                position: i,
+                            });
+                        }
                     }
-                    i += 2;
                 } else {
                     s.push(chars[i]);
                     i += 1;
@@ -518,6 +581,21 @@ fn lex_sql_with_spans(input: &str) -> Result<(Vec<SqlTok>, Vec<usize>), ParseErr
                 i += 1;
                 while i < chars.len() && chars[i].is_ascii_digit() {
                     i += 1;
+                }
+            }
+            // An exponent, on the same terms as the PowQL lexer: `e`/`E`, an
+            // optional sign, at least one digit. The token text is handed
+            // straight to PowQL, which reads the same spelling.
+            if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                let mut look = i + 1;
+                if chars.get(look).is_some_and(|c| *c == '+' || *c == '-') {
+                    look += 1;
+                }
+                if chars.get(look).is_some_and(char::is_ascii_digit) {
+                    i = look;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 }
             }
             out.push(SqlTok::Number(chars[start..i].iter().collect()));
@@ -678,6 +756,17 @@ impl AggCall {
         match &self.arg {
             AggArg::Star => format!("{}(*)", self.func),
             AggArg::Field(f) => format!("{}({f})", self.func),
+        }
+    }
+
+    /// The SQL spelling of this call, which is the column name SQL gives an
+    /// aggregate that was written without `AS`. PowQL's own name for it is the
+    /// internal `__agg_N`, so without this the header of
+    /// `SELECT s, count(n) FROM t GROUP BY s` read `__agg_0`.
+    fn sql_spelling(&self) -> String {
+        match &self.arg {
+            AggArg::Star => format!("{}(*)", self.func),
+            AggArg::Field(f) => format!("{}({})", self.func, f.strip_prefix('.').unwrap_or(f)),
         }
     }
 }
@@ -999,6 +1088,10 @@ impl SqlParser {
             let text = if self.eat_kw("as") {
                 let alias = self.expect_ident("projection alias")?;
                 format!("{alias}: {expr}")
+            } else if let Some(call) = &agg {
+                // A backtick alias, because the SQL name of an unaliased
+                // aggregate (`count(n)`) is not a PowQL identifier.
+                format!("`{}`: {expr}", call.sql_spelling())
             } else {
                 expr
             };
@@ -1260,8 +1353,14 @@ impl SqlParser {
                 // follow the type, so reaching them here can only be the table
                 // form. A column genuinely named `unique` has to be quoted, and
                 // a quoted identifier never matches `is_kw`.
-                if self.is_kw("primary")
-                    || self.is_kw("foreign")
+                if self.is_kw("primary") {
+                    return Err(ParseError::Unsupported {
+                        feature: "PRIMARY KEY is supported only on the column it keys; \
+                                  write it after the column's type, as `id int PRIMARY KEY`"
+                            .into(),
+                    });
+                }
+                if self.is_kw("foreign")
                     || self.is_kw("constraint")
                     || self.is_kw("unique")
                     || self.is_kw("check")
@@ -1279,6 +1378,14 @@ impl SqlParser {
                         self.expect_kw("null")?;
                         required = true;
                     } else if self.eat_kw("unique") {
+                        unique = true;
+                    } else if self.eat_kw("primary") {
+                        // A single-column PRIMARY KEY is exactly PowDB's
+                        // `required unique`. It is the first line of nearly
+                        // every CREATE TABLE an ORM emits, and it used to be
+                        // refused with a message about table constraints.
+                        self.expect_kw("key")?;
+                        required = true;
                         unique = true;
                     } else if self.eat_kw("autoincrement") || self.eat_kw("auto_increment") {
                         auto = true;
@@ -1479,6 +1586,9 @@ impl SqlParser {
             "datetime" | "timestamp" => "datetime",
             "uuid" => "uuid",
             "blob" | "bytes" | "bytea" => "bytes",
+            // PowDB stores JSON natively (PJ1), and `jsonb` is the spelling
+            // Postgres-shaped DDL uses for the same thing.
+            "json" | "jsonb" => "json",
             other => {
                 return Err(ParseError::Unsupported {
                     feature: format!("unsupported SQL type `{other}`"),

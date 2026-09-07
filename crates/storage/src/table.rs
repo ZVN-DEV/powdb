@@ -12,6 +12,50 @@ use crate::types::*;
 use std::io;
 use std::path::Path;
 
+/// Put the table's name and file into an error raised while opening its heap.
+///
+/// `HeapFile::open` verifies every page, and a rotted one comes back as
+/// `page 7 CRC32 mismatch`: true, and useless to the operator it is addressed
+/// to. The documented remedy is to restore from a backup, and that is a
+/// per-table decision, so an operator whose database will not start has to be
+/// told which of forty tables to restore and which file holds it.
+///
+/// The typed variant is *rebuilt* rather than wrapped in a fresh `io::Error`.
+/// `StorageError::kind_of_io_error` recovers the variant from the error's
+/// source and the server classifies the wire error from that, so a wrap that
+/// only prefixed the text would quietly downgrade a `PageCorrupt` refusal to an
+/// unclassified internal fault. The `io::ErrorKind` is preserved for the same
+/// reason: callers above this one branch on it.
+fn name_the_table(table: &str, heap_path: &Path, error: io::Error) -> io::Error {
+    if error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<StorageError>())
+        .is_none()
+    {
+        return error;
+    }
+    let io_kind = error.kind();
+    let typed = *error
+        .into_inner()
+        .expect("checked above")
+        .downcast::<StorageError>()
+        .expect("checked above");
+    let where_ = format!("table '{table}' ({})", heap_path.display());
+    let described = match typed {
+        StorageError::PageCorrupt(msg) => {
+            StorageError::PageCorrupt(format!("{where_}: {msg}; restore this table from a backup"))
+        }
+        StorageError::CorruptData(msg) => {
+            StorageError::CorruptData(format!("{where_}: {msg}; restore this table from a backup"))
+        }
+        StorageError::OverflowCorrupt(msg) => StorageError::OverflowCorrupt(format!(
+            "{where_}: {msg}; restore this table from a backup"
+        )),
+        other => other,
+    };
+    io::Error::new(io_kind, described)
+}
+
 /// Per-indexed-column metadata owning the BTree inline.
 ///
 /// Mission C Phase 15 introduced this struct as a cache of `col_idx`,
@@ -249,11 +293,12 @@ impl Table {
         read_only: bool,
     ) -> io::Result<Self> {
         let heap_path = data_dir.join(format!("{}.heap", schema.table_name));
-        let heap = if read_only {
-            HeapFile::open_read_only(&heap_path)?
+        let opened = if read_only {
+            HeapFile::open_read_only(&heap_path)
         } else {
-            HeapFile::open(&heap_path)?
+            HeapFile::open(&heap_path)
         };
+        let heap = opened.map_err(|e| name_the_table(&schema.table_name, &heap_path, e))?;
         let row_layout = RowLayout::new(&schema);
         let mut table = Table {
             schema,
@@ -588,7 +633,7 @@ impl Table {
 
     pub(crate) fn preflight_update(&self, rid: RowId, values: &Row) -> io::Result<()> {
         let old_row = if self.indexed_cols.iter().any(|index| index.unique) {
-            self.get(rid)
+            self.get(rid)?
         } else {
             None
         };
@@ -1126,7 +1171,7 @@ impl Table {
         if !self.has_overflow_rows() {
             return Ok(Vec::new());
         }
-        let data = match self.heap.get(rid) {
+        let data = match self.heap.get(rid)? {
             Some(d) => d,
             None => return Ok(Vec::new()),
         };
@@ -1322,15 +1367,15 @@ impl Table {
                 // rebuild-after-spill must not build a btree of missing keys).
                 let owned;
                 let v: &Value = if crate::row::row_is_v2(raw) {
-                    match crate::row::decode_row_v2(schema, layout, raw, |stub| {
+                    // A chain that will not reassemble fails the whole
+                    // rebuild. Skipping the row instead built a column index
+                    // that was silently missing it, so every keyed access
+                    // reported the row as absent while a scan still found it.
+                    let row = crate::row::decode_row_v2(schema, layout, raw, |stub| {
                         heap.read_overflow_value(stub).map_err(io::Error::from)
-                    }) {
-                        Ok(row) => {
-                            owned = row[entry.col_idx].clone();
-                            &owned
-                        }
-                        Err(_) => continue,
-                    }
+                    })?;
+                    owned = row[entry.col_idx].clone();
+                    &owned
                 } else {
                     owned = decode_column(schema, layout, raw, entry.col_idx);
                     &owned
@@ -1387,16 +1432,24 @@ impl Table {
         Ok(())
     }
 
-    pub fn get(&self, rid: RowId) -> Option<Row> {
-        let data = self.heap.get(rid)?;
+    /// Read one row by RowId.
+    ///
+    /// `Ok(None)` means the row is deleted or was never there. A read
+    /// failure, a page that fails its CRC, and an overflow chain that will
+    /// not reassemble are all errors: mapping them to `None` turned a corrupt
+    /// row into "no such row" with a success status.
+    pub fn get(&self, rid: RowId) -> io::Result<Option<Row>> {
+        let Some(data) = self.heap.get(rid)? else {
+            return Ok(None);
+        };
         if crate::row::row_is_v2(&data) {
             // v2 row: reassemble each spilled column from its overflow chain.
             return crate::row::decode_row_v2(&self.schema, &self.row_layout, &data, |stub| {
                 self.heap.read_overflow_value(stub).map_err(io::Error::from)
             })
-            .ok();
+            .map(Some);
         }
-        Some(decode_row(&self.schema, &data))
+        Ok(Some(decode_row(&self.schema, &data)))
     }
 
     /// Read only the requested logical columns from one row.
@@ -1422,7 +1475,7 @@ impl Table {
             }
         }
 
-        let Some(data) = self.heap.get(rid) else {
+        let Some(data) = self.heap.get(rid)? else {
             return Ok(None);
         };
         let mut values: Vec<Value> = Vec::with_capacity(column_indices.len());
@@ -1948,7 +2001,7 @@ impl Table {
             true
         };
 
-        let old_row = if touches_index { self.get(rid) } else { None };
+        let old_row = if touches_index { self.get(rid)? } else { None };
 
         let new_rid = self.heap.update(rid, encoded)?;
 
@@ -2210,19 +2263,25 @@ impl Table {
         })
     }
 
-    pub fn index_lookup(&self, col_name: &str, key: &Value) -> Option<(RowId, Row)> {
-        let entry = self.indexed_cols.iter().find(|c| c.col_name == col_name)?;
-        if entry.unique {
-            let rid = entry.btree.lookup(key)?;
-            let row = self.get(rid)?;
-            Some((rid, row))
+    /// Point lookup through the index on `col_name`.
+    ///
+    /// `Ok(None)` when the column has no index or no row carries `key`. On a
+    /// non-unique index this is the first match; [`Self::index_lookup_all`]
+    /// returns every matching [`RowId`].
+    pub fn index_lookup(&self, col_name: &str, key: &Value) -> io::Result<Option<(RowId, Row)>> {
+        let Some(entry) = self.indexed_cols.iter().find(|c| c.col_name == col_name) else {
+            return Ok(None);
+        };
+        let rid = if entry.unique {
+            entry.btree.lookup(key)
         } else {
             // Non-unique: return the first match (for backwards compat).
-            let rids = entry.btree.lookup_prefix(key);
-            let rid = *rids.first()?;
-            let row = self.get(rid)?;
-            Some((rid, row))
-        }
+            entry.btree.lookup_prefix(key).first().copied()
+        };
+        let Some(rid) = rid else {
+            return Ok(None);
+        };
+        Ok(self.get(rid)?.map(|row| (rid, row)))
     }
 
     /// Look up ALL matching rows for a column value. For unique indexes
@@ -2359,7 +2418,7 @@ mod projected_tests {
             Value::Bytes(vec![0xA5; 9_000]),
         ];
         let rid = table.insert(&row).expect("insert spilled row");
-        let raw = table.heap.get(rid).expect("raw row");
+        let raw = table.heap.get(rid).expect("read row").expect("raw row");
         assert!(crate::row::row_is_v2(&raw));
         assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1).is_some());
         assert!(crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 2).is_some());
@@ -2404,7 +2463,7 @@ mod projected_tests {
     #[test]
     fn projected_read_ignores_unselected_corrupt_spill() {
         let (_dir, mut table, rid, row) = projected_table();
-        let raw = table.heap.get(rid).expect("raw row");
+        let raw = table.heap.get(rid).expect("read row").expect("raw row");
         let document_stub = crate::row::raw_stub(&table.schema, table.row_layout(), &raw, 1)
             .expect("document stub");
         table

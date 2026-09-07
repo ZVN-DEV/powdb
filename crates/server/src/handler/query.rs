@@ -10,20 +10,19 @@ use powdb_query::sql;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
 use super::auth::{check_statement_permitted, Principal};
-use super::classify::{classify_query_error, error_response, sanitize_error};
+use super::classify::{error_response, query_error_response};
 use super::transaction::{
     acquire_autocommit_permit, acquire_begin_permit, parsed_transaction_control,
-    rollback_connection_transaction, statement_admission, AdmissionMode, TransactionControl,
-    TxGate,
+    rollback_connection_transaction, statement_admission, upgrade_to_exclusive, AdmissionMode,
+    TransactionControl, TxGate, TxGateHold,
 };
 use super::wire::{
     is_query_cancellation_response, is_success_response, query_result_to_message,
-    read_message_cancel_safe, ConnectionTermination, DecodedWireMessage, FrameStream,
-    WireResultMode, MAX_IN_FLIGHT_READ_AHEAD_BYTES, MAX_IN_FLIGHT_READ_AHEAD_FRAMES,
+    read_message_cancel_safe, ConnectionTermination, DecodedWireMessage, FrameReadError,
+    FrameStream, WireResultMode,
 };
 
 /// Maximum query text length accepted from the wire (1 MB).
@@ -267,10 +266,7 @@ fn wire_param_to_value(p: &WireParam) -> powdb_query::ast::ParamValue {
 /// mutating statement, transaction-control frame, or a read that needs a writer
 /// (a stale materialized view). The connection stays usable afterward.
 fn readonly_terminal_message() -> Message {
-    error_response(
-        sanitize_error(&QueryError::ReadonlyMode.to_string()),
-        ErrorClass::ReadonlyRefused,
-    )
+    query_error_response(&QueryError::ReadonlyMode)
 }
 
 #[cfg(test)]
@@ -406,7 +402,7 @@ pub(super) fn parse_failure_response(
 ) {
     metrics.record_query(start.elapsed(), QueryOutcome::Error);
     (
-        error_response(sanitize_error(message), ErrorClass::Parse),
+        query_error_response(&QueryError::Parse(message.to_string())),
         None,
         None,
     )
@@ -433,14 +429,7 @@ fn permission_denied_response(
     Option<ConnectionTermination>,
 ) {
     metrics.record_query(start.elapsed(), QueryOutcome::Error);
-    (
-        error_response(
-            sanitize_error(&denied.to_string()),
-            classify_query_error(denied),
-        ),
-        None,
-        None,
-    )
+    (query_error_response(denied), None, None)
 }
 
 /// Everything one wire query frame is executed against: the connection's
@@ -457,7 +446,7 @@ fn permission_denied_response(
 pub(super) struct QueryContext<'a, R> {
     pub(super) engine: Arc<RwLock<Engine>>,
     pub(super) tx_gate: TxGate,
-    pub(super) tx_permit: &'a mut Option<OwnedSemaphorePermit>,
+    pub(super) tx_permit: &'a mut Option<TxGateHold>,
     pub(super) principal: Option<Principal>,
     pub(super) result_mode: WireResultMode,
     pub(super) query_timeout: Duration,
@@ -565,9 +554,7 @@ where
             if tx_permit.is_some() {
                 return (
                     error_response(
-                        sanitize_error(
-                            "cannot begin: a transaction is already active on this connection",
-                        ),
+                        "cannot begin: a transaction is already active on this connection",
                         ErrorClass::Execution,
                     ),
                     None,
@@ -656,6 +643,20 @@ where
             (response, ticket, termination)
         }
         None if tx_permit.is_some() => {
+            // The transaction takes the whole gate at its FIRST write, not at
+            // `begin`: from that point its uncommitted rows are in the heap
+            // and no reader may run beside it.
+            let writes = autocommit_admission == AdmissionMode::Writer;
+            if writes {
+                if let Err(response) =
+                    upgrade_to_exclusive(&tx_gate, tx_permit, tx_wait_timeout, metrics).await
+                {
+                    return (response, None, None);
+                }
+            }
+            let retry_engine = Arc::clone(&engine);
+            let retry_parsed_query = Arc::clone(&parsed_query);
+            let retry_principal = principal.clone();
             let dispatch_in_tx = dispatch.clone();
             let mut out = run_blocking_query(
                 BlockingQuery {
@@ -669,10 +670,37 @@ where
                 },
                 Arc::clone(&parsed_query),
                 move |engine, parsed_query, principal| {
-                    dispatch_in_tx(engine, parsed_query, principal, true)
+                    dispatch_in_tx(engine, parsed_query, principal, writes)
                 },
             )
             .await;
+            if out.3 {
+                // A read inside the transaction turned out to need the writer
+                // (a stale materialized view). Same rule as a plain write: the
+                // gate goes exclusive before anything is written.
+                if let Err(response) =
+                    upgrade_to_exclusive(&tx_gate, tx_permit, tx_wait_timeout, metrics).await
+                {
+                    return (response, None, None);
+                }
+                let dispatch_retry = dispatch.clone();
+                out = run_blocking_query(
+                    BlockingQuery {
+                        engine: retry_engine,
+                        principal: retry_principal,
+                        result_mode,
+                        query_timeout,
+                        query_deadline,
+                        metrics,
+                        stream: stream.reborrow(),
+                    },
+                    retry_parsed_query,
+                    move |engine, parsed_query, principal| {
+                        dispatch_retry(engine, parsed_query, principal, true)
+                    },
+                )
+                .await;
+            }
             if is_query_cancellation_response(&out.0) {
                 rollback_connection_transaction(engine, principal, tx_permit).await;
                 out.2 = Some(ConnectionTermination::Closed);
@@ -992,6 +1020,12 @@ where
     });
     let mut exceeded_timeout = false;
     let mut termination = None;
+    // Set once a frame arrives that is too large for the read-ahead budget.
+    // The frame is not refused and not lost: its header stays buffered and
+    // the main loop reads the whole thing at the full wire limit as soon as
+    // this statement finishes. Read-ahead simply stops for the rest of the
+    // statement, exactly as it does when the queue is full.
+    let mut read_ahead_over_budget = false;
     let timeout = tokio::time::sleep(query_deadline.saturating_duration_since(Instant::now()));
     tokio::pin!(timeout);
     let join_result = loop {
@@ -1006,11 +1040,16 @@ where
                 cancel.cancel(powdb_query::cancel::CancelReason::Timeout);
                 break handle.await;
             }
+            // Read-ahead pauses once the queue is full instead of closing the
+            // connection: the frames already queued are served by the
+            // batching/main loop as soon as this statement finishes, so a
+            // burst of any size completes in order. A client with frames
+            // queued here is still connected, so pausing costs no liveness.
             read = read_message_cancel_safe(
                 stream.reader,
                 stream.buffered,
                 stream.pending.remaining_bytes(),
-            ) => {
+            ), if stream.pending.has_room() && !read_ahead_over_budget => {
                 match read {
                     Ok(Some(DecodedWireMessage { message: Message::Disconnect, .. })) => {
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
@@ -1018,17 +1057,6 @@ where
                         break handle.await;
                     }
                     Ok(Some(frame)) => {
-                        if stream.pending.len() + 1 >= MAX_IN_FLIGHT_READ_AHEAD_FRAMES
-                            || stream.pending.wire_bytes + frame.wire_len
-                                >= MAX_IN_FLIGHT_READ_AHEAD_BYTES
-                        {
-                            // Never stop observing the socket behind a full
-                            // queue. Reaching either hard cap cancels the query
-                            // and closes this connection immediately.
-                            cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
-                            termination = Some(ConnectionTermination::ReadError);
-                            break handle.await;
-                        }
                         // Preserve frames that arrive while the blocking query
                         // runs. The normal batching/main-loop path consumes them
                         // in order once execution completes.
@@ -1038,6 +1066,9 @@ where
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
                         termination = Some(ConnectionTermination::Closed);
                         break handle.await;
+                    }
+                    Err(FrameReadError::OverBudget { .. }) => {
+                        read_ahead_over_budget = true;
                     }
                     Err(_) => {
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
@@ -1053,7 +1084,7 @@ where
         Ok((Ok(result), ticket)) => match query_result_to_message(result, result_mode) {
             Ok(message) => (message, ticket, QueryOutcome::Ok, false),
             Err(e) => (
-                error_response(sanitize_error(&e.to_string()), classify_query_error(&e)),
+                error_response(e.to_string(), ErrorClass::LimitExceeded),
                 ticket,
                 QueryOutcome::Error,
                 false,
@@ -1062,10 +1093,7 @@ where
         Ok((Err(QueryError::ReadonlyNeedsWrite), ticket)) => {
             if exceeded_timeout {
                 (
-                    error_response(
-                        sanitize_error(&QueryError::Timeout { timeout_ms }.to_string()),
-                        ErrorClass::Timeout,
-                    ),
+                    query_error_response(&QueryError::Timeout { timeout_ms }),
                     ticket,
                     QueryOutcome::Timeout,
                     true,
@@ -1093,12 +1121,7 @@ where
             } else {
                 QueryOutcome::Error
             };
-            (
-                error_response(sanitize_error(&e.to_string()), classify_query_error(&e)),
-                ticket,
-                outcome,
-                false,
-            )
+            (query_error_response(&e), ticket, outcome, false)
         }
         Err(e) => (
             error_response(format!("internal error: {e}"), ErrorClass::Internal),
@@ -1149,7 +1172,7 @@ where
 pub(super) async fn settle_durability_ticket(ticket: WalDurabilityTicket) -> Option<String> {
     match tokio::task::spawn_blocking(move || ticket.wait()).await {
         Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(sanitize_error(&format!("WAL durability sync failed: {e}"))),
+        Ok(Err(e)) => Some(format!("WAL durability sync failed: {e}")),
         Err(e) => Some(format!("internal error: {e}")),
     }
 }

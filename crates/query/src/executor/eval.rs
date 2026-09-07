@@ -4,6 +4,68 @@ use crate::ast::*;
 use powdb_storage::catalog::Catalog;
 use powdb_storage::types::*;
 
+/// The expression evaluator's error channel.
+///
+/// `eval_expr` returns a `Value` and is called from closures the storage scan
+/// drives, so it has nowhere to put an error. Every unrepresentable arithmetic
+/// result therefore became `Value::Empty`, which is indistinguishable from a
+/// missing column: `.big * 2` produced NULL in a projection, filtered nothing
+/// out in a predicate, and an `update` wrote that NULL into a required column,
+/// while `sum` over the same values refused the same overflow outright.
+///
+/// A fault recorded here is turned into the statement's error at the two
+/// execution boundaries every plan crosses, `Engine::execute_lowered` and
+/// `Engine::execute_plan_readonly` (see `Engine::raise_arith_fault`). Both take
+/// unconditionally, so a fault recorded by an outer frame and collected by a
+/// nested one (a correlated subquery, a view's source query) is still raised,
+/// as that frame's error rather than the outer one's: attribution can move, the
+/// refusal cannot be lost. Nothing else clears the slot, so nothing leaks into
+/// the next statement either.
+///
+/// The first fault wins, because it is the one the query hit first; later rows
+/// cannot overwrite it.
+mod arith_fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(message: String) {
+        FAULT.with(|fault| {
+            let mut slot = fault.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        });
+    }
+
+    pub(crate) fn take() -> Option<String> {
+        FAULT.with(|fault| fault.borrow_mut().take())
+    }
+}
+
+pub(crate) use arith_fault::take as take_arith_fault;
+
+/// Record an integer-arithmetic overflow and yield the empty set for this row.
+/// The empty value never reaches the caller as an answer: the statement fails
+/// with the recorded message.
+fn overflow(label: &str) -> Value {
+    arith_fault::record(format!(
+        "cannot compute {label}: the integer result overflows int64"
+    ));
+    Value::Empty
+}
+
+/// Record a zero divisor, matching the message validation gives the literal
+/// form so the two spellings of the same mistake read the same.
+fn divide_by_zero() -> Value {
+    arith_fault::record(
+        "cannot divide by zero: the divisor is zero for at least one row".to_string(),
+    );
+    Value::Empty
+}
+
 pub(super) fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Field(name) => out.push(name.clone()),
@@ -235,7 +297,18 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
                 col.name, s
             )
         }),
-        (Value::Float(v), Int) => Ok(Value::Int(*v as i64)),
+        // A float into an int column is accepted only when it IS that
+        // integer. `*v as i64` truncates toward zero and saturates at the ends
+        // of the range, so `30.7` was stored as 30, `-0.5` as 0 and `1e300` as
+        // `i64::MAX`: the column refused a string outright and silently
+        // rewrote the near-miss number.
+        (Value::Float(v), Int) => exact_i64(*v).map(Value::Int).ok_or_else(|| {
+            format!(
+                "column '{}' is int and {v} is not a whole number in range; \
+                 write an integer",
+                col.name
+            )
+        }),
         _ => Err(format!(
             "type mismatch for column '{}': expected {:?}, got {}",
             col.name,
@@ -252,12 +325,29 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
     }
 }
 
+/// `v` as an `i64` when the conversion is exact: a whole number inside the
+/// range. Anything else has no integer to become.
+fn exact_i64(v: f64) -> Option<i64> {
+    if !v.is_finite() || v.fract() != 0.0 {
+        return None;
+    }
+    // 2^63 is exactly representable; every i64 lies in [-2^63, 2^63).
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&v) {
+        return None;
+    }
+    Some(v as i64)
+}
+
 pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
     match expr {
         Expr::Literal(Literal::Int(v)) => Ok(Value::Int(*v)),
         Expr::Literal(Literal::Float(v)) => Ok(Value::Float(*v)),
         Expr::Literal(Literal::String(v)) => Ok(Value::Str(v.clone())),
         Expr::Literal(Literal::Bool(v)) => Ok(Value::Bool(*v)),
+        // A value the typed-literal coercion pass already resolved (a uuid,
+        // datetime or bytes comparison key). It is the only literal form that
+        // can address those columns' index lanes.
+        Expr::ValueLit(v) => Ok(v.clone()),
         Expr::Null => Ok(Value::Empty),
         // Const-fold cast sugar in value position: `uuid("…")`, `bytes("…")`,
         // `cast(1718000000, "datetime")`. A failed cast errors (the whole
@@ -468,9 +558,14 @@ pub(super) fn eval_expr_mode(
             if mode == CmpMode::Filter && val.is_empty() {
                 return Value::Bool(false);
             }
+            // `x in (a, b)` is defined as `x = a or x = b`, so it has to use
+            // the same comparison the `=` path uses. Testing with `Value`'s
+            // strictly typed `PartialEq` made the two operators disagree on the
+            // same pair: `.n = 28.0` matched a stored int 28 and
+            // `.n in (28.0)` did not.
             let found = list.iter().any(|item| {
                 let iv = eval_expr_mode(item, row, columns, mode);
-                val == iv
+                eval_binop_mode(&val, BinOp::Eq, &iv, mode) == Value::Bool(true)
             });
             Value::Bool(if *negated { !found } else { found })
         }
@@ -486,8 +581,15 @@ pub(super) fn eval_expr_mode(
         Expr::UnaryOp(op, inner) => {
             let v = eval_expr_mode(inner, row, columns, mode);
             match op {
+                // Two-valued, as docs/POWQL.md states for every other `not`:
+                // a missing value never matches, so the predicate it stands
+                // for is false and its complement is true. Without this,
+                // `not .b` excluded the rows with no `b` while
+                // `not (.b = true)`, the same predicate one word longer,
+                // included them.
                 UnaryOp::Not => match v {
                     Value::Bool(b) => Value::Bool(!b),
+                    Value::Empty => Value::Bool(true),
                     _ => Value::Empty,
                 },
                 UnaryOp::Exists => Value::Bool(!v.is_empty()),
@@ -704,8 +806,23 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
             Some(Value::Str(s)) => Value::Str(s.to_lowercase()),
             _ => Value::Empty,
         },
+        // Characters, not UTF-8 bytes. `substring` and `like`'s `_` wildcard
+        // both count characters, so counting bytes here made three string
+        // operations disagree about the same string: `length("Zoe")` with a
+        // diaeresis was 4 while `like "___"` matched it and `substring(s, 1, 3)`
+        // returned all of it.
+        //
+        // A `bytes` value is measured in bytes, the only unit it has. It used
+        // to fall through to `Empty`, so `length(.blob)` answered null on every
+        // row with no error anywhere: a silent wrong answer for a question with
+        // one obvious right answer. Operands that have no length at all are
+        // refused before execution (`plan_exec::validate::length_type_error`)
+        // whenever their type is fixed by the schema; this arm is what the
+        // remaining un-typable ones (a cast, a bound parameter, a json path)
+        // fall back to.
         ScalarFn::Length => match args.first() {
-            Some(Value::Str(s)) => Value::Int(s.len() as i64),
+            Some(Value::Str(s)) => Value::Int(s.chars().count() as i64),
+            Some(Value::Bytes(b)) => Value::Int(b.len() as i64),
             _ => Value::Empty,
         },
         ScalarFn::Trim => match args.first() {
@@ -1112,6 +1229,12 @@ fn eval_cast(val: Value, target: CastType) -> Value {
 /// what they already promised (`Empty = Empty` matches there too). Teaching them
 /// cross-type keys means giving the hash side a canonical numeric key, which is
 /// the `Value::Hash` change this deliberately does not make.
+/// Whether `value` is the float that compares equal to nothing.
+#[inline]
+fn is_nan(value: &Value) -> bool {
+    matches!(value, Value::Float(f) if f.is_nan())
+}
+
 fn cross_type_numeric_cmp(
     left: &Value,
     right: &Value,
@@ -1195,6 +1318,24 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
     {
         return Value::Bool(false);
     }
+    // IEEE: NaN is unordered, so it is equal to nothing, less than nothing and
+    // greater than nothing, and `!=` against it is true for every row including
+    // the NaN row itself. `Value`'s own equality is `total_cmp`, which has to be
+    // a total order because `Eq`/`Hash` are built on it and `order`, `group`,
+    // `distinct` and the B-tree all need NaN in one definite place. Comparison
+    // and ordering are different questions: only this one follows IEEE, which
+    // is why the rule lives here rather than in `Value`. `Join` mode keeps
+    // identity, so a join on a NaN key still matches, exactly as it does for a
+    // missing key.
+    if mode == CmpMode::Filter
+        && matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+        )
+        && (is_nan(left) || is_nan(right))
+    {
+        return Value::Bool(op == BinOp::Neq);
+    }
     // Numeric pairs whose two sides are different `Value` variants compare as
     // numbers, not as variants: see `cross_type_numeric_cmp` for why the six
     // comparison operators cannot use `Value::PartialEq` here and stay
@@ -1216,6 +1357,20 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             BinOp::Lte => ordering != O::Greater,
             _ => ordering != O::Less,
         });
+    }
+    // An ordered comparison between two different types has no meaningful
+    // answer, and `Value::Ord`'s tail arm gives it one anyway: it falls back to
+    // the type discriminant, so `.j->v > 99.5` returned the rows whose value was
+    // the string "deep" and the bool true. The pairs that genuinely order across
+    // types (Int/Float, DateTime/Int) were handled just above; every other pair
+    // is false, which is what the typed-column comparisons are refused with at
+    // plan time. `Join` mode keeps `Value::Ord` so a non-equi join's ordering
+    // stays what the hash and nested-loop paths both already agree on.
+    if mode == CmpMode::Filter
+        && matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte)
+        && left.type_id() != right.type_id()
+    {
+        return Value::Bool(false);
     }
     // A json document against a string compares as a document (either
     // orientation): the text is parsed to canonical PJ1 and byte-compared,
@@ -1258,33 +1413,36 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
         // through to the `_` arms is a MISSING operand, which propagates as
         // missing per SQL NULL semantics, and an operand whose type is only
         // known per row (a cast, a scalar function, a JSON path).
-        // Integer overflow is missing, never a clamped number. `saturating_add`
-        // answered `.big + 1` with `i64::MAX`, which is a plausible-looking
-        // number that is not the sum, and the aggregate accumulator refuses the
-        // same overflow outright (`plan_exec::aggregate::agg_overflow_error`),
-        // so `sum(A { .v })` and `A { x: .v + 1 }` disagreed about whether the
-        // total exists. All four arithmetic operators now use the checked form
-        // that `Div` already used, and all four report the same way. `Empty`
-        // rather than an error because this evaluator has no error channel and
-        // because it is the convention every other unrepresentable result here
-        // already follows (`abs(i64::MIN)`, an overflowing `date_add`, `date_diff`
-        // across the full i64 range).
+        // Integer overflow is an error, never a clamped number and never a
+        // silent NULL. `saturating_add` answered `.big + 1` with `i64::MAX`,
+        // which is a plausible-looking number that is not the sum; `Empty`
+        // answered it with a missing value, which an `update` then wrote into a
+        // required column. The aggregate accumulator refuses the same overflow
+        // outright (`plan_exec::aggregate::agg_overflow_error`), so all four
+        // operators now report through `arith_fault` and say the same thing
+        // `sum` says.
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_add(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_add(*b)
+                .map_or_else(|| overflow("a sum"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             _ => Value::Empty,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_sub(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_sub(*b)
+                .map_or_else(|| overflow("a difference"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Empty,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_mul(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_mul(*b)
+                .map_or_else(|| overflow("a product"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
@@ -1297,7 +1455,17 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             // Returning `Empty` on either matches the sibling arithmetic arms.
             // A literal zero divisor is a typed error at validation; only a
             // divisor that is zero for some rows reaches this guard.
-            (Value::Int(a), Value::Int(b)) => a.checked_div(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => {
+                if *b == 0 {
+                    divide_by_zero()
+                } else {
+                    // Still `checked_div`: `i64::MIN / -1` overflows and panics
+                    // even in release builds, which under `panic = "abort"` is a
+                    // remotely craftable process crash.
+                    a.checked_div(*b)
+                        .map_or_else(|| overflow("a quotient"), Value::Int)
+                }
+            }
             (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),

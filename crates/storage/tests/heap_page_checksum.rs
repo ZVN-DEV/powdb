@@ -7,7 +7,7 @@
 
 use powdb_storage::error::StorageError;
 use powdb_storage::heap::HeapFile;
-use powdb_storage::page::PAGE_SIZE;
+use powdb_storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE};
 use powdb_storage::row::encode_row;
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -224,7 +224,10 @@ fn test_clean_page_reads_back_after_flush() {
     }
 
     let heap = HeapFile::open(&path).unwrap();
-    let data = heap.get(rid).expect("clean page row must read back");
+    let data = heap
+        .get(rid)
+        .expect("clean page must read")
+        .expect("clean page row must read back");
     assert_eq!(
         powdb_storage::row::decode_row(&schema, &data)[0],
         Value::Str("hello".into())
@@ -271,7 +274,7 @@ fn test_legacy_unstamped_page_opens() {
     // Even though the stored CRC bytes no longer match (flag is clear), the
     // page must read without a PageCorrupt error.
     let heap = HeapFile::open(&path).unwrap();
-    match heap.get(rid) {
+    match heap.get(rid).expect("legacy page must read") {
         Some(data) => assert_eq!(
             powdb_storage::row::decode_row(&schema, &data)[0],
             Value::Str("legacy".into())
@@ -284,4 +287,94 @@ fn test_legacy_unstamped_page_opens() {
     // Avoid an unused-import warning for StorageError if the corruption
     // test is ever cfg'd out.
     let _ = std::mem::size_of::<StorageError>();
+}
+
+/// Read one byte at `offset` in the heap file.
+fn read_byte(path: &std::path::Path, offset: u64) -> u8 {
+    let mut f = std::fs::File::open(path).unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    let mut byte = [0u8; 1];
+    f.read_exact(&mut byte).unwrap();
+    byte[0]
+}
+
+/// Overwrite `len` bytes at `offset` in the heap file.
+fn write_bytes(path: &std::path::Path, offset: u64, bytes: &[u8]) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(bytes).unwrap();
+    f.flush().unwrap();
+}
+
+/// Clear the checksum flag on `page_id`, turning it into a page that looks
+/// like it was written before checksums existed.
+fn unstamp_page(path: &std::path::Path, page_id: u32) {
+    let flag_at = page_id as u64 * PAGE_SIZE as u64 + 5;
+    let flags = read_byte(path, flag_at);
+    write_bytes(path, flag_at, &[flags & !0b0000_0001]);
+}
+
+/// Build a one-row heap and return its path and the row's id.
+fn heap_with_one_row(name: &str, value: &str) -> (std::path::PathBuf, RowId) {
+    let path = tmp_path(name);
+    let schema = one_col_schema();
+    let mut heap = HeapFile::create(&path).unwrap();
+    let rid = heap
+        .insert(&encode_row(&schema, &[Value::Str(value.into())]))
+        .unwrap();
+    heap.flush().unwrap();
+    drop(heap);
+    (path, rid)
+}
+
+#[test]
+fn an_unstamped_page_is_checksummed_by_the_next_writable_open() {
+    let (path, rid) = heap_with_one_row("unstamped_upgrade", "legacy");
+    unstamp_page(&path, rid.page_id);
+
+    // Opening for writing upgrades the page: its rows are validated once and
+    // it comes back under a CRC, so damage from here on is detectable.
+    drop(HeapFile::open(&path).unwrap());
+
+    let row_at = rid.page_id as u64 * PAGE_SIZE as u64 + PAGE_HEADER_SIZE as u64;
+    let byte = read_byte(&path, row_at);
+    write_bytes(&path, row_at, &[byte ^ 0xFF]);
+
+    match HeapFile::open(&path) {
+        Ok(_) => panic!("a corrupt page opened as if it were intact"),
+        Err(e) => assert!(
+            format!("{e}").contains("CRC32 mismatch"),
+            "expected a CRC failure, got {e}"
+        ),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_row_whose_format_version_is_corrupt_is_refused_not_decoded() {
+    let (path, rid) = heap_with_one_row("row_version", "legacy");
+    unstamp_page(&path, rid.page_id);
+
+    // A read-only handle never rewrites the directory, so the page stays
+    // unstamped and nothing else stands between the bytes and the caller.
+    let heap = HeapFile::open_read_only(&path).unwrap();
+
+    // Bump the row's format version past anything this build knows. The page
+    // carries no CRC, so only the row header can catch it.
+    let version_at = rid.page_id as u64 * PAGE_SIZE as u64 + PAGE_HEADER_SIZE as u64 + 4;
+    write_bytes(&path, version_at, &[0xFF, 0xFF]);
+
+    match heap.get(rid) {
+        Ok(other) => panic!("row with an unknown version read back as {other:?}"),
+        Err(e) => assert!(
+            format!("{e}").contains("unsupported row format version"),
+            "expected an unsupported-version refusal, got {e}"
+        ),
+    }
+    drop(heap);
+    let _ = std::fs::remove_file(&path);
 }

@@ -64,7 +64,7 @@ escapeIdent("User");        // → "User" (throws on invalid)
 
 **The SQL frontend has no parameter binding.** `querySql`, `querySqlNative`, and `querySqlObjects` take a statement and nothing else: there is no `QuerySqlParams` wire frame, so `$N` placeholders cannot be bound on the SQL path. Prefer PowQL with `$N` parameters for anything built from untrusted input.
 
-When you must build SQL, use the `sql` tagged template rather than concatenation. It escapes for PowDB's own SQL lexer: `'` is doubled and a backslash is escaped (PowDB's SQL lexer honours backslash escapes, unlike standard SQL). Identifiers are validated, not quoted, because the lexer reads a double-quoted run as a string literal.
+When you must build SQL, use the `sql` tagged template rather than concatenation. It escapes for PowDB's own SQL lexer: `'` is doubled and a backslash is escaped (PowDB's SQL lexer honours backslash escapes, unlike standard SQL). Identifiers are validated and then double-quoted, which is what lets a reserved word such as `order` or `group` name a table; quoted identifiers need a server on 0.23.0 or newer.
 
 ```typescript
 import { sql, sqlIdent, escapeSqlLiteral, escapeSqlIdent } from "@zvndev/powdb-client";
@@ -73,10 +73,11 @@ const q = sql`SELECT name FROM ${sqlIdent("User")} WHERE name = ${userName}`;
 await client.querySql(q);
 
 escapeSqlLiteral("o'neil");   // → "'o''neil'"
-escapeSqlIdent("User");       // → "User" (throws on anything else)
+escapeSqlIdent("User");       // → '"User"' (throws on anything else)
+escapeSqlIdent("order");      // → '"order"' (a reserved word, usable once quoted)
 ```
 
-Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and it cannot make an identifier or keyword safe. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
+Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and quoting a name makes it an identifier, never a keyword, so a column *type* in `CREATE TABLE` must not go through `sqlIdent`. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
 
 ### Parameter binding (`$N`)
 
@@ -92,8 +93,8 @@ await client.query("insert User { name := $1, email := $2, age := $3 }", [
 
 const r = await client.query("User filter .email = $1 { .name }", [email]);
 
-// null binds PowQL null; numbers bind as int when integral, float otherwise;
-// bigint always binds as int.
+// null binds PowQL null; a number binds as int when it is integral and inside
+// the signed 64-bit range, float otherwise; bigint always binds as int.
 await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 ```
 
@@ -102,9 +103,11 @@ await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 ## Multi-statement scripts (`execScript`)
 
 `execScript` runs a whole `;`-separated PowQL script down one connection,
-**pipelined**: every statement is written back-to-back without waiting for
-the previous reply, so an N-statement script costs one round trip instead of
-N. Splitting is statement-aware with the exact semantics of the CLI's script
+**pipelined**: statements are written back-to-back without waiting for the
+previous reply, so a script of up to `maxInFlight` (64) statements costs one
+round trip instead of N. A longer script slides that window forward as
+replies arrive, which keeps the pipeline full without holding every encoded
+statement in memory at once. Splitting is statement-aware with the exact semantics of the CLI's script
 path — `;` inside `"..."` string literals or `#` comments never splits, and
 empty statements are dropped. (The splitter is exported as
 `splitStatements(script)` if you need it standalone.)
@@ -122,9 +125,10 @@ const results = await client.execScript(`
 By default execution is **fail-fast**: the first failed statement rejects the
 promise with a `PowDBScriptError` carrying `statementIndex`, the failing
 `statement` text, and the successful `results` so far. Because dispatch is
-pipelined, statements already on the wire when the error reply arrives
-(typically the whole script) still execute server-side — use
-`transactional: true` if you need all-or-nothing behavior. Do **not** embed
+pipelined, statements already on the wire when the error reply arrives still
+execute server-side: up to one `maxInFlight` window past the failure, and the
+whole script when it is shorter than the window. Use `transactional: true` if
+you need all-or-nothing behavior. Do **not** embed
 `begin`/`commit` in the script yourself: the trailing `commit` is already on
 the wire when an error reply arrives, so it commits the partial work.
 
@@ -499,8 +503,18 @@ try {
 ```
 
 The full taxonomy: `connect_failed`, `auth_failed`, `query_failed`,
-`aborted`, `size_exceeded`, `protocol_error`, `closed`, `timeout`,
-`type_coercion_failed`.
+`aborted`, `invalid_argument`, `size_exceeded`, `protocol_error`, `closed`,
+`timeout`, `type_coercion_failed`.
+
+`invalid_argument` means the call itself was unsendable: a `bigint` outside the
+signed 64-bit range, a non-finite `number`, an unsupported parameter type, more
+than 4096 parameters, or a frame larger than the 64 MB wire limit. It is raised
+before anything is written, so the connection is untouched and every other
+in-flight query is unaffected. Fix the call; never retry it.
+
+`wireErrorClass` carries the server's own numeric classification (see
+`docs/errors.md`) when the error came from a server `Error` frame, so a driver
+can branch on the class rather than on the message.
 
 `execScript` failures throw `PowDBScriptError`, a `PowDBError` subclass whose
 `code` mirrors the failing statement's error and which adds
@@ -574,12 +588,20 @@ try {
 }
 ```
 
-A plain `ctrl.abort()` throws a `PowDBError` with `code === "aborted"`. If you
-abort with a custom `Error` reason (`ctrl.abort(myError)`), that error is thrown
-as-is; any non-`Error` reason is wrapped in a `PowDBError` (`code === "aborted"`).
+Aborting always rejects with a `PowDBError` whose `code` is `"aborted"`,
+whatever the reason was. The reason is preserved on `.cause`: a plain
+`ctrl.abort()` leaves the `AbortError` `DOMException` there, and
+`ctrl.abort(myError)` leaves `myError` there and puts its message in the
+`PowDBError`'s own message. Branching on `err.code === "aborted"` is therefore
+enough; read `err.cause` when you need the reason itself.
 
-The socket stays open — the aborted query's reply is silently discarded when it
-arrives, and every other in-flight query still receives its own result.
+A signal that is already aborted rejects immediately and never enqueues the
+query, matching `fetch()`.
+
+The socket stays open. If the frame was already written, the server still
+replies and the client discards that reply; if the query was still waiting for
+room in the in-flight window, the frame is never written at all. Either way
+every other in-flight query still receives its own result.
 
 ## API
 
@@ -597,6 +619,7 @@ Returns a `Promise<Client>`. Options:
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
 | `eager` | `boolean` | `false` | Resolve as soon as the Connect frame is written instead of waiting for ConnectOk; queries pipeline behind the handshake (see Eager connect above) |
+| `maxInFlight` | `number` | `64` | How many requests may be left unanswered on the wire at once. Beyond it, queries queue in the client instead of being written, so a burst of any size still completes in order. Encoded frame bytes are capped at 1 MiB in parallel (`MAX_IN_FLIGHT_BYTES`), which binds first for anything but small statements; a single frame larger than that still goes out on an empty window. Must be a positive integer |
 
 > **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
 > ≥0.4.6 (enforced roles). See the version matrix under Authentication.
@@ -728,10 +751,10 @@ Getters: `size`, `idle`, `closed`.
 - `ident(name)` — wrap a string so `powql` treats it as an identifier
 - `escapeLiteral(value)` — render a JS value as a PowQL literal
 - `escapeIdent(name)` — validate an identifier (throws `TypeError` on invalid)
-- `sql`: tagged template for the SQL frontend; escapes literals, validates identifiers
+- `sql`: tagged template for the SQL frontend; escapes literals, quotes identifiers
 - `sqlIdent(name)`: wrap a string so `sql` treats it as a SQL identifier
 - `escapeSqlLiteral(value)`: render a JS value as a PowDB SQL literal
-- `escapeSqlIdent(name)`: validate a SQL identifier (throws `TypeError` on invalid)
+- `escapeSqlIdent(name)`: validate a SQL identifier and return it double-quoted (throws `TypeError` on invalid)
 - `splitStatements(script)` — the statement-aware script splitter used by `execScript`
 
 ## Limits
@@ -746,6 +769,15 @@ The client enforces the same frame limits as the server and throws on violation:
   allocate: a cell is only 4 bytes on the wire but costs far more as a JS
   value, so without the cap a ~40 MB frame could expand to roughly 1.9 GB. Page
   larger results with `limit`/`offset`.
+
+It also bounds what it leaves unanswered on the wire, so a burst cannot
+overrun a server's read-ahead budget (128 frames and 1 MiB while a query is
+running). A server on 0.28.0 or newer pauses reading when it reaches either
+cap; an older one cancelled the running query and closed the connection with
+no Error frame.
+
+- `DEFAULT_MAX_IN_FLIGHT`: 64 unanswered request frames (see `maxInFlight`)
+- `MAX_IN_FLIGHT_BYTES`: 1 MiB of unanswered request frames
 
 ## Requirements
 

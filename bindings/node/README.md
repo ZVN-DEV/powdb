@@ -149,9 +149,15 @@ const db = Database.open("./data");
 db.query("type Doc { required id: int, body: json }");
 db.query(`insert Doc { id := 1, body := "null" }`);
 
-const [cell] = db.queryNative("Doc filter .id = 1 { .body }").rows[0];
-// { type: "json", value: null, pj1: <Uint8Array> }: a JSON null,
-// which is NOT { type: "empty" } (a missing cell).
+// `kind` is the discriminant: narrow on it before reading `rows`, the same
+// way you would with the networked client's `QueryResult`.
+const doc = db.queryNative("Doc filter .id = 1 { .body }");
+if (doc.kind === "rows") {
+  const [cell] = doc.rows[0];
+  // { type: "json", value: null, pj1: <Uint8Array> }: a JSON null,
+  // which is NOT { type: "empty" } (a missing cell).
+  console.log(cell);
+}
 
 // Positional parameters are substituted as literal tokens before parsing, so
 // untrusted input can never change the query's shape.
@@ -189,15 +195,31 @@ Prebuilt native binaries ship for:
 | Linux x64 (glibc) | `x86_64-unknown-linux-gnu` |
 | Linux arm64 (glibc) | `aarch64-unknown-linux-gnu` |
 
-There is no source fallback, so `require()` throws a load error on any other
-platform (Windows, Intel macOS, musl/Alpine). Use the networked
-[`@zvndev/powdb-client`](https://github.com/ZVN-DEV/powdb) there instead.
+There is no source fallback. On any other platform (Windows, Intel macOS,
+musl/Alpine) importing the package throws an error coded `unsupported_platform`
+that names the platforms above, with the underlying load failure on `.cause`.
+Use the networked
+[`@zvndev/powdb-client`](https://www.npmjs.com/package/@zvndev/powdb-client)
+there instead, or build this addon from source (`bindings/node` in the
+[repository](https://github.com/ZVN-DEV/powdb)).
+
+`SUPPORTED_PLATFORMS` is exported, so a host can check before opening a
+database.
 
 ## Safety
 
 A query that panics is caught at the boundary and surfaced as a thrown JS error
 — it never aborts the host process. After an internal panic the handle is
 poisoned; reopen the database (committed data is recovered from the WAL).
+
+## Links
+
+- [Changelog](https://github.com/ZVN-DEV/powdb/blob/main/bindings/node/CHANGELOG.md)
+- [`@zvndev/powdb-client`](https://www.npmjs.com/package/@zvndev/powdb-client)
+  (networked client)
+- [`@zvndev/powdb-sync`](https://www.npmjs.com/package/@zvndev/powdb-sync)
+  (embedded sync orchestration)
+- [PowDB](https://github.com/ZVN-DEV/powdb)
 
 ## License
 

@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::checkpoint::retained_segments_dir;
+use crate::fsync::fsync_dir;
 use crate::metadata::{
     minimum_retained_lsn, read_replica_cursors_unlocked, replace_replica_cursors_unlocked,
     with_cursor_metadata_lock,
@@ -343,16 +344,6 @@ fn validate_retained_tail(
             .checked_add(1)
             .ok_or_else(|| invalid_data("retained segment LSN overflow"))?;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
-    fs::File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 

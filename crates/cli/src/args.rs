@@ -56,6 +56,14 @@ pub(crate) struct CliArgs {
     pub(crate) output: OutputMode,
     pub(crate) action: Action,
     pub(crate) tls: TlsOpts,
+    /// Open the embedded data directory read-only (`--readonly`). Mutating
+    /// statements are refused by the engine and nothing on disk is written,
+    /// which is what makes a snapshot or a restored backup safe to inspect.
+    pub(crate) readonly: bool,
+    /// WAL size in bytes at which a finished statement checkpoints on the
+    /// embedded path (`--wal-checkpoint-bytes`). `None` keeps the storage
+    /// default; `0` turns the automatic checkpoint off.
+    pub(crate) wal_checkpoint_bytes: Option<u64>,
 }
 
 /// TLS settings for remote mode.
@@ -159,6 +167,116 @@ pub(crate) fn restore_sync_mode_for_flag(flag: &str) -> Option<powdb_backup::Res
     }
 }
 
+/// Read a password from the first line of stdin, for `--password-stdin`.
+///
+/// Only the line terminator is stripped: a password may legitimately end in
+/// spaces, and trimming them would fail an authentication with no explanation.
+pub(crate) fn read_password_from_stdin() -> String {
+    let mut line = String::new();
+    match io::BufRead::read_line(&mut io::stdin().lock(), &mut line) {
+        Ok(0) => {
+            eprintln!("Error: --password-stdin was given but stdin was empty");
+            std::process::exit(2);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("Error: failed to read the password from stdin: {e}");
+            std::process::exit(1);
+        }
+    }
+    let without_lf = line.strip_suffix('\n').unwrap_or(line.as_str());
+    without_lf
+        .strip_suffix('\r')
+        .unwrap_or(without_lf)
+        .to_string()
+}
+
+/// The usage block for one subcommand.
+///
+/// Printed both by `--help` and by `<subcommand> --help`, so the two cannot
+/// drift apart: they are the same strings.
+pub(crate) fn subcommand_help(name: &str) -> &'static [&'static str] {
+    match name {
+        "backup" => &[
+            "    backup <DEST_DIR> [--base <FULL_DIR>]",
+            "        Snapshot --data-dir into DEST_DIR. With --base, write an",
+            "        incremental (differential) backup of only the 4 KB pages that",
+            "        changed since the full backup at FULL_DIR.",
+        ],
+        "restore" => &[
+            "    restore <BKP> <DEST_DIR> [--apply <INC_DIR>]...",
+            "        Rebuild a data dir from a backup. Pass --apply once per",
+            "        increment (in order) to chain-restore a full base plus",
+            "        incrementals for coarse point-in-time restore.",
+            "        Sync identity modes for sync-enabled backups:",
+            "          --sync-strip     Default. Restore data without sync identity.",
+            "          --sync-preserve  Disaster recovery: keep source sync identity.",
+            "          --sync-fork      Clone/fork: mint a fresh sync identity.",
+        ],
+        "sync-enable" => &[
+            "    sync-enable",
+            "        Offline/admin: create sync identity and checkpoint retained WAL",
+            "        for --data-dir so future backups can bootstrap replicas.",
+        ],
+        "sync-bootstrap" => &[
+            "    sync-bootstrap <BKP> <REPLICA_DIR> <REPLICA_ID>",
+            "        Offline/admin: restore a sync-enabled full backup into",
+            "        REPLICA_DIR and publish REPLICA_ID's primary-side cursor.",
+        ],
+        "sync-status" => &[
+            "    sync-status [REPLICA_ID]",
+            "        Offline/admin: show primary-side cursor, lag, and repair",
+            "        action for one replica or every registered replica.",
+            "        Uses sync-aware open and may archive/checkpoint pending WAL.",
+        ],
+        "useradd" => &[
+            "    useradd <NAME> --role <ROLE> --password <PW>",
+            "        Create a user in --data-dir's user store. --role defaults to",
+            "        readwrite (admin|readwrite|readonly). Password from --password,",
+            "        --password-stdin, or POWDB_NEW_PASSWORD.",
+        ],
+        "userdel" => &[
+            "    userdel <NAME>",
+            "        Delete a user from --data-dir's user store.",
+        ],
+        "passwd" => &[
+            "    passwd <NAME> --password <PW>",
+            "        Change a user's password (or via --password-stdin or",
+            "        POWDB_NEW_PASSWORD).",
+        ],
+        "users" => &[
+            "    users",
+            "        List users (name + role) from --data-dir's user store.",
+        ],
+        "sweep" => &[
+            "    sweep <TABLE|all>",
+            "        Reclaim orphaned overflow pages for a table (or all).",
+        ],
+        _ => &[],
+    }
+}
+
+/// The subcommand whose help was asked for, if any.
+///
+/// `powdb-cli backup --help` used to take "--help" as the destination
+/// directory and back the database up into it; `restore --help` and
+/// `sync-status --help` were "unknown argument"; `sync-bootstrap --help`
+/// demanded a directory. A `--help` BEFORE the subcommand still means the
+/// general help, which is what the top-level flag has always done.
+pub(crate) fn subcommand_help_request(argv: &[String]) -> Option<&'static str> {
+    let sub_index = argv
+        .iter()
+        .position(|a| SUBCOMMANDS.contains(&a.as_str()))?;
+    let help_index = argv.iter().position(|a| a == "--help" || a == "-h")?;
+    if help_index < sub_index {
+        return None;
+    }
+    SUBCOMMANDS
+        .iter()
+        .find(|name| **name == argv[sub_index])
+        .copied()
+}
+
 pub(crate) fn parse_args() -> CliArgs {
     let mut data_dir = "./powdb_data".to_string();
     let mut remote: Option<String> = None;
@@ -182,6 +300,10 @@ pub(crate) fn parse_args() -> CliArgs {
     let mut exec: Option<String> = None;
     let mut exec_file: Option<String> = None;
     let mut dialect = Dialect::Powql;
+    let mut password_flag_given = false;
+    let mut password_stdin = false;
+    let mut readonly = false;
+    let mut wal_checkpoint_bytes: Option<u64> = None;
     let mut output = OutputMode::Table;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
@@ -207,6 +329,15 @@ pub(crate) fn parse_args() -> CliArgs {
             std::process::exit(2);
         }
     };
+    if let Some(name) = subcommand_help_request(&argv) {
+        println!("powdb-cli {name}");
+        println!();
+        for line in subcommand_help(name) {
+            println!("{line}");
+        }
+        std::process::exit(0);
+    }
+
     let mut i = 1;
     let mut saw_positional = false;
     let mut data_dir_explicit = false;
@@ -230,6 +361,26 @@ pub(crate) fn parse_args() -> CliArgs {
             }
             "--sql" => {
                 dialect = Dialect::Sql;
+            }
+            "--readonly" => {
+                readonly = true;
+            }
+            "--wal-checkpoint-bytes" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --wal-checkpoint-bytes requires a value in bytes");
+                    std::process::exit(2);
+                }
+                match argv[i].trim().parse::<u64>() {
+                    Ok(bytes) => wal_checkpoint_bytes = Some(bytes),
+                    Err(_) => {
+                        eprintln!(
+                            "Error: --wal-checkpoint-bytes wants a plain whole number of bytes, \
+                             with no unit suffix (0 disables the automatic checkpoint)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
             }
             "--format" => {
                 i += 1;
@@ -271,6 +422,10 @@ pub(crate) fn parse_args() -> CliArgs {
                     std::process::exit(2);
                 }
                 password = Some(argv[i].clone());
+                password_flag_given = true;
+            }
+            "--password-stdin" => {
+                password_stdin = true;
             }
             "--tls" => {
                 tls_enabled = true;
@@ -343,11 +498,28 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("                               (same `;` rule: a newline continues a statement)");
                 println!("        --sql                  Treat --exec / --exec-file input as SQL, and start");
                 println!("                               the REPL in SQL mode (see docs/SQL.md for the subset)");
+                println!("        --readonly             Open the embedded data dir read-only: reads are served,");
+                println!("                               writes are refused, and nothing on disk is modified.");
+                println!("                               For snapshots and restored backups. Embedded only; a");
+                println!("                               remote server decides this with its own --readonly /");
+                println!("                               POWDB_READONLY");
+                println!("        --wal-checkpoint-bytes <BYTES>");
+                println!("                               WAL size at which a finished statement checkpoints on the");
+                println!("                               embedded path (default: 64 MiB; 0 disables, leaving the");
+                println!("                               log to grow until the CLI exits). Embedded only");
                 println!("        --format <FMT>         Result rendering: table (default), json, or csv.");
                 println!("                               json and csv make the CLI scriptable");
-                println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP");
+                println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP, or pass the path");
+                println!(
+                    "                               of a `--socket` unix socket to connect locally"
+                );
                 println!("        --db <NAME>            Database name (default: default)");
-                println!("        --password <PW>        Password for remote auth");
+                println!("        --password <PW>        Password for remote auth, and for the user-admin");
+                println!("                               subcommands. Visible to every user on the machine in");
+                println!("                               `ps`: prefer --password-stdin or POWDB_PASSWORD");
+                println!(
+                    "        --password-stdin       Read the password from the first line of stdin"
+                );
                 println!("    -u, --user <NAME>          Username for multi-user remote auth");
                 println!("        --tls                  Encrypt the remote connection with TLS");
                 println!("                               (env fallback: POWDB_TLS=1)");
@@ -386,43 +558,24 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("    Scriptable output:   powdb-cli --format json -c 'count(User)'");
                 println!();
                 println!("SUBCOMMANDS:");
-                println!("    backup <DEST_DIR> [--base <FULL_DIR>]");
-                println!("        Snapshot --data-dir into DEST_DIR. With --base, write an");
-                println!("        incremental (differential) backup of only the 4 KB pages that");
-                println!("        changed since the full backup at FULL_DIR.");
-                println!("    restore <BKP> <DEST_DIR> [--apply <INC_DIR>]...");
-                println!("        Rebuild a data dir from a backup. Pass --apply once per");
-                println!("        increment (in order) to chain-restore a full base plus");
-                println!("        incrementals for coarse point-in-time restore.");
-                println!("        Sync identity modes for sync-enabled backups:");
-                println!("          --sync-strip     Default. Restore data without sync identity.");
-                println!(
-                    "          --sync-preserve  Disaster recovery: keep source sync identity."
-                );
-                println!("          --sync-fork      Clone/fork: mint a fresh sync identity.");
-                println!("    sync-enable");
-                println!("        Offline/admin: create sync identity and checkpoint retained WAL");
-                println!("        for --data-dir so future backups can bootstrap replicas.");
-                println!("    sync-bootstrap <BKP> <REPLICA_DIR> <REPLICA_ID>");
-                println!("        Offline/admin: restore a sync-enabled full backup into");
-                println!("        REPLICA_DIR and publish REPLICA_ID's primary-side cursor.");
-                println!("    sync-status [REPLICA_ID]");
-                println!("        Offline/admin: show primary-side cursor, lag, and repair");
-                println!("        action for one replica or every registered replica.");
-                println!("        Uses sync-aware open and may archive/checkpoint pending WAL.");
+                for name in [
+                    "backup",
+                    "restore",
+                    "sync-enable",
+                    "sync-bootstrap",
+                    "sync-status",
+                ] {
+                    for line in subcommand_help(name) {
+                        println!("{line}");
+                    }
+                }
                 println!();
-                println!("USER ADMIN (offline — operate on --data-dir's user store):");
-                println!("    useradd <NAME> --role <ROLE> --password <PW>");
-                println!("        Create a user. --role defaults to readwrite (admin|readwrite|");
-                println!("        readonly). Password from --password or POWDB_NEW_PASSWORD.");
-                println!("    userdel <NAME>");
-                println!("        Delete a user.");
-                println!("    passwd <NAME> --password <PW>");
-                println!("        Change a user's password (or via POWDB_NEW_PASSWORD).");
-                println!("    users");
-                println!("        List users (name + role).");
-                println!("    sweep <TABLE|all>");
-                println!("        Reclaim orphaned overflow pages for a table (or all).");
+                println!("USER ADMIN (offline \u{2014} operate on --data-dir's user store):");
+                for name in ["useradd", "userdel", "passwd", "users", "sweep"] {
+                    for line in subcommand_help(name) {
+                        println!("{line}");
+                    }
+                }
                 std::process::exit(0);
             }
             "backup" => {
@@ -694,6 +847,60 @@ pub(crate) fn parse_args() -> CliArgs {
         }
     }
 
+    // A password on the command line is in `ps` for every user on the box for
+    // as long as the process runs, and in the shell history afterwards.
+    // `--password-stdin` is the way to pass one without that, so the flag that
+    // exposes it says so.
+    if password_stdin {
+        if password_flag_given {
+            eprintln!("Error: --password and --password-stdin are mutually exclusive");
+            std::process::exit(2);
+        }
+        password = Some(read_password_from_stdin());
+    } else if password_flag_given {
+        eprintln!(
+            "note: --password is visible to other users in `ps`; prefer --password-stdin, \
+             or POWDB_PASSWORD (POWDB_NEW_PASSWORD for the user-admin subcommands)"
+        );
+    }
+
+    // Read-only is a property of how the data directory is OPENED, and in
+    // remote mode this process opens nothing: the server did. Accepting the
+    // flag here would suggest the CLI was enforcing a restriction it has no
+    // way to enforce.
+    // A unix socket carries no hostname and the server's socket listener
+    // speaks cleartext, so TLS over one can only fail at handshake time.
+    // Refusing here says which of the two settings to drop.
+    #[cfg(unix)]
+    if tls_enabled && remote.as_deref().is_some_and(remote_is_unix_socket) {
+        eprintln!("Error: TLS is not used on a unix socket: the connection is already local");
+        eprintln!(
+            "note: drop --tls (POWDB_TLS, POWDB_TLS_CA and POWDB_TLS_SERVER_NAME imply it), \
+             or connect to the server's TCP address instead"
+        );
+        std::process::exit(2);
+    }
+
+    if wal_checkpoint_bytes.is_some() && remote.is_some() {
+        eprintln!(
+            "Error: --wal-checkpoint-bytes applies to an embedded data dir, not to a remote connection"
+        );
+        eprintln!(
+            "note: the server that owns the data dir sets it, with its own --wal-checkpoint-bytes \
+             or POWDB_WAL_CHECKPOINT_BYTES"
+        );
+        std::process::exit(2);
+    }
+
+    if readonly && remote.is_some() {
+        eprintln!("Error: --readonly applies to an embedded data dir, not to a remote connection");
+        eprintln!(
+            "note: a remote session is read-only when the SERVER is: start it with --readonly \
+             or POWDB_READONLY=1"
+        );
+        std::process::exit(2);
+    }
+
     // `--exec-file <PATH>` reads a whole PowQL file (or stdin for `-`) and
     // feeds it through the same one-shot path as `--exec`, sidestepping the
     // ARG_MAX ceiling on large loads. The two flags are mutually exclusive.
@@ -737,5 +944,7 @@ pub(crate) fn parse_args() -> CliArgs {
             ca_path: tls_ca,
             server_name: tls_server_name,
         },
+        readonly,
+        wal_checkpoint_bytes,
     }
 }

@@ -9,7 +9,7 @@
 **PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its compiled execution engine measures 3-7x SQLite on aggregates and 1-3.7x on filtered scans, and roughly 16x slower than SQLite on indexed point lookups.**
 
 - **Performance** -- compiled byte-level predicates, zero-copy mmap scans, and a plan cache with literal substitution. Filter and aggregate paths skip full row decoding.
-- **Platform** -- 100% pure-Rust core, no C dependencies, embeddable and server modes, installed with a single `cargo install` on Linux and macOS. **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
+- **Platform** -- pure-Rust engine (`powdb`, `powdb-storage`, `powdb-query` pull no C at all), embeddable and server modes, installed with a single `cargo install` on Linux and macOS. A built binary needs nothing installed beside it, but building `powdb-server` or `powdb-cli` from source does need a C toolchain and `cmake` for their TLS stack; see [Install](#install). **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
 - **DX** -- PowQL is the front door: a left-to-right pipeline syntax that reads like an iterator chain.
 
 Website: **[zvn-dev.github.io/powdb](https://zvn-dev.github.io/powdb/)**
@@ -57,7 +57,9 @@ For the concurrency numbers behind the boundary above (single-request cost versu
 
 PowQL uses `.field` dot syntax for column references, `:=` for assignments, and `"double quotes"` for strings. The pipeline reads like a sentence: *"User, filter age greater than 25, order by name, limit 10, give me name and age."*
 
-Two capabilities have no SQL spelling at all, and are where PowQL earns its keep over SQL: **nested projections** (correlated children as a native JSON array, one row per parent) and **entity links** (declare a relationship once, then traverse it by name, with a scalar hop through a non-unique key refused as an error instead of silently multiplying rows).
+**Nested projections** (correlated children as a native array, one row per parent) and **entity links** (declare a relationship once, then traverse it by name) are the two PowQL-only spellings. They are spellings, not capabilities SQL lacks: stock SQLite reproduces the same shaped output, `[]` for a childless parent included, with a correlated subquery and `json_group_array(json_object(...))`. What PowQL adds over that is real but narrow: one line instead of three, the correlation declared once in the catalog instead of retyped in every query, and a value that reaches the client as PJ1 binary rather than as JSON text it has to parse back.
+
+**Where PowQL changes the answer, not the spelling: aggregates over a join.** A one-to-many join repeats the parent once per child, so an average over the parent's column is inflated by the fan-out. Three accounts (10, 10, 40) with 4, 1 and 1 orders average 20 by themselves and 15 through the join. SQL gives you the 15 unless you know to write a `DISTINCT` subquery; PowQL's aggregates are symmetric by default and give you the 20, with `avg(raw a.balance)` as the explicit opt-out when you do want the joined-row number. This is the one place PowDB is correct by default where the obvious SQL is quietly wrong, and it is documented in [Grouped aggregates over joins](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#grouped-aggregates-over-joins-symmetric-and-raw-semantics). PowDB's own SQL frontend keeps SQL's raw semantics on purpose.
 
 **Already think in SQL?** Since v0.5.0 PowDB also accepts a supported subset of SQL through a frontend that lowers to the same PowQL plan tree (and shares the plan cache), see [docs/SQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md). PowQL remains the native, fastest path.
 
@@ -76,7 +78,7 @@ cargo install powdb-server
 # TypeScript client (Node 18+): version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
-# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu ONLY; no source fallback, `require()` throws elsewhere: use @zvndev/powdb-client there)
+# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu ONLY; no source fallback. Elsewhere `require()` throws an error coded `unsupported_platform` that names the three supported targets: use @zvndev/powdb-client there)
 npm install @zvndev/powdb-embedded
 
 # Prebuilt binaries (linux x86_64, macos aarch64)
@@ -175,13 +177,13 @@ The compiled predicate engine avoids full row decoding during scans and aggregat
 
 **PowDB loses the indexed point lookup, badly, and by more than we used to publish.** Once the index is probed the remaining work is trivial, so nearly the whole 3.17 us is PowDB's own front end (lex, parse, canonicalize, plan-cache lookup) while SQLite amortizes that away with a prepared statement. The previous table put this at 7.9x against an older engine. Nine independent re-measurements of the current engine, across two machines, ranged from 10x to 20x, most of them above 15x. This row got worse and we had been understating it by roughly 2x. If your hot path is "fetch one row by id", SQLite is the better engine and scan throughput will not compensate.
 
-Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from durability cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `e3dfa71`, 2026-08-15. **These are laptop numbers, not CI numbers.** One caveat specific to the write rows: PowDB writes to a real temp directory while SQLite is `:memory:`, so `insert_single`, `insert_batch_1k`, and `delete_by_filter` are sensitive to whatever else is touching the disk. Measured under a heavy concurrent build on the same laptop, those rows moved by 30-100x while every other row moved by less than 2x, and two of them changed sign. The table above is from the quietest run we could get, but this machine was not fully idle, so treat the three write rows as the least reliable and re-measure them yourself before relying on them. Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
+Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from durability cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `e3dfa71`, 2026-08-15. Re-measured the same way on 2026-09-07 after a large correctness round: every row landed within 11% of the number above and eleven of the fifteen within 3%, so the table is unchanged. The heap allocator rewrite in that round is not visible here because it removes a cost that grows with heap size, and this fixture is too small to pay it; the measurement that does show it is in the changelog. **These are laptop numbers, not CI numbers.** One caveat specific to the write rows: PowDB writes to a real temp directory while SQLite is `:memory:`, so `insert_single`, `insert_batch_1k`, and `delete_by_filter` are sensitive to whatever else is touching the disk. Measured under a heavy concurrent build on the same laptop, those rows moved by 30-100x while every other row moved by less than 2x, and two of them changed sign. The table above is from the quietest run we could get, but this machine was not fully idle, so treat the three write rows as the least reliable and re-measure them yourself before relying on them. Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
 
 ### Write throughput & durability
 
-PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: every mutating statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
+PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: an autocommit statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
 
-The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD). That is not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
+The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD). That is not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the batch into far fewer of them:
 
 ```
 # ~hundreds of rows/sec: one fsync per row
@@ -189,7 +191,7 @@ insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
 ...
 
-# ~50x faster, still fully durable: one fsync for the whole batch
+# ~50x faster, still fully durable: roughly one fsync per 64 rows
 begin
 insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
@@ -197,9 +199,16 @@ insert User { id := 2, name := "b" }
 commit
 ```
 
-On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
+Be exact about what a transaction costs, because it is not one fsync. A statement inside `begin` / `commit` does not fsync on its own: the durability point is the `commit`. But the WAL flushes and fsyncs whenever its append buffer reaches 64 records, inside a transaction as much as outside one, and a row is one record. So a 5000-row transaction costs roughly 78 fsyncs, not 5000 and not 1. The same applies to a multi-row `insert`: it is one statement, but a batch of 5000 rows is still 5000 WAL records.
 
-`WalSyncMode::Off` (used by the benchmark harness to compare against SQLite `:memory:`) disables the WAL entirely and is **not durable**: never use it in production.
+On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync happens per 64 records and at `commit`, instead of once per row). Always wrap bulk loads and write bursts in a transaction.
+
+The two weaker modes trade that guarantee away, and it is worth being exact about how much:
+
+- **`normal`** (`POWDB_SYNC_MODE=normal`, `WalSyncMode::Normal`) appends to the WAL but does not fsync before acknowledging. A **process** death loses nothing: the records are in the WAL, and replay finds them. Measured: 500 acknowledged inserts, `kill -9`, restart, all 500 present. What it exposes is an **OS crash or power loss**, which can lose whatever the kernel had not flushed. Writes are roughly 15-40x faster.
+- **`off`** (`POWDB_SYNC_MODE=off`, `WalSyncMode::Off`) writes no WAL at all, so there is nothing to replay and the loss window is not bounded by anything: **every row written since the last graceful close is gone** after any unclean exit. Measured on the same setup: 500 acknowledged inserts, `kill -9`, restart, `count` = 0. The table definition survived, the rows did not. The mode exists so the benchmark harness can compare against SQLite `:memory:`. Never point it at data you intend to keep.
+
+The embedded `Engine` checkpoints and truncates the WAL on its own once the durable log passes 64 MiB (`Catalog::set_wal_checkpoint_bytes`, `0` to opt out). `powdb-server` and `powdb-cli` do not: both install a WAL archive hook so retained replication history is never truncated behind a replica's back, and the automatic checkpoint never runs behind such a hook. For those two, only a graceful shutdown (SIGINT/SIGTERM) checkpoints and truncates, and during a run the log grows monotonically: 168 KB after 2,000 single-row inserts, back to 8 bytes once SIGTERM has been handled. Size the volume for the write burst between restarts, not for the size of the data.
 
 ## PowQL
 
@@ -319,6 +328,8 @@ materialized views before snapshotting.
 
 ### Environment variables
 
+The table below is `powdb-server`'s. `powdb-cli` reads five of its own, listed under [CLI environment variables](#cli-environment-variables).
+
 | Variable | Default | Description |
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
@@ -330,7 +341,7 @@ materialized views before snapshotting.
 | `POWDB_REQUIRE_TLS` | *(off)* | When set (`1`/`true`), refuse to start if a password is configured without TLS |
 | `POWDB_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
 | `POWDB_QUERY_TIMEOUT` | `30` | Per-query deadline in seconds; cooperative cancellation stops supported scan, join, group, and mutation-discovery work and releases server admission promptly |
-| `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server |
+| `POWDB_QUERY_MEMORY_LIMIT` | `268435456` | Per-query memory budget in bytes (256 MiB); over-budget queries error instead of OOM-killing the server. **Read by `powdb-server` only.** The embedded CLI and the `powdb` crate ignore it; embedded callers set the budget in code (`Database::open_with_memory_limit` in the `powdb` facade, `Engine::with_memory_limit` in `powdb-query`) |
 | `POWDB_TX_WAIT_TIMEOUT_MS` | `5000` | Max milliseconds a `begin` waits for a concurrent explicit transaction before failing with a timeout error instead of queueing indefinitely |
 | `POWDB_TX_MAX_LIFETIME_MS` | `300000` | Max milliseconds one connection may hold an **open explicit transaction**. An explicit transaction holds the single write-admission gate for its whole lifetime, so the server bounds that lifetime: past it, the transaction is **rolled back** (uncommitted writes are lost), the gate is released, and the connection gets a class-3 `timeout` error and is closed. If the budget expires while a reply is being written and the write cannot finish, the connection is closed without the error frame, so treat an unexpected close during an open transaction as a timeout. The clock starts at `begin` and nothing the client sends extends it. This applies to legitimate long transactions too, so raise it (e.g. `3600000`) for servers running hour-long migrations, and split bulk loads that will not fit. `0` disables the bound and restores the pre-0.22 behavior in which one client can hold the gate, and therefore block every other connection including readers, for as long as it likes. Reaps are counted at `powdb_tx_reaped_total` |
 | `POWDB_DB_NAME` | *(accept any)* | When set, the single database name this server serves; a CONNECT that explicitly names a different database is rejected |
@@ -340,14 +351,38 @@ materialized views before snapshotting.
 | `POWDB_SYNC_MODE` | `full` | WAL durability: `full` (fsync before ack, fully durable) \| `normal` (bounded loss window on OS crash/power loss only, ~15-40x faster writes) \| `off` (no durability, bench-only) |
 | `POWDB_METRICS_ADDR` | *(off)* | When set to `host:port` (e.g. `127.0.0.1:9090`), serve a Prometheus `/metrics` endpoint on a separate listener ([metric reference](https://github.com/ZVN-DEV/powdb/blob/main/docs/metrics.md)). **Unauthenticated**: bind it to localhost or a private network, never the public internet |
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
+| `POWDB_MAX_CONNECTIONS` | `1024` | Ceiling on concurrent connections. Same as `--max-connections` |
+| `POWDB_SHUTDOWN_TIMEOUT` | `30` | Seconds a graceful shutdown waits for connections to drain before exiting non-zero. Same as `--shutdown-timeout` |
+| `POWDB_WAL_CHECKPOINT_BYTES` | `67108864` | WAL size in bytes at which a finished statement checkpoints and truncates the log; `0` disables it. A plain byte count, no unit suffix. Same as `--wal-checkpoint-bytes`. **Has no effect on `powdb-server` or `powdb-cli` today**: both install a WAL archive hook so retained replication history is never truncated behind a replica, and the automatic checkpoint never runs behind such a hook. It applies to an embedded `Engine` opened without one |
+| `POWDB_PORT_FILE` | *(off)* | Path the server writes the bound listener ports to once it is listening, as `port=<n>` (plus `metrics=<n>` when the metrics endpoint is on). Written atomically before the ready log line, so a reader never sees a partial file. Pair it with `--port 0` to run a server on a free port in tests and scripts. Same as `--port-file` |
+| `NO_COLOR` | *(unset)* | When set, disables ANSI colour in the log. Colour is off automatically when stdout is not a terminal |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
+
+Every `POWDB_*` value above goes through the same validator as its command-line flag. A value that does not parse refuses startup and names the variable (`invalid value for POWDB_MAX_CONNECTIONS: "abc"`, exit 2); it is never silently defaulted. The refusal names the unit the setting is actually in, so a connection ceiling is not described as a byte count.
+
+Two behaviours worth knowing beside the table:
+
+- **A peer past `POWDB_MAX_CONNECTIONS` is not refused; it waits.** Its TCP connection is established and then parks, unserved, until a slot frees. No bytes are read from it and the 10-second pre-auth deadline does not start until it gets one. Clients should rely on their own connect timeout rather than expecting a refusal.
+- **SIGHUP reloads `auth.json`** and nothing else, so a password rotated with `powdb-cli passwd` takes effect and a deleted user stops being able to log in without a restart. It does not reload TLS material, `POWDB_PASSWORD`, or any other setting. SIGTERM and SIGINT drain: the server stops accepting, closes each connection between frames with a `server shutting down` error, and waits up to `POWDB_SHUTDOWN_TIMEOUT`. A statement already executing is not interrupted.
+
+#### CLI environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `POWDB_PASSWORD` | *(unset)* | Password `powdb-cli --remote` authenticates with. Prefer `--password-stdin`, since `--password` is visible in `ps` |
+| `POWDB_TLS` | *(off)* | When set (`1`/`true`), connect with TLS. Same as `--tls` |
+| `POWDB_TLS_CA` | *(unset)* | Path to a PEM CA bundle used to verify the server certificate. Same as `--tls-ca` |
+| `POWDB_TLS_SERVER_NAME` | *(the host)* | SNI/verification name to use instead of the connect host. Same as `--tls-server-name` |
+| `POWDB_NEW_PASSWORD` | *(unset)* | Read by the offline `useradd` and `passwd` subcommands so a password is never typed on the command line |
+
+`powdb-cli --remote` accepts a Unix-domain socket path as well as `host:port`: an argument containing a path separator, starting with `~`, or ending `.sock` is read as a socket. TLS over a socket is refused, because it is local and same-host. `@zvndev/powdb-client` speaks sockets too, through `{ path }` instead of `{ host, port }`.
 
 ### Production checklist
 
 Before exposing `powdb-server` beyond `127.0.0.1`:
 
 - [ ] Configure authentication. Either set `POWDB_PASSWORD` to a strong shared secret, or define named users with roles (`powdb-cli --data-dir <dir> useradd …`; connect with `--user`). The server logs a `WARN` on startup when neither is configured and will accept any connection. See [Multi-user authentication](https://github.com/ZVN-DEV/powdb/blob/main/docs/getting-started.md#multi-user-authentication).
-- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration.
+- [ ] Enable TLS via `POWDB_TLS_CERT` and `POWDB_TLS_KEY` (or run behind a TLS-terminating proxy). Set `POWDB_REQUIRE_TLS=1` to make the server refuse to start with a password but no TLS, so credentials can never transit in cleartext by misconfiguration. For a self-signed certificate the server and the CLI both accept, use the recipe in [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md#generating-a-self-signed-certificate-for-testing): a plain `openssl req -x509` one-liner produces a certificate every client rejects.
 - [ ] Bind to a specific interface with `--bind` rather than `0.0.0.0` if you can.
 - [ ] If you enable the `POWDB_METRICS_ADDR` Prometheus endpoint, keep it on localhost or a private network, because it is unauthenticated and exposes operational counts (connection, query, and auth-failure totals).
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.

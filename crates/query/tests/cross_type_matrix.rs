@@ -160,6 +160,18 @@ const LITERALS: &[Literal] = &[
         label: "null",
         text: "null",
     },
+    // The plain string spellings of the uuid and bytes values, which is how
+    // every client writes them. They used to be silently false against their
+    // own column (E1); the coercion pass rewrites them, so the matrix has to
+    // carry them next to the cast sugar.
+    Literal {
+        label: "str_uuid",
+        text: "\"UUID\"",
+    },
+    Literal {
+        label: "str_bytes",
+        text: "\"\\\\x01\"",
+    },
     Literal {
         label: "uuid_lit",
         text: "uuid(\"UUID\")",

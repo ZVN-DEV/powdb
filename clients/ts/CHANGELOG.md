@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+### Fixed
+
+- A parameter the wire protocol cannot carry no longer desynchronizes the
+  connection. `2 ** 63`, `1e19`, `1e300` and `Number.MAX_VALUE` were tagged as
+  ints and threw a raw Node `RangeError` out of `writeBigInt64LE` after the
+  pending entry had already been queued, leaving a slot waiting for a reply the
+  server was never asked for: the next query hung and later ones took
+  `ECONNRESET`. Encoding now happens before anything is queued, an integral
+  double outside the safe-integer range binds as a float, and a `bigint` outside
+  the signed 64-bit range or a non-finite number is refused synchronously with
+  the new `invalid_argument` code.
+- A server-initiated `Error` frame (idle timeout, reaped transaction, "server
+  shutting down") arrived as `protocol_error: received unexpected frame from
+  server`, discarding the server's own text and error class. It now closes the
+  client with that text and the code its class maps to. A raw socket error is
+  wrapped as a `PowDBError` coded `closed`, with the Node error as `cause`.
+- A result larger than `MAX_RESULT_CELLS` closed the connection and poisoned the
+  client for every later call. It is the one decode failure that leaves the byte
+  stream intact, so the frame is skipped, only the query that asked for it fails
+  (with `size_exceeded`), and the connection stays up.
+- A burst past the server's frame read-ahead budget died mid-flight (200
+  concurrent queries: 22 answered, then `ECONNRESET`). Requests beyond a window
+  of `maxInFlight` (default 64) now wait in a client-side FIFO and go out as
+  replies come back.
+- `Pool` handed out idle clients whose connection had already died, costing one
+  failed `withClient` per idle client after a server restart. Pooled clients are
+  watched for teardown and evicted, and the acquire timeout is now a `PowDBError`
+  coded `timeout` rather than a bare `Error`.
+- An over-cap parameter count or an oversized frame is refused locally before
+  anything is written, instead of being sent and rejected by the server.
+- `escapeIdent("select")` returned a bare reserved word the engine then refused,
+  and it refused the backticked form too, so no spelling of a reserved table name
+  worked. Reserved words are backtick-quoted now, and an already-backticked name
+  is refused with a message saying to pass the bare name. The reserved list is
+  diffed against the engine lexer by `test/escape.test.ts`.
+- `escapeLiteral` and `escapeSqlLiteral` range-check bigints, instead of emitting
+  an integer literal above `i64::MAX` that the engine refuses at parse time.
+- Every abort rejects with a `PowDBError` coded `aborted`, with the abort reason
+  on `.cause`. `ctrl.abort(new Error(...))` used to reject with the bare `Error`,
+  so `err.code === "aborted"` did not hold for a custom reason.
+- `escapeSqlIdent`, twelve lines below `escapeIdent`, kept returning the bare
+  name after `escapeIdent` learned to quote, so there was no injection-safe
+  spelling of a reserved-word table left in SQL either: `sqlIdent("order")`
+  emitted `SELECT * FROM order`, which the engine refuses, and a hand-quoted
+  `sqlIdent('"order"')` was rejected by the identifier pattern. It returns the
+  validated name double-quoted now. The SQL frontend has read `"..."` as an
+  identifier since 0.23.0 and does no case folding, so this is safe for every
+  name and needs no second keyword list. A column *type* is a keyword, not an
+  identifier, and must not be passed through `sqlIdent`.
+- `execScript` dispatched the whole script regardless of the in-flight window.
+  `send` stopped writing directly when the window landed, so the dispatch loop
+  yielded only on socket backpressure, which the window makes unreachable: its
+  fail-fast and abort guards could not fire (a 400-statement script dispatched
+  all 400 after statement 6 failed) and every frame past the window accumulated
+  in the client's heap, roughly 50 MB for a 10,000-statement script of 5 KB
+  inserts. Dispatch waits for the reply that frees each statement's slot now.
+  The window still slides, so the pipeline stays full and throughput is
+  unchanged.
+- The in-flight window bounds bytes as well as frames. The server's read-ahead
+  budget is 128 frames **and** 1 MiB, and the byte cap is the tighter one for
+  anything but small statements: 64 frames of 20 KiB of query text is 1.28 MiB
+  of read-ahead while the frame count never approaches 128. Against a pre-0.28.0
+  server, which cancelled the running query and closed the connection with no
+  `Error` frame, that was the exact `ECONNRESET` the window was added to
+  prevent. The pump now also stops at `MAX_IN_FLIGHT_BYTES` (1 MiB, the server's
+  own cap), and always writes the head frame on an empty window so one oversized
+  statement cannot deadlock.
+
+### Changed
+
+- `queryTyped`'s generic is no longer constrained to `TypedRow`. The bound
+  rejected the `interface` most callers declare a row type with, while claiming
+  a check the method never performed. It now matches `queryObjects`.
+- New `maxInFlight` connect option (default 64), bounded in bytes as well by
+  `MAX_IN_FLIGHT_BYTES` (1 MiB). Raising `maxInFlight` alone does not lift the
+  byte budget.
+- An integral number above 2^53 binds as `int` again, matching the embedded
+  addon. The wire client tagged a number `int` only when `Number.isSafeInteger`
+  held, while the addon binds any integral double inside the i64 range. Every
+  double in `[2^53, 2^63)` is an exact integer, so the `int` tag is lossless
+  there; the float tag cost the index. Measured against a running server,
+  `filter .id = $1` with `2 ** 60` on a `required unique id: int` column planned
+  `Filter(SeqScan)` over the wire and `IndexScan` in process. Snowflake-shaped
+  ids sit squarely in that range. `2 ** 63` and above still bind float: the
+  `int` tag has no room for them.
+
 ## 0.27.0 - 2026-08-26
 
 No client API changes. Version moves in lockstep with the engine.

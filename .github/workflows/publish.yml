@@ -53,6 +53,15 @@ jobs:
   # hazard is a point release (x.y.Z+1) cut over an unnoticed API break —
   # exactly what this catches. Dry runs get the same verdict, so a
   # dry_run=true dispatch doubles as a release preflight.
+  #
+  # Two guards make this a gate rather than a decoration, because for seven
+  # consecutive releases it was a decoration: on a 0.x MINOR bump
+  # cargo-semver-checks classifies the release as major and skips every lint,
+  # so the job printed "0 checks: 0 pass, 254 skip" for all eight crates and
+  # exited 0 having compared nothing. scripts/ci/semver-gate.sh now runs a
+  # fixture selftest that proves the checker can still fail, and refuses a
+  # "0 checks" verdict on a patch bump. The advisory step below lists the
+  # breaks a 0.x minor bump is allowed to have, so they reach the CHANGELOG.
   semver:
     name: semver-checks vs published baselines
     runs-on: ubuntu-24.04
@@ -69,21 +78,86 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Install cargo-semver-checks (pinned)
+      # Pinned by version AND by content. This tarball is the gate standing at
+      # the door to crates.io, and it was fetched over curl and piped straight
+      # into tar: no checksum, and a GitHub release tag can be moved. Every
+      # `uses:` in this repo is pinned to a 40-hex SHA; the binary that decides
+      # whether a release is API-compatible deserves at least as much.
+      #
+      # The pipe is gone too: `curl | tar` cannot verify anything, because the
+      # bytes are consumed before there is a file to hash. Recompute after a
+      # version bump with `curl -sSfL <url> | sha256sum`.
+      - name: Install cargo-semver-checks (pinned by version and sha256)
+        env:
+          SEMVER_CHECKS_VERSION: "0.50.0"
+          SEMVER_CHECKS_SHA256: 5763f6f62310f76428ba19d42cac060c56e07a1b8e3be0394c8c686398978f48
         run: |
           set -euo pipefail
-          curl -sSfL \
-            https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v0.50.0/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz \
-            | tar xz -C "$HOME/.cargo/bin"
+          url="https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v${SEMVER_CHECKS_VERSION}/cargo-semver-checks-x86_64-unknown-linux-musl.tar.gz"
+          curl -sSfL "$url" -o /tmp/cargo-semver-checks.tar.gz
+          echo "${SEMVER_CHECKS_SHA256}  /tmp/cargo-semver-checks.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-semver-checks.tar.gz -C "$HOME/.cargo/bin"
           cargo semver-checks --version
 
+      # The selftest runs first, on a throwaway two-crate fixture whose patch
+      # release deletes a public function. It asserts the checker FAILS on that
+      # and PASSES on the same pair with the function kept, so a checker that
+      # has silently lost the ability to say no is caught here rather than at
+      # the next point release. See the script header for the history: this
+      # gate cleared seven releases in a row having executed 0 checks.
+      - name: Prove the semver checker can fail
+        run: bash scripts/ci/semver-gate.sh --selftest
+
+      # The real check, wrapped so that "0 checks" on a patch bump (the one
+      # shape cargo-semver-checks always lints) fails the job instead of
+      # reading as a pass, and so that a run which examined no crate at all
+      # fails too.
       - name: Check every publishable crate against its crates.io baseline
-        run: cargo semver-checks check-release --workspace
+        run: bash scripts/ci/semver-gate.sh
+
+      # Advisory, never a gate. cargo-semver-checks classifies a 0.x MINOR bump
+      # as a major release and skips every lint, which is correct (0.x minors
+      # are allowed to break) but leaves the release with no list of what
+      # broke. Forcing --release-type minor produces that list for the
+      # CHANGELOG and for the release notes.
+      #
+      # The body lives in a script, not inline here, and the reason is a bug
+      # this step shipped with: an inline `run:` gets GitHub's default
+      # `bash -e {0}`, the block opened with `set -uo pipefail` (which does not
+      # clear the inherited `-e`), and `--release-type minor` forces the major
+      # lints on, so the first removed public item killed the shell on the
+      # cargo line. No log, no summary, the trailing `exit 0` unreachable, the
+      # `semver` job red and `publish` (needs: semver) never started. An
+      # "advisory" step took the crates.io channel down for exactly the release
+      # shape it exists to describe. In a script the behaviour is testable, and
+      # the selftest below drives it against a tool that exits 1.
+      #
+      # It exits 0 in its own body rather than carrying
+      # `continue-on-error: true`: this repo has been burned by gates that
+      # could not fail, so a step that deliberately does not gate says so where
+      # a reader of the log sees it, instead of in a YAML key they have to go
+      # look up.
+      #
+      # The one thing it does refuse is cargo-semver-checks not running at all
+      # (exit > 1: a panic, an unparseable manifest, a missing binary).
+      # Findings never block, because findings are legal on a 0.x minor; but on
+      # a 0.x minor the gate above lints nothing by design, so this pass is the
+      # release's whole semver verdict, and a green job that compared nothing
+      # anywhere would be a claim that the release was checked.
+      - name: Prove the advisory pass survives a failing checker
+        run: bash scripts/ci/semver-advisory.sh --selftest
+
+      - name: List breaking changes for the CHANGELOG (advisory, never blocks on findings)
+        run: bash scripts/ci/semver-advisory.sh
 
   publish:
     name: publish crates
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # 45, not 20: this job now also builds the release profile (lto, one
+    # codegen unit) for the durability smoke below. On a cold cache that is the
+    # longest step in the job, and a publish that times out half way through
+    # the eight crates is the worst possible failure mode.
+    timeout-minutes: 45
     needs: semver
     # No GitHub Actions `environment:` here on purpose. crates.io Trusted
     # Publishing matches a publisher configured with a blank environment only
@@ -91,8 +165,11 @@ jobs:
     # OIDC token carry an environment the (blank) crates.io configs didn't match,
     # so token minting failed with "No Trusted Publishing config found". The
     # `crates-publish` environment carried no protection rules, so dropping it
-    # costs nothing. To reintroduce protected publishing later, re-add the
-    # environment here AND set the same name on every crate's crates.io config.
+    # cost nothing, and the environment itself was deleted on 2026-09-07. What
+    # gates this path instead is the `v*` tag ruleset (admins only) plus the
+    # tag guard below. To reintroduce protected publishing later, create the
+    # environment again, reference it here AND set the same name on every
+    # crate's crates.io config.
     permissions:
       contents: read
       id-token: write # mint a short-lived crates.io token via OIDC
@@ -101,6 +178,17 @@ jobs:
       # Kept explicit: publish verification builds should use the same portable
       # baseline as the released binaries, documented here on purpose.
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      # Dispatch inputs reach the shell through the environment, never by
+      # interpolation into a `run:` block. GitHub substitutes ${{ }} as TEXT
+      # before bash ever sees the script, so a crafted input is spliced into
+      # the source of the step; through `env:` it is a value bash quotes. Only
+      # write-access users can dispatch this workflow, so nothing here is
+      # exploitable today, but this is the job that mints a crates.io token and
+      # post-publish-smoke.yml already applies the rule ("so a crafted dispatch
+      # input cannot inject shell"). `if:` conditions below stay as
+      # expressions: those are evaluated by Actions, not by a shell.
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
 
     steps:
       - name: Checkout
@@ -122,20 +210,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+          # The release-* restore-keys are a warm start for the release build the
+          # durability smoke below needs: release.yml builds the same commit
+          # with the same RUSTFLAGS on the same tag ref, so its target cache
+          # applies. When that cache does not exist they are simply no-ops.
+          # (Comments cannot live inside the block scalar: everything under
+          # `restore-keys: |` is literal text, so a `#` line there would be
+          # offered to actions/cache as a key.)
           key: publish-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             publish-${{ runner.os }}-
+            release-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+            release-x86_64-unknown-linux-gnu-
 
       - name: Verify version matches input
         run: |
           # Crates use version.workspace = true, so check the workspace root
           # against the manually supplied release input as a second guardrail.
           ws_version="$(python3 -c 'from pathlib import Path; import re; text=Path("Cargo.toml").read_text(); m=re.search(r"\[workspace\.package\](.*?)(?:\n\[|\Z)", text, re.S); vm=re.search(r"^version\s*=\s*\"([^\"]+)\"", m.group(1), re.M) if m else None; print(vm.group(1) if vm else "")')"
-          if [ "$ws_version" != "${{ inputs.version }}" ]; then
-            echo "::error::workspace version ($ws_version) does not match input (${{ inputs.version }})"
+          if [ "$ws_version" != "$VERSION" ]; then
+            echo "::error::workspace version ($ws_version) does not match input ($VERSION)"
             exit 1
           fi
-          echo "Workspace version matches ${{ inputs.version }}"
+          echo "Workspace version matches $VERSION"
 
       - name: Check repository version consistency
         run: bash scripts/check-version-consistency.sh
@@ -149,11 +246,11 @@ jobs:
       - name: Verify tag v${{ inputs.version }} points at this commit
         run: |
           set -euo pipefail
-          tag="v${{ inputs.version }}"
+          tag="v${VERSION}"
           head_sha="$(git rev-parse HEAD)"
           if ! tag_sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
             msg="tag ${tag} does not exist in this repository"
-            if [ "${{ inputs.dry_run }}" = "true" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
               echo "::warning::${msg} (dry run, continuing)"
               exit 0
             fi
@@ -162,7 +259,7 @@ jobs:
           fi
           if [ "$tag_sha" != "$head_sha" ]; then
             msg="tag ${tag} points at ${tag_sha}, but this run is on ${head_sha}"
-            if [ "${{ inputs.dry_run }}" = "true" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
               echo "::warning::${msg} (dry run, continuing)"
               exit 0
             fi
@@ -186,6 +283,26 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
+      # crates.io is the one irreversible channel: a published version cannot be
+      # replaced, only yanked. Every other channel in release.yml already sits
+      # behind `needs: smoke-release`; this one did not, and on v0.27.0 the
+      # crates went out 56 seconds BEFORE the durability smoke passed
+      # (publish run 32925073799 finished 03:13:13Z, release.yml's
+      # `durability smoke (release binary)` at 03:14:09Z). The two workflows are
+      # dispatched independently, so the ordering was luck.
+      #
+      # Running the smoke here rather than polling release.yml keeps the gate a
+      # property of this job: same commit, same toolchain, same RUSTFLAGS, no
+      # dependency on which workflow started first, no extra token scope, and
+      # nothing to get wrong when a publish is re-dispatched by hand after a
+      # fix. This is the gate whose absence caused the v0.4.1 to v0.4.3
+      # data-loss yanks; it must clear before anything reaches the registry.
+      - name: Build release binaries for the durability smoke
+        run: cargo build --release --locked -p powdb-cli -p powdb-server
+
+      - name: Durability smoke against release binaries (kill -9 + WAL replay)
+        run: bash scripts/smoke-release.sh
+
       - name: Package smoke (npm pack + cargo package list)
         run: bash scripts/smoke-package.sh
 
@@ -207,44 +324,44 @@ jobs:
       # sleep gives the index time to propagate.
 
       - name: Publish powdb-storage
-        run: bash scripts/publish-crate.sh powdb-storage "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-storage "$VERSION" "$DRY_RUN"
 
       # powdb-auth is a leaf (argon2 etc., no powdb deps) but powdb-server
       # depends on it, so publish it before query/server to match RELEASES.md.
       - name: Publish powdb-auth
-        run: bash scripts/publish-crate.sh powdb-auth "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-auth "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-query
-        run: bash scripts/publish-crate.sh powdb-query "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-query "$VERSION" "$DRY_RUN"
 
       # powdb-sync (experimental sync substrate) depends only on powdb-storage,
       # but backup/server/powdb/cli all depend on it, so it must precede them.
       - name: Publish powdb-sync
-        run: bash scripts/publish-crate.sh powdb-sync "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-sync "$VERSION" "$DRY_RUN"
 
       # powdb-backup depends on storage+query+sync (all already published above)
       # and powdb-cli depends on backup, so it must precede the cli.
       - name: Publish powdb-backup
-        run: bash scripts/publish-crate.sh powdb-backup "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-backup "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-server
-        run: bash scripts/publish-crate.sh powdb-server "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-server "$VERSION" "$DRY_RUN"
 
       # powdb (embedded facade) depends on powdb-query + powdb-storage (both
       # published above). It is a publishable crate with full crates.io metadata
       # (docs.rs/powdb) — the SQLite-shaped in-process front door — so it must be
       # released alongside the rest.
       - name: Publish powdb (embedded facade)
-        run: bash scripts/publish-crate.sh powdb "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-cli
-        run: bash scripts/publish-crate.sh powdb-cli "${{ inputs.version }}" "${{ inputs.dry_run }}"
+        run: bash scripts/publish-crate.sh powdb-cli "$VERSION" "$DRY_RUN"
 
       - name: Summary
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             echo "## Dry run complete" >> "$GITHUB_STEP_SUMMARY"
-            echo "All crates validated for v${{ inputs.version }}. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "All crates validated for v$VERSION. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "## Published to crates.io" >> "$GITHUB_STEP_SUMMARY"
             # Listed in publish order. This block used to name 7 crates while
@@ -252,12 +369,12 @@ jobs:
             # under-reported what had actually gone out.
             # scripts/check-version-consistency.sh asserts this list equals both
             # the publish steps above and the set of publishable crate manifests.
-            echo "- powdb-storage v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-auth v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-query v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-sync v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-backup v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-server v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb (embedded facade) v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
-            echo "- powdb-cli v${{ inputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-storage v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-auth v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-query v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-sync v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-backup v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-server v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb (embedded facade) v$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            echo "- powdb-cli v$VERSION" >> "$GITHUB_STEP_SUMMARY"
           fi

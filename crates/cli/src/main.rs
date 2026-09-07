@@ -193,8 +193,19 @@ fn main() {
             &args.tls,
         ));
     } else if let Some(query) = args.exec {
-        std::process::exit(exec_embedded(&args.data_dir, &query, session));
+        std::process::exit(exec_embedded(
+            &args.data_dir,
+            &query,
+            session,
+            args.readonly,
+            args.wal_checkpoint_bytes,
+        ));
     } else {
-        run_embedded(&args.data_dir, session);
+        run_embedded(
+            &args.data_dir,
+            session,
+            args.readonly,
+            args.wal_checkpoint_bytes,
+        );
     }
 }

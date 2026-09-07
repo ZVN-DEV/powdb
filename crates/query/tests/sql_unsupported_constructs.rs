@@ -345,7 +345,6 @@ fn every_table_constraint_spelling_gets_the_documented_error() {
     let mut engine = fixture(dir.path());
 
     for sql in [
-        "CREATE TABLE C1 (a INTEGER, PRIMARY KEY (a))",
         "CREATE TABLE C2 (a INTEGER, FOREIGN KEY (a) REFERENCES T(id))",
         "CREATE TABLE C3 (a INTEGER, CONSTRAINT x UNIQUE (a))",
         "CREATE TABLE C4 (a INTEGER, UNIQUE (a))",
@@ -361,12 +360,24 @@ fn every_table_constraint_spelling_gets_the_documented_error() {
         );
     }
 
+    // PRIMARY KEY is the one of the five that has a supported spelling, so it
+    // names that spelling rather than the generic refusal.
+    let err = engine
+        .execute_sql("CREATE TABLE C1 (a INTEGER, PRIMARY KEY (a))")
+        .expect_err("a table-level PRIMARY KEY must be refused")
+        .to_string();
+    assert!(
+        err.contains("int PRIMARY KEY"),
+        "the refusal must name the column form, got: {err}"
+    );
+
     // The refusal must stay narrow: UNIQUE and CHECK are *column* constraints
     // too, and those follow the type rather than sitting where a column name is
     // expected. Only the column form is supported, and it must keep working.
     for sql in [
         "CREATE TABLE OK1 (a INTEGER UNIQUE, b TEXT)",
         "CREATE TABLE OK2 (a INTEGER NOT NULL, b TEXT)",
+        "CREATE TABLE OK3 (a INTEGER PRIMARY KEY, b TEXT)",
     ] {
         assert!(
             engine.execute_sql(sql).is_ok(),

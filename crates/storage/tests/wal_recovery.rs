@@ -321,13 +321,13 @@ fn test_crash_recovery_deletes_idempotent() {
         );
         for rid in &rids_to_keep {
             assert!(
-                cat.get("users", *rid).is_some(),
+                cat.get("users", *rid).expect("read row").is_some(),
                 "kept rid {rid:?} should still exist"
             );
         }
         for rid in &rids_to_delete {
             assert!(
-                cat.get("users", *rid).is_none(),
+                cat.get("users", *rid).expect("read row").is_none(),
                 "deleted rid {rid:?} must be gone after replay"
             );
         }
@@ -447,6 +447,7 @@ fn test_crash_recovery_update_by_pk_fast_path() {
         let cat = Catalog::open(&dir).unwrap();
         let row = cat
             .get("users", target_rid)
+            .expect("read row")
             .expect("row 5 should exist after replay");
         assert_eq!(row[0], Value::Int(5));
         assert_eq!(
@@ -515,6 +516,7 @@ fn test_crash_recovery_var_col_update() {
         let cat = Catalog::open(&dir).unwrap();
         let row = cat
             .get("users", target_rid)
+            .expect("read row")
             .expect("row 3 should exist after replay");
         assert_eq!(row[0], Value::Int(3));
         assert_eq!(

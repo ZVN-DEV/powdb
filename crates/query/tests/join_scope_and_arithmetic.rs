@@ -451,10 +451,11 @@ fn numeric_arithmetic_is_unchanged() {
             Value::Int(4)
         ]]
     );
-    assert_eq!(
-        rows(&mut engine, "Ev { .n / .zero }"),
-        vec![vec![Value::Empty]],
-        "a per-row zero divisor still yields the empty set in a projection"
+    assert!(
+        error(&mut engine, "Ev { .n / .zero }")
+            .to_string()
+            .contains("divide by zero"),
+        "a per-row zero divisor is refused, like the literal one above"
     );
     assert_eq!(
         rows(
@@ -467,14 +468,20 @@ fn numeric_arithmetic_is_unchanged() {
 
 // ---- A3: statement atomicity and sort-key resolution ----
 
-/// The expression-update loop writes each row as it goes and every non-transactional
-/// statement commits when it returns, error or not. A mid-loop `?` therefore leaves a
-/// TORN, durably committed update: the rows before the failure keep their new values,
-/// the rows after it are never visited. Any per-row rejection added to the write path
-/// buys a cleaner error message at the price of corrupting the table, so the write
-/// path must not reject per-row.
+/// The expression-update loop used to write each row as it went, and every
+/// non-transactional statement commits when it returns, error or not. A mid-loop
+/// `?` therefore left a TORN, durably committed update: the rows before the
+/// failure kept their new values and the rows after it were never visited, so a
+/// per-row rejection bought a cleaner message at the price of corrupting the
+/// table and the loop had to run to completion instead, writing a missing value
+/// into a required column.
+///
+/// The loop now evaluates every row image first and writes only once they all
+/// resolved, so the statement can refuse without touching a row. Neither half
+/// of the old dilemma survives: nothing is torn and nothing is silently
+/// missing.
 #[test]
-fn an_update_that_misses_on_one_row_is_not_torn() {
+fn an_update_that_cannot_compute_one_row_writes_nothing() {
     let mut engine = Engine::new(&temp_dir("torn")).unwrap();
     engine
         .execute_powql("type T { required id: int, required n: int, required z: int }")
@@ -484,27 +491,23 @@ fn an_update_that_misses_on_one_row_is_not_torn() {
             .execute_powql(&format!("insert T {{ id := {id}, n := {n}, z := {z} }}"))
             .unwrap();
     }
-    // Row 3 divides by a per-row zero, which the evaluator answers with the
-    // empty set. Every row must still be visited and the statement must not
-    // stop halfway through.
+    // Row 3 divides by a per-row zero, which has no answer.
     assert!(
-        matches!(
-            engine.execute_powql("T update { n := .n / .z }"),
-            Ok(QueryResult::Modified(4))
-        ),
-        "the update must run to completion rather than tearing at row 3"
+        error(&mut engine, "T update { n := .n / .z }")
+            .to_string()
+            .contains("divide by zero"),
+        "the row with no answer must refuse the statement"
     );
-    // Rows 1, 2 and 4 carry their computed value; row 3's `required n` holds a
-    // missing value, which is a known pre-existing gap (a per-row computed
-    // miss landing in a required column). Refusing it here is what tore the
-    // table, so the fix belongs with statement-level atomicity, not here.
+    // Every row keeps its original value: the refusal came before any write,
+    // so rows 1, 2 and 4 are not half-updated and row 3's `required n` is not
+    // missing.
     assert_eq!(
         rows(&mut engine, "T order .id { .id, .n }"),
         vec![
             vec![Value::Int(1), Value::Int(10)],
-            vec![Value::Int(2), Value::Int(10)],
-            vec![Value::Int(3), Value::Empty],
-            vec![Value::Int(4), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+            vec![Value::Int(4), Value::Int(40)],
         ]
     );
 }

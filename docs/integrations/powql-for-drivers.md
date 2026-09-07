@@ -81,10 +81,40 @@ only for named-user (multi-user) auth; omit it for shared-password or open
 servers.
 
 `ConnectOk` payload is a length-prefixed `version` string (the server's semver,
-e.g. `"0.22.0"`), optionally followed by the server's hello block.
+e.g. `"0.22.0"`), optionally followed by the server's hello block. The hello
+block, when present, is `HELLO_MAGIC` (`0x50574831`, u32 LE), then the
+negotiated `protocol`, `min_protocol`, `max_protocol` and `catalog_version`
+(u16 LE each), then the negotiated feature list.
 
 The whole payload after `db_name` is bounded by a 4 KiB pre-auth limit, so keep
 the hello small.
+
+#### What `ConnectOk` does not tell you
+
+Those are all the fields there are. Two things a driver might reasonably expect
+to learn from a successful handshake are not on the wire at all, and both are
+worth surfacing to your users as a caveat rather than silently assuming:
+
+- **A password you sent may have been ignored.** A server with no shared
+  password and no user store authenticates every peer, and never examines the
+  credential. It logs one warning at startup (`no password configured: all
+  connections will be accepted without authentication`) and nothing per
+  connection. `ConnectOk` carries no field saying whether the credential was
+  checked, so a client that believes it is authenticating against a secured
+  server, and is not, gets an indistinguishable reply. Verify the server's
+  configuration out of band; do not infer it from a successful CONNECT.
+- **A database name you sent may have been ignored.** A server that is not
+  pinned to a name (`--db-name` / `POWDB_DB_NAME` unset) serves one global
+  database and accepts any `db_name`. It warns **once per process**, not once
+  per connection (`client requested a named database but this server serves a
+  single global database; name ignored`), so the second and every later client
+  to send a wrong name produces no signal anywhere. `ConnectOk` does not echo
+  the name back. Only a server that *is* pinned refuses a mismatch, with
+  `unknown database '<x>'; this server serves '<y>'` and error class 6.
+
+Both are gaps in the protocol rather than in any client. Closing either one
+needs a new appended field and a negotiated feature; until then, a driver
+cannot detect either case.
 
 ### Protocol version negotiation
 
@@ -430,7 +460,44 @@ see [POWQL.md](../POWQL.md) for the full grammar.
 
 String literals use double quotes. Assignment (insert/update/upsert) uses `:=`,
 not `=`. A keyword used as an identifier must be backtick-quoted (`` `order`
-``); a dotted field reference like `.order` bypasses keyword lookup.
+``); a dotted field reference like `.order` bypasses keyword lookup. In SQL the
+same job is done by double-quoting (`"order"`), which the SQL frontend has read
+as an identifier since 0.23.0 and does not case-fold.
+
+#### Escaping a string literal
+
+PowQL's escape set is exactly `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and
+`\uXXXX` (four hex digits). The SQL frontend's is the same plus `\'`, because
+SQL strings are single-quoted; the two are otherwise identical, and the SQL set
+applies to a double-quoted identifier as well as to a string. **Any other escape
+is a parse error** in both languages. Until
+this release an unrecognized escape silently dropped its backslash, so `"a\Ab"`
+became `aAb` and a quoted SQL identifier `"i\d"` resolved to `id`. A generator
+that escapes only the quote character was producing text that meant something
+else; escape the backslash too.
+
+One consequence worth stating to your users: a `bytes` literal is written with a
+doubled backslash (`"\\x0a"`), which was always the only spelling that worked
+and is now the only spelling that parses.
+
+#### Two values that do not survive a round trip
+
+- **Negative zero.** A binder that tags an integral number as `int` loses the
+  sign of `-0`: it binds as `0`. The reference client does exactly this, because
+  `-0` is integral and in range. If a caller needs `-0.0` preserved, it must
+  reach the engine as a float.
+- **A lone surrogate.** A JavaScript string can hold an unpaired surrogate
+  (`"\uD800"`); UTF-8 cannot. The reference client encodes with the platform's
+  lossy UTF-8 conversion, so the surrogate is replaced with U+FFFD and **sent**,
+  not refused. On the server side the two frame families differ: the legacy
+  `Query` / `QueryWithParams` frames decode with a lossy conversion and also
+  replace, while the native `0x13`-`0x17` frames reject invalid UTF-8 with
+  `invalid UTF-8 in <field>`. A driver in a language with well-formed strings
+  will never produce this; one in a language without them should decide
+  deliberately whether to refuse or replace, and say which. Note the *literal*
+  path is stricter than the parameter path: a `\uD800` escape written into
+  query text is a lex error, because the four digits must name a Unicode
+  character and a surrogate is not one.
 
 #### Equality is type-strict; range comparison coerces numerically
 
@@ -610,11 +677,26 @@ commit          # or: rollback
 ```
 
 Transactions are per-connection; other connections never see uncommitted rows.
-Nesting is an error (`begin` inside an open transaction). A connection that
-closes with an open transaction is rolled back implicitly. Inside a transaction
-the WAL fsync is deferred to `commit`, so wrapping a bulk load in one
-transaction is dramatically faster while staying fully durable: surface this to
-your users as the batching primitive.
+Nesting is an error (`cannot begin: a transaction is already active on this
+connection`, class 2). A connection that closes with an open transaction is
+rolled back implicitly. Inside a transaction a statement does not fsync: the
+durability point is the `commit`, so wrapping a bulk load in one transaction is
+dramatically faster while staying fully durable. Surface this to your users as
+the batching primitive, but do not promise them one fsync: the WAL flushes and
+fsyncs every 64 records whatever the transaction state, and a written row is one
+record, so a 5000-row transaction costs roughly 78.
+
+Two more things a driver must know about an open transaction:
+
+- **A `readonly` role cannot begin one at all.** `begin`, `commit` and
+  `rollback` all classify as writes, because a transaction takes the writer
+  gate, so a `readonly` principal is refused with `permission denied: role
+  'readonly' cannot execute write statements` even for a transaction that would
+  only read. There is no read-only transaction on this surface; a `readonly`
+  connection reads in autocommit.
+- **The server stops batching its replies while a transaction is open**, because
+  the connection is holding the transaction gate. Do not tune your driver's read
+  loop on the assumption that reply batching is always on.
 
 If your driver pipelines statements, do **not** embed your own `begin`/`commit`
 in a pipelined script: a trailing `commit` is already on the wire when an
@@ -761,6 +843,119 @@ because they change how an application should retry and pool connections.
   usable for reads. A driver should classify it separately from the RBAC
   `permission denied: role` family: RBAC means "this user may not write here",
   snapshot mode means "nothing can write here; route writes to the primary".
+
+### Pipelining: the server's read-ahead budget, and yours
+
+A driver may pipeline: write the next request frame before the previous reply
+arrives. The server reads ahead into a bounded queue while a statement runs, and
+that queue has **two** caps, both of which bind:
+
+| Cap | Value | Constant |
+|---|---|---|
+| Frames in flight | 128 | `MAX_IN_FLIGHT_READ_AHEAD_FRAMES` |
+| Bytes in flight | 1 MiB | `MAX_IN_FLIGHT_READ_AHEAD_BYTES` |
+
+The byte cap is the tighter one for anything but small statements: 64 frames of
+20 KiB of query text is 1.28 MiB while the frame count never approaches 128. A
+driver that budgets only in frames will hit the byte cap first. The reference
+client bounds itself in both, at 64 frames (`maxInFlight`) and 1 MiB
+(`MAX_IN_FLIGHT_BYTES`), and always writes the head frame when the window is
+empty so one oversized statement cannot deadlock the pipeline.
+
+What happens at the cap changed in this release, and the old behaviour is worth
+knowing because it is what an older server does:
+
+- **Now**: the server pauses its read arm. A frame that does not fit the
+  remaining byte budget is not consumed at all; its header stays buffered,
+  read-ahead stops for the rest of the running statement, and the main loop
+  reads the whole frame at the full 64 MiB wire limit as soon as that statement
+  finishes. Nothing is refused and nothing is lost. The client sees no error.
+- **Before**: the server cancelled the running statement and closed the
+  connection with no `Error` frame. A burst of 200 concurrent queries answered
+  22 and the rest took `ECONNRESET`. If your driver must work against a
+  pre-0.28.0 server, bound your own in-flight window as above rather than
+  relying on the server to push back.
+
+Separately, a **frame-level** refusal (a payload past the 64 MiB wire limit, too
+many parameters) now answers with an `Error` frame carrying its class rather
+than only being logged before the close.
+
+### Cancellation is client-side only
+
+There is no cancel frame in this protocol. A driver that "aborts" a request can
+only stop caring about the reply: the statement is already on the wire, the
+server runs it to completion, and its reply must still be read off the socket
+and discarded. Consequences to surface:
+
+- An aborted write is **not** rolled back by the abort. It commits.
+- The in-flight slot is not freed early, so an abort does not make room in your
+  pipelining window sooner.
+- The one cancellation the server does perform is cooperative and is triggered
+  by the client **disconnecting**: the statement returns `query cancelled by
+  client disconnect`. Closing the connection is the only way to stop a running
+  statement, and it costs the connection.
+
+The reference client models this as rejecting the caller's promise with a
+`PowDBError` coded `aborted`, carrying the abort reason on `.cause`, while
+leaving the entry in its queue so the eventual reply is decoded and dropped.
+
+### A too-large result need not cost the connection
+
+A driver that caps result size (the reference client caps at
+`MAX_RESULT_CELLS`, 2,000,000 rows times columns) should treat that cap as the
+one decode failure it can recover from: the frame's length prefix is intact, so
+the whole frame can be consumed and discarded, only the query that asked for it
+failed (the reference client codes it `size_exceeded`), and the connection stays
+usable. Every other decode failure means the byte stream is no longer trusted
+and the connection must be dropped.
+
+### Connection ceiling, shutdown, and reload
+
+- **Concurrent connections** are capped at 1024 by default
+  (`--max-connections` / `POWDB_MAX_CONNECTIONS`). A peer past the ceiling is
+  **not refused**: its TCP connection is established and then waits, unserved,
+  for a slot. No bytes are read from it and the 10 s pre-auth deadline does not
+  start until a slot is granted. A driver cannot distinguish this from a slow
+  server; use your own connect timeout.
+- **The pre-auth deadline is 10 s and is not configurable.** It bounds the whole
+  phase before CONNECT, pings included: a pre-auth `Ping` is answered but does
+  not extend the deadline. A health check that connects, pings and closes fits
+  comfortably; one that parks a pre-auth connection and pings it forever must
+  reconnect per check.
+- **The idle timeout is 300 s** (`POWDB_IDLE_TIMEOUT`), and `0` is refused
+  rather than meaning "disabled".
+- **SIGTERM and SIGINT drain.** The server stops accepting, then each connection
+  is closed **between frames** with an `Error` frame reading `server shutting
+  down` (class 0). A statement already executing is not interrupted, so
+  in-flight work finishes. The drain is bounded by `--shutdown-timeout`
+  (30 s default); on expiry the server logs and exits non-zero.
+- **SIGHUP reloads the user store and nothing else.** It re-reads `auth.json`,
+  so a rotated password takes effect and a deleted user stops being able to log
+  in without a restart. It does not reload TLS material, the shared password, or
+  any other setting.
+
+### Unix-domain sockets
+
+`powdb-server --socket <path>` (env `POWDB_SOCKET`) publishes an additional
+listener alongside the TCP one. The socket is bound at a private staging name in
+the same directory (`.<name>.staging-<pid>`), restricted to `0660`, and renamed
+into place, so the published path only ever names an already-restricted socket
+and is never briefly absent. That directory must be writable and on the same
+filesystem; nothing observes the staging name and it is removed on failure.
+
+Which surfaces can connect over one:
+
+| Surface | Unix socket |
+|---|---|
+| `powdb-cli --remote <path>` | Yes. An argument containing a path separator, starting `~`, or ending `.sock` is read as a socket path |
+| `@zvndev/powdb-client` | Yes, via `{ path }` instead of `{ host, port }`. `Pool` inherits it |
+| `@zvndev/powdb-sync` | Transport-agnostic: it takes an injected client, so it reaches a socket through a `Client` constructed with `{ path }` |
+| `@zvndev/powdb-embedded` | Not applicable: in-process, no server and no socket |
+
+Two protocol consequences a driver must handle: TLS over a Unix socket is
+refused (it is local and same-host), and a socket peer has no address, so **all
+socket peers share one auth rate-limit bucket** rather than being limited
+per address.
 
 ### Version compatibility
 

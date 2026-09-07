@@ -295,6 +295,21 @@ pub(crate) fn is_effectively_blank_in(statement: &str, dialect: Dialect) -> bool
     }
 }
 
+/// Drop one trailing `;` from a REPL statement.
+///
+/// `--exec` and `--exec-file` SEPARATE statements with `;`, so every
+/// documented example and every line copied out of a script carries one, and
+/// the REPL answered a parse error for a statement it would otherwise have
+/// run. Exactly one is dropped, so `select 1;;` still reports the empty
+/// statement it really is.
+pub(crate) fn strip_one_trailing_semicolon(statement: &str) -> &str {
+    let trimmed = statement.trim_end();
+    match trimmed.strip_suffix(';') {
+        Some(rest) => rest.trim_end(),
+        None => trimmed,
+    }
+}
+
 /// True when the line is the continuation escape hatch. Recognized anywhere,
 /// including in the middle of an unterminated statement, which is the whole
 /// point: without it an unbalanced `(` swallows every later line, meta-commands

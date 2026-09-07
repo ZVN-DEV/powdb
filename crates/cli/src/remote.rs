@@ -9,6 +9,22 @@ use super::*;
 pub(crate) enum RemoteStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    /// A Unix domain socket, for a server started with `--socket`. Such a
+    /// server may bind no TCP port at all.
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+/// Whether `--remote` names a Unix socket path rather than `host:port`.
+///
+/// A `host:port` never contains a path separator, and neither does an IPv6
+/// literal in brackets, so the separator settles it. `--remote ./powdb.sock`
+/// and `--remote ~/run/powdb.sock` are paths too.
+pub(crate) fn remote_is_unix_socket(addr: &str) -> bool {
+    addr.contains('/')
+        || addr.contains(std::path::MAIN_SEPARATOR)
+        || addr.starts_with('~')
+        || addr.ends_with(".sock")
 }
 
 /// Build a rustls client connector on the same tokio-rustls stack the server
@@ -75,9 +91,66 @@ pub(crate) fn resolve_tls_server_name(
         .map_err(|_| format!("invalid TLS server name: {name}"))
 }
 
+/// What to try next after a failed TLS handshake, given what rustls said and
+/// what was already passed.
+///
+/// The old hint told you to pass `--tls-ca` even when `--tls-ca` was what had
+/// just failed, and `CaUsedAsEndEntity` (the file is the server's own leaf
+/// certificate rather than a CA) got the same generic advice as every other
+/// failure, so following it changed nothing.
+pub(crate) fn tls_handshake_hint(error: &str, tls: &TlsOpts) -> String {
+    if error.contains("CaUsedAsEndEntity") {
+        return "the file passed to --tls-ca is the server's own certificate, not a CA \
+                certificate: pass the CA that signed it. A self-signed leaf cannot be used \
+                as its own CA unless it carries basicConstraints CA:TRUE"
+            .to_string();
+    }
+    if error.contains("ExtensionValueInvalid") {
+        return "the certificate has an invalid extension, most often a DUPLICATE \
+                basicConstraints written by an `openssl req` config that sets it twice: \
+                reissue the certificate with a single basicConstraints extension"
+            .to_string();
+    }
+    if error.contains("CertExpired") || error.contains("expired") {
+        return "the server certificate is expired: reissue it".to_string();
+    }
+    let mut suggestions: Vec<&str> = Vec::new();
+    if tls.ca_path.is_none() {
+        suggestions.push("self-signed server? pass --tls-ca <ca.pem>");
+    }
+    if tls.server_name.is_none() {
+        suggestions
+            .push("connecting by IP to a hostname certificate? pass --tls-server-name <name>");
+    }
+    if suggestions.is_empty() {
+        return "--tls-ca and --tls-server-name are both already set, so the certificate \
+                itself is what the client will not accept"
+            .to_string();
+    }
+    suggestions.join("; ")
+}
+
 /// Open the remote connection, wrapping it in TLS when requested. With TLS
 /// disabled this is exactly the plaintext `TcpStream::connect` path.
 pub(crate) async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteStream, String> {
+    #[cfg(unix)]
+    if remote_is_unix_socket(addr) {
+        // TLS terminates a TCP connection and verifies a hostname. A unix
+        // socket has neither, and the server's socket listener speaks
+        // cleartext, so asking for TLS here can only ever fail at handshake.
+        if tls.enabled {
+            return Err(format!(
+                "TLS is not used on a unix socket ({addr}): the connection is already local and \
+                 the server's socket listener speaks cleartext. Drop --tls (and POWDB_TLS, \
+                 POWDB_TLS_CA, POWDB_TLS_SERVER_NAME, which imply it)"
+            ));
+        }
+        let stream = tokio::net::UnixStream::connect(addr)
+            .await
+            .map_err(|e| format!("connection to unix socket {addr} failed: {e}"))?;
+        return Ok(RemoteStream::Unix(stream));
+    }
+
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connection failed: {e}"))?;
@@ -89,9 +162,8 @@ pub(crate) async fn connect_remote(addr: &str, tls: &TlsOpts) -> Result<RemoteSt
     match connector.connect(server_name, stream).await {
         Ok(s) => Ok(RemoteStream::Tls(Box::new(s))),
         Err(e) => Err(format!(
-            "TLS handshake with {addr} failed: {e} \
-             (self-signed server? pass --tls-ca <ca.pem>; connecting by IP to a \
-             hostname certificate? pass --tls-server-name <name>)"
+            "TLS handshake with {addr} failed: {e} ({})",
+            tls_handshake_hint(&e.to_string(), tls)
         )),
     }
 }
@@ -113,6 +185,10 @@ pub(crate) async fn exec_remote(
         }
         Ok(RemoteStream::Tls(s)) => {
             exec_remote_on(*s, db, password, username, query, session).await
+        }
+        #[cfg(unix)]
+        Ok(RemoteStream::Unix(s)) => {
+            exec_remote_on(s, db, password, username, query, session).await
         }
         Err(msg) => {
             eprintln!("Error: {msg}");
@@ -288,7 +364,7 @@ where
     let mut code = 0;
     let statements = split_statements_in(&query, session.dialect);
     let statement_count = statements.len();
-    for stmt in statements {
+    for (index, stmt) in statements.into_iter().enumerate() {
         // Comment-only segments never reach the wire, same as embedded
         // one-shot and the REPL: they are not statements, and the server
         // would answer "expected statement, got end of input".
@@ -319,6 +395,9 @@ where
                 let is_error = matches!(msg, Message::Error { .. });
                 print_remote_result(&msg, session.output);
                 if is_error {
+                    if let Some(where_) = failing_statement_locator(index, statement_count, stmt) {
+                        eprintln!("{where_}");
+                    }
                     if let Some(hint) = missing_separator_hint(&query, statement_count) {
                         eprintln!("{hint}");
                     }
@@ -339,9 +418,51 @@ where
         }
     }
 
+    if close_open_remote_transaction(&mut reader, &mut writer, session.dialect, typed).await {
+        eprintln!("Error: transaction still open at end of script; rolled back");
+        eprintln!(
+            "note: every write since `begin` was discarded when this connection closed. \
+             End the script with `commit` (or `rollback`) so its outcome is explicit."
+        );
+        code = 1;
+    }
+
     let _ = Message::Disconnect.write_to(&mut writer).await;
     let _ = tokio::io::AsyncWriteExt::flush(&mut writer).await;
     code
+}
+
+/// Roll back a transaction the script left open, reporting whether there was
+/// one.
+///
+/// The server discards an open transaction when the connection closes, so a
+/// script that ended between `begin` and `commit` committed nothing and used
+/// to exit 0 anyway. The server is the authority on whether a transaction is
+/// open, so this asks it: `rollback` succeeds only when there is one to roll
+/// back. A connection that is already broken answers nothing and reports
+/// nothing, because the failure has been reported already.
+pub(crate) async fn close_open_remote_transaction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    dialect: Dialect,
+    typed: bool,
+) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let probe = query_message("rollback".to_string(), dialect, typed);
+    if probe.write_to(writer).await.is_err()
+        || tokio::io::AsyncWriteExt::flush(writer).await.is_err()
+    {
+        return false;
+    }
+    matches!(
+        Message::read_from(reader).await,
+        Ok(Some(
+            Message::ResultOk { .. } | Message::ResultMessage { .. }
+        ))
+    )
 }
 
 // ─── Remote (wire protocol) mode ────────────────────────────────────────────
@@ -360,6 +481,8 @@ pub(crate) async fn run_remote(
     match connect_remote(&addr, tls).await {
         Ok(RemoteStream::Plain(s)) => run_remote_on(s, db, password, username, session).await,
         Ok(RemoteStream::Tls(s)) => run_remote_on(*s, db, password, username, session).await,
+        #[cfg(unix)]
+        Ok(RemoteStream::Unix(s)) => run_remote_on(s, db, password, username, session).await,
         Err(msg) => {
             eprintln!("Error: {msg}");
             std::process::exit(1);
@@ -517,7 +640,7 @@ pub(crate) async fn run_remote_on<S>(
                     continue;
                 }
                 continuation_noted = false;
-                let statement = buffer.trim().to_string();
+                let statement = strip_one_trailing_semicolon(buffer.trim()).to_string();
                 buffer.clear();
                 if is_effectively_blank_in(&statement, session.dialect) {
                     continue;

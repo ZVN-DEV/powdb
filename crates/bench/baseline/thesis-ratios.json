@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated": "2026-07-14",
+  "updated": "2026-09-07",
   "_README": [
     "This file is HAND-EDITED ONLY. No script writes to it.",
     "Each ratio enforces a structural property of PowDB that should not silently degrade.",
@@ -11,9 +11,9 @@
     "powql_point_over_btree_lookup": {
       "numerator": "powql_point",
       "denominator": "btree_lookup",
-      "ceiling": 7.0,
-      "observed_at_last_edit": 6.172,
-      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. Previous ceilings: 2.5 (M1, btree_lookup ~1832ns), 6.0 (Mission D, btree_lookup ~262ns, observed 5.004x). PR #14 CI: 1529ns / 248ns = 6.172x \u2014 btree_lookup improved -6.15% while powql_point was -1.59%, both within absolute gates. Same denominator-shrinkage pattern. Relaxed 6.0 -> 7.0 with ~13% headroom. The absolute gate on powql_point (7%) is the real regression detector; this ratio guards against structural parse/plan/exec overhead growth."
+      "ceiling": 9.5,
+      "observed_at_last_edit": 8.505,
+      "meaning": "Full PowQL parser+planner+executor overhead over the raw B-tree probe. Previous ceilings: 2.5 (M1, btree_lookup ~1832ns), 6.0 (Mission D, btree_lookup ~262ns, observed 5.004x). PR #14 CI: 1529ns / 248ns = 6.172x \u2014 btree_lookup improved -6.15% while powql_point was -1.59%, both within absolute gates. Same denominator-shrinkage pattern. Relaxed 6.0 -> 7.0 with ~13% headroom. The absolute gate on powql_point (7%) is the real regression detector; this ratio guards against structural parse/plan/exec overhead growth. Depot run 34167015205 at f37c437 (v0.28.0-rc.1 branch): 1439ns / 169ns = 8.505x. This time the thesis did give ground: per-execution validation against the live catalog (0.20.0) and plan-cache verification (0.26.0) are real per-query costs that stay, and btree_lookup shrank another 8% on top. On main (v0.27.0) the same instance measured 1977 / 171 = 11.56x; this branch's single-walk validation brought it back to 8.5x. Relaxed 7.0 -> 9.5 with ~12% headroom. The absolute gate on powql_point (20%) remains the regression detector."
     },
     "scan_filter_count_over_btree_lookup": {
       "numerator": "powql_aggregation",

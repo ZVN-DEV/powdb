@@ -1,12 +1,13 @@
 {
   "name": "@zvndev/powdb-client",
-  "version": "0.27.0",
+  "version": "0.28.0-rc.1",
   "description": "TypeScript client for PowDB (PowQL wire protocol)",
   "type": "module",
   "packageManager": "pnpm@10.29.3",
   "main": "./dist/cjs/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "sideEffects": false,
   "exports": {
     ".": {
       "import": {
@@ -75,6 +76,7 @@
     "test:script": "tsx test/script.test.ts",
     "test:eager": "tsx test/run-with-server.ts test/eager.test.ts",
     "test:exec-script": "tsx test/run-with-server.ts test/exec-script.test.ts",
+    "test:readme": "node scripts/check-readme-samples.mjs",
     "demo": "tsx demo/demo.ts",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run build"

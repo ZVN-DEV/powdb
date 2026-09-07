@@ -188,6 +188,14 @@ section:last-child { border-bottom: none; }
 
 .install-block .prompt { color: var(--green); }
 
+.hero-version {
+  margin-top: 12px;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.hero-version a { color: var(--text-muted); }
+
 /* ── Benchmark Table ── */
 
 .bench-section h2,

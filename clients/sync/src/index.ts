@@ -105,7 +105,25 @@ export interface RemoteSyncClient {
   syncAck(request: SyncAckRequest, opts?: { signal?: AbortSignal }): Promise<SyncAckResult>;
 }
 
-export interface LocalApplyRequest extends SyncIdentity {
+/**
+ * A {@link SyncIdentity} after normalization: every field is exactly the type
+ * the native `Database.applyRetainedUnits(...)` binding takes.
+ *
+ * `SyncIdentity` is the lenient caller-facing input type, where a u64 may
+ * arrive as a `number`. What a replica hands its local adapter has already
+ * been through `toU64`, so widening the adapter's parameter to `SyncU64` only
+ * made the obvious adapter (`(request) => local.applyRetainedUnits(request)`)
+ * fail to compile against the addon's own `bigint`.
+ */
+export interface NormalizedSyncIdentity {
+  databaseId: string | Uint8Array;
+  primaryGeneration: bigint;
+  walFormatVersion: number;
+  catalogVersion: number;
+  segmentFormatVersion: number;
+}
+
+export interface LocalApplyRequest extends NormalizedSyncIdentity {
   replicaId: string;
   sinceLsn: bigint;
   units: RetainedUnit[];
@@ -160,7 +178,22 @@ export interface PowDBSyncReplicaOptions {
   identity: SyncIdentity;
   local: LocalReplica;
   remote: RemoteSyncClient;
+  /**
+   * Units one pull asks for. Defaults to, and is capped at, the primary's
+   * `MAX_SYNC_PULL_UNITS` (4096), which is also the most the primary will put
+   * in one chunk. Asking for less does not cut a chunk inside a transaction:
+   * the primary runs a chunk on to the commit that closes the transaction it
+   * lands in, but only as far as that same cap. At the default there is
+   * therefore no headroom above the request left, and a transaction too large
+   * for the cap comes back as a `rebootstrap` status naming it.
+   */
   maxPullUnits?: number;
+  /**
+   * Payload bytes one pull asks for. Defaults to, and is capped at, the
+   * primary's `MAX_SYNC_PULL_BYTES` (16 MiB). This is the budget that cuts a
+   * chunk, so lowering it makes a large transaction unservable: the primary
+   * cannot cut inside one and answers `rebootstrap` instead.
+   */
   maxPullBytes?: SyncU64;
   maxPullRounds?: number;
 }
@@ -223,15 +256,57 @@ export interface WriteResult {
   syncRemoteLsn?: bigint;
 }
 
-const DEFAULT_MAX_PULL_UNITS = 512;
-const DEFAULT_MAX_PULL_BYTES = 4 * 1024 * 1024;
+/**
+ * The largest `maxUnits` the primary accepts, and the most it will serve in
+ * one chunk (`MAX_SYNC_PULL_UNITS` in `crates/server/src/handler/sync.rs`). A
+ * larger request is refused outright, so asking for one only produces a
+ * protocol error on every pull.
+ */
+const MAX_PULL_UNITS_CEILING = 4096;
+
+/**
+ * The largest `maxBytes` the primary accepts (`MAX_SYNC_PULL_BYTES`, same
+ * file). The primary stops filling a chunk on
+ * `selected_bytes + unit_bytes > max_bytes`, so on wide rows this budget is
+ * what cuts a chunk and on narrow ones the unit cap is. Whichever cuts first,
+ * a transaction that does not fit inside it is answered with `rebootstrap`.
+ */
+const MAX_PULL_BYTES_CEILING = 16 * 1024 * 1024;
+
+/**
+ * Units a pull asks for by default.
+ *
+ * The primary runs a chunk past `maxUnits` to the commit that closes the
+ * transaction the chunk lands in, but never past `MAX_SYNC_PULL_UNITS`, which
+ * is what this default already is. So the primary cannot serve more than the
+ * default asks for, and a transaction that does not fit the cap comes back as
+ * a `rebootstrap` status rather than as an over-long chunk. The default sat at
+ * 512 while the primary treated the request as a hard cap, which made every
+ * transaction of more than ~512 units unservable: the chunk was cut inside
+ * the transaction, the primary refused it, and every retry cut in the same
+ * place.
+ */
+const DEFAULT_MAX_PULL_UNITS = MAX_PULL_UNITS_CEILING;
+
+/**
+ * Bytes a pull asks for by default.
+ *
+ * Both defaults have to sit at the primary's ceiling for the same reason. A
+ * chunk the byte budget cuts inside a transaction is not applyable, and the
+ * primary answers `rebootstrap` rather than an error the replica could retry
+ * differently — so a default below the server's own cap turns a transaction
+ * the primary would happily serve into a permanent rebootstrap loop, and the
+ * replica re-wedges on the next transaction of that size after every
+ * bootstrap. `test/sync.test.ts` diffs both against the engine's constants.
+ */
+const DEFAULT_MAX_PULL_BYTES = MAX_PULL_BYTES_CEILING;
 const DEFAULT_MAX_PULL_ROUNDS = 32;
 const MAX_U64 = 0xffff_ffff_ffff_ffffn;
 const DDL_KEYWORDS = new Set(["alter", "create", "drop", "materialize", "type"]);
 
 export class PowDBSyncReplica {
   private readonly replicaId: string;
-  private readonly identity: NormalizedIdentity;
+  private readonly identity: NormalizedSyncIdentity;
   private readonly local: LocalReplica;
   private readonly remote: RemoteSyncClient;
   private readonly maxPullUnits: number;
@@ -247,9 +322,24 @@ export class PowDBSyncReplica {
       options.maxPullUnits ?? DEFAULT_MAX_PULL_UNITS,
       "maxPullUnits",
     );
+    // Both budgets are validated against the primary's own ceilings here
+    // rather than left to the server, which refuses an over-large request on
+    // every pull with no hint about which option produced it.
+    if (this.maxPullUnits > MAX_PULL_UNITS_CEILING) {
+      throw new PowDBSyncError(
+        `maxPullUnits must be between 1 and ${MAX_PULL_UNITS_CEILING}, the primary's ceiling`,
+        "protocol_error",
+      );
+    }
     this.maxPullBytes = toU64(options.maxPullBytes ?? DEFAULT_MAX_PULL_BYTES, "maxPullBytes");
     if (this.maxPullBytes === 0n) {
       throw new PowDBSyncError("maxPullBytes must be greater than zero", "protocol_error");
+    }
+    if (this.maxPullBytes > BigInt(MAX_PULL_BYTES_CEILING)) {
+      throw new PowDBSyncError(
+        `maxPullBytes must be between 1 and ${MAX_PULL_BYTES_CEILING}, the primary's ceiling`,
+        "protocol_error",
+      );
     }
     this.maxPullRounds = validatePositiveInteger(
       options.maxPullRounds ?? DEFAULT_MAX_PULL_ROUNDS,
@@ -262,7 +352,7 @@ export class PowDBSyncReplica {
   }
 
   async status(opts?: { signal?: AbortSignal }): Promise<SyncStatus> {
-    return this.remote.syncStatus(this.replicaId, opts);
+    return this.remoteStatus(opts?.signal);
   }
 
   startBackgroundSync(options: BackgroundSyncOptions): BackgroundSyncHandle {
@@ -339,7 +429,7 @@ export class PowDBSyncReplica {
       options.maxPullRounds ?? this.maxPullRounds,
       "maxPullRounds",
     );
-    let status = await this.remote.syncStatus(this.replicaId, { signal: options.signal });
+    let status = await this.remoteStatus(options.signal);
     let pulls = 0;
     let units = 0;
     let appliedLsn: bigint | null = status.lastAppliedLsn;
@@ -369,16 +459,7 @@ export class PowDBSyncReplica {
       }
 
       const sinceLsn = status.lastAppliedLsn;
-      const pull = await this.remote.syncPull(
-        {
-          replicaId: this.replicaId,
-          sinceLsn,
-          maxUnits: this.maxPullUnits,
-          maxBytes: this.maxPullBytes,
-          ...this.identity,
-        },
-        { signal: options.signal },
-      );
+      const pull = await this.remotePull(sinceLsn, options.signal);
       status = pull.status;
       this.throwIfUnusableStatus(status);
 
@@ -493,6 +574,42 @@ export class PowDBSyncReplica {
     }
   }
 
+  /**
+   * Ask the primary for this replica's status, reporting a transport failure
+   * as `remote_unavailable`.
+   *
+   * Every entry point routes through here so one dead connection cannot
+   * surface as `closed` from `status()`, `protocol_error` from `syncNow()`,
+   * and `remote_unavailable` from the background loop.
+   */
+  private async remoteStatus(signal?: AbortSignal): Promise<SyncStatus> {
+    try {
+      return await this.remote.syncStatus(this.replicaId, { signal });
+    } catch (err) {
+      throw toRemoteError(err, "sync status");
+    }
+  }
+
+  private async remotePull(
+    sinceLsn: bigint,
+    signal?: AbortSignal,
+  ): Promise<SyncPullResult> {
+    try {
+      return await this.remote.syncPull(
+        {
+          replicaId: this.replicaId,
+          sinceLsn,
+          maxUnits: this.maxPullUnits,
+          maxBytes: this.maxPullBytes,
+          ...this.identity,
+        },
+        { signal },
+      );
+    } catch (err) {
+      throw toRemoteError(err, "sync pull");
+    }
+  }
+
   private throwIfUnusableStatus(
     status: SyncStatus,
     context: PowDBSyncErrorOptions = {},
@@ -507,15 +624,7 @@ export class PowDBSyncReplica {
   }
 }
 
-type NormalizedIdentity = {
-  databaseId: string | Uint8Array;
-  primaryGeneration: bigint;
-  walFormatVersion: number;
-  catalogVersion: number;
-  segmentFormatVersion: number;
-};
-
-function normalizeIdentity(identity: SyncIdentity): NormalizedIdentity {
+function normalizeIdentity(identity: SyncIdentity): NormalizedSyncIdentity {
   return {
     databaseId: normalizeDatabaseId(identity.databaseId),
     primaryGeneration: toU64(identity.primaryGeneration, "primaryGeneration"),
@@ -764,6 +873,27 @@ function classifyWriteError(err: unknown): PowDBSyncError {
     "commit_outcome_unknown",
     { cause: err },
   );
+}
+
+/**
+ * One code for every way the primary can be out of reach. An abort is the
+ * caller's own doing and passes through untouched.
+ */
+function toRemoteError(err: unknown, operation: string): PowDBSyncError {
+  if (err instanceof PowDBSyncError) return err;
+  if (isAbort(err)) throw err;
+  return new PowDBSyncError(
+    errorMessage(err, `${operation} failed`),
+    "remote_unavailable",
+    { cause: err },
+  );
+}
+
+function isAbort(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = "code" in err ? (err as { code?: unknown }).code : undefined;
+  const name = "name" in err ? (err as { name?: unknown }).name : undefined;
+  return code === "aborted" || name === "AbortError";
 }
 
 function toSyncError(err: unknown, fallback: PowDBSyncErrorCode): PowDBSyncError {

@@ -6,8 +6,8 @@ body:
     attributes:
       value: |
         Thanks for taking the time to suggest an improvement. Please check the
-        existing [issues](https://github.com/zvndev/powdb/issues) and
-        [PowQL reference](https://github.com/zvndev/powdb/blob/main/docs/POWQL.md)
+        existing [issues](https://github.com/ZVN-DEV/powdb/issues) and
+        [PowQL reference](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md)
         first to avoid duplicates.
 
   - type: textarea

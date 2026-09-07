@@ -177,6 +177,69 @@ async function main() {
     assert.equal(scalar(c), "2");
   });
 
+  await test("a failure stops dispatch instead of running the whole script", async () => {
+    // Fail-fast is written as a loop-head guard, but the loop only yielded on
+    // socket backpressure, which a 64-frame window makes unreachable -- so the
+    // guard could never observe a failure and every statement of a long script
+    // went out and ran server-side.
+    const halt = tbl("Halt");
+    await client.query(`type ${halt} { required n: int }`);
+    const total = 400;
+    const statements = Array.from({ length: total }, (_, i) =>
+      i === 5 ? "this is not valid powql" : `insert ${halt} { n := ${i} }`,
+    );
+
+    const writes = instrumentWrites(client);
+    const before = writes.count();
+    await assert.rejects(
+      () => client.execScript(statements.join(";\n")),
+      (err: unknown) => isPowDBScriptError(err) && err.statementIndex === 5,
+    );
+    const dispatched = writes.count() - before;
+    assert.ok(
+      dispatched < total,
+      `dispatched all ${dispatched} statements despite the failure at 6`,
+    );
+    // The window is 64 frames, so dispatch legitimately runs that far ahead of
+    // the first reply. This is the documented "statements already written when
+    // the error arrives still execute" behaviour, now bounded by the window.
+    assert.ok(dispatched >= 64, `dispatched only ${dispatched}, below the window`);
+    const inserted = Number(scalar(await client.query(`count(${halt})`)));
+    assert.ok(inserted < total - 1, `${inserted} rows inserted out of ${total - 1}`);
+  });
+
+  await test("a long script does not buffer every frame in client memory", async () => {
+    // Frames past the window wait in the client's own queue. Without a yield
+    // on the window, dispatch ran to the end of the script first, so a
+    // 10,000-statement script of 5 KB inserts held ~50 MB of encoded frames
+    // however slowly the server drained.
+    const bulk = tbl("Bulk");
+    await client.query(`type ${bulk} { required n: int }`);
+    const total = 500;
+    const script = Array.from(
+      { length: total },
+      (_, i) => `insert ${bulk} { n := ${i} }`,
+    ).join(";\n");
+
+    const inner = client as unknown as { queued: unknown[]; pump: () => void };
+    const origPump = inner.pump;
+    let maxQueued = 0;
+    inner.pump = function patched(this: unknown) {
+      maxQueued = Math.max(maxQueued, inner.queued.length);
+      return origPump.call(this);
+    };
+    try {
+      const results = await client.execScript(script);
+      assert.equal(results.length, total);
+    } finally {
+      delete (inner as { pump?: unknown }).pump;
+    }
+    assert.ok(
+      maxQueued <= 128,
+      `client buffered ${maxQueued} unwritten frames for a ${total}-statement script`,
+    );
+  });
+
   // ──────────────────────────────────────────────────────────
   console.log("\nexecScript — continueOnError");
   // ──────────────────────────────────────────────────────────

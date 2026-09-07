@@ -63,6 +63,25 @@ fn positioned(position: Option<usize>, body: &str) -> String {
     }
 }
 
+/// A pipeline clause that carries a value may be written at most once. Before
+/// this check a second `filter` simply replaced the first, so half a predicate
+/// could go missing without a word; the same held for `order`, `limit`,
+/// `offset`, `group` and the projection block. One rule covers every such
+/// clause, in the read pipeline and in nested blocks alike. `having` is the
+/// deliberate exception: repeats there chain with `and`.
+fn refuse_repeated_clause<T>(slot: &Option<T>, what: &str) -> Result<(), ParseError> {
+    if slot.is_none() {
+        return Ok(());
+    }
+    Err(ParseError::Syntax {
+        message: format!(
+            "{what} appears more than once in one pipeline; each clause is written once, \
+             so combine them into one"
+        ),
+        position: None,
+    })
+}
+
 impl ParseError {
     /// Convenience: human-readable message for any variant.
     pub fn message(&self) -> String {
@@ -149,6 +168,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
         message: e.message,
         position: e.position,
     })?;
+    let mut referenced = vec![false; params.len()];
     for tok in tokens.iter_mut() {
         if let Token::Param(name) = tok {
             let n: usize = name.parse().map_err(|_| ParseError::Syntax {
@@ -170,6 +190,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                 ),
                 position: None,
             })?;
+            referenced[n - 1] = true;
             *tok = match p {
                 ParamValue::Null => Token::Null,
                 ParamValue::Int(v) => Token::IntLit(*v),
@@ -178,6 +199,29 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                 ParamValue::Str(s) => Token::StringLit(s.clone()),
             };
         }
+    }
+    // A supplied value the query never mentions was dropped in silence, which
+    // is the same failure an off-by-one in any positional API produces and
+    // leaves nothing in the result to show it. Too FEW parameters has always
+    // been an error; too many is the same mistake counted the other way.
+    if let Some(unused) = referenced.iter().position(|used| !used) {
+        let supplied = params.len();
+        let plural = if supplied == 1 { "" } else { "s" };
+        let message = match referenced.iter().rposition(|used| *used) {
+            None => format!("{supplied} parameter{plural} supplied but the query references none"),
+            Some(highest) if unused > highest => format!(
+                "{supplied} parameter{plural} supplied but the query references only ${}",
+                highest + 1
+            ),
+            Some(_) => format!(
+                "{supplied} parameter{plural} supplied but the query never references ${}",
+                unused + 1
+            ),
+        };
+        return Err(ParseError::Syntax {
+            message,
+            position: None,
+        });
     }
     parse_tokens_with_spans(tokens, Some(spans))
 }
@@ -293,6 +337,60 @@ fn closest_keyword<'a>(
         // over statement keywords. At a pipeline-stage boundary that is the
         // likelier intent.
         .min_by_key(|kw| edit_distance(&lower, kw))
+}
+
+/// Every function name PowQL knows, for naming the closest one when a call
+/// names a function it does not have.
+const FUNCTION_NAMES: &[&str] = &[
+    "upper",
+    "lower",
+    "length",
+    "trim",
+    "substring",
+    "concat",
+    "abs",
+    "round",
+    "ceil",
+    "floor",
+    "sqrt",
+    "pow",
+    "now",
+    "extract",
+    "date_add",
+    "date_diff",
+    "json_type",
+    "json_text",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "uuid",
+    "bytes",
+];
+
+/// Best function-name match for a call to a function PowQL does not have.
+fn closest_function(word: &str) -> Option<&'static str> {
+    closest_keyword(word, FUNCTION_NAMES.iter())
+}
+
+/// The one message a link path outside a projection gets, whichever way it was
+/// written. `p.author.name` and `.author.name` are the same mistake and reach
+/// two different parser productions, so the wording lives here rather than at
+/// either of them: the aliased spelling was fixed first and the unaliased one
+/// kept the old opaque "unexpected trailing token" for a release.
+fn link_traversal_outside_projection(path: &str) -> ParseError {
+    ParseError::Syntax {
+        message: format!(
+            "link traversal '{path}' is only supported in a projection; \
+             `filter`, `order` and `group` cannot traverse a link, so join \
+             the target type and use its own columns"
+        ),
+        position: None,
+    }
 }
 
 /// Best keyword match for an identifier that appeared where the parser
@@ -657,26 +755,32 @@ impl Parser {
                     distinct = true;
                 }
                 Token::Group => {
+                    refuse_repeated_clause(&group_by, "'group'")?;
                     self.advance();
                     group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
+                    refuse_repeated_clause(&filter, "'filter'")?;
                     self.advance();
                     filter = Some(self.parse_expr()?);
                 }
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
                 Token::LBrace => {
+                    refuse_repeated_clause(&projection, "a projection")?;
                     projection = Some(self.parse_projection()?);
                 }
                 Token::Having => {
@@ -786,26 +890,32 @@ impl Parser {
                     distinct = true;
                 }
                 Token::Group => {
+                    refuse_repeated_clause(&group_by, "'group'")?;
                     self.advance();
                     group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
+                    refuse_repeated_clause(&filter, "'filter'")?;
                     self.advance();
                     filter = Some(self.parse_expr()?);
                 }
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
                 Token::LBrace => {
+                    refuse_repeated_clause(&projection, "a projection")?;
                     projection = Some(self.parse_projection()?);
                 }
                 Token::Having => {
@@ -1255,6 +1365,7 @@ impl Parser {
         loop {
             match self.peek() {
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     let mut clause = self.parse_order()?;
                     for key in &mut clause.keys {
@@ -1266,6 +1377,7 @@ impl Parser {
                     order = Some(clause);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     if offset.is_some() {
                         offset_before_limit = true;
@@ -1273,6 +1385,7 @@ impl Parser {
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
@@ -1356,10 +1469,12 @@ impl Parser {
         loop {
             match self.peek() {
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     if offset.is_some() {
                         offset_before_limit = true;
@@ -1367,6 +1482,7 @@ impl Parser {
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
@@ -2048,6 +2164,19 @@ impl Parser {
         match self.peek().clone() {
             Token::DotIdent(name) => {
                 self.advance();
+                // The unaliased spelling of a link path, `.author.name`. The
+                // aliased one (`p.author.name`) is caught in the `Ident` arm
+                // below; this arm returned `Field("author")` and left `.name`
+                // for whoever came next, so the same mistake written without an
+                // alias still got "unexpected trailing token near token 3:
+                // field '.name'". A projection slot never reaches here with two
+                // dotted parts -- `reject_bare_dotted_path` names the alias it
+                // needs first -- so this is the `filter`/`order`/`group` case.
+                if let Token::DotIdent(next) = self.peek().clone() {
+                    return Err(link_traversal_outside_projection(&format!(
+                        ".{name}.{next}"
+                    )));
+                }
                 Ok(Expr::Field(name))
             }
             Token::IntLit(v) => {
@@ -2134,12 +2263,39 @@ impl Parser {
                         self.expect(&Token::RParen)?;
                         return Ok(Expr::Cast(Box::new(inner), cast_type));
                     }
+                    // Every function PowQL has is a lexer keyword, so a plain
+                    // identifier followed by `(` is a call to one it does not
+                    // have. Reading it as a column and leaving the `(` for the
+                    // next production is what produced three unrelated messages
+                    // for one mistake: `column 'foo' not found` in a
+                    // projection, an unexpected `(` in a filter, and
+                    // `expected ')', got ','` for anything with two arguments.
+                    return Err(ParseError::Syntax {
+                        message: match closest_function(&name) {
+                            Some(known) => {
+                                format!("unknown function '{name}'; did you mean '{known}'?")
+                            }
+                            None => format!("unknown function '{name}'"),
+                        },
+                        position: None,
+                    });
                 }
                 // `alias.field` → QualifiedField. The lexer emits `t1.name` as
                 // `Ident("t1")` + `DotIdent("name")` (see lexer.rs line 30),
                 // so a trailing DotIdent here means a qualified reference.
                 if let Token::DotIdent(field) = self.peek().clone() {
                     self.advance();
+                    // A second `.part` makes this a link path. The projection
+                    // has its own production for those
+                    // (`parse_scalar_link_path`) and this parser has none, so
+                    // without a word here the reader got "unexpected trailing
+                    // token near token 6: field '.name'", which never says the
+                    // word link and cannot be told from a typo.
+                    if let Token::DotIdent(next) = self.peek().clone() {
+                        return Err(link_traversal_outside_projection(&format!(
+                            "{name}.{field}.{next}"
+                        )));
+                    }
                     return Ok(Expr::QualifiedField {
                         qualifier: name,
                         field,
@@ -2463,6 +2619,16 @@ impl Parser {
                         action: AlterAction::DropIndex { target, if_exists },
                     }));
                 }
+                if *self.peek() == Token::Link {
+                    self.advance();
+                    let if_exists = self.parse_optional_if_exists();
+                    let name = self.expect_named_ident("link name")?;
+                    return Ok(Statement::DropLink(DropLinkExpr {
+                        owner: table,
+                        name,
+                        if_exists,
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -2565,6 +2731,27 @@ impl Parser {
     /// `drop [if exists] <Table>` or `drop view [if exists] <ViewName>`
     fn parse_drop_or_drop_view(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Drop)?;
+        if *self.peek() == Token::Link {
+            self.advance(); // consume `link`
+            let if_exists = self.parse_optional_if_exists();
+            let owner = self.expect_named_ident("link owner type")?;
+            let name = match self.advance() {
+                Token::DotIdent(n) => n,
+                t => {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "`.<name>` after the owner type (drop link <Owner>.<name>)"
+                            .into(),
+                        got: t.display_name(),
+                        position: None,
+                    })
+                }
+            };
+            return Ok(Statement::DropLink(DropLinkExpr {
+                owner,
+                name,
+                if_exists,
+            }));
+        }
         if *self.peek() == Token::View {
             self.advance(); // consume `view`
             let if_exists = self.parse_optional_if_exists();
@@ -5453,14 +5640,19 @@ mod token_text_roundtrip {
 
     /// A view whose source text cannot be stored faithfully is refused at
     /// creation instead of quietly becoming a different query.
+    ///
+    /// The lexer now refuses a literal with no finite value outright, so this
+    /// one never reaches the round-trip check; the check still guards the
+    /// token streams that are built rather than lexed, which
+    /// `unspellable_tokens_are_typed_errors` covers directly.
     #[test]
     fn unspellable_view_source_is_refused() {
         let huge = format!("1{}.0", "0".repeat(400)); // overflows f64 to inf
         let err = parse(&format!("materialize V as U filter .x = {huge}"))
             .expect_err("a view source that cannot round-trip must be refused");
         assert!(
-            matches!(err, ParseError::Unsupported { .. }),
-            "expected a typed Unsupported error, got {err:?}"
+            matches!(err, ParseError::Lex { ref message, .. } if message.contains("out of range")),
+            "expected the out-of-range refusal, got {err:?}"
         );
     }
 

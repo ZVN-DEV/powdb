@@ -971,6 +971,16 @@ fn visit_rust_files(dir: &std::path::Path, visit: &mut impl FnMut(&std::path::Pa
     }
 }
 
+/// The plan text after `passes` rounds of lowering, or the refusal, rendered so
+/// the two outcomes compare the same way. A plan the pass refuses (a literal it
+/// cannot coerce to the column's type) has to refuse identically on every pass.
+fn lowered_outcome(engine: &Engine, query: &str, passes: usize) -> String {
+    match engine.lowered_plan_text(query, passes) {
+        Ok(text) => text,
+        Err(err) => format!("refused: {err}"),
+    }
+}
+
 /// Lowering has to be idempotent, or routing every plan through it is unsound.
 ///
 /// A plan can reach the pass more than once by design: the plan cache stores
@@ -984,7 +994,9 @@ fn visit_rust_files(dir: &std::path::Path, visit: &mut impl FnMut(&std::path::Pa
 /// cross-type bound that gets coerced, one that gets rejected back to a scan, a
 /// conjunction whose driver is chosen, a hot equality that is demoted to a
 /// scan) rather than only shapes it passes through untouched, because a pass
-/// that never fires is trivially idempotent.
+/// that never fires is trivially idempotent. It also includes a shape the pass
+/// REFUSES (a float literal against a datetime column), so the refusal is held
+/// to the same stability rule as a rewrite.
 #[test]
 fn lowering_is_idempotent() {
     for kind in COLUMN_KINDS {
@@ -1003,15 +1015,9 @@ fn lowering_is_idempotent() {
                 "T filter .v < 2.5 update { tag := 9 }",
                 "T filter .v >= 1 delete",
             ] {
-                let once = engine
-                    .lowered_plan_text(query, 1)
-                    .unwrap_or_else(|err| panic!("`{query}` should plan: {err}"));
-                let twice = engine
-                    .lowered_plan_text(query, 2)
-                    .expect("second pass plans");
-                let thrice = engine
-                    .lowered_plan_text(query, 3)
-                    .expect("third pass plans");
+                let once = lowered_outcome(&engine, query, 1);
+                let twice = lowered_outcome(&engine, query, 2);
+                let thrice = lowered_outcome(&engine, query, 3);
                 assert_eq!(
                     once, twice,
                     "lowering `{query}` twice changed the plan on a {} column with \

@@ -4,7 +4,15 @@
 # host arch and cross-compiles to $TARGETARCH. Under multi-arch buildx this
 # keeps the (slow) DB-engine build off QEMU emulation — only the tiny runtime
 # stage below runs emulated for the non-native arch.
-FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm AS builder
+#
+# Pinned by DIGEST as well as tag (multi-arch index digest for
+# rust:1.95-slim-bookworm as of 2026-09-06), so the compiler that builds the
+# shipped binary cannot be swapped under us by a tag repoint, the way the
+# runtime stage below has been since 2026-07-24. The tag is kept alongside the
+# digest for readability and is what msrv-consistency parses. Refresh both
+# together, deliberately:
+#   docker buildx imagetools inspect rust:1.95-slim-bookworm
+FROM --platform=$BUILDPLATFORM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder
 
 WORKDIR /src
 
@@ -50,10 +58,14 @@ RUN set -eux; \
       } > /cross-env; \
     fi
 
-# No RUSTFLAGS/target-cpu override is set here: .cargo/config.toml (which pins
-# target-cpu=native for local dev) is never copied into the build context, so
-# cargo uses the portable baseline target-cpu for each triple — the binaries
-# stay runnable across the whole arch, no SIGILL on older silicon.
+# No RUSTFLAGS/target-cpu override is set here, and none is needed: the
+# checked-in .cargo/config.toml deliberately sets NO rustflags (it says so on
+# its first line), so cargo already uses the portable baseline target-cpu for
+# each triple and the binaries stay runnable across the whole arch, with no
+# SIGILL on older silicon. The comment that used to sit here said that file
+# "pins target-cpu=native for local dev", which was true of a version removed
+# after exactly that SIGILL incident; anyone acting on it would have added an
+# override this image does not want.
 
 # Cache deps separately from source by copying manifests first.
 # powdb-server depends on storage + query + auth + sync; powdb-cli additionally
@@ -194,13 +206,22 @@ if [ -z "${POWDB_TLS_CERT:-}" ] && [ -z "${POWDB_TLS_KEY:-}" ]; then
   }
   # Frame layout: [type][flags][payload length u32 LE]. 0x11 = PING, no payload.
   printf '\x11\x00\x00\x00\x00\x00' >&3 || exit 1
-  reply=''
-  IFS= read -r -N 1 -t 5 reply <&3 || true
-  # 0x12 = PONG
-  if [ "$reply" = $'\x12' ]; then
+  # Read the WHOLE 6-byte PONG frame, not just its first byte. Closing a socket
+  # that still has bytes queued in its receive buffer makes the kernel send RST
+  # instead of FIN, and the server logged every probe as
+  # "ERROR error reading CONNECT ... Connection reset by peer" once per
+  # interval on an idle, healthy container. Draining the frame closes with FIN,
+  # which the server records as a DEBUG "client closed before CONNECT".
+  # `read -N` cannot hold the four NUL bytes of the length field, so the frame
+  # is read through od, which is byte-exact. `timeout` bounds the read the way
+  # `read -t` used to.
+  reply="$(timeout 5 od -An -N6 -tx1 <&3 2>/dev/null | tr -d ' \n')"
+  # 0x12 = PONG. Requiring all six bytes is what makes the close clean; the
+  # type byte alone would leave five bytes unread.
+  if [ "${#reply}" -eq 12 ] && [ "${reply:0:2}" = "12" ]; then
     exit 0
   fi
-  note "wire port did not answer PING with PONG"
+  note "wire port did not answer PING with a complete PONG frame (got '${reply:-<nothing>}')"
   exit 1
 fi
 
@@ -215,6 +236,23 @@ done
 note "no powdb-server process found"
 exit 1
 HEALTHCHECK_SH
+
+# Argument shim for the entrypoint. tini's `--` ends tini's own option parsing,
+# so with ENTRYPOINT ["/usr/bin/tini", "--"] the first argument of
+# `docker run <image> --version` became the command itself and tini died with
+# `exec --version failed: No such file or directory` (exit 127). This restores
+# the ordinary `docker run <image> --flag` idiom: a first argument beginning
+# with "-" is a flag for powdb-server and gets the binary prepended, while
+# anything else (`powdb-server --help`, `bash`, an absolute path) still runs
+# verbatim, so every previously documented invocation behaves exactly as before.
+COPY --chmod=0755 <<'ENTRYPOINT_SH' /usr/local/bin/powdb-entrypoint
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  -*) set -- /usr/local/bin/powdb-server "$@" ;;
+esac
+exec "$@"
+ENTRYPOINT_SH
 
 ENV RUST_LOG=info \
     POWDB_DATA=/data \
@@ -252,5 +290,5 @@ LABEL org.opencontainers.image.title="PowDB" \
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["/usr/local/bin/powdb-healthcheck"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/powdb-entrypoint"]
 CMD ["/usr/local/bin/powdb-server"]

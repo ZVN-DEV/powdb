@@ -263,7 +263,7 @@ async fn test_max_connections_backpressure() {
                         engine: eng2,
                         tx_gate,
                         expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
+                        users: Arc::new(powdb_server::handler::UserDirectory::empty()),
                         shutdown_rx: &mut rx,
                         idle_timeout: Duration::from_secs(5),
                         preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,

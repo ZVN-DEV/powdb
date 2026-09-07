@@ -331,3 +331,185 @@ async fn the_closing_flush_delivers_buffered_frames_without_parking_teardown() {
         "the whole frame, exactly once"
     );
 }
+
+// ---- The in-flight read-ahead byte budget ----
+
+/// A reader that answers a 6-byte header declaring `payload_len` bytes and
+/// then hands out payload bytes forever, the way a client streaming a large
+/// frame does. It counts what it served, so a test can see how much the
+/// server was willing to buffer.
+struct EndlessFrame {
+    header: Vec<u8>,
+    header_sent: usize,
+    served: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl EndlessFrame {
+    fn declaring(payload_len: usize) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut header = vec![0x03u8, 0]; // MSG_QUERY, no flags
+        header.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            EndlessFrame {
+                header,
+                header_sent: 0,
+                served: Arc::clone(&served),
+            },
+            served,
+        )
+    }
+}
+
+impl tokio::io::AsyncRead for EndlessFrame {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let remaining_header = self.header.len() - self.header_sent;
+        let n = if remaining_header > 0 {
+            let n = remaining_header.min(buf.remaining());
+            let from = self.header_sent;
+            let bytes = self.header[from..from + n].to_vec();
+            buf.put_slice(&bytes);
+            self.header_sent += n;
+            n
+        } else {
+            let n = buf.remaining().min(8192);
+            buf.put_slice(&vec![b'x'; n]);
+            n
+        };
+        self.served
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A frame that declares more payload than the read-ahead budget has left
+/// must not be buffered while a statement runs.
+///
+/// The budget exists to bound what one connection can hold in memory ahead of
+/// the statement it is executing. `has_room()` only decides whether a read may
+/// START; if the frame being read is not bounded too, a peer that opens a
+/// statement and then announces a 64 MiB frame parks 64 MiB of server heap per
+/// connection for as long as the statement runs, and `Vec::drain` never gives
+/// the capacity back afterwards.
+///
+/// Nothing is lost by refusing to read it here: the frame's header stays
+/// buffered and the ordinary main loop reads the whole frame, at the full wire
+/// limit, once the statement finishes.
+#[tokio::test]
+async fn a_frame_over_the_read_ahead_budget_is_not_buffered_while_a_query_runs() {
+    let (dir, engine) = one_row_engine();
+    let metrics = Arc::new(Metrics::new());
+    let (reader, served) = EndlessFrame::declaring(MAX_WIRE_PAYLOAD_SIZE);
+    let mut reader = BufReader::new(reader);
+    let mut buffered = Vec::new();
+    let mut pending = InFlightReadAhead::default();
+
+    let (message, _durability, termination, _) = run_blocking_query(
+        BlockingQuery {
+            engine: Arc::clone(&engine),
+            principal: None,
+            result_mode: WireResultMode::LegacyText,
+            query_timeout: Duration::from_secs(5),
+            query_deadline: Instant::now() + Duration::from_secs(5),
+            metrics: &metrics,
+            stream: FrameStream {
+                reader: &mut reader,
+                buffered: &mut buffered,
+                pending: &mut pending,
+            },
+        },
+        (),
+        |_engine, (), _principal| {
+            // Long enough that the read arm is polled to completion first,
+            // short enough to keep the test quick.
+            std::thread::sleep(Duration::from_millis(400));
+            (
+                Ok(QueryResult::Executed {
+                    message: "done".into(),
+                }),
+                None,
+            )
+        },
+    )
+    .await;
+
+    assert!(
+        buffered.len() <= MAX_IN_FLIGHT_READ_AHEAD_BYTES,
+        "the connection buffered {} bytes of one frame against a \
+         {MAX_IN_FLIGHT_READ_AHEAD_BYTES}-byte read-ahead budget",
+        buffered.len()
+    );
+    assert!(
+        served.load(std::sync::atomic::Ordering::Relaxed) <= MAX_IN_FLIGHT_READ_AHEAD_BYTES,
+        "the connection read {} bytes off the socket against a \
+         {MAX_IN_FLIGHT_READ_AHEAD_BYTES}-byte read-ahead budget",
+        served.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    // The statement still ran to completion and the connection stays open:
+    // the oversized frame is deferred, not refused, and not a disconnect.
+    assert!(
+        matches!(message, Message::ResultMessage { .. }),
+        "the statement must still answer, got {message:?}"
+    );
+    assert!(
+        termination.is_none(),
+        "an oversized read-ahead frame must not end the connection, got {termination:?}"
+    );
+    drop(dir);
+}
+
+/// Small pipelined frames are still read ahead, so the bound above is not a
+/// bound that works by never reading anything.
+#[tokio::test]
+async fn small_pipelined_frames_are_still_read_ahead() {
+    let (dir, engine) = one_row_engine();
+    let metrics = Arc::new(Metrics::new());
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        frames.extend_from_slice(
+            &Message::Query {
+                query: "User".into(),
+            }
+            .encode(),
+        );
+    }
+    let mut reader = BufReader::new(std::io::Cursor::new(frames));
+    let mut buffered = Vec::new();
+    let mut pending = InFlightReadAhead::default();
+
+    run_blocking_query(
+        BlockingQuery {
+            engine: Arc::clone(&engine),
+            principal: None,
+            result_mode: WireResultMode::LegacyText,
+            query_timeout: Duration::from_secs(5),
+            query_deadline: Instant::now() + Duration::from_secs(5),
+            metrics: &metrics,
+            stream: FrameStream {
+                reader: &mut reader,
+                buffered: &mut buffered,
+                pending: &mut pending,
+            },
+        },
+        (),
+        |_engine, (), _principal| {
+            std::thread::sleep(Duration::from_millis(200));
+            (
+                Ok(QueryResult::Executed {
+                    message: "done".into(),
+                }),
+                None,
+            )
+        },
+    )
+    .await;
+
+    assert!(
+        !pending.is_empty(),
+        "ordinary pipelined frames must still be read while a statement runs"
+    );
+    drop(dir);
+}

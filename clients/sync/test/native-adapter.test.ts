@@ -23,7 +23,11 @@ type EmbeddedDatabase = {
 
 const require = createRequire(import.meta.url);
 const EMBEDDED_PACKAGE = "@zvndev/powdb-embedded";
-const REPO_LOCAL_EMBEDDED_ENTRY = "../../../bindings/node/index.js";
+// loader.js, not the generated index.js beside it: the loader is the
+// package entry point, and reaching past it gets an addon whose errors
+// carry no `code` rewriting and no `errorClass`. An installed copy is no
+// longer reachable that way at all, so neither is the repo-local one here.
+const REPO_LOCAL_EMBEDDED_ENTRY = "../../../bindings/node/loader.js";
 
 function isMissingEmbeddedPackage(err: unknown): boolean {
   return (

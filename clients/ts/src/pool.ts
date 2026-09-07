@@ -108,9 +108,11 @@ type Waiter = {
  *   - `acquire` returns an idle client if one exists; otherwise creates a new
  *     one up to `max`; otherwise waits until `release`/`destroy` frees a slot
  *     (subject to `acquireTimeoutMs`).
- *   - `release(c)` puts `c` back in the idle queue unconditionally. **If the
- *     caller observed a socket/connection error on `c`, they MUST call
- *     `destroy(c)` instead** — the pool cannot safely detect dead sockets.
+ *   - `release(c)` puts `c` back in the idle queue. A client whose connection
+ *     has already torn down is evicted instead, so a server restart never
+ *     leaves dead clients to be handed out. **If the caller observed a
+ *     socket/connection error on `c` they should still call `destroy(c)`**:
+ *     the pool learns about the teardown only once the socket reports it.
  *   - `destroy(c)` closes `c` and decrements the live count, freeing a slot
  *     for a new client to be created.
  *   - `withClient(fn)` acquires, runs `fn`, and always destroys on error or
@@ -131,6 +133,8 @@ export class Pool {
   /** Clients owned by this pool (idle + checked-out). Used to reject
    *  foreign/double-destroyed clients from corrupting the slot accounting. */
   private readonly owned: Set<Client> = new Set();
+  /** The `close` listener each owned client carries, so it can be removed. */
+  private readonly closeListeners: Map<Client, () => void> = new Map();
   private live = 0;
   private _closed = false;
 
@@ -201,7 +205,7 @@ export class Pool {
    */
   async acquire(): Promise<Client> {
     if (this._closed) {
-      throw new Error("pool closed");
+      throw new PowDBError("pool closed", "closed");
     }
 
     const existing = this.idleClients.shift();
@@ -213,7 +217,7 @@ export class Pool {
       this.live++;
       try {
         const c = await this.connect();
-        this.owned.add(c);
+        this.adopt(c);
         return c;
       } catch (err) {
         // Creation failed — we never had a live client, so give the slot
@@ -237,7 +241,12 @@ export class Pool {
         waiter.timer = setTimeout(() => {
           const idx = this.waiters.indexOf(waiter);
           if (idx !== -1) this.waiters.splice(idx, 1);
-          reject(new Error("pool acquire timeout"));
+          reject(
+            new PowDBError(
+              `pool acquire timeout after ${this.acquireTimeoutMs}ms`,
+              "timeout",
+            ),
+          );
         }, this.acquireTimeoutMs);
         // Don't keep the event loop alive just for the timeout.
         if (typeof waiter.timer.unref === "function") waiter.timer.unref();
@@ -261,8 +270,7 @@ export class Pool {
 
     if (this._closed) {
       // Pool is gone — just close the client, fire-and-forget.
-      this.owned.delete(c);
-      if (this.live > 0) this.live--;
+      this.evict(c);
       void c.close().catch(() => {});
       return;
     }
@@ -287,16 +295,10 @@ export class Pool {
       // Foreign client or already destroyed — don't touch slot accounting.
       return;
     }
-    this.owned.delete(c);
-    // Decrement first so any waiter we hand off to can create a fresh one.
-    if (this.live > 0) this.live--;
+    // Evict first so any waiter we hand off to can create a fresh one, then
+    // drain: `evict` gives the slot back and wakes a waiter itself.
+    this.evict(c);
     void c.close().catch(() => {});
-
-    if (this._closed) return;
-
-    // Drain one waiter if possible — the freed slot lets them create a new
-    // connection.
-    this.drainWaiters();
   }
 
   /**
@@ -381,12 +383,15 @@ export class Pool {
     while (this.waiters.length > 0) {
       const w = this.waiters.shift()!;
       if (w.timer !== null) clearTimeout(w.timer);
-      w.reject(new Error("pool closed"));
+      w.reject(new PowDBError("pool closed", "closed"));
     }
 
     // Close every idle client.
     const idle = this.idleClients.splice(0, this.idleClients.length);
-    for (const c of idle) this.owned.delete(c);
+    for (const c of idle) {
+      this.owned.delete(c);
+      this.detach(c);
+    }
     this.live -= idle.length;
     await Promise.all(idle.map((c) => c.close().catch(() => {})));
   }
@@ -394,6 +399,42 @@ export class Pool {
   // ──────────────────────────────────────────────────────────
   // internals
   // ──────────────────────────────────────────────────────────
+
+  /**
+   * Take ownership of `c` and watch it for teardown. Without this a pooled
+   * client whose server went away sits in the idle queue looking healthy and
+   * is handed to the next caller, who eats the failure.
+   */
+  private adopt(c: Client): void {
+    this.owned.add(c);
+    const onClose = () => this.evict(c);
+    this.closeListeners.set(c, onClose);
+    c.once("close", onClose);
+  }
+
+  private detach(c: Client): void {
+    const listener = this.closeListeners.get(c);
+    if (listener !== undefined) {
+      c.removeListener("close", listener);
+      this.closeListeners.delete(c);
+    }
+  }
+
+  /**
+   * Drop `c` from the pool: out of the idle queue, out of the owned set, and
+   * its slot returned. Safe to call twice and safe to call on a client the
+   * caller still holds — the later `destroy` then finds nothing to do.
+   */
+  private evict(c: Client): void {
+    this.detach(c);
+    if (!this.owned.has(c)) return;
+    this.owned.delete(c);
+    if (this.live > 0) this.live--;
+    const idx = this.idleClients.indexOf(c);
+    if (idx !== -1) this.idleClients.splice(idx, 1);
+    if (this._closed) return;
+    this.drainWaiters();
+  }
 
   private drainWaiters(): void {
     // If we have headroom AND a waiter, try to create a client for them.
@@ -414,7 +455,7 @@ export class Pool {
             void c.close().catch(() => {});
             return;
           }
-          this.owned.add(c);
+          this.adopt(c);
           waiter.resolve(c);
         },
         (err) => {

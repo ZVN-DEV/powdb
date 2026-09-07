@@ -218,32 +218,57 @@ pub(crate) fn format_sync_repair_action(action: powdb_sync::SyncRepairAction) ->
     }
 }
 
+/// The report for one replica, as lines, so what an operator reads is
+/// testable without a primary and a registered cursor to reproduce each state.
+pub(crate) fn replica_sync_status_lines(status: &powdb_sync::ReplicaSyncStatus) -> Vec<String> {
+    let mut lines = vec![
+        format!("replica {}", status.replica_id),
+        format!("  active: {}", status.active),
+        format!(
+            "  lastAppliedLsn: {}",
+            format_optional_u64(status.last_applied_lsn)
+        ),
+        format!("  remoteLsn: {}", status.remote_lsn),
+        format!(
+            "  servableLsn: {}",
+            format_optional_u64(status.servable_lsn)
+        ),
+        format!(
+            "  unarchivedLsn: {}",
+            format_optional_u64(status.unarchived_lsn)
+        ),
+        format!("  lagLsn: {}", format_optional_u64(status.lag_lsn)),
+        format!("  lagBytes: {}", format_optional_u64(status.lag_bytes)),
+        format!("  lagMs: {}", format_optional_u64(status.lag_ms)),
+        format!("  stale: {}", status.stale),
+        format!(
+            "  repairAction: {}",
+            format_sync_repair_action(status.repair_action)
+        ),
+    ];
+    match status.repair_action {
+        // Retained history is archived on demand when a replica pulls, so a
+        // primary that has moved past its archived tail is in a state the next
+        // pull resolves by itself. Reporting it under `lastSyncError` said the
+        // replication was broken when nothing had failed.
+        powdb_sync::SyncRepairAction::AwaitArchive => lines.push(
+            "  note: the primary is ahead of the retained history archived for this replica. \
+             Retained history is archived on demand at the next pull, so this clears itself; \
+             it is not a failure."
+                .to_string(),
+        ),
+        _ => {
+            if let Some(err) = &status.last_sync_error {
+                lines.push(format!("  lastSyncError: {err}"));
+            }
+        }
+    }
+    lines
+}
+
 pub(crate) fn print_replica_sync_status(status: &powdb_sync::ReplicaSyncStatus) {
-    println!("replica {}", status.replica_id);
-    println!("  active: {}", status.active);
-    println!(
-        "  lastAppliedLsn: {}",
-        format_optional_u64(status.last_applied_lsn)
-    );
-    println!("  remoteLsn: {}", status.remote_lsn);
-    println!(
-        "  servableLsn: {}",
-        format_optional_u64(status.servable_lsn)
-    );
-    println!(
-        "  unarchivedLsn: {}",
-        format_optional_u64(status.unarchived_lsn)
-    );
-    println!("  lagLsn: {}", format_optional_u64(status.lag_lsn));
-    println!("  lagBytes: {}", format_optional_u64(status.lag_bytes));
-    println!("  lagMs: {}", format_optional_u64(status.lag_ms));
-    println!("  stale: {}", status.stale);
-    println!(
-        "  repairAction: {}",
-        format_sync_repair_action(status.repair_action)
-    );
-    if let Some(err) = &status.last_sync_error {
-        println!("  lastSyncError: {err}");
+    for line in replica_sync_status_lines(status) {
+        println!("{line}");
     }
 }
 
@@ -352,6 +377,33 @@ pub(crate) fn save_user_store(store: &powdb_auth::UserStore, data_dir: &str) -> 
     Ok(())
 }
 
+/// The pid recorded in `<data_dir>/LOCK`, when a process is holding this data
+/// directory as a writer.
+pub(crate) fn data_dir_holder_pid(data_dir: &str) -> Option<u32> {
+    std::fs::read_to_string(Path::new(data_dir).join("LOCK"))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Say what a live server will do with a user change written under a data
+/// directory it already has open.
+///
+/// The user-admin commands edit `auth.json` directly and take no lock, so they
+/// succeed against a running server. The server re-reads the file when it
+/// changes, but that happens at the next authentication attempt, and an
+/// operator who saw only "password updated" had no way to know when the change
+/// would take effect.
+pub(crate) fn note_live_server(data_dir: &str) {
+    if let Some(pid) = data_dir_holder_pid(data_dir) {
+        println!(
+            "note: data dir is open by process {pid}; the server reloads users on its next \
+             login attempt"
+        );
+    }
+}
+
 pub(crate) fn run_useradd(
     data_dir: &str,
     name: &str,
@@ -381,6 +433,7 @@ pub(crate) fn run_useradd(
         return code;
     }
     println!("user '{name}' created (role {role})");
+    note_live_server(data_dir);
     0
 }
 
@@ -401,6 +454,7 @@ pub(crate) fn run_userdel(data_dir: &str, name: &str) -> i32 {
         return code;
     }
     println!("user '{name}' deleted");
+    note_live_server(data_dir);
     0
 }
 
@@ -427,6 +481,7 @@ pub(crate) fn run_passwd(data_dir: &str, name: &str, password: Option<&str>) -> 
         return code;
     }
     println!("password updated for user '{name}'");
+    note_live_server(data_dir);
     0
 }
 

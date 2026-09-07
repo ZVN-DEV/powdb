@@ -438,7 +438,10 @@ async fn start_server(engine: Engine, gate_permits: u32) -> BenchServer {
     let engine = Arc::new(RwLock::new(engine));
     let tx_gate = new_tx_gate_with_permits(gate_permits);
     let metrics = Arc::new(Metrics::new());
-    let users = Arc::new(powdb_auth::UserStore::new());
+    // No named users: this harness measures read latency, not the handshake.
+    // `UserDirectory::empty()` is the non-reloading directory that makes the
+    // handshake fall through to the shared-password (here: open) path.
+    let users = Arc::new(powdb_server::handler::UserDirectory::empty());
     let (shutdown, mut accept_shutdown) = watch::channel(false);
 
     let accept_task = tokio::spawn(async move {

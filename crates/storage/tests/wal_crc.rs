@@ -4,6 +4,13 @@
 //! detects and rejects corrupted records via CRC32 validation, rather
 //! than silently processing corrupt data.
 //!
+//! Two outcomes are possible and they are not interchangeable. Damage with
+//! valid records still behind it is damage INSIDE the log: those records were
+//! written and committed, so the reader refuses rather than truncating them
+//! away. Damage with nothing readable after it is the torn tail of the write
+//! that was in flight when the process died, and truncating there is the
+//! whole point of a WAL.
+//!
 //! WAL record layout (from wal.rs):
 //!   len:    4 bytes (u32 LE) — total record size including header
 //!   crc32:  4 bytes (u32 LE) — CRC of (tx_id + type + data)
@@ -11,8 +18,26 @@
 //!   type:   1 byte
 //!   data:   (len - 17) bytes
 
+use powdb_storage::error::{StorageError, StorageErrorKind};
 use powdb_storage::wal::{Wal, WalRecordType};
 use std::io::Write;
+
+/// Assert that reading `wal` refuses as mid-log damage rather than returning
+/// a silently shortened prefix.
+fn expect_mid_log_refusal(wal: &Wal) {
+    let error = match wal.read_all() {
+        Ok(records) => panic!(
+            "mid-log damage must refuse, but {} records came back",
+            records.len()
+        ),
+        Err(error) => error,
+    };
+    assert_eq!(
+        StorageError::kind_of_io_error(&error),
+        Some(StorageErrorKind::WalReplay),
+        "expected a WAL replay refusal, got: {error}"
+    );
+}
 
 const WAL_FILE_HEADER_SIZE: usize = 8;
 const WAL_RECORD_HEADER_SIZE: usize = 25;
@@ -45,8 +70,8 @@ fn write_valid_records(name: &str, count: usize) -> std::path::PathBuf {
 
 // ── CRC bit-flip detection ────────────────────────────────────────────
 
-/// Flip bits in the CRC32 field of the first record. replay should
-/// detect the mismatch and return zero records (stops at first bad record).
+/// Flip bits in the CRC32 field of the first record. Records 2 and 3 are
+/// still there behind it, so this is damage inside the log.
 #[test]
 fn test_crc_bit_flip_in_first_record() {
     let path = write_valid_records("crc_flip_first", 3);
@@ -60,17 +85,12 @@ fn test_crc_bit_flip_in_first_record() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        0,
-        "corrupted first record should stop replay immediately"
-    );
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
-/// Flip bits in the CRC32 field of the second record. The first record
-/// should be returned successfully; the second and third should be dropped.
+/// Flip bits in the CRC32 field of the second record. The third record is
+/// still behind it, so the log is damaged, not torn.
 #[test]
 fn test_crc_bit_flip_in_second_record() {
     let path = write_valid_records("crc_flip_second", 3);
@@ -92,13 +112,7 @@ fn test_crc_bit_flip_in_second_record() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        1,
-        "only the first (uncorrupted) record should survive"
-    );
-    assert_eq!(records[0].tx_id, 1);
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
@@ -119,12 +133,7 @@ fn test_data_payload_corruption() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        0,
-        "corrupted data payload should fail CRC check"
-    );
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
@@ -140,8 +149,7 @@ fn test_tx_id_corruption() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(records.len(), 0, "corrupted tx_id should fail CRC check");
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
@@ -156,12 +164,7 @@ fn test_record_type_corruption() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(
-        records.len(),
-        0,
-        "corrupted record type should fail CRC or type parse"
-    );
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
@@ -306,19 +309,19 @@ fn test_zero_length_field() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(records.len(), 0, "zero-length record should stop replay");
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
 /// Set the length field to a value smaller than WAL_RECORD_HEADER_SIZE (e.g. 5).
-/// The checked_sub in read_all should catch this.
+/// The checked_sub in read_all should catch this. Record 2 is still readable
+/// behind it, so it is damage inside the log.
 #[test]
 fn test_length_smaller_than_header() {
     let path = write_valid_records("len_small", 2);
 
     let mut data = std::fs::read(&path).unwrap();
-    // Set length to 5 (less than WAL_RECORD_HEADER_SIZE=17).
+    // Set length to 5 (less than WAL_RECORD_HEADER_SIZE=25).
     data[WAL_FILE_HEADER_SIZE] = 5;
     data[WAL_FILE_HEADER_SIZE + 1] = 0;
     data[WAL_FILE_HEADER_SIZE + 2] = 0;
@@ -326,8 +329,7 @@ fn test_length_smaller_than_header() {
     std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(records.len(), 0);
+    expect_mid_log_refusal(&wal);
     std::fs::remove_file(&path).ok();
 }
 
@@ -351,29 +353,49 @@ fn test_huge_length_field() {
     std::fs::remove_file(&path).ok();
 }
 
-// ── Valid records survive alongside corruption ────────────────────────
+// ── Damage inside the log versus a torn tail ──────────────────────────
 
-/// Write 5 valid records, corrupt only the 4th. Records 1-3 should
-/// survive, 4-5 should be dropped.
+/// Byte offset of the `index`-th record, walking the length fields.
+fn record_offset(bytes: &[u8], index: usize) -> usize {
+    let mut offset = WAL_FILE_HEADER_SIZE;
+    for _ in 0..index {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += len;
+    }
+    offset
+}
+
+/// Write 5 valid records, corrupt only the 4th. Record 5 is still readable
+/// behind it, so this is damage inside the log: the reader must refuse rather
+/// than hand back the first three and truncate the rest.
 #[test]
 fn test_corruption_mid_stream() {
     let path = write_valid_records("mid_stream", 5);
 
-    let data = std::fs::read(&path).unwrap();
-    // Walk through records to find the start of the 4th.
-    let mut offset = WAL_FILE_HEADER_SIZE;
-    for _ in 0..3 {
-        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += len;
-    }
-    // Corrupt the CRC of the 4th record.
-    let mut corrupted = data.clone();
-    corrupted[offset + 4] ^= 0xFF;
-    std::fs::write(&path, &corrupted).unwrap();
+    let mut data = std::fs::read(&path).unwrap();
+    let fourth = record_offset(&data, 3);
+    data[fourth + 4] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
 
     let wal = Wal::open(&path, 128).unwrap();
-    let records = wal.read_all().unwrap();
-    assert_eq!(records.len(), 3, "records 1-3 should survive, 4-5 dropped");
+    expect_mid_log_refusal(&wal);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same corruption in the LAST record is the torn tail of the write that
+/// was in flight at the crash. Everything before it is intact and replays.
+#[test]
+fn test_corruption_in_the_last_record_is_a_torn_tail() {
+    let path = write_valid_records("torn_tail", 5);
+
+    let mut data = std::fs::read(&path).unwrap();
+    let fifth = record_offset(&data, 4);
+    data[fifth + 4] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
+
+    let wal = Wal::open(&path, 128).unwrap();
+    let records = wal.read_all().expect("a torn tail is recoverable");
+    assert_eq!(records.len(), 4, "the four intact records must survive");
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.tx_id, (i + 1) as u64);
     }

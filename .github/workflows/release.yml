@@ -234,6 +234,31 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      # The published tarball ships CHANGELOG.md, and every one so far opened
+      # with an empty `## Unreleased` heading, so the first thing a reader saw
+      # on npm was an empty promise. The heading belongs in the repository (it
+      # is where the next entry goes); it means nothing in a published
+      # artifact. This edits the working copy only, after the build and before
+      # the publish, so nothing is committed and the repository keeps its
+      # heading. A section that actually has content is left alone and says so:
+      # silently deleting real release notes would be worse than the wart.
+      # Runs first, on fixtures: it proves the rewrite removes an empty section,
+      # leaves a section that has content alone, is a no-op without a heading,
+      # and is idempotent. The dangerous direction is the second one, so it is
+      # asserted every time rather than trusted.
+      - name: Prove the CHANGELOG rewrite leaves real notes alone
+        run: bash scripts/ci/strip-empty-unreleased.sh --selftest
+
+      - name: Strip the empty Unreleased section from the published CHANGELOG
+        run: bash scripts/ci/strip-empty-unreleased.sh clients/ts/CHANGELOG.md
+
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -254,12 +279,15 @@ jobs:
     # on npmjs.com for @zvndev/powdb-sync (org: ZVN-DEV, repo: powdb, workflow:
     # release.yml, env: npm-publish).
     #
-    # The package has never been published, and npm cannot configure a trusted
-    # publisher for a name that does not exist yet, so the first publish has to
-    # be a manual `npm publish` (see docs/ci/trusted-publishing.md). Until that
-    # bootstrap happens this job WARNS and skips rather than failing, so an
-    # unbootstrapped optional package cannot redden a release that is otherwise
-    # complete. It starts publishing on its own the moment the name exists.
+    # The package was bootstrapped by hand for 0.24.0 (npm cannot configure a
+    # trusted publisher for a name that does not exist yet, see
+    # docs/ci/trusted-publishing.md) and has published from here ever since.
+    # The "warn and skip if npm view fails" branch that covered the bootstrap
+    # window is gone: `npm view` fails on a registry 5xx or a network blip
+    # exactly as it does on a missing package, so keeping it meant a transient
+    # error would drop one of the three npm packages from a release and leave
+    # the run green. This job now publishes unconditionally and fails if it
+    # cannot.
     environment: npm-publish
     permissions:
       contents: read
@@ -304,18 +332,7 @@ jobs:
           done
           echo "peer pins match $tag"
 
-      - name: Has this package been bootstrapped on npm?
-        id: exists
-        run: |
-          if npm view @zvndev/powdb-sync version >/dev/null 2>&1; then
-            echo "bootstrapped=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "bootstrapped=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::@zvndev/powdb-sync is not on npm yet, so this release does not include it. Publish it once by hand (npm publish --access public from clients/sync), then add the trusted publisher on npmjs.com; this job takes over from the next release."
-          fi
-
       - name: Install dependencies, build and test
-        if: steps.exists.outputs.bootstrapped == 'true'
         working-directory: clients/sync
         run: |
           corepack enable
@@ -324,12 +341,31 @@ jobs:
           pnpm build
           pnpm test
 
+      # Same as the client job above: the tarball ships CHANGELOG.md, and an
+      # empty `## Unreleased` heading is meaningless once published. Working
+      # copy only, nothing committed.
+      # Runs first, on fixtures: it proves the rewrite removes an empty section,
+      # leaves a section that has content alone, is a no-op without a heading,
+      # and is idempotent. The dangerous direction is the second one, so it is
+      # asserted every time rather than trusted.
+      - name: Prove the CHANGELOG rewrite leaves real notes alone
+        run: bash scripts/ci/strip-empty-unreleased.sh --selftest
+
+      - name: Strip the empty Unreleased section from the published CHANGELOG
+        run: bash scripts/ci/strip-empty-unreleased.sh clients/sync/CHANGELOG.md
+
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
       - name: Publish to npm (token-less, with provenance)
-        if: steps.exists.outputs.bootstrapped == 'true'
         working-directory: clients/sync
         run: npm publish --provenance --access public --tag "${{ steps.channel.outputs.npm_tag }}"
 
@@ -346,6 +382,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
 
       - name: Classify the release channel (final vs rc)
         id: channel
@@ -459,6 +502,13 @@ jobs:
 
       # An rc moves the `rc` floating tag, never `latest`, so `docker pull
       # ghcr.io/zvn-dev/powdb` keeps serving the last final release.
+      # The classifier decides which npm dist-tag and which ghcr floating tag a
+      # release moves, so a shape it wrongly accepts publishes an rc as
+      # `latest`. Prove it still refuses the malformed shapes before trusting
+      # its verdict on this tag.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
         run: bash scripts/ci/release-channel.sh "${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
@@ -483,9 +533,16 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          # Three tags: the floating channel pointer (`latest` or `rc`), the
+          # git tag (`v0.27.0`) and the bare semver (`0.27.0`). The bare form is
+          # what every other registry in this project uses (crates.io and npm
+          # have no `v`), and what a reader who saw `0.27.0` in the CHANGELOG
+          # reaches for first; without it `docker pull ghcr.io/zvn-dev/powdb:0.27.0`
+          # fails with "manifest unknown" on a version that exists.
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.channel.outputs.docker_floating_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.semver }}
           # Populates the dynamic OCI labels declared at the end of the
           # Dockerfile. Without these the image ships the placeholder defaults
           # (0.0.0-dev / unknown), which is the honest answer for a local build

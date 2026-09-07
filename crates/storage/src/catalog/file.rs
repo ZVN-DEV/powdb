@@ -238,6 +238,29 @@ pub(super) struct CatalogFile {
 
 pub(super) fn read_catalog_file(path: &Path) -> io::Result<CatalogFile> {
     read_catalog_file_with_max_version(path, CATALOG_VERSION)
+        .map_err(|e| name_the_catalog_file(path, e))
+}
+
+/// Name the file and the remedy on a catalog that will not parse.
+///
+/// The parse raises `bad catalog magic` and `catalog CRC32 mismatch`, neither
+/// of which says which file is damaged or what an operator can do about it.
+/// A startup failure has to answer both.
+///
+/// I/O failures pass through untouched. A missing catalog file is how
+/// `Catalog::open` reports "there is no database here", and `Engine::new_inner`
+/// branches on exactly that, so it must not be dressed up as damage.
+fn name_the_catalog_file(path: &Path, error: io::Error) -> io::Error {
+    if error.kind() != io::ErrorKind::InvalidData {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: {error}; restore this file from a backup",
+            path.display()
+        ),
+    )
 }
 
 /// Read the catalog format version currently persisted on disk for `data_dir`

@@ -204,7 +204,11 @@ impl Engine {
                     rows.push(fetched);
                 }
                 None => {
-                    let Some(row) = self.catalog.get(table, rid) else {
+                    let Some(row) = self
+                        .catalog
+                        .get(table, rid)
+                        .map_err(QueryError::from_storage_io)?
+                    else {
                         continue;
                     };
                     if let Some((start, start_inclusive, end, end_inclusive)) = &range {
@@ -314,7 +318,11 @@ impl Engine {
                 continue;
             };
             if eval_predicate(predicate, &sparse, &residual_names) {
-                if let Some(full) = self.catalog.get(table, rid) {
+                if let Some(full) = self
+                    .catalog
+                    .get(table, rid)
+                    .map_err(QueryError::from_storage_io)?
+                {
                     rows.push(full);
                 }
             }

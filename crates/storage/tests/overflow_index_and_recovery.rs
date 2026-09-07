@@ -92,7 +92,12 @@ fn p0_1_spilled_row_survives_crash_replay_byte_exact() {
     // Reopen → replay. Before the fix this panicked in `decode_row` (v1-only)
     // during the post-replay index rebuild and crash-looped forever.
     let cat = Catalog::open(&dir).expect("reopen/replay must not brick");
-    let row = cat.get_table("t").unwrap().get(row0(&cat)).unwrap();
+    let row = cat
+        .get_table("t")
+        .unwrap()
+        .get(row0(&cat))
+        .unwrap()
+        .unwrap();
     assert_eq!(row[0], Value::Int(1));
     assert_eq!(
         match &row[1] {
@@ -106,7 +111,12 @@ fn p0_1_spilled_row_survives_crash_replay_byte_exact() {
 
     // Double reopen (double replay) must be idempotent and still intact.
     let cat = Catalog::open(&dir).expect("second reopen");
-    let row = cat.get_table("t").unwrap().get(row0(&cat)).unwrap();
+    let row = cat
+        .get_table("t")
+        .unwrap()
+        .get(row0(&cat))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         match &row[1] {
             Value::Str(s) => s.len(),
@@ -301,7 +311,7 @@ fn sweep_reclaims_orphaned_overflow_pages_after_delete() {
         .next()
         .unwrap()
         .0;
-    let row = cat.get_table("t").unwrap().get(keep_rid).unwrap();
+    let row = cat.get_table("t").unwrap().get(keep_rid).unwrap().unwrap();
     assert_eq!(row[0], Value::Int(1));
     assert_eq!(
         match &row[1] {
@@ -312,5 +322,86 @@ fn sweep_reclaims_orphaned_overflow_pages_after_delete() {
         "live data must survive sweep"
     );
     drop(cat);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── E3: a chain that will not reassemble must fail the rebuild, not vanish ──
+
+/// `rebuild_indexes_from_heap` used to `continue` past a row whose overflow
+/// chain failed to reassemble, so crash recovery quietly produced a column
+/// index that was missing that row. Every keyed access then reported the row
+/// as absent while a full scan still found it.
+#[test]
+fn e3_unreassemblable_chain_fails_the_index_rebuild() {
+    let dir = temp_dir("rebuild_corrupt_chain");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = "x".repeat(16_384); // spills
+
+    let first_page = {
+        let mut cat = Catalog::create(&dir).unwrap();
+        cat.create_table(Schema {
+            table_name: "t".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    type_id: TypeId::Int,
+                    required: true,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_id: TypeId::Str,
+                    required: true,
+                    position: 1,
+                },
+            ],
+        })
+        .unwrap();
+        cat.create_index_unique("t", "id", true).unwrap();
+        cat.insert("t", &vec![Value::Int(1), Value::Str(body)])
+            .unwrap();
+        cat.checkpoint().unwrap();
+
+        let rid = row0(&cat);
+        let tbl = cat.get_table("t").unwrap();
+        let raw = tbl.heap.get(rid).unwrap().expect("row on disk");
+        let stub = powdb_storage::row::raw_stub(tbl.schema(), tbl.row_layout(), &raw, 1)
+            .expect("v spilled into a chain");
+        stub.first_page
+    };
+
+    {
+        // Clobber the chain head with a short chunk that terminates the
+        // chain: the page CRC is valid, so only the whole-value check
+        // catches it. This is post-open bit rot, not a torn write.
+        let mut cat = Catalog::open(&dir).unwrap();
+        cat.get_table_mut("t")
+            .unwrap()
+            .heap
+            .write_overflow_page(
+                first_page,
+                powdb_storage::page::OVERFLOW_CHAIN_END,
+                b"rot",
+                0,
+            )
+            .unwrap();
+        // A second, un-checkpointed row makes the next open replay the WAL,
+        // which is what runs the post-replay index rebuild.
+        cat.insert("t", &vec![Value::Int(2), Value::Str("small".into())])
+            .unwrap();
+        cat.sync_wal().unwrap();
+        std::mem::forget(cat);
+    }
+
+    let err = match Catalog::open(&dir) {
+        Ok(_) => panic!("a chain that will not reassemble must fail the open"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        powdb_storage::error::StorageError::kind_of_io_error(&err),
+        Some(powdb_storage::error::StorageErrorKind::OverflowCorrupt),
+        "expected the rebuild to surface OverflowCorrupt, got: {err}"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -22,7 +22,9 @@ pub const PAGE_HEADER_SIZE: usize = 20;
 /// the CRC and start data at `PAGE_HEADER_SIZE` (20).
 const LEGACY_HEADER_SIZE: usize = 16;
 const SLOT_COUNT_SIZE: usize = 2; // u16 at bottom of page
-const SLOT_ENTRY_SIZE: usize = 4; // u16 offset + u16 length per slot
+/// Bytes one slot-directory entry costs: a u16 offset plus a u16 length.
+/// A row therefore consumes `row.len() + SLOT_ENTRY_SIZE` of a page.
+pub const SLOT_ENTRY_SIZE: usize = 4;
 const DELETED_MARKER: u16 = 0xFFFF;
 
 /// Maximum encoded row size that can ever fit in a single page: a fresh
@@ -191,6 +193,22 @@ impl Page {
     /// pre-WS3 files (flag clear) are accepted without verification so old
     /// data files still open. Returns `PageCorrupt` on a CRC mismatch.
     pub fn from_bytes_verified(buf: &[u8]) -> crate::error::Result<Self> {
+        Self::verify_bytes(buf)?;
+        let mut data = [0u8; PAGE_SIZE];
+        data.copy_from_slice(buf);
+        Ok(Page { data })
+    }
+
+    /// [`Self::from_bytes_verified`]'s gate, without the copy.
+    ///
+    /// Split out for the scan path, which reads mapped bytes zero-copy: making
+    /// it verify through `from_bytes_verified` would have added a 4KB memcpy
+    /// per page to buy a check that costs less than the copy does. Same
+    /// refusals, same messages, no `Page`.
+    ///
+    /// Validate-if-present: a page written before checksums shipped carries no
+    /// CRC and passes here, exactly as it does through `from_bytes_verified`.
+    pub fn verify_bytes(buf: &[u8]) -> crate::error::Result<()> {
         if buf.len() != PAGE_SIZE {
             return Err(crate::error::StorageError::PageCorrupt(format!(
                 "page buffer is {} bytes, expected {PAGE_SIZE}",
@@ -214,9 +232,14 @@ impl Page {
                 )));
             }
         }
-        let mut data = [0u8; PAGE_SIZE];
-        data.copy_from_slice(buf);
-        Ok(Page { data })
+        Ok(())
+    }
+
+    /// Whether this page carries a CRC32. Pages written before checksums
+    /// shipped do not, which is why [`Self::from_bytes_verified`] cannot
+    /// refuse them outright.
+    pub fn has_checksum(&self) -> bool {
+        self.data[5] & FLAG_HAS_CHECKSUM != 0
     }
 
     /// Compute the page CRC32 and write it into the header. Must be called
@@ -478,7 +501,66 @@ impl Page {
         true
     }
 
-    /// Mark a slot as deleted. Does not reclaim space (compaction is separate).
+    /// Bytes in the data area that belong to deleted slots, or to rows an
+    /// [`Self::update`] moved to the end of the page. [`Self::compact`]
+    /// turns exactly this many bytes back into [`Self::free_space`].
+    pub fn dead_space(&self) -> usize {
+        let mut live = 0usize;
+        for i in 0..self.slot_count() {
+            let (_, length) = self.read_slot_entry(i);
+            if length != DELETED_MARKER {
+                live += length as usize;
+            }
+        }
+        (self.free_start() as usize).saturating_sub(PAGE_HEADER_SIZE + live)
+    }
+
+    /// Slide every live row down to the front of the data area, reclaiming
+    /// the bytes left behind by deletes and relocating updates.
+    ///
+    /// Slot indices are preserved, tombstones included, so every `RowId`
+    /// already handed out stays valid. Rows are moved in offset order, which
+    /// is not slot order once an update has relocated a row.
+    ///
+    /// Returns `false`, having changed nothing, when a live slot points
+    /// outside the page: bit rot or a bad restore in the slot directory
+    /// leaves no safe place to slide that row to. The dead space such a page
+    /// reports is unreclaimable, and a caller that keeps offering the page for
+    /// new rows on the strength of it never makes progress, so the answer has
+    /// to reach the caller rather than being a silent early return.
+    #[must_use]
+    pub fn compact(&mut self) -> bool {
+        let count = self.slot_count();
+        let mut live: Vec<(u16, u16, u16)> = Vec::with_capacity(count as usize);
+        for slot in 0..count {
+            let (offset, length) = self.read_slot_entry(slot);
+            if length == DELETED_MARKER {
+                continue;
+            }
+            let start = offset as usize;
+            let end = start + length as usize;
+            if start < PAGE_HEADER_SIZE || end > PAGE_SIZE {
+                return false;
+            }
+            live.push((offset, length, slot));
+        }
+        live.sort_unstable_by_key(|(offset, _, _)| *offset);
+        let mut cursor = PAGE_HEADER_SIZE;
+        for (offset, length, slot) in live {
+            let start = offset as usize;
+            if start != cursor {
+                self.data
+                    .copy_within(start..start + length as usize, cursor);
+                self.write_slot_entry(slot, cursor as u16, length);
+            }
+            cursor += length as usize;
+        }
+        self.set_free_start(cursor as u16);
+        true
+    }
+
+    /// Mark a slot as deleted. Does not reclaim space on its own; the space
+    /// comes back when [`Self::compact`] runs.
     pub fn delete(&mut self, slot: u16) {
         if slot < self.slot_count() {
             let (offset, _) = self.read_slot_entry(slot);
@@ -943,6 +1025,51 @@ mod tests {
             Page::from_bytes_verified(&bytes).expect("legacy page must read without verification");
         assert_eq!(reopened.page_id(), 9);
         assert_eq!(reopened.get(0).unwrap(), b"legacy row");
+    }
+
+    #[test]
+    fn compact_reports_that_it_ran_and_reclaims_the_dead_space() {
+        let mut page = Page::new(1, PageType::Data);
+        let first = page.insert(b"first row").expect("fits");
+        page.insert(b"second row").expect("fits");
+        page.delete(first);
+        assert!(page.dead_space() > 0, "the delete must leave dead space");
+
+        assert!(page.compact(), "an intact page compacts");
+        assert_eq!(page.dead_space(), 0, "compaction reclaims the dead space");
+    }
+
+    #[test]
+    fn compact_refuses_a_page_whose_live_slot_points_outside_it() {
+        let mut page = Page::new(1, PageType::Data);
+        let first = page.insert(b"first row").expect("fits");
+        let second = page.insert(b"second row").expect("fits");
+        page.delete(first);
+        let dead_before = page.dead_space();
+        assert!(dead_before > 0, "the delete must leave dead space");
+
+        // A row that runs off the end of the page: bit rot in the slot
+        // directory, or a legacy (pre-checksum) page out of a bad restore.
+        // Only the offset moves, so the page still reports the same live
+        // bytes and the same unreclaimable dead space.
+        let (_, length) = page.read_slot_entry(second);
+        page.write_slot_entry(second, (PAGE_SIZE - 1) as u16, length);
+        let before = *page.as_bytes();
+
+        assert!(
+            !page.compact(),
+            "a page with a live slot outside it cannot be compacted"
+        );
+        assert_eq!(
+            page.as_bytes(),
+            &before,
+            "a refused compaction must leave the page byte-for-byte alone"
+        );
+        assert_eq!(
+            page.dead_space(),
+            dead_before,
+            "and the dead space it cannot reclaim is still there"
+        );
     }
 
     #[test]

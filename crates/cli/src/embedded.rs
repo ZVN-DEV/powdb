@@ -4,21 +4,75 @@ use super::*;
 
 // ─── One-shot execution (embedded) ──────────────────────────────────────────
 
-pub(crate) fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -> i32 {
-    let mut engine = match Engine::new_with_wal_archive(
-        Path::new(data_dir),
-        archive_wal_records_if_sync_enabled,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Error: failed to initialize engine: {e}");
-            return 1;
+/// Open the embedded engine at `data_dir`, read-write or read-only.
+///
+/// The path is checked first. `Engine::open_read_only` surfaces a bare
+/// `No such file or directory (os error 2)` for a missing directory, and the
+/// read-write path fails deep inside directory creation when the path is a
+/// file; neither names the path the operator typed. A read-only open must also
+/// never CREATE the directory: handing back an empty database because the
+/// snapshot path was mistyped looks exactly like data loss.
+pub(crate) fn open_embedded_engine(
+    data_dir: &str,
+    readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
+) -> Result<Engine, i32> {
+    let path = Path::new(data_dir);
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            eprintln!("Error: {data_dir} is not a directory");
+            eprintln!("note: --data-dir takes the database directory, not a file inside it");
+            return Err(1);
         }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if readonly {
+                eprintln!("Error: data directory {data_dir} does not exist");
+                eprintln!(
+                    "note: --readonly never creates a database; check the path, or drop \
+                     --readonly to create one here"
+                );
+                return Err(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: cannot use data directory {data_dir}: {e}");
+            return Err(1);
+        }
+    }
+
+    let opened = if readonly {
+        Engine::open_read_only(path)
+    } else {
+        Engine::new_with_wal_archive(path, archive_wal_records_if_sync_enabled)
+    };
+    let mut engine = opened.map_err(|e| {
+        eprintln!("Error: failed to initialize engine: {e}");
+        1
+    })?;
+    // A read-only engine never appends to the log, so the threshold is moot
+    // there and setting it would only invite a write.
+    if let (Some(bytes), false) = (wal_checkpoint_bytes, readonly) {
+        engine.catalog_mut().set_wal_checkpoint_bytes(bytes);
+    }
+    Ok(engine)
+}
+
+pub(crate) fn exec_embedded(
+    data_dir: &str,
+    query: &str,
+    session: SessionOpts,
+    readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
+) -> i32 {
+    let mut engine = match open_embedded_engine(data_dir, readonly, wal_checkpoint_bytes) {
+        Ok(e) => e,
+        Err(code) => return code,
     };
     // Statement-aware splitting (#150): a `;` inside a string literal or a
     // `#` comment is not a boundary, so text-heavy rows load intact.
     let statements = split_statements_in(query, session.dialect);
-    for stmt in &statements {
+    for (index, stmt) in statements.iter().enumerate() {
         // A segment that is only comments and whitespace is not a statement.
         // The engine lexes it to zero tokens and reports "expected statement,
         // got end of input", so a dump that merely *ended* with a comment line
@@ -44,15 +98,72 @@ pub(crate) fn exec_embedded(data_dir: &str, query: &str, session: SessionOpts) -
                 print_local_result(&result, session.output);
             }
             Err(e) => {
+                if let Some(where_) = failing_statement_locator(index, statements.len(), stmt) {
+                    eprintln!("{where_}");
+                }
                 eprintln!("Error: {e}");
                 if let Some(hint) = missing_separator_hint(query, statements.len()) {
                     eprintln!("{hint}");
                 }
-                return 1;
+                return finish_open_transaction(&mut engine, 1);
             }
         }
     }
-    0
+    finish_open_transaction(&mut engine, 0)
+}
+
+/// Close a transaction the script left open, and report it.
+///
+/// A script that ends between `begin` and `commit` has committed nothing: the
+/// engine discards the transaction when it closes. Exiting 0 told a `set -e`
+/// deploy that writes had landed when none had, and the only trace was a
+/// checkpoint-on-drop ERROR about an active transaction, which reads like an
+/// internal fault rather than the script's own mistake.
+///
+/// The engine is the authority on whether a transaction is open, so this asks
+/// it: `rollback` succeeds only when there is one to roll back.
+pub(crate) fn finish_open_transaction(engine: &mut Engine, code: i32) -> i32 {
+    if engine.execute_powql("rollback").is_err() {
+        return code;
+    }
+    eprintln!("Error: transaction still open at end of script; rolled back");
+    eprintln!(
+        "note: every write since `begin` was discarded. End the script with `commit` \
+         (or `rollback`) so its outcome is explicit."
+    );
+    1
+}
+
+/// Which statement of a multi-statement script failed, and what it said.
+///
+/// A one-shot load stops at the first failure, and the engine's error is
+/// about the statement, not about the script: for a dump of a few hundred
+/// statements it does not say where to look. `None` for a single statement,
+/// where there is nothing to locate.
+pub(crate) fn failing_statement_locator(
+    index: usize,
+    total: usize,
+    statement: &str,
+) -> Option<String> {
+    if total < 2 {
+        return None;
+    }
+    Some(format!(
+        "Error: statement {} of {total} failed: {}",
+        index + 1,
+        statement_excerpt(statement)
+    ))
+}
+
+/// One line of a statement, short enough to read in an error.
+pub(crate) fn statement_excerpt(statement: &str) -> String {
+    let flat = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 120 {
+        return flat;
+    }
+    let mut short: String = flat.chars().take(117).collect();
+    short.push_str("...");
+    short
 }
 
 /// Explain the single most common `--exec-file` mistake instead of leaving the
@@ -87,20 +198,31 @@ pub(crate) fn missing_separator_hint(source: &str, statement_count: usize) -> Op
 
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
-pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts) {
-    eprintln!("PowDB v{} — embedded mode", env!("CARGO_PKG_VERSION"));
+pub(crate) fn run_embedded(
+    data_dir: &str,
+    session: SessionOpts,
+    readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
+) {
+    eprintln!(
+        "PowDB v{} — embedded mode{}",
+        env!("CARGO_PKG_VERSION"),
+        if readonly { " (read-only)" } else { "" }
+    );
     eprintln!("Data directory: {data_dir}");
-    eprintln!("Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.\n");
-
-    let mut engine = match Engine::new_with_wal_archive(
-        Path::new(data_dir),
-        archive_wal_records_if_sync_enabled,
-    ) {
-        Ok(engine) => engine,
-        Err(e) => {
-            eprintln!("Error: failed to initialize engine: {e}");
-            std::process::exit(1);
+    // The banner used to say "Type PowQL queries" even when `--sql` had put
+    // the REPL into SQL mode, so the prompt and the instructions disagreed.
+    eprintln!(
+        "Type {} queries. Use Ctrl-D to exit. Type .help for commands.\n",
+        match session.dialect {
+            Dialect::Powql => "PowQL",
+            Dialect::Sql => "SQL",
         }
+    );
+
+    let mut engine = match open_embedded_engine(data_dir, readonly, wal_checkpoint_bytes) {
+        Ok(engine) => engine,
+        Err(code) => std::process::exit(code),
     };
 
     let mut rl = match Editor::new() {
@@ -191,7 +313,7 @@ pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts) {
                     continue;
                 }
                 continuation_noted = false;
-                let statement = buffer.trim().to_string();
+                let statement = strip_one_trailing_semicolon(buffer.trim()).to_string();
                 buffer.clear();
                 if is_effectively_blank_in(&statement, session.dialect) {
                     continue;
@@ -261,7 +383,7 @@ pub(crate) fn run_embedded_meta(trimmed: &str, engine: &Engine) {
         cmd if cmd.starts_with(".schema") => {
             let table_name = cmd.strip_prefix(".schema").unwrap().trim();
             if table_name.is_empty() {
-                eprintln!("Usage: .schema <TABLE_NAME>");
+                eprintln!("Usage: .schema <TABLE>");
             } else if let Some(schema) = engine.catalog().schema(table_name) {
                 println!("Table: {}", schema.table_name);
                 println!("  {:<20} {:<12} Required", "Column", "Type");

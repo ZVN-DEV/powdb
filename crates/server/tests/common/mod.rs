@@ -159,7 +159,7 @@ pub struct InprocServer {
     pub preauth_deadline: Duration,
     pub query_timeout: Duration,
     pub expected_password: Option<String>,
-    pub users: Arc<powdb_auth::UserStore>,
+    pub users: Arc<powdb_server::handler::UserDirectory>,
     pub metrics: Arc<Metrics>,
     pub rate_limiter: Option<AuthRateLimiter>,
     /// External shutdown signal. When `None`, each connection gets its own
@@ -180,7 +180,7 @@ impl Default for InprocServer {
             preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
             query_timeout: Duration::from_secs(30),
             expected_password: None,
-            users: Arc::new(powdb_auth::UserStore::new()),
+            users: Arc::new(powdb_server::handler::UserDirectory::empty()),
             metrics: Arc::new(Metrics::new()),
             rate_limiter: None,
             shutdown_rx: None,
@@ -303,12 +303,32 @@ pub fn spawn_server_bound_with_metrics(
     )
 }
 
+/// Pay the operating system's first-exec cost for the server binary once, so
+/// the per-spawn deadline below measures the server and not the platform.
+///
+/// macOS scans a newly written executable the first time it runs; for a 44 MB
+/// debug binary that is tens of seconds during which the process sits in the
+/// dynamic linker and never reaches `main`. Cargo rewrites the binary on every
+/// relink, so a test that spawns it right afterwards can blow a 30 s deadline
+/// without anything being wrong with the server.
+fn warm_server_binary() {
+    static WARMED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    WARMED.get_or_init(|| {
+        let _ = Command::new(env!("CARGO_BIN_EXE_powdb-server"))
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
 fn spawn_server_bound_inner(
     data_dir: &std::path::Path,
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
     metrics: bool,
 ) -> (Child, u16, Option<u16>) {
+    warm_server_binary();
     let seq = PORT_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let port_file =
         std::env::temp_dir().join(format!("powdb_test_ports_{}_{seq}", std::process::id()));
@@ -359,6 +379,7 @@ pub fn spawn_server_bin_env(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Child {
+    warm_server_binary();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_powdb-server"));
     cmd.arg("--port")
         .arg(port.to_string())

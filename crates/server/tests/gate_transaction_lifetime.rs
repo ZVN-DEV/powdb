@@ -94,7 +94,7 @@ async fn start_server(
                         engine,
                         tx_gate,
                         expected_password: None,
-                        users: Arc::new(powdb_auth::UserStore::new()),
+                        users: Arc::new(powdb_server::handler::UserDirectory::empty()),
                         shutdown_rx: &mut shutdown_rx,
                         idle_timeout: IDLE_TIMEOUT,
                         preauth_deadline: powdb_server::handler::DEFAULT_PREAUTH_DEADLINE,
@@ -530,21 +530,33 @@ async fn a_client_that_stops_reading_cannot_hold_the_gate_for_the_write_timeout(
     .unwrap();
 
     let started = Instant::now();
+    // The stalled transaction has written nothing, so a reader on another
+    // connection is served straight away and cannot tell us whether the gate
+    // came back. A WRITE can: it needs the whole gate, so it stays refused
+    // until the reap releases the holder's permits.
     let mut reader = connect(addr).await;
+    match query(&mut reader, "count(T)").await {
+        Message::ResultScalar { .. } | Message::ResultScalarNative { .. } => {}
+        other => panic!(
+            "a read must be served beside a transaction that has not written: {}",
+            error_message(&other)
+        ),
+    }
+
+    let mut writer = connect(addr).await;
     // The server's tx_wait_timeout is 300ms, so the first attempts are refused
     // with a gate timeout while the holder still has the gate. Retry until the
     // gate is actually free, bounded well below the 30s write timeout.
     let deadline = started + Duration::from_secs(12);
-    let count = loop {
+    loop {
         assert!(
             Instant::now() < deadline,
             "the stalled reader held the transaction gate past its {}ms budget; \
              it is being bounded by the 30s response-write timeout instead",
             STALLED_WRITE_LIFETIME.as_millis()
         );
-        match query(&mut reader, "count(T)").await {
-            Message::ResultScalar { value } => break value,
-            Message::ResultScalarNative { .. } => break "1".to_string(),
+        match query(&mut writer, "insert T { id := 2 }").await {
+            Message::ResultOk { .. } | Message::ResultMessage { .. } => break,
             other => {
                 let message = error_message(&other);
                 assert!(
@@ -553,8 +565,7 @@ async fn a_client_that_stops_reading_cannot_hold_the_gate_for_the_write_timeout(
                 );
             }
         }
-    };
-    assert_eq!(count, "1");
+    }
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(12),

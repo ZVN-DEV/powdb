@@ -6,11 +6,14 @@
 cargo build --workspace            # build everything
 cargo test --workspace             # run all tests (tens of minutes: roughly 35-45 on an M-series laptop, longer cold)
 cargo run --release -p powdb-compare  # benchmark vs SQLite (100K rows)
-cargo bench -p powdb-bench         # criterion benchmarks (24 benches, 22 gated workloads; ~5 min of measurement,
+cargo bench -p powdb-bench         # criterion benchmarks (23 benches, 22 gated workloads; ~5 min of measurement,
                                    # plus a cold compile of the bench targets)
 ```
 
 Watch mode: `bacon` (or `cargo watch -x "check --workspace"`) for a recheck-on-save loop.
+The repo ships a `bacon.toml` defining the jobs worth having here: `check` (the default),
+`clippy` (all targets, `-D warnings`, spelled as ci.yml runs it), `test-query`,
+`test-storage`, `fmt` and `doc`. `bacon <job>` starts one by name.
 
 ## Architecture
 
@@ -87,7 +90,7 @@ cargo test -p powdb-storage               # storage crate only
 # Wide comparison (PowDB vs SQLite, 100K rows, 15 workloads)
 cargo run --release -p powdb-compare
 
-# Criterion regression suite (24 benches, 22 gated workloads; ~5 min of measurement)
+# Criterion regression suite (23 benches, 22 gated workloads; ~5 min of measurement)
 cargo bench -p powdb-bench
 
 # Check against regression baselines
@@ -97,6 +100,25 @@ cargo run -p powdb-bench --bin compare
 ./scripts/update-bench-baseline.sh
 ```
 
+The harness binaries read a few environment variables that exist nowhere else. Each one is
+also documented in the module doc comment at the top of the binary that reads it:
+
+| Variable | Read by | Meaning |
+|---|---|---|
+| `BENCH_N_ROWS` | `powdb-compare` | Fixture size for the SQLite comparison (default 100,000) |
+| `POWDB_JOIN_BENCH_SIZES` | `compound_join_scaling` | Comma-separated join cardinalities to sweep; required, the binary exits without it |
+| `POWDB_EXPR_INDEX_SIZES` | `expression_index_release_gate` | Comma-separated row counts to sweep; required |
+| `POWDB_EXPR_INDEX_OUTPUT` | `expression_index_release_gate` | Path the JSON report is written to |
+| `POWDB_HISTORICAL_LEGACY_ARTIFACT` | `phase0_read_baseline` | Path to the isolated pre-v0.13 JSON artifact to compare against; required |
+| `POWDB_HISTORICAL_BASELINE_LABEL` | `phase0_read_baseline` | Label recorded for that historical artifact |
+| `POWDB_BASELINE_RUN_LABEL` | `phase0_read_baseline` | Label recorded for this run (default `unlabeled`) |
+
+One more lives outside the bench crates: `POWDB_UPDATE_WIRE_VECTORS=1 cargo test -p powdb-server
+--test wire_conformance` regenerates the golden wire vectors instead of asserting against them.
+Regenerate deliberately: the vectors are the wire-compatibility gate.
+
+The server's own `POWDB_*` variables are documented in the README's environment-variable table.
+
 ## Common Patterns
 
 ### Adding a new PowQL keyword
@@ -105,7 +127,7 @@ cargo run -p powdb-bench --bin compare
 3. Add parser production to `crates/query/src/parser.rs`
 4. Add plan node (if needed) to `crates/query/src/plan.rs`
 5. Add planner case to `crates/query/src/planner.rs`
-6. Add executor case to `crates/query/src/executor/` (start in `mod.rs` / `plan_exec.rs`)
+6. Add executor case to `crates/query/src/executor/` (start in `mod.rs` / `plan_exec/dispatch.rs`; `plan_exec` is a module directory, not a file)
 
 ### Adding an executor fast path
 Fast paths match on specific `PlanNode` shapes in `execute_plan()`. Pattern-match the plan tree and handle it before the generic recursive executor. Always verify with benchmarks.
@@ -118,11 +140,11 @@ If the planner emits a different shape for the same logical operation, the fast 
 Eight workflow files. Only the first gates merges.
 
 **Merge gate**
-- `.github/workflows/ci.yml`: clippy + fmt + test + doctest (+ ASan, miri, cargo audit, cargo-deny, MSRV, version consistency, cross-version on-disk compat, fuzz-corpus replay, examples smoke, ts-client, node-addon, embedded-sync-js, internal-content-guard, secret-scan). All jobs feed a single **`ci-success`** aggregator job (`needs:` every job, fails if any fails); **`ci-success`** is the one required status check on `main`, so the whole matrix gates merges. Add new jobs to its `needs:` list, or the `ci-needs-completeness` job fails the build.
+- `.github/workflows/ci.yml`: clippy + fmt + test + doctest (+ ASan, miri, cargo audit, cargo-deny, MSRV, version consistency, cross-version on-disk compat, fuzz-corpus replay, examples smoke, ts-client, node-addon, embedded-sync-js, internal-content-guard, secret-scan). All jobs feed a single **`ci-success`** aggregator job (`needs:` every job, fails if any fails); **`ci-success`** is the one required status check on `main`, so the whole matrix gates merges. Add new jobs to its `needs:` list. `ci-success` now runs the completeness check itself, against `ci.yml` on disk rather than against the list it is auditing, so an incomplete or emptied `needs:` list fails the aggregator directly instead of only through the job it was guarding. The `internal-content-guard` job likewise fails when either half of it did not actually inspect anything (a `git grep` that errored, a missing pattern file), not only when it found something.
 
 **Not merge gates**
 - `.github/workflows/fuzz.yml`: cargo-fuzz targets. **Separate** from ci.yml (PR-triggered + nightly cron at 07:00 UTC + `workflow_dispatch`); not part of the required check set above.
-- `.github/workflows/bench.yml`: criterion microbenchmark suite. **Manual-only (`workflow_dispatch`), NOT a required gate.** Runs on a Depot single-tenant runner (`depot-ubuntu-24.04-4`, tmpfs temp DBs), so numbers are comparable run-to-run; `crates/bench/baseline/main.json` must only ever be rebaselined from a Depot run of this workflow, never from a laptop. It is not a gate because shared-runner and single-tenant timing noise makes a wall-clock threshold an unreliable blocking check, not because of what `powdb-bench` links: it depends on `powdb-storage`, `powdb-query`, `powdb-server` **and** `powdb-auth`, so it does compile server and auth code that the normal suite also covers. Run it on demand: `gh workflow run bench.yml`.
+- `.github/workflows/bench.yml`: criterion microbenchmark suite. **Manual-only (`workflow_dispatch`), NOT a required gate.** Runs on a Depot single-tenant runner (`depot-ubuntu-24.04-4`, tmpfs temp DBs), so numbers are comparable run-to-run; `crates/bench/baseline/main.json` must only ever be rebaselined from a Depot run of this workflow, never from a laptop: `scripts/update-bench-baseline-from-depot.sh <run id>` writes it from that run's uploaded criterion estimates. It is not a gate because shared-runner and single-tenant timing noise makes a wall-clock threshold an unreliable blocking check, not because of what `powdb-bench` links: it depends on `powdb-storage`, `powdb-query`, `powdb-server` **and** `powdb-auth`, so it does compile server and auth code that the normal suite also covers. Run it on demand: `gh workflow run bench.yml`.
 - `.github/workflows/release.yml`: fires on a `v*` tag with full test suite, prebuilt `powdb-cli` / `powdb-server` binaries for Linux x86_64 and macOS arm64, the ghcr Docker image, the GitHub Release, and the `@zvndev/powdb-client` + `@zvndev/powdb-sync` npm publishes.
 - `.github/workflows/publish.yml`: publishes the eight crates.io crates in dependency order (`workflow_dispatch`, token-less via OIDC). `dry_run` defaults to **true**, so a real publish must pass `-f dry_run=false`.
 - `.github/workflows/publish-node-addon.yml`: publishes `@zvndev/powdb-embedded`, the prebuilt native addon, one runner per platform (`workflow_dispatch`). Run this **before** the post-publish smoke, which installs the addon.

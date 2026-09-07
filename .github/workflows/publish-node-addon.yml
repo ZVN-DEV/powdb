@@ -85,11 +85,30 @@ jobs:
         working-directory: bindings/node
         run: npm ci
 
+      # `napi build` does not forward --locked to cargo, so the checked-in lock
+      # only means something if a separate step asserts it. Without this, the
+      # published native binary could be built against a dependency set no CI
+      # run ever compiled, and the addon's lock has gone stale before: it sat at
+      # 0.21.0 through four minors. Same pattern fuzz.yml uses for cargo-fuzz,
+      # which has the same gap.
+      - name: Verify the checked-in addon lockfile is current
+        working-directory: bindings/node
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: Build native addon (release, portable)
         working-directory: bindings/node
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: npm run build
+
+      # ci.yml runs `npm test` on Linux x64 only. This matrix builds the macOS
+      # arm64 and Linux arm64 binaries that actually ship, and published them
+      # having never loaded them once. Each runner is native to the binary it
+      # just built, so the test is a real load-and-query of the artifact being
+      # uploaded rather than a proxy for it.
+      - name: Test the binary this runner just built
+        working-directory: bindings/node
+        run: npm test
 
       - name: Upload addon artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -109,10 +128,23 @@ jobs:
     permissions:
       contents: read
       id-token: write # prove identity to npm via OIDC (no stored token)
+    env:
+      # Dispatch inputs reach the shell through the environment, never by
+      # interpolation into a `run:` block: GitHub substitutes ${{ }} as TEXT
+      # before bash sees the script, so a crafted input would be spliced into
+      # the step's source. Same rule post-publish-smoke.yml already applies.
+      # `if:` conditions stay as expressions; Actions evaluates those, not a
+      # shell.
+      VERSION: ${{ inputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history + tags: the tag verification step below has to resolve
+          # v<version> and compare it against the dispatched commit.
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -131,11 +163,44 @@ jobs:
         working-directory: bindings/node
         run: |
           pkg="$(node -p "require('./package.json').version")"
-          if [ "$pkg" != "${{ inputs.version }}" ]; then
-            echo "::error::bindings/node/package.json ($pkg) does not match input (${{ inputs.version }})"
+          if [ "$pkg" != "$VERSION" ]; then
+            echo "::error::bindings/node/package.json ($pkg) does not match input ($VERSION)"
             exit 1
           fi
-          echo "package.json version matches ${{ inputs.version }}"
+          echo "package.json version matches $VERSION"
+
+      # Same guard publish.yml carries, and it matters more here: this
+      # workflow publishes whatever ref was dispatched, and what it publishes
+      # is a NATIVE binary that users load into their own process. Without
+      # this, a real publish could ship an arbitrary commit (a feature branch,
+      # an unmerged fix) under a released version number, with only
+      # package.json's version string to say otherwise. Every addon release so
+      # far was dispatched on the tag by discipline alone. Dry runs only warn:
+      # they are used before tagging.
+      - name: Verify tag v${{ inputs.version }} points at this commit
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          head_sha="$(git rev-parse HEAD)"
+          if ! tag_sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
+            msg="tag ${tag} does not exist in this repository"
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}"
+            exit 1
+          fi
+          if [ "${tag_sha}" != "${head_sha}" ]; then
+            msg="tag ${tag} points at ${tag_sha}, but this run is on ${head_sha}"
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "::warning::${msg} (dry run, continuing)"
+              exit 0
+            fi
+            echo "::error::${msg}. Dispatch this workflow on the tag."
+            exit 1
+          fi
+          echo "tag ${tag} matches HEAD (${head_sha})"
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -160,9 +225,12 @@ jobs:
       # version publishes under `latest`, an X.Y.Z-rc.N under `next`, so an rc
       # never becomes what a bare `npm install @zvndev/powdb-embedded`
       # resolves to. Any other version shape fails here rather than shipping.
+      - name: Prove the release-channel classifier can refuse a bad tag
+        run: bash scripts/ci/release-channel.sh --selftest
+
       - name: Classify the release channel (final vs rc)
         id: channel
-        run: bash scripts/ci/release-channel.sh "${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+        run: bash scripts/ci/release-channel.sh "$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish to npm (token-less, with provenance)
         if: ${{ inputs.dry_run == false }}
@@ -175,11 +243,13 @@ jobs:
         run: npm publish --dry-run --tag "${{ steps.channel.outputs.npm_tag }}"
 
       - name: Summary
+        env:
+          NPM_TAG: ${{ steps.channel.outputs.npm_tag }}
         run: |
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             echo "## Dry run complete" >> "$GITHUB_STEP_SUMMARY"
-            echo "Built + packed @zvndev/powdb-embedded v${{ inputs.version }} for all 3 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "Built + packed @zvndev/powdb-embedded v$VERSION for all 3 platforms. Re-run with dry_run=false to publish." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "## Published @zvndev/powdb-embedded v${{ inputs.version }} (dist-tag ${{ steps.channel.outputs.npm_tag }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Published @zvndev/powdb-embedded v$VERSION (dist-tag ${NPM_TAG})" >> "$GITHUB_STEP_SUMMARY"
             echo "Single package with prebuilt binaries for macOS (arm64), Linux (x64/arm64). Intel mac builds from source (retired runners); Windows deferred (Unix-only engine)." >> "$GITHUB_STEP_SUMMARY"
           fi

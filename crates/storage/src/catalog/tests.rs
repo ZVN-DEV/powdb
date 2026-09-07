@@ -751,7 +751,7 @@ fn test_create_table_and_insert() {
     let row = vec![Value::Str("Alice".into()), Value::Int(30)];
     let rid = cat.insert("users", &row).unwrap();
 
-    let result = cat.get("users", rid).unwrap();
+    let result = cat.get("users", rid).expect("read row").unwrap();
     assert_eq!(result[0], Value::Str("Alice".into()));
     assert_eq!(result[1], Value::Int(30));
 }
@@ -857,8 +857,8 @@ fn test_delete_row() {
     let r1 = cat.insert("t", &vec![Value::Int(1)]).unwrap();
     let r2 = cat.insert("t", &vec![Value::Int(2)]).unwrap();
     cat.delete("t", r1).unwrap();
-    assert!(cat.get("t", r1).is_none());
-    assert!(cat.get("t", r2).is_some());
+    assert!(cat.get("t", r1).expect("read row").is_none());
+    assert!(cat.get("t", r2).expect("read row").is_some());
 }
 
 #[test]
@@ -876,7 +876,7 @@ fn test_update_row() {
     cat.create_table(schema).unwrap();
     let rid = cat.insert("t", &vec![Value::Int(1)]).unwrap();
     let new_rid = cat.update("t", rid, &vec![Value::Int(99)]).unwrap();
-    let row = cat.get("t", new_rid).unwrap();
+    let row = cat.get("t", new_rid).expect("read row").unwrap();
     assert_eq!(row[0], Value::Int(99));
 }
 
@@ -1322,5 +1322,342 @@ fn autocommit_writes_are_not_capped_by_the_dirty_page_budget() {
             .unwrap()
             .len(),
         5_000
+    );
+}
+
+/// A crafted `page_id` used to grow the heap one page at a time all the way
+/// up to it: `u32::MAX` meant a 16 TiB file and an open that never returned.
+/// The nightly fuzz run of 2026-08-30 found this as a `fuzz_wal_replay`
+/// timeout.
+#[test]
+fn replaying_an_insert_past_the_page_ceiling_refuses_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let heap_path = dir.path().join("Wild.heap");
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Wild")).unwrap();
+        cat.insert("Wild", &vec![Value::Int(1), Value::Str("a".into())])
+            .unwrap();
+        cat.checkpoint().unwrap();
+
+        // One un-checkpointed Insert aimed at the far end of the address
+        // space. No transaction boundaries, so replay treats it as committed.
+        let row = crate::row::encode_row(
+            cat.schema("Wild").unwrap(),
+            &[Value::Int(2), Value::Str("b".into())],
+        );
+        let payload = encode_wal_payload(
+            "Wild",
+            RowId {
+                page_id: u32::MAX,
+                slot_index: 0,
+            },
+            &row,
+        );
+        cat.wal
+            .append(0, WalRecordType::Insert, &payload)
+            .expect("append crafted record");
+        cat.wal.flush().expect("flush crafted record");
+        std::mem::forget(cat); // crash: the record is replayed on the next open
+    }
+
+    let heap_len_before = fs::metadata(&heap_path).unwrap().len();
+    let started = std::time::Instant::now();
+    let err = match Catalog::open(dir.path()) {
+        Ok(_) => panic!("a wild page id must refuse the open"),
+        Err(e) => e,
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        StorageError::kind_of_io_error(&err),
+        Some(crate::error::StorageErrorKind::WalReplay),
+        "expected a WAL replay refusal, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("Wild"),
+        "the refusal must name the table, got: {err}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "refusal must be immediate, took {elapsed:?}"
+    );
+    assert_eq!(
+        fs::metadata(&heap_path).unwrap().len(),
+        heap_len_before,
+        "the refused record must not have grown the heap"
+    );
+}
+
+/// A `DdlCreateTable` record whose table cannot be created is not survivable:
+/// every later Insert for that table has nowhere to land and used to be
+/// dropped in silence.
+#[test]
+fn replaying_a_create_table_that_cannot_be_created_refuses_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Seed")).unwrap();
+        cat.checkpoint().unwrap();
+
+        let payload =
+            encode_ddl_create_table(&ddl_guard_schema("Later"), &[None, None], &[false, false]);
+        cat.wal
+            .append(0, WalRecordType::DdlCreateTable, &payload)
+            .expect("append create record");
+        cat.wal.flush().expect("flush create record");
+        std::mem::forget(cat);
+    }
+
+    // A directory where the heap file cannot be created: put a directory in
+    // the way of the path `Table::create` needs.
+    fs::create_dir(dir.path().join("Later.heap")).unwrap();
+
+    let err = match Catalog::open(dir.path()) {
+        Ok(_) => panic!("a create that cannot run must refuse the open"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        StorageError::kind_of_io_error(&err),
+        Some(crate::error::StorageErrorKind::WalReplay),
+        "expected a WAL replay refusal, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("Later"),
+        "the refusal must name the table, got: {err}"
+    );
+}
+
+/// A record naming a table this catalog does not have is dropped, but the
+/// records around it still apply and the open still succeeds.
+#[test]
+fn replay_drops_a_record_for_an_unknown_table_and_keeps_going() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        cat.create_table(ddl_guard_schema("Real")).unwrap();
+        cat.checkpoint().unwrap();
+
+        let ghost = encode_wal_payload(
+            "Ghost",
+            RowId {
+                page_id: 1,
+                slot_index: 0,
+            },
+            b"whatever",
+        );
+        cat.wal
+            .append(0, WalRecordType::Insert, &ghost)
+            .expect("append ghost record");
+        cat.insert("Real", &vec![Value::Int(1), Value::Str("kept".into())])
+            .unwrap();
+        cat.sync_wal().unwrap();
+        std::mem::forget(cat);
+    }
+
+    let cat = Catalog::open(dir.path()).expect("an unroutable record must not fail the open");
+    let rows: Vec<_> = cat
+        .scan("Real")
+        .unwrap()
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "the routable record must still have applied");
+}
+
+/// One-column table used by the auto-checkpoint tests below.
+fn one_int_table(cat: &mut Catalog, name: &str) {
+    cat.create_table(Schema {
+        table_name: name.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            type_id: TypeId::Int,
+            required: true,
+            position: 0,
+        }],
+    })
+    .unwrap();
+}
+
+/// `commit_autocommit` piggy-backs an automatic checkpoint onto the commit.
+/// The commit is durable the moment `wal.flush()` returns; the checkpoint that
+/// follows writes dirty heap pages and truncates the log, and on a filesystem
+/// that has just filled it fails while the commit stands. Reporting that
+/// through the commit's return value told the caller the write had not
+/// happened when it had, and a client that retried the "failed" insert on a
+/// table with no unique constraint ended up with the row twice.
+#[test]
+fn a_failing_auto_checkpoint_does_not_report_the_commit_as_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cat = Catalog::create(dir.path()).unwrap();
+    one_int_table(&mut cat, "T");
+    cat.commit_autocommit().unwrap();
+
+    // Every commit crosses the threshold from here on.
+    cat.set_wal_checkpoint_bytes(1);
+    // Break the checkpoint without breaking the commit: `catalog.lsn` is
+    // written by rename inside `Catalog::checkpoint`, after the WAL flush that
+    // makes the statement durable. A directory in its place fails that rename
+    // the way a full or failing filesystem would.
+    let lsn_path = dir.path().join(CATALOG_LSN_FILE);
+    let _ = fs::remove_file(&lsn_path);
+    fs::create_dir(&lsn_path).unwrap();
+
+    cat.insert("T", &vec![Value::Int(7)]).unwrap();
+    let checkpoint_error = cat
+        .checkpoint()
+        .expect_err("the test needs the checkpoint to actually fail, or it proves nothing");
+    assert!(
+        checkpoint_error
+            .to_string()
+            .to_lowercase()
+            .contains("directory")
+            || checkpoint_error.raw_os_error().is_some(),
+        "expected an I/O failure writing the LSN sidecar, got: {checkpoint_error}"
+    );
+
+    cat.commit_autocommit()
+        .expect("the commit is durable, so it must not be reported as failed");
+
+    // And the row really is durable: the WAL still holds it.
+    drop(cat);
+    fs::remove_dir(&lsn_path).unwrap();
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.scan("T").unwrap().count(),
+        1,
+        "the row the commit acknowledged must survive the reopen"
+    );
+}
+
+/// A hook that was handed to the open but never registered for the automatic
+/// checkpoint cannot be run from inside one, so the checkpoint has to skip:
+/// there is no way to publish the records a truncate would destroy.
+///
+/// This is the narrow case. It is *not* how either shipped binary opens a
+/// catalog: they register the hook, so their threshold fires and archives
+/// first. See `an_auto_archive_hook_publishes_the_log_and_then_truncates_it`.
+#[test]
+fn an_installed_wal_archive_hook_stops_the_automatic_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        one_int_table(&mut cat, "T");
+        cat.commit_autocommit().unwrap();
+        cat.checkpoint().unwrap();
+    }
+
+    let mut archived = 0usize;
+    let mut cat = Catalog::open_with_wal_archive(dir.path(), |_, records| {
+        archived += records.len();
+        Ok(())
+    })
+    .unwrap();
+    // The directory was checkpointed above, so this is the length of a log
+    // holding nothing but its header: what a truncate would leave behind.
+    let empty_log = cat.wal.synced_len().unwrap();
+    cat.set_wal_checkpoint_bytes(1);
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.commit_autocommit().unwrap();
+
+    assert!(
+        cat.wal.synced_len().unwrap() > empty_log,
+        "the automatic checkpoint truncated a WAL that is somebody's archive stream"
+    );
+    assert_eq!(
+        archived, 0,
+        "the automatic checkpoint does not run the hook, which is the whole reason \
+         it must not truncate"
+    );
+}
+
+/// The other half: without a hook the automatic checkpoint still runs, so the
+/// skip above is a skip and not "the threshold never fires".
+#[test]
+fn a_catalog_without_an_archive_hook_still_checkpoints_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cat = Catalog::create(dir.path()).unwrap();
+    one_int_table(&mut cat, "T");
+    cat.commit_autocommit().unwrap();
+    cat.checkpoint().unwrap();
+    let empty_log = cat.wal.synced_len().unwrap();
+
+    cat.set_wal_checkpoint_bytes(1);
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.commit_autocommit().unwrap();
+
+    assert_eq!(
+        cat.wal.synced_len().unwrap(),
+        empty_log,
+        "a plainly-opened catalog must still checkpoint when the log crosses the threshold"
+    );
+}
+
+/// The configuration both shipped binaries actually use: a catalog opened with
+/// an archive hook that is *also* registered for the automatic checkpoint. The
+/// threshold has to fire here, and the hook has to see every record the
+/// truncate is about to destroy.
+///
+/// `powdb-cli` and `powdb-server` always pass a hook to
+/// `Engine::new_with_wal_archive` (a no-op unless sync is on), so a skip keyed
+/// on "a hook was passed" turned `--wal-checkpoint-bytes` into a no-op in every
+/// real deployment and let the WAL grow without bound, which is the one thing
+/// the threshold exists to prevent. The answer is to archive and then truncate,
+/// not to stop checkpointing.
+#[test]
+fn an_auto_archive_hook_publishes_the_log_and_then_truncates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        one_int_table(&mut cat, "T");
+        cat.commit_autocommit().unwrap();
+        cat.checkpoint().unwrap();
+    }
+
+    // Every record the hook is handed, in the order it saw them.
+    let published: Arc<std::sync::Mutex<Vec<(WalRecordType, u64)>>> = Arc::default();
+    let recorder = Arc::clone(&published);
+    let hook: WalArchiveHook = Arc::new(move |_dir: &Path, records: &[WalRecord]| {
+        recorder.lock().unwrap().extend(
+            records
+                .iter()
+                .map(|record| (record.record_type, record.lsn)),
+        );
+        Ok(())
+    });
+
+    // Opened the way the binaries open it, then handed the same hook to keep.
+    let mut cat = Catalog::open_with_wal_archive(dir.path(), |_, _| Ok(())).unwrap();
+    cat.install_auto_wal_archive(hook);
+    // Measured after the checkpoint above, so this is the length of a log
+    // holding nothing but its header: what a truncate leaves behind.
+    let empty_log = cat.wal.synced_len().unwrap();
+    cat.set_wal_checkpoint_bytes(1);
+
+    const ROWS: usize = 5;
+    for i in 0..ROWS {
+        cat.insert("T", &vec![Value::Int(i as i64)]).unwrap();
+    }
+    cat.commit_autocommit().unwrap();
+
+    assert_eq!(
+        cat.wal.synced_len().unwrap(),
+        empty_log,
+        "the threshold must still fire when a hook is installed, or the WAL of every \
+         shipped deployment grows without bound"
+    );
+
+    let published = published.lock().unwrap();
+    let inserts = published
+        .iter()
+        .filter(|(kind, _)| *kind == WalRecordType::Insert)
+        .count();
+    assert_eq!(
+        inserts, ROWS,
+        "every record the truncate destroyed must have reached the hook first, saw: {published:?}"
+    );
+    assert_eq!(
+        published.iter().map(|(_, lsn)| *lsn).max(),
+        Some(cat.wal.last_appended_lsn()),
+        "the hook must see the log through its newest record, not a prefix of it"
     );
 }

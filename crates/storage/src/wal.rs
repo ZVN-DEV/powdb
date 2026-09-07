@@ -1,3 +1,4 @@
+use crate::error::StorageError;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -898,109 +899,227 @@ fn parse_wal_records(path: &Path, max_len: u64) -> io::Result<Vec<WalRecord>> {
     let mut pos = wal_records_start_readonly(&mut file_for_header)?;
     let mut records = Vec::new();
 
-    while let Some((record, next_pos)) = parse_wal_record_at(&mut file, pos, file_len)? {
-        records.push(record);
-        pos = next_pos;
+    loop {
+        match parse_record_at(&mut file, pos, file_len)? {
+            ParseOutcome::Record(record, next_pos) => {
+                records.push(record);
+                pos = next_pos;
+            }
+            ParseOutcome::Eof => break,
+            ParseOutcome::Corrupt { reason, resume_at } => {
+                // A record that will not parse is either the torn tail of the
+                // last write (everything after it is nothing) or damage in the
+                // middle of the log (records after it survived). Truncating on
+                // the second one throws away committed work with no warning,
+                // so the two have to be told apart before anything is
+                // discarded.
+                if let Some(found_at) = probe_for_valid_record(&mut file, resume_at, pos, file_len)?
+                {
+                    return Err(StorageError::WalReplay(format!(
+                        "{}: record at byte {pos} is corrupt ({reason}), but a valid record follows at byte {found_at}: this is damage inside the log, not a torn tail",
+                        path.display()
+                    ))
+                    .into());
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    offset = pos,
+                    discarded_bytes = file_len.saturating_sub(pos),
+                    reason,
+                    "discarding torn WAL tail"
+                );
+                break;
+            }
+        }
     }
 
     Ok(records)
 }
 
-/// Parse the single record starting at `pos`, returning it together with the
-/// position of the next record. Returns `Ok(None)` at end of file or at the
-/// first corrupted/truncated record (the same stop-on-corruption semantics
-/// replay has always had).
-fn parse_wal_record_at(
+/// How far past a corrupt record to look for the next valid one when the
+/// corrupt record's own length field cannot be trusted. One megabyte covers
+/// any plausible run of damage while keeping the scan bounded on a
+/// multi-hundred-megabyte log.
+const CORRUPTION_PROBE_WINDOW: u64 = 1024 * 1024;
+
+/// Look for a valid record after the corrupt one at `bad_pos`. Returns the
+/// offset of the first valid record found, or `None` when nothing after the
+/// damage parses (a torn tail).
+///
+/// The first probe is the cheap and overwhelmingly common one: bit rot inside
+/// a record leaves its length field intact, so the next record still starts
+/// exactly where that length says. Only when that fails does this fall back to
+/// a bounded byte scan, which is what catches a corrupt length field.
+fn probe_for_valid_record(
     file: &mut File,
-    pos: u64,
+    resume_at: Option<u64>,
+    bad_pos: u64,
     file_len: u64,
-) -> io::Result<Option<(WalRecord, u64)>> {
+) -> io::Result<Option<u64>> {
+    if let Some(next) = resume_at {
+        if next <= file_len
+            && matches!(
+                parse_record_at(file, next, file_len)?,
+                ParseOutcome::Record(..)
+            )
+        {
+            return Ok(Some(next));
+        }
+    }
+    let scan_end = file_len
+        .saturating_sub(WAL_HEADER_SIZE as u64)
+        .min(bad_pos.saturating_add(CORRUPTION_PROBE_WINDOW));
+    let mut candidate = bad_pos.saturating_add(1);
+    while candidate <= scan_end {
+        if matches!(
+            parse_record_at(file, candidate, file_len)?,
+            ParseOutcome::Record(..)
+        ) {
+            return Ok(Some(candidate));
+        }
+        candidate += 1;
+    }
+    Ok(None)
+}
+
+/// Whether `path` holds a WAL with no `PWAL` file header.
+///
+/// Such a file is read as a pre-v0.5.0 headerless log whose records start at
+/// byte 0. That is the right reading for a genuinely old directory and the
+/// wrong one everywhere else: it parses arbitrary bytes as records and, when
+/// the first of them does not decode, silently drops every un-checkpointed
+/// row. Callers that know the directory is newer than that refuse instead.
+pub fn is_headerless_log(path: &Path) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        // A fresh or freshly truncated WAL: `Wal::open` writes the header.
+        return Ok(false);
+    }
+    if len < WAL_FILE_HEADER_SIZE {
+        return Ok(true);
+    }
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    Ok(&magic != WAL_MAGIC)
+}
+
+/// Why a record could not be parsed, and where the log claims the next record
+/// begins.
+enum ParseOutcome {
+    Record(WalRecord, u64),
+    Eof,
+    Corrupt {
+        reason: &'static str,
+        /// The offset the corrupt record's own length field points at, when it
+        /// is inside the file. `None` when the length itself is unusable.
+        resume_at: Option<u64>,
+    },
+}
+
+/// Parse the single record starting at `pos`.
+///
+/// Returns [`ParseOutcome::Eof`] when there is nothing left to read and
+/// [`ParseOutcome::Corrupt`] when a record is there but will not decode. The
+/// caller decides whether that is a torn tail or damage inside the log.
+fn parse_record_at(file: &mut File, pos: u64, file_len: u64) -> io::Result<ParseOutcome> {
     if pos + WAL_HEADER_SIZE as u64 > file_len {
-        return Ok(None);
+        return Ok(ParseOutcome::Eof);
     }
-    {
-        file.seek(SeekFrom::Start(pos))?;
+    file.seek(SeekFrom::Start(pos))?;
 
-        let mut header = [0u8; WAL_HEADER_SIZE];
-        if file.read_exact(&mut header).is_err() {
-            return Ok(None);
-        }
-
-        // These slice-to-array conversions are infallible (fixed-size
-        // sub-slices of a 17-byte array) but we avoid `unwrap` to
-        // satisfy the project-wide zero-panic policy.
-        let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let total_len = u32::from_le_bytes(total_len_bytes) as usize;
-        let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let stored_crc = u32::from_le_bytes(stored_crc_bytes);
-        let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let tx_id = u64::from_le_bytes(tx_id_bytes);
-        let record_type = match WalRecordType::from_u8(header[16]) {
-            Some(rt) => rt,
-            None => return Ok(None),
-        };
-        let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
-        };
-        let lsn = u64::from_le_bytes(lsn_bytes);
-
-        // TASK-11: Verify the record fits within the file before
-        // allocating. Catches truncated writes without any allocation.
-        if pos + total_len as u64 > file_len {
-            return Ok(None); // Record extends beyond file: truncated write
-        }
-
-        // TASK-09: Use checked_sub to prevent integer underflow when
-        // a corrupted WAL has total_len < WAL_HEADER_SIZE.
-        let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
-            Some(len) => len,
-            None => return Ok(None), // Corrupted record: stop replay
-        };
-
-        // TASK-10: Cap allocation size before reading data. A crafted
-        // WAL claiming a huge total_len would otherwise allocate
-        // gigabytes before the CRC check rejects the record.
-        if data_len > MAX_WAL_RECORD_SIZE {
-            return Ok(None); // Unreasonably large record: treat as corruption
-        }
-
-        let mut data = vec![0u8; data_len];
-        if data_len > 0 {
-            file.read_exact(&mut data)?;
-        }
-
-        // Verify CRC (includes lsn in the hash input)
-        let mut crc_input = Vec::with_capacity(17 + data.len());
-        crc_input.extend_from_slice(&tx_id.to_le_bytes());
-        crc_input.push(record_type as u8);
-        crc_input.extend_from_slice(&lsn.to_le_bytes());
-        crc_input.extend_from_slice(&data);
-        let computed_crc = crc32fast::hash(&crc_input);
-
-        if computed_crc != stored_crc {
-            return Ok(None); // Corrupted record: stop here
-        }
-
-        Ok(Some((
-            WalRecord {
-                tx_id,
-                record_type,
-                lsn,
-                data,
-            },
-            pos + total_len as u64,
-        )))
+    let mut header = [0u8; WAL_HEADER_SIZE];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(ParseOutcome::Eof);
     }
+
+    // These slice-to-array conversions are infallible (fixed-size sub-slices
+    // of a 25-byte array) but we avoid `unwrap` to satisfy the project-wide
+    // zero-panic policy.
+    let corrupt = |reason: &'static str| ParseOutcome::Corrupt {
+        reason,
+        resume_at: None,
+    };
+    let total_len_bytes: [u8; 4] = match header[0..4].try_into() {
+        Ok(b) => b,
+        Err(_) => return Ok(corrupt("unreadable length field")),
+    };
+    let total_len = u32::from_le_bytes(total_len_bytes) as usize;
+    let stored_crc_bytes: [u8; 4] = match header[4..8].try_into() {
+        Ok(b) => b,
+        Err(_) => return Ok(corrupt("unreadable CRC field")),
+    };
+    let stored_crc = u32::from_le_bytes(stored_crc_bytes);
+    let tx_id_bytes: [u8; 8] = match header[8..16].try_into() {
+        Ok(b) => b,
+        Err(_) => return Ok(corrupt("unreadable transaction id")),
+    };
+    let tx_id = u64::from_le_bytes(tx_id_bytes);
+    let record_type = match WalRecordType::from_u8(header[16]) {
+        Some(rt) => rt,
+        None => return Ok(corrupt("unknown record type")),
+    };
+    let lsn_bytes: [u8; 8] = match header[17..25].try_into() {
+        Ok(b) => b,
+        Err(_) => return Ok(corrupt("unreadable LSN")),
+    };
+    let lsn = u64::from_le_bytes(lsn_bytes);
+
+    // TASK-11: Verify the record fits within the file before allocating.
+    // Catches truncated writes without any allocation.
+    if pos + total_len as u64 > file_len {
+        return Ok(corrupt("record extends past the end of the file"));
+    }
+
+    // TASK-09: Use checked_sub to prevent integer underflow when a corrupted
+    // WAL has total_len < WAL_HEADER_SIZE.
+    let data_len = match total_len.checked_sub(WAL_HEADER_SIZE) {
+        Some(len) => len,
+        None => return Ok(corrupt("length field shorter than a record header")),
+    };
+
+    // TASK-10: Cap allocation size before reading data. A crafted WAL claiming
+    // a huge total_len would otherwise allocate gigabytes before the CRC check
+    // rejects the record.
+    if data_len > MAX_WAL_RECORD_SIZE {
+        return Ok(corrupt("record payload exceeds the maximum record size"));
+    }
+
+    // From here on the length field is usable, so the caller can look for the
+    // next record exactly where this one says it ends.
+    let next_pos = pos + total_len as u64;
+
+    let mut data = vec![0u8; data_len];
+    if data_len > 0 {
+        file.read_exact(&mut data)?;
+    }
+
+    // Verify CRC (includes lsn in the hash input)
+    let mut crc_input = Vec::with_capacity(17 + data.len());
+    crc_input.extend_from_slice(&tx_id.to_le_bytes());
+    crc_input.push(record_type as u8);
+    crc_input.extend_from_slice(&lsn.to_le_bytes());
+    crc_input.extend_from_slice(&data);
+    if crc32fast::hash(&crc_input) != stored_crc {
+        return Ok(ParseOutcome::Corrupt {
+            reason: "CRC32 mismatch",
+            resume_at: Some(next_pos),
+        });
+    }
+
+    Ok(ParseOutcome::Record(
+        WalRecord {
+            tx_id,
+            record_type,
+            lsn,
+            data,
+        },
+        next_pos,
+    ))
 }
 
 /// Report whether `path` holds at least one committed WAL record, without
@@ -1018,7 +1137,10 @@ pub fn wal_has_committed_records(path: &Path) -> io::Result<bool> {
     let file_len = file.metadata()?.len();
     let mut file_for_header = File::open(path)?;
     let pos = wal_records_start_readonly(&mut file_for_header)?;
-    Ok(parse_wal_record_at(&mut file, pos, file_len)?.is_some())
+    Ok(matches!(
+        parse_record_at(&mut file, pos, file_len)?,
+        ParseOutcome::Record(..)
+    ))
 }
 
 /// Locate the first record byte in a WAL file **without mutating it**. Mirrors
@@ -1363,16 +1485,86 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn test_crc_integrity() {
-        let (mut wal, path) = temp_wal("crc");
-        wal.append(1, WalRecordType::Insert, b"important data")
-            .unwrap();
-        wal.flush().unwrap();
+    /// Byte offset of the `index`-th record in a WAL file, walking the length
+    /// fields from the file header.
+    fn record_offset(bytes: &[u8], index: usize) -> usize {
+        let mut offset = WAL_FILE_HEADER_SIZE as usize;
+        for _ in 0..index {
+            let len = u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .expect("4-byte length field"),
+            ) as usize;
+            offset += len;
+        }
+        offset
+    }
 
+    fn three_record_wal(name: &str) -> (Wal, PathBuf) {
+        let (mut wal, path) = temp_wal(name);
+        for i in 1..=3u64 {
+            wal.append(i, WalRecordType::Insert, format!("record-{i}").as_bytes())
+                .unwrap();
+        }
+        wal.flush().unwrap();
+        (wal, path)
+    }
+
+    #[test]
+    fn a_clean_log_reads_every_record_back() {
+        let (wal, path) = three_record_wal("crc_clean");
         let records = wal.read_all().unwrap();
-        assert_eq!(records.len(), 1);
-        // CRC was validated during read_all — if we get here, integrity is good
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].data, b"record-1");
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Damage in the MIDDLE of the log is not a torn tail: the records after it
+    /// were written and committed. Truncating there silently discarded them.
+    #[test]
+    fn a_corrupt_record_in_the_middle_of_the_log_refuses_replay() {
+        let (wal, path) = three_record_wal("crc_middle");
+        drop(wal);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let second = record_offset(&bytes, 1);
+        bytes[second + 4] ^= 0xFF; // flip the stored CRC of record 2
+        std::fs::write(&path, &bytes).unwrap();
+
+        let wal = Wal::open(&path, 128).unwrap();
+        let error = wal
+            .read_all()
+            .expect_err("mid-log damage must refuse, not truncate");
+        assert_eq!(
+            crate::error::StorageError::kind_of_io_error(&error),
+            Some(crate::error::StorageErrorKind::WalReplay),
+            "expected a WAL replay refusal, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("damage inside the log"),
+            "the refusal must say why it is not a torn tail, got: {error}"
+        );
+        drop(wal);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Damage in the LAST record is the torn tail of an interrupted write.
+    /// Everything before it is intact and replayable.
+    #[test]
+    fn a_corrupt_record_at_the_tail_is_discarded_as_a_torn_write() {
+        let (wal, path) = three_record_wal("crc_tail");
+        drop(wal);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let third = record_offset(&bytes, 2);
+        bytes[third + 4] ^= 0xFF; // flip the stored CRC of the last record
+        std::fs::write(&path, &bytes).unwrap();
+
+        let wal = Wal::open(&path, 128).unwrap();
+        let records = wal.read_all().expect("a torn tail is recoverable");
+        assert_eq!(records.len(), 2, "the two intact records must survive");
+        assert_eq!(records[1].data, b"record-2");
         drop(wal);
         std::fs::remove_file(&path).ok();
     }

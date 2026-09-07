@@ -19,7 +19,7 @@ The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, 
 - **Embedded / edge / serverless workloads** where query latency is a tight budget and you don't want SQLite's quirks.
 - **Single-node analytics** over tables that fit on disk. The scan path is zero-syscall (mmap) and filters are compiled to byte-level predicates.
 - **You control both sides** (the DB and the app). PowDB has no Postgres wire protocol, no ODBC, no legacy compatibility. The client is a TCP binary protocol or an in-process Engine.
-- **You want to read the code.** Eleven crates, ~145K lines of Rust (~102K outside integration-test files), no generated parsers, no plan-language IR.
+- **You want to read the code.** Eleven crates, ~166K lines of Rust (~99K of it outside the integration-test files), no generated parsers, no plan-language IR.
 
 ### When it's *not* the right choice
 
@@ -85,11 +85,11 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Left join | `User as u left join Order as o on u.id = o.user_id` | `SELECT ... FROM User u LEFT JOIN Order o ON ...` |
 | Declare a link | `link Post.user -> User on user_id = id` | *(no SQL equivalent: a persisted, named relationship)* |
 | Traverse a to-one link | `Post as p { p.id, p.user.name }` | `SELECT p.id, u.name FROM Post p JOIN User u ON p.user_id = u.id` |
-| Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(PowQL only: one row per parent, children as a JSON array)* |
-| Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(PowQL only)* |
+| Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(no SQL-frontend equivalent: one row per parent, children as a JSON array)* |
+| Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(no SQL-frontend equivalent)* |
 | IN subquery | `User filter .id in (Order filter .total > 100 { .user_id })` | `SELECT * FROM User WHERE id IN (SELECT user_id FROM Order WHERE total > 100)` |
-| EXISTS | `User filter exists (Order filter .user_id = User.id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
-| UNION | `(A filter ...) union (B filter ...)` | `SELECT ... UNION SELECT ...` |
+| EXISTS | `User filter exists (Order filter .user_id = .id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
+| UNION | `A filter ... union B filter ...` | `SELECT ... UNION SELECT ...` |
 | NULL check | `User filter .age = null` / `.age != null` | `WHERE age IS NULL` / `IS NOT NULL` |
 | Update | `User filter .id = 1 update { age := 31 }` | `UPDATE User SET age = 31 WHERE id = 1` |
 | Update with expr | `User update { age := .age + 1 }` | `UPDATE User SET age = age + 1` |
@@ -107,7 +107,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `name: string!` | `required name: str` |
 | `name = "Alice"` (in insert) | `name := "Alice"` |
 | `.city == "NYC"` | `.city = "NYC"` |
-| `string`, `varchar`, `text` | `str` *(unknown names silently coerce to `str`: footgun)* |
+| `varchar`, `text`, `integer` | `str`, `str`, `int`. An unknown type name is a hard error (`type mismatch: unknown type name: 'varchar'`), not a silent coercion. `string` and `boolean` are accepted aliases for `str` and `bool` |
 | `User match T on ...` | `User inner join T on ...` (*`match` is not a keyword*) |
 | `User create_index .col` | `alter User add index .col` |
 | `User add_column x: int` | `alter User add column x: int` |
@@ -115,15 +115,17 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `AND`, `OR`, `NOT` | `and`, `or`, `not` (lowercase) |
 | `User.posts` (bare link navigation) | alias the table and label the block: `User as u { posts: u.posts { title } }`; a to-one link reads inline: `Post as p { p.user.name }` |
 | `let x := ...` | not yet implemented |
-| `count: count(.name)` (aggregate keyword as alias) | fails `expected alias name`; `sum:` fails too; use `n:`, `cnt:`, `total:` |
+| `exists (Order filter .user_id = User.id)` (qualified outer reference) | `exists (Order filter .user_id = .id)`: inside `exists`, a bare `.col` reaches the outer row. `User.id` and the aliased `u.id` are both rejected |
+| `(A filter ...) union (B filter ...)` (parenthesized branches) | `A filter ... union B filter ...`: a statement cannot start with `(` |
+| `count: count(.name)` (aggregate keyword as alias) | fails with `expected '(', got ':'`; `sum:` fails the same way; use `n:`, `cnt:`, `total:` |
 
 ---
 
 ## Type system
 
-Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`.
+Canonical type names: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`, `json`.
 
-**Footgun:** the executor's type resolver falls back to `TypeId::Str` for any unknown name (`crates/query/src/executor/`), so `string`, `varchar`, or a typo silently produces a Str column with no error. Always use the canonical names above.
+The type resolver takes the canonical names above plus two aliases, matched case-insensitively: `string` for `str` and `boolean` for `bool`. Every other name is rejected, so a typo is a hard error rather than a silent Str column: `type Bad { a: varchar }` fails with `type mismatch: unknown type name: 'varchar'`. Prefer the canonical spellings.
 
 `required` is a prefix keyword on the field, not a `!` suffix: `required name: str`, never `name: str!`. `unique` is a sibling prefix keyword (`required unique email: str`, either order) that auto-creates a unique B+tree index and enforces no duplicate non-null values on insert/update/upsert.
 
@@ -228,7 +230,7 @@ The legacy `query()` and `querySql()` result shapes above remain unchanged.
 
 ## What's available vs. what's planned
 
-Available in released PowDB (v0.25.0): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), nested projections (PowQL-only shaped results: one row per parent with correlated children as a native JSON array, with per-parent `filter` / `order` / `limit` / `offset`), entity links (PowQL-only relationship traversal: `link Post.user -> User on user_id = id`, then `p.user.name` for a to-one hop or a labeled block `posts: u.posts { title }` for a to-many, with `schema links` / `describe <Type>` introspection), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL, see `docs/SQL.md`).
+Available in released PowDB (v0.27.0): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), nested projections (PowQL-only shaped results: one row per parent with correlated children as a native JSON array, with per-parent `filter` / `order` / `limit` / `offset`), entity links (PowQL-only relationship traversal: `link Post.user -> User on user_id = id`, then `p.user.name` for a to-one hop or a labeled block `posts: u.posts { title }` for a to-many, with `schema links` / `describe <Type>` introspection), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL, see `docs/SQL.md`).
 
 Planned (design doc only, don't use): `let` bindings, UDFs, per-row permissions, replication.
 

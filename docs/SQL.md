@@ -20,13 +20,28 @@ PowDB now has an explicit SQL frontend in addition to native PowQL. SQL is a fro
 - `INSERT INTO T (a, b) VALUES (1, 'x'), (2, 'y') [RETURNING *]`
 - `UPDATE T SET a = ... WHERE ... [RETURNING *]`
 - `DELETE FROM T WHERE ... [RETURNING *]`
-- `CREATE TABLE T (...)`, including `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, and `AUTOINCREMENT` (alias `AUTO_INCREMENT`) column modifiers
+- `CREATE TABLE T (...)`, including `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `DEFAULT <literal>`, and `AUTOINCREMENT` (alias `AUTO_INCREMENT`) column modifiers. A bare `NULL` modifier is accepted and ignored
 - `CREATE [UNIQUE] INDEX name ON T (col)`
 - `ALTER TABLE T ADD/DROP COLUMN ...`
 - `DROP TABLE`, `DROP VIEW`
 - `BEGIN [TRANSACTION]`, `COMMIT`, `ROLLBACK`
 
-Supported expressions include literals, column references, qualified join references, arithmetic, boolean `AND`/`OR`/`NOT`, comparisons, `IS [NOT] NULL`, `LIKE`, aggregate/scalar function calls that already exist in PowQL, `count(*)`, and the JSON path operators `->` and `->>`.
+Supported expressions include literals, `$N` parameter placeholders, column references, qualified join references, arithmetic, boolean `AND`/`OR`/`NOT`, comparisons, `IS [NOT] NULL`, `LIKE`, aggregate/scalar function calls that already exist in PowQL, `count(*)`, and the JSON path operators `->` and `->>`.
+
+Column types map onto PowDB's seven storage types plus `json`. A length specifier (`VARCHAR(255)`) parses and is ignored.
+
+| SQL you write | PowDB type |
+| --- | --- |
+| `TEXT`, `VARCHAR`, `CHAR`, `STRING`, `STR` | `str` |
+| `INT`, `INTEGER`, `BIGINT`, `SMALLINT` | `int` |
+| `REAL`, `DOUBLE`, `FLOAT`, `DECIMAL`, `NUMERIC` | `float` |
+| `BOOL`, `BOOLEAN` | `bool` |
+| `DATETIME`, `TIMESTAMP` | `datetime` |
+| `UUID` | `uuid` |
+| `BLOB`, `BYTES`, `BYTEA` | `bytes` |
+| `JSON`, `JSONB` | `json` |
+
+`PRIMARY KEY` on a column lowers to PowQL's `required unique`. Written as a table constraint it is refused, naming the spelling that works: `PRIMARY KEY is supported only on the column it keys; write it after the column's type, as `id int PRIMARY KEY``.
 
 `INSERT`/`UPDATE`/`DELETE` accept an optional trailing `RETURNING *`, which returns the affected rows in the same statement (insert/update return the post-image, delete returns the pre-image) — so an ORM gets its rows back in one round-trip instead of a write followed by a reselect. This lowers to PowQL's `returning` clause.
 
@@ -50,13 +65,32 @@ interchangeable, so a quoted *identifier* on the right of a comparison is a
 column-to-column comparison, not a string match.
 
 A quoted identifier is never a keyword, which is the entire reason delimited
-identifiers exist. PowQL reserves nearly 100 lowercase words in identifier
-position, so quoting is frequently the only way to reach a column named after
-one of them:
+identifiers exist. The lexer re-emits a double-quoted token as a PowQL
+backtick-quoted word, which bypasses every keyword check downstream, and it does
+**no case folding** in either direction: identifiers are case-sensitive, so
+`SELECT ID FROM T` reports `column 'ID' not found` on a column named `id`.
 
 ```sql
 SELECT "limit", "order" FROM T;   -- columns named limit and order
 ```
+
+Quoting is not usually *required*, though. PowQL's roughly 100 reserved words
+are not reserved here: `SELECT order FROM T`, `ORDER BY order` and
+`WHERE limit = 5` all work unquoted, because the frontend emits those as PowQL
+dotted field references, which bypass keyword lookup. What genuinely needs
+quoting is one of **SQL's own** twelve reserved words in a position that expects
+a bare identifier: `select`, `from`, `where`, `insert`, `into`, `values`,
+`update`, `set`, `delete`, `create`, `table`, `alter`. `CREATE TABLE S (select INT)`
+is refused with ``expected column name, got reserved word `select` ``;
+`CREATE TABLE S ("select" INT)` succeeds.
+
+Two quoted identifiers are refused rather than silently mangled, because PowQL
+quotes identifiers with backticks and has no escape for one: an empty identifier
+(`""`), and an identifier containing a backtick.
+
+A backslash escape inside either quote form follows the same rule as a string
+literal (see below); an unknown one is a parse error, not a silently dropped
+backslash.
 
 Quoting works anywhere an identifier is legal, including table names, aliases,
 and qualified references:
@@ -65,9 +99,18 @@ and qualified references:
 SELECT "a"."name" FROM Author AS "a" WHERE "a"."age" > 20;
 ```
 
-Two quoted identifiers are refused rather than silently mangled, because PowQL
-quotes identifiers with backticks and has no escape for one: an empty
-identifier (`""`), and an identifier containing a backtick.
+### String escapes
+
+The escape set is `\'`, `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and `\uXXXX`
+(four hex digits). **Any other escape is a parse error**, in a single-quoted
+string and in a double-quoted identifier alike:
+``unknown escape '\c' in string literal; SQL supports \' \" \\ \n \t \r \0 and \uXXXX``.
+
+Before this release an unrecognized escape silently dropped its backslash, so
+`'back\slash'` was read as `backslash` and a quoted identifier `"i\d"` resolved
+to `id`. That meant the same text meant two different things in PowDB's two
+frontends. It does not now: PowQL's set is identical minus `\'`, which it has
+no use for because PowQL strings are double-quoted.
 
 ## Intentional unsupported errors
 
@@ -77,21 +120,40 @@ SQL outside the production subset returns an explicit unsupported-feature parse 
 | --- | --- | --- |
 | `CASE WHEN <cond> THEN a ELSE b END` | `SQL CASE/WHEN is not supported yet in the SQL frontend` | PowQL: `case when <cond> then <value> else <value> end` |
 | `COALESCE(a, b)` | `SQL COALESCE is not supported yet in the SQL frontend` | PowQL: `.a ?? .b` |
-| `COUNT(DISTINCT col)` | `SQL COUNT(DISTINCT ...) is not supported yet in the SQL frontend` | PowQL: `count(distinct T { .col })` |
+| `COUNT(DISTINCT col)`, and `SUM`/`AVG`/`MIN`/`MAX (DISTINCT ...)` | `SQL COUNT(DISTINCT ...) is not supported yet in the SQL frontend`, and the matching message per function | PowQL: `count(distinct T { .col })`. The message names the PowQL spelling for `COUNT` only |
 | `CAST(x AS INT)` | `SQL CAST(x AS TYPE) is not supported yet in the SQL frontend` | The two-argument form, which SQL mode also accepts: `cast(x, 'int')` |
 | `row_number() OVER (...)` | `SQL window functions (OVER) are not supported yet in the SQL frontend` | PowQL: `row_number() over (partition .dept order .id)` |
 | `x IN (1, 2)`, `x IN (SELECT ...)` | `SQL IN lists/subqueries are not supported yet in the SQL frontend` | PowQL: `.x in (1, 2)`, `.x in (T { .col })` |
 | `EXISTS (SELECT ...)` | `SQL EXISTS subqueries are not supported yet; use PowQL EXISTS for now` | PowQL `exists` |
 | a scalar subquery, e.g. `WHERE x = (SELECT ...)` | `SQL scalar subqueries are not supported yet; use PowQL subqueries for now` | PowQL subqueries |
 | `x BETWEEN 1 AND 2` | `SQL BETWEEN is not supported yet in the SQL frontend` | SQL: `x >= 1 AND x <= 2` |
-| a table constraint in `CREATE TABLE` | `SQL table constraints are not supported; declare UNIQUE columns or add indexes explicitly` | column modifiers, or `CREATE INDEX` |
+| `PRIMARY KEY (col)` as a table constraint | ``PRIMARY KEY is supported only on the column it keys; write it after the column's type, as `id int PRIMARY KEY` `` | the column modifier, which **is** supported and lowers to `required unique` |
+| any other table constraint (`FOREIGN KEY`, `CONSTRAINT`, table-level `UNIQUE`, `CHECK`) | `SQL table constraints are not supported; declare UNIQUE columns or add indexes explicitly` | column modifiers, or `CREATE INDEX` |
 | `RETURNING a, b` | ``RETURNING currently supports only `RETURNING *` (column projection is not yet supported)`` | `RETURNING *`, because PowQL's `returning` is all-columns |
+| two aggregates, or an aggregate beside a plain column, with no `GROUP BY` | `multiple aggregates, or an aggregate mixed with plain columns, without GROUP BY are not supported; aggregate a single expression or add GROUP BY` | add `GROUP BY`, or run one aggregate per statement |
+| `SELECT DISTINCT count(x)` with no `GROUP BY` | `aggregates with DISTINCT and no GROUP BY are not supported by the SQL frontend` | add `GROUP BY`, or drop the `DISTINCT` |
+
+Four more constructs are unsupported and, unlike every row above, do **not**
+name themselves. The parser reads each one as something else first, so the error
+points at the wrong token. Do not read these messages as bugs in your SQL:
+
+| SQL you wrote | The error you get | Why it reads that way |
+| --- | --- | --- |
+| `SELECT ... UNION SELECT ...` | `unexpected trailing SQL token: SELECT` | `UNION` is consumed as a table alias, so the parser is already past it |
+| `WITH x AS (...) SELECT ...` | `expected SQL statement, got WITH` | no CTE production exists |
+| `DROP TABLE IF EXISTS T` | `unexpected trailing SQL token: EXISTS` | `IF` is consumed as the table name |
+| `CREATE TABLE IF NOT EXISTS T (...)` | `expected (, got NOT` | same, then the column list is expected |
+
+`CREATE VIEW` has no production either, though `DROP VIEW` is supported. Declare
+a materialized view in PowQL with `materialize`.
 
 `CAST` is worth spelling out, because the accepted form is not the SQL one: write `cast(x, 'int')`, with the target type as a string argument. The valid type strings are `int`, `float`, `str`, `bool`, `datetime`, `uuid`, and `bytes`.
 
 Every row above is a subset gap rather than a refusal on principle, so read the table as the current boundary and not a permanent one.
 
-Nested projections (shaped, one-row-per-parent results with children as JSON arrays) are PowQL-only by design, not a pending subset gap: SQL's `SELECT` list is flat and PowDB does not add a dialect extension for it. In SQL, use a join and regroup client-side, or run the PowQL query directly. See [Nested Projections (Shaped Results)](POWQL.md#nested-projections-shaped-results) in the PowQL reference.
+Nested projections (shaped, one-row-per-parent results with children as JSON arrays) have no spelling in **PowDB's SQL frontend**, and that is a deliberate boundary rather than a pending subset gap: SQL's `SELECT` list is flat and PowDB does not add a dialect extension for it. In SQL here, use a join and regroup client-side, or run the PowQL query directly.
+
+They are not something SQL as a language cannot express. An engine with JSON aggregate functions produces the same shape with a correlated subquery, for example SQLite's `(SELECT json_group_array(json_object('total', o.total)) FROM "Order" o WHERE o.user_id = u.id)`, empty array for a childless parent included. What PowQL offers over that spelling is brevity, a correlation the catalog can declare once, and a result that stays a typed binary value on the wire instead of JSON text the client re-parses. Entity links are the same story: the relationship is of course expressible in SQL by writing the join condition out in every query. See [Nested Projections (Shaped Results)](POWQL.md#nested-projections-shaped-results) in the PowQL reference.
 
 `CREATE INDEX` and `CREATE UNIQUE INDEX` accept either one stored column or a
 direct JSON `->` path:
@@ -105,6 +167,23 @@ The extra expression parentheses are optional for a direct path. `->>` text
 extraction, arithmetic expressions, functions, and multi-column indexes remain
 outside the production subset. Native PowQL exposes the same path-index feature
 as `alter T add index (.data->path)`.
+
+## Result column names
+
+An unaliased column is named after what it computes, in the spelling of the
+language you wrote it in.
+
+- **SQL, grouped:** `SELECT txt, count(id) FROM P GROUP BY txt` returns the
+  headers `txt` and `count(id)`. `count(*)` is headed `count(*)`.
+- **PowQL, grouped:** `P group .txt { .txt, count(.id) }` returns `txt` and
+  `count(.id)`, with the leading dot PowQL writes.
+- **An ungrouped SQL aggregate has no column name at all**, because it lowers to
+  a PowQL scalar aggregate: `SELECT count(txt) FROM P` returns a single scalar
+  value, not a one-column row.
+
+Before this release an unaliased aggregate was headed by the planner's internal
+`__agg_0`, and an unaliased expression was headed `?`. Alias explicitly
+(`count(id) AS n`) if you depend on the header text.
 
 ## NULL comparison semantics
 

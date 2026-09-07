@@ -84,6 +84,85 @@ from retained segment files that overlap the servable unapplied LSN range.
 while stale; true commit-age lag requires remote commit timestamps in the future
 wire protocol.
 
+## The Pull Window
+
+A pull request carries a `maxUnits` and a `maxBytes` budget. Neither is a cut
+point, because a chunk cut inside an explicit transaction is not applyable: a
+replica handed one refuses it, and every retry cuts in the same place, so the
+replica is wedged for good.
+
+- **`maxUnits` is a hint.** The primary extends the chunk past it to the commit
+  or rollback that closes the transaction the cut would otherwise land inside.
+- **The served chunk is capped at 4096 retained units**, whatever the hint says.
+  That is the ceiling every released decoder accepts on a `SYNC_PULL_RESULT`
+  frame, and a peer through v0.27.0 answers a larger frame with a frame-level
+  decode failure, which on the TypeScript replica drops the socket with no
+  diagnostic and repeats on every retry. Raising what a primary *sends* needs a
+  negotiated wire feature. A v0.28 peer will *decode* up to 262144 units; that
+  number bounds an acknowledgement scan, not a served chunk, and it is not a
+  number a client can ask a primary to serve.
+- **`maxBytes` is capped at 16 MiB** (`MAX_SYNC_PULL_BYTES`).
+- **A transaction that fits neither budget is answered with a rebootstrap
+  status naming it**, not with an error the replica would retry forever. The
+  status carries `stale: true`, `repairAction: "rebootstrap"`, a `lastSyncError`
+  reading `sync pull cannot fit <transaction> within the <n>-byte budget
+  (server cap 16777216) and <n>-unit chunk cap; rebootstrap the replica`, and no
+  units.
+
+The JS client defaults both budgets to the primary's own ceilings (4096 units,
+16 MiB) and range-checks them at construction. **Lowering `maxPullBytes` is not
+a safe tuning knob.** A transaction larger than the budget cannot be cut, so the
+primary answers `rebootstrap` rather than a retryable error, and the replica
+re-wedges on the next transaction of that size after each bootstrap. The default
+was 512 units and 4 MiB before this release, which made any transaction between
+4 and 16 MiB (about 1,000 rows of 5 KB) a permanent rebootstrap loop.
+
+### The Per-Transaction Replication Ceiling
+
+The 4096-unit cap is a hard product ceiling on transaction size, and an
+integrator sizing their writes has to plan around it. An explicit transaction
+reaches the retained tail as a `begin` marker, one unit per row change, and a
+`commit` marker, so **a transaction of more than about 4094 row changes can
+never be replicated incrementally, on any version.** Rows large enough to spill
+to overflow pages log those chains as extra units and lower the figure further,
+and the 16 MiB byte budget binds first once rows average more than about 4 KB.
+An autocommit statement is its own atomic group with its own, lower, ceiling,
+because its commit markers are appended after all of its row records.
+
+A transaction over the ceiling is not served and not silently truncated: the
+pull answers with `repairAction: "rebootstrap"` and a `lastSyncError` naming the
+transaction. That is a typed answer the replica can act on, but it is not a
+recovery: rebootstrapping moves the replica past the offending transaction and
+leaves it just as unable to replicate the next one of that size. Split large
+writes into transactions below the ceiling instead.
+
+## When A Primary Archives
+
+Retained segments used to be written only by a checkpoint, and the only
+checkpoint a running primary performed was on graceful shutdown. Every write on
+a live primary therefore sat unarchived and a replica polling it was told
+`awaitArchive` until the primary was restarted.
+
+A primary now archives pending history on demand, when a replica calls
+`sync-status` or `sync-pull`, and **only when there is something unarchived**:
+the archive's own high-water mark, read from segment file names before any lock
+is taken (`powdb_sync::archived_through_lsn`), gates it. Without that gate the
+demand archive ran a full checkpoint on every frame, under the engine write lock
+and with every transaction-gate permit held, so a replica polling once a second
+stalled all client traffic once a second against a primary with nothing new to
+archive.
+
+Archiving is **best effort**: a checkpoint refuses while an explicit transaction
+is open, so the archive stops at the last commit and the primary serves what is
+archived. `awaitArchive` is therefore a momentary state, not a failure, and
+`powdb-cli sync-status` reports it as one rather than under `lastSyncError`.
+
+`sync-status` also predicts one failure a replica used to discover one failed
+pull at a time: when the retained tail holds DDL, which V1 embedded sync cannot
+apply, the status comes back `repairAction: "rebootstrap"` with the reason
+`DDL retained units are not supported by V1 embedded sync; rebootstrap or
+upgrade required`.
+
 ## Unsupported In V1
 
 - offline local writes,
@@ -92,7 +171,10 @@ wire protocol.
 - automatic sharding,
 - Raft-style consensus,
 - Postgres wire compatibility,
-- full SQL compatibility beyond PowDB's documented SQL subset.
+- full SQL compatibility beyond PowDB's documented SQL subset,
+- transactions above the per-transaction replication ceiling of about 4094 row
+  changes: they are answered with a typed rebootstrap rather than served (see
+  [The Per-Transaction Replication Ceiling](#the-per-transaction-replication-ceiling)).
 
 ## Current Implementation
 
@@ -143,9 +225,8 @@ boundary:
   `readonly` users cannot access sync metadata. Pull requests bind replica id,
   cursor LSN, database identity, primary generation, WAL/catalog/segment format
   versions, and a max unit/byte budget before any retained units are returned.
-  Pull responses must be V1-applyable chunks: if `maxUnits` or `maxBytes`
-  would cut through an explicit transaction before its commit/rollback marker,
-  the server fails clearly instead of returning an unusable partial chunk.
+  Pull responses must be V1-applyable chunks, which is why `maxUnits` is a
+  hint rather than a bound: see [The Pull Window](#the-pull-window) below.
   Apply acknowledgements validate the acknowledged retained-unit range before
   advancing the primary-side cursor, so a buggy client cannot acknowledge a
   transaction-cut LSN and strand required retained history.
