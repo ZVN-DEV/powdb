@@ -2219,6 +2219,23 @@ impl Parser {
                 // so a trailing DotIdent here means a qualified reference.
                 if let Token::DotIdent(field) = self.peek().clone() {
                     self.advance();
+                    // A second `.part` makes this a link path. The projection
+                    // has its own production for those
+                    // (`parse_scalar_link_path`) and this parser has none, so
+                    // without a word here the reader got "unexpected trailing
+                    // token near token 6: field '.name'", which never says the
+                    // word link and cannot be told from a typo.
+                    if let Token::DotIdent(next) = self.peek().clone() {
+                        return Err(ParseError::Syntax {
+                            message: format!(
+                                "link traversal '{name}.{field}.{next}' is only supported \
+                                 in a projection; `filter`, `order` and `group` cannot \
+                                 traverse a link, so join the target type and use its \
+                                 own columns"
+                            ),
+                            position: None,
+                        });
+                    }
                     return Ok(Expr::QualifiedField {
                         qualifier: name,
                         field,
