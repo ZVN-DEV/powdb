@@ -11,6 +11,9 @@ readme = "../../README.md"
 keywords = ["database", "powdb", "powql", "query-engine", "parser"]
 categories = ["database", "database-implementations", "parser-implementations"]
 documentation = "https://docs.rs/powdb-query"
+# The executor's unit-test shards are `#[cfg(test)]` only: about 300 KB that
+# every consumer of the published crate would download and never build.
+exclude = ["src/executor/tests/**"]
 
 [features]
 # Test-only instrumentation. Enables `Engine::set_force_generic_path`, which
