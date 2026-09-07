@@ -455,6 +455,7 @@ pub(crate) fn validate_column_references(
         rebound,
         ambiguous,
         scope,
+        display: std::collections::HashMap::new(),
     };
     check_plan_columns(plan, &ctx)
 }
@@ -584,6 +585,11 @@ struct ColumnScope {
     ambiguous: std::collections::HashSet<String>,
     /// Scan columns with their types.
     scope: Vec<(String, TypeId)>,
+    /// How an error message spells a name the plan invented. The grouped
+    /// aggregate columns are called `__agg_0`, `__agg_1`, … in the plan, which
+    /// is a name no query, schema or result set carries, so a refusal that
+    /// quoted it pointed the reader at nothing. See [`having_scope`].
+    display: std::collections::HashMap<String, String>,
 }
 
 /// Collect names bound to a computed expression: projection aliases and the
@@ -694,7 +700,9 @@ fn literal_type_name(literal: &Literal) -> &'static str {
 }
 
 /// If `expr` is a bare column reference that resolves to exactly one scan type
-/// and is not rebound by a projection, return its name and type.
+/// and is not rebound by a projection, return the name an error should call it
+/// by and its type. The two differ only for a plan-invented name that
+/// [`ColumnScope::display`] can spell the way the query did.
 fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)> {
     let name = match expr {
         Expr::Field(name) => name.clone(),
@@ -705,7 +713,8 @@ fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)>
         return None;
     }
     let type_id = resolve_scan_type(&name, &ctx.scope)?;
-    Some((name, type_id))
+    let reported = ctx.display.get(&name).cloned().unwrap_or(name);
+    Some((reported, type_id))
 }
 
 /// Reject a `like` whose subject or pattern is known not to be text.
@@ -811,9 +820,25 @@ fn having_scope(ctx: &ColumnScope, keys: &[GroupKey], aggregates: &[GroupAgg]) -
         if let Some(type_id) = aggregate_output_type(aggregate, &input) {
             grouped.rebound.remove(&aggregate.output_name);
             grouped.scope.push((aggregate.output_name.clone(), type_id));
+            grouped.display.insert(
+                aggregate.output_name.clone(),
+                aggregate_display_name(aggregate),
+            );
         }
     }
     grouped
+}
+
+/// The name a refusal gives a grouped aggregate: the call the user wrote,
+/// rendered back from the plan. It is the same name an unaliased projection of
+/// the same aggregate carries in the result set (`T group .s { count(.n) }`
+/// comes back with a column called `count(.n)`), so the reader can find it.
+fn aggregate_display_name(aggregate: &GroupAgg) -> String {
+    crate::ast::projection_output_name(&Expr::FunctionCall(
+        aggregate.function,
+        Box::new(aggregate.argument.clone()),
+        aggregate.mode,
+    ))
 }
 
 /// Reject `column <cmp> literal` (either orientation) when the two sides

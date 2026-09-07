@@ -165,3 +165,94 @@ fn the_sql_frontend_refuses_the_same_two() {
             .unwrap_err();
     }
 }
+
+/// The typed refusal has to name something the reader can find. The planner
+/// rewrites `count(.id)` into an internal `__agg_0` column before validation
+/// ever sees it, and the message quoted that: `type mismatch for column
+/// '__agg_0'` points at a name nobody wrote and nothing in the query, the
+/// schema or the result set carries. `count(.id)` is the name an unaliased
+/// projection of the same aggregate already gets, so it is the name the error
+/// uses too.
+#[test]
+fn a_mistyped_having_names_the_expression_the_user_wrote() {
+    let (_dir, mut engine) = engine();
+    for (query, written) in [
+        ("T group .s having count(.id) = \"x\" { .s }", "count(.id)"),
+        ("T group .s having count(.id) > \"x\" { .s }", "count(.id)"),
+        ("T group .s having sum(.n) = true { .s }", "sum(.n)"),
+        ("T group .s having avg(.n) = \"x\" { .s }", "avg(.n)"),
+        ("T group .b having max(.s) = 5 { .b }", "max(.s)"),
+        (
+            "T group .s having count(distinct .id) = \"x\" { .s }",
+            "count(distinct .id)",
+        ),
+    ] {
+        let message = err(&mut engine, query);
+        assert!(
+            !message.contains("__agg"),
+            "`{query}` leaked an internal name: {message}"
+        );
+        assert!(
+            message.contains(written),
+            "`{query}` must name `{written}`, got {message}"
+        );
+    }
+}
+
+/// The same internal name escaped into the neighbouring message too: `like`
+/// reports the operand it refused, and for an aggregate that operand had no
+/// user-facing name either.
+#[test]
+fn a_mistyped_having_like_names_the_expression_too() {
+    let (_dir, mut engine) = engine();
+    let message = err(
+        &mut engine,
+        "T group .s having count(.id) like \"x%\" { .s }",
+    );
+    assert!(
+        !message.contains("__agg"),
+        "`having ... like` leaked an internal name: {message}"
+    );
+    assert!(
+        message.contains("count(.id)"),
+        "`having ... like` must name the aggregate, got {message}"
+    );
+}
+
+/// The SQL frontend lowers to the same plan, so it inherited the same leak.
+#[test]
+fn the_sql_frontend_does_not_leak_the_internal_name_either() {
+    let (_dir, mut engine) = engine();
+    let message = engine
+        .execute_sql("select s from T group by s having count(id) = 'x'")
+        .map(|ok| panic!("should have been refused, got {ok:?}"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !message.contains("__agg"),
+        "the SQL frontend leaked an internal name: {message}"
+    );
+    assert!(
+        message.contains("count("),
+        "the SQL frontend must name the aggregate, got {message}"
+    );
+}
+
+/// The name the error uses is the name the result set uses, which is what
+/// makes it findable: projecting the same aggregate without an alias produces
+/// a column called `count(.id)`.
+#[test]
+fn the_name_in_the_error_is_the_name_the_result_column_carries() {
+    let (_dir, mut engine) = engine();
+    let columns = match engine
+        .execute_powql("T group .s { .s, count(.id) }")
+        .unwrap()
+    {
+        QueryResult::Rows { columns, .. } => columns,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(
+        columns.iter().any(|c| c == "count(.id)"),
+        "the result columns were {columns:?}"
+    );
+}
