@@ -344,6 +344,19 @@ fn validate_wire_replica_id(replica_id: &str) -> Result<(), String> {
 /// which would otherwise pay for replication whether or not a replica exists.
 /// It runs only when a replica asks and only when something is unarchived.
 ///
+/// That second half is load-bearing and used not to be checked. The checkpoint
+/// underneath flushes every dirty heap page and index, reads the whole WAL,
+/// writes a segment and truncates the log, all under the engine write lock and
+/// (on the wire path) with every `tx_gate` permit held, so every other reader
+/// and writer on the process is stopped for its duration. Running it on every
+/// frame turned a replica polling `syncStatus` once a second into one full
+/// checkpoint a second against a primary with nothing new to archive. Measured
+/// on a 2000-row database, 20 idle status polls with a thread contending for
+/// the engine write lock: the worst wait that thread saw was 5986 us before
+/// this check and 98 us after it. The archive's own high-water mark is
+/// answered from segment file names, so asking costs a `read_dir` and happens
+/// before the lock is taken.
+///
 /// Best effort by design. A checkpoint refuses while a transaction is open, so
 /// the archive naturally stops at the last commit; the caller then serves the
 /// history that *is* archived rather than failing the pull.
@@ -352,6 +365,13 @@ fn archive_pending_history_for_replica(
     context: SyncContext,
 ) -> SyncContext {
     if !powdb_sync::sync_state_dir(&context.data_dir).exists() {
+        return context;
+    }
+    // A failed read answers 0, which archives: never skip on a doubt.
+    let archived_through =
+        powdb_sync::archived_through_lsn(&powdb_sync::retained_segments_dir(&context.data_dir))
+            .unwrap_or(0);
+    if context.remote_lsn <= archived_through {
         return context;
     }
     {

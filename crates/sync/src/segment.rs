@@ -397,6 +397,20 @@ pub fn list_segment_files(dir: &Path) -> io::Result<Vec<SegmentFile>> {
     Ok(files)
 }
 
+/// The highest LSN the retained archive already carries, or 0 if it carries
+/// nothing.
+///
+/// Answered from segment file NAMES alone: a `read_dir` and a parse, no
+/// segment body is opened. That makes it cheap enough to ask before deciding
+/// whether a checkpoint is worth taking the engine write lock for.
+pub fn archived_through_lsn(dir: &Path) -> io::Result<u64> {
+    Ok(list_segment_files(dir)?
+        .iter()
+        .map(|file| file.end_lsn)
+        .max()
+        .unwrap_or(0))
+}
+
 pub fn read_units_since(
     dir: &Path,
     expected_identity: SegmentIdentity,

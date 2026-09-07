@@ -42,8 +42,9 @@ pub use retention::{
     RetentionPressureSummary,
 };
 pub use segment::{
-    list_segment_files, read_segment_file, read_units_since, read_units_through,
-    retained_tail_progress, segment_file_name, validate_retained_tail_available,
-    write_segment_atomic, RetainedSegment, RetainedTailAvailability, RetainedTailProgress,
-    RetainedUnit, SegmentFile, SegmentIdentity, RETAINED_SEGMENT_FORMAT_VERSION,
+    archived_through_lsn, list_segment_files, read_segment_file, read_units_since,
+    read_units_through, retained_tail_progress, segment_file_name,
+    validate_retained_tail_available, write_segment_atomic, RetainedSegment,
+    RetainedTailAvailability, RetainedTailProgress, RetainedUnit, SegmentFile, SegmentIdentity,
+    RETAINED_SEGMENT_FORMAT_VERSION,
 };

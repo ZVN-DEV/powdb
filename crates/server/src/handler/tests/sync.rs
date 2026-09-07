@@ -1020,3 +1020,94 @@ fn sync_reports_rebootstrap_when_the_next_chunk_holds_ddl() {
         other => panic!("expected a rebootstrap pull status, got {other:?}"),
     }
 }
+
+// ---- Demand archive ----
+
+/// A primary with nothing unarchived must answer `syncStatus` without taking
+/// the engine write lock.
+///
+/// The demand archive runs a full checkpoint: every dirty heap page and index
+/// flushed, the whole WAL read, a segment written, the log truncated. It holds
+/// the engine write lock throughout, and the wire path holds every `tx_gate`
+/// permit around it, so while it runs no other connection reads or writes.
+/// Running it unconditionally turned a replica polling once a second into one
+/// checkpoint a second with nothing to archive.
+///
+/// The test holds a READ lock and asks for a status from another thread: a
+/// call that wants the write lock cannot answer, so this fails by timing out
+/// rather than by measuring anything.
+#[test]
+fn an_idle_primary_answers_sync_status_without_the_engine_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type Idle { required id: int }")
+        .unwrap();
+    engine.execute_powql("insert Idle { id := 1 }").unwrap();
+    let remote_lsn = seed_pullable_replica(&mut engine);
+    assert!(remote_lsn > 0);
+    let engine = Arc::new(RwLock::new(engine));
+
+    // Settle whatever the fixture left unarchived, so the next call has
+    // genuinely nothing to do.
+    let principal = admin_principal();
+    let _ = dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal));
+
+    let held = engine.read().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let background = Arc::clone(&engine);
+    let worker = std::thread::spawn(move || {
+        let principal = admin_principal();
+        let message = dispatch_sync_status(&background, "replica-a".into(), true, Some(&principal));
+        let _ = tx.send(matches!(message, Message::SyncStatusResult { .. }));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(5));
+    drop(held);
+    worker.join().unwrap();
+    assert_eq!(
+        answered.ok(),
+        Some(true),
+        "an idle primary took the engine write lock to answer a status poll"
+    );
+}
+
+/// The gate is on the archive's own high-water mark, so it opens again the
+/// moment there is something to archive. Pinned directly: the sibling
+/// end-to-end test `sync_against_a_live_primary_archives_committed_writes_on_demand`
+/// would also catch a gate that never opens, but this says which number
+/// decides it.
+#[test]
+fn the_demand_archive_gate_opens_as_soon_as_the_primary_outruns_the_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(dir.path()).unwrap();
+    engine
+        .execute_powql("type Gate { required id: int }")
+        .unwrap();
+    engine.execute_powql("insert Gate { id := 1 }").unwrap();
+    seed_pullable_replica(&mut engine);
+    let data_dir = dir.path().to_path_buf();
+    let segments = retained_segments_dir(&data_dir);
+
+    let archived = powdb_sync::archived_through_lsn(&segments).unwrap();
+    let engine = Arc::new(RwLock::new(engine));
+    assert!(
+        archived >= engine.read().unwrap().catalog().max_lsn(),
+        "the fixture must start with everything archived"
+    );
+
+    // One more commit puts the primary ahead of the archive.
+    engine
+        .write()
+        .unwrap()
+        .execute_powql("insert Gate { id := 2 }")
+        .unwrap();
+    let ahead = engine.read().unwrap().catalog().max_lsn();
+    assert!(ahead > archived, "the write must advance the primary's LSN");
+
+    let principal = admin_principal();
+    let _ = dispatch_sync_status(&engine, "replica-a".into(), true, Some(&principal));
+    assert!(
+        powdb_sync::archived_through_lsn(&segments).unwrap() >= ahead,
+        "a primary ahead of its archive must still archive on demand"
+    );
+}
