@@ -178,7 +178,18 @@ export interface PowDBSyncReplicaOptions {
   identity: SyncIdentity;
   local: LocalReplica;
   remote: RemoteSyncClient;
+  /**
+   * Units one pull asks for. Defaults to, and is capped at, the primary's
+   * `MAX_SYNC_PULL_UNITS` (4096). A hint the primary may exceed to reach a
+   * transaction boundary.
+   */
   maxPullUnits?: number;
+  /**
+   * Payload bytes one pull asks for. Defaults to, and is capped at, the
+   * primary's `MAX_SYNC_PULL_BYTES` (16 MiB). This is the budget that cuts a
+   * chunk, so lowering it makes a large transaction unservable: the primary
+   * cannot cut inside one and answers `rebootstrap` instead.
+   */
   maxPullBytes?: SyncU64;
   maxPullRounds?: number;
 }
@@ -242,6 +253,21 @@ export interface WriteResult {
 }
 
 /**
+ * The largest `maxUnits` the primary accepts (`MAX_SYNC_PULL_UNITS` in
+ * `crates/server/src/handler/sync.rs`). A larger request is refused outright,
+ * so asking for one only produces a protocol error on every pull.
+ */
+const MAX_PULL_UNITS_CEILING = 4096;
+
+/**
+ * The largest `maxBytes` the primary accepts (`MAX_SYNC_PULL_BYTES`, same
+ * file). This is the budget that actually cuts a chunk: the primary stops
+ * filling on `selected_bytes + unit_bytes > max_bytes`, well before the hard
+ * unit cap.
+ */
+const MAX_PULL_BYTES_CEILING = 16 * 1024 * 1024;
+
+/**
  * Units a pull asks for by default.
  *
  * `maxUnits` is a hint the primary may exceed to reach a transaction
@@ -251,8 +277,20 @@ export interface WriteResult {
  * the transaction, the primary refused it, and every retry cut in the same
  * place.
  */
-const DEFAULT_MAX_PULL_UNITS = 4096;
-const DEFAULT_MAX_PULL_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_PULL_UNITS = MAX_PULL_UNITS_CEILING;
+
+/**
+ * Bytes a pull asks for by default.
+ *
+ * Both defaults have to sit at the primary's ceiling for the same reason. A
+ * chunk the byte budget cuts inside a transaction is not applyable, and the
+ * primary answers `rebootstrap` rather than an error the replica could retry
+ * differently — so a default below the server's own cap turns a transaction
+ * the primary would happily serve into a permanent rebootstrap loop, and the
+ * replica re-wedges on the next transaction of that size after every
+ * bootstrap. `test/sync.test.ts` diffs both against the engine's constants.
+ */
+const DEFAULT_MAX_PULL_BYTES = MAX_PULL_BYTES_CEILING;
 const DEFAULT_MAX_PULL_ROUNDS = 32;
 const MAX_U64 = 0xffff_ffff_ffff_ffffn;
 const DDL_KEYWORDS = new Set(["alter", "create", "drop", "materialize", "type"]);
@@ -275,9 +313,24 @@ export class PowDBSyncReplica {
       options.maxPullUnits ?? DEFAULT_MAX_PULL_UNITS,
       "maxPullUnits",
     );
+    // Both budgets are validated against the primary's own ceilings here
+    // rather than left to the server, which refuses an over-large request on
+    // every pull with no hint about which option produced it.
+    if (this.maxPullUnits > MAX_PULL_UNITS_CEILING) {
+      throw new PowDBSyncError(
+        `maxPullUnits must be between 1 and ${MAX_PULL_UNITS_CEILING}, the primary's ceiling`,
+        "protocol_error",
+      );
+    }
     this.maxPullBytes = toU64(options.maxPullBytes ?? DEFAULT_MAX_PULL_BYTES, "maxPullBytes");
     if (this.maxPullBytes === 0n) {
       throw new PowDBSyncError("maxPullBytes must be greater than zero", "protocol_error");
+    }
+    if (this.maxPullBytes > BigInt(MAX_PULL_BYTES_CEILING)) {
+      throw new PowDBSyncError(
+        `maxPullBytes must be between 1 and ${MAX_PULL_BYTES_CEILING}, the primary's ceiling`,
+        "protocol_error",
+      );
     }
     this.maxPullRounds = validatePositiveInteger(
       options.maxPullRounds ?? DEFAULT_MAX_PULL_ROUNDS,

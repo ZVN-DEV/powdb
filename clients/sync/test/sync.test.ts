@@ -907,6 +907,95 @@ async function main() {
     // 512 could not carry a 1000-row transaction, and the server refuses a
     // chunk that cuts one, so the replica wedged on its own default.
     assert.equal(remote.pullRequests[0]?.maxUnits, 4096);
+    // The byte budget is the one that actually cuts a chunk: the primary
+    // stops on `selected_bytes + unit_bytes > max_bytes` long before it
+    // reaches the hard unit cap. A default under the server's own ceiling
+    // makes a transaction the server would happily serve unservable, and an
+    // unservable transaction answers `rebootstrap` on every pull, forever.
+    assert.equal(remote.pullRequests[0]?.maxBytes, 16n * 1024n * 1024n);
+  });
+
+  await test("the default pull budgets are the ceilings the server validates", async () => {
+    const path = fileURLToPath(
+      new URL("../../../crates/server/src/handler/sync.rs", import.meta.url),
+    );
+    const text = readFileSync(path, "utf8");
+    const constant = (name: string): bigint => {
+      const matches = [
+        ...text.matchAll(
+          new RegExp(`^pub\\(super\\) const ${name}: u\\d+ = ([^;]+);$`, "gm"),
+        ),
+      ];
+      assert.equal(matches.length, 1, `expected exactly one \`${name}\` in ${path}`);
+      const expr = matches[0]![1]!.replace(/_/g, "").trim();
+      assert.match(expr, /^\d+( \* \d+)*$/, `cannot evaluate ${name} = ${expr}`);
+      return expr.split("*").reduce((acc, part) => acc * BigInt(part.trim()), 1n);
+    };
+
+    const remote = new MockRemote();
+    remote.statuses.push(
+      syncStatus({ remoteLsn: 1n, stale: true, repairAction: "pull" }),
+    );
+    remote.pulls.push({
+      status: syncStatus({ remoteLsn: 1n, lastAppliedLsn: 1n }),
+      units: [retainedUnit(1n)],
+      hasMore: false,
+    });
+    remote.acks.push({
+      previousAppliedLsn: 0n,
+      appliedLsn: 1n,
+      remoteLsn: 1n,
+      advanced: true,
+      status: syncStatus({ remoteLsn: 1n, lastAppliedLsn: 1n }),
+    });
+    const db = new PowDBSyncReplica({
+      replicaId: "replica-a",
+      identity,
+      local: new MockLocal(),
+      remote,
+    });
+    await db.syncNow();
+    assert.equal(
+      BigInt(remote.pullRequests[0]!.maxUnits),
+      constant("MAX_SYNC_PULL_UNITS"),
+      "DEFAULT_MAX_PULL_UNITS has drifted from the server's MAX_SYNC_PULL_UNITS",
+    );
+    assert.equal(
+      remote.pullRequests[0]!.maxBytes,
+      constant("MAX_SYNC_PULL_BYTES"),
+      "DEFAULT_MAX_PULL_BYTES has drifted from the server's MAX_SYNC_PULL_BYTES",
+    );
+  });
+
+  await test("maxPullBytes above the server ceiling is refused at construction", () => {
+    const build = (maxPullBytes: bigint) =>
+      new PowDBSyncReplica({
+        replicaId: "replica-a",
+        identity,
+        local: new MockLocal(),
+        remote: new MockRemote(),
+        maxPullBytes,
+      });
+    // The server answers `sync pull maxBytes must be between 1 and 16777216`
+    // and the replica retries it forever, so refuse it where the mistake was
+    // made rather than on every pull.
+    assert.throws(() => build(32n * 1024n * 1024n), /maxPullBytes/);
+    assert.throws(() => build(0n), /maxPullBytes/);
+    // The ceiling itself is legal.
+    build(16n * 1024n * 1024n);
+  });
+
+  await test("maxPullUnits above the server ceiling is refused at construction", () => {
+    const build = (maxPullUnits: number) =>
+      new PowDBSyncReplica({
+        replicaId: "replica-a",
+        identity,
+        local: new MockLocal(),
+        remote: new MockRemote(),
+        maxPullUnits,
+      });
+    assert.throws(() => build(8192), /maxPullUnits/);
+    build(4096);
   });
 }
 
