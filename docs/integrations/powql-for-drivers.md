@@ -466,9 +466,11 @@ as an identifier since 0.23.0 and does not case-fold.
 
 #### Escaping a string literal
 
-The escape set is exactly `\'`, `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and
-`\uXXXX` (four hex digits), in PowQL and in the SQL frontend alike, in string
-literals and in quoted identifiers. **Any other escape is a parse error.** Until
+PowQL's escape set is exactly `\"`, `\\`, `\n`, `\t`, `\r`, `\0` and
+`\uXXXX` (four hex digits). The SQL frontend's is the same plus `\'`, because
+SQL strings are single-quoted; the two are otherwise identical, and the SQL set
+applies to a double-quoted identifier as well as to a string. **Any other escape
+is a parse error** in both languages. Until
 this release an unrecognized escape silently dropped its backslash, so `"a\Ab"`
 became `aAb` and a quoted SQL identifier `"i\d"` resolved to `id`. A generator
 that escapes only the quote character was producing text that meant something
@@ -492,7 +494,10 @@ and is now the only spelling that parses.
   replace, while the native `0x13`-`0x17` frames reject invalid UTF-8 with
   `invalid UTF-8 in <field>`. A driver in a language with well-formed strings
   will never produce this; one in a language without them should decide
-  deliberately whether to refuse or replace, and say which.
+  deliberately whether to refuse or replace, and say which. Note the *literal*
+  path is stricter than the parameter path: a `\uD800` escape written into
+  query text is a lex error, because the four digits must name a Unicode
+  character and a surrogate is not one.
 
 #### Equality is type-strict; range comparison coerces numerically
 
