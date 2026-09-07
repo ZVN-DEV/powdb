@@ -51,9 +51,37 @@ fi
 cd "${REPO_ROOT}"
 
 echo "===> asking the comparator which workloads it gates"
+# Capture to a file first: reading the exit code through a pipe or a process
+# substitution reads the WRONG process. If --list-workloads ever stops being
+# handled, the binary falls through to an ordinary comparison run and its
+# report lands on stdout, which would be read as a list of workload names.
+WORKLOAD_LIST="$(mktemp "${TMPDIR:-/tmp}/powdb-workloads-XXXXXX")"
+set +e
+cargo run -q -p powdb-bench --bin compare -- --list-workloads > "${WORKLOAD_LIST}"
+LIST_STATUS=$?
+set -e
+if [[ ${LIST_STATUS} -ne 0 ]]; then
+  echo "error: 'compare --list-workloads' exited ${LIST_STATUS}." >&2
+  rm -f "${WORKLOAD_LIST}"
+  exit 1
+fi
 while IFS= read -r w; do
-  [[ -n "${w}" ]] && WORKLOADS+=("${w}")
-done < <(cargo run -q -p powdb-bench --bin compare -- --list-workloads)
+  [[ -z "${w}" ]] && continue
+  # A workload id is a bare lowercase identifier. Anything else means the
+  # binary printed something other than the list, and accepting it would write
+  # main.json entries under invented names. A real workload would then have no
+  # baseline, and the comparator passes an unbaselined workload in CAPTURE
+  # mode, so the gate would silently stop guarding everything.
+  if [[ ! "${w}" =~ ^[a-z][a-z0-9_]*$ ]]; then
+    echo "error: 'compare --list-workloads' printed a line that is not a workload" >&2
+    echo "       name: ${w}" >&2
+    echo "       Refusing to rebaseline from output this script cannot trust." >&2
+    rm -f "${WORKLOAD_LIST}"
+    exit 1
+  fi
+  WORKLOADS+=("${w}")
+done < "${WORKLOAD_LIST}"
+rm -f "${WORKLOAD_LIST}"
 if [[ ${#WORKLOADS[@]} -eq 0 ]]; then
   echo "error: the comparator reported no gated workloads; refusing to write an" >&2
   echo "       empty baseline, which would disable the gate entirely." >&2

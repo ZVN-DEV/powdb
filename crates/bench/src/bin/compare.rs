@@ -879,14 +879,17 @@ mod tests {
         );
     }
 
-    /// `WORKLOADS` is the single source of truth, and the rebaseline script
-    /// asks the binary for it rather than keeping a copy. Prove the flag the
-    /// script depends on still answers.
+    /// The rebaseline script asks the binary for the workload list rather
+    /// than keeping a copy, so the flag has to keep working. This half pins
+    /// the parse; `tests/compare_cli.rs` drives the built binary and pins
+    /// what it actually prints, because asserting on `workload_list()` here
+    /// would only be asserting a property of `join` and `lines`.
     #[test]
-    fn the_workload_list_flag_prints_one_workload_per_line() {
-        let printed = workload_list();
-        let lines: Vec<&str> = printed.lines().collect();
-        assert_eq!(lines, WORKLOADS.to_vec());
+    fn the_list_workloads_flag_parses() {
+        let parsed = parse_args(["--list-workloads".to_string()]).expect("flag parses");
+        assert!(parsed.list_workloads, "--list-workloads must set the flag");
+        assert!(!parsed.print_arch, "and must not set anything else");
+        assert!(parsed.control.is_none());
     }
 
     #[test]
