@@ -608,7 +608,11 @@ refused.** These announce themselves, but they fail work that previously ran:
   per page, 64-byte buckets, lazy deletion of stale entries) now looks only in a
   bucket guaranteed to fit. Loading 40,000 rows of 1 KB went from 45.2 s to
   68.7 ms, and 100 inserts into that heap from 233 ms to 147 us; at 200,000 rows
-  the same 100 inserts cost 138 us. No on-disk format change.
+  the same 100 inserts cost 138 us. No on-disk format change. The summary is
+  kept exact on every insert, which on a bulk load into a small heap costs about
+  7 ns per row (Depot, same instance as 0.27.0: `insert_10k` +5% to +8% across
+  four runs, `insert_batch_1k` -53%); deferring the hot page's update to the
+  moment it is unpinned would remove it and is the follow-up.
 
 - **Deleted space is allocatable again.** `Page::delete` only wrote a tombstone,
   so a table that was emptied and refilled grew by the full amount a second
