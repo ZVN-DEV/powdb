@@ -74,10 +74,10 @@ await client.querySql(q);
 
 escapeSqlLiteral("o'neil");   // → "'o''neil'"
 escapeSqlIdent("User");       // → '"User"' (throws on anything else)
-escapeSqlIdent("order");      // → '"order"' — a reserved word, usable once quoted
+escapeSqlIdent("order");      // → '"order"' (a reserved word, usable once quoted)
 ```
 
-Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and quoting a name makes it an identifier, never a keyword — so a column *type* in `CREATE TABLE` must not go through `sqlIdent`. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
+Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and quoting a name makes it an identifier, never a keyword, so a column *type* in `CREATE TABLE` must not go through `sqlIdent`. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
 
 ### Parameter binding (`$N`)
 
@@ -776,8 +776,8 @@ running). A server on 0.28.0 or newer pauses reading when it reaches either
 cap; an older one cancelled the running query and closed the connection with
 no Error frame.
 
-- `DEFAULT_MAX_IN_FLIGHT` — 64 unanswered request frames (see `maxInFlight`)
-- `MAX_IN_FLIGHT_BYTES` — 1 MiB of unanswered request frames
+- `DEFAULT_MAX_IN_FLIGHT`: 64 unanswered request frames (see `maxInFlight`)
+- `MAX_IN_FLIGHT_BYTES`: 1 MiB of unanswered request frames
 
 ## Requirements
 
