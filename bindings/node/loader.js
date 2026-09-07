@@ -70,11 +70,46 @@ const NAPI_COERCION_STATUSES = Object.freeze([
   "StringExpected",
 ]);
 
+/**
+ * Whether this process links musl rather than glibc. Node's own report names a
+ * glibc runtime version and omits it on musl, so this needs no filesystem
+ * probe. Always false off Linux, which has no such split.
+ */
+function processLinksMusl() {
+  if (process.platform !== "linux") return false;
+  try {
+    return !process.report.getReport().header.glibcVersionRuntime;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A platform's name in the vocabulary {@link SUPPORTED_PLATFORMS} uses.
+ *
+ * `${process.platform}-${process.arch}` is NOT that vocabulary on Linux: a
+ * prebuilt binary there is per-libc, so the names carry a `-gnu` or `-musl`
+ * suffix and a bare `linux-x64` matches no entry at all. Comparing the two
+ * shapes can only ever be false, which is why the key is built here and not
+ * at each call site.
+ *
+ * The defaults describe this process. Only this process's libc is detectable,
+ * so a caller naming some other `platform` passes `musl` itself.
+ */
+function platformKey(
+  platform = process.platform,
+  arch = process.arch,
+  musl = platform === process.platform && processLinksMusl(),
+) {
+  if (platform !== "linux") return `${platform}-${arch}`;
+  return `${platform}-${arch}-${musl ? "musl" : "gnu"}`;
+}
+
 function loadNative() {
   try {
     return require("./index.js");
   } catch (err) {
-    const platform = `${process.platform}-${process.arch}`;
+    const platform = platformKey();
     const error = new Error(
       `@zvndev/powdb-embedded has no prebuilt native binary for ${platform}. ` +
         `Prebuilt binaries are published for ${SUPPORTED_PLATFORMS.join(", ")}. ` +
@@ -193,5 +228,6 @@ for (const name of Object.getOwnPropertyNames(native)) {
 
 module.exports = native;
 module.exports.SUPPORTED_PLATFORMS = SUPPORTED_PLATFORMS;
+module.exports.platformKey = platformKey;
 module.exports.ERROR_CLASS_BY_CODE = ERROR_CLASS_BY_CODE;
 module.exports.NAPI_COERCION_STATUSES = NAPI_COERCION_STATUSES;

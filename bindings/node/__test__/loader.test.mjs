@@ -54,6 +54,12 @@ test("a missing native binary names the platforms that have one", () => {
   assert.match(err.message, /linux-arm64-gnu/);
   // It says what to do instead of reinstalling.
   assert.match(err.message, /build the addon from source/);
+  // The platform it names is the one a reader compares against that list.
+  const { platformKey, SUPPORTED_PLATFORMS } = require("../loader.js");
+  const named = err.message.match(/no prebuilt native binary for (\S+)\./);
+  assert.ok(named, `the message no longer names a platform: ${err.message}`);
+  assert.equal(named[1], platformKey());
+  assert.ok(SUPPORTED_PLATFORMS.includes(named[1]));
 });
 
 test("the supported-platform list matches the targets the package builds", () => {
@@ -65,9 +71,37 @@ test("the supported-platform list matches the targets the package builds", () =>
     return platform;
   });
   assert.deepEqual([...SUPPORTED_PLATFORMS].sort(), expected.sort());
-  // The list has to include this machine, or nothing else in the suite could
-  // have loaded the addon at all.
-  assert.ok(SUPPORTED_PLATFORMS.includes(`${process.platform}-${process.arch}`));
+});
+
+test("the platform key is in the vocabulary the supported list uses", () => {
+  const { platformKey, SUPPORTED_PLATFORMS } = require("../loader.js");
+
+  // `${process.platform}-${process.arch}` is not that vocabulary on Linux. A
+  // prebuilt binary there is per-libc, so the names carry a suffix and a bare
+  // `linux-x64` matches no entry: a membership test against one is false on
+  // every Linux runner, which is every runner this package's CI uses.
+  assert.ok(!SUPPORTED_PLATFORMS.includes("linux-x64"));
+
+  assert.equal(platformKey("linux", "x64", false), "linux-x64-gnu");
+  assert.equal(platformKey("linux", "x64", true), "linux-x64-musl");
+  assert.equal(platformKey("linux", "arm64", false), "linux-arm64-gnu");
+  // Only Linux splits on libc; nothing else takes a suffix.
+  assert.equal(platformKey("darwin", "arm64"), "darwin-arm64");
+  assert.equal(platformKey("win32", "x64"), "win32-x64");
+
+  // Every platform the package ships for has to be a key this produces, or the
+  // two sides of the membership test are different vocabularies again.
+  for (const supported of SUPPORTED_PLATFORMS) {
+    const [platform, arch, libc] = supported.split("-");
+    assert.equal(platformKey(platform, arch, libc === "musl"), supported);
+  }
+
+  // This machine has a binary, or nothing else in the suite could have loaded
+  // the addon at all, so it has to be in the list.
+  assert.ok(
+    SUPPORTED_PLATFORMS.includes(platformKey()),
+    `${platformKey()} is not one of ${SUPPORTED_PLATFORMS.join(", ")}`,
+  );
 });
 
 test("the .d.ts promise about error classification matches what the loader does", () => {
