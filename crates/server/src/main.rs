@@ -2,7 +2,7 @@ use powdb_query::executor::{Engine, WalSyncMode};
 use powdb_server::handler;
 use powdb_server::metrics::{serve_metrics, Metrics};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
@@ -964,6 +964,62 @@ fn ensure_bootstrap_admin(
     }
 }
 
+/// Bind a Unix-domain socket at `path` so the node clients can connect to is
+/// never reachable at a looser mode than [`UNIX_SOCKET_MODE`].
+///
+/// `UnixListener::bind` creates the node under the process umask (0755 or
+/// 0775 in practice) and tightening it afterwards is too late: a `chmod` on a
+/// socket does not close connections already accepted on it, so a local user
+/// racing a restart could hold a connection for its whole life to a server
+/// whose data directory is deliberately 0700. UDS peers get no TLS and no
+/// IP-based rate limiting, and on the documented single-node default
+/// (`--password` unset) that connection has full read/write access.
+///
+/// So the socket is bound at a private staging name in the same directory,
+/// restricted there, and renamed into place. `rename` is atomic and replaces
+/// any stale node from an unclean exit, so the published path only ever names
+/// a socket that was already restricted, and it is never briefly absent
+/// either.
+#[cfg(unix)]
+fn bind_unix_socket_restricted(path: &Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let staging = staging_socket_path(path);
+    // A leftover staging node (or one planted by a local user to make the
+    // bind fail) is removed first. `remove_file` does not follow symlinks.
+    let _ = std::fs::remove_file(&staging);
+    let listener = UnixListener::bind(&staging)?;
+    if let Err(e) =
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(UNIX_SOCKET_MODE))
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&staging, path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    Ok(listener)
+}
+
+/// The private name a socket is bound at before it is published.
+///
+/// Same directory, so the `rename` that publishes it stays within one
+/// filesystem; named after the process so two servers staging at once do not
+/// collide.
+#[cfg(unix)]
+fn staging_socket_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "powdb.sock".to_string());
+    let staged = format!(".{file_name}.staging-{}", std::process::id());
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(staged),
+        _ => PathBuf::from(staged),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing. RUST_LOG overrides; default is info.
@@ -1207,24 +1263,13 @@ async fn main() {
     // unclean exit first — `bind` fails if the path already exists.
     let unix_listener = match args.socket.as_deref() {
         Some(path) => {
-            let _ = std::fs::remove_file(path);
-            match UnixListener::bind(path) {
+            // The socket carries the same access as the data directory, so it
+            // is published 0660 (owner and group) rather than at the process
+            // umask's 0755. It is bound privately and renamed into place, so
+            // it is never CONNECTABLE at the looser mode: see
+            // `bind_unix_socket_restricted`.
+            match bind_unix_socket_restricted(Path::new(path)) {
                 Ok(l) => {
-                    // The socket carries the same access as the data
-                    // directory, so it is created 0660 (owner and group)
-                    // rather than the process umask's 0755, which let any
-                    // local user open a connection.
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Err(e) = std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(UNIX_SOCKET_MODE),
-                        ) {
-                            error!(socket = %path, error = %e, "failed to restrict unix socket permissions");
-                            std::process::exit(1);
-                        }
-                    }
                     info!(socket = %path, mode = format!("{UNIX_SOCKET_MODE:o}"), "unix domain socket listening");
                     Some(l)
                 }
@@ -1928,5 +1973,91 @@ mod tests {
         );
         engine.catalog_mut().set_dirty_page_budget_bytes(budget);
         assert_eq!(engine.catalog().dirty_page_budget_bytes(), 32_768);
+    }
+
+    /// The socket must never be connectable at a looser mode than
+    /// [`UNIX_SOCKET_MODE`], not merely end up at it.
+    ///
+    /// Binding and then tightening leaves a window in which the node exists at
+    /// the process umask (0755 or 0775 in practice), and a `chmod` on a socket
+    /// does not close a connection already accepted on it: a local user
+    /// looping `connect` across a restart holds that connection for its whole
+    /// life. A watcher thread samples the published path while the server
+    /// binds it over and over; it must never see a mode with a bit outside
+    /// 0660. With the socket bound privately and renamed into place there is
+    /// no window to see, so this test cannot fail for a timing reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_published_unix_socket_is_never_connectable_at_a_looser_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("powdb_srv_uds_mode_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("powdb.sock");
+
+        // A umask that would leave a freshly bound node group- and
+        // world-accessible, which is what makes the window worth watching.
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicU32::new(0));
+        let watcher = {
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(meta) = std::fs::metadata(&socket) {
+                        let mode = meta.permissions().mode() & 0o777;
+                        if mode & !UNIX_SOCKET_MODE != 0 {
+                            seen.store(mode, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            let listener = bind_unix_socket_restricted(&socket).expect("bind");
+            drop(listener);
+        }
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        let observed = seen.load(Ordering::Relaxed);
+        assert_eq!(
+            observed, 0,
+            "the published socket was observable at mode {observed:o}, \
+             looser than {UNIX_SOCKET_MODE:o}"
+        );
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            UNIX_SOCKET_MODE,
+            "the socket that is left behind must carry the restricted mode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Publishing by rename must not leave its staging node behind, and must
+    /// replace a stale socket from an unclean exit without a gap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binding_replaces_a_stale_socket_and_leaves_no_staging_node() {
+        let dir = std::env::temp_dir().join(format!("powdb_srv_uds_stale_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("powdb.sock");
+
+        // A stale socket file, as an unclean exit leaves behind.
+        let first = bind_unix_socket_restricted(&socket).expect("first bind");
+        drop(first);
+        assert!(socket.exists());
+
+        let _second = bind_unix_socket_restricted(&socket).expect("bind over the stale node");
+        assert!(
+            !staging_socket_path(&socket).exists(),
+            "the staging node must not survive a successful publish"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
