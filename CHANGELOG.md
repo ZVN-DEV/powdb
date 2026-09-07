@@ -42,10 +42,14 @@ keys an `update` / `delete` on a `datetime`, `uuid` or `bytes` column:
 - `Fixed` An ordered comparison across two types is false (rows of another type
   are no longer returned).
 - `Fixed` `x in (...)` answers what `x = ...` answers.
+- `Fixed` `length()` on a `bytes` column answers its byte count (it was null
+  on every row, with no error).
 
 **Statements, directories or deployments that used to be accepted are now
 refused.** These announce themselves, but they fail work that previously ran:
 
+- `Fixed` `length()` on an `int`, `float`, `bool`, `datetime`, `uuid` or
+  `json` operand is a typed refusal naming the column and its type.
 - `Changed` An arithmetic result with no int64 answer is an error, not the
   missing value.
 - `Changed` An `int` column refuses a float that is not exactly that integer.
@@ -921,6 +925,70 @@ refused.** These announce themselves, but they fail work that previously ran:
   the only coverage the remote client path has could vanish without changing a
   test result. A missing binary is now a hard failure naming the command that
   builds it.
+
+- **A crash after an ordinary insert could leave the data directory
+  unopenable.** Two entry points place a row in a heap page and only one of them
+  could compact. The runtime insert compacts when a row does not fit the
+  untouched tail but does fit the space deleted rows left behind, so a row can be
+  placed purely because compaction reclaimed that space, and the identifier it
+  chose is what the log records. The replay entry point went straight to the slot
+  insert, which refuses on free space alone however much dead space the page
+  holds. Replay therefore could not reproduce the identifier, and opening the
+  catalog failed. The everyday route in is a relocating update, recorded as a
+  delete plus an insert: the delete makes the dead space and the insert then
+  needs it. Replay now compacts and retries, which preserves slot indices so
+  later records in the same replay stay correctly targeted.
+
+- **The automatic WAL checkpoint was off in both shipped binaries.** A catalog
+  opened with an archive hook stopped checkpointing altogether, because the hook
+  was borrowed for the open and could not be run later. The server and the CLI
+  both always pass a hook, so `--wal-checkpoint-bytes` did nothing in either of
+  them and the log grew without bound, which is the thing the threshold exists to
+  prevent. The catalog can now own a hook, and the threshold checkpoint publishes
+  the log through it before truncating. Nothing truncates without running the
+  hook, so a hook passed to the open but never registered is still a refusal to
+  truncate. The separate skip when PowDB's own replica sync is enabled is kept,
+  because there the sync machinery owns checkpointing and that is a different
+  reason to skip.
+
+- **BREAKING (silent, and now refused):** **`length()` on a `bytes` column answered null on every row, with no error.** A
+  silent wrong answer. A bytes value has exactly one length, its byte count,
+  which is what SQLite, Postgres and MySQL all return for a blob, so it now
+  answers with that. An operand with no length at all (`int`, `float`, `bool`,
+  `datetime`, `uuid`, `json`) is now a typed refusal naming the column and its
+  type. A `json` document is refused rather than answered because it has no one
+  obvious length, and the `->` paths already spell each candidate. Both frontends
+  share the one code path, so PowQL and SQL agree by construction.
+
+- **A mistyped `having` named the planner's invented column instead of the
+  query's.** `having count(.id) = "x"` reported a type mismatch on `__agg_0`, a
+  name that appears in no query, no schema and no result set. The refusal was
+  right; the name was not. The same internal name escaped into two neighbouring
+  messages, and all three now read back the aggregate the query actually wrote.
+
+- **Only one of the two spellings of an unsupported link path explained
+  itself.** The aliased form named the limitation, which was this sprint's fix,
+  while the identical mistake written without an alias still reported an
+  unexpected trailing token. The two lex differently and landed in two different
+  parser arms. The wording now lives in one function both arms call.
+
+- **The node addon's own documented first line failed to load.** `import
+  { Database } from "@zvndev/powdb-embedded"` raised a named-export error,
+  because the loader published its exports through a dynamic assignment that the
+  CommonJS module lexer cannot see through. The dynamic assignment stays as the
+  source of truth, with explicit re-publication beside it so the lexer sees the
+  names, and a test that reads the import line out of the README rather than
+  restating it.
+
+- **Requiring the addon's generated binding directly bypassed error
+  classification.** The package had no `exports` map, so a deep import reached
+  the unwrapped binding and threw errors without the class the type declarations
+  promise. The wrapped loader is now the only reachable entry point.
+
+- **Three of the addon's runtime exports were declared in neither type file**, so
+  they were absent from every published tarball, and the unsupported-platform
+  check compared a platform key against entries carrying a libc suffix, so its
+  membership test could never succeed on any Linux target.
 
 ### Security
 
