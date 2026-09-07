@@ -1463,3 +1463,130 @@ fn replay_drops_a_record_for_an_unknown_table_and_keeps_going() {
         .unwrap();
     assert_eq!(rows.len(), 1, "the routable record must still have applied");
 }
+
+/// One-column table used by the auto-checkpoint tests below.
+fn one_int_table(cat: &mut Catalog, name: &str) {
+    cat.create_table(Schema {
+        table_name: name.into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            type_id: TypeId::Int,
+            required: true,
+            position: 0,
+        }],
+    })
+    .unwrap();
+}
+
+/// `commit_autocommit` piggy-backs an automatic checkpoint onto the commit.
+/// The commit is durable the moment `wal.flush()` returns; the checkpoint that
+/// follows writes dirty heap pages and truncates the log, and on a filesystem
+/// that has just filled it fails while the commit stands. Reporting that
+/// through the commit's return value told the caller the write had not
+/// happened when it had, and a client that retried the "failed" insert on a
+/// table with no unique constraint ended up with the row twice.
+#[test]
+fn a_failing_auto_checkpoint_does_not_report_the_commit_as_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cat = Catalog::create(dir.path()).unwrap();
+    one_int_table(&mut cat, "T");
+    cat.commit_autocommit().unwrap();
+
+    // Every commit crosses the threshold from here on.
+    cat.set_wal_checkpoint_bytes(1);
+    // Break the checkpoint without breaking the commit: `catalog.lsn` is
+    // written by rename inside `Catalog::checkpoint`, after the WAL flush that
+    // makes the statement durable. A directory in its place fails that rename
+    // the way a full or failing filesystem would.
+    let lsn_path = dir.path().join(CATALOG_LSN_FILE);
+    let _ = fs::remove_file(&lsn_path);
+    fs::create_dir(&lsn_path).unwrap();
+
+    cat.insert("T", &vec![Value::Int(7)]).unwrap();
+    let checkpoint_error = cat
+        .checkpoint()
+        .expect_err("the test needs the checkpoint to actually fail, or it proves nothing");
+    assert!(
+        checkpoint_error
+            .to_string()
+            .to_lowercase()
+            .contains("directory")
+            || checkpoint_error.raw_os_error().is_some(),
+        "expected an I/O failure writing the LSN sidecar, got: {checkpoint_error}"
+    );
+
+    cat.commit_autocommit()
+        .expect("the commit is durable, so it must not be reported as failed");
+
+    // And the row really is durable: the WAL still holds it.
+    drop(cat);
+    fs::remove_dir(&lsn_path).unwrap();
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.scan("T").unwrap().count(),
+        1,
+        "the row the commit acknowledged must survive the reopen"
+    );
+}
+
+/// The automatic checkpoint truncates the WAL without running any archive
+/// hook. `Catalog::open_with_wal_archive` (reached from `powdb-query`'s
+/// published `Engine::new_with_wal_archive`) says somebody is shipping this
+/// log somewhere, and such a caller need not be PowDB's own sync, so keying
+/// the skip on the `.powdb-sync` identity file alone let the log be discarded
+/// behind a live archive stream with no error anywhere.
+#[test]
+fn an_installed_wal_archive_hook_stops_the_automatic_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        one_int_table(&mut cat, "T");
+        cat.commit_autocommit().unwrap();
+        cat.checkpoint().unwrap();
+    }
+
+    let mut archived = 0usize;
+    let mut cat = Catalog::open_with_wal_archive(dir.path(), |_, records| {
+        archived += records.len();
+        Ok(())
+    })
+    .unwrap();
+    // The directory was checkpointed above, so this is the length of a log
+    // holding nothing but its header: what a truncate would leave behind.
+    let empty_log = cat.wal.synced_len().unwrap();
+    cat.set_wal_checkpoint_bytes(1);
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.commit_autocommit().unwrap();
+
+    assert!(
+        cat.wal.synced_len().unwrap() > empty_log,
+        "the automatic checkpoint truncated a WAL that is somebody's archive stream"
+    );
+    assert_eq!(
+        archived, 0,
+        "the automatic checkpoint does not run the hook, which is the whole reason \
+         it must not truncate"
+    );
+}
+
+/// The other half: without a hook the automatic checkpoint still runs, so the
+/// skip above is a skip and not "the threshold never fires".
+#[test]
+fn a_catalog_without_an_archive_hook_still_checkpoints_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cat = Catalog::create(dir.path()).unwrap();
+    one_int_table(&mut cat, "T");
+    cat.commit_autocommit().unwrap();
+    cat.checkpoint().unwrap();
+    let empty_log = cat.wal.synced_len().unwrap();
+
+    cat.set_wal_checkpoint_bytes(1);
+    cat.insert("T", &vec![Value::Int(1)]).unwrap();
+    cat.commit_autocommit().unwrap();
+
+    assert_eq!(
+        cat.wal.synced_len().unwrap(),
+        empty_log,
+        "a plainly-opened catalog must still checkpoint when the log crosses the threshold"
+    );
+}

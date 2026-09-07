@@ -426,6 +426,12 @@ pub struct Catalog {
     /// to leave the log to grow until close. See
     /// [`Self::set_wal_checkpoint_bytes`].
     wal_checkpoint_bytes: u64,
+    /// Whether this catalog was opened through
+    /// [`Catalog::open_with_wal_archive`], i.e. whether somebody is shipping
+    /// this WAL somewhere. The automatic checkpoint does not run the hook, so
+    /// it must not truncate the log when one is installed. See
+    /// [`Self::checkpoint_if_wal_is_large`].
+    wal_archive_hook_installed: bool,
     /// Catalog-level durable LSN. Heap page LSNs cover row mutations, but
     /// DDL-only changes can advance the WAL without touching a data page.
     durable_lsn: u64,
@@ -502,6 +508,7 @@ impl Catalog {
             pending_free_overflow: Vec::new(),
             checkpointed: false,
             wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
             durable_lsn: 0,
             active_catalog_version: LEGACY_CATALOG_VERSION,
             next_index_id: 1,
@@ -539,7 +546,12 @@ impl Catalog {
         F: FnMut(&Path, &[WalRecord]) -> io::Result<()>,
     {
         let archive: WalArchiveCallback<'_> = &mut archive;
-        Self::open_inner(data_dir, Some(archive))
+        let mut catalog = Self::open_inner(data_dir, Some(archive))?;
+        // The hook is borrowed for the open, so it cannot be kept; what is
+        // kept is the fact that this WAL is being archived, which is what the
+        // automatic checkpoint has to respect.
+        catalog.wal_archive_hook_installed = true;
+        Ok(catalog)
     }
 
     fn open_inner(data_dir: &Path, archive: Option<WalArchiveCallback<'_>>) -> io::Result<Self> {
@@ -636,6 +648,7 @@ impl Catalog {
             pending_free_overflow: Vec::new(),
             checkpointed: false,
             wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -766,6 +779,7 @@ impl Catalog {
             pending_free_overflow: Vec::new(),
             checkpointed: false,
             wal_checkpoint_bytes: DEFAULT_WAL_CHECKPOINT_BYTES,
+            wal_archive_hook_installed: false,
             durable_lsn,
             active_catalog_version,
             next_index_id,
@@ -1546,8 +1560,26 @@ impl Catalog {
                 self.wal.append(id, WalRecordType::Commit, &[])?;
             }
         }
+        // The durability point: once this returns, the statement is committed
+        // and replay brings it back after a crash.
         self.wal.flush()?;
-        self.checkpoint_if_wal_is_large()
+        // Everything past that point is housekeeping, and its failure is not
+        // the statement's failure. `checkpoint_if_wal_is_large` writes every
+        // dirty heap page and index and truncates the log; on a filesystem
+        // that has just filled, that fails while the commit above stands.
+        // Returning it through this value told the caller the write had not
+        // happened when it had, and a client that retried the "failed" insert
+        // on a table with no unique constraint ended up with the row twice.
+        // The WAL is intact either way, so the next commit or the close-time
+        // checkpoint retries it.
+        if let Err(error) = self.checkpoint_if_wal_is_large() {
+            tracing::warn!(
+                %error,
+                "the automatic checkpoint after a commit failed; the commit itself is \
+                 durable and the log will be checkpointed again on the next attempt"
+            );
+        }
+        Ok(())
     }
 
     /// Checkpoint when the log has grown past the configured threshold.
@@ -1556,10 +1588,22 @@ impl Catalog {
     /// point where the log is at a record boundary with nothing half-written.
     /// Skipped inside an explicit transaction (a checkpoint there would have
     /// to truncate records the transaction may still roll back) and skipped
-    /// for a directory that publishes retained history, where truncating
-    /// without the archive hook would discard replication state. Both of
-    /// those are refusals in `checkpoint`, and an insert must not turn into
-    /// an error just because the log happened to cross a size.
+    /// whenever the log is somebody's archive stream, where truncating without
+    /// running the archive hook would discard records nothing else holds.
+    /// Both of those are refusals in `checkpoint`, and an insert must not turn
+    /// into an error just because the log happened to cross a size.
+    ///
+    /// "Somebody's archive stream" is two things, not one. PowDB's own sync
+    /// publishes retained history and marks it with the identity file. But
+    /// [`Catalog::open_with_wal_archive`] takes an *arbitrary* hook, reached
+    /// from `powdb-query`'s published `Engine::new_with_wal_archive`, and a
+    /// WAL-shipping integration that installs one has no `.powdb-sync`
+    /// directory: keying the skip on the identity file alone let this
+    /// checkpoint truncate `wal.log` behind such a hook, silently, with no
+    /// error anywhere and an intact heap to hide it. So the presence of a hook
+    /// is a skip in its own right. That leaves the log to grow until an
+    /// explicit checkpoint (which does run the hook) or the close, which is
+    /// exactly where such a caller was before this threshold existed.
     fn checkpoint_if_wal_is_large(&mut self) -> io::Result<()> {
         if self.wal_checkpoint_bytes == 0 || self.active_tx_id.is_some() {
             return Ok(());
@@ -1567,7 +1611,7 @@ impl Catalog {
         if self.wal.synced_len()? < self.wal_checkpoint_bytes {
             return Ok(());
         }
-        if self.sync_identity_file_exists() {
+        if self.wal_archive_hook_installed || self.sync_identity_file_exists() {
             return Ok(());
         }
         self.checkpoint()
