@@ -159,7 +159,9 @@ In both modes:
   spray of throwaway source addresses cannot clear a peer that is close to its bound. The
   expiry sweep runs at most once a second rather than on every handshake.
 - **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
-- **Connection limits**: the server enforces a maximum number of concurrent connections.
+- **Connection limits**: the server accepts at most `POWDB_MAX_CONNECTIONS` concurrent connections (1024 by default). A peer past the ceiling is not refused: its connection is established and then waits, unserved, for a slot, and its 10-second pre-auth deadline does not start until it gets one.
+- **Pre-auth deadline**: the whole phase before a successful `CONNECT`, pings included, runs under one 10-second deadline. It is not configurable on the binary.
+- **A Unix-domain socket** (`--socket` / `POWDB_SOCKET`) is published at mode 0660 by an atomic rename from a staging name in the same directory, so the published path never names a socket at the process umask and is never briefly absent. Socket peers have no address, so they share one rate-limit bucket between them rather than being limited per address.
 
 > **Note on the `readonly` role:** in releases up to and including 0.4.5, role storage is in place but read-only restrictions are **not enforced** at the query layer — do not rely on the `readonly` role as a security boundary against writes on those versions. Read-only restrictions are **enforced as of 0.4.6** at the server dispatch layer: write statements from `readonly` users are rejected with `permission denied`, and unknown roles fail closed.
 

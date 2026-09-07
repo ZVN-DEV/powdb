@@ -328,6 +328,8 @@ materialized views before snapshotting.
 
 ### Environment variables
 
+The table below is `powdb-server`'s. `powdb-cli` reads five of its own, listed under [CLI environment variables](#cli-environment-variables).
+
 | Variable | Default | Description |
 |---|---|---|
 | `POWDB_PORT` | `5433` | TCP port for the server |
@@ -356,7 +358,24 @@ materialized views before snapshotting.
 | `NO_COLOR` | *(unset)* | When set, disables ANSI colour in the log. Colour is off automatically when stdout is not a terminal |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |
 
-Every `POWDB_*` value above goes through the same validator as its command-line flag. A value that does not parse refuses startup and names the variable (`invalid value for POWDB_MAX_CONNECTIONS: "abc"`, exit 2); it is never silently defaulted.
+Every `POWDB_*` value above goes through the same validator as its command-line flag. A value that does not parse refuses startup and names the variable (`invalid value for POWDB_MAX_CONNECTIONS: "abc"`, exit 2); it is never silently defaulted. The refusal names the unit the setting is actually in, so a connection ceiling is not described as a byte count.
+
+Two behaviours worth knowing beside the table:
+
+- **A peer past `POWDB_MAX_CONNECTIONS` is not refused; it waits.** Its TCP connection is established and then parks, unserved, until a slot frees. No bytes are read from it and the 10-second pre-auth deadline does not start until it gets one. Clients should rely on their own connect timeout rather than expecting a refusal.
+- **SIGHUP reloads `auth.json`** and nothing else, so a password rotated with `powdb-cli passwd` takes effect and a deleted user stops being able to log in without a restart. It does not reload TLS material, `POWDB_PASSWORD`, or any other setting. SIGTERM and SIGINT drain: the server stops accepting, closes each connection between frames with a `server shutting down` error, and waits up to `POWDB_SHUTDOWN_TIMEOUT`. A statement already executing is not interrupted.
+
+#### CLI environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `POWDB_PASSWORD` | *(unset)* | Password `powdb-cli --remote` authenticates with. Prefer `--password-stdin`, since `--password` is visible in `ps` |
+| `POWDB_TLS` | *(off)* | When set (`1`/`true`), connect with TLS. Same as `--tls` |
+| `POWDB_TLS_CA` | *(unset)* | Path to a PEM CA bundle used to verify the server certificate. Same as `--tls-ca` |
+| `POWDB_TLS_SERVER_NAME` | *(the host)* | SNI/verification name to use instead of the connect host. Same as `--tls-server-name` |
+| `POWDB_NEW_PASSWORD` | *(unset)* | Read by the offline `useradd` and `passwd` subcommands so a password is never typed on the command line |
+
+`powdb-cli --remote` accepts a Unix-domain socket path as well as `host:port`: an argument containing a path separator, starting with `~`, or ending `.sock` is read as a socket. TLS over a socket is refused, because it is local and same-host. `@zvndev/powdb-client` speaks sockets too, through `{ path }` instead of `{ host, port }`.
 
 ### Production checklist
 
