@@ -228,10 +228,7 @@ pub(super) enum FrameReadError {
     /// the wire limit, or its bytes do not decode. The reply is boxed because
     /// `Message` is a large enum and this error travels in every frame read's
     /// `Result`.
-    Refused {
-        reply: Box<Message>,
-        detail: String,
-    },
+    Refused { reply: Box<Message>, detail: String },
     /// The socket failed, or the peer went away mid-frame.
     Transport(std::io::Error),
 }

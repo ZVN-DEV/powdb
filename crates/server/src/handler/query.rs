@@ -10,7 +10,6 @@ use powdb_query::sql;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
-use tokio::sync::OwnedSemaphorePermit;
 use tracing::debug;
 
 use super::auth::{check_statement_permitted, Principal};
@@ -18,7 +17,7 @@ use super::classify::{error_response, query_error_response};
 use super::transaction::{
     acquire_autocommit_permit, acquire_begin_permit, parsed_transaction_control,
     rollback_connection_transaction, statement_admission, upgrade_to_exclusive, AdmissionMode,
-    TransactionControl, TxGate,
+    TransactionControl, TxGate, TxGateHold,
 };
 use super::wire::{
     is_query_cancellation_response, is_success_response, query_result_to_message,
@@ -447,7 +446,7 @@ fn permission_denied_response(
 pub(super) struct QueryContext<'a, R> {
     pub(super) engine: Arc<RwLock<Engine>>,
     pub(super) tx_gate: TxGate,
-    pub(super) tx_permit: &'a mut Option<OwnedSemaphorePermit>,
+    pub(super) tx_permit: &'a mut Option<TxGateHold>,
     pub(super) principal: Option<Principal>,
     pub(super) result_mode: WireResultMode,
     pub(super) query_timeout: Duration,

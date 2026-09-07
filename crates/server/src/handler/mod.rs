@@ -18,7 +18,7 @@ use powdb_query::executor::{Engine, WalDurabilityTicket};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
-use tokio::sync::{watch, OwnedSemaphorePermit};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
@@ -368,7 +368,7 @@ async fn serve_connection<R, W>(
         }
     }
 
-    let mut tx_permit: Option<OwnedSemaphorePermit> = None;
+    let mut tx_permit: Option<transaction::TxGateHold> = None;
     // Persistent framing state makes reads cancellation-safe while they race
     // an in-flight blocking query. Frames decoded during execution retain
     // their original order here for normal pipelined processing afterwards.

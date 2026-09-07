@@ -4,9 +4,9 @@ use super::*;
 
 // ---- Explicit-transaction gate wait timeout (P-4) ----
 
-/// `begin` takes more than half the pool: enough that no second explicit
-/// transaction and no autocommit writer can start, and no more, so readers
-/// keep running beside a transaction that has written nothing.
+/// `begin` takes the whole pool, so nothing else that needs the gate runs
+/// beside it, and reads are admitted out of the open-transaction reader pool
+/// until the transaction's first write drains that pool too.
 #[tokio::test]
 async fn begin_permit_acquires_when_gate_is_free() {
     let gate = new_tx_gate();
@@ -16,32 +16,45 @@ async fn begin_permit_acquires_when_gate_is_free() {
             .await
             .expect("should acquire a free gate"),
     );
-    let held = gate.begin_permits() as usize;
-    assert!(
-        held * 2 > DEFAULT_TX_GATE_READER_PERMITS as usize,
-        "a begin must hold more than half the pool or two could overlap"
-    );
-    assert_eq!(
-        gate.available_permits(),
-        DEFAULT_TX_GATE_READER_PERMITS as usize - held,
-        "the rest of the pool must stay available to readers"
-    );
-
-    // The transaction's first write takes the remainder.
-    upgrade_to_exclusive(&gate, &mut permit, Duration::from_secs(5), &metrics)
-        .await
-        .expect("upgrade on an uncontended gate");
     assert_eq!(
         gate.available_permits(),
         0,
-        "a transaction that has written must hold the whole gate"
+        "a begin must hold the whole pool or a second transaction could start"
     );
+    assert!(
+        gate.admits_readers_beside_transaction(),
+        "a transaction that has written nothing must still admit reads"
+    );
+    assert_eq!(
+        gate.available_open_tx_reader_permits(),
+        DEFAULT_TX_GATE_READER_PERMITS as usize,
+        "the reader pool must be untouched until the first write"
+    );
+
+    // The transaction's first write takes the reader pool.
+    upgrade_to_exclusive(&gate, &mut permit, Duration::from_secs(5), &metrics)
+        .await
+        .expect("upgrade on an uncontended gate");
+    assert!(
+        !gate.admits_readers_beside_transaction(),
+        "a transaction that has written must exclude readers"
+    );
+    assert_eq!(gate.available_open_tx_reader_permits(), 0);
 
     drop(permit);
     assert_eq!(
         gate.available_permits(),
         DEFAULT_TX_GATE_READER_PERMITS as usize,
         "permit pool must release on drop"
+    );
+    assert_eq!(
+        gate.available_open_tx_reader_permits(),
+        DEFAULT_TX_GATE_READER_PERMITS as usize,
+        "the reader pool must release with it"
+    );
+    assert!(
+        !gate.admits_readers_beside_transaction(),
+        "the next holder of the gate must not inherit an open door"
     );
 }
 
@@ -104,6 +117,53 @@ async fn the_first_write_waits_for_readers_then_excludes_them() {
     );
 }
 
+/// The first write of a transaction is a lock UPGRADE, and every other
+/// connection queued for the gate is queued behind that transaction. Tokio's
+/// semaphore is FIFO, so an upgrade that queues normally waits behind waiters
+/// that are waiting on it, and both sides sit there until the wait budget
+/// elapses. Ten connections doing begin/insert/commit hit exactly this.
+#[tokio::test]
+async fn the_first_write_is_not_queued_behind_transactions_waiting_on_it() {
+    let gate = new_tx_gate();
+    let metrics = Arc::new(Metrics::new());
+    let mut permit = Some(
+        acquire_begin_permit(&gate, Duration::from_secs(5), &metrics)
+            .await
+            .expect("begin admission"),
+    );
+
+    // Nine more connections call `begin` and queue: each wants more than half
+    // the pool, and the open transaction holds more than half.
+    let mut queued = Vec::new();
+    for _ in 0..9 {
+        let gate = gate.clone();
+        let metrics = metrics.clone();
+        queued.push(tokio::spawn(async move {
+            acquire_begin_permit(&gate, Duration::from_secs(5), &metrics).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        upgrade_to_exclusive(&gate, &mut permit, Duration::from_secs(5), &metrics),
+    )
+    .await
+    .expect("the first write must not wait on connections that are waiting on it")
+    .expect("the upgrade must succeed");
+
+    assert!(
+        metrics.render().contains("powdb_tx_gate_timeouts_total 0"),
+        "nothing timed out, so nothing may be counted as a timeout"
+    );
+    drop(permit);
+    for task in queued {
+        task.await
+            .expect("begin task")
+            .expect("every queued begin must be admitted once the holder finishes");
+    }
+}
+
 #[tokio::test]
 async fn begin_permit_times_out_with_clear_error_and_truthful_metric() {
     let gate = new_tx_gate();
@@ -147,7 +207,7 @@ async fn transaction_deadline_tracks_the_permit_and_never_re_arms_mid_transactio
     let metrics = Arc::new(Metrics::new());
     let max = Some(Duration::from_secs(60));
     let mut deadline: Option<Instant> = None;
-    let mut permit: Option<OwnedSemaphorePermit> = None;
+    let mut permit: Option<TxGateHold> = None;
 
     sync_tx_deadline(&permit, &mut deadline, max);
     assert!(deadline.is_none(), "no transaction, no deadline");
