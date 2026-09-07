@@ -1137,6 +1137,20 @@ impl Engine {
         }
     }
 
+    /// The statement boundary. An autocommit statement is durable before it
+    /// returns; inside an explicit transaction the boundary belongs to
+    /// `commit`, so nothing is flushed here. Flushing per statement inside a
+    /// transaction buys no durability (an unfinished transaction is rolled
+    /// back on replay) and costs one fsync per row.
+    fn commit_statement(&mut self) -> Result<(), QueryError> {
+        if self.in_transaction {
+            return Ok(());
+        }
+        self.catalog
+            .commit_autocommit()
+            .map_err(QueryError::from_storage_io)
+    }
+
     /// Parse + plan + execute a PowQL query.
     ///
     /// # Examples
@@ -1207,11 +1221,7 @@ impl Engine {
                     // the fsync happens here exactly once per statement.
                     // `sync_wal` is a no-op when nothing was buffered
                     // (pure reads pay zero fsync).
-                    if !self.in_transaction {
-                        self.catalog
-                            .commit_autocommit()
-                            .map_err(QueryError::from_storage_io)?;
-                    }
+                    self.commit_statement()?;
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -1221,22 +1231,14 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                if !self.in_transaction {
-                    self.catalog
-                        .commit_autocommit()
-                        .map_err(QueryError::from_storage_io)?;
-                }
+                self.commit_statement()?;
                 return result;
             }
             // Lex error — fall through to the planner so the caller gets a
             // consistent error shape.
             let (_, plan) = self.plan_text_and_lower(input)?;
             let result = self.execute_lowered(&plan);
-            if !self.in_transaction {
-                self.catalog
-                    .commit_autocommit()
-                    .map_err(QueryError::from_storage_io)?;
-            }
+            self.commit_statement()?;
             return result;
         }
 
@@ -1254,11 +1256,7 @@ impl Engine {
 
         let exec_start = Instant::now();
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         let exec_us = exec_start.elapsed().as_micros();
 
         let total_us = total_start.elapsed().as_micros();
@@ -1316,11 +1314,7 @@ impl Engine {
                 if let Some(plan) = cached {
                     let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
-                    if !self.in_transaction {
-                        self.catalog
-                            .commit_autocommit()
-                            .map_err(QueryError::from_storage_io)?;
-                    }
+                    self.commit_statement()?;
                     return result;
                 }
 
@@ -1330,22 +1324,14 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                if !self.in_transaction {
-                    self.catalog
-                        .commit_autocommit()
-                        .map_err(QueryError::from_storage_io)?;
-                }
+                self.commit_statement()?;
                 return result;
             }
         }
 
         let plan = self.plan_and_lower(parsed.statement)?;
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         result
     }
 
@@ -1407,11 +1393,7 @@ impl Engine {
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = self.plan_and_lower(stmt)?;
         let result = self.execute_lowered(&plan);
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         result
     }
 

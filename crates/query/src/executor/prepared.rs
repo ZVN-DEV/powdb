@@ -423,9 +423,7 @@ impl Engine {
                 // commit. The fast path appended an Update record but did
                 // not flush — flush it now so the executor's contract is
                 // "WAL is on disk before this returns".
-                self.catalog
-                    .commit_autocommit()
-                    .map_err(QueryError::from_storage_io)?;
+                self.commit_statement()?;
                 return Ok(result);
             }
         }
@@ -516,9 +514,7 @@ impl Engine {
                 .mark_dependents_dirty(&fast.table_name)
                 .map_err(QueryError::from_storage_io)?;
             // Mission B (post-review): statement-boundary WAL group commit.
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
+            self.commit_statement()?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -534,9 +530,7 @@ impl Engine {
         let result = self.execute_lowered(&plan);
         // Mission B (post-review): statement-boundary WAL group commit.
         // No-op when nothing was buffered (read-only plans).
-        self.catalog
-            .commit_autocommit()
-            .map_err(QueryError::from_storage_io)?;
+        self.commit_statement()?;
         result
     }
 
@@ -732,11 +726,11 @@ impl Engine {
                 return Err(QueryError::from_storage_io(error));
             }
             // Mission B (post-review): statement-boundary WAL group commit.
-            if let Err(error) = self.catalog.commit_autocommit() {
+            if let Err(error) = self.commit_statement() {
                 restore_taken_strings(fast, literals, &mut values);
                 values.clear();
                 self.insert_values_scratch = values;
-                return Err(QueryError::from_storage_io(error));
+                return Err(error);
             }
             values.clear();
             self.insert_values_scratch = values;

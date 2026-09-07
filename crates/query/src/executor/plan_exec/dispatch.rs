@@ -2602,11 +2602,7 @@ impl Engine {
         // and `register` fsyncs `views.bin` while those rows are still only in
         // the WAL buffer. A crash in between would leave a registered, clean,
         // EMPTY view answering queries with zero rows and no error.
-        if !self.in_transaction {
-            self.catalog
-                .commit_autocommit()
-                .map_err(QueryError::from_storage_io)?;
-        }
+        self.commit_statement()?;
         self.view_registry
             .register(ViewDef {
                 name: name.to_string(),
