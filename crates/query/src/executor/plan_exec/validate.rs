@@ -409,6 +409,7 @@ pub(crate) fn validate_column_references(
     catalog: &Catalog,
     plan: &PlanNode,
 ) -> Result<(), QueryError> {
+    check_scanned_tables_exist(catalog, plan)?;
     let mut scope: Vec<(String, TypeId)> = Vec::new();
     collect_scan_columns(catalog, plan, &mut scope);
     if scope.is_empty() {
@@ -456,6 +457,51 @@ pub(crate) fn validate_column_references(
         scope,
     };
     check_plan_columns(plan, &ctx)
+}
+
+/// Every table a plan reads must exist, reported as the missing table itself.
+///
+/// Without this, a query naming a table that is not there failed on whatever it
+/// tried next and reported that instead: `count(Missing)` surfaced the storage
+/// layer's generic error (wire class 0, "an internal error") while
+/// `count(Missing filter .x = 1)` reported `TableNotFound`, and a join to a
+/// missing table reported `column 'id' not found in table 'm'`, sending the
+/// reader to look for a column in a table that was never there. Scans only:
+/// a `type` names a table that must NOT exist yet, and `drop if exists` names
+/// one that may be gone already.
+fn check_scanned_tables_exist(catalog: &Catalog, plan: &PlanNode) -> Result<(), QueryError> {
+    match plan {
+        PlanNode::SeqScan { table }
+        | PlanNode::AliasScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::RangeScan { table, .. }
+        | PlanNode::ExprIndexScan { table, .. }
+        | PlanNode::ExprRangeScan { table, .. }
+        | PlanNode::OrderedExprIndexScan { table, .. } => {
+            if catalog.schema(table).is_none() {
+                return Err(QueryError::TableNotFound(table.clone()));
+            }
+            Ok(())
+        }
+        PlanNode::Filter { input, .. }
+        | PlanNode::Project { input, .. }
+        | PlanNode::NestedProject { input, .. }
+        | PlanNode::Sort { input, .. }
+        | PlanNode::Limit { input, .. }
+        | PlanNode::Offset { input, .. }
+        | PlanNode::Aggregate { input, .. }
+        | PlanNode::Distinct { input }
+        | PlanNode::GroupBy { input, .. }
+        | PlanNode::Window { input, .. }
+        | PlanNode::Update { input, .. }
+        | PlanNode::Delete { input, .. }
+        | PlanNode::Explain { input } => check_scanned_tables_exist(catalog, input),
+        PlanNode::NestedLoopJoin { left, right, .. } | PlanNode::Union { left, right, .. } => {
+            check_scanned_tables_exist(catalog, left)?;
+            check_scanned_tables_exist(catalog, right)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Bare field names that a join exposes under more than one alias.
