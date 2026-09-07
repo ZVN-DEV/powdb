@@ -50,16 +50,32 @@ compares that fingerprint against the machine it is running on and refuses to
 judge across a mismatch. `arch` is measured from the comparator binary itself
 rather than asked of `rustc`, so the two cannot disagree.
 
-To rebaseline after an intentional change:
+To rebaseline after an intentional change, run `bench.yml` on the branch
+(`gh workflow run bench.yml --ref <branch>`), let it finish, then write the
+baseline from that run's uploaded criterion estimates:
 
 ```bash
-./scripts/update-bench-baseline.sh
+./scripts/update-bench-baseline-from-depot.sh <run id>
 ```
 
-The script stages the new file but does not commit. Write the commit message
-yourself and say which change moved which workload. The script never touches
+Every number, the runner label, the `RUSTFLAGS` and the toolchain come from the
+run's artifact and job log; nothing is measured on the machine running the
+script, and the document records the run in `source_run`. The script prints the
+old and new value of every gated workload so the commit message can say which
+change moved which one. `./scripts/update-bench-baseline.sh` is the same
+extraction run on the Depot runner itself; on a laptop it would record the
+laptop's arch and the comparator would refuse the result on Depot, which is the
+gate working.
+
+Both scripts stage the new file but do not commit, and neither touches
 `baseline/thesis-ratios.json`: raising a ratio ceiling is a separate, deliberate
 commit.
+
+Both `main.json` and the gate drifted once already: the baseline written at
+v0.13.0 was carried untouched through v0.27.0 while `bench.yml` was never run on
+a release branch, so a 22x regression on one workload and a 70% one on another
+went unmeasured for fourteen releases. The release checklist's "run the perf
+gate on the release branch" step exists because of that.
 
 ## The workload list has one source of truth
 

@@ -15,7 +15,9 @@
 # Raising a ratio ceiling is a separate, deliberate commit.
 #
 # POLICY: baseline/main.json may only be rebaselined from a Depot run of
-# bench.yml (see CLAUDE.md). This script records the fingerprint of the host
+# bench.yml (see CLAUDE.md). update-bench-baseline-from-depot.sh <run id> is
+# the script that does that, from the run's uploaded criterion estimates; this
+# one exists for the Depot runner itself. This script records the fingerprint of the host
 # it actually runs on (runner from POWDB_BENCH_RUNNER, RUSTFLAGS as set, arch
 # measured from the compare binary). It never fabricates the Depot values, so
 # a baseline produced on a laptop will be refused by the comparator. That is
