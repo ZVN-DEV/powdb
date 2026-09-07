@@ -2,23 +2,33 @@
 //! liveness oracle.
 //!
 //! Stops two **separate** processes from opening the same database directory at
-//! once — concurrent writers corrupt the heap and WAL. Admission is still keyed
-//! on the PID file rather than on holding an fd lock: the engine's
-//! crash-recovery suite simulates a crash with [`std::mem::forget`] and then
-//! reopens the same directory **in the same process**, which would wedge on a
-//! leaked fd lock. A PID file instead lets a same-PID owner (an in-process
-//! reopen after a forget-crash) or a dead-PID owner (a real crash — the process
-//! is gone) take over, while still refusing a different, still-running process.
+//! once — concurrent writers corrupt the heap and WAL.
 //!
-//! A PID alone is not enough to answer "is that process still there", because a
-//! PID means nothing outside its namespace. In a container the recorded PID 1 is
-//! the container's own init, and on a bind mount shared with the host it is some
-//! unrelated host process; either way `kill(pid, 0)` says "alive" forever and
-//! the directory can never be opened again. So on unix the writer also holds an
-//! advisory `flock` on the `LOCK` file for the life of its handle. The kernel
-//! releases that lock when the holder dies, whatever namespace it was in, which
-//! makes it the one liveness signal that cannot go stale: a `LOCK` naming a
-//! "live" PID whose `flock` we can take is a stale lock, and we reclaim it.
+//! On unix the kernel `flock` on the `LOCK` file **is** admission, and it is
+//! taken first: the pid is then written through that same handle, so "the pid
+//! is in `LOCK`" is never true before "the lock is held". Nothing about a PID
+//! decides who gets in. That ordering is the whole point. A PID means nothing
+//! outside its namespace — in a container the recorded PID 1 is the container's
+//! own init, and on a bind mount shared with the host it is some unrelated host
+//! process, so `kill(pid, 0)` says "alive" forever and the directory could
+//! never be opened again — while the kernel releases an `flock` when its holder
+//! dies, whatever namespace it was in. A `LOCK` naming a "live" PID whose
+//! `flock` is free is therefore a stale lock, and it is reclaimed; a `LOCK`
+//! whose `flock` is held is refused, whatever its pid reads as.
+//!
+//! The pid is written **in place** through the locked handle, never renamed
+//! into position. A rename gives `LOCK` a new inode, and the lock that admitted
+//! the writer is on the old one; two acquirers publishing over each other used
+//! to end up locking two different inodes, and both were admitted. For the same
+//! reason the lock is only ever accepted on the inode the path names *now*: a
+//! previous holder's `Drop` unlinks `LOCK`, and holding a lock on an orphaned
+//! inode excludes nobody.
+//!
+//! The one case a held `flock` does not refuse is our own forgotten handle. The
+//! engine's crash-recovery suite simulates a crash with [`std::mem::forget`] and
+//! reopens the same directory **in the same process**, and `flock` is per open
+//! file description, so that leaked fd blocks us. `LOCK` naming our own pid is
+//! what identifies it, and that reopen is admitted without a second lock.
 
 use std::fs;
 use std::io::{self, Write};
@@ -64,6 +74,52 @@ const READERS_DIR: &str = crate::data_dir::READERS_DIR;
 /// locks acquired in the same wall-clock nanosecond still get distinct names.
 static READER_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only rendezvous, run at the instant before an acquisition takes the
+/// writer `flock`.
+///
+/// The double-admission race lives entirely inside that window: by then an
+/// acquisition has decided it may be admitted, and the directory can still
+/// change hands before it holds anything. A single-threaded test cannot
+/// express that, so a test parks one acquisition here while another runs to
+/// completion around it. Each hook is keyed on the acquiring pid and removed
+/// when it fires, so only the acquisition a test asked for is ever parked: the
+/// one it races against, and every other test running in parallel, go through
+/// untouched. A list rather than a single slot, because the tests that use it
+/// run concurrently and a single slot would let one drop the other's hook.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static BEFORE_FLOCK_HOOKS: std::sync::Mutex<Vec<(u32, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn install_before_flock_hook<F: FnOnce() + Send + 'static>(pid: u32, hook: F) {
+    BEFORE_FLOCK_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((pid, Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_flock_hook(me: u32) {
+    // Taken out from under the lock so the hook may block without holding it.
+    let hook = {
+        let mut hooks = BEFORE_FLOCK_HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hooks
+            .iter()
+            .position(|(pid, _)| *pid == me)
+            .map(|index| hooks.swap_remove(index).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn run_before_flock_hook(_me: u32) {}
+
 /// The kind of lock a [`DirLock`] holds, so [`Drop`] cleans up the right file.
 #[derive(Debug)]
 enum LockKind {
@@ -108,66 +164,90 @@ impl DirLock {
     fn acquire_as(data_dir: &Path, me: u32) -> io::Result<DirLock> {
         let path = data_dir.join(LOCK_FILE);
 
-        // A readable, parseable PID that belongs to another live process is the
-        // one case we refuse. Our own PID (in-process reopen) or a dead PID
-        // (real crash) is a stale lock we take over; garbage is overwritten.
-        //
-        // "Live" by PID alone is not trustworthy across a PID namespace: a
-        // container's init is PID 1 to itself and something else entirely on
-        // the host, so a `LOCK` written in one namespace reads as permanently
-        // held in the other. The `flock` settles it. If we can take it, no
-        // process anywhere is holding this directory and the PID is a ghost.
-        if let Some(owner) = live_writer_pid(&path, me) {
-            match take_lock_flock(&path) {
-                Some(_) => tracing::warn!(
-                    data_dir = %data_dir.display(),
-                    stale_pid = owner,
-                    "reclaimed stale lock from pid {owner}: it holds no lock on {}",
-                    path.display()
-                ),
-                None => return Err(writer_busy_err(data_dir, owner, &path)),
+        // What the directory *claims*, read before anything is written: a
+        // reclaim is worth a warning and a refusal has to be able to name a
+        // pid. It is a claim and not a verdict — see the module docs on why a
+        // PID cannot answer "is that process still there".
+        let claimed_owner = live_writer_pid(&path, me);
+
+        // The lock is admission, and it is taken before the pid is published.
+        run_before_flock_hook(me);
+        let admission = match take_lock_flock(&path) {
+            FlockAttempt::Held(file) => {
+                if let Some(ghost) = claimed_owner {
+                    tracing::warn!(
+                        data_dir = %data_dir.display(),
+                        stale_pid = ghost,
+                        "reclaimed stale lock from pid {ghost}: it holds no lock on {}",
+                        path.display()
+                    );
+                }
+                Admission::Locked(file)
             }
-        }
+            FlockAttempt::Busy => {
+                // Some open file description holds the directory. If `LOCK`
+                // names us it is one of ours (an in-process reopen after a
+                // forget-crash) and that reopen is allowed; anything else is a
+                // live foreign writer, whatever its pid reads as here.
+                let owner = lock_file_pid(&path);
+                if owner != Some(me) {
+                    return Err(writer_busy_err(data_dir, owner.unwrap_or(0), &path));
+                }
+                Admission::OwnHandle
+            }
+            // Never a reason to admit a writer: without the lock there is
+            // nothing to exclude the next acquirer with.
+            FlockAttempt::Unavailable(error) => return Err(error),
+            FlockAttempt::Unsupported => {
+                if let Some(owner) = claimed_owner {
+                    return Err(writer_busy_err(data_dir, owner, &path));
+                }
+                Admission::PidOnly
+            }
+        };
 
         // A live reader (a different process) makes cross-process torn reads
         // possible the moment we start writing pages in place. Refuse rather
         // than race.
         if let Some(reader_pid) = live_reader_pid(data_dir, me) {
+            admission.back_off(&path, me);
             return Err(reader_present_err(data_dir, reader_pid));
         }
 
-        // Publish LOCK atomically (write a temp, then rename it into place) so a
-        // concurrent reader's recheck never observes a half-written (momentarily
-        // empty) LOCK and wrongly concludes there is no writer.
-        write_pid_atomically(&path, me)?;
+        // Publish the pid: a diagnostic, and the identity a later in-process
+        // reopen recognises. On a platform with no kernel lock it is still the
+        // admission record, so there it is published the old way.
+        match &admission {
+            Admission::Locked(file) => write_pid_in_place(file, me)?,
+            // `LOCK` already names us — that is how this handle was identified.
+            Admission::OwnHandle => {}
+            Admission::PidOnly => write_pid_atomically(&path, me)?,
+        }
 
         // Create-then-recheck (TOCTOU): a reader may have published its file in
-        // the window between our scan above and this write. If so, back off:
-        // remove our LOCK (only while it is still ours) and refuse, so the
-        // reader and this writer are never both admitted.
+        // the window between the scan above and this write. The reader re-reads
+        // `LOCK` after publishing its own file and this writer re-scans
+        // `readers/` after publishing its pid, so whichever of the two
+        // published second sees the other and backs off. Both admitted is
+        // therefore impossible, not merely unlikely.
         if let Some(reader_pid) = live_reader_pid(data_dir, me) {
-            remove_lock_if_owned(&path, me);
+            admission.back_off(&path, me);
             return Err(reader_present_err(data_dir, reader_pid));
         }
-        // A second writer may likewise have overwritten LOCK after our write.
-        // If it now names a different live process, it won our slot: back off
-        // without deleting its file.
-        if let Some(owner) = live_writer_pid(&path, me) {
-            return Err(writer_busy_err(data_dir, owner, &path));
+        // Without a kernel lock a second writer may have overwritten `LOCK`
+        // after our write and won the slot. Where the lock exists it already
+        // made that impossible: only its holder ever writes this file.
+        if matches!(admission, Admission::PidOnly) {
+            if let Some(owner) = live_writer_pid(&path, me) {
+                return Err(writer_busy_err(data_dir, owner, &path));
+            }
         }
-
-        // Hold the flock on the LOCK file we just published, so the next
-        // acquirer, in any namespace, can tell that this handle is alive. The
-        // probe above ran against the previous inode, which the publish
-        // replaced. `None` means a forgotten handle of ours already holds it,
-        // which is the in-process-reopen case and needs no second lock.
-        let flock = take_lock_flock(&path);
 
         Ok(DirLock {
             path,
             pid: me,
             kind: LockKind::Writer,
-            flock,
+            flock: admission.into_flock(),
         })
     }
 
@@ -235,6 +315,84 @@ impl DirLock {
             flock: None,
         })
     }
+}
+
+/// What a writer ended up holding, and therefore how a refusal path has to
+/// undo itself and what goes into the [`DirLock`].
+enum Admission {
+    /// We hold the kernel lock on the inode `LOCK` names.
+    Locked(fs::File),
+    /// A forgotten handle of *ours* holds it: the in-process reopen after a
+    /// [`std::mem::forget`] crash simulation. There is no second lock to take
+    /// and nothing to publish; `LOCK` already names us.
+    OwnHandle,
+    /// No advisory lock was available, so admission rested on the PID
+    /// heuristic alone and the pid file is the record of it.
+    PidOnly,
+}
+
+impl Admission {
+    /// Undo the publish on a refusal path.
+    ///
+    /// The `LOCK` file is removed while this acquisition still holds the kernel
+    /// lock, so no other acquirer can be holding the inode being unlinked, and
+    /// the lock itself is released only when `self` drops — after the file is
+    /// gone. Doing it the other way round would let the next acquirer take the
+    /// lock, read our pid out of a `LOCK` we are about to delete, and refuse.
+    fn back_off(&self, path: &Path, me: u32) {
+        match self {
+            // We hold the lock, so the file is ours whatever it currently says.
+            Self::Locked(_) => {
+                let _ = fs::remove_file(path);
+            }
+            // A forgotten handle of ours still holds the directory. Walking
+            // away is not the same as releasing it, so its `LOCK` stays.
+            Self::OwnHandle => {}
+            Self::PidOnly => remove_lock_if_owned(path, me),
+        }
+    }
+
+    fn into_flock(self) -> Option<fs::File> {
+        match self {
+            Self::Locked(file) => Some(file),
+            Self::OwnHandle | Self::PidOnly => None,
+        }
+    }
+}
+
+/// Write `pid` into the `LOCK` file this acquisition already holds the `flock`
+/// on, in place, through that same handle.
+///
+/// Deliberately not a rename: a rename gives `LOCK` a new inode, and the lock
+/// that admitted this writer is on the old one. Two acquirers renaming over
+/// each other locked two different inodes and both were admitted, which is the
+/// double-writer bug this ordering closes.
+///
+/// Truncating and then writing leaves a window in which a concurrent reader's
+/// liveness check reads an empty or short `LOCK`. That is safe, by the same
+/// create-then-recheck argument the reader side already rests on: the reader
+/// re-reads `LOCK` after publishing its own file and this writer re-scans
+/// `readers/` after this returns, so whichever published second sees the other.
+/// A short read parses as some other pid and is refused, which errs closed.
+fn write_pid_in_place(mut file: &fs::File, pid: u32) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(pid.to_string().as_bytes())?;
+    // Best-effort durability; the lock is advisory, not a data structure.
+    let _ = file.sync_all();
+    Ok(())
+}
+
+/// The pid the `LOCK` file names, whoever it belongs to. Unlike
+/// [`live_writer_pid`] this asks nothing about liveness or ownership: it is for
+/// naming a holder in an error, and for recognising our own forgotten handle.
+fn lock_file_pid(lock_path: &Path) -> Option<u32> {
+    fs::read_to_string(lock_path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 /// Cap on temp-name retries when a reader file name collides. A collision needs
@@ -336,8 +494,7 @@ fn is_readonly_dir_error(e: &io::Error) -> bool {
 /// The PID in `lock_path` if it names a live process other than `me`; `None`
 /// when the lock is absent, garbage, ours, or held by a dead process.
 fn live_writer_pid(lock_path: &Path, me: u32) -> Option<u32> {
-    let contents = fs::read_to_string(lock_path).ok()?;
-    let owner = contents.trim().parse::<u32>().ok()?;
+    let owner = lock_file_pid(lock_path)?;
     if owner != me && pid_is_alive(owner) {
         Some(owner)
     } else {
@@ -458,42 +615,111 @@ fn live_reader_pid(data_dir: &Path, me: u32) -> Option<u32> {
     None
 }
 
-/// Try to take the exclusive advisory `flock` on the `LOCK` file, returning the
-/// open handle that holds it. `None` means some live process (in this or any
-/// other PID namespace) already holds it, or the file could not be opened.
-///
-/// The returned handle must be kept for as long as the lock should be held:
-/// closing the fd releases it, and so does process death, which is exactly the
-/// property a PID file cannot offer.
+/// What happened when an acquisition tried to take the writer `flock`.
+enum FlockAttempt {
+    /// We hold it, on the inode `LOCK` names right now. The handle must be kept
+    /// for as long as the lock should be held: closing the fd releases it, and
+    /// so does process death, which is exactly the property a PID file cannot
+    /// offer.
+    Held(fs::File),
+    /// Another open file description holds it. On unix that is conclusive: a
+    /// live holder, in this or any other PID namespace.
+    Busy,
+    /// The lock could not be taken for a reason that is not "somebody has it":
+    /// the file could not be opened, or it kept being replaced under us. Never
+    /// a reason to admit a writer.
+    Unavailable(io::Error),
+    /// No advisory whole-file lock is available: either the platform has none
+    /// at all, or this particular filesystem does not implement it. Admission
+    /// falls back to the PID heuristic alone.
+    Unsupported,
+}
+
+/// How many times an acquisition re-opens `LOCK` after finding that the file it
+/// just locked is no longer the file the path names. Each round means another
+/// holder's `Drop` unlinked it between our `open` and our `flock`. A couple of
+/// rounds is a busy directory; thirty-two is a livelock, and refusing beats
+/// spinning inside an engine open.
 #[cfg(unix)]
-fn take_lock_flock(lock_path: &Path) -> Option<fs::File> {
+const MAX_FLOCK_ATTEMPTS: u32 = 32;
+
+/// Try to take the exclusive advisory `flock` on the `LOCK` file, returning the
+/// open handle that holds it.
+#[cfg(unix)]
+fn take_lock_flock(lock_path: &Path) -> FlockAttempt {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)
-        .ok()?;
-    // SAFETY: `flock` takes a file descriptor and a flag word and touches no
-    // memory. `file` owns the descriptor and outlives the call, so the fd is
-    // valid for its duration. `LOCK_NB` means the call cannot block. The lock
-    // released when `file` is dropped, or when the process dies.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        Some(file)
-    } else {
-        None
+    for _ in 0..MAX_FLOCK_ATTEMPTS {
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => return FlockAttempt::Unavailable(error),
+        };
+        // SAFETY: `flock` takes a file descriptor and a flag word and touches
+        // no memory. `file` owns the descriptor and outlives the call, so the
+        // fd is valid for its duration. `LOCK_NB` means the call cannot block.
+        // The lock is released when `file` is dropped, or when the process
+        // dies.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            let code = error.raw_os_error();
+            if code == Some(libc::EWOULDBLOCK) {
+                return FlockAttempt::Busy;
+            }
+            // The filesystem has no advisory locking at all — some network
+            // mounts. Refusing here would make the directory permanently
+            // unopenable, which is a worse failure than the one the lock
+            // guards against, so admission falls back to the PID heuristic and
+            // says so. (Compared rather than matched: several of these codes
+            // are equal on some platforms, and duplicate match arms do not
+            // compile.)
+            if code == Some(libc::ENOLCK)
+                || code == Some(libc::EOPNOTSUPP)
+                || code == Some(libc::ENOTSUP)
+                || code == Some(libc::ENOSYS)
+            {
+                tracing::warn!(
+                    lock_file = %lock_path.display(),
+                    %error,
+                    "this filesystem does not support advisory file locks; falling back to \
+                     the PID heuristic, which cannot tell a live writer in another PID \
+                     namespace from a stale lock"
+                );
+                return FlockAttempt::Unsupported;
+            }
+            return FlockAttempt::Unavailable(error);
+        }
+        // Holding a lock on an *unlinked* inode excludes nobody: a previous
+        // holder's `Drop` unlinks `LOCK`, and the next acquirer creates a fresh
+        // file at the same path. Only the inode the path names right now is the
+        // directory's lock, so an orphan is dropped and the new one tried.
+        if let (Ok(held), Ok(named)) = (file.metadata(), fs::metadata(lock_path)) {
+            if held.ino() == named.ino() && held.dev() == named.dev() {
+                return FlockAttempt::Held(file);
+            }
+        }
     }
+    FlockAttempt::Unavailable(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "{}: the writer lock file kept being replaced while we were locking it",
+            lock_path.display()
+        ),
+    ))
 }
 
 /// No portable advisory whole-file lock outside unix, so liveness falls back to
 /// the PID heuristic alone (conservative: a lock is never reclaimed from a PID
 /// that looks alive).
 #[cfg(not(unix))]
-fn take_lock_flock(_lock_path: &Path) -> Option<fs::File> {
-    None
+fn take_lock_flock(_lock_path: &Path) -> FlockAttempt {
+    FlockAttempt::Unsupported
 }
 
 /// Whether `pid` refers to a live process. `kill(pid, 0)` sends no signal but
@@ -596,6 +822,122 @@ mod tests {
             "the refusal must name the holder, got: {err}"
         );
         drop(held);
+    }
+
+    /// Two writers racing for one directory. The window that matters is the
+    /// instant an acquisition takes the `flock`: it has already decided it may
+    /// be admitted, and the directory can still change hands before it holds
+    /// anything. Parking one acquisition there and running the other to
+    /// completion around it is the only way to express the interleaving; the
+    /// sibling tests above each drive one acquisition at a time and cannot.
+    #[cfg(unix)]
+    #[test]
+    fn two_writers_racing_for_the_flock_are_not_both_admitted() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Two distinct live pids, so the cross-process `owner != me` exclusion
+        // engages on both sides the way it does between two real servers.
+        let mut first_proc = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .unwrap();
+        let mut second_proc = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .unwrap();
+        let first_pid = first_proc.id();
+        let second_pid = second_proc.id();
+
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        install_before_flock_hook(first_pid, move || {
+            let _ = parked_tx.send(());
+            let _ = resume_rx.recv();
+        });
+
+        let path = dir.path().to_path_buf();
+        let first = std::thread::spawn(move || DirLock::acquire_as(&path, first_pid));
+
+        parked_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the first acquisition never reached the flock");
+        // The hook is keyed on the other pid, so this one runs start to finish
+        // inside the first one's window.
+        let second = DirLock::acquire_as(dir.path(), second_pid);
+        let _ = resume_tx.send(());
+        let first = first.join().expect("the acquiring thread must not panic");
+
+        let admitted = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(
+            admitted, 1,
+            "exactly one of two racing writers may hold the directory, \
+             but {admitted} were admitted (first: {first:?}, second: {second:?})"
+        );
+
+        drop(first);
+        drop(second);
+        let _ = first_proc.kill();
+        let _ = second_proc.kill();
+        let _ = first_proc.wait();
+        let _ = second_proc.wait();
+    }
+
+    /// The ordering everything else rests on: an acquisition publishes its pid
+    /// only *after* it holds the lock. That is what makes "`LOCK` names a live
+    /// pid" mean "the directory is genuinely held" — the property the CLI's
+    /// offline subcommands and their live-writer tests read the file for. When
+    /// the pid went in first (published by rename, with the lock taken
+    /// afterwards over whatever inode the path had come to name) there was a
+    /// window in which the file named a live process that held nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_pid_is_published_only_after_the_lock_is_held() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        let mut stand_in = std::process::Command::new("sleep")
+            .arg("120")
+            .spawn()
+            .unwrap();
+        let pid = stand_in.id();
+
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        install_before_flock_hook(pid, move || {
+            let _ = parked_tx.send(());
+            let _ = resume_rx.recv();
+        });
+
+        let path = dir.path().to_path_buf();
+        let acquiring = std::thread::spawn(move || DirLock::acquire_as(&path, pid));
+
+        parked_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the acquisition never reached the flock");
+        assert_eq!(
+            lock_file_pid(&lock_path),
+            None,
+            "LOCK named a writer that did not hold the lock yet"
+        );
+        let _ = resume_tx.send(());
+
+        let lock = acquiring
+            .join()
+            .expect("the acquiring thread must not panic")
+            .expect("nothing else holds the directory");
+        assert_eq!(
+            lock_file_pid(&lock_path),
+            Some(pid),
+            "once the lock is held, LOCK must name its holder"
+        );
+        drop(lock);
+
+        let _ = stand_in.kill();
+        let _ = stand_in.wait();
     }
 
     #[test]
