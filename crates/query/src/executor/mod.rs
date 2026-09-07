@@ -402,8 +402,28 @@ fn catalog_file_present(data_dir: &Path) -> bool {
     data_dir.join("catalog.bin").exists()
 }
 
-fn open_view_registry(data_dir: &Path) -> ViewRegistry {
-    let mut registry = ViewRegistry::open(data_dir).unwrap_or_else(|_| ViewRegistry::new(data_dir));
+/// Open the view registry, refusing the whole database when the file is there
+/// but unreadable.
+///
+/// [`ViewRegistry::open`] already answers "no views" for an absent file, so an
+/// error here means `views.bin` exists and did not decode. Treating that as an
+/// empty registry lost every `materialize` statement ever run: reads of a view
+/// name reported an unknown table, the backing tables stayed on disk with
+/// nothing to refresh them, and the next `materialize` overwrote the file that
+/// still held the definitions. A damaged heap and a missing catalog both refuse
+/// the open (see `new_inner`), and so does this.
+fn open_view_registry(data_dir: &Path) -> io::Result<ViewRegistry> {
+    let mut registry = ViewRegistry::open(data_dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{} could not be read ({e}); it defines this database's materialized views,                  so it must be restored or removed before the database can be opened",
+                data_dir
+                    .join(powdb_storage::data_dir::VIEW_REGISTRY_FILE)
+                    .display()
+            ),
+        )
+    })?;
     let unreadable: Vec<String> = registry
         .list_views()
         .iter()
@@ -422,7 +442,7 @@ fn open_view_registry(data_dir: &Path) -> ViewRegistry {
         );
         registry.mark_dirty_in_memory(&name);
     }
-    registry
+    Ok(registry)
 }
 
 /// Names of the dirty materialized views this plan scans, taken from table
@@ -607,7 +627,7 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        let view_registry = open_view_registry(data_dir);
+        let view_registry = open_view_registry(data_dir)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -650,7 +670,7 @@ impl Engine {
         let dir_lock = powdb_storage::dir_lock::DirLock::acquire_reader(data_dir)?;
         let catalog = Catalog::open_read_only(data_dir)?;
         info!(data_dir = %data_dir.display(), "engine opened read-only for snapshot serving");
-        let view_registry = open_view_registry(data_dir);
+        let view_registry = open_view_registry(data_dir)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -1039,7 +1059,8 @@ impl Engine {
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.clear();
         }
-        self.view_registry = open_view_registry(self.catalog.data_dir());
+        self.view_registry =
+            open_view_registry(self.catalog.data_dir()).map_err(QueryError::from_storage_io)?;
         Ok(QueryResult::Executed {
             message: "transaction rolled back".to_string(),
         })
