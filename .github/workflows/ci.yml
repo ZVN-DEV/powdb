@@ -927,47 +927,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The selftest first, on throwaway git fixtures. It proves both halves
+      # can fail, including the case that made this a script: a denylist regex
+      # git cannot compile used to leave `names` empty and print "denylist
+      # checked", so the guard stopped inspecting anything while the log said
+      # it had run. `git ls-files` outside a repository printed "paths clean"
+      # the same way.
+      - name: Prove the internal-content guard can fail
+        run: bash scripts/ci/internal-content-guard.sh --selftest
+
+      # The regex comes from `secrets`, and secrets are not available to a
+      # `pull_request` run from a fork. The denylist half then does not run,
+      # and it used to print "clean" anyway, so the log said the guard had
+      # passed when only the path check had. The script says which halves ran,
+      # every time: the regex check still gets its verdict on the post-merge
+      # push run, and a reader of a fork PR can see that it is pending.
       - name: Fail on tracked internal-only content
         env:
           PUBLICATION_DENYLIST_REGEX: ${{ secrets.PUBLICATION_DENYLIST_REGEX }}
-        run: |
-          set -uo pipefail
-          fail=0
-
-          # (1) No tracked file may live under an internal-only path.
-          paths="$(git ls-files | grep -E '^(docs/strategy/|docs/superpowers/|docs/audits/|docs/gtm-strategy\.md|\.omx/)' || true)"
-          if [ -n "$paths" ]; then
-            echo "::error::Internal-only paths are tracked in this public repo (see .gitignore):"
-            echo "$paths"
-            fail=1
-          fi
-
-          # (2) Apply the private publication denylist without storing
-          # sensitive names in this public workflow.
-          #
-          # The regex comes from `secrets`, and secrets are not available to a
-          # `pull_request` run from a fork. This half then does not run, and it
-          # used to print "clean" anyway, so the log said the guard had passed
-          # when only the path check had. Say which halves ran, every time: the
-          # regex check still gets its verdict on the post-merge push run, and
-          # a reader of a fork PR can now see that it is pending.
-          if [ -n "${PUBLICATION_DENYLIST_REGEX:-}" ]; then
-            names="$(git grep -niP "$PUBLICATION_DENYLIST_REGEX" -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' || true)"
-            if [ -n "$names" ]; then
-              echo "::error::Private name found in a public file. Use neutral wording:"
-              echo "$names"
-              fail=1
-            fi
-            denylist_verdict="checked"
-          else
-            denylist_verdict="NOT CHECKED"
-            echo "::warning::internal-content-guard: PUBLICATION_DENYLIST_REGEX is unavailable on this event (${GITHUB_EVENT_NAME:-unknown}), so only the path check ran. Secrets are withheld from fork pull requests; the denylist half gets its verdict on the push run after merge."
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-            exit 1
-          fi
-          echo "internal-content-guard: paths clean, denylist ${denylist_verdict}."
+        run: bash scripts/ci/internal-content-guard.sh
 
   # Supply-chain policy gate: license allowlist, duplicate-version warnings,
   # and crates.io-only sources, driven by deny.toml at the repo root.

@@ -26,6 +26,7 @@ exist and passed for months.
 | `testing-feature-guard.sh` | no shipped artifact resolves `powdb-query/testing` | resolve the feature from a published crate's manifest |
 | `missing-docs-ratchet.sh` | the `missing_docs` count never grows (`--color never` is load-bearing: this greps cargo's own output) | add an undocumented public item |
 | `release-channel.sh` | a release tag classifies into exactly one channel, or the release fails | `release-channel.sh 0.27` or any non-SemVer shape, leading zeros included |
+| `internal-content-guard.sh` | no tracked file lives under an internal-only path, and no public doc or source matches the private publication denylist; refuses a run in which either half did not actually inspect anything | `PUBLICATION_DENYLIST_REGEX='(' bash scripts/ci/internal-content-guard.sh` (a regex git cannot compile: it used to print "denylist checked"), or run it from a directory that is not a git repo |
 
 ## Running them locally
 
@@ -45,6 +46,9 @@ bash scripts/ci/miri-shards.sh --check
 bash scripts/ci/miri-shards.sh --selftest
 bash scripts/ci/strip-empty-unreleased.sh --selftest
 bash scripts/ci/release-channel.sh --selftest
+bash scripts/ci/internal-content-guard.sh --selftest
+bash scripts/ci/check-ci-success-needs.sh --selftest
+bash scripts/ci/semver-advisory.sh --selftest
 bash scripts/ci/changelog-section.sh 0.25.0   # prints the release body
 ```
 
