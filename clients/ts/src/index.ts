@@ -1486,9 +1486,11 @@ export class Client extends EventEmitter<ClientEvents> {
    * (see {@link splitStatements}: `;` inside string literals and `#`
    * comments never splits; empty statements are dropped). All statements
    * are then written down the single connection back-to-back WITHOUT
-   * waiting for each reply — the server reads frames sequentially, so an
-   * N-statement script costs one round trip instead of N. Results are
-   * collected in statement order.
+   * waiting for each reply — the server reads frames sequentially, so a
+   * script of up to `maxInFlight` statements costs one round trip instead
+   * of N, and a longer one slides that window forward as replies arrive
+   * rather than waiting for a batch to finish. Results are collected in
+   * statement order.
    *
    * Error handling:
    *   - Default (fail-fast): resolve with `QueryResult[]` (one entry per
@@ -1496,8 +1498,10 @@ export class Client extends EventEmitter<ClientEvents> {
    *     statements and reject with a {@link PowDBScriptError} carrying the
    *     failing `statementIndex`, the `statement` text, and the successful
    *     `results` so far. NOTE: because dispatch is pipelined, statements
-   *     already written when the error reply arrives (typically the whole
-   *     script) still execute server-side. If you need all-or-nothing
+   *     already written when the error reply arrives still execute
+   *     server-side — up to one `maxInFlight` window past the failure, and
+   *     the whole script when it is shorter than that. If you need
+   *     all-or-nothing
    *     behavior use `transactional: true` — do NOT embed `begin`/`commit`
    *     in the script yourself: the trailing `commit` is already on the
    *     wire when an error reply arrives, so it commits the partial work.
@@ -1567,6 +1571,15 @@ export class Client extends EventEmitter<ClientEvents> {
     let dispatched = 0;
 
     for (let i = 0; i < statements.length; i++) {
+      // Keep dispatch within one window of the replies. `send` only writes
+      // while the window has room and holds the rest as encoded frames, so a
+      // loop that dispatched the whole script at once buffered all of it in
+      // this client's heap. Waiting on the reply that frees this statement's
+      // slot bounds that backlog, and it is also the only yield the loop has:
+      // without it nothing can change the guards below, and a fail-fast script
+      // dispatched every statement no matter which one failed.
+      if (i >= this.maxInFlight) await inFlight[i - this.maxInFlight];
+
       // Stop dispatching when the script is already doomed: fail-fast saw
       // an error, the caller aborted, or the connection is gone.
       if (this.closed || signal?.aborted) break;
@@ -1596,9 +1609,9 @@ export class Client extends EventEmitter<ClientEvents> {
           },
         ),
       );
-      // Backpressure: only yield when the kernel buffer is full. These
-      // yields are also the windows in which an already-arrived error reply
-      // or abort can stop further dispatch (the checks at the loop head).
+      // A single statement can be far larger than the socket's buffer, so
+      // wait out kernel backpressure too rather than piling encoded frames
+      // behind a socket that is not draining.
       if (this.socket.writableNeedDrain) await this.drained();
     }
 

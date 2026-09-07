@@ -103,9 +103,11 @@ await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 ## Multi-statement scripts (`execScript`)
 
 `execScript` runs a whole `;`-separated PowQL script down one connection,
-**pipelined**: every statement is written back-to-back without waiting for
-the previous reply, so an N-statement script costs one round trip instead of
-N. Splitting is statement-aware with the exact semantics of the CLI's script
+**pipelined**: statements are written back-to-back without waiting for the
+previous reply, so a script of up to `maxInFlight` (64) statements costs one
+round trip instead of N. A longer script slides that window forward as
+replies arrive, which keeps the pipeline full without holding every encoded
+statement in memory at once. Splitting is statement-aware with the exact semantics of the CLI's script
 path — `;` inside `"..."` string literals or `#` comments never splits, and
 empty statements are dropped. (The splitter is exported as
 `splitStatements(script)` if you need it standalone.)
@@ -123,9 +125,10 @@ const results = await client.execScript(`
 By default execution is **fail-fast**: the first failed statement rejects the
 promise with a `PowDBScriptError` carrying `statementIndex`, the failing
 `statement` text, and the successful `results` so far. Because dispatch is
-pipelined, statements already on the wire when the error reply arrives
-(typically the whole script) still execute server-side — use
-`transactional: true` if you need all-or-nothing behavior. Do **not** embed
+pipelined, statements already on the wire when the error reply arrives still
+execute server-side: up to one `maxInFlight` window past the failure, and the
+whole script when it is shorter than the window. Use `transactional: true` if
+you need all-or-nothing behavior. Do **not** embed
 `begin`/`commit` in the script yourself: the trailing `commit` is already on
 the wire when an error reply arrives, so it commits the partial work.
 
