@@ -1010,6 +1010,22 @@ refused.** These announce themselves, but they fail work that previously ran:
   fails on length now names both paths and the difference instead of reporting a
   system error about a path the operator never wrote.
 
+- **A conjunction with a hot indexed literal no longer pays for counting it.**
+  The index chooser ranks a conjunction's indexed equalities by the exact count
+  of each literal, and that count is bounded at half the index. The bound was
+  walked in full on every execution when the literal was hot: `filter
+  .is_published = true and .data->slug = "s2"` over 20K rows, with both an index
+  on the 50/50 boolean and one on the per-row-unique path, walked ~10K index
+  entries per query to learn what the path's count of 1 had already decided,
+  and the query took twenty times longer than the same query without the
+  boolean index. The plan it chose was right all along; only the choosing was
+  slow. Counting now starts at a small cap and doubles only until the ranking is
+  settled, which picks the same driver the full count picks in every case (a
+  saturated tie goes another round; an all-hot tie still falls to conjunct
+  order), and a unique equality or a lone one is never counted at all. The
+  regression dated from 0.19.1 and went unmeasured because the workload sat in
+  the benchmark baseline but not in the comparator's gated list until now.
+
 ### Security
 
 - **The auth rate limiter is bounded in key size and entry count.** A failed
