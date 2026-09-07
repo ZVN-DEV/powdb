@@ -193,6 +193,22 @@ impl Page {
     /// pre-WS3 files (flag clear) are accepted without verification so old
     /// data files still open. Returns `PageCorrupt` on a CRC mismatch.
     pub fn from_bytes_verified(buf: &[u8]) -> crate::error::Result<Self> {
+        Self::verify_bytes(buf)?;
+        let mut data = [0u8; PAGE_SIZE];
+        data.copy_from_slice(buf);
+        Ok(Page { data })
+    }
+
+    /// [`Self::from_bytes_verified`]'s gate, without the copy.
+    ///
+    /// Split out for the scan path, which reads mapped bytes zero-copy: making
+    /// it verify through `from_bytes_verified` would have added a 4KB memcpy
+    /// per page to buy a check that costs less than the copy does. Same
+    /// refusals, same messages, no `Page`.
+    ///
+    /// Validate-if-present: a page written before checksums shipped carries no
+    /// CRC and passes here, exactly as it does through `from_bytes_verified`.
+    pub fn verify_bytes(buf: &[u8]) -> crate::error::Result<()> {
         if buf.len() != PAGE_SIZE {
             return Err(crate::error::StorageError::PageCorrupt(format!(
                 "page buffer is {} bytes, expected {PAGE_SIZE}",
@@ -216,9 +232,7 @@ impl Page {
                 )));
             }
         }
-        let mut data = [0u8; PAGE_SIZE];
-        data.copy_from_slice(buf);
-        Ok(Page { data })
+        Ok(())
     }
 
     /// Whether this page carries a CRC32. Pages written before checksums

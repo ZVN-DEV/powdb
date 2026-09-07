@@ -3352,4 +3352,163 @@ mod tests {
         drop(heap);
         std::fs::remove_file(&path).ok();
     }
+
+    /// Not a gate: a measurement, and the number the decision to verify page
+    /// CRCs on the scan path rests on.
+    ///
+    /// ```text
+    /// cargo test -p powdb-storage --lib mmap_scan_verification_cost \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// It walks the same mapped pages twice, once the way the scan path walks
+    /// them and once with [`Page::verify_bytes`] in front, and interleaves the
+    /// two so a machine that speeds up or slows down mid-run cannot favour
+    /// either. Both loops consume the row bytes the same way, so the only
+    /// difference between them is the CRC.
+    #[test]
+    #[ignore = "timing measurement, not a correctness gate"]
+    fn mmap_scan_verification_cost() {
+        use std::os::unix::io::AsRawFd;
+        use std::time::Instant;
+
+        let (mut heap, path) = temp_heap("verify_cost");
+        let schema = user_schema();
+        // ~120 bytes a row, so roughly 30 rows to a 4KB page.
+        for i in 0..60_000i64 {
+            let row = vec![
+                Value::Str(format!("row_{i:08}_{}", "x".repeat(96))),
+                Value::Int(i),
+            ];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        heap.flush().unwrap();
+        drop(heap);
+
+        let heap = HeapFile::open(&path).unwrap();
+        let num_pages = heap.disk.num_pages();
+        let file_len = num_pages as usize * PAGE_SIZE;
+        let fd = heap.disk.file_ref().as_raw_fd();
+        // SAFETY: `fd` is a live descriptor for a file of at least `file_len`
+        // bytes (`num_pages` pages), mapped read-only and private. The mapping
+        // is unmapped below and never outlives `heap`.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                file_len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "mmap failed");
+        // SAFETY: the mmap above succeeded and covers `file_len` bytes.
+        let mapped = unsafe { std::slice::from_raw_parts(ptr as *const u8, file_len) };
+
+        // What a compiled predicate costs the memory system: one byte read per
+        // cache line of the row. A callback that only sums `data.len()` reads
+        // the slot directory and never the row, which makes the baseline about
+        // twenty times faster than any real scan and the CRC look proportionally
+        // worse than it is.
+        #[inline]
+        fn touch_row(data: &[u8]) -> usize {
+            let mut acc = 0usize;
+            let mut i = 0usize;
+            while i < data.len() {
+                acc += data[i] as usize;
+                i += 64;
+            }
+            acc
+        }
+
+        let walk = |verify: bool| -> (u64, usize) {
+            let mut sink = 0usize;
+            let start = Instant::now();
+            for page_id in 0..num_pages {
+                let offset = page_id as usize * PAGE_SIZE;
+                let page_bytes = &mapped[offset..offset + PAGE_SIZE];
+                if verify {
+                    crate::page::Page::verify_bytes(page_bytes).unwrap();
+                }
+                for (_slot, data) in iter_page_slots(page_bytes) {
+                    sink += touch_row(data);
+                }
+            }
+            (start.elapsed().as_nanos() as u64, sink)
+        };
+
+        // The production entry point, for scale: this is what a full-table
+        // scan actually pays per page today, callback included.
+        let production_scan = || -> u64 {
+            let mut sink = 0usize;
+            let start = Instant::now();
+            heap.for_each_row(|_rid, data| sink += touch_row(data))
+                .unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            assert!(sink > 0, "the callback must actually read the rows");
+            elapsed
+        };
+
+        // One warm pass of each so the page cache and the branch predictors
+        // are in the same state for every measured pass.
+        let (_, bytes_plain) = walk(false);
+        let (_, bytes_verified) = walk(true);
+        assert_eq!(
+            bytes_plain, bytes_verified,
+            "the two loops must read the same rows, or they are not comparable"
+        );
+
+        const PASSES: usize = 21;
+        let mut plain = Vec::with_capacity(PASSES);
+        let mut verified = Vec::with_capacity(PASSES);
+        for _ in 0..PASSES {
+            plain.push(walk(false).0);
+            verified.push(walk(true).0);
+        }
+        plain.sort_unstable();
+        verified.sort_unstable();
+        let median_plain = plain[PASSES / 2];
+        let median_verified = verified[PASSES / 2];
+
+        let per_page_plain = median_plain as f64 / f64::from(num_pages);
+        let per_page_verified = median_verified as f64 / f64::from(num_pages);
+        println!("pages: {num_pages}, row bytes per pass: {bytes_plain}");
+        println!(
+            "scan without verification: {median_plain} ns median, {per_page_plain:.1} ns/page"
+        );
+        println!(
+            "scan with    verification: {median_verified} ns median, {per_page_verified:.1} ns/page"
+        );
+        println!(
+            "marginal cost of verifying: {:.1} ns/page, {:+.1}%",
+            per_page_verified - per_page_plain,
+            (median_verified as f64 / median_plain as f64 - 1.0) * 100.0
+        );
+        println!("plain    passes (ns): {plain:?}");
+        println!("verified passes (ns): {verified:?}");
+
+        let mut production = Vec::with_capacity(PASSES);
+        for _ in 0..PASSES {
+            production.push(production_scan());
+        }
+        production.sort_unstable();
+        let median_production = production[PASSES / 2];
+        let per_page_production = median_production as f64 / f64::from(num_pages);
+        println!(
+            "HeapFile::for_each_row as shipped: {median_production} ns median, \
+             {per_page_production:.1} ns/page"
+        );
+        println!(
+            "verification against that baseline: {:+.1}%",
+            (per_page_verified - per_page_plain) / per_page_production * 100.0
+        );
+
+        // SAFETY: `ptr` and `file_len` come from the successful mmap above.
+        unsafe {
+            libc::munmap(ptr, file_len);
+        }
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
 }

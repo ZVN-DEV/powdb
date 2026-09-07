@@ -313,6 +313,72 @@ fn mmap_point_lookup_with_wild_slot_count_does_not_abort() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The two halves of the corrupt-read model, pinned against each other so the
+/// documentation cannot drift from the code.
+///
+/// A point lookup on a page that rotted after the heap was opened refuses with
+/// `PageCorrupt` (the two tests above). A scan over the same page does **not**:
+/// the scan path serves mapped bytes as they are, so it hands the rotted row to
+/// the caller and reports success. One page, two answers, decided by which
+/// access path the planner chose.
+///
+/// That inconsistency is documented in `docs/STABILITY.md` rather than removed,
+/// because verifying the CRC on the scan path was measured and costs too much:
+/// a full-table filter query over 60,000 rows went from 447 us to 1.17 ms, a
+/// 2.6x slowdown, and the per-page CRC alone is ~352 ns against a scan that
+/// costs ~231 ns/page end to end. See
+/// `heap::tests::mmap_scan_verification_cost` for the harness.
+///
+/// This test exists so the divergence cannot change silently in either
+/// direction. If the scan starts refusing, that is a deliberate decision and
+/// `docs/STABILITY.md` has to be rewritten with it.
+#[test]
+fn a_scan_serves_a_rotted_page_that_a_point_lookup_refuses() {
+    let dir = tmp_path("scan_vs_get_crc");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let mut table = Table::create(one_col_schema(), &dir).expect("create table");
+    let rid = table
+        .insert(&vec![Value::Str("important_data".into())])
+        .expect("insert");
+    table.heap.flush().expect("flush");
+    let intact = table
+        .heap
+        .get(rid)
+        .expect("read the intact row")
+        .expect("the row is there");
+    table.heap.discard_dirty();
+
+    let heap_path = dir.join("t.heap");
+    let mut page = read_page(&heap_path, rid.page_id);
+    page[40] ^= 0xFF;
+    write_page(&heap_path, rid.page_id, &page);
+
+    // The scan: succeeds, and hands over the rotted bytes.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    table
+        .for_each_row_raw(|_rid, data| seen.push(data.to_vec()))
+        .expect("the scan path does not verify page CRCs, so it does not refuse");
+    assert_eq!(seen.len(), 1, "the scan must still see the row");
+    assert_ne!(
+        seen[0], intact,
+        "the corruption must be inside what the scan returned, or this test is \
+         not about a rotted page at all"
+    );
+
+    // The point lookup, same page, same moment: refuses.
+    let err = match table.heap.get(rid) {
+        Ok(other) => panic!("a corrupt page must not read as {other:?}"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        powdb_storage::error::StorageError::kind_of_io_error(&err),
+        Some(powdb_storage::error::StorageErrorKind::PageCorrupt),
+        "the point lookup half of the model must still fail closed, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The message an operator actually reads when the database will not start.
 ///
 /// `HeapFile::open` reports `page 1 CRC32 mismatch` and stops there. The
