@@ -988,7 +988,28 @@ fn bind_unix_socket_restricted(path: &Path) -> std::io::Result<UnixListener> {
     // A leftover staging node (or one planted by a local user to make the
     // bind fail) is removed first. `remove_file` does not follow symlinks.
     let _ = std::fs::remove_file(&staging);
-    let listener = UnixListener::bind(&staging)?;
+    let listener = UnixListener::bind(&staging).map_err(|e| {
+        // The staged name is a few bytes longer than the published one, so a
+        // published path sitting within those few bytes of the platform limit
+        // binds while the staged name does not. Say so: the bare errno for
+        // this is "File name too long" against a path the operator never
+        // wrote.
+        if staging.as_os_str().len() > path.as_os_str().len() {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "binding the unix socket at {} failed ({e}); it is staged at {} \
+                     while its permissions are set, which is {} bytes longer. Use a \
+                     shorter socket path.",
+                    path.display(),
+                    staging.display(),
+                    staging.as_os_str().len() - path.as_os_str().len()
+                ),
+            )
+        } else {
+            e
+        }
+    })?;
     if let Err(e) =
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(UNIX_SOCKET_MODE))
     {
@@ -1007,13 +1028,19 @@ fn bind_unix_socket_restricted(path: &Path) -> std::io::Result<UnixListener> {
 /// Same directory, so the `rename` that publishes it stays within one
 /// filesystem; named after the process so two servers staging at once do not
 /// collide.
+///
+/// The name is kept as short as uniqueness allows, and deliberately does not
+/// describe itself. A socket path has a hard length limit that the published
+/// path already has to fit (`sun_path` is 104 bytes on macOS, 108 on Linux),
+/// and the published path is the operator's choice, so every byte this adds
+/// is a byte taken from them. The first version of this decorated the
+/// published file name (`.powdb.sock.staging-12345`), which added 15 bytes
+/// and made every socket path within 15 bytes of the limit fail to bind, a
+/// bind that worked before the staging step existed. `.<pid in hex>` adds at
+/// most 7.
 #[cfg(unix)]
 fn staging_socket_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "powdb.sock".to_string());
-    let staged = format!(".{file_name}.staging-{}", std::process::id());
+    let staged = format!(".{:x}", std::process::id());
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(staged),
         _ => PathBuf::from(staged),
@@ -1985,6 +2012,67 @@ mod tests {
     /// life. A watcher thread samples the published path while the server
     /// binds it over and over; it must never see a mode with a bit outside
     /// 0660. With the socket bound privately and renamed into place there is
+    /// A socket path close to the platform limit still binds.
+    ///
+    /// `sun_path` is 104 bytes on macOS and 108 on Linux, and the published
+    /// path already has to fit. Staging the bind under a second name spends
+    /// some of that budget on a path the operator never chose, so a path that
+    /// bound before the staging step existed must still bind now. The first
+    /// staging name decorated the published file name and cost 15 bytes,
+    /// which broke `cargo test -p powdb-cli --test remote_unix_socket`: on
+    /// macOS the per-user temp directory is 49 bytes on its own, and the
+    /// test's socket landed at 99 bytes, so the staged name reached 114 and
+    /// the server exited before binding.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_path_near_the_platform_limit_still_binds() {
+        // The published path is sized to sit just inside the smaller of the
+        // two platform limits, so this test is meaningful on both.
+        const SMALLEST_SUN_PATH: usize = 104;
+
+        let base = std::env::temp_dir();
+        let socket_name = "powdb.sock";
+        // Leave a couple of bytes of headroom under the limit so the test is
+        // about the staging overhead, not about the limit itself.
+        let target_len = SMALLEST_SUN_PATH - 5;
+        let fixed = base.join("x").join(socket_name).as_os_str().len();
+        assert!(
+            fixed < target_len,
+            "the temp directory alone is {fixed} bytes, leaving no room to build a \
+             near-limit path; this test cannot run here"
+        );
+        let filler = "d".repeat(target_len - fixed);
+        let dir = base.join(filler);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join(socket_name);
+        assert!(
+            socket.as_os_str().len() <= SMALLEST_SUN_PATH,
+            "the published path must itself be bindable: {} bytes",
+            socket.as_os_str().len()
+        );
+
+        let listener = bind_unix_socket_restricted(&socket).unwrap_or_else(|e| {
+            panic!(
+                "a {}-byte socket path did not bind, staged at {} ({} bytes): {e}",
+                socket.as_os_str().len(),
+                staging_socket_path(&socket).display(),
+                staging_socket_path(&socket).as_os_str().len()
+            )
+        });
+
+        // The length fix must not have cost the restriction it stages for.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, UNIX_SOCKET_MODE,
+            "the published socket is at {mode:o}, not {UNIX_SOCKET_MODE:o}"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// no window to see, so this test cannot fail for a timing reason.
     #[cfg(unix)]
     #[tokio::test]
