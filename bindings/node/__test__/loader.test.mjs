@@ -104,6 +104,34 @@ test("the platform key is in the vocabulary the supported list uses", () => {
   );
 });
 
+test("index.d.ts carries the current dts-header.d.ts verbatim", () => {
+  // `napi build` writes index.d.ts as dts-header.d.ts followed by the
+  // declarations it generates from the Rust. Editing the header without
+  // re-running generation leaves the shipped `types` file describing an older
+  // contract than the one in the repo, which is invisible until a host reads
+  // the wrong one.
+  const header = readFileSync(join(HERE, "..", "dts-header.d.ts"), "utf8");
+  const dts = readFileSync(join(HERE, "..", "index.d.ts"), "utf8");
+  assert.ok(
+    dts.startsWith(header),
+    "index.d.ts is stale against dts-header.d.ts: re-run `napi build`",
+  );
+});
+
+test("every runtime export of the entry point is declared in index.d.ts", () => {
+  // `main` is loader.js and `types` is index.d.ts, so index.d.ts is the
+  // contract for what loader.js exports, not for what the generated index.js
+  // exports. An export missing here is invisible to every TypeScript host.
+  const dts = readFileSync(join(HERE, "..", "index.d.ts"), "utf8");
+  for (const name of Object.keys(require("../loader.js"))) {
+    assert.match(
+      dts,
+      new RegExp(`^export declare (const|function|class|enum|interface) ${name}\\b`, "m"),
+      `loader.js exports ${name} at runtime, but index.d.ts does not declare it`,
+    );
+  }
+});
+
 test("the .d.ts promise about error classification matches what the loader does", () => {
   // dts-header.d.ts is the contract a TypeScript host reads. It shipped two
   // claims the loader did not keep for static factories, so the claims are

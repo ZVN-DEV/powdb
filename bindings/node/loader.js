@@ -17,8 +17,16 @@
 
 "use strict";
 
-/** Platforms this package ships a prebuilt binary for. */
-const SUPPORTED_PLATFORMS = ["darwin-arm64", "linux-x64-gnu", "linux-arm64-gnu"];
+/**
+ * Platforms this package ships a prebuilt binary for, named the way
+ * {@link platformKey} names them. Frozen because `index.d.ts` declares it
+ * `readonly`, and its two siblings below already are.
+ */
+const SUPPORTED_PLATFORMS = Object.freeze([
+  "darwin-arm64",
+  "linux-x64-gnu",
+  "linux-arm64-gnu",
+]);
 
 /**
  * The stable wire error class (docs/errors.md) each code corresponds to. The

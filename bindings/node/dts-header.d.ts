@@ -194,3 +194,46 @@ export interface PowDBError extends Error {
   code: PowDBErrorCode | (string & {})
   errorClass?: number
 }
+
+/**
+ * Platforms this package ships a prebuilt native binary for, named the way
+ * {@link platformKey} names them. On Linux that is per-libc
+ * (`"linux-x64-gnu"`), because a prebuilt binary there is.
+ */
+export declare const SUPPORTED_PLATFORMS: readonly string[]
+
+/**
+ * A platform's name in the {@link SUPPORTED_PLATFORMS} vocabulary. Call it
+ * with no arguments for this machine:
+ *
+ * ```ts
+ * import { SUPPORTED_PLATFORMS, platformKey } from "@zvndev/powdb-embedded"
+ * const prebuilt = SUPPORTED_PLATFORMS.includes(platformKey())
+ * ```
+ *
+ * `${process.platform}-${process.arch}` is not that vocabulary: it omits the
+ * libc, so on Linux it matches no entry at all. Only this process's libc is
+ * detectable, so a caller naming a different `platform` passes `musl` itself.
+ */
+export declare function platformKey(
+  platform?: string,
+  arch?: string,
+  musl?: boolean,
+): string
+
+/**
+ * The wire error class (docs/errors.md) the package entry point puts on an
+ * error carrying each {@link PowDBErrorCode}. Partial: a code with no entry is
+ * a code the loader does not recognize, and such an error carries no
+ * `errorClass`.
+ */
+export declare const ERROR_CLASS_BY_CODE: Readonly<
+  Partial<Record<PowDBErrorCode, number>>
+>
+
+/**
+ * The napi status strings the package entry point rewrites to
+ * `"invalid_argument"`. They come from generated argument-coercion code, which
+ * runs before any addon logic. See {@link PowDBError}.
+ */
+export declare const NAPI_COERCION_STATUSES: readonly string[]
