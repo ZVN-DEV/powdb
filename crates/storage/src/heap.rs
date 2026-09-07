@@ -1198,10 +1198,35 @@ impl HeapFile {
             hot.page = Page::new(rid.page_id, PageType::Data);
         }
         if !hot.page.insert_at_slot(rid.slot_index, row_data) {
-            return Err(io::Error::other(format!(
-                "replay: row does not fit at {rid:?} (page {} slot {})",
-                rid.page_id, rid.slot_index
-            )));
+            // `Page::insert_at_slot` refuses on free space alone, however much
+            // reclaimable space the page holds. [`HeapFile::insert`] compacts
+            // in exactly this position, so a row can have been placed at
+            // runtime purely because compaction reclaimed what deleted rows
+            // left behind, and the RowId it chose is what the log records.
+            // Replay reaches that Insert record through here and has to be
+            // able to reproduce it: without this retry, a crash after an
+            // ordinary insert into a page with reclaimable space left the data
+            // directory unopenable. (A relocating update is logged as a Delete
+            // plus an Insert, so it makes the page and then needs it.)
+            //
+            // Compacting here is safe for everything that replays after it.
+            // `Page::compact` rewrites only the *offset* of a live slot entry,
+            // leaves every tombstone entry exactly as it is, and never touches
+            // `slot_count`, so slot indices are preserved and the later Update
+            // and Delete records in the same replay stay targeted at the rows
+            // they name.
+            let mut placed = false;
+            if hot.page.dead_space() > 0 && hot.page.compact() {
+                // The page was rewritten whether or not the row now fits.
+                hot.dirty = true;
+                placed = hot.page.insert_at_slot(rid.slot_index, row_data);
+            }
+            if !placed {
+                return Err(io::Error::other(format!(
+                    "replay: row does not fit at {rid:?} (page {} slot {})",
+                    rid.page_id, rid.slot_index
+                )));
+            }
         }
         hot.dirty = true;
         Ok(())
@@ -2899,6 +2924,115 @@ mod tests {
         heap.take_candidate_probes();
         heap.insert(row).unwrap();
         heap.take_candidate_probes()
+    }
+
+    /// WAL replay places a row only through [`HeapFile::insert_at`], at the
+    /// exact `RowId` the log records, and the log records whatever
+    /// [`HeapFile::insert`] chose. So every `RowId` `insert` can produce,
+    /// `insert_at` has to be able to reproduce.
+    ///
+    /// It could not. `insert` compacts a page when the row does not fit its
+    /// untouched tail but does fit the space deleted rows left behind;
+    /// `insert_at` went straight to `Page::insert_at_slot`, which refuses on
+    /// free space alone. A row placed at runtime purely because the page was
+    /// compacted therefore wrote an Insert record replay could not apply, the
+    /// replay returned an error, and the data directory failed to open. A
+    /// crash after an ordinary insert into a page with reclaimable space lost
+    /// the whole database.
+    #[test]
+    fn every_row_id_insert_produces_can_be_replayed_by_insert_at() {
+        /// One record's worth of the log this test replays, in the two shapes
+        /// `Catalog::replay_wal` actually applies to a heap.
+        enum Logged {
+            Insert(RowId, Vec<u8>),
+            Delete(RowId),
+        }
+
+        let (mut live, live_path) = temp_heap("replayable_live");
+        let (mut replay, replay_path) = temp_heap("replayable_replay");
+        let schema = user_schema();
+        let small = |i: i64| encode_row(&schema, &[Value::Str("s".repeat(20)), Value::Int(i)]);
+        let big = encode_row(&schema, &[Value::Str("b".repeat(400)), Value::Int(999)]);
+
+        let mut log: Vec<Logged> = Vec::new();
+        // Fill data page 1, taking the row that spills onto page 2 with us:
+        // replay has to place that one too.
+        let mut on_page_one: Vec<RowId> = Vec::new();
+        loop {
+            let row = small(on_page_one.len() as i64);
+            let rid = live.insert(&row).unwrap();
+            log.push(Logged::Insert(rid, row));
+            if rid.page_id != 1 {
+                break;
+            }
+            on_page_one.push(rid);
+        }
+        assert!(
+            on_page_one.len() > 20,
+            "page 1 must hold enough rows to delete 20 of them"
+        );
+        // Reclaimable space, in the shape a relocating update leaves behind:
+        // `update_logged` writes a Delete plus an Insert for exactly this.
+        for rid in on_page_one.iter().take(20) {
+            live.delete(*rid).unwrap();
+            log.push(Logged::Delete(*rid));
+        }
+
+        // The state that makes this test mean anything: the next row fits
+        // only once the deleted space is reclaimed.
+        let needed = big.len() + SLOT_ENTRY_SIZE;
+        live.ensure_hot(1).unwrap();
+        {
+            let hot = live.hot_page.as_ref().expect("ensure_hot guarantees Some");
+            assert!(
+                hot.page.free_space() < needed,
+                "precondition: the row must not fit in the untouched tail"
+            );
+            assert!(
+                hot.page.free_space() + hot.page.dead_space() >= needed,
+                "precondition: it must fit once the deleted space is reclaimed"
+            );
+        }
+
+        let grown = live.insert(&big).unwrap();
+        assert_eq!(grown.page_id, 1, "the row must land on the compacted page");
+        log.push(Logged::Insert(grown, big.clone()));
+
+        // Replay into a fresh heap exactly as `Catalog::replay_wal` does:
+        // Insert records through `insert_at`, Delete records through `delete`.
+        for record in &log {
+            match record {
+                Logged::Insert(rid, row) => replay.insert_at(*rid, row).unwrap_or_else(|e| {
+                    panic!("insert_at cannot reproduce a RowId that insert produced: {e}")
+                }),
+                Logged::Delete(rid) => replay.delete(*rid).unwrap(),
+            }
+        }
+
+        // Not merely "replay returned Ok": the replayed heap must hold the
+        // same bytes at the same RowIds as the heap the log came from.
+        let mut compared = 0;
+        for record in &log {
+            if let Logged::Insert(rid, _) = record {
+                assert_eq!(
+                    replay.get(*rid).unwrap(),
+                    live.get(*rid).unwrap(),
+                    "replayed row differs at {rid:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 20, "the comparison must cover the whole log");
+        assert_eq!(
+            replay.get(grown).unwrap(),
+            Some(big),
+            "the row that needed compaction must survive replay intact"
+        );
+
+        drop(live);
+        drop(replay);
+        std::fs::remove_file(&live_path).ok();
+        std::fs::remove_file(&replay_path).ok();
     }
 
     /// A page whose slot directory points outside the page cannot be
