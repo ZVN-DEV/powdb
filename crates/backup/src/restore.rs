@@ -48,7 +48,7 @@ fn is_plain_manifest_name(name: &str) -> bool {
 }
 
 pub(crate) fn validate_backup_file_name(name: &str) -> io::Result<()> {
-    let durable_name = name == "catalog.bin"
+    let durable_name = name == powdb_storage::data_dir::CATALOG_FILE
         || name == CATALOG_LSN_FILE
         || UNREFERENCED_DURABLE_FILES.contains(&name)
         || (name.ends_with(".heap") && name.len() > ".heap".len())
@@ -106,7 +106,7 @@ pub(crate) fn verify_restored_sync_catalog(
     sync: &SyncSnapshotMetadata,
     dest_data_dir: &Path,
 ) -> io::Result<()> {
-    let catalog_bytes = std::fs::read(dest_data_dir.join("catalog.bin"))?;
+    let catalog_bytes = std::fs::read(dest_data_dir.join(powdb_storage::data_dir::CATALOG_FILE))?;
     let catalog_hash = blake3::hash(&catalog_bytes).to_hex().to_string();
     if catalog_hash != sync.catalog_blake3_hex {
         return Err(io::Error::new(

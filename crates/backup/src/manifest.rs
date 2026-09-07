@@ -37,21 +37,19 @@ pub(crate) fn validate_catalog_transition(base: u16, next: u16) -> io::Result<()
 }
 
 /// Durable files that sit beside the catalog without being referenced by
-/// catalog metadata: the materialized-view registry and the user store. They
-/// are snapshotted whenever they exist and their absence is normal (a database
-/// with no views, or one that was never given users).
+/// Durable files no catalog entry points at, taken from the crate that owns
+/// the directory layout so this crate cannot fall behind a file added there.
 ///
 /// A restored directory that lost `views.bin` serves whatever rows the backing
 /// heaps happen to hold and cannot refresh a view; one that lost `auth.json`
 /// accepts unauthenticated connections.
-pub(crate) const UNREFERENCED_DURABLE_FILES: &[&str] = &["views.bin", "auth.json"];
+pub(crate) use powdb_storage::data_dir::UNREFERENCED_DURABLE_FILES;
 
-/// Files a data dir holds that a snapshot deliberately leaves behind: the WAL
-/// (truncated by the checkpoint that precedes every backup, so a snapshot is
-/// already a clean-shutdown image) and the writer lock. Only the coverage
-/// test below consumes this; it is the other half of the durable-file census.
+/// Files a data dir holds that a snapshot deliberately leaves behind. Only the
+/// coverage test below consumes this; it is the other half of the
+/// durable-file census.
 #[cfg(test)]
-const NON_SNAPSHOT_FILES: &[&str] = &["wal.log", "LOCK"];
+use powdb_storage::data_dir::NON_SNAPSHOT_FILES;
 
 /// Durable files referenced by current catalog metadata, plus the unreferenced
 /// durable files that are present on disk.
@@ -60,7 +58,10 @@ const NON_SNAPSHOT_FILES: &[&str] = &["wal.log", "LOCK"];
 /// index IDs. Stray files from a dropped or failed index are deliberately not
 /// included in a new snapshot.
 pub(crate) fn active_durable_file_names(catalog: &Catalog) -> BTreeSet<String> {
-    let mut names = BTreeSet::from(["catalog.bin".to_string(), CATALOG_LSN_FILE.to_string()]);
+    let mut names = BTreeSet::from([
+        powdb_storage::data_dir::CATALOG_FILE.to_string(),
+        CATALOG_LSN_FILE.to_string(),
+    ]);
     for table in catalog.list_tables() {
         names.insert(format!("{table}.heap"));
         if let Some(indexes) = catalog.index_metadata(table) {
@@ -293,7 +294,7 @@ pub(crate) fn current_sync_snapshot_metadata(
     let Some(identity) = powdb_sync::read_identity_snapshot_if_exists(data_dir)? else {
         return Ok(None);
     };
-    let catalog_bytes = std::fs::read(data_dir.join("catalog.bin"))?;
+    let catalog_bytes = std::fs::read(data_dir.join(powdb_storage::data_dir::CATALOG_FILE))?;
     let catalog_blake3_hex = blake3::hash(&catalog_bytes).to_hex().to_string();
     Ok(Some(SyncSnapshotMetadata::current(
         identity,
@@ -369,7 +370,7 @@ mod tests {
                 dirty: false,
             })
             .unwrap();
-        std::fs::write(dir.join("auth.json"), b"{}").unwrap();
+        std::fs::write(dir.join(powdb_storage::data_dir::AUTH_STORE_FILE), b"{}").unwrap();
 
         let claimed = active_durable_file_names(&catalog);
         let mut unclaimed: Vec<String> = Vec::new();
