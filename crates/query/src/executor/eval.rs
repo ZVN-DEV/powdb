@@ -235,7 +235,18 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
                 col.name, s
             )
         }),
-        (Value::Float(v), Int) => Ok(Value::Int(*v as i64)),
+        // A float into an int column is accepted only when it IS that
+        // integer. `*v as i64` truncates toward zero and saturates at the ends
+        // of the range, so `30.7` was stored as 30, `-0.5` as 0 and `1e300` as
+        // `i64::MAX`: the column refused a string outright and silently
+        // rewrote the near-miss number.
+        (Value::Float(v), Int) => exact_i64(*v).map(Value::Int).ok_or_else(|| {
+            format!(
+                "column '{}' is int and {v} is not a whole number in range; \
+                 write an integer",
+                col.name
+            )
+        }),
         _ => Err(format!(
             "type mismatch for column '{}': expected {:?}, got {}",
             col.name,
@@ -250,6 +261,19 @@ pub(super) fn coerce_value(val: Value, col: &ColumnDef) -> Result<Value, String>
             }
         )),
     }
+}
+
+/// `v` as an `i64` when the conversion is exact: a whole number inside the
+/// range. Anything else has no integer to become.
+fn exact_i64(v: f64) -> Option<i64> {
+    if !v.is_finite() || v.fract() != 0.0 {
+        return None;
+    }
+    // 2^63 is exactly representable; every i64 lies in [-2^63, 2^63).
+    if v >= 9_223_372_036_854_775_808.0 || v < -9_223_372_036_854_775_808.0 {
+        return None;
+    }
+    Some(v as i64)
 }
 
 pub(super) fn literal_to_value(expr: &Expr) -> Result<Value, String> {
