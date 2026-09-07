@@ -1317,14 +1317,6 @@ impl Catalog {
         Ok(())
     }
 
-    /// Flush every dirty heap page and truncate the WAL. This is the
-    /// "clean shutdown" point — after this returns, the on-disk heap files
-    /// are fully consistent and the WAL is empty, so the next `open` will
-    /// skip replay entirely.
-    ///
-    /// Safe to call multiple times. Safe to call on a catalog that has
-    /// performed zero mutations since the last checkpoint (in which case
-    /// the flushes are no-ops and the truncate is a bounded syscall).
     /// Set the WAL size at which a finished statement checkpoints, in bytes.
     /// 0 disables the automatic checkpoint and leaves the log to grow until
     /// the catalog is closed. Defaults to [`DEFAULT_WAL_CHECKPOINT_BYTES`].
@@ -1332,6 +1324,20 @@ impl Catalog {
         self.wal_checkpoint_bytes = bytes;
     }
 
+    /// The WAL size at which a finished statement checkpoints, in bytes.
+    /// See [`Catalog::set_wal_checkpoint_bytes`].
+    pub fn wal_checkpoint_bytes(&self) -> u64 {
+        self.wal_checkpoint_bytes
+    }
+
+    /// Flush every dirty heap page and truncate the WAL. This is the
+    /// "clean shutdown" point: after this returns, the on-disk heap files
+    /// are fully consistent and the WAL is empty, so the next `open` will
+    /// skip replay entirely.
+    ///
+    /// Safe to call multiple times. Safe to call on a catalog that has
+    /// performed zero mutations since the last checkpoint (in which case
+    /// the flushes are no-ops and the truncate is a bounded syscall).
     pub fn checkpoint(&mut self) -> io::Result<()> {
         self.ensure_no_active_transaction_for_checkpoint()?;
         self.ensure_plain_checkpoint_allowed_before_flush()?;

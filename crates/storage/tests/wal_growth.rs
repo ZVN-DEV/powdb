@@ -100,3 +100,31 @@ fn a_zero_threshold_leaves_the_wal_to_grow_until_close() {
         "opting out should keep the whole log, got {grown} bytes"
     );
 }
+
+/// The threshold is settable but was write-only, so nothing could report what
+/// a running catalog had been configured with. A server that wants to log or
+/// expose its own effective setting needs to read it back.
+#[test]
+fn the_checkpoint_threshold_reads_back_what_was_set() {
+    let dir = temp_dir("readback");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cat = Catalog::create(&dir).unwrap();
+
+    assert_eq!(
+        cat.wal_checkpoint_bytes(),
+        powdb_storage::catalog::DEFAULT_WAL_CHECKPOINT_BYTES,
+        "a fresh catalog starts on the documented default"
+    );
+
+    cat.set_wal_checkpoint_bytes(64 * 1024);
+    assert_eq!(cat.wal_checkpoint_bytes(), 64 * 1024);
+
+    cat.set_wal_checkpoint_bytes(0);
+    assert_eq!(
+        cat.wal_checkpoint_bytes(),
+        0,
+        "0 is a real setting (automatic checkpoints off), not 'unset'"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
