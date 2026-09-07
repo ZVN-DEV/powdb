@@ -1024,7 +1024,8 @@ refused.** These announce themselves, but they fail work that previously ran:
   saturated tie goes another round; an all-hot tie still falls to conjunct
   order), and a unique equality or a lone one is never counted at all. The
   regression dated from 0.19.1 and went unmeasured because the workload sat in
-  the benchmark baseline but not in the comparator's gated list until now.
+  the benchmark baseline but not in the comparator's gated list until now. On
+  the same Depot instance, head against 0.27.0: 65,612 ns to 4,808 ns (-93%).
 
 - **A query no longer rebuilds its validation scaffolding on every execution.**
   Since 0.20.0 every execution, plan-cache hits included, checks the plan
@@ -1038,8 +1039,9 @@ refused.** These announce themselves, but they fail work that previously ran:
   into a fresh string and building hash sets of them per query. They now share
   one walk and borrow every name they resolve, the projection names that can
   shadow a JSON path base are collected only when the plan carries a `->` path,
-  and the join ambiguity walk is skipped for a single-table plan. On a point
-  lookup that scaffolding was a large share of the wall time.
+  and the join ambiguity walk is skipped for a single-table plan. On the same
+  Depot instance, head against 0.27.0: a point lookup 1,977 ns to 1,439 ns
+  (-27%), an update by primary key 2,018 ns to 1,616 ns (-20%).
 
 ### Security
 
