@@ -507,7 +507,15 @@ impl Page {
     /// Slot indices are preserved, tombstones included, so every `RowId`
     /// already handed out stays valid. Rows are moved in offset order, which
     /// is not slot order once an update has relocated a row.
-    pub fn compact(&mut self) {
+    ///
+    /// Returns `false`, having changed nothing, when a live slot points
+    /// outside the page: bit rot or a bad restore in the slot directory
+    /// leaves no safe place to slide that row to. The dead space such a page
+    /// reports is unreclaimable, and a caller that keeps offering the page for
+    /// new rows on the strength of it never makes progress, so the answer has
+    /// to reach the caller rather than being a silent early return.
+    #[must_use]
+    pub fn compact(&mut self) -> bool {
         let count = self.slot_count();
         let mut live: Vec<(u16, u16, u16)> = Vec::with_capacity(count as usize);
         for slot in 0..count {
@@ -518,7 +526,7 @@ impl Page {
             let start = offset as usize;
             let end = start + length as usize;
             if start < PAGE_HEADER_SIZE || end > PAGE_SIZE {
-                return;
+                return false;
             }
             live.push((offset, length, slot));
         }
@@ -534,6 +542,7 @@ impl Page {
             cursor += length as usize;
         }
         self.set_free_start(cursor as u16);
+        true
     }
 
     /// Mark a slot as deleted. Does not reclaim space on its own; the space
@@ -1002,6 +1011,51 @@ mod tests {
             Page::from_bytes_verified(&bytes).expect("legacy page must read without verification");
         assert_eq!(reopened.page_id(), 9);
         assert_eq!(reopened.get(0).unwrap(), b"legacy row");
+    }
+
+    #[test]
+    fn compact_reports_that_it_ran_and_reclaims_the_dead_space() {
+        let mut page = Page::new(1, PageType::Data);
+        let first = page.insert(b"first row").expect("fits");
+        page.insert(b"second row").expect("fits");
+        page.delete(first);
+        assert!(page.dead_space() > 0, "the delete must leave dead space");
+
+        assert!(page.compact(), "an intact page compacts");
+        assert_eq!(page.dead_space(), 0, "compaction reclaims the dead space");
+    }
+
+    #[test]
+    fn compact_refuses_a_page_whose_live_slot_points_outside_it() {
+        let mut page = Page::new(1, PageType::Data);
+        let first = page.insert(b"first row").expect("fits");
+        let second = page.insert(b"second row").expect("fits");
+        page.delete(first);
+        let dead_before = page.dead_space();
+        assert!(dead_before > 0, "the delete must leave dead space");
+
+        // A row that runs off the end of the page: bit rot in the slot
+        // directory, or a legacy (pre-checksum) page out of a bad restore.
+        // Only the offset moves, so the page still reports the same live
+        // bytes and the same unreclaimable dead space.
+        let (_, length) = page.read_slot_entry(second);
+        page.write_slot_entry(second, (PAGE_SIZE - 1) as u16, length);
+        let before = *page.as_bytes();
+
+        assert!(
+            !page.compact(),
+            "a page with a live slot outside it cannot be compacted"
+        );
+        assert_eq!(
+            page.as_bytes(),
+            &before,
+            "a refused compaction must leave the page byte-for-byte alone"
+        );
+        assert_eq!(
+            page.dead_space(),
+            dead_before,
+            "and the dead space it cannot reclaim is still there"
+        );
     }
 
     #[test]

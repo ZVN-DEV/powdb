@@ -1080,13 +1080,37 @@ impl HeapFile {
                 self.candidate_probes += 1;
             }
             self.ensure_hot(page_id)?;
-            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             // The summary counts space that deleted rows left behind, which
             // only exists as a contiguous run once the page is compacted.
-            if hot.page.free_space() < needed && hot.page.dead_space() > 0 {
-                hot.page.compact();
-                hot.dirty = true;
+            let compacted = {
+                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+                if hot.page.free_space() < needed && hot.page.dead_space() > 0 {
+                    let ran = hot.page.compact();
+                    hot.dirty |= ran;
+                    ran
+                } else {
+                    true
+                }
+            };
+            if !compacted {
+                // A live slot points outside the page, so its directory is
+                // corrupt and the dead space it advertises can never be given
+                // back. Re-filing the page at that number hands it straight
+                // back: `note_free_bytes` re-pushes it into the bucket
+                // `take_free_page` just popped it from, and the search spins
+                // on it forever, inside the engine write lock, on a
+                // `spawn_blocking` thread no query timeout can cancel. Drop it
+                // from the free list instead. The rows it still holds stay
+                // readable; it just stops being offered for new ones.
+                tracing::warn!(
+                    page_id,
+                    "heap page cannot be compacted (a live slot points outside it); \
+                     dropping it from the free list"
+                );
+                self.note_free_bytes(page_id, 0);
+                continue;
             }
+            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             if let Some(slot) = hot.page.insert(row_data) {
                 hot.dirty = true;
                 let free = hot.page.free_space();
@@ -1097,9 +1121,13 @@ impl HeapFile {
                 });
             }
             // The summary overstated this page. Correct it from the page
-            // itself and move on: the new count is below `needed`, so the
-            // same page cannot come back on the next round.
-            let free = hot.page.free_space() + hot.page.dead_space();
+            // itself, capped below what this search asks for: whatever the
+            // page really holds it demonstrably could not take this row, and
+            // filing it at or above `needed` would put it back in a bucket
+            // `take_free_page(needed)` scans. The cap is what makes the loop
+            // terminate rather than an argument about who overstated what.
+            let free =
+                (hot.page.free_space() + hot.page.dead_space()).min(needed.saturating_sub(1));
             self.note_free_bytes(page_id, free);
         }
 
@@ -2871,6 +2899,110 @@ mod tests {
         heap.take_candidate_probes();
         heap.insert(row).unwrap();
         heap.take_candidate_probes()
+    }
+
+    /// A page whose slot directory points outside the page cannot be
+    /// compacted, and the free-space summary still credits it with dead space
+    /// it will never give back. Re-filing it at that number puts it straight
+    /// back into the bucket the allocator took it from, so `insert` used to
+    /// spin on it forever while holding the engine write lock.
+    #[test]
+    fn insert_does_not_spin_on_a_page_that_cannot_be_compacted() {
+        use crate::page::slot_entry_offset_checked;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (mut heap, path) = temp_heap("uncompactable");
+        let schema = user_schema();
+        let mk = |i: i64| encode_row(&schema, &[Value::Str("x".repeat(180)), Value::Int(i)]);
+
+        // Fill data page 1, then step back off the page it spilled onto.
+        let mut on_page_one: Vec<RowId> = Vec::new();
+        loop {
+            let rid = heap.insert(&mk(on_page_one.len() as i64)).unwrap();
+            if rid.page_id != 1 {
+                heap.delete(rid).unwrap();
+                break;
+            }
+            on_page_one.push(rid);
+        }
+        assert!(on_page_one.len() > 4, "page 1 must hold several rows");
+        // Dead space for the allocator to offer, and a live slot to corrupt.
+        for rid in on_page_one.iter().take(3) {
+            heap.delete(*rid).unwrap();
+        }
+        let victim = *on_page_one.last().expect("page 1 holds rows");
+        drop(heap);
+
+        // Point the victim's row off the end of the page. `Page::compact`
+        // refuses such a page and `iter_page_slots` skips the slot, so the
+        // heap still opens and every other row stays readable.
+        {
+            let mut disk = DiskManager::open(&path).unwrap();
+            let mut bytes = disk.read_page(1).unwrap();
+            let entry =
+                slot_entry_offset_checked(victim.slot_index).expect("slot entry is in range");
+            // Only the offset moves: the page keeps reporting the same live
+            // bytes, the same free space and the same dead space, so the
+            // allocator still offers it exactly as it did before.
+            bytes[entry..entry + 2].copy_from_slice(&((PAGE_SIZE - 1) as u16).to_le_bytes());
+            let mut page = Page::from_bytes(&bytes).expect("page 1 decodes");
+            page.stamp_checksum();
+            disk.write_page(1, page.as_bytes()).unwrap();
+            disk.flush().unwrap();
+        }
+
+        let row = mk(9_999);
+        let needed = row.len() + SLOT_ENTRY_SIZE;
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let mut page = Page::from_bytes(&disk.read_page(1).unwrap()).unwrap();
+            assert!(
+                page.free_space() < needed,
+                "the row must not fit in the untouched tail, or nothing compacts"
+            );
+            assert!(
+                page.free_space() + page.dead_space() >= needed,
+                "the summary must still offer this page for the row"
+            );
+            assert!(!page.compact(), "the corrupted page must refuse to compact");
+        }
+
+        // The insert runs on its own thread: before the fix it never returns,
+        // and a test that hangs says nothing useful.
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let mut heap = HeapFile::open(&thread_path).unwrap();
+            let placed = heap
+                .insert(&row)
+                .map(|rid| rid.page_id)
+                .map_err(|e| e.to_string());
+            let summary = heap.free_bytes.get(1).copied();
+            let bucket = heap.bucket_of_page.get(1).copied();
+            let _ = tx.send((placed, summary, bucket));
+        });
+
+        let (placed, summary, bucket) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("insert never returned: the free-space search spun on the uncompactable page");
+        assert_ne!(
+            placed.expect("the row must still be stored"),
+            1,
+            "the uncompactable page must not be used"
+        );
+        assert_eq!(
+            summary,
+            Some(0),
+            "the uncompactable page must be credited with no reclaimable space"
+        );
+        assert_eq!(
+            bucket,
+            Some(NO_BUCKET),
+            "and it must be off the free list entirely"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
