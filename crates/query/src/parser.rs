@@ -377,6 +377,22 @@ fn closest_function(word: &str) -> Option<&'static str> {
     closest_keyword(word, FUNCTION_NAMES.iter())
 }
 
+/// The one message a link path outside a projection gets, whichever way it was
+/// written. `p.author.name` and `.author.name` are the same mistake and reach
+/// two different parser productions, so the wording lives here rather than at
+/// either of them: the aliased spelling was fixed first and the unaliased one
+/// kept the old opaque "unexpected trailing token" for a release.
+fn link_traversal_outside_projection(path: &str) -> ParseError {
+    ParseError::Syntax {
+        message: format!(
+            "link traversal '{path}' is only supported in a projection; \
+             `filter`, `order` and `group` cannot traverse a link, so join \
+             the target type and use its own columns"
+        ),
+        position: None,
+    }
+}
+
 /// Best keyword match for an identifier that appeared where the parser
 /// expected syntax, drawn from every keyword that can legally appear there.
 fn keyword_suggestion(word: &str) -> Option<&'static str> {
@@ -2148,6 +2164,19 @@ impl Parser {
         match self.peek().clone() {
             Token::DotIdent(name) => {
                 self.advance();
+                // The unaliased spelling of a link path, `.author.name`. The
+                // aliased one (`p.author.name`) is caught in the `Ident` arm
+                // below; this arm returned `Field("author")` and left `.name`
+                // for whoever came next, so the same mistake written without an
+                // alias still got "unexpected trailing token near token 3:
+                // field '.name'". A projection slot never reaches here with two
+                // dotted parts -- `reject_bare_dotted_path` names the alias it
+                // needs first -- so this is the `filter`/`order`/`group` case.
+                if let Token::DotIdent(next) = self.peek().clone() {
+                    return Err(link_traversal_outside_projection(&format!(
+                        ".{name}.{next}"
+                    )));
+                }
                 Ok(Expr::Field(name))
             }
             Token::IntLit(v) => {
@@ -2263,15 +2292,9 @@ impl Parser {
                     // token near token 6: field '.name'", which never says the
                     // word link and cannot be told from a typo.
                     if let Token::DotIdent(next) = self.peek().clone() {
-                        return Err(ParseError::Syntax {
-                            message: format!(
-                                "link traversal '{name}.{field}.{next}' is only supported \
-                                 in a projection; `filter`, `order` and `group` cannot \
-                                 traverse a link, so join the target type and use its \
-                                 own columns"
-                            ),
-                            position: None,
-                        });
+                        return Err(link_traversal_outside_projection(&format!(
+                            "{name}.{field}.{next}"
+                        )));
                     }
                     return Ok(Expr::QualifiedField {
                         qualifier: name,

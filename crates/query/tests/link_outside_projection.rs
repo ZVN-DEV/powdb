@@ -77,3 +77,73 @@ fn a_plain_qualified_column_is_untouched() {
         .execute_powql("Post as p join User as u on p.uid = u.id filter u.name = \"ann\" { p.id }")
         .unwrap();
 }
+
+/// The unaliased spelling of the same mistake. `Post filter .author.name = ...`
+/// reached a different parser production than `Post as p filter p.author.name`
+/// and kept the old opaque message ("unexpected trailing token near token 3:
+/// field '.name'"), so the fix covered one of the two ways to write it.
+#[test]
+fn the_unaliased_link_path_says_the_same_thing() {
+    let (_dir, mut engine) = engine();
+    for query in [
+        "Post filter .author.name = \"ann\" { .id }",
+        "Post order .author.name { .id }",
+        "Post group .author.name { c: count(.id) }",
+        "count(Post filter .author.name = \"ann\")",
+        "Post filter .author.name = \"ann\" delete",
+    ] {
+        let message = message(&mut engine, query);
+        assert!(
+            message.contains("link traversal") && message.contains("projection"),
+            "`{query}` was refused with {message}"
+        );
+        assert!(
+            !message.contains("trailing token"),
+            "`{query}` still gets the opaque message: {message}"
+        );
+    }
+}
+
+/// The two spellings are the same mistake and must read the same, apart from
+/// the path each one quotes.
+#[test]
+fn both_spellings_carry_the_same_guidance() {
+    let (_dir, mut engine) = engine();
+    let aliased = message(
+        &mut engine,
+        "Post as p filter p.author.name = \"ann\" { p.id }",
+    );
+    let unaliased = message(&mut engine, "Post filter .author.name = \"ann\" { .id }");
+    let guidance = "is only supported in a projection";
+    let (_, aliased_tail) = aliased.split_once(guidance).unwrap_or_else(|| {
+        panic!("the aliased message no longer carries the shared guidance: {aliased}")
+    });
+    let (_, unaliased_tail) = unaliased.split_once(guidance).unwrap_or_else(|| {
+        panic!("the unaliased message does not carry the shared guidance: {unaliased}")
+    });
+    assert_eq!(
+        aliased_tail, unaliased_tail,
+        "the two spellings must give the same advice"
+    );
+    assert!(
+        aliased.contains("'p.author.name'"),
+        "the aliased message must quote what was written: {aliased}"
+    );
+    assert!(
+        unaliased.contains("'.author.name'"),
+        "the unaliased message must quote what was written: {unaliased}"
+    );
+}
+
+/// A bare `.column` is untouched: only two adjacent dotted parts are a path.
+#[test]
+fn an_unqualified_column_is_untouched() {
+    let (_dir, mut engine) = engine();
+    engine
+        .execute_powql("Post filter .uid = 1 { .id }")
+        .unwrap();
+    engine.execute_powql("Post order .uid { .id }").unwrap();
+    engine
+        .execute_powql("Post group .uid { c: count(.id) }")
+        .unwrap();
+}
