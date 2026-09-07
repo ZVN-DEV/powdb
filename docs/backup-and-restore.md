@@ -141,7 +141,7 @@ A backup deliberately leaves three things behind:
 - The writer lock (`LOCK`) and the `readers/` directory. They describe the process that took the backup and mean nothing in a restored copy.
 - The `.powdb-sync/` directory: replica cursors and retained replication segments. A restored directory therefore has no retained history of its own. That is deliberate for the replica-bootstrap flow, where the replica restores the snapshot and then catches up from the **primary's** retained history, which stays on the primary.
 
-The `manifest.json` records, for each copied file, its name, raw byte length, and blake3 hash. Nothing is compressed, so the length is the file's size on disk. Restore verifies the hash; the length is recorded for inspection, not as a second check. It also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable — the same number printed by `backup` (`at lsn 128` above).
+The `manifest.json` records, for each copied file, its name, raw byte length, and blake3 hash. Nothing is compressed, so the length is the file's size on disk. Restore verifies the hash; the length is recorded for inspection, not as a second check. It also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable, the same number printed by `backup` (`at lsn 128` above).
 
 ---
 

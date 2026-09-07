@@ -78,7 +78,7 @@ cargo install powdb-server
 # TypeScript client (Node 18+): version is kept in lockstep with the workspace by scripts/check-version-consistency.sh
 npm install @zvndev/powdb-client
 
-# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu ONLY; no source fallback, `require()` throws elsewhere: use @zvndev/powdb-client there)
+# In-process Node addon: embed the engine directly, no server (prebuilt for macOS arm64, Linux x64-gnu, Linux arm64-gnu ONLY; no source fallback. Elsewhere `require()` throws an error coded `unsupported_platform` that names the three supported targets: use @zvndev/powdb-client there)
 npm install @zvndev/powdb-embedded
 
 # Prebuilt binaries (linux x86_64, macos aarch64)
