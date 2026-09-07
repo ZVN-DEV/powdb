@@ -357,6 +357,22 @@ fn float_key_is_faithful(value: f64, probe: ProbeKind) -> bool {
 /// all of them at once. Calling it from only some of the lowering arms is what
 /// made `.price < 3` answer 0 while `.price < 3 and .id > 0` answered 2.
 fn coerce_column_index_key(col_type: TypeId, key: &Expr, probe: ProbeKind) -> Option<Expr> {
+    // A `bytes` index cannot answer an ordered comparison at all, whatever the
+    // literal says. `Btree::encode_composite_value` writes a four-byte length
+    // before the bytes, so index order is length first while the scan orders
+    // bytes bytewise: the one-byte key `\xff` sorts before the two-byte key
+    // `\x0102` in the index and after it in the scan. A bound built from any
+    // literal therefore skipped every stored value of a different length, in
+    // silence. Equality is unaffected because the encoding is injective, so an
+    // exact key still probes exactly the entries it names.
+    if col_type == TypeId::Bytes
+        && matches!(
+            probe,
+            ProbeKind::LowerBound { .. } | ProbeKind::UpperBound { .. }
+        )
+    {
+        return None;
+    }
     // A value literal reached this plan through the typed-literal coercion pass
     // (`plan_exec::coerce`), which resolved it against this same column, so it
     // already addresses the stored key lane. Anything else is a mismatch the
