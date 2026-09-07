@@ -36,6 +36,8 @@ import {
   Client,
   Pool,
   PowDBError,
+  DEFAULT_MAX_IN_FLIGHT,
+  MAX_IN_FLIGHT_BYTES,
   isPowDBError,
   assertServerCatalogVersionSupported,
   serverCapabilityMismatch,
@@ -243,11 +245,23 @@ function echoServer(delayMs = 20): net.Server {
 function queryServer(replyDelayMs = 0): {
   server: net.Server;
   received: Message[];
-  stats: { inFlight: number; maxInFlight: number };
+  stats: {
+    inFlight: number;
+    maxInFlight: number;
+    inFlightBytes: number;
+    maxInFlightBytes: number;
+  };
   sockets: Set<net.Socket>;
 } {
   const received: Message[] = [];
-  const stats = { inFlight: 0, maxInFlight: 0 };
+  // Bytes as well as frames: the server's read-ahead budget has both caps and
+  // the byte one is the tighter of the two for anything but a tiny query.
+  const stats = {
+    inFlight: 0,
+    maxInFlight: 0,
+    inFlightBytes: 0,
+    maxInFlightBytes: 0,
+  };
   const sockets = new Set<net.Socket>();
   const server = net.createServer((sock) => {
     sockets.add(sock);
@@ -276,8 +290,15 @@ function queryServer(replyDelayMs = 0): {
         }
         stats.inFlight++;
         stats.maxInFlight = Math.max(stats.maxInFlight, stats.inFlight);
+        const wireLen = encode(msg).length;
+        stats.inFlightBytes += wireLen;
+        stats.maxInFlightBytes = Math.max(
+          stats.maxInFlightBytes,
+          stats.inFlightBytes,
+        );
         const answer = () => {
           stats.inFlight--;
+          stats.inFlightBytes -= wireLen;
           if (!sock.destroyed) {
             sock.write(encode({ type: "ResultOk", affected: 0n }));
           }
@@ -2530,6 +2551,78 @@ async function main() {
       await client.close();
       await closeServer(server);
     }
+  });
+
+  await test("the in-flight window bounds unanswered bytes, not only frames", async () => {
+    // 64 frames of 20 KiB is 1.28 MiB of read-ahead, and a pre-0.28.0 server
+    // cancels the running query and closes the connection at 1 MiB with no
+    // Error frame -- the exact ECONNRESET this window exists to prevent. The
+    // frame count never gets near its own cap on traffic like this.
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const text = "q".repeat(20 * 1024);
+      const results = await withTimeout(
+        Promise.all(Array.from({ length: 200 }, (_, i) => client.query(`${text}${i}`))),
+        30_000,
+      );
+      assert.equal(results.length, 200);
+      assert.ok(
+        stats.maxInFlightBytes < 1024 * 1024,
+        `client left ${stats.maxInFlightBytes} unanswered bytes on the wire, cap is 1 MiB`,
+      );
+      // The byte budget, not the frame count, is what bound this burst.
+      assert.ok(
+        stats.maxInFlight < 64,
+        `frame count ${stats.maxInFlight} reached the window, so bytes were never the binding cap`,
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("a single frame larger than the byte budget still goes out", async () => {
+    // The budget may never deadlock a client whose one and only query is
+    // bigger than it: with nothing in flight, the head frame always writes.
+    const { server, stats } = queryServer(2);
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      const result = await withTimeout(client.query("q".repeat(2 * 1024 * 1024)), 30_000);
+      assert.equal(result.kind, "ok");
+      assert.ok(stats.maxInFlightBytes > 1024 * 1024);
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the window's caps are the ones the server actually enforces", () => {
+    const path = fileURLToPath(
+      new URL("../../../crates/server/src/handler/wire.rs", import.meta.url),
+    );
+    const text = readFileSync(path, "utf8");
+    const constant = (name: string): number => {
+      const matches = [
+        ...text.matchAll(
+          new RegExp(`^pub\\(super\\) const ${name}: usize = ([^;]+);$`, "gm"),
+        ),
+      ];
+      assert.equal(matches.length, 1, `expected exactly one \`${name}\` in ${path}`);
+      const expr = matches[0]![1]!.replace(/_/g, "").trim();
+      assert.match(expr, /^\d+( \* \d+)*$/, `cannot evaluate ${name} = ${expr}`);
+      return expr.split("*").reduce((acc, part) => acc * Number(part.trim()), 1);
+    };
+    assert.ok(
+      DEFAULT_MAX_IN_FLIGHT < constant("MAX_IN_FLIGHT_READ_AHEAD_FRAMES"),
+      "the default window no longer sits under the server's frame cap",
+    );
+    assert.ok(
+      MAX_IN_FLIGHT_BYTES <= constant("MAX_IN_FLIGHT_READ_AHEAD_BYTES"),
+      "the client's byte budget no longer sits under the server's byte cap",
+    );
   });
 
   await test("queries queued behind the window reject when the connection dies", async () => {

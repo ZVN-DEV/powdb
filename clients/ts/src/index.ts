@@ -609,21 +609,41 @@ export interface ClientOptions {
   legacyHandshake?: boolean;
   /**
    * How many requests this client will leave unanswered on the wire at once.
-   * Defaults to {@link DEFAULT_MAX_IN_FLIGHT} (64), comfortably under the
-   * server's 128-frame read-ahead budget: a server that reaches that budget
-   * closes the connection outright, so a burst of a few hundred concurrent
-   * queries used to die mid-flight. Anything past the window waits in a local
-   * FIFO and goes out as replies come back, so `Promise.all` over any number
-   * of queries completes.
+   * Defaults to {@link DEFAULT_MAX_IN_FLIGHT} (64). Anything past the window
+   * waits in a local FIFO and goes out as replies come back, so `Promise.all`
+   * over any number of queries completes.
+   *
+   * The window bounds unanswered frames. {@link MAX_IN_FLIGHT_BYTES} bounds
+   * their encoded size at the same time and is the tighter of the two for
+   * anything but small statements; raising `maxInFlight` does not lift it.
    */
   maxInFlight?: number;
 }
 
 /**
- * Default in-flight window. The server's read-ahead budget is 128 frames and
- * exceeding it closes the connection, so the client stays well below it.
+ * Default in-flight window, in frames.
+ *
+ * A server reading ahead while a query runs holds those frames in a budget of
+ * 128 frames and 1 MiB (`MAX_IN_FLIGHT_READ_AHEAD_FRAMES` and
+ * `MAX_IN_FLIGHT_READ_AHEAD_BYTES` in `crates/server/src/handler/wire.rs`).
+ * From 0.28.0 a server that reaches either cap pauses its read arm until the
+ * queue drains; before that it cancelled the running query and closed the
+ * connection with no Error frame, which is what a burst of a few hundred
+ * concurrent queries used to die of. Staying under both caps is what keeps
+ * this client safe against a server of either vintage.
  */
 export const DEFAULT_MAX_IN_FLIGHT = 64;
+
+/**
+ * Bytes of unanswered request frames this client will leave on the wire.
+ *
+ * The frame count alone does not cover the server's budget: 64 frames of
+ * 20 KiB of query text (bulk inserts, long `in`-lists) is 1.28 MiB of
+ * read-ahead against a 1 MiB cap, and the frame count never comes near 128.
+ * A frame larger than this budget still goes out when nothing else is in
+ * flight, so a single large statement can never deadlock.
+ */
+export const MAX_IN_FLIGHT_BYTES = 1024 * 1024;
 
 type Pending = {
   resolve: (msg: Message) => void;
@@ -1900,16 +1920,34 @@ export class Client extends EventEmitter<ClientEvents> {
   }
 
   /**
-   * Write queued requests until the in-flight window is full. Order is
-   * strictly FIFO in both queues, which is what keeps `pending` aligned with
-   * the server's replies.
+   * Write queued requests until the in-flight window is full, in frames or in
+   * bytes. Order is strictly FIFO in both queues, which is what keeps
+   * `pending` aligned with the server's replies.
+   *
+   * The byte total is recomputed from `pending` on each call rather than
+   * carried in a counter: entries leave that queue from four places, and a
+   * counter that drifts at any one of them would wedge the connection.
    */
   private pump(): void {
+    let inFlightBytes = 0;
+    for (const entry of this.pending) inFlightBytes += entry.frame.length;
     while (this.queued.length > 0 && this.pending.length < this.maxInFlight) {
+      const next = this.queued[0]!;
+      if (
+        !next.settled &&
+        this.pending.length > 0 &&
+        inFlightBytes + next.frame.length >= MAX_IN_FLIGHT_BYTES
+      ) {
+        // Over the byte budget. Nothing else may go out until a reply frees
+        // room; an empty window always writes its head, so one frame bigger
+        // than the whole budget still gets sent.
+        break;
+      }
       const entry = this.queued.shift()!;
       // Aborted while it waited for room: nothing was written, so there is
       // no reply to match and it must not enter the pending FIFO.
       if (entry.settled) continue;
+      inFlightBytes += entry.frame.length;
       this.pending.push(entry);
       this.socket.write(entry.frame, (err) => {
         if (err) {

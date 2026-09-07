@@ -619,7 +619,7 @@ Returns a `Promise<Client>`. Options:
 | `connectTimeoutMs` | `number` | `5000` | Connection timeout in milliseconds |
 | `tls` | `boolean \| tls.ConnectionOptions` | `false` | Enable TLS; `true` uses system defaults, or pass a `tls.connect` options object |
 | `eager` | `boolean` | `false` | Resolve as soon as the Connect frame is written instead of waiting for ConnectOk; queries pipeline behind the handshake (see Eager connect above) |
-| `maxInFlight` | `number` | `64` | How many requests may be on the wire at once. Beyond it, queries queue in the client instead of being written, so a burst cannot exhaust the socket's send buffer. Must be a positive integer |
+| `maxInFlight` | `number` | `64` | How many requests may be left unanswered on the wire at once. Beyond it, queries queue in the client instead of being written, so a burst of any size still completes in order. Encoded frame bytes are capped at 1 MiB in parallel (`MAX_IN_FLIGHT_BYTES`), which binds first for anything but small statements; a single frame larger than that still goes out on an empty window. Must be a positive integer |
 
 > **Multi-user servers:** requires client ≥0.4.0 (`user` option) and server
 > ≥0.4.6 (enforced roles). See the version matrix under Authentication.
@@ -769,6 +769,15 @@ The client enforces the same frame limits as the server and throws on violation:
   allocate: a cell is only 4 bytes on the wire but costs far more as a JS
   value, so without the cap a ~40 MB frame could expand to roughly 1.9 GB. Page
   larger results with `limit`/`offset`.
+
+It also bounds what it leaves unanswered on the wire, so a burst cannot
+overrun a server's read-ahead budget (128 frames and 1 MiB while a query is
+running). A server on 0.28.0 or newer pauses reading when it reaches either
+cap; an older one cancelled the running query and closed the connection with
+no Error frame.
+
+- `DEFAULT_MAX_IN_FLIGHT` — 64 unanswered request frames (see `maxInFlight`)
+- `MAX_IN_FLIGHT_BYTES` — 1 MiB of unanswered request frames
 
 ## Requirements
 
