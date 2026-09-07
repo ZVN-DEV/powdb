@@ -6,14 +6,14 @@ PowDB is pre-1.0. `CHANGELOG.md` says the project "adheres to Semantic
 Versioning", and under SemVer a `0.y.z` project is allowed to break anything in
 a minor bump. That is technically accurate and practically useless: it tells you
 nothing about whether your data directory survives `cargo install
-powdb-cli --version 0.27.0`. This page is the actual promise.
+powdb-cli --version 0.28.0`. This page is the actual promise.
 
 [FORMAT.md](FORMAT.md) documents the *mechanics* (magics, version numbers, the
 deprecation floor). This page documents the *commitment*.
 
 ## Summary
 
-| Surface | Across a patch (`0.27.0` to `0.27.1`) | Across a minor (`0.27` to `0.28`) |
+| Surface | Across a patch (`0.28.0` to `0.28.1`) | Across a minor (`0.28` to `0.29`) |
 |---|---|---|
 | Data directory, read forward | Compatible | **Compatible** |
 | Data directory, read backward (downgrade) | Usually | **Not supported** |
@@ -256,11 +256,11 @@ The Rust crates, the Node addon, the TypeScript client, and the CLI are all
 versions:
 
 ```bash
-cargo install powdb-cli --version 0.27.0 --locked
+cargo install powdb-cli --version 0.28.0 --locked
 ```
 
 ```json
-{ "dependencies": { "@zvndev/powdb-client": "0.27.0" } }
+{ "dependencies": { "@zvndev/powdb-client": "0.28.0" } }
 ```
 
 Breaking changes are listed in `CHANGELOG.md` under the release that made them.

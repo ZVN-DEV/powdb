@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.28.0 - 2026-09-07
+
 ### Fixed
 
 - A parameter the wire protocol cannot carry no longer desynchronizes the

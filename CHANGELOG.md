@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-09-07
+
 ### Breaking
 
 An index, not a second copy: every item below is tagged `**BREAKING (...)**` on
@@ -475,6 +477,13 @@ refused.** These announce themselves, but they fail work that previously ran:
   content in it is left alone.
 
 ### Fixed
+
+- **The release-body check rejected a release section larger than a pipe
+  buffer.** `changelog-section.sh` tested for content with `printf | grep -q`
+  under `pipefail`; `grep -q` exits on its first match, and once the section
+  outgrew the pipe buffer (this one is 68 KB) `printf` took SIGPIPE and the
+  check reported the fullest section in the file as empty. Found cutting this
+  release; both it and `check-version-consistency.sh` now test a here-string.
 
 - **BREAKING (silent):** **A repeated query no longer answers a different question.** The plan cache
   collected a query's literals in source order and re-bound them in plan-walk
