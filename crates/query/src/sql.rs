@@ -423,13 +423,76 @@ fn lex_sql_with_spans(input: &str) -> Result<(Vec<SqlTok>, Vec<usize>), ParseErr
                     break;
                 }
                 if chars[i] == '\\' && i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    match next {
-                        'n' => s.push('\n'),
-                        't' => s.push('\t'),
-                        other => s.push(other),
+                    // The same escape set the PowQL lexer accepts, and the
+                    // same refusal. Collapsing an unrecognised `\X` to `X`
+                    // rewrote the user's own text on the way in, and it made
+                    // the two frontends disagree about one source text:
+                    // PowQL refused `"back\slash"` while SQL read it as
+                    // `backslash`.
+                    match chars[i + 1] {
+                        '\'' => {
+                            s.push('\'');
+                            i += 2;
+                        }
+                        '"' => {
+                            s.push('"');
+                            i += 2;
+                        }
+                        '\\' => {
+                            s.push('\\');
+                            i += 2;
+                        }
+                        'n' => {
+                            s.push('\n');
+                            i += 2;
+                        }
+                        't' => {
+                            s.push('\t');
+                            i += 2;
+                        }
+                        'r' => {
+                            s.push('\r');
+                            i += 2;
+                        }
+                        '0' => {
+                            s.push('\0');
+                            i += 2;
+                        }
+                        'u' => {
+                            let digits: String = chars
+                                .get(i + 2..i + 6)
+                                .map(|hex| hex.iter().collect())
+                                .unwrap_or_default();
+                            let scalar = (digits.len() == 4)
+                                .then(|| u32::from_str_radix(&digits, 16).ok())
+                                .flatten()
+                                .and_then(char::from_u32);
+                            match scalar {
+                                Some(c) => {
+                                    s.push(c);
+                                    i += 6;
+                                }
+                                None => {
+                                    return Err(ParseError::Lex {
+                                        message: format!(
+                                            "invalid \\u escape in string literal: expected four \
+                                             hex digits naming a Unicode character, got \"{digits}\""
+                                        ),
+                                        position: i,
+                                    });
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(ParseError::Lex {
+                                message: format!(
+                                    "unknown escape '\\{other}' in string literal; SQL \
+                                     supports \\' \\\" \\\\ \\n \\t \\r \\0 and \\uXXXX"
+                                ),
+                                position: i,
+                            });
+                        }
                     }
-                    i += 2;
                 } else {
                     s.push(chars[i]);
                     i += 1;

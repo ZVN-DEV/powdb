@@ -111,3 +111,49 @@ fn a_bytes_literal_still_takes_the_doubled_backslash_form() {
         other => panic!("expected rows, got {other:?}"),
     }
 }
+
+/// The SQL frontend shares the escape convention, so it must share the
+/// refusal. While it did not, the two frontends disagreed about the meaning of
+/// the same source text: PowQL refused `"back\slash"` and SQL read it as
+/// `backslash`, which is the one thing the two languages must never do.
+#[test]
+fn the_sql_frontend_refuses_an_unknown_escape_too() {
+    let (_dir, mut engine) = engine();
+    let message = engine
+        .execute_sql("SELECT id FROM T WHERE s = 'back\\slash'")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("unknown escape '\\s'"),
+        "expected the unknown-escape refusal, got {message}"
+    );
+}
+
+#[test]
+fn the_sql_frontend_keeps_the_escapes_it_documents() {
+    let (_dir, mut engine) = engine();
+    engine
+        .execute_sql("INSERT INTO T (id, s) VALUES (1, 'a\\\\b\\nc')")
+        .unwrap();
+    match engine.execute_sql("SELECT s FROM T").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], Value::Str("a\\b\nc".to_string()))
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// A quoted SQL identifier goes through the same string scanner, so an unknown
+/// escape there is refused rather than silently rewriting the name.
+#[test]
+fn an_unknown_escape_in_a_quoted_identifier_is_refused() {
+    let (_dir, mut engine) = engine();
+    let message = engine
+        .execute_sql("SELECT \"i\\d\" FROM T")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("unknown escape '\\d'"),
+        "expected the unknown-escape refusal, got {message}"
+    );
+}
