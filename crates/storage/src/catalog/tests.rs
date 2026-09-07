@@ -1529,12 +1529,13 @@ fn a_failing_auto_checkpoint_does_not_report_the_commit_as_failed() {
     );
 }
 
-/// The automatic checkpoint truncates the WAL without running any archive
-/// hook. `Catalog::open_with_wal_archive` (reached from `powdb-query`'s
-/// published `Engine::new_with_wal_archive`) says somebody is shipping this
-/// log somewhere, and such a caller need not be PowDB's own sync, so keying
-/// the skip on the `.powdb-sync` identity file alone let the log be discarded
-/// behind a live archive stream with no error anywhere.
+/// A hook that was handed to the open but never registered for the automatic
+/// checkpoint cannot be run from inside one, so the checkpoint has to skip:
+/// there is no way to publish the records a truncate would destroy.
+///
+/// This is the narrow case. It is *not* how either shipped binary opens a
+/// catalog: they register the hook, so their threshold fires and archives
+/// first. See `an_auto_archive_hook_publishes_the_log_and_then_truncates_it`.
 #[test]
 fn an_installed_wal_archive_hook_stops_the_automatic_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
@@ -1588,5 +1589,75 @@ fn a_catalog_without_an_archive_hook_still_checkpoints_automatically() {
         cat.wal.synced_len().unwrap(),
         empty_log,
         "a plainly-opened catalog must still checkpoint when the log crosses the threshold"
+    );
+}
+
+/// The configuration both shipped binaries actually use: a catalog opened with
+/// an archive hook that is *also* registered for the automatic checkpoint. The
+/// threshold has to fire here, and the hook has to see every record the
+/// truncate is about to destroy.
+///
+/// `powdb-cli` and `powdb-server` always pass a hook to
+/// `Engine::new_with_wal_archive` (a no-op unless sync is on), so a skip keyed
+/// on "a hook was passed" turned `--wal-checkpoint-bytes` into a no-op in every
+/// real deployment and let the WAL grow without bound, which is the one thing
+/// the threshold exists to prevent. The answer is to archive and then truncate,
+/// not to stop checkpointing.
+#[test]
+fn an_auto_archive_hook_publishes_the_log_and_then_truncates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut cat = Catalog::create(dir.path()).unwrap();
+        one_int_table(&mut cat, "T");
+        cat.commit_autocommit().unwrap();
+        cat.checkpoint().unwrap();
+    }
+
+    // Every record the hook is handed, in the order it saw them.
+    let published: Arc<std::sync::Mutex<Vec<(WalRecordType, u64)>>> = Arc::default();
+    let recorder = Arc::clone(&published);
+    let hook: WalArchiveHook = Arc::new(move |_dir: &Path, records: &[WalRecord]| {
+        recorder.lock().unwrap().extend(
+            records
+                .iter()
+                .map(|record| (record.record_type, record.lsn)),
+        );
+        Ok(())
+    });
+
+    // Opened the way the binaries open it, then handed the same hook to keep.
+    let mut cat = Catalog::open_with_wal_archive(dir.path(), |_, _| Ok(())).unwrap();
+    cat.install_auto_wal_archive(hook);
+    // Measured after the checkpoint above, so this is the length of a log
+    // holding nothing but its header: what a truncate leaves behind.
+    let empty_log = cat.wal.synced_len().unwrap();
+    cat.set_wal_checkpoint_bytes(1);
+
+    const ROWS: usize = 5;
+    for i in 0..ROWS {
+        cat.insert("T", &vec![Value::Int(i as i64)]).unwrap();
+    }
+    cat.commit_autocommit().unwrap();
+
+    assert_eq!(
+        cat.wal.synced_len().unwrap(),
+        empty_log,
+        "the threshold must still fire when a hook is installed, or the WAL of every \
+         shipped deployment grows without bound"
+    );
+
+    let published = published.lock().unwrap();
+    let inserts = published
+        .iter()
+        .filter(|(kind, _)| *kind == WalRecordType::Insert)
+        .count();
+    assert_eq!(
+        inserts, ROWS,
+        "every record the truncate destroyed must have reached the hook first, saw: {published:?}"
+    );
+    assert_eq!(
+        published.iter().map(|(_, lsn)| *lsn).max(),
+        Some(cat.wal.last_appended_lsn()),
+        "the hook must see the log through its newest record, not a prefix of it"
     );
 }
