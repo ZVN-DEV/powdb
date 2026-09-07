@@ -437,26 +437,34 @@ User filter (.a + .b) * .c > 0
 `int / int` divides and truncates toward zero (`5 / 2` is `2`, `-5 / 2` is `-2`).
 Mixing an `int` with a `float` produces a `float` (`5.0 / 2` is `2.5`).
 
-Integer arithmetic that leaves the `int64` range does **not** wrap and does not
-abort the query. `+`, `-` and `*` evaluate to `null` for that row:
+Integer arithmetic that leaves the `int64` range does **not** wrap, and it is
+**not** the missing value either. `+`, `-`, `*` and `/` fail the statement:
 
 ```
 # .x is 9223372036854775807
-User { v: .x + 1 }   # null
-User { v: .x * 2 }   # null
+User { v: .x + 1 }   # cannot compute a sum: the integer result overflows int64
+User { v: .x * 2 }   # cannot compute a product: the integer result overflows int64
 ```
 
-Two related cases differ deliberately:
+The label names the operation: `a sum`, `a difference`, `a product`, or
+`a quotient` (the quotient case is `i64::MIN / -1`, the one division that
+overflows). Before this release each of these evaluated to the missing value for
+that row, which is indistinguishable from a missing column, and an `update` wrote
+it into a required column. An `update` that hits one now writes no row at all.
+
+Division by zero splits three ways:
 
 - **A literal zero divisor is refused before the query runs**, because it can
   never be anything else: `cannot divide by zero: the divisor is the literal 0`.
-- **A zero divisor that comes from a column** is a per-row value, so it follows
-  the type: integer division by zero yields `null`, float division by zero
-  yields `inf`.
+- **An integer divisor that is zero for some row** fails the statement:
+  `cannot divide by zero: the divisor is zero for at least one row`. It used to
+  yield the missing value.
+- **Float division by zero still yields `inf`**, which is what IEEE 754 says and
+  what every float path in the engine does.
 
-`sum` is the exception to the quiet-null rule. Silently returning `null` from an
-aggregate reads as "no rows", so an integer total that leaves the `int64` range
-is a hard error instead: `cannot compute sum: the integer total overflows int64`.
+`sum` was already a hard error on integer overflow, and stays one:
+`cannot compute sum: the integer total overflows int64`. Silently returning
+`null` from an aggregate reads as "no rows".
 
 #### NaN and infinity
 
@@ -1944,17 +1952,21 @@ configuration table in the README.
 ### Concurrency behavior
 
 Reads run in parallel, but PowDB has no MVCC and serializes writers through a
-single write-admission gate. An **explicit** transaction holds that gate for its
-entire lifetime: from `begin` until `commit` or `rollback`, every other
-connection that needs the gate, readers included, waits. Autocommit is
-different: an autocommit writer releases admission before it waits on the fsync,
-so it does not pin the gate across a slow disk sync.
+single write-admission gate. An **explicit** transaction holds that gate from
+`begin` until `commit` or `rollback`, so every other connection that needs to
+write waits for it. Reads are admitted from a separate pool until the
+transaction's **first write**; that write closes the pool and drains it, waiting
+for the reads already running and for nothing else, and from then on readers
+wait too. Autocommit is different: an autocommit writer releases admission
+before it waits on the fsync, so it does not pin the gate across a slow disk
+sync.
 
 Two rules follow:
 
 - **Keep explicit transactions short.** Do the writes, `commit`, and get out. A
-  transaction left open (waiting on application logic or a slow client) blocks
-  every reader for as long as it stays open.
+  transaction that has written and is then left open (waiting on application
+  logic or a slow client) blocks every reader for as long as it stays open. A
+  `begin` that has not written yet does not.
 - **Prefer autocommit on read-mostly paths.** Wrap statements in `begin` /
   `commit` only when you need atomicity or bulk-load throughput. Do not hold a
   transaction open across reads.

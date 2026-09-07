@@ -8,9 +8,18 @@
   `status()` and `syncNow()` used to let the underlying client's error escape
   with its own code, so a caller branching on `PowDBSyncErrorCode` saw codes that
   are not in that union.
-- `DEFAULT_MAX_PULL_UNITS` raised from 512 to 4096, matching the server's own
-  chunk ceiling. Paired with the server-side fix below, a transaction larger than
-  the pull window is now served instead of wedging the replica.
+- `DEFAULT_MAX_PULL_UNITS` raised from 512 to 4096 and `DEFAULT_MAX_PULL_BYTES`
+  from 4 MiB to 16 MiB, both now at the primary's own ceilings. The byte budget
+  is the one that cuts a chunk, and a chunk cut inside a transaction is not
+  applyable, so a 4 MiB default against a server cap of 16 MiB made any
+  transaction between the two (about 1,000 rows of 5 KB) answer `rebootstrap` on
+  every pull, for good, and the replica re-wedged on the next transaction of
+  that size after each bootstrap. Both budgets are range-checked against the
+  primary's ceilings at construction now; the check previously rejected only
+  zero and left an over-large `maxPullBytes` to fail server-side on every pull.
+  **Lowering `maxPullBytes` is not a safe tuning knob**: a transaction larger
+  than the budget cannot be cut, and the primary answers `rebootstrap` rather
+  than a retryable error.
 
 ### Changed
 
@@ -29,13 +38,24 @@
   primary refused it, and every retry cut in the same place, so the replica was
   wedged for good while `status` reported `repairAction: "pull"` with
   `lastSyncError: null`. `maxUnits` is a hint now and the chunk runs on to the
-  commit or rollback that closes the transaction, bounded by the byte budget. A
-  transaction too large for the byte budget answers with a rebootstrap status
-  naming it, instead of an error the replica would retry forever.
+  commit or rollback that closes the transaction, bounded by the byte budget and
+  by a 4096-unit chunk cap. That cap is the ceiling every released decoder
+  accepts on a pull frame: a peer through v0.27.0 answers a larger frame with a
+  frame-level decode failure, which drops the socket with no diagnostic and
+  repeats on every retry. A transaction too large for either bound answers with
+  a rebootstrap status naming it, instead of an error the replica would retry
+  forever.
 - A live primary archives committed history on demand when a replica calls
   `status` or `pull`. Retained segments were previously written only by a
   checkpoint, and the only checkpoint a running primary performed was on graceful
   shutdown, so a replica polling a live primary was told `awaitArchive` forever.
+  It archives only when there is something unarchived: the archive's own
+  high-water mark gates it, read from segment file names before any lock is
+  taken. Without that gate the demand archive ran a full checkpoint on every
+  frame, under the engine write lock, so a replica polling once a second stalled
+  all of the primary's client traffic once a second. Archiving is best effort: a
+  checkpoint refuses while a transaction is open, so it stops at the last
+  commit.
 - `status` reports `rebootstrap` when the tail a replica is about to pull holds a
   record V1 embedded sync cannot apply, with the reason naming DDL, instead of
   leaving the replica to discover it one failed pull at a time.

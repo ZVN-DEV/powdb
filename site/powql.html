@@ -318,7 +318,7 @@ User as u { u.name, orders: u.orders order total desc { total } }</code></pre>
 insert User { name := "Bob", email := "bob@example.com" }
 
 # Multi-row insert: separate row blocks with commas.
-# One statement = one WAL fsync = one round trip; all-or-nothing on validation.
+# One statement = one round trip; all-or-nothing on validation.
 insert User
   { name := "Alice", email := "alice@example.com", age := 30 },
   { name := "Bob",   email := "bob@example.com" },
@@ -363,8 +363,8 @@ commit    # apply all changes
 begin
 insert User { name := "Charlie", email := "charlie@example.com", age := 40 }
 rollback  # discard all changes</code></pre>
-    <p>Transactions are per-connection; other connections never see uncommitted rows, and a connection that closes before <code>commit</code> rolls back implicitly. Nested <code>begin</code> is an error. Statements between <code>begin</code> and <code>commit</code> share a single WAL fsync, so bulk loads inside a transaction run roughly 50x faster than autocommit with identical durability.</p>
-    <p><strong>Concurrency:</strong> PowDB has no MVCC. An explicit transaction holds the whole write-admission gate for its lifetime, so from <code>begin</code> until <code>commit</code> or <code>rollback</code> every other connection that needs the gate (readers included) waits. Keep explicit transactions short, and prefer autocommit on read-mostly paths (an autocommit writer releases admission before the fsync wait). A connection that waits past the server timeout (5 seconds by default, <code>POWDB_TX_WAIT_TIMEOUT_MS</code>) fails with a <code>transaction gate timeout</code> error rather than blocking forever.</p>
+    <p>Transactions are per-connection; other connections never see uncommitted rows, and a connection that closes before <code>commit</code> rolls back implicitly. Nested <code>begin</code> is an error. A statement between <code>begin</code> and <code>commit</code> does not fsync on its own; the WAL fsyncs every 64 records and at the commit, so a bulk load inside a transaction runs roughly 50x faster than autocommit with identical durability.</p>
+    <p><strong>Concurrency:</strong> PowDB has no MVCC. An explicit transaction holds the write-admission gate from <code>begin</code> until <code>commit</code> or <code>rollback</code>, so every other connection that needs to <em>write</em> waits for it. Reads are admitted until the transaction's first write; from that write on, readers wait too. Keep explicit transactions short, and prefer autocommit on read-mostly paths (an autocommit writer releases admission before the fsync wait). A connection that waits past the server timeout (5 seconds by default, <code>POWDB_TX_WAIT_TIMEOUT_MS</code>) fails with a <code>transaction gate timeout</code> error rather than blocking forever.</p>
 
     <!-- DDL -->
     <h2 id="ddl">DDL</h2>

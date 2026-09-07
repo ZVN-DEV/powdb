@@ -472,7 +472,7 @@ db.query('User filter .age > 25 { .name, .age }');
 db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</code></pre>
       </div>
     </div>
-    <p class="section-subtitle" style="margin-top: 20px;">Durability is a knob, not a fork: <code>"full"</code> fsyncs every commit (safest, the default), <code>"normal"</code> moves the fsync off the write lock for a bounded crash-loss window, and batching writes in a <code>begin</code>/<code>commit</code> transaction collapses a whole bulk load into a single fsync. That is how single-row insert throughput stops being fsync-bound.</p>
+    <p class="section-subtitle" style="margin-top: 20px;">Durability is a knob, not a fork: <code>"full"</code> fsyncs every commit (safest, the default), <code>"normal"</code> moves the fsync off the write lock for a bounded crash-loss window, and batching writes in a <code>begin</code>/<code>commit</code> transaction drops the cost from one fsync per row to roughly one per 64. That is how single-row insert throughput stops being fsync-bound.</p>
   </div>
 </section>
 

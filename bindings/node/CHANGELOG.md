@@ -29,6 +29,15 @@ the engine, so `@zvndev/powdb-embedded` 0.27.0 is PowDB 0.27.0.
 - An `undefined` parameter bound a PowQL `null`, so a caller who read a missing
   property off an object silently ran a different query. It is refused with a
   message saying to pass `null` for a null.
+- `Database.open` and its three sibling factories carry `errorClass` too, and
+  napi's coercion statuses are rewritten there as well. The loader wrapped only
+  writable function properties, and napi defines `#[napi(factory)]` statics as
+  non-writable, so the four ways to obtain a handle were the one surface with no
+  classification while the shipped `.d.ts` promised it on every entry point. A
+  host branching on `err.errorClass`, or on a rewritten `err.code`, around
+  `Database.open(configuredPath)` matched no branch. The exported class is now a
+  subclass owning classifying statics, with `Symbol.hasInstance` kept pointing at
+  the native class so `instanceof` is unchanged.
 - Errors raised by generated argument coercion carried napi's own status names
   (`StringExpected`, `InvalidArg`) rather than any of this package's codes. They
   are reported as `invalid_argument`.
