@@ -49,7 +49,7 @@ id = "not-of-a-comparison-is-two-valued"
 shape = "filter_not"
 pair = "powql_vs_sqlite"
 reason = "PowDB filter logic is deliberately two-valued: a comparison against a missing value is false, so NOT makes it true and the row is kept, where standard three-valued SQL keeps it unknown and drops the row. This is documented user-facing behaviour in docs/SQL.md and docs/POWQL.md, not an accident. Every non-negated comparison shape (filter_cmp, filter_and, filter_or) agrees with SQLite exactly, which is what shows the divergence is confined to NOT."
-owner = "docs/SQL.md:161"
+owner = "docs/SQL.md:240"
 anchor = "`NOT` is two-valued"
 
 [[divergence]]
