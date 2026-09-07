@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+An index, not a second copy: every item below is tagged `**BREAKING (...)**` on
+the entry itself, which is where the reasoning lives. Nothing here is a new
+fact. It exists because 35 breaking items are spread across four sections of a
+long release, and twelve of them change what a query answers with no error
+raised at all, which is the group an upgrading user gets no signal about.
+
+`cargo-semver-checks` runs zero lints on a 0.x MINOR bump, so the Rust API
+changes below get no automated verdict on this release. This list is the record.
+
+**Answers or written data change, with no error raised.** Re-check anything that
+compares floats, sums floats, ranges over a `bytes` column, measures string
+length, negates a filter on an optional column, reads result columns by name, or
+keys an `update` / `delete` on a `datetime`, `uuid` or `bytes` column:
+
+- `Changed` A comparison against NaN follows IEEE.
+- `Changed` Float `sum` and `avg` are accumulated with compensation.
+- `Changed` An ordered comparison on a `bytes` column no longer uses the index.
+- `Changed` `length()` counts characters, not bytes.
+- `Changed` `not` over a missing value is the plain complement (rows that were
+  dropped are now kept).
+- `Changed` A projection column is named after what it computes (result column
+  names move: `?` and `__agg_0` become real names).
+- `Changed` A number binds as `int` when it is integral and inside the signed
+  64-bit range (`@zvndev/powdb-client`).
+- `Fixed` A repeated query no longer answers a different question (a cached
+  query's second and later executions were computing something else).
+- `Fixed` A comparison against a `datetime`, `uuid` or `bytes` column coerces its
+  literal. **An `update` or `delete` keyed on such a column was a silent no-op
+  and now writes rows.**
+- `Fixed` `union` de-duplicates both branches (row counts fall).
+- `Fixed` An ordered comparison across two types is false (rows of another type
+  are no longer returned).
+- `Fixed` `x in (...)` answers what `x = ...` answers.
+
+**Statements, directories or deployments that used to be accepted are now
+refused.** These announce themselves, but they fail work that previously ran:
+
+- `Changed` An arithmetic result with no int64 answer is an error, not the
+  missing value.
+- `Changed` An `int` column refuses a float that is not exactly that integer.
+- `Changed` An unknown backslash escape in a string is a parse error (catches
+  Windows paths and regexes written in literals).
+- `Changed` A cast literal against a mistyped column is an error.
+- `Changed` `having` and `like` refuse a mistyped operand.
+- `Changed` A pipeline clause that carries a value may be written once.
+- `Changed` A supplied parameter the query never references is an error.
+- `Changed` A type no row of which could ever be stored is refused at `type` and
+  at `alter ... add column`.
+- `Changed` `drop <name>` on a materialized view is refused; use `drop view`.
+- `Changed` A damaged data directory refuses to open instead of opening smaller.
+- `Changed` WAL damage inside the log refuses the open.
+- `Changed` A malformed `POWDB_*` value refuses startup with exit 2. A
+  deployment carrying a typo (`POWDB_READONLY=ture`) used to start and serve the
+  directory writable.
+- `Changed` `powdb-cli --exec` exits 1, not 0, when a script ends inside an open
+  transaction.
+- `Fixed` `@zvndev/powdb-embedded` rejects arguments it used to coerce: an
+  `undefined` parameter no longer binds a PowQL null, and a `NaN` memory limit
+  no longer opens with a zero-byte budget.
+- `Security` A data directory the owner cannot open is refused rather than
+  widened; 0000 is refused outright.
+
+**API, wire and operational contracts:**
+
+- `Changed` A corrupt page read fails closed. Rust: `HeapFile::get`,
+  `Table::get` and `Table::index_lookup` return `io::Result<Option<..>>`, so
+  every caller of the three must handle the error arm. A point lookup on a
+  rotted page raises `PageCorrupt` where it answered zero rows.
+- `Changed` Engine error text reaches remote clients verbatim. Message text
+  changes for everything that used to arrive as the bare `query execution
+  error`, `InvalidIdentifier` moves from wire class 0 to 2 and `RowTooLarge` /
+  `ValueTooLarge` from 0 to 4, and Rust callers of
+  `powdb_server::protocol::Message::decode` get `Result<Message, DecodeError>`
+  where they got `Result<Message, String>`.
+- `Changed` A served sync pull chunk stays inside the wire envelope every
+  released peer decodes. This makes the 4096-unit cap a hard product ceiling of
+  about 4094 row changes per transaction; a larger transaction is answered with
+  a typed rebootstrap rather than served. See
+  [docs/embedded-sync.md](docs/embedded-sync.md).
+- `Changed` `@zvndev/powdb-sync`: `LocalApplyRequest.primaryGeneration` is
+  `bigint`, a compile break for an adapter implementer, and
+  `DEFAULT_MAX_PULL_UNITS` moves from 512 to 4096.
+- `Fixed` `@zvndev/powdb-embedded`: engine failures carry the wire error class,
+  so `err.code` values change. Anything matching the flat `query_failed` must be
+  updated, as it was for the same package in 0.26.0.
+- `Added` SIGHUP reloads the user store. The server installed no SIGHUP handler
+  before, so `kill -HUP` terminated it; it now reloads `auth.json` and keeps
+  serving.
+- `Fixed` Backups now carry `auth.json`, so a server started on a restored
+  directory enforces authentication where it previously accepted
+  unauthenticated connections.
+- `Security` A shared-password deployment counts auth failures against the peer,
+  not the username. Unix-socket peers are rate limited for the first time and
+  share one bucket, a shared-password server drops from 50 to 5 guesses a minute
+  per peer, and `powdb_server::handler::AuthRateLimiter`'s underlying type
+  changed.
+
 ### Added
 
 - **`drop link <Owner>.<name>`**, also spelled `alter <Owner> drop link
@@ -52,7 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong (an EC key with explicit curve parameters names the command that
   re-encodes it, a duplicate `basicConstraints` extension is named).
 
-- **SIGHUP reloads the user store** without restarting the server, so a
+- **BREAKING (operational):** **SIGHUP reloads the user store** without restarting the server, so a
   password rotated with `powdb-cli passwd` takes effect on the next
   authentication and a deleted user stops being able to log in. `powdb-cli`'s
   user-admin subcommands now say so when a server holds the data directory.
@@ -120,7 +219,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **A corrupt page read fails closed instead of answering "no such row".**
+- **BREAKING (API/wire):** **A corrupt page read fails closed instead of answering "no such row".**
   `HeapFile::get` and `Table::get` mapped an I/O failure and a CRC refusal to
   `None`, and ten executor sites read `None` as "the row is deleted", so an
   indexed point lookup on a page that rotted after the directory was opened
@@ -132,18 +231,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`io::Result<Option<(RowId, Row)>>`). See
   [docs/STABILITY.md](docs/STABILITY.md).
 
-- **An arithmetic result with no int64 answer is an error, not the missing
+- **BREAKING (now refused):** **An arithmetic result with no int64 answer is an error, not the missing
   value.** `+`, `-` and `*` that overflow, and `/` by a divisor that is zero for
   some row, used to evaluate to the missing value: indistinguishable from a
   missing column, and an `update` wrote it into a required column. All four now
   refuse the statement, and an `update` that hits one writes no row at all.
 
-- **A comparison against NaN follows IEEE.** `=`, `<`, `>`, `<=` and `>=`
+- **BREAKING (silent):** **A comparison against NaN follows IEEE.** `=`, `<`, `>`, `<=` and `>=`
   against NaN are false and `!=` is true, on every access path. Ordering,
   `group`, `distinct` and index key order still place NaN in one definite
   position, and a join on a NaN key still matches.
 
-- **Float `sum` and `avg` are accumulated with compensation.** The same rows
+- **BREAKING (silent):** **Float `sum` and `avg` are accumulated with compensation.** The same rows
   summed through a sequential scan and through an index gave two different
   numbers on a column that mixes very large and very small values, and neither
   was the exactly rounded total. Every float accumulator in the engine now
@@ -151,11 +250,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every access path. **Reported float aggregate results may move**, always
   towards the exact answer. Integer sums are unchanged.
 
-- **An `int` column refuses a float that is not exactly that integer.** `30.7`
+- **BREAKING (now refused):** **An `int` column refuses a float that is not exactly that integer.** `30.7`
   was stored as `30`, `-0.5` as `0` and `1e300` as `i64::MAX`, on insert and
   update alike.
 
-- **An ordered comparison on a `bytes` column no longer uses the index.** The
+- **BREAKING (silent):** **An ordered comparison on a `bytes` column no longer uses the index.** The
   B+tree orders bytes keys by length before content, so an index-backed
   `.y >= "\\x0102"` silently dropped every stored value of a different length,
   including the row holding `\xff`. `<`, `<=`, `>` and `>=` on a bytes column
@@ -164,10 +263,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over an indexed bytes column now plans a filtered scan and costs what a scan
   costs.
 
-- **`length()` counts characters, not bytes.** `length("café")` was `5`, and
+- **BREAKING (silent):** **`length()` counts characters, not bytes.** `length("café")` was `5`, and
   disagreed with `substring`, which has always been character-indexed.
 
-- **An unknown backslash escape in a string is a parse error**, in PowQL and in
+- **BREAKING (now refused):** **An unknown backslash escape in a string is a parse error**, in PowQL and in
   the SQL frontend alike, in string literals and in quoted identifiers. The
   lexer used to drop the backslash and keep the rest, so `"a\Ab"` was stored as
   `aAb` and a quoted SQL identifier `"i\d"` silently resolved to `id`. The
@@ -175,45 +274,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consequence: a `bytes` literal must be written with the doubled-backslash
   form (`"\\x0a"`), which was always the only form that worked.
 
-- **A cast literal against a mistyped column is an error** where it was silently
+- **BREAKING (now refused):** **A cast literal against a mistyped column is an error** where it was silently
   false. `.u = bytes("...")` on a column that is not `bytes` used to match no
   row and say nothing.
 
-- **`having` and `like` refuse a mistyped operand.** `.n like "abc"` on an int
+- **BREAKING (now refused):** **`having` and `like` refuse a mistyped operand.** `.n like "abc"` on an int
   column, `.s like 5`, and `having count(.id) = "x"` used to return no rows;
   they now raise the same typed error `filter` raises.
 
-- **A pipeline clause that carries a value may be written once.**
+- **BREAKING (now refused):** **A pipeline clause that carries a value may be written once.**
   `User filter .a = 1 filter .b = 2` used to keep only the second predicate and
   answer as if the first had never been written; the same held for `order`,
   `limit`, `offset`, `group` and the projection block. Writing one twice is now
   a parse error. Repeated `having` still chains with `and`.
 
-- **A supplied parameter the query never references is an error.** Binding three
+- **BREAKING (now refused):** **A supplied parameter the query never references is an error.** Binding three
   parameters to a query that mentions `$1` and `$2` used to run with the third
   silently ignored, which hides a caller's off-by-one instead of reporting it.
 
-- **`not` over a missing value is the plain complement.** `not (.x = 1)` on a
+- **BREAKING (silent):** **`not` over a missing value is the plain complement.** `not (.x = 1)` on a
   row where `.x` is missing was itself missing, so the row was dropped. PowQL's
   filter logic is two-valued everywhere else, and now here too: the row is kept.
 
-- **A projection column is named after what it computes.** `D { .j->a, .j->b }`
+- **BREAKING (silent):** **A projection column is named after what it computes.** `D { .j->a, .j->b }`
   came back as two columns both called `?`, and a grouped aggregate written
   without an alias was headed by the planner's internal `__agg_0`. SQL names an
   unaliased aggregate the way SQL does: `count(n)`.
 
-- **A type no row of which could ever be stored is refused at `type` and at
+- **BREAKING (now refused):** **A type no row of which could ever be stored is refused at `type` and at
   `alter ... add column`.** Declaring several hundred columns used to succeed
   and then fail on every insert, including inserts that set no value at all,
   because the empty row already exceeded the page budget. The refusal says how
   many bytes the columns need and how many a row may use.
 
-- **`drop <name>` on a materialized view is refused; use `drop view <name>`.**
+- **BREAKING (now refused):** **`drop <name>` on a materialized view is refused; use `drop view <name>`.**
   It removed the backing table and left the definition behind, so the view
   stayed registered, still went dirty on writes to its source, and reported a
   missing table on every read, across restarts.
 
-- **A damaged data directory refuses to open instead of opening smaller.** A
+- **BREAKING (now refused):** **A damaged data directory refuses to open instead of opening smaller.** A
   heap whose length is not a whole number of pages was rounded down, so
   `truncate -s 100` on a 500-row table gave a table with no rows and no error. A
   catalogued table whose heap is zero bytes was the same defect with a length
@@ -223,7 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vanished; that is now `CatalogCorrupt` naming `catalog.bin`, while a genuinely
   empty directory still reports `NotFound`.
 
-- **WAL damage inside the log refuses the open; only a torn tail is
+- **BREAKING (now refused):** **WAL damage inside the log refuses the open; only a torn tail is
   truncated.** A CRC failure mid-log returned the prefix before it and the log
   was then truncated with nothing logged, which is data loss dressed as
   recovery. Replay now looks for a valid record after the bad one, first where
@@ -235,7 +334,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every un-checkpointed row; a directory whose catalog or heap format is past
   that era now refuses.
 
-- **A malformed `POWDB_*` value refuses startup.** A typo in a deployment's
+- **BREAKING (now refused):** **A malformed `POWDB_*` value refuses startup.** A typo in a deployment's
   environment used to run the server on a default nobody chose. Every setting
   now goes through the same validator as its flag and exits 2 naming the
   variable and the value. `0` is refused for `POWDB_IDLE_TIMEOUT` and
@@ -261,7 +360,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still waits, and a second `begin` and an autocommit write still wait as
   before.
 
-- **Engine error text reaches remote clients verbatim, classified by type.**
+- **BREAKING (API/wire):** **Engine error text reaches remote clients verbatim, classified by type.**
   Egress rendering was a prefix allowlist over the message text, so any
   diagnostic whose wording did not start with one of about 35 recognized
   phrases arrived as the bare string `query execution error`: a mistyped column,
@@ -289,7 +388,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly as it does when the queue is full, and the main loop reads the whole
   frame at the full wire limit as soon as the statement finishes.
 
-- **A served sync pull chunk stays inside the wire envelope every released peer
+- **BREAKING (API/wire):** **A served sync pull chunk stays inside the wire envelope every released peer
   decodes.** Chunking was changed this cycle so a chunk runs on to the commit or
   rollback that closes the transaction the cut would otherwise land inside,
   because a chunk cut inside a transaction is not applyable and wedged the
@@ -306,7 +405,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v0.28 primary sends are now two separate numbers: raising what is sent needs a
   negotiated wire feature.
 
-- **`powdb-cli --exec` fails a script that ends inside an open transaction.** It
+- **BREAKING (now refused):** **`powdb-cli --exec` fails a script that ends inside an open transaction.** It
   exited 0 while every write the script made was discarded. It now exits 1 with
   `transaction still open at end of script; rolled back`. A script that commits
   or rolls back explicitly is unaffected.
@@ -315,7 +414,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replica waiting for the primary to archive has not failed, and printing it
   under `lastSyncError` read as one. A `rebootstrap` still reports its error.
 
-- **A number binds as `int` when it is integral and inside the signed 64-bit
+- **BREAKING (silent):** **A number binds as `int` when it is integral and inside the signed 64-bit
   range**, in `@zvndev/powdb-client` as it already did in the embedded addon.
   The wire client tagged a number `int` only when `Number.isSafeInteger` held.
   Every double in `[2^53, 2^63)` is an exact integer, so the `int` tag is
@@ -330,7 +429,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constrained to `TypedRow`: the bound rejected the `interface` most callers
   declare a row type with, while claiming a check the method never performed.
 
-- **`@zvndev/powdb-sync` raises `DEFAULT_MAX_PULL_UNITS` from 512 to 4096**, and
+- **BREAKING (API/wire):** **`@zvndev/powdb-sync` raises `DEFAULT_MAX_PULL_UNITS` from 512 to 4096**, and
   `LocalApplyRequest` extends the new `NormalizedSyncIdentity` so
   `primaryGeneration` is `bigint`, matching what a replica already passes.
 
@@ -373,7 +472,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A repeated query no longer answers a different question.** The plan cache
+- **BREAKING (silent):** **A repeated query no longer answers a different question.** The plan cache
   collected a query's literals in source order and re-bound them in plan-walk
   order, and the two disagree wherever the planner reorders clauses. The
   everyday case was a projection above a slice: `T { x: .n + 1 } limit 5`
@@ -382,7 +481,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows. A projection whose literal cannot be ordered against a sort key's is no
   longer cached at all.
 
-- **A comparison against a `datetime`, `uuid` or `bytes` column coerces its
+- **BREAKING (silent):** **A comparison against a `datetime`, `uuid` or `bytes` column coerces its
   literal.** `.u = "<the exact uuid>"` was false on every row, `!=` true on
   every row, `update` and `delete` by such a key touched nothing, and the index
   was never probed. The literal is now coerced once, where the plan enters
@@ -390,14 +489,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation's discovery scan all read the same value; a literal that cannot be
   coerced is the typed error `insert` already gives.
 
-- **`union` de-duplicates both branches.** `A union B` kept duplicate rows that
+- **BREAKING (silent):** **`union` de-duplicates both branches.** `A union B` kept duplicate rows that
   came from the left branch.
 
-- **An ordered comparison across two types is false.** `.j->v > 99.5` returned
+- **BREAKING (silent):** **An ordered comparison across two types is false.** `.j->v > 99.5` returned
   the rows whose value was the string `"deep"` and the bool `true`, because the
   fallback ordering ranked the two values by type.
 
-- **`x in (...)` answers what `x = ...` answers.** The list compared with strict
+- **BREAKING (silent):** **`x in (...)` answers what `x = ...` answers.** The list compared with strict
   variant equality while `=` compares numerically, so `.n in (28.0)` and
   `.n = 28.0` disagreed.
 
@@ -550,7 +649,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   log could have grown the heap to. The nightly fuzz artifact of 2026-08-30 is
   checked in as a seed and refuses in 9.5 ms instead of running forever.
 
-- **Backups no longer lose materialized views or the user store.** A full or
+- **BREAKING (operational):** **Backups no longer lose materialized views or the user store.** A full or
   incremental backup enumerated `catalog.bin`, the catalog LSN sidecar, every
   heap and every index, and stopped there. Two durable files live beside them
   and were never copied: `views.bin`, the materialized-view registry, and
@@ -669,7 +768,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the bare `Error`, so `err.code === "aborted"` did not hold for a custom
   reason.
 
-- **`@zvndev/powdb-embedded`: engine failures carry the wire error class.**
+- **BREAKING (API/wire):** **`@zvndev/powdb-embedded`: engine failures carry the wire error class.**
   Every one reached JavaScript as a flat `query_failed` with no class, so an
   embedded caller could not tell a unique-constraint violation from a parse
   error without matching on message text, while a networked caller could read
@@ -683,7 +782,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class is now a subclass owning classifying statics, with `Symbol.hasInstance`
   kept pointing at the native class so `instanceof` is unchanged.
 
-- **`@zvndev/powdb-embedded`: rejected arguments say what is wrong.**
+- **BREAKING (now refused):** **`@zvndev/powdb-embedded`: rejected arguments say what is wrong.**
   `Database.open("")` and `Database.open` on a regular file surfaced the raw OS
   error; `openWithMemoryLimit(dir, NaN)` opened with a silently coerced
   zero-byte budget; an `undefined` parameter bound a PowQL `null`. All are
@@ -835,7 +934,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at most once a second instead of on every handshake, so a legitimate `CONNECT`
   no longer pays an O(n) scan of a table an attacker inflated.
 
-- **A shared-password deployment counts auth failures against the peer, not the
+- **BREAKING (operational):** **A shared-password deployment counts auth failures against the peer, not the
   username.** A server with no user store never reads the username while
   authenticating, so counting failures against it let one address make 50
   password guesses a minute instead of 5. It also made an unauthenticated peer
@@ -856,7 +955,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published path only ever names an already-restricted socket and is never
   briefly absent either.
 
-- **A data directory the owner cannot open is refused rather than widened.** A
+- **BREAKING (now refused):** **A data directory the owner cannot open is refused rather than widened.** A
   0555, 0500 or 0000 data directory was silently `chmod`ded to 0700 and written
   into. The change is now logged with both the old and the new mode, and 0000 is
   refused.
