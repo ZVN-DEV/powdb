@@ -137,8 +137,20 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+      # Pinned, and pinned to the same version ci.yml's corpus-replay job uses.
+      # The commit that pinned "the third-party tools the gates run on" pinned
+      # gitleaks, cargo-semver-checks, cargo-audit and ci.yml's cargo-fuzz, and
+      # left this one floating: the nightly campaign's compiler was pinned to
+      # the day while its harness was whatever crates.io served that morning.
+      # That is the property the sibling job's own comment argues against, and
+      # scripts/ci/check-tool-pins.sh now fails a workflow that reintroduces it.
+      # The `command -v` guard matches the sibling: a restored ~/.cargo/bin
+      # without cargo's install-tracking metadata makes an unconditional
+      # install hard-fail with "already exists in destination".
+      - name: Install cargo-fuzz (pinned)
+        env:
+          CARGO_FUZZ_VERSION: 0.13.2
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
 
       # `cargo fuzz` has no --locked flag (cargo-fuzz 0.13 rejects the argument
       # outright), so the checked-in lock only means something if a separate

@@ -403,6 +403,14 @@ jobs:
       - name: Every dependency manifest is watched by dependabot
         run: bash scripts/ci/check-dependabot-coverage.sh
 
+      # "We pinned the tools" was a claim in a commit message rather than a
+      # check, and fuzz.yml's cargo-fuzz stayed unpinned through the commit
+      # that said otherwise. This is the check.
+      - name: Prove the tool-pin check can fail
+        run: bash scripts/ci/check-tool-pins.sh --selftest
+      - name: Every cargo install in a workflow is pinned
+        run: bash scripts/ci/check-tool-pins.sh
+
   ts-client:
     name: TypeScript client (build + tests)
     runs-on: ubuntu-24.04
