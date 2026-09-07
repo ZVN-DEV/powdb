@@ -680,6 +680,17 @@ impl AggCall {
             AggArg::Field(f) => format!("{}({f})", self.func),
         }
     }
+
+    /// The SQL spelling of this call, which is the column name SQL gives an
+    /// aggregate that was written without `AS`. PowQL's own name for it is the
+    /// internal `__agg_N`, so without this the header of
+    /// `SELECT s, count(n) FROM t GROUP BY s` read `__agg_0`.
+    fn sql_spelling(&self) -> String {
+        match &self.arg {
+            AggArg::Star => format!("{}(*)", self.func),
+            AggArg::Field(f) => format!("{}({})", self.func, f.strip_prefix('.').unwrap_or(f)),
+        }
+    }
 }
 
 /// Lower a single ungrouped aggregate over `inner` (an already-lowered PowQL
@@ -999,6 +1010,10 @@ impl SqlParser {
             let text = if self.eat_kw("as") {
                 let alias = self.expect_ident("projection alias")?;
                 format!("{alias}: {expr}")
+            } else if let Some(call) = &agg {
+                // A backtick alias, because the SQL name of an unaliased
+                // aggregate (`count(n)`) is not a PowQL identifier.
+                format!("`{}`: {expr}", call.sql_spelling())
             } else {
                 expr
             };
@@ -1260,8 +1275,14 @@ impl SqlParser {
                 // follow the type, so reaching them here can only be the table
                 // form. A column genuinely named `unique` has to be quoted, and
                 // a quoted identifier never matches `is_kw`.
-                if self.is_kw("primary")
-                    || self.is_kw("foreign")
+                if self.is_kw("primary") {
+                    return Err(ParseError::Unsupported {
+                        feature: "PRIMARY KEY is supported only on the column it keys; \
+                                  write it after the column's type, as `id int PRIMARY KEY`"
+                            .into(),
+                    });
+                }
+                if self.is_kw("foreign")
                     || self.is_kw("constraint")
                     || self.is_kw("unique")
                     || self.is_kw("check")
@@ -1279,6 +1300,14 @@ impl SqlParser {
                         self.expect_kw("null")?;
                         required = true;
                     } else if self.eat_kw("unique") {
+                        unique = true;
+                    } else if self.eat_kw("primary") {
+                        // A single-column PRIMARY KEY is exactly PowDB's
+                        // `required unique`. It is the first line of nearly
+                        // every CREATE TABLE an ORM emits, and it used to be
+                        // refused with a message about table constraints.
+                        self.expect_kw("key")?;
+                        required = true;
                         unique = true;
                     } else if self.eat_kw("autoincrement") || self.eat_kw("auto_increment") {
                         auto = true;
@@ -1479,6 +1508,9 @@ impl SqlParser {
             "datetime" | "timestamp" => "datetime",
             "uuid" => "uuid",
             "blob" | "bytes" | "bytea" => "bytes",
+            // PowDB stores JSON natively (PJ1), and `jsonb` is the spelling
+            // Postgres-shaped DDL uses for the same thing.
+            "json" | "jsonb" => "json",
             other => {
                 return Err(ParseError::Unsupported {
                     feature: format!("unsupported SQL type `{other}`"),

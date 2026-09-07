@@ -2055,10 +2055,9 @@ impl Engine {
                     let proj_columns: Vec<String> = fields
                         .iter()
                         .map(|f| {
-                            f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                Expr::Field(name) => name.clone(),
-                                _ => "?".into(),
-                            })
+                            f.alias
+                                .clone()
+                                .unwrap_or_else(|| projection_output_name(&f.expr))
                         })
                         .collect();
 
@@ -2207,13 +2206,9 @@ impl Engine {
                         let proj_columns: Vec<String> = fields
                             .iter()
                             .map(|f| {
-                                f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                    Expr::Field(name) => name.clone(),
-                                    Expr::QualifiedField { qualifier, field } => {
-                                        format!("{qualifier}.{field}")
-                                    }
-                                    _ => "?".into(),
-                                })
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
                             })
                             .collect();
                         let mut cancel = crate::cancel::CancelCheck::new();

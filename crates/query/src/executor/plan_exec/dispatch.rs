@@ -275,10 +275,9 @@ impl Engine {
                     let proj_columns: Vec<String> = fields
                         .iter()
                         .map(|f| {
-                            f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                Expr::Field(name) => name.clone(),
-                                _ => "?".into(),
-                            })
+                            f.alias
+                                .clone()
+                                .unwrap_or_else(|| projection_output_name(&f.expr))
                         })
                         .collect();
 
@@ -449,16 +448,12 @@ impl Engine {
                         let proj_columns: Vec<String> = fields
                             .iter()
                             .map(|f| {
-                                f.alias.clone().unwrap_or_else(|| match &f.expr {
-                                    Expr::Field(name) => name.clone(),
-                                    // Mission E1.2: `{ u.name }` projects as the
-                                    // qualified column name so callers can still
-                                    // disambiguate across the join output.
-                                    Expr::QualifiedField { qualifier, field } => {
-                                        format!("{qualifier}.{field}")
-                                    }
-                                    _ => "?".into(),
-                                })
+                                // Mission E1.2: `{ u.name }` projects as the
+                                // qualified column name so callers can still
+                                // disambiguate across the join output.
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
                             })
                             .collect();
                         let mut cancel = CancelCheck::new();
@@ -3553,7 +3548,7 @@ impl Engine {
                 NestedProjectField::Plain(f) => f
                     .alias
                     .clone()
-                    .unwrap_or_else(|| expression_output_name(&f.expr)),
+                    .unwrap_or_else(|| projection_output_name(&f.expr)),
                 NestedProjectField::Nested(nested) => nested.name.clone(),
                 NestedProjectField::Link(link) => link.name.clone(),
             })

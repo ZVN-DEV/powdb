@@ -1503,6 +1503,15 @@ fn extract_aggregates(
     let mut aggs: Vec<GroupAgg> = Vec::new();
     let mut counter = 0usize;
     for f in proj_fields.iter_mut() {
+        // `__agg_N` is the internal name HAVING resolves against, and the
+        // rewrite below puts it where the aggregate call used to be. An
+        // unaliased field then took that synthetic name as its result column,
+        // so `T group .s { .s, count(.n) }` came back with a column called
+        // `__agg_0`. Naming the field after what it computes, before the call
+        // is rewritten away, is what an explicit alias would have done.
+        if f.alias.is_none() && contains_aggregate(&f.expr) {
+            f.alias = Some(projection_output_name(&f.expr));
+        }
         rewrite_agg_expr(&mut f.expr, &mut aggs, &mut counter, source_aliases)?;
     }
     if let Some(h) = having {
@@ -1581,6 +1590,32 @@ fn rewrite_group_key_expr(expr: &mut Expr, keys: &[GroupKey]) {
             }
         }
         _ => {}
+    }
+}
+
+/// Whether `expr` calls an aggregate anywhere inside it, so an unaliased
+/// projection field can be named before the call is rewritten away.
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall(..) => true,
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expr::UnaryOp(_, inner) | Expr::Cast(inner, _) | Expr::JsonPath { base: inner, .. } => {
+            contains_aggregate(inner)
+        }
+        Expr::ScalarFunc(_, args) => args.iter().any(contains_aggregate),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
+        Expr::Case { whens, else_expr } => {
+            whens
+                .iter()
+                .any(|(when, then)| contains_aggregate(when) || contains_aggregate(then))
+                || else_expr.as_deref().is_some_and(contains_aggregate)
+        }
+        _ => false,
     }
 }
 
