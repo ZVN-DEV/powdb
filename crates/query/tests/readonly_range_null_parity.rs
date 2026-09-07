@@ -96,7 +96,9 @@ fn readonly_range_over_nullable_column_excludes_nulls_when_indexed() {
     let mut engine = engine_with_nulls("indexed", true);
     for (query, expected) in UPPER_BOUND_CASES {
         let rw = engine.execute_powql(query).expect("read-write query");
-        let ro = engine.execute_powql_readonly(query).expect("read-only query");
+        let ro = engine
+            .execute_powql_readonly(query)
+            .expect("read-only query");
         assert_eq!(
             ids(&rw),
             expected.to_vec(),
