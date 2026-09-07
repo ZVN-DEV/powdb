@@ -2136,6 +2136,18 @@ impl Engine {
             },
 
             PlanNode::DropTable { name, if_exists } => {
+                // A materialized view is a registry entry plus a backing table
+                // that happens to share its name. `drop` reaches only the
+                // table, so it left the definition behind in `views.bin`: the
+                // view stayed registered, stayed listed, was still marked dirty
+                // by writes to its source, and every read of it reported a
+                // missing table, across restarts. One DDL drops a view whole,
+                // and this refusal is what points at it.
+                if self.view_registry.is_view(name) {
+                    return Err(QueryError::Execution(format!(
+                        "'{name}' is a materialized view; use 'drop view {name}'"
+                    )));
+                }
                 if *if_exists && self.catalog.schema(name).is_none() {
                     return Ok(QueryResult::Executed {
                         message: format!("type '{name}' does not exist (skipped)"),
