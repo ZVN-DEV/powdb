@@ -163,13 +163,13 @@ fn zero_literal() {
 
 #[test]
 fn negative_float_keeps_its_sign_in_the_literal() {
-    let q = query("User filter .score > -3.14");
+    let q = query("User filter .score > -3.75");
     assert_eq!(
         q.filter,
         Some(cmp(
             field("score"),
             BinOp::Gt,
-            Expr::Literal(Literal::Float(-3.14))
+            Expr::Literal(Literal::Float(-3.75))
         ))
     );
 }
