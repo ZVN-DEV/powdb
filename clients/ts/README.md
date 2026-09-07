@@ -93,8 +93,8 @@ await client.query("insert User { name := $1, email := $2, age := $3 }", [
 
 const r = await client.query("User filter .email = $1 { .name }", [email]);
 
-// null binds PowQL null; numbers bind as int when integral, float otherwise;
-// bigint always binds as int.
+// null binds PowQL null; a number binds as int when it is integral and inside
+// the signed 64-bit range, float otherwise; bigint always binds as int.
 await client.query("insert User { name := $1, age := $2 }", ["Dana", null]);
 ```
 

@@ -309,13 +309,30 @@ const WIRE_INT_MIN = -(2n ** 63n);
 const WIRE_INT_MAX = 2n ** 63n - 1n;
 
 /**
+ * The same bounds as doubles. `-(2 ** 63)` is exactly `i64::MIN`, so the lower
+ * bound is inclusive; `2 ** 63` is one past `i64::MAX` and no double in
+ * between is representable, so the upper bound is exclusive.
+ */
+const WIRE_INT_MIN_DOUBLE = -(2 ** 63);
+const WIRE_INT_MAX_EXCLUSIVE_DOUBLE = 2 ** 63;
+
+/**
  * Convert one caller-supplied parameter to its wire form.
  *
  * Every rejection here happens before the frame is built, so a bad parameter
- * can never leave a half-written request or a pending slot behind. Integral
- * doubles above `Number.MAX_SAFE_INTEGER` are bound as floats: the double
- * never held an exact integer in the first place, and tagging it `int` would
- * overflow the 64-bit field the tag promises.
+ * can never leave a half-written request or a pending slot behind.
+ *
+ * A number binds `int` when it is integral and inside the signed 64-bit range,
+ * and `float` otherwise. Every integral double is an exact integer, so the
+ * `int` tag holds it losslessly right up to the bound; above it there is no
+ * room in the 64-bit field the tag promises, and `2 ** 63` in particular is
+ * one past `i64::MAX`. The bound is what decides the plan as much as the
+ * value: an int literal probes a B+tree on an `int` column where a float
+ * literal falls back to a filtered sequential scan, and Snowflake-shaped ids
+ * sit above `2 ** 53`. This rule is the twin of `js_param_to_value` in
+ * `bindings/node/src/lib.rs`, so the same JS number reaches the engine with
+ * the same tag over the wire and in process; `test/protocol.test.ts` fails if
+ * the two drift apart.
  */
 function toWireParam(p: QueryParam, index: number): WireParam {
   if (p === null) return { tag: "null" };
@@ -339,7 +356,7 @@ function toWireParam(p: QueryParam, index: number): WireParam {
           "invalid_argument",
         );
       }
-      return Number.isSafeInteger(p)
+      return Number.isInteger(p) && p >= WIRE_INT_MIN_DOUBLE && p < WIRE_INT_MAX_EXCLUSIVE_DOUBLE
         ? { tag: "int", value: BigInt(p) }
         : { tag: "float", value: p };
     default:

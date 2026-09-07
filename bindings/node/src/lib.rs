@@ -472,8 +472,11 @@ fn js_param_to_value(param: &Unknown, index: usize) -> napi::Result<Value, Code>
         ValueType::Number => {
             let n = unsafe { param.cast::<f64>() }.map_err(internal)?;
             // Integral, finite, and inside i64 range binds as an int; anything
-            // else (fractional or out of range) binds as a float, matching the
-            // networked client's number-to-param rule.
+            // else (fractional or out of range) binds as a float. This is the
+            // hand-kept twin of `toWireParam` in `clients/ts/src/index.ts`, so
+            // the same JS number reaches the engine with the same tag in
+            // process and over the wire; the client's `test/protocol.test.ts`
+            // reads the condition below and fails when the two drift apart.
             //
             // The upper bound is strict (`n < i64::MAX as f64`): `i64::MAX as f64`
             // rounds up to 2^63, which is one past i64::MAX and would saturate to

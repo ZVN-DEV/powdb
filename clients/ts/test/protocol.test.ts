@@ -2152,22 +2152,66 @@ async function main() {
     }
   });
 
-  await test("integral doubles outside the safe-integer range bind as float", async () => {
+  await test("integral doubles outside the int64 range bind as float", async () => {
     const { server, received } = queryServer();
     const port = await listen(server);
     const client = await Client.connect({ host: "127.0.0.1", port });
     try {
-      for (const big of [2 ** 63, 1e19, 1e300, Number.MAX_VALUE]) {
+      // 2^63 is one past i64::MAX, so the int tag has no room for it.
+      for (const big of [2 ** 63, -(2 ** 63) - 2048, 1e19, 1e300, Number.MAX_VALUE]) {
         await withTimeout(client.query("Val filter .f = $1 { .id }", [big]), 2000);
       }
       const params = received
         .filter((m) => m.type === "QueryWithParams")
         .map((m) => (m as { params: { tag: string }[] }).params[0]!.tag);
-      assert.deepEqual(params, ["float", "float", "float", "float"]);
+      assert.deepEqual(params, ["float", "float", "float", "float", "float"]);
     } finally {
       await client.close();
       await closeServer(server);
     }
+  });
+
+  await test("an integral double above 2^53 still binds as int", async () => {
+    const { server, received } = queryServer();
+    const port = await listen(server);
+    const client = await Client.connect({ host: "127.0.0.1", port });
+    try {
+      // Every double in this range is an exact integer, so the int tag holds
+      // it losslessly -- and the tag is what decides the plan: an int literal
+      // probes the B+tree on an `int` column, a float literal falls back to a
+      // filtered sequential scan. Snowflake-shaped ids sit right here.
+      const values = [2 ** 53, 2 ** 60, 2 ** 63 - 1024, -(2 ** 63)];
+      for (const value of values) {
+        await withTimeout(client.query("Val filter .id = $1 { .id }", [value]), 2000);
+      }
+      const params = received
+        .filter((m) => m.type === "QueryWithParams")
+        .map((m) => (m as { params: { tag: string; value: bigint }[] }).params[0]!);
+      assert.deepEqual(
+        params,
+        values.map((value) => ({ tag: "int", value: BigInt(value) })),
+      );
+    } finally {
+      await client.close();
+      await closeServer(server);
+    }
+  });
+
+  await test("the number-to-param rule matches the embedded addon's", () => {
+    // The two bindings are hand-kept twins: the same JS number has to reach
+    // the engine with the same tag whether it goes over the wire or through
+    // the in-process addon, or one of them silently loses the index.
+    const lib = readFileSync(
+      fileURLToPath(new URL("../../../bindings/node/src/lib.rs", import.meta.url)),
+      "utf8",
+    );
+    const rule = lib.match(/if (n\.is_finite\(\)[^{]*)\{\s*\n\s*Ok\(Value::Int/);
+    assert.ok(rule, "the addon's number-to-param rule is no longer where this test looks");
+    assert.equal(
+      rule[1]!.replace(/\s+/g, " ").trim(),
+      "n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n < i64::MAX as f64",
+      "bindings/node/src/lib.rs changed its number rule; toWireParam has to move with it",
+    );
   });
 
   await test("safe integers still bind as int", async () => {
