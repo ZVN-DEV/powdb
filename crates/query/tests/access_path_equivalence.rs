@@ -1307,20 +1307,22 @@ fn a_float_column_compared_to_an_int_literal_answers_the_same_on_every_path() {
     }
 }
 
-/// Pinned because it is broken.
+/// A view materialized over zero rows takes its column types from the source.
 ///
-/// `materialize V as <query>` infers the view's column types from the rows the
-/// query returns right now. When it returns none, every column is typed `str`,
-/// and the wrong types are persisted: from then on any comparison against a
-/// non-string literal is a hard type error, permanently, even after the source
-/// table fills up.
+/// `materialize V as <query>` used to infer the view's column types from the
+/// rows the query returned at creation time. When it returned none, every
+/// column was persisted as `str`, so from then on any comparison against a
+/// non-string literal was a hard type error, permanently, even after the
+/// source table filled up. The types now come from the projection's static
+/// types against the base schema, so an empty materialization is typed like a
+/// full one.
 ///
 /// This is the materialized-view arm of the catalog-state axis, so it belongs
 /// with the rest of the access-path evidence. The runner above seeds its view
-/// from a non-empty table and therefore never trips it; that is exactly why it
-/// needs its own test rather than being left to chance.
+/// from a non-empty table and therefore never exercises the empty case; that
+/// is exactly why it needs its own test rather than being left to chance.
 #[test]
-fn a_view_materialized_over_zero_rows_types_every_column_as_str() {
+fn a_view_materialized_over_zero_rows_inherits_the_source_column_types() {
     let mut engine =
         Engine::new(&fresh_dir("emptyview")).expect("engine opens over a fresh temp dir");
     exec(&mut engine, "type S { required unique id: int, n: int }");
@@ -1341,34 +1343,40 @@ fn a_view_materialized_over_zero_rows_types_every_column_as_str() {
         .collect();
     assert_eq!(
         types,
-        vec!["str".to_string(), "str".to_string()],
-        "an empty materialization should inherit the source column types; it currently \
-         types everything as str"
+        vec!["int".to_string(), "int".to_string()],
+        "an empty materialization must inherit the source column types"
     );
 
-    // The consequence: the view can never be filtered on its int column again.
+    // The consequence that used to be impossible: the int column is still an
+    // int column, so a comparison against an int literal answers instead of
+    // failing.
     let filtered = run(&mut engine, "EV filter .n = 1 { .id }");
-    assert!(
-        matches!(&filtered, Outcome::Error(message) if message.contains("type mismatch")),
-        "expected the persisted str typing to make an int comparison a type error, \
-         got {filtered:?}"
+    assert_eq!(
+        filtered,
+        Outcome::Rows {
+            columns: vec!["id".to_string()],
+            rows: Vec::new(),
+        },
+        "an int comparison over an empty view should answer with no rows"
     );
 }
 
 /// The refresh side of the empty-materialization bug above, formerly a
-/// process kill.
+/// process kill and then a permanent error.
 ///
-/// Once a view has been mistyped by that bug, the first refresh with an
-/// actual row to write used to encode an `int` into a column the schema
-/// calls `str` and reach `unreachable!("variable column with non-variable
-/// value")` in the row encoder: an abort under the shipped `panic = "abort"`
-/// release profile, triggered by a plain read of the view after an unrelated
-/// insert. The refresh path now validates the fresh rows against the backing
-/// schema before touching anything, so the same sequence is a typed error on
-/// every read shape, the process stays up, and the message says what to do
-/// (drop and recreate the view).
+/// This exact sequence has failed two different ways. First, the refresh
+/// encoded an `int` into a column the empty materialization had typed `str`
+/// and reached `unreachable!("variable column with non-variable value")` in
+/// the row encoder: an abort under the shipped `panic = "abort"` release
+/// profile, triggered by a plain read of a view after an unrelated insert.
+/// Then the refresh path validated the fresh rows against the backing schema
+/// first, which turned the abort into a typed error, but the view stayed
+/// broken for good and every read of it failed. Now that an empty
+/// materialization is typed from the source schema, the sequence simply
+/// works, on every read shape. Keeping the case pinned means neither older
+/// failure can return unnoticed.
 #[test]
-fn refreshing_a_mistyped_view_is_a_typed_error_not_an_abort() {
+fn a_view_first_materialized_empty_serves_rows_once_the_source_fills() {
     let mut engine =
         Engine::new(&fresh_dir("viewpanic")).expect("engine opens over a fresh temp dir");
     exec(&mut engine, "type S { required unique id: int, n: int }");
@@ -1379,13 +1387,34 @@ fn refreshing_a_mistyped_view_is_a_typed_error_not_an_abort() {
     // (`every_read_shape_refreshes_a_dirty_materialized_view`), so each one
     // runs the refresh and each one must surface the same clean error.
     exec(&mut engine, "insert S { id := 2, n := 5 }");
-    for read in ["EV", "EV { .id }", "count(EV)", "refresh EV"] {
+    for (read, expected) in [
+        (
+            "EV",
+            Outcome::Rows {
+                columns: vec!["id".to_string(), "n".to_string()],
+                rows: vec![vec![Value::Int(2), Value::Int(5)]],
+            },
+        ),
+        (
+            "EV { .id }",
+            Outcome::Rows {
+                columns: vec!["id".to_string()],
+                rows: vec![vec![Value::Int(2)]],
+            },
+        ),
+        ("count(EV)", Outcome::Scalar(Value::Int(1))),
+    ] {
         let outcome = run(&mut engine, read);
-        assert!(
-            matches!(&outcome, Outcome::Error(message) if message.contains("drop and recreate")),
-            "expected a typed refresh error from {read:?}, got {outcome:?}"
+        assert_eq!(
+            outcome, expected,
+            "reading {read:?} after the source filled should serve the new row"
         );
     }
+    let refreshed = run(&mut engine, "refresh EV");
+    assert!(
+        matches!(&refreshed, Outcome::Other(message) if message.contains("refreshed")),
+        "an explicit refresh should succeed, got {refreshed:?}"
+    );
 }
 
 /// Every read shape must see a refreshed materialized view, whatever physical
