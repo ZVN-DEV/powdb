@@ -24,6 +24,7 @@
 //! harness is needed (unlike `crates/server/tests/kill9_durability.rs`, which
 //! needs a real child process because it SIGKILLs the server).
 
+use powdb_storage::catalog::Catalog;
 use powdb_storage::heap::HeapFile;
 use powdb_storage::page::PAGE_SIZE;
 use powdb_storage::row::encode_row;
@@ -310,4 +311,98 @@ fn mmap_point_lookup_with_wild_slot_count_does_not_abort() {
 
     drop(heap);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The message an operator actually reads when the database will not start.
+///
+/// `HeapFile::open` reports `page 1 CRC32 mismatch` and stops there. The
+/// documented remedy is to restore from a backup, and that is a per-table
+/// decision, so a directory with forty tables gave an operator no way to know
+/// which file to restore. The refusal has to name the table and the file, and
+/// it has to stay a typed `PageCorrupt`, because the server classifies the wire
+/// error from the variant rather than the text.
+#[test]
+fn a_corrupt_page_names_the_table_that_will_not_open() {
+    let dir = tmp_path("open_names_table");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    {
+        let mut cat = Catalog::create(&dir).expect("create catalog");
+        let mut schema = one_col_schema();
+        schema.table_name = "Orders".into();
+        cat.create_table(schema).expect("create table");
+        cat.insert("Orders", &vec![Value::Str("important_data".into())])
+            .expect("insert");
+        cat.checkpoint().expect("checkpoint");
+    }
+
+    // Page 0 is the heap superblock, so the single row is on page 1.
+    let heap_path = dir.join("Orders.heap");
+    let mut page = read_page(&heap_path, 1);
+    page[40] ^= 0xFF;
+    write_page(&heap_path, 1, &page);
+
+    let err = match Catalog::open(&dir) {
+        Ok(_) => panic!("a rotted page must refuse the open"),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("Orders"),
+        "the refusal must name the table an operator has to restore, got: {message}"
+    );
+    assert!(
+        message.contains("Orders.heap"),
+        "the refusal must name the file, got: {message}"
+    );
+    assert!(
+        message.contains("backup"),
+        "the refusal must carry the remedy, got: {message}"
+    );
+    assert_eq!(
+        powdb_storage::error::StorageError::kind_of_io_error(&err),
+        Some(powdb_storage::error::StorageErrorKind::PageCorrupt),
+        "naming the table must not cost the typed refusal, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The sibling refusal: a catalog file that will not parse.
+///
+/// `bad catalog magic` and `catalog CRC32 mismatch` said neither which file was
+/// damaged nor what to do, which is the same gap one level up from the heap.
+#[test]
+fn a_corrupt_catalog_file_names_itself_and_the_remedy() {
+    let dir = tmp_path("open_names_catalog");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    {
+        let mut cat = Catalog::create(&dir).expect("create catalog");
+        cat.create_table(one_col_schema()).expect("create table");
+        cat.checkpoint().expect("checkpoint");
+    }
+
+    // Rot a byte in the middle of the payload so the trailing CRC no longer
+    // matches. The magic stays intact, so this is the CRC refusal and not the
+    // "this is not a catalog at all" one.
+    let catalog_path = dir.join("catalog.bin");
+    let mut bytes = std::fs::read(&catalog_path).expect("read catalog");
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&catalog_path, &bytes).expect("write catalog");
+
+    let err = match Catalog::open(&dir) {
+        Ok(_) => panic!("a rotted catalog must refuse the open"),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("catalog.bin"),
+        "the refusal must name the file, got: {message}"
+    );
+    assert!(
+        message.contains("backup"),
+        "the refusal must carry the remedy, got: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
