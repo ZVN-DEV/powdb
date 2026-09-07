@@ -239,3 +239,21 @@ module.exports.SUPPORTED_PLATFORMS = SUPPORTED_PLATFORMS;
 module.exports.platformKey = platformKey;
 module.exports.ERROR_CLASS_BY_CODE = ERROR_CLASS_BY_CODE;
 module.exports.NAPI_COERCION_STATUSES = NAPI_COERCION_STATUSES;
+
+// A CommonJS `require` of this file reads names off the live object above, so
+// it already sees everything the addon exports. An ESM `import { Database }`
+// does not: Node asks cjs-module-lexer, which reads this source statically and
+// cannot see through `module.exports = native`, because that object is built at
+// runtime. It found the four assignments above, which name their property
+// literally, and nothing else, so the README's own first line failed with
+// "Named export 'Database' not found".
+//
+// These assignments are no-ops at runtime: `module.exports` IS `native`, so
+// each one writes a property back onto itself. They exist solely to put the
+// name where a static reader can find it. Do not delete them as dead code.
+//
+// The loop above stays the source of truth and stays drift-proof, classifying
+// whatever the addon exports without naming it. This list only publishes those
+// names, and `__test__/package-entry.test.mjs` fails if the two disagree in
+// either direction.
+module.exports.Database = native.Database;
