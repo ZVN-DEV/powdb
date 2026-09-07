@@ -21,8 +21,8 @@ use super::transaction::{
 };
 use super::wire::{
     is_query_cancellation_response, is_success_response, query_result_to_message,
-    read_message_cancel_safe, ConnectionTermination, DecodedWireMessage, FrameStream,
-    WireResultMode, MAX_WIRE_PAYLOAD_SIZE,
+    read_message_cancel_safe, ConnectionTermination, DecodedWireMessage, FrameReadError,
+    FrameStream, WireResultMode,
 };
 
 /// Maximum query text length accepted from the wire (1 MB).
@@ -1020,6 +1020,12 @@ where
     });
     let mut exceeded_timeout = false;
     let mut termination = None;
+    // Set once a frame arrives that is too large for the read-ahead budget.
+    // The frame is not refused and not lost: its header stays buffered and
+    // the main loop reads the whole thing at the full wire limit as soon as
+    // this statement finishes. Read-ahead simply stops for the rest of the
+    // statement, exactly as it does when the queue is full.
+    let mut read_ahead_over_budget = false;
     let timeout = tokio::time::sleep(query_deadline.saturating_duration_since(Instant::now()));
     tokio::pin!(timeout);
     let join_result = loop {
@@ -1042,8 +1048,8 @@ where
             read = read_message_cancel_safe(
                 stream.reader,
                 stream.buffered,
-                MAX_WIRE_PAYLOAD_SIZE + 6,
-            ), if stream.pending.has_room() => {
+                stream.pending.remaining_bytes(),
+            ), if stream.pending.has_room() && !read_ahead_over_budget => {
                 match read {
                     Ok(Some(DecodedWireMessage { message: Message::Disconnect, .. })) => {
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
@@ -1060,6 +1066,9 @@ where
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);
                         termination = Some(ConnectionTermination::Closed);
                         break handle.await;
+                    }
+                    Err(FrameReadError::OverBudget { .. }) => {
+                        read_ahead_over_budget = true;
                     }
                     Err(_) => {
                         cancel.cancel(powdb_query::cancel::CancelReason::Disconnect);

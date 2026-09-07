@@ -178,6 +178,16 @@ impl InFlightReadAhead {
         self.frames.is_empty()
     }
 
+    /// Bytes of read-ahead budget still available.
+    ///
+    /// This is the bound passed to the frame reader while a statement runs,
+    /// not merely a bound on the queue: `has_room` only decides whether a
+    /// read may START, so without it one frame's declared payload is bounded
+    /// by nothing under the 64 MiB wire limit.
+    pub(super) fn remaining_bytes(&self) -> usize {
+        MAX_IN_FLIGHT_READ_AHEAD_BYTES.saturating_sub(self.wire_bytes)
+    }
+
     pub(super) fn push_back(&mut self, frame: DecodedWireMessage) {
         self.wire_bytes += frame.wire_len;
         self.frames.push_back(frame);
@@ -231,6 +241,13 @@ pub(super) enum FrameReadError {
     Refused { reply: Box<Message>, detail: String },
     /// The socket failed, or the peer went away mid-frame.
     Transport(std::io::Error),
+    /// The next frame declares more than the caller's current budget allows.
+    ///
+    /// Not a client mistake and not a transport failure: the frame is legal,
+    /// it just does not fit what this caller is willing to buffer right now.
+    /// Nothing has been consumed — the header stays in `buffered` — so a
+    /// later read with a larger budget sees the same frame whole.
+    OverBudget { frame_len: usize, budget: usize },
 }
 
 impl FrameReadError {
@@ -246,7 +263,7 @@ impl FrameReadError {
     /// and closes it produces one of these on every probe.
     pub(super) fn is_peer_gone(&self) -> bool {
         match self {
-            FrameReadError::Refused { .. } => false,
+            FrameReadError::Refused { .. } | FrameReadError::OverBudget { .. } => false,
             FrameReadError::Transport(e) => matches!(
                 e.kind(),
                 std::io::ErrorKind::ConnectionReset
@@ -263,6 +280,11 @@ impl std::fmt::Display for FrameReadError {
         match self {
             FrameReadError::Refused { detail, .. } => f.write_str(detail),
             FrameReadError::Transport(e) => write!(f, "{e}"),
+            FrameReadError::OverBudget { frame_len, budget } => write!(
+                f,
+                "wire frame of {frame_len} bytes exceeds the {budget} bytes of \
+                 in-flight read-ahead budget still available"
+            ),
         }
     }
 }
@@ -297,13 +319,11 @@ where
                 )
             })?;
             if frame_len > max_frame_len {
-                return Err(FrameReadError::refused(
-                    format!(
-                        "wire frame exceeds the available in-flight read-ahead budget: \
-                         {frame_len} bytes (available {max_frame_len})"
-                    ),
-                    ErrorClass::LimitExceeded,
-                ));
+                // The header stays buffered: this is "not now", not "never".
+                return Err(FrameReadError::OverBudget {
+                    frame_len,
+                    budget: max_frame_len,
+                });
             }
             if buffered.len() >= frame_len {
                 let frame: Vec<u8> = buffered.drain(..frame_len).collect();
