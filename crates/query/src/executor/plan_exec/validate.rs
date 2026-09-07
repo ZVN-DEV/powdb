@@ -737,6 +737,35 @@ fn like_operand_error(expr: &Expr, ctx: &ColumnScope, role: &str) -> Option<Stri
     }
 }
 
+/// Reject a `length()` whose operand is known to have no length.
+///
+/// `length` measures a `str` in characters and a `bytes` in bytes. Nothing else
+/// has a length, and the evaluator answered `Empty` for everything else, so
+/// `length(.blob)` on a `bytes` column and `length(.n)` on an int column both
+/// came back null on every row with no error to search for. `bytes` now
+/// answers; the rest is refused here, naming the column and its type the way a
+/// mistyped `like` operand already is.
+///
+/// Only operands whose type is fixed before execution are judged, the same rule
+/// `like` follows: a computed expression, a cast, a json path or a bound
+/// parameter is left to run.
+fn length_type_error(args: &[Expr], ctx: &ColumnScope) -> Option<String> {
+    match args.first()? {
+        Expr::Literal(Literal::String(_)) => None,
+        Expr::Literal(literal) => Some(format!(
+            "type mismatch: the 'length' argument must be str or bytes, got {}",
+            literal_type_name(literal)
+        )),
+        argument => match comparable_column(argument, ctx)? {
+            (_, TypeId::Str | TypeId::Bytes) => None,
+            (name, type_id) => Some(format!(
+                "type mismatch for column '{name}': 'length' measures str or bytes, not {}",
+                type_id_to_name(type_id)
+            )),
+        },
+    }
+}
+
 /// The type a grouped aggregate's output column carries, so `having` can be
 /// type-checked against it.
 fn aggregate_output_type(aggregate: &GroupAgg, input: &ColumnScope) -> Option<TypeId> {
@@ -1016,6 +1045,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
             if *func == ScalarFn::DateAdd {
                 if let Some(error) = date_add_overflow_error(args) {
                     return Err(error);
+                }
+            }
+            if *func == ScalarFn::Length {
+                if let Some(message) = length_type_error(args, ctx) {
+                    return Err(QueryError::Execution(message));
                 }
             }
             for arg in args {

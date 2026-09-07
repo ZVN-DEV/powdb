@@ -811,8 +811,18 @@ fn eval_scalar_func(func: ScalarFn, args: &[Value]) -> Value {
         // operations disagree about the same string: `length("Zoe")` with a
         // diaeresis was 4 while `like "___"` matched it and `substring(s, 1, 3)`
         // returned all of it.
+        //
+        // A `bytes` value is measured in bytes, the only unit it has. It used
+        // to fall through to `Empty`, so `length(.blob)` answered null on every
+        // row with no error anywhere: a silent wrong answer for a question with
+        // one obvious right answer. Operands that have no length at all are
+        // refused before execution (`plan_exec::validate::length_type_error`)
+        // whenever their type is fixed by the schema; this arm is what the
+        // remaining un-typable ones (a cast, a bound parameter, a json path)
+        // fall back to.
         ScalarFn::Length => match args.first() {
             Some(Value::Str(s)) => Value::Int(s.chars().count() as i64),
+            Some(Value::Bytes(b)) => Value::Int(b.len() as i64),
             _ => Value::Empty,
         },
         ScalarFn::Trim => match args.first() {
