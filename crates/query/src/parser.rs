@@ -320,6 +320,44 @@ fn closest_keyword<'a>(
         .min_by_key(|kw| edit_distance(&lower, kw))
 }
 
+/// Every function name PowQL knows, for naming the closest one when a call
+/// names a function it does not have.
+const FUNCTION_NAMES: &[&str] = &[
+    "upper",
+    "lower",
+    "length",
+    "trim",
+    "substring",
+    "concat",
+    "abs",
+    "round",
+    "ceil",
+    "floor",
+    "sqrt",
+    "pow",
+    "now",
+    "extract",
+    "date_add",
+    "date_diff",
+    "json_type",
+    "json_text",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "uuid",
+    "bytes",
+];
+
+/// Best function-name match for a call to a function PowQL does not have.
+fn closest_function(word: &str) -> Option<&'static str> {
+    closest_keyword(word, FUNCTION_NAMES.iter())
+}
+
 /// Best keyword match for an identifier that appeared where the parser
 /// expected syntax, drawn from every keyword that can legally appear there.
 fn keyword_suggestion(word: &str) -> Option<&'static str> {
@@ -2159,6 +2197,22 @@ impl Parser {
                         self.expect(&Token::RParen)?;
                         return Ok(Expr::Cast(Box::new(inner), cast_type));
                     }
+                    // Every function PowQL has is a lexer keyword, so a plain
+                    // identifier followed by `(` is a call to one it does not
+                    // have. Reading it as a column and leaving the `(` for the
+                    // next production is what produced three unrelated messages
+                    // for one mistake: `column 'foo' not found` in a
+                    // projection, an unexpected `(` in a filter, and
+                    // `expected ')', got ','` for anything with two arguments.
+                    return Err(ParseError::Syntax {
+                        message: match closest_function(&name) {
+                            Some(known) => {
+                                format!("unknown function '{name}'; did you mean '{known}'?")
+                            }
+                            None => format!("unknown function '{name}'"),
+                        },
+                        position: None,
+                    });
                 }
                 // `alias.field` → QualifiedField. The lexer emits `t1.name` as
                 // `Ident("t1")` + `DotIdent("name")` (see lexer.rs line 30),
