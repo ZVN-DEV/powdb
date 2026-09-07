@@ -990,6 +990,26 @@ refused.** These announce themselves, but they fail work that previously ran:
   check compared a platform key against entries carrying a libc suffix, so its
   membership test could never succeed on any Linux target.
 
+- **A corruption refusal at startup names the table and the remedy.** A rotted
+  page reported only `page 1 CRC32 mismatch`, and the documented remedy is to
+  restore from a backup, which is a per-table decision. With forty tables in a
+  directory that message did not say which file to restore, and the database
+  would not start until one was. It now reads
+  `page corrupt: table 'Orders' (/path/Orders.heap): page 1 CRC32 mismatch: ...;
+  restore this table from a backup`. A catalog file that will not parse names
+  itself and its remedy the same way. The typed error class is preserved, so
+  what reaches the wire is unchanged.
+
+- **A Unix-domain socket path close to the platform limit binds again.** The
+  socket is bound under a private staging name and renamed into place, so it is
+  never briefly world-connectable. That staging name was built by decorating the
+  published one and cost 15 bytes, and `sun_path` is a hard 104 bytes on macOS
+  and 108 on Linux, so any socket path within 15 bytes of the limit stopped
+  binding: on macOS the per-user temp directory is 49 bytes by itself. The
+  staging name no longer grows with the published one, and a bind that still
+  fails on length now names both paths and the difference instead of reporting a
+  system error about a path the operator never wrote.
+
 ### Security
 
 - **The auth rate limiter is bounded in key size and entry count.** A failed
