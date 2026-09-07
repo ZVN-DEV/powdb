@@ -359,11 +359,12 @@ async function main() {
     assert.throws(() => escapeSqlLiteral({} as any), TypeError);
   });
 
-  await test("escapeSqlIdent validates instead of quoting", () => {
-    // PowDB's SQL lexer reads a double-quoted run as a string, so there is no
-    // identifier-quoting syntax to fall back on: invalid names must throw.
-    assert.equal(escapeSqlIdent("User"), "User");
-    assert.equal(escapeSqlIdent("_x1"), "_x1");
+  await test("escapeSqlIdent double-quotes the name it validates", () => {
+    // The SQL frontend lexes a double-quoted run as an identifier (it re-emits
+    // it as a backticked PowQL word), so quoting is what makes a reserved word
+    // usable. Invalid names still throw.
+    assert.equal(escapeSqlIdent("User"), '"User"');
+    assert.equal(escapeSqlIdent("_x1"), '"_x1"');
     assert.throws(() => escapeSqlIdent("users; drop table x"), TypeError);
     assert.throws(() => escapeSqlIdent('u"'), TypeError);
     assert.throws(() => escapeSqlIdent(""), TypeError);
@@ -371,9 +372,33 @@ async function main() {
     assert.throws(() => escapeSqlIdent(7 as any), TypeError);
   });
 
+  await test("escapeSqlIdent makes a reserved word usable as a table name", () => {
+    // Bare `order` is a parse error where a SQL table name is expected, and
+    // IDENT_RE refuses a hand-quoted '"order"', so before quoting there was no
+    // spelling of this table that went through the safe API at all.
+    assert.equal(escapeSqlIdent("order"), '"order"');
+    assert.equal(escapeSqlIdent("select"), '"select"');
+    assert.equal(escapeSqlIdent("group"), '"group"');
+    // Every PowQL keyword reaches the same trap: the quoted name is a Word.
+    for (const word of powqlReservedWords()) {
+      assert.equal(escapeSqlIdent(word), `"${word}"`);
+    }
+  });
+
+  await test("an already-quoted SQL name is refused with a pointed message", () => {
+    assert.throws(() => escapeSqlIdent('"order"'), /pass the bare name/);
+  });
+
   await test("sql template escapes literals and identifiers", () => {
     const q = sql`SELECT * FROM ${sqlIdent("User")} WHERE name = ${"o'neil"} AND age > ${25}`;
-    assert.equal(q, "SELECT * FROM User WHERE name = 'o''neil' AND age > 25");
+    assert.equal(q, `SELECT * FROM "User" WHERE name = 'o''neil' AND age > 25`);
+  });
+
+  await test("sql template names a reserved-word table", () => {
+    assert.equal(
+      sql`SELECT * FROM ${sqlIdent("order")}`,
+      'SELECT * FROM "order"',
+    );
   });
 
   await test("sql template traps a classic injection payload in one literal", () => {

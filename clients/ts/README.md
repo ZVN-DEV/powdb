@@ -64,7 +64,7 @@ escapeIdent("User");        // → "User" (throws on invalid)
 
 **The SQL frontend has no parameter binding.** `querySql`, `querySqlNative`, and `querySqlObjects` take a statement and nothing else: there is no `QuerySqlParams` wire frame, so `$N` placeholders cannot be bound on the SQL path. Prefer PowQL with `$N` parameters for anything built from untrusted input.
 
-When you must build SQL, use the `sql` tagged template rather than concatenation. It escapes for PowDB's own SQL lexer: `'` is doubled and a backslash is escaped (PowDB's SQL lexer honours backslash escapes, unlike standard SQL). Identifiers are validated, not quoted, because the lexer reads a double-quoted run as a string literal.
+When you must build SQL, use the `sql` tagged template rather than concatenation. It escapes for PowDB's own SQL lexer: `'` is doubled and a backslash is escaped (PowDB's SQL lexer honours backslash escapes, unlike standard SQL). Identifiers are validated and then double-quoted, which is what lets a reserved word such as `order` or `group` name a table; quoted identifiers need a server on 0.23.0 or newer.
 
 ```typescript
 import { sql, sqlIdent, escapeSqlLiteral, escapeSqlIdent } from "@zvndev/powdb-client";
@@ -73,10 +73,11 @@ const q = sql`SELECT name FROM ${sqlIdent("User")} WHERE name = ${userName}`;
 await client.querySql(q);
 
 escapeSqlLiteral("o'neil");   // → "'o''neil'"
-escapeSqlIdent("User");       // → "User" (throws on anything else)
+escapeSqlIdent("User");       // → '"User"' (throws on anything else)
+escapeSqlIdent("order");      // → '"order"' — a reserved word, usable once quoted
 ```
 
-Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and it cannot make an identifier or keyword safe. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
+Escaping is a weaker guarantee than binding: it depends on the value landing in a string or number position, and quoting a name makes it an identifier, never a keyword — so a column *type* in `CREATE TABLE` must not go through `sqlIdent`. Track the missing `QuerySqlParams` frame if you need real binding on the SQL path.
 
 ### Parameter binding (`$N`)
 
@@ -747,10 +748,10 @@ Getters: `size`, `idle`, `closed`.
 - `ident(name)` — wrap a string so `powql` treats it as an identifier
 - `escapeLiteral(value)` — render a JS value as a PowQL literal
 - `escapeIdent(name)` — validate an identifier (throws `TypeError` on invalid)
-- `sql`: tagged template for the SQL frontend; escapes literals, validates identifiers
+- `sql`: tagged template for the SQL frontend; escapes literals, quotes identifiers
 - `sqlIdent(name)`: wrap a string so `sql` treats it as a SQL identifier
 - `escapeSqlLiteral(value)`: render a JS value as a PowDB SQL literal
-- `escapeSqlIdent(name)`: validate a SQL identifier (throws `TypeError` on invalid)
+- `escapeSqlIdent(name)`: validate a SQL identifier and return it double-quoted (throws `TypeError` on invalid)
 - `splitStatements(script)` — the statement-aware script splitter used by `execScript`
 
 ## Limits

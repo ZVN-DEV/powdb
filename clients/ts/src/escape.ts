@@ -256,12 +256,21 @@ export function escapeSqlLiteral(
 }
 
 /**
- * Validate a SQL identifier (table, column, alias). Returns it unchanged on
- * success and throws `TypeError` otherwise.
+ * Render a SQL identifier (table, column, alias). The validated name comes back
+ * double-quoted — `escapeSqlIdent("order")` gives `"order"` — and `TypeError`
+ * is thrown on any invalid input. Pass the bare name: a value that already
+ * carries quotes is rejected rather than quoted twice.
  *
- * Identifiers are validated rather than quoted because PowDB's SQL lexer reads
- * `"..."` as a string literal, so there is no identifier-quoting syntax to fall
- * back on. Only `^[A-Za-z_][A-Za-z0-9_]*$` is accepted.
+ * The quoting is unconditional. PowDB's SQL lexer reads `"..."` as an
+ * identifier and re-emits it as a backtick-quoted PowQL word, which bypasses
+ * every keyword check downstream, so quoting is the only spelling that lets a
+ * reserved word like `order` or `group` name a table. It does no case folding,
+ * so quoting a name that needed no quoting changes nothing. Doing it always
+ * means there is no second keyword list to keep in step with the engine.
+ *
+ * Quoted identifiers need a server on 0.23.0 or newer. This is for names, not
+ * types: a column type in `CREATE TABLE` is a keyword, not an identifier, and
+ * must not be passed through here.
  */
 export function escapeSqlIdent(name: string): string {
   if (typeof name !== "string") {
@@ -271,11 +280,14 @@ export function escapeSqlIdent(name: string): string {
     throw new TypeError("escapeSqlIdent: identifier must not be empty");
   }
   if (!IDENT_RE.test(name)) {
+    const hint = name.includes('"')
+      ? " (pass the bare name; escapeSqlIdent adds the quotes a reserved word needs)"
+      : "";
     throw new TypeError(
-      `escapeSqlIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)`
+      `escapeSqlIdent: invalid identifier ${JSON.stringify(name)} (must match /^[A-Za-z_][A-Za-z0-9_]*$/)${hint}`
     );
   }
-  return name;
+  return `"${name}"`;
 }
 
 /** Wrapper marking a string as a SQL identifier for the `sql` tagged template. */

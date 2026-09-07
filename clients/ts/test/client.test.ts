@@ -973,6 +973,31 @@ async function main() {
     );
   });
 
+  await test("sqlIdent names a reserved-word table end to end", async () => {
+    // `order` is a PowQL keyword, so the bare name is a parse error wherever a
+    // SQL table name is expected. Quoting is the only spelling that reaches the
+    // engine, and it has to survive create/insert/select alike.
+    const { sql } = await import("../src/escape.js");
+    const reserved = "order";
+    await client.querySql(
+      sql`CREATE TABLE ${sqlIdent(reserved)} (${sqlIdent("id")} INT)`,
+    );
+    try {
+      await client.querySql(
+        sql`INSERT INTO ${sqlIdent(reserved)} (${sqlIdent("id")}) VALUES (${7})`,
+      );
+      const rows = await client.querySqlObjects<{ id: number }>(
+        sql`SELECT ${sqlIdent("id")} FROM ${sqlIdent(reserved)}`,
+      );
+      assert.deepStrictEqual(
+        rows.map((r) => Number(r.id)),
+        [7],
+      );
+    } finally {
+      await client.query(`drop \`${reserved}\``);
+    }
+  });
+
   await client.query(`drop ${typedT}`);
 
   // ──────────────────────────────────────────────────────────
