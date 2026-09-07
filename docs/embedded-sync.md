@@ -117,6 +117,25 @@ re-wedges on the next transaction of that size after each bootstrap. The default
 was 512 units and 4 MiB before this release, which made any transaction between
 4 and 16 MiB (about 1,000 rows of 5 KB) a permanent rebootstrap loop.
 
+### The Per-Transaction Replication Ceiling
+
+The 4096-unit cap is a hard product ceiling on transaction size, and an
+integrator sizing their writes has to plan around it. An explicit transaction
+reaches the retained tail as a `begin` marker, one unit per row change, and a
+`commit` marker, so **a transaction of more than about 4094 row changes can
+never be replicated incrementally, on any version.** Rows large enough to spill
+to overflow pages log those chains as extra units and lower the figure further,
+and the 16 MiB byte budget binds first once rows average more than about 4 KB.
+An autocommit statement is its own atomic group with its own, lower, ceiling,
+because its commit markers are appended after all of its row records.
+
+A transaction over the ceiling is not served and not silently truncated: the
+pull answers with `repairAction: "rebootstrap"` and a `lastSyncError` naming the
+transaction. That is a typed answer the replica can act on, but it is not a
+recovery: rebootstrapping moves the replica past the offending transaction and
+leaves it just as unable to replicate the next one of that size. Split large
+writes into transactions below the ceiling instead.
+
 ## When A Primary Archives
 
 Retained segments used to be written only by a checkpoint, and the only
@@ -152,7 +171,10 @@ upgrade required`.
 - automatic sharding,
 - Raft-style consensus,
 - Postgres wire compatibility,
-- full SQL compatibility beyond PowDB's documented SQL subset.
+- full SQL compatibility beyond PowDB's documented SQL subset,
+- transactions above the per-transaction replication ceiling of about 4094 row
+  changes: they are answered with a typed rebootstrap rather than served (see
+  [The Per-Transaction Replication Ceiling](#the-per-transaction-replication-ceiling)).
 
 ## Current Implementation
 
