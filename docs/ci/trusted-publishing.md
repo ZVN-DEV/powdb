@@ -79,7 +79,7 @@ permissions: {}                       # default deny; grant per-job
 jobs:
   publish-npm:
     runs-on: ubuntu-latest
-    environment: npm-publish          # optional; add required reviewers here for a manual gate
+    environment: npm-publish          # required reviewers + main/v* only, see below
     permissions:
       contents: read
       id-token: write                 # the ONLY grant OIDC needs — no NPM secret
@@ -124,10 +124,14 @@ For crates.io, the equivalent auth step is:
 - [ ] Trigger is a pushed `v*` tag (an immutable ref), not `pull_request` (forks can't get your OIDC identity anyway, but don't invite it).
 - [ ] Third-party actions pinned to SHAs.
 - [ ] A tag↔manifest version guard fails the run on mismatch.
-- [ ] Optional: a GitHub **Environment** with required reviewers and/or a tag
-      restriction, so publishing needs a human click and can only run from
-      release tags. Reference the same environment name in the registry's
-      trusted-publisher config to bind the trust tighter.
+- [x] A GitHub **Environment** with required reviewers and a ref restriction,
+      so publishing needs a human click and can only run from `main` or a
+      release tag. PowDB's `npm-publish` environment requires kirbycampbell or
+      zvndev to approve and accepts only `main` and `v*` tags; the npm
+      trusted-publisher configs name that environment. crates.io is the
+      exception: its blank-environment configs match only runs that present
+      no environment claim, so `publish.yml` runs without one and the
+      `v*` tag ruleset (admins only) is what gates it.
 - [ ] `--provenance` on public repos for attestation.
 - [ ] After migrating: **revoke the old tokens** to shrink the attack surface.
 

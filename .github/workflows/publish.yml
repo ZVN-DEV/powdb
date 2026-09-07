@@ -165,8 +165,11 @@ jobs:
     # OIDC token carry an environment the (blank) crates.io configs didn't match,
     # so token minting failed with "No Trusted Publishing config found". The
     # `crates-publish` environment carried no protection rules, so dropping it
-    # costs nothing. To reintroduce protected publishing later, re-add the
-    # environment here AND set the same name on every crate's crates.io config.
+    # cost nothing, and the environment itself was deleted on 2026-09-07. What
+    # gates this path instead is the `v*` tag ruleset (admins only) plus the
+    # tag guard below. To reintroduce protected publishing later, create the
+    # environment again, reference it here AND set the same name on every
+    # crate's crates.io config.
     permissions:
       contents: read
       id-token: write # mint a short-lived crates.io token via OIDC

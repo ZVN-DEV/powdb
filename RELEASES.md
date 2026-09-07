@@ -146,6 +146,19 @@ under a released version number, so the crates cannot go first.
     @zvndev/powdb-sync to npm token-less via OIDC. No manual npm publish for
     either. The addon (@zvndev/powdb-embedded) is the one npm package the tag
     does not publish; it has its own dispatch below.
+[ ] Approve the npm publish. The `npm-publish` environment requires a reviewer
+    (kirbycampbell or zvndev) and accepts deployments only from `main` and
+    `v*` tags, so release.yml pauses at its two npm jobs with "waiting for
+    review" until one of them approves, either on the run's page (Review
+    deployments) or from a terminal:
+
+      gh api -X POST repos/ZVN-DEV/powdb/actions/runs/<run-id>/pending_deployments \
+        --input - <<< '{"environment_ids":[17328437676],"state":"approved","comment":"vX.Y.Z"}'
+
+    publish-node-addon.yml below pauses at the same gate. The tags themselves
+    are covered by a repository ruleset ("release tags: admins only"): only
+    repository admins can create, move, or delete a `v*` tag, so a
+    write-access account cannot start a release or re-point one.
 [ ] Publish the crates, dispatched ON THE TAG, in dependency order (the
     workflow already orders them: storage, auth, query, sync, backup, server,
     powdb, cli):
@@ -215,8 +228,10 @@ Checklist's version bump, lockfiles included;
 `Next release: vX.Y.Z-rc.N (unreleased)` in this file and add the `X.Y.x | :x: (unreleased)` row to SECURITY.md (the
 consistency script derives the series from the `X.Y` prefix, so an rc and
 its final share one row), leave every `--version` pin, banner, and
-`Current release` at the last final, tag `vX.Y.Z-rc.N`, push the tag, then
-run `publish.yml` and `publish-node-addon.yml` on the tag as usual. Promote
+`Current release` at the last final, tag `vX.Y.Z-rc.N`, push the tag,
+approve the `npm-publish` deployment when release.yml pauses for it, then
+run `publish.yml` and `publish-node-addon.yml` on the tag as usual (the addon
+run pauses for the same approval). Promote
 by cutting the final `vX.Y.Z` from the same commit plus the version bump;
 nothing is re-tagged or re-labelled, the final artifacts are rebuilt from
 the final tag. A candidate that turns out bad is simply never
