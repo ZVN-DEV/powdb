@@ -63,8 +63,10 @@ const SQL_RAW_CACHE_SALT: u64 = 0x7261_772d_7371_6c01;
 fn sql_raw_cache_hash(hash: u64) -> u64 {
     hash ^ SQL_RAW_CACHE_SALT
 }
-type WalArchiveHook =
-    Arc<dyn Fn(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()> + Send + Sync>;
+/// Re-exported rather than re-declared: `Catalog::install_auto_wal_archive`
+/// takes this exact type, and a second hand-written copy of it here is a
+/// parity that has to be maintained by hand.
+use powdb_storage::catalog::WalArchiveHook;
 
 /// Maximum number of rows a join may produce before the executor aborts.
 /// Prevents Cartesian-product blowups (e.g. `T cross join T` on 10K rows
@@ -609,7 +611,7 @@ impl Engine {
             }
             None => Catalog::open(data_dir),
         };
-        let catalog = match catalog_result {
+        let mut catalog = match catalog_result {
             Ok(c) => {
                 info!(data_dir = %data_dir.display(), "engine reopened existing database");
                 c
@@ -629,6 +631,13 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        // `Catalog::open_with_wal_archive` borrows its hook for the open and
+        // cannot keep it, so a catalog that had one used to stop checkpointing
+        // altogether rather than truncate records it could not publish. Hand it
+        // one it can keep: the automatic checkpoint archives, then truncates.
+        if let Some(hook) = &wal_archive_hook {
+            catalog.install_auto_wal_archive(Arc::clone(hook));
+        }
         let view_registry = open_view_registry(data_dir)?;
         Ok(Engine {
             catalog,
