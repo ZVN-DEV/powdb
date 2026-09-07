@@ -72,15 +72,35 @@ There is no salvage mode: restore from a backup. See
 [FORMAT.md](FORMAT.md#page-checksums).
 
 **A page that rots after the directory is open** is a separate case, and the open
-scan cannot help with it: that check is point-in-time, and reads run through an
-mmap, so the engine sees whatever a page holds at the moment it touches it.
-Up to and including 0.27.0, a row fetch whose page failed its checksum was
-reported as **no such row**, with a success status: an indexed point lookup on a
-rotted page answered zero rows, indistinguishable from a row that had been
-deleted. That path now fails closed. A checksum refusal reaches the caller as a
-`PageCorrupt` error, and "no row" is reserved for a slot that really is deleted
-or out of range. Neither release repairs the page, and neither one promises to
-*notice* every kind of damage; restore from a backup.
+scan cannot help with it: that check is point-in-time, and nothing re-checks a
+page afterwards. What happens then depends on which read path touches it, and
+the two paths do not agree.
+
+A **point lookup verifies**. It reads the page off disk and checks its checksum,
+so a rotted page is refused. Up to and including 0.27.0 that refusal was
+reported as **no such row** with a success status, indistinguishable from a row
+that had been deleted. That path now fails closed: the refusal reaches the
+caller as a `PageCorrupt` error, and "no row" is reserved for a slot that really
+is deleted or out of range.
+
+A **scan does not verify**. Full-table reads (a filter, a count, an aggregate, a
+plain select) map the heap file and read each page as it lies, which is what
+makes them fast. A page that rotted after the open is served as it is, and its
+rows reach the caller as ordinary rows. The slot arithmetic is hardened, so a
+corrupt page cannot make the process read out of bounds or abort, but its
+*contents* are not checked.
+
+So one rotted page can be refused by an indexed lookup and returned by a scan of
+the same table in the same process. That is a deliberate trade, not an
+oversight. Verifying every page on the scan path was measured at about 352 ns
+per 4 KiB page, which took a full-table filter query over 60,000 rows from
+447 us to 1.17 ms: a 2.6x slowdown of every read of that shape. PowDB does not
+spend that by default.
+
+What follows for an operator: the open-time scan is the checksum guarantee you
+can rely on, and it covers every data page, so restarting a database is what
+re-checks it end to end. Neither release repairs a page, and neither promises to
+*notice* every kind of damage while running. Restore from a backup.
 
 One adjacent behaviour is not part of that story. A heap page whose slot
 directory is corrupt cannot be compacted, and the insert path used to re-offer
