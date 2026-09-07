@@ -11,6 +11,7 @@ pub enum Statement {
     /// `link <Owner>.<name> -> <Target> on <local> = <target>`: declare a
     /// persistent entity link (catalog v7). Lowers to `Catalog::create_link`.
     CreateLink(CreateLinkExpr),
+    DropLink(DropLinkExpr),
     AlterTable(AlterTableExpr),
     DropTable(DropTableExpr),
     CreateView(CreateViewExpr),
@@ -57,6 +58,15 @@ pub struct CreateLinkExpr {
     pub local_key: String,
     /// Column on the target matched against `local_key`.
     pub target_key: String,
+}
+
+/// `drop link <Owner>.<name>`, also spelled
+/// `alter <Owner> drop link <name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropLinkExpr {
+    pub owner: String,
+    pub name: String,
+    pub if_exists: bool,
 }
 
 /// An unresolved link traversal on a projection, e.g. `orders: u.orders

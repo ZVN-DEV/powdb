@@ -1607,6 +1607,9 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
         } => {
             format!("{indent}CreateLink {owner}.{name} -> {target} on {local_key} = {target_key}")
         }
+        PlanNode::DropLink { owner, name, .. } => {
+            format!("{indent}DropLink {owner}.{name}")
+        }
         PlanNode::AlterTable { table, action } => {
             format!("{indent}AlterTable table={table} action={action:?}")
         }

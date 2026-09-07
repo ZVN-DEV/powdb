@@ -200,6 +200,17 @@ pub enum PlanNode {
         local_key: String,
         target_key: String,
     },
+    /// `drop link <Owner>.<name>` (also spelled
+    /// `alter <Owner> drop link <name>`): remove a declared entity link.
+    /// Lowers to `Catalog::drop_link`. The owner's rows and columns are
+    /// untouched; only the relationship metadata goes.
+    DropLink {
+        owner: String,
+        name: String,
+        /// `drop link if exists` — a missing link is a no-op instead of an
+        /// error.
+        if_exists: bool,
+    },
     /// `schema` — list every type (table) in the catalog. Read-only; reads
     /// live catalog state at execution time, so a cached plan is never stale.
     ListTypes,

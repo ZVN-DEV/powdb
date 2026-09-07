@@ -1899,6 +1899,29 @@ impl Engine {
                 })
             }
 
+            PlanNode::DropLink {
+                owner,
+                name,
+                if_exists,
+            } => {
+                if *if_exists && self.catalog.link(owner, name).is_none() {
+                    return Ok(QueryResult::Executed {
+                        message: format!("link '{name}' on '{owner}' does not exist (skipped)"),
+                    });
+                }
+                self.catalog
+                    .drop_link(owner, name)
+                    .map_err(QueryError::from_storage_io)?;
+                // A cached plan may traverse the link that just went, and a
+                // materialized view built over it can no longer be recomputed.
+                if let Ok(mut cache) = self.plan_cache.lock() {
+                    cache.clear();
+                }
+                Ok(QueryResult::Executed {
+                    message: format!("link '{name}' dropped from '{owner}'"),
+                })
+            }
+
             PlanNode::AlterTable { table, action } => match action {
                 AlterAction::AddColumn {
                     name,

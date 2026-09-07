@@ -281,6 +281,7 @@ pub fn is_read_only_statement(stmt: &Statement) -> bool {
         | Statement::DeleteQuery(_)
         | Statement::CreateType(_)
         | Statement::CreateLink(_)
+        | Statement::DropLink(_)
         | Statement::AlterTable(_)
         | Statement::DropTable(_)
         | Statement::CreateView(_)
@@ -368,6 +369,7 @@ fn plan_reads_dirty_view(plan: &PlanNode, views: &ViewRegistry) -> bool {
         | PlanNode::Delete { .. }
         | PlanNode::CreateTable { .. }
         | PlanNode::CreateLink { .. }
+        | PlanNode::DropLink { .. }
         | PlanNode::ListTypes
         | PlanNode::Describe { .. }
         | PlanNode::ListLinks
@@ -2640,6 +2642,7 @@ impl Engine {
             | PlanNode::Upsert { .. }
             | PlanNode::CreateTable { .. }
             | PlanNode::CreateLink { .. }
+            | PlanNode::DropLink { .. }
             | PlanNode::AlterTable { .. }
             | PlanNode::DropTable { .. }
             | PlanNode::CreateView { .. }

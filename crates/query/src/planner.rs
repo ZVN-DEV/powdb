@@ -71,6 +71,11 @@ pub fn plan_statement(stmt: Statement) -> Result<PlanNode, PlanError> {
             local_key: cl.local_key,
             target_key: cl.target_key,
         }),
+        Statement::DropLink(dl) => Ok(PlanNode::DropLink {
+            owner: dl.owner,
+            name: dl.name,
+            if_exists: dl.if_exists,
+        }),
         Statement::AlterTable(at) => Ok(PlanNode::AlterTable {
             table: at.table,
             action: at.action,

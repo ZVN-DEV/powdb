@@ -2559,6 +2559,16 @@ impl Parser {
                         action: AlterAction::DropIndex { target, if_exists },
                     }));
                 }
+                if *self.peek() == Token::Link {
+                    self.advance();
+                    let if_exists = self.parse_optional_if_exists();
+                    let name = self.expect_named_ident("link name")?;
+                    return Ok(Statement::DropLink(DropLinkExpr {
+                        owner: table,
+                        name,
+                        if_exists,
+                    }));
+                }
                 // optional `column` keyword
                 if *self.peek() == Token::Column {
                     self.advance();
@@ -2661,6 +2671,27 @@ impl Parser {
     /// `drop [if exists] <Table>` or `drop view [if exists] <ViewName>`
     fn parse_drop_or_drop_view(&mut self) -> Result<Statement, ParseError> {
         self.expect(&Token::Drop)?;
+        if *self.peek() == Token::Link {
+            self.advance(); // consume `link`
+            let if_exists = self.parse_optional_if_exists();
+            let owner = self.expect_named_ident("link owner type")?;
+            let name = match self.advance() {
+                Token::DotIdent(n) => n,
+                t => {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "`.<name>` after the owner type (drop link <Owner>.<name>)"
+                            .into(),
+                        got: t.display_name(),
+                        position: None,
+                    })
+                }
+            };
+            return Ok(Statement::DropLink(DropLinkExpr {
+                owner,
+                name,
+                if_exists,
+            }));
+        }
         if *self.peek() == Token::View {
             self.advance(); // consume `view`
             let if_exists = self.parse_optional_if_exists();
