@@ -306,10 +306,16 @@ impl CompiledLeaf {
                         .try_into()
                         .unwrap_or_else(|_| unreachable!()),
                 );
-                // `total_cmp` matches Value::Ord: NaN > everything,
-                // -0.0 < +0.0, finite order as expected. Keeps compiled
-                // WHERE identical in semantics to the generic row-decode
-                // path (which calls Value::cmp directly).
+                // IEEE: an unordered operand answers no comparison, and `!=`
+                // against it is true. The generic evaluator applies the same
+                // rule (`eval::eval_binop_mode`), so a NaN cannot answer one
+                // way when the predicate compiles and another when it does not.
+                if val.is_nan() || literal.is_nan() {
+                    return *op == BinOp::Neq;
+                }
+                // `total_cmp` matches Value::Ord: -0.0 < +0.0, finite order as
+                // expected. Keeps compiled WHERE identical in semantics to the
+                // generic row-decode path (which calls Value::cmp directly).
                 let ord = val.total_cmp(literal);
                 match op {
                     BinOp::Eq => ord.is_eq(),
@@ -492,6 +498,12 @@ fn json_node_is_empty(node: Option<&[u8]>) -> bool {
 fn json_compare(node: Option<&[u8]>, op: BinOp, literal: &Value) -> bool {
     if json_node_is_empty(node) {
         return false;
+    }
+    // IEEE, as in `eval::eval_binop_mode`: nothing compares against NaN and
+    // `!=` against it is true. JSON has no NaN of its own, so only the literal
+    // can be one.
+    if matches!(literal, Value::Float(f) if f.is_nan()) {
+        return op == BinOp::Neq;
     }
     match op {
         BinOp::Eq => json_scalar_eq(node, literal),

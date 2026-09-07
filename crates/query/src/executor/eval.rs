@@ -1212,6 +1212,12 @@ fn eval_cast(val: Value, target: CastType) -> Value {
 /// what they already promised (`Empty = Empty` matches there too). Teaching them
 /// cross-type keys means giving the hash side a canonical numeric key, which is
 /// the `Value::Hash` change this deliberately does not make.
+/// Whether `value` is the float that compares equal to nothing.
+#[inline]
+fn is_nan(value: &Value) -> bool {
+    matches!(value, Value::Float(f) if f.is_nan())
+}
+
 fn cross_type_numeric_cmp(
     left: &Value,
     right: &Value,
@@ -1294,6 +1300,24 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
         && (left.is_empty() || right.is_empty())
     {
         return Value::Bool(false);
+    }
+    // IEEE: NaN is unordered, so it is equal to nothing, less than nothing and
+    // greater than nothing, and `!=` against it is true for every row including
+    // the NaN row itself. `Value`'s own equality is `total_cmp`, which has to be
+    // a total order because `Eq`/`Hash` are built on it and `order`, `group`,
+    // `distinct` and the B-tree all need NaN in one definite place. Comparison
+    // and ordering are different questions: only this one follows IEEE, which
+    // is why the rule lives here rather than in `Value`. `Join` mode keeps
+    // identity, so a join on a NaN key still matches, exactly as it does for a
+    // missing key.
+    if mode == CmpMode::Filter
+        && matches!(
+            op,
+            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Lte | BinOp::Gte
+        )
+        && (is_nan(left) || is_nan(right))
+    {
+        return Value::Bool(op == BinOp::Neq);
     }
     // Numeric pairs whose two sides are different `Value` variants compare as
     // numbers, not as variants: see `cross_type_numeric_cmp` for why the six
