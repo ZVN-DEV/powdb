@@ -581,8 +581,15 @@ pub(super) fn eval_expr_mode(
         Expr::UnaryOp(op, inner) => {
             let v = eval_expr_mode(inner, row, columns, mode);
             match op {
+                // Two-valued, as docs/POWQL.md states for every other `not`:
+                // a missing value never matches, so the predicate it stands
+                // for is false and its complement is true. Without this,
+                // `not .b` excluded the rows with no `b` while
+                // `not (.b = true)`, the same predicate one word longer,
+                // included them.
                 UnaryOp::Not => match v {
                     Value::Bool(b) => Value::Bool(!b),
+                    Value::Empty => Value::Bool(true),
                     _ => Value::Empty,
                 },
                 UnaryOp::Exists => Value::Bool(!v.is_empty()),
