@@ -147,6 +147,13 @@ fi
 # Deploy examples pin a published ghcr image tag; every such pin must track the
 # current published release, never the unreleased workspace version.
 example_tags="$(grep -RhoE 'ghcr\.io/zvn-dev/powdb:v[0-9]+\.[0-9]+\.[0-9]+' examples/ | sort -u || true)"
+# A pattern that stops matching is a check that stops checking. Rewriting a
+# compose file to ghcr.io/zvn-dev/powdb@sha256:... (which examples/deploy/README.md
+# itself recommends for production) makes this grep match nothing, the loop below
+# run zero times, and the script print its ALL-PASS line with the image tags
+# never compared. Verified: the digest rewrite exits 0 today.
+[[ -n "$example_tags" ]] \
+  || fail "found no ghcr.io/zvn-dev/powdb:vX.Y.Z pin under examples/; this check has gone vacuous"
 while IFS= read -r ref; do
   [[ -n "$ref" ]] || continue
   ref_version="${ref##*:v}"
@@ -157,6 +164,11 @@ done <<< "$example_tags"
 # The marketing site quotes versioned banners/output; any vX.Y.Z it mentions
 # must be the published release, not the in-progress development version.
 site_versions="$(grep -RhoE 'v[0-9]+\.[0-9]+\.[0-9]+' site/*.html | sort -u || true)"
+# Same floor. Regenerating site/ with "0.28.0" instead of "v0.28.0" drops every
+# match, and the marketing site could then sit a release behind with this job
+# green. Verified: stripping the leading v exits 0 today.
+[[ -n "$site_versions" ]] \
+  || fail "found no vX.Y.Z reference in site/*.html; this check has gone vacuous"
 while IFS= read -r ref; do
   [[ -n "$ref" ]] || continue
   [[ "$ref" == "v$current_release" ]] \
@@ -210,6 +222,13 @@ while IFS= read -r ref; do
 done <<< "$banner_refs"
 
 npm_pins="$(grep -ohE '"@zvndev/powdb-[a-z]+": "[0-9]+\.[0-9]+\.[0-9]+"' docs/STABILITY.md | sort -u || true)"
+# Same floor. The pattern wants an exact pin, so re-writing the documented
+# dependency as "^0.27.0" or moving it out of a JSON snippet drops the only
+# match and the npm pin stops being compared. Verified: adding a caret exits 0
+# today. The pattern covers every @zvndev/powdb-* package, not just the client;
+# docs/STABILITY.md documents one today, so this floor is 1, not 3.
+[[ -n "$npm_pins" ]] \
+  || fail "found no exact \"@zvndev/powdb-*\": \"X.Y.Z\" pin in docs/STABILITY.md; this check has gone vacuous"
 while IFS= read -r pin; do
   [[ -n "$pin" ]] || continue
   pin_version="$(printf '%s\n' "$pin" | sed -n 's/.*: "\([^"]*\)"/\1/p')"
