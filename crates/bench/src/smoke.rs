@@ -95,7 +95,14 @@ fn bench_index_lookup(engine: &mut Engine) {
     let mut hits = 0usize;
     for i in 0..N_LOOKUPS {
         let key = Value::Int((i % N_ROWS) as i64);
-        if table.index_lookup("id", &key).is_some() {
+        // `index_lookup` reports an unreadable or unverifiable page as an
+        // error rather than as a miss. A smoke bench must not quietly count
+        // corruption as "row absent" and then publish a lookup rate.
+        if table
+            .index_lookup("id", &key)
+            .expect("index lookup on the smoke fixture")
+            .is_some()
+        {
             hits += 1;
         }
     }
