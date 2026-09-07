@@ -19,6 +19,17 @@
   ],
   "main": "loader.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./loader.js"
+    },
+    "./loader.js": {
+      "types": "./index.d.ts",
+      "default": "./loader.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "loader.js",
     "index.js",
