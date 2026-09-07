@@ -59,7 +59,7 @@ const ERROR_CLASS_BY_CODE = Object.freeze({
  * generated code before any addon logic runs. They describe the same thing the
  * addon calls `invalid_argument`.
  */
-const NAPI_COERCION_STATUSES = new Set([
+const NAPI_COERCION_STATUSES = Object.freeze([
   "ArrayExpected",
   "BigintExpected",
   "BooleanExpected",
@@ -90,7 +90,7 @@ function loadNative() {
 /** Give `err` this package's `code` and its `errorClass`, in place. */
 function classify(err) {
   if (!(err instanceof Error)) return err;
-  if (typeof err.code === "string" && NAPI_COERCION_STATUSES.has(err.code)) {
+  if (typeof err.code === "string" && NAPI_COERCION_STATUSES.includes(err.code)) {
     err.code = "invalid_argument";
   }
   const errorClass = ERROR_CLASS_BY_CODE[err.code];
@@ -126,7 +126,11 @@ function classifying(fn) {
   };
 }
 
-/** Replace every own function property of `target` with a classifying wrapper. */
+/**
+ * Replace every own function property of `target` with a classifying wrapper.
+ * For prototypes, whose methods napi defines as writable. Statics need
+ * {@link withClassifiedStatics} instead.
+ */
 function wrapFunctions(target) {
   if (target === null || typeof target !== "object") return;
   for (const name of Object.getOwnPropertyNames(target)) {
@@ -142,15 +146,52 @@ function wrapFunctions(target) {
   }
 }
 
+/**
+ * Return a subclass of `cls` whose static factories classify what they throw.
+ *
+ * napi defines `#[napi(factory)]` statics as non-writable and
+ * non-configurable, so they can be replaced neither in place (`defineProperty`
+ * throws) nor through a Proxy (a `get` trap on a read-only, non-configurable
+ * property must return the target's own value, or the proxy throws). A
+ * subclass owns its statics. The wrappers are written from the class's own
+ * property names rather than a list, so a factory added later is covered
+ * without touching this file.
+ */
+function withClassifiedStatics(cls) {
+  class Classified extends cls {}
+  // A host reads this in a stack trace, and `__test__` asserts on it.
+  Object.defineProperty(Classified, "name", { value: cls.name, configurable: true });
+  for (const name of Object.getOwnPropertyNames(cls)) {
+    if (name === "length" || name === "name" || name === "prototype") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(cls, name);
+    if (!descriptor || typeof descriptor.value !== "function") continue;
+    Object.defineProperty(Classified, name, {
+      ...descriptor,
+      writable: true,
+      configurable: true,
+      value: classifying(descriptor.value),
+    });
+  }
+  // The factories hand back instances of the native class, not of this
+  // subclass, so `db instanceof Database` has to keep meaning what it meant.
+  Object.defineProperty(Classified, Symbol.hasInstance, {
+    value: (value) => value instanceof cls,
+    configurable: true,
+  });
+  return Classified;
+}
+
 const native = loadNative();
 for (const name of Object.getOwnPropertyNames(native)) {
   const exported = native[name];
-  if (typeof exported === "function") {
-    wrapFunctions(exported);
-    if (exported.prototype) wrapFunctions(exported.prototype);
-  }
+  // Every export the addon has is a class: instance methods on the prototype,
+  // and the four ways to open a database as static factories.
+  if (typeof exported !== "function" || !exported.prototype) continue;
+  wrapFunctions(exported.prototype);
+  native[name] = withClassifiedStatics(exported);
 }
 
 module.exports = native;
 module.exports.SUPPORTED_PLATFORMS = SUPPORTED_PLATFORMS;
 module.exports.ERROR_CLASS_BY_CODE = ERROR_CLASS_BY_CODE;
+module.exports.NAPI_COERCION_STATUSES = NAPI_COERCION_STATUSES;

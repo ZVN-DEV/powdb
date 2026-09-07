@@ -312,6 +312,61 @@ test("distinct failure conditions get distinct codes", () => {
   }
 });
 
+test("every static factory classifies what it throws, not just the methods", () => {
+  // napi defines `#[napi(factory)]` statics as non-writable, and the loader's
+  // wrapper used to skip exactly those -- so `open`, `openReadOnly` and their
+  // memory-limited siblings, the only four ways to obtain a handle, were the
+  // one surface with no errorClass and no napi-status rewriting, while
+  // dts-header.d.ts promised both on every entry point.
+  const statics = Object.getOwnPropertyNames(Database).filter(
+    (name) => typeof Database[name] === "function" && name !== "constructor",
+  );
+  // A floor, so this cannot pass by finding nothing to check.
+  assert.ok(statics.length >= 4, `expected the addon's factories, found ${statics}`);
+  for (const name of statics) {
+    // Every factory takes the data directory first, so a number is a napi
+    // coercion failure on all of them.
+    const err = thrown(() => Database[name](123));
+    assert.equal(err.code, "invalid_argument", `${name} did not rewrite the napi status`);
+    assert.equal(err.errorClass, 2, `${name} threw without an errorClass`);
+  }
+});
+
+test("an errorClass rides along on every factory failure a caller can hit", () => {
+  const dir = freshDir();
+  try {
+    // invalid_argument is class 2; open_failed is class 0. Both are in the
+    // loader's table, so the .d.ts promise that errorClass is absent "only on
+    // an error whose code the loader does not recognize" has to hold here.
+    assert.equal(thrown(() => Database.open("")).errorClass, 2);
+    assert.equal(thrown(() => Database.openWithMemoryLimit(dir, Number.NaN)).errorClass, 2);
+    assert.equal(thrown(() => Database.openReadOnlyWithMemoryLimit(dir, 1.5)).errorClass, 2);
+    const missing = join(tmpdir(), `powdb-errclass-missing-${process.pid}-${Date.now()}`);
+    const failed = thrown(() => Database.openReadOnly(missing));
+    assert.equal(failed.code, "open_failed");
+    assert.equal(failed.errorClass, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the exported class stays usable as a class after wrapping", () => {
+  // Classification must not cost `instanceof`, the prototype methods, or the
+  // class name a host sees in a stack trace.
+  const dir = freshDir();
+  const db = Database.open(dir);
+  try {
+    assert.ok(db instanceof Database);
+    assert.equal(Database.name, "Database");
+    assert.equal(typeof db.query, "function");
+    // Static identity is stable: two reads are the same function object.
+    assert.equal(Database.open, Database.open);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("dts-header.d.ts declares exactly the codes the addon can throw", () => {
   const header = readFileSync(join(HERE, "..", "dts-header.d.ts"), "utf8");
   const union = header.match(/export type PowDBErrorCode =([\s\S]*?)\n\n/);

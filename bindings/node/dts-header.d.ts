@@ -182,6 +182,10 @@ export type PowDBErrorCode =
  * against an embedded database and a server. It is absent only on an error
  * whose code the loader does not recognize.
  *
+ * Both hold on every entry point, static factories included: an error from
+ * `Database.open` carries the same rewritten `code` and the same `errorClass`
+ * as one from `db.query`.
+ *
  * The addon throws native `Error` instances, not instances of the networked
  * client's `PowDBError` class, so `instanceof` does not cross the two
  * packages. `code` is the portable branch.

@@ -69,3 +69,37 @@ test("the supported-platform list matches the targets the package builds", () =>
   // have loaded the addon at all.
   assert.ok(SUPPORTED_PLATFORMS.includes(`${process.platform}-${process.arch}`));
 });
+
+test("the .d.ts promise about error classification matches what the loader does", () => {
+  // dts-header.d.ts is the contract a TypeScript host reads. It shipped two
+  // claims the loader did not keep for static factories, so the claims are
+  // parsed out of the header here and checked against the loader's own tables
+  // rather than restated in this file.
+  const { ERROR_CLASS_BY_CODE, NAPI_COERCION_STATUSES } = require("../loader.js");
+  const raw = readFileSync(join(HERE, "..", "dts-header.d.ts"), "utf8");
+  // Flatten the doc comment so an assertion matches a sentence rather than a
+  // particular line wrapping.
+  const header = raw.replace(/^\s*\*/gm, " ").replace(/\s+/g, " ");
+
+  const claim = header.match(
+    /Argument coercion in generated binding code raises napi's own status strings \(([^)]*)\)/,
+  );
+  assert.ok(claim, "the napi-status claim is no longer in dts-header.d.ts");
+  const named = [...claim[1].matchAll(/`"([A-Za-z]+)"`/g)].map((m) => m[1]);
+  assert.ok(named.length >= 2, `expected the header to name statuses, got ${named}`);
+  for (const status of named) {
+    assert.ok(
+      NAPI_COERCION_STATUSES.includes(status),
+      `dts-header.d.ts promises ${status} is rewritten, but the loader does not rewrite it`,
+    );
+  }
+
+  // "It is absent only on an error whose code the loader does not recognize"
+  // is only true if recognition means this table, so the header has to keep
+  // saying that and the table has to be reachable from here.
+  assert.match(header, /absent only on an error whose code the loader does not recognize/);
+  assert.ok(Object.keys(ERROR_CLASS_BY_CODE).length > 0);
+
+  // The header promises this of every entry point, factories included.
+  assert.match(header, /static factories included/);
+});
