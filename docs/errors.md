@@ -22,14 +22,14 @@ These numeric values are **stable wire contract**: they are never renumbered or 
 
 | Code | Name | Meaning | Typical causes | TS client `PowDBError.code` |
 |------|------|---------|----------------|------------------------------|
-| 0 | `internal` | Unclassified or internal server error | Lock poisoning, internal task failure, WAL durability sync failure, protocol misuse, server shutdown notice | `query_failed` |
+| 0 | `internal` | Unclassified or internal server error | Lock poisoning, internal task failure, WAL durability sync failure, an unreadable or checksum-failing page (`PageCorrupt`), protocol misuse, server shutdown notice | `query_failed` |
 | 1 | `parse` | The query text failed to lex or parse | Syntax errors, unterminated strings, unsupported constructs, excessive nesting | `query_failed` |
 | 2 | `execution` | Planning or execution failed | Unknown table or column, type mismatch, view/index errors, `cannot begin` while a transaction is active | `query_failed` |
 | 3 | `timeout` | A time budget elapsed | Per-query timeout, transaction-gate wait timeout, idle-connection timeout, **explicit-transaction maximum lifetime** (see below) | `timeout` |
 | 4 | `limit_exceeded` | A memory or size limit was exceeded | Sort/join row caps, per-query memory budget, query text too large, result too large | `size_exceeded` |
 | 5 | `readonly_refused` | The server serves a read-only snapshot and the statement requires a writer | Any mutation (or a read that needs a writer, e.g. a stale materialized view) against `powdb-server --readonly` | `query_failed` |
-| 6 | `auth_failed` | Authentication or database selection failed at CONNECT time | Wrong password, unknown user, unknown database name | `auth_failed` |
-| 7 | `rate_limited` | Too many failed authentication attempts from this address | Repeated bad passwords; wait and retry later | `auth_failed` |
+| 6 | `auth_failed` | Authentication or database selection failed at CONNECT time | Wrong password, unknown user, a database name that does not match the one a pinned server serves | `auth_failed` |
+| 7 | `rate_limited` | Too many failed authentication attempts from this address | Repeated bad passwords. The thresholds and the window are in [SECURITY.md](../SECURITY.md#authentication): 5 failures against one username, or 50 across all usernames, from one peer in 60 seconds. The message names the retry delay (`too many auth failures, retry after 60s`) | `auth_failed` |
 | 8 | `constraint_violation` | A constraint rejected the write | Unique index violation | `query_failed` |
 | 9 | `cancelled` | Execution was cancelled cooperatively | The issuing client disconnected mid-query | `query_failed` |
 | 10 | `protocol_version` | The handshake could not agree on a wire protocol version or a required feature | Client and server protocol version ranges do not overlap; a feature the client requires is absent | `protocol_version` |
@@ -37,6 +37,8 @@ These numeric values are **stable wire contract**: they are never renumbered or 
 Class `10` is the only class that never arrives mid-session: the server sends it during the handshake, in place of `ConnectOk`, and then closes the connection.
 
 The authoritative Rust definition is `ErrorClass` in `crates/server/src/protocol.rs`; the TypeScript mirror is `WIRE_ERROR_CLASS` in `clients/ts/src/errors.ts`.
+
+The embedded Node addon reports the same classification on `err.errorClass`, so a caller branches identically whether it is embedded or networked. `@zvndev/powdb-embedded` exports the code-to-class map as `ERROR_CLASS_BY_CODE`.
 
 ### Not every class-3 error is retryable in place
 
@@ -63,6 +65,8 @@ Errors from servers that predate the class byte keep the historical behavior: `e
 
 ## Message sanitization policy
 
-The class byte is orthogonal to the message *text*. The server only forwards an error message verbatim when it starts with one of a fixed allowlist of safe prefixes (`SAFE_ERROR_PREFIXES` in `crates/server/src/handler/classify.rs`); everything else is replaced with the generic string `query execution error`. This prevents internal details (I/O paths, panic payloads, storage internals) from leaking to clients, while messages derived purely from the client's own query (parse errors, unknown tables, resource-limit guidance) pass through unchanged.
+The class byte is orthogonal to the message *text*. The server decides whether to forward a message verbatim from the **type** of the failure, not from its wording: an exhaustive match over `QueryError` in `crates/server/src/handler/classify.rs`, with no wildcard arm, so a new variant does not compile until someone decides whether its text may cross the wire. Everything the engine phrases from the client's own statement, or from a budget the operator configured, crosses unchanged. Only what can carry internal state is replaced with the generic string `query execution error`: a plain I/O failure, corruption detail (`PageCorrupt`, `CorruptCrc`, `WalReplay`, `CatalogCorrupt`, `OverflowCorrupt`), and the read-only retry sentinel below. A storage refusal that kept its `StorageErrorKind` is decided by the kind; the few that still reach the query layer as a bare `io::Error` string keep a narrowed prefix fallback (`UNTYPED_STORAGE_SAFE_PREFIXES`) until their producers are typed.
+
+Before this, the decision ran on a prefix allowlist over the message text, so any diagnostic whose wording did not start with one of about 35 recognized phrases arrived as `query execution error`. A mistyped column, `commit` outside a transaction, a malformed `uuid` or `bytes` literal, a missing required column, an unknown insert field, a negative limit, an upsert on a non-unique key, a non-scalar path-index key and a refresh of an unknown view were all diagnosable embedded and undiagnosable over the wire. `crates/server/tests/wire_error_text_parity.rs` now holds the two surfaces equal by executing each refusal both ways and comparing the text.
 
 Because the class is derived from the typed error at the point the response is built, never from the message text, a sanitized generic message still carries an accurate class. One internal string is special: `__POWDB_READONLY_NEEDS_WRITE__` is a retry sentinel used inside the server's read-to-write lock escalation and must never cross the wire; a regression test (`crates/server/tests/wire_error_codes.rs`) asserts a read-only server refuses a write with the operator-facing `readonly mode: ...` message and class 5, sentinel-free.

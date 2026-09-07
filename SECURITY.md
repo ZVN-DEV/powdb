@@ -149,7 +149,15 @@ In both modes:
   server must not be able to lock a real user out of their own account. A locked-out client
   is refused with `too many auth failures, retry after 60s` (wire error class 7,
   `rate_limited`) rather than being told whether the credentials were right. A successful
-  authentication clears both counters for that peer.
+  authentication clears both counters for that peer. A server with **no user store**
+  (open, or shared-password) never reads the username while authenticating, so it counts
+  failures per peer alone: 5 per minute from one address, not 50. Unix-socket peers have
+  no address and share one bucket between them.
+- **The limiter itself is bounded.** A failure bucket retains at most 64 bytes of the
+  username the peer sent, and the table holds at most 4096 buckets. At capacity it evicts
+  deterministically (lowest failure count first, then oldest window, then key order), so a
+  spray of throwaway source addresses cannot clear a peer that is close to its bound. The
+  expiry sweep runs at most once a second rather than on every handshake.
 - **Pre-auth payload limits**: the server enforces frame size limits on unauthenticated connections to prevent resource exhaustion.
 - **Connection limits**: the server enforces a maximum number of concurrent connections.
 

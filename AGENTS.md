@@ -19,7 +19,7 @@ The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, 
 - **Embedded / edge / serverless workloads** where query latency is a tight budget and you don't want SQLite's quirks.
 - **Single-node analytics** over tables that fit on disk. The scan path is zero-syscall (mmap) and filters are compiled to byte-level predicates.
 - **You control both sides** (the DB and the app). PowDB has no Postgres wire protocol, no ODBC, no legacy compatibility. The client is a TCP binary protocol or an in-process Engine.
-- **You want to read the code.** Eleven crates, ~155K lines of Rust (~105K of it outside the integration-test files), no generated parsers, no plan-language IR.
+- **You want to read the code.** Eleven crates, ~166K lines of Rust (~99K of it outside the integration-test files), no generated parsers, no plan-language IR.
 
 ### When it's *not* the right choice
 

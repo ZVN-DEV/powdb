@@ -137,9 +137,9 @@ powql> insert User { name := "Grace", email := "grace@example.com" }
 1 row affected
 ```
 
-> **Multi-row insert:** you can also insert many rows in one statement by separating row blocks with commas -- `insert User { ... }, { ... }, { ... }`. One statement means one WAL fsync and one network round trip, and validation is all-or-nothing. See [INSERT in the PowQL reference](POWQL.md#insert).
+> **Multi-row insert:** you can also insert many rows in one statement by separating row blocks with commas -- `insert User { ... }, { ... }, { ... }`. One statement means one network round trip and all-or-nothing validation. It does not mean one fsync: each row is its own WAL record and the log fsyncs every 64 records. See [INSERT in the PowQL reference](POWQL.md#insert).
 
-> **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- they share a single fsync at commit and run dozens of times faster, still fully durable. See [Transactions](POWQL.md#transactions).
+> **Note:** Each autocommit `insert` fsyncs to the write-ahead log for durability, which caps single-row inserts at roughly a few hundred per second on real disks. For bulk loads, wrap many inserts in a `begin` / `commit` transaction -- a statement inside one does not fsync, so the batch costs roughly one fsync per 64 rows instead of one per row, and runs dozens of times faster while staying fully durable. See [Transactions](POWQL.md#transactions).
 
 ---
 

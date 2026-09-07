@@ -181,9 +181,9 @@ Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which iso
 
 ### Write throughput & durability
 
-PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: every mutating statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
+PowDB is durable by default. The embedded `Engine` and `powdb-server` both run in `WalSyncMode::Full`: an autocommit statement appends to the write-ahead log and `fdatasync`s before the call returns, so an acknowledged write has reached stable storage. Reads pay zero fsync cost.
 
-The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD). That is not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the whole batch into a single fsync at `commit`:
+The one thing worth knowing: **a single-row `insert` in autocommit costs one fsync.** That caps single-row autocommit at your disk's fsync rate (a few hundred rows/sec on a typical SSD). That is not an engine limit, just the price of durability per statement. The fix is to **batch writes in a transaction**, which collapses the batch into far fewer of them:
 
 ```
 # ~hundreds of rows/sec: one fsync per row
@@ -191,7 +191,7 @@ insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
 ...
 
-# ~50x faster, still fully durable: one fsync for the whole batch
+# ~50x faster, still fully durable: roughly one fsync per 64 rows
 begin
 insert User { id := 1, name := "a" }
 insert User { id := 2, name := "b" }
@@ -199,14 +199,16 @@ insert User { id := 2, name := "b" }
 commit
 ```
 
-On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync just happens once, at `commit`, instead of per row). Always wrap bulk loads and write bursts in a transaction.
+Be exact about what a transaction costs, because it is not one fsync. A statement inside `begin` / `commit` does not fsync on its own: the durability point is the `commit`. But the WAL flushes and fsyncs whenever its append buffer reaches 64 records, inside a transaction as much as outside one, and a row is one record. So a 5000-row transaction costs roughly 78 fsyncs, not 5000 and not 1. The same applies to a multi-row `insert`: it is one statement, but a batch of 5000 rows is still 5000 WAL records.
+
+On a 2026 laptop SSD this is the difference between ~290 rows/sec (autocommit) and ~15,600 rows/sec (one transaction), a 54x speedup, with identical crash-safety either way (the fsync happens per 64 records and at `commit`, instead of once per row). Always wrap bulk loads and write bursts in a transaction.
 
 The two weaker modes trade that guarantee away, and it is worth being exact about how much:
 
 - **`normal`** (`POWDB_SYNC_MODE=normal`, `WalSyncMode::Normal`) appends to the WAL but does not fsync before acknowledging. A **process** death loses nothing: the records are in the WAL, and replay finds them. Measured: 500 acknowledged inserts, `kill -9`, restart, all 500 present. What it exposes is an **OS crash or power loss**, which can lose whatever the kernel had not flushed. Writes are roughly 15-40x faster.
 - **`off`** (`POWDB_SYNC_MODE=off`, `WalSyncMode::Off`) writes no WAL at all, so there is nothing to replay and the loss window is not bounded by anything: **every row written since the last graceful close is gone** after any unclean exit. Measured on the same setup: 500 acknowledged inserts, `kill -9`, restart, `count` = 0. The table definition survived, the rows did not. The mode exists so the benchmark harness can compare against SQLite `:memory:`. Never point it at data you intend to keep.
 
-Only a graceful shutdown (SIGINT/SIGTERM, or dropping the embedded engine) checkpoints and truncates the WAL. During a run it grows monotonically: 168 KB after 2,000 single-row inserts, back to 8 bytes once SIGTERM has been handled. Size the volume for the write burst between restarts, not for the size of the data.
+The embedded `Engine` checkpoints and truncates the WAL on its own once the durable log passes 64 MiB (`Catalog::set_wal_checkpoint_bytes`, `0` to opt out). `powdb-server` and `powdb-cli` do not: both install a WAL archive hook so retained replication history is never truncated behind a replica's back, and the automatic checkpoint never runs behind such a hook. For those two, only a graceful shutdown (SIGINT/SIGTERM) checkpoints and truncates, and during a run the log grows monotonically: 168 KB after 2,000 single-row inserts, back to 8 bytes once SIGTERM has been handled. Size the volume for the write burst between restarts, not for the size of the data.
 
 ## PowQL
 
@@ -349,6 +351,7 @@ materialized views before snapshotting.
 | `POWDB_READONLY` | *(off)* | When set (`1`/`true`), serve the data directory read-only (snapshot serving); mutations are refused. Same as `--readonly`. See [Read-only snapshot serving](https://github.com/ZVN-DEV/powdb/blob/main/docs/read-only-serving.md) |
 | `POWDB_MAX_CONNECTIONS` | `1024` | Ceiling on concurrent connections. Same as `--max-connections` |
 | `POWDB_SHUTDOWN_TIMEOUT` | `30` | Seconds a graceful shutdown waits for connections to drain before exiting non-zero. Same as `--shutdown-timeout` |
+| `POWDB_WAL_CHECKPOINT_BYTES` | `67108864` | WAL size in bytes at which a finished statement checkpoints and truncates the log; `0` disables it. A plain byte count, no unit suffix. Same as `--wal-checkpoint-bytes`. **Has no effect on `powdb-server` or `powdb-cli` today**: both install a WAL archive hook so retained replication history is never truncated behind a replica, and the automatic checkpoint never runs behind such a hook. It applies to an embedded `Engine` opened without one |
 | `POWDB_PORT_FILE` | *(off)* | Path the server writes the bound listener ports to once it is listening, as `port=<n>` (plus `metrics=<n>` when the metrics endpoint is on). Written atomically before the ready log line, so a reader never sees a partial file. Pair it with `--port 0` to run a server on a free port in tests and scripts. Same as `--port-file` |
 | `NO_COLOR` | *(unset)* | When set, disables ANSI colour in the log. Colour is off automatically when stdout is not a terminal |
 | `RUST_LOG` | `info` | Log level (`debug`, `trace` for per-query timings) |

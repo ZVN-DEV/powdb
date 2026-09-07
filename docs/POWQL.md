@@ -1741,9 +1741,11 @@ insert User
   { name := "Carol", email := "carol@example.com", age := 41 }
 ```
 
-A multi-row insert is **one statement = one WAL fsync** (vs one fsync per
-single-row autocommit statement), so it's the fastest durable way to bulk-load,
-and over a network connection it's **one round trip** instead of N. It's also
+A multi-row insert is **one statement** rather than N, so it is the fastest
+durable way to bulk-load, and over a network connection it is **one round trip**
+instead of N. It is not one fsync: each row is its own WAL record, and the log
+fsyncs every 64 records, so a 5000-row batch costs roughly 78 fsyncs against the
+5000 the same rows cost as separate autocommit statements. It's also
 **all-or-nothing on validation**: if any row is invalid (missing a required
 field, unknown column, bad type), the whole statement fails and *no* rows are
 inserted. The result reports the number of rows inserted. (A mid-write *storage*
@@ -2021,7 +2023,12 @@ server-side reaper, so an embedded transaction lives until the caller ends it.
 
 By default PowDB runs in `WalSyncMode::Full`: every autocommit statement fsyncs the write-ahead log before returning, so each write is durable on its own. That fsync is the bottleneck for single-row writes -- on real disks, autocommit inserts top out around a few hundred rows per second.
 
-Inside a transaction, the fsync is deferred to `commit`. All statements between `begin` and `commit` share one fsync, so wrapping a bulk load in a transaction is dramatically faster while staying fully durable:
+Inside a transaction, a statement does not fsync: the durability point is the
+`commit`. It is not one fsync for the whole transaction, though. The WAL flushes
+and fsyncs whenever its append buffer reaches 64 records, inside a transaction as
+much as outside one, and a written row is one record, so a 5000-row transaction
+costs roughly 78 fsyncs. That is still dramatically faster than 5000, and it is
+fully durable either way:
 
 ```
 begin
