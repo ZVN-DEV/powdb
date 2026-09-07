@@ -1401,9 +1401,10 @@ Post as p filter p.author.name = "ann" { p.title }
 ```
 
 Before this release that reported an unexpected trailing token, which said
-nothing about what was wrong. One spelling still does: the **unqualified**
-`Post filter .author.name = "ann"` gives the older opaque parse error, because
-without an alias there is nothing to recognize as a link path.
+nothing about what was wrong. The unqualified spelling of the same mistake,
+`Post filter .author.name = "ann"`, gives the same explanation, quoting its own
+path. The two spellings lex differently and are parsed in different places, so
+the wording lives in one function both of them call.
 
 ### PowQL Only
 
@@ -1528,8 +1529,24 @@ same unit `substring` indexes in, so the two agree: `substring(.s, 1, length(.s)
 is the whole string for any text. Before this release `length` counted bytes and
 `substring` counted characters, so they disagreed on anything outside ASCII.
 
-`length` of a value that is not a string, a `bytes` column for instance, is
-null. There is no error for it.
+`length` of a `bytes` value is its byte count. A `bytes` value has exactly one
+length and there is no unit to confuse it with, so the two units cannot meet: no
+single value is ever both text and bytes.
+
+Every other type has no length, and asking for one is refused rather than
+answered:
+
+```
+User { n: length(.age) }
+# type mismatch for column 'age': 'length' measures str or bytes, not int
+```
+
+`int`, `float`, `bool`, `datetime`, `uuid` and `json` are all refused this way. A
+`json` document is refused rather than measured because it has no one obvious
+length (the array's? the key count? the serialized text?), and the `->` paths
+already spell each of those. Only operands whose type is fixed before the query
+runs are judged, so a cast, a bound parameter or a json path is still left to
+run. Before this release all of these answered null on every row, with no error.
 
 #### trim
 
