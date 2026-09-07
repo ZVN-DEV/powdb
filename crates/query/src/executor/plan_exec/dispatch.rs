@@ -1872,6 +1872,7 @@ impl Engine {
                     table_name: name.clone(),
                     columns,
                 };
+                refuse_schema_with_no_room_for_a_row(&schema)?;
                 self.catalog
                     .create_table_full(schema, defaults, auto_cols)
                     .map_err(QueryError::from_storage_io)?;
@@ -1904,18 +1905,20 @@ impl Engine {
                     type_name,
                     required,
                 } => {
-                    let position = self
+                    let existing = self
                         .catalog
                         .schema(table)
-                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?
-                        .columns
-                        .len() as u16;
+                        .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
+                    let position = existing.columns.len() as u16;
                     let col = ColumnDef {
                         name: name.clone(),
                         type_id: type_name_to_id(type_name).map_err(QueryError::TypeError)?,
                         required: *required,
                         position,
                     };
+                    let mut widened = existing.clone();
+                    widened.columns.push(col.clone());
+                    refuse_schema_with_no_room_for_a_row(&widened)?;
                     self.catalog
                         .alter_table_add_column(table, col)
                         .map_err(QueryError::from_storage_io)?;
@@ -4065,4 +4068,32 @@ fn push_dep(deps: &mut Vec<String>, table: &str) {
     if !deps.iter().any(|dep| dep == table) {
         deps.push(table.to_string());
     }
+}
+
+/// Refuse a schema no row of which can ever be stored.
+///
+/// A row lives in one page and cannot be split across pages: overflow pages
+/// hold an individual large VALUE, not a row's own header. Once the null
+/// bitmap, the fixed-column region and the variable-offset table exceed the
+/// page's row budget on their own, every `insert` fails, including one that
+/// sets nothing at all, so the type could be declared and could never hold a
+/// row. Measured by encoding the emptiest row the schema allows rather than by
+/// re-deriving the layout arithmetic here, so it stays true if the row format
+/// changes.
+fn refuse_schema_with_no_room_for_a_row(schema: &Schema) -> Result<(), QueryError> {
+    let empty_row = vec![Value::Empty; schema.columns.len()];
+    let size = powdb_storage::row::try_encode_row(schema, &empty_row)
+        .map_err(QueryError::from_storage_io)?
+        .len();
+    if size <= powdb_storage::page::MAX_ROW_DATA_SIZE {
+        return Ok(());
+    }
+    Err(QueryError::Execution(format!(
+        "cannot store any row of '{}': its {} columns need {} bytes even with every value \
+         missing, and a row must fit {} bytes; declare fewer columns",
+        schema.table_name,
+        schema.columns.len(),
+        size,
+        powdb_storage::page::MAX_ROW_DATA_SIZE
+    )))
 }
