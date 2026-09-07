@@ -129,9 +129,14 @@ fn code_for_storage_kind(kind: StorageErrorKind) -> Code {
         StorageErrorKind::TransactionTooLarge
         | StorageErrorKind::RowTooLarge
         | StorageErrorKind::ValueTooLarge => code::SIZE_EXCEEDED,
-        StorageErrorKind::DdlInTransaction | StorageErrorKind::InvalidIdentifier => {
-            code::QUERY_FAILED
-        }
+        // The statement names something the caller spelled wrong, or is not
+        // allowed here, and the message says what to do instead. The server
+        // classifies these three together as class 2 (see
+        // `crates/server/src/handler/classify.rs`), so the two surfaces agree
+        // on what a caller can act on.
+        StorageErrorKind::DdlInTransaction
+        | StorageErrorKind::InvalidIdentifier
+        | StorageErrorKind::TableNotFound => code::QUERY_FAILED,
         StorageErrorKind::Io
         | StorageErrorKind::CorruptData
         | StorageErrorKind::CorruptCrc
