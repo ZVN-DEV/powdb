@@ -97,9 +97,9 @@ fn probe_cap(total_entries: u64) -> usize {
 /// full skew probe, used by `explain` and by the lone-equality hot guard.
 const FULL_PROBE_CAP: usize = usize::MAX;
 
-/// Counting cap the conjunction chooser starts from. Doubled until the ranking
-/// is settled (see [`settle_estimates`]); the first round already separates a
-/// point-shaped conjunct from a hot one.
+/// Counting cap the conjunction chooser starts from. Grown by
+/// [`next_rank_cap`] until the ranking is settled (see [`settle_estimates`]);
+/// the first round already separates a point-shaped conjunct from a hot one.
 const INITIAL_RANK_CAP: usize = 16;
 
 /// Rows an equality probe is estimated to return, and whether a larger
@@ -113,6 +113,9 @@ struct EqEstimate {
     /// which is the estimate's ceiling by design. `false` when the count
     /// saturated at a smaller cap, so `rows` is only a lower bound.
     settled: bool,
+    /// The index's full [`probe_cap`]: the cap at which a count is settled no
+    /// matter what it finds. Zero for an estimate that was never counted.
+    full_cap: usize,
 }
 
 impl EqEstimate {
@@ -120,6 +123,7 @@ impl EqEstimate {
         Self {
             rows,
             settled: true,
+            full_cap: 0,
         }
     }
 
@@ -129,6 +133,7 @@ impl EqEstimate {
         Self {
             rows: count as u64,
             settled: count < cap || cap >= full_cap,
+            full_cap,
         }
     }
 }
@@ -283,19 +288,28 @@ fn eq_candidate_est(catalog: &Catalog, scan: &PlanNode, cap: usize) -> EqEstimat
 /// `conjunction_s4_selective_path` workload from 2.7 us to 60 us. Lowering runs
 /// per execution (plan-cache hits included), so the walk was per execution too.
 ///
-/// Rounds double the cap from [`INITIAL_RANK_CAP`] and stop once the smallest
-/// `(rows, build order)` estimate is settled. That pick is the one the
-/// full-cap ranking makes: a settled exact count is strictly below every
-/// competitor still saturated at a cap at least that large, a count settled at
-/// its own full cap is that index's ceiling exactly as the full probe reports
-/// it, and a saturated tie is never settled, so it goes another round until
-/// only build order can separate the candidates. The unit tests below hold this
-/// agreement over a grid of counts and caps.
+/// Rounds grow the cap from [`INITIAL_RANK_CAP`] (see [`next_rank_cap`]) and
+/// stop once the smallest `(rows, build order)` estimate is settled. That pick
+/// is the one the full-cap ranking makes: a settled exact count is strictly
+/// below every competitor still saturated at a cap at least that large, a
+/// count settled at its own full cap is that index's ceiling exactly as the
+/// full probe reports it, and a saturated tie is never settled, so it goes
+/// another round until only build order can separate the candidates. The unit
+/// tests below hold this agreement over a grid of counts and caps.
+///
+/// Each round restarts its leaf walks from the root, so a candidate pays every
+/// cap it saturated at before the one that settles it. A candidate settling
+/// exactly at count `c` therefore walks under `3c` entries in total (its
+/// saturated caps sum to less than the settling cap, which is under `2c`), and
+/// a hot candidate that never settles below its full probe walks under 1.5x
+/// that probe, because [`next_rank_cap`] stops doubling and jumps to the full
+/// probe before the small rounds can add up to more than half of it.
 fn settle_estimates(n: usize, mut count_at: impl FnMut(usize, usize) -> EqEstimate) -> Vec<u64> {
     let mut estimates = vec![
         EqEstimate {
             rows: 0,
             settled: false,
+            full_cap: 0,
         };
         n
     ];
@@ -315,7 +329,36 @@ fn settle_estimates(n: usize, mut count_at: impl FnMut(usize, usize) -> EqEstima
                 .map(|estimate| estimate.rows)
                 .collect();
         }
-        cap = cap.saturating_mul(2);
+        // The smallest estimate is unsettled, so every unsettled candidate
+        // saturated at `cap` (a settled one would have to be at least as
+        // large to lose to it, and a smaller settled one would have won).
+        let largest_full_cap = estimates
+            .iter()
+            .filter(|estimate| !estimate.settled)
+            .map(|estimate| estimate.full_cap)
+            .max()
+            .unwrap_or(0);
+        cap = next_rank_cap(cap, largest_full_cap);
+    }
+}
+
+/// The cap for the round after one in which every unsettled candidate
+/// saturated at `cap`, given the largest full [`probe_cap`] still unsettled.
+///
+/// Doubling keeps a moderately selective conjunct cheap next to a hot one (a
+/// literal matching 500 rows beside one matching 33K settles after walking
+/// about 2K entries instead of 33K), but each doubled round restarts the walk,
+/// so when every candidate is hot the rounds would add up to about twice the
+/// full probe. Once the doubled cap would reach a quarter of the largest full
+/// probe still in play, the rounds so far have cost under half of it, so the
+/// next round goes straight to the full probe: the all-hot case then walks
+/// under 1.5x what the full probe alone walked, and settles for certain.
+fn next_rank_cap(cap: usize, largest_full_cap: usize) -> usize {
+    let doubled = cap.saturating_mul(2);
+    if doubled.saturating_mul(4) >= largest_full_cap {
+        FULL_PROBE_CAP
+    } else {
+        doubled
     }
 }
 
@@ -1873,13 +1916,20 @@ mod tests {
         );
     }
 
+    /// Every round restarts the leaf walk, so all-hot candidates pay the small
+    /// rounds on top of the full probe. The jump in `next_rank_cap` keeps that
+    /// under 1.5x the full probe (here 2 x 10,000 entries).
     #[test]
     fn an_all_hot_tie_reaches_the_full_cap_and_keeps_build_order() {
         let hot = || FakeIndex {
             count: 10_000,
             full_cap: 10_001,
         };
-        let (rows, _) = settle(&[hot(), hot()]);
+        let (rows, walked) = settle(&[hot(), hot()]);
+        assert!(
+            walked <= 30_000,
+            "the doubling rounds must not add up past half the full probe: walked {walked}"
+        );
         assert_eq!(
             rows,
             vec![10_000, 10_000],
@@ -1908,6 +1958,65 @@ mod tests {
         ]);
         assert_eq!(rows, vec![40, 32]);
         assert_eq!(winner(&rows), 1);
+    }
+
+    /// The case doubling exists for: a moderately selective conjunct (500 rows)
+    /// beside an unselective one (33K of 100K rows, below the full probe of
+    /// 50,001 so the full probe walked all 33K exactly). Doubling settles it
+    /// after walking about 2K entries; the jump must not fire early here.
+    #[test]
+    fn a_moderate_conjunct_beside_a_hot_one_settles_long_before_the_full_probe() {
+        let (rows, walked) = settle(&[
+            FakeIndex {
+                count: 33_333,
+                full_cap: 50_001,
+            },
+            FakeIndex {
+                count: 500,
+                full_cap: 50_001,
+            },
+        ]);
+        assert_eq!(winner(&rows), 1);
+        assert_eq!(rows[1], 500, "the winner's estimate is exact");
+        assert!(
+            walked < 2_500,
+            "the full probe walked 33,833 entries here; doubling walked {walked}"
+        );
+    }
+
+    /// Two hot candidates on indexes of very different sizes: the jump is
+    /// keyed to the LARGEST full probe still unsettled, so the small index
+    /// settles at its own full cap during the doubling rounds and wins without
+    /// the big index ever walking to its full probe.
+    #[test]
+    fn a_hot_small_index_beside_a_hot_big_one_settles_without_the_big_full_probe() {
+        let (rows, walked) = settle(&[
+            FakeIndex {
+                count: 10_000,
+                full_cap: 10_001,
+            },
+            FakeIndex {
+                count: 40,
+                full_cap: 33,
+            },
+        ]);
+        assert_eq!(
+            rows[1], 33,
+            "settled at its own full cap, the full probe's ceiling"
+        );
+        assert_eq!(winner(&rows), 1);
+        assert!(walked < 300, "walked {walked}");
+    }
+
+    #[test]
+    fn next_rank_cap_doubles_then_jumps_to_the_full_probe() {
+        assert_eq!(next_rank_cap(16, 10_001), 32);
+        assert_eq!(next_rank_cap(1_024, 10_001), 2_048);
+        // 4,096 x 4 >= 10,001: the small rounds so far (16..=2,048) sum to
+        // under half the full probe, so the next round is the full probe.
+        assert_eq!(next_rank_cap(2_048, 10_001), FULL_PROBE_CAP);
+        assert_eq!(next_rank_cap(16, 33), FULL_PROBE_CAP);
+        assert_eq!(next_rank_cap(16, 0), FULL_PROBE_CAP);
     }
 
     /// A small index whose full cap is below the round's cap settles at that
