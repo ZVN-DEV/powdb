@@ -770,7 +770,25 @@ impl Engine {
     /// system says was lowered.
     fn execute_lowered(&mut self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
         self.refresh_dirty_views_read_by(plan.node())?;
-        self.dispatch_mut(plan.node())
+        let result = self.dispatch_mut(plan.node());
+        Self::raise_arith_fault(result)
+    }
+
+    /// Turn a fault the expression evaluator recorded during `result` into the
+    /// error it had no channel to report itself.
+    ///
+    /// An overflowing `+` or a per-row zero divisor evaluates to `Value::Empty`,
+    /// which is indistinguishable from a missing column: the row came back with
+    /// a NULL in a projection, matched nothing in a predicate, and an `update`
+    /// wrote that NULL into a required column. An existing error wins, because
+    /// it is the more specific one; either way the slot is cleared.
+    fn raise_arith_fault(
+        result: Result<QueryResult, QueryError>,
+    ) -> Result<QueryResult, QueryError> {
+        match (result, take_arith_fault()) {
+            (Ok(_), Some(message)) => Err(QueryError::Execution(message)),
+            (result, _) => result,
+        }
     }
 
     /// Refresh every stale materialized view this plan is about to read, before
@@ -1540,7 +1558,7 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
-        self.dispatch_readonly(plan.node())
+        Self::raise_arith_fault(self.dispatch_readonly(plan.node()))
     }
 
     /// The read-path dispatch itself. Takes a bare `&PlanNode` because it is

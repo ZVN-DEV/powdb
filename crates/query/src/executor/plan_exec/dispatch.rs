@@ -1117,6 +1117,11 @@ impl Engine {
                     // after a logged prefix would violate statement atomicity and
                     // is especially unsafe inside an explicit transaction.
                     crate::cancel::check()?;
+                    // Same two-pass shape as the non-returning expression path
+                    // below: compute every new row image first, so an
+                    // arithmetic fault refuses the statement instead of leaving
+                    // the rows before it written.
+                    let mut pending_rids = Vec::with_capacity(matching_rids.len());
                     for rid in matching_rids {
                         let mut row = match self
                             .catalog
@@ -1146,10 +1151,17 @@ impl Engine {
                                 }
                             }
                         }
-                        self.catalog
-                            .update_hinted(table, rid, &row, Some(&changed_cols))
-                            .map_err(QueryError::from_storage_io)?;
+                        pending_rids.push(rid);
                         out_rows.push(row);
+                    }
+                    if let Some(message) = take_arith_fault() {
+                        return Err(QueryError::Execution(message));
+                    }
+                    self.charge_rows(&out_rows)?;
+                    for (rid, row) in pending_rids.iter().zip(&out_rows) {
+                        self.catalog
+                            .update_hinted(table, *rid, row, Some(&changed_cols))
+                            .map_err(QueryError::from_storage_io)?;
                     }
                     self.view_registry
                         .mark_dependents_dirty(table)
@@ -1442,7 +1454,17 @@ impl Engine {
                         .ok_or_else(|| QueryError::TableNotFound(table.to_string()))?;
                     schema_ref.columns.iter().map(|c| c.name.clone()).collect()
                 };
-                let mut count = 0u64;
+                // Every target row's new image is computed BEFORE any of them
+                // is written. The expression evaluator reports an overflow or a
+                // per-row zero divisor through `arith_fault` rather than through
+                // its return value, and writing as we go would leave the rows
+                // before the faulting one holding the `Value::Empty` it produced
+                // instead. Two passes cost the same materialization the
+                // `returning` path above already pays.
+                let (mut pending_rids, mut pending_rows) = (
+                    Vec::with_capacity(matching_rids.len()),
+                    Vec::with_capacity(matching_rids.len()),
+                );
                 for rid in matching_rids {
                     let mut row = match self
                         .catalog
@@ -1462,6 +1484,15 @@ impl Engine {
                         row[col_indices[i]] =
                             coerce_value(val, &target_cols[i]).map_err(QueryError::TypeError)?;
                     }
+                    pending_rids.push(rid);
+                    pending_rows.push(row);
+                }
+                if let Some(message) = take_arith_fault() {
+                    return Err(QueryError::Execution(message));
+                }
+                self.charge_rows(&pending_rows)?;
+                let mut count = 0u64;
+                for (rid, row) in pending_rids.into_iter().zip(pending_rows) {
                     self.catalog
                         .update_hinted(table, rid, &row, Some(&changed_cols))
                         .map_err(QueryError::from_storage_io)?;

@@ -4,6 +4,68 @@ use crate::ast::*;
 use powdb_storage::catalog::Catalog;
 use powdb_storage::types::*;
 
+/// The expression evaluator's error channel.
+///
+/// `eval_expr` returns a `Value` and is called from closures the storage scan
+/// drives, so it has nowhere to put an error. Every unrepresentable arithmetic
+/// result therefore became `Value::Empty`, which is indistinguishable from a
+/// missing column: `.big * 2` produced NULL in a projection, filtered nothing
+/// out in a predicate, and an `update` wrote that NULL into a required column,
+/// while `sum` over the same values refused the same overflow outright.
+///
+/// A fault recorded here is turned into the statement's error at the two
+/// execution boundaries every plan crosses, `Engine::execute_lowered` and
+/// `Engine::execute_plan_readonly` (see `Engine::raise_arith_fault`). Both take
+/// unconditionally, so a fault recorded by an outer frame and collected by a
+/// nested one (a correlated subquery, a view's source query) is still raised,
+/// as that frame's error rather than the outer one's: attribution can move, the
+/// refusal cannot be lost. Nothing else clears the slot, so nothing leaks into
+/// the next statement either.
+///
+/// The first fault wins, because it is the one the query hit first; later rows
+/// cannot overwrite it.
+mod arith_fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(message: String) {
+        FAULT.with(|fault| {
+            let mut slot = fault.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        });
+    }
+
+    pub(crate) fn take() -> Option<String> {
+        FAULT.with(|fault| fault.borrow_mut().take())
+    }
+}
+
+pub(crate) use arith_fault::take as take_arith_fault;
+
+/// Record an integer-arithmetic overflow and yield the empty set for this row.
+/// The empty value never reaches the caller as an answer: the statement fails
+/// with the recorded message.
+fn overflow(label: &str) -> Value {
+    arith_fault::record(format!(
+        "cannot compute {label}: the integer result overflows int64"
+    ));
+    Value::Empty
+}
+
+/// Record a zero divisor, matching the message validation gives the literal
+/// form so the two spellings of the same mistake read the same.
+fn divide_by_zero() -> Value {
+    arith_fault::record(
+        "cannot divide by zero: the divisor is zero for at least one row".to_string(),
+    );
+    Value::Empty
+}
+
 pub(super) fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Field(name) => out.push(name.clone()),
@@ -270,7 +332,7 @@ fn exact_i64(v: f64) -> Option<i64> {
         return None;
     }
     // 2^63 is exactly representable; every i64 lies in [-2^63, 2^63).
-    if v >= 9_223_372_036_854_775_808.0 || v < -9_223_372_036_854_775_808.0 {
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&v) {
         return None;
     }
     Some(v as i64)
@@ -1310,33 +1372,36 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
         // through to the `_` arms is a MISSING operand, which propagates as
         // missing per SQL NULL semantics, and an operand whose type is only
         // known per row (a cast, a scalar function, a JSON path).
-        // Integer overflow is missing, never a clamped number. `saturating_add`
-        // answered `.big + 1` with `i64::MAX`, which is a plausible-looking
-        // number that is not the sum, and the aggregate accumulator refuses the
-        // same overflow outright (`plan_exec::aggregate::agg_overflow_error`),
-        // so `sum(A { .v })` and `A { x: .v + 1 }` disagreed about whether the
-        // total exists. All four arithmetic operators now use the checked form
-        // that `Div` already used, and all four report the same way. `Empty`
-        // rather than an error because this evaluator has no error channel and
-        // because it is the convention every other unrepresentable result here
-        // already follows (`abs(i64::MIN)`, an overflowing `date_add`, `date_diff`
-        // across the full i64 range).
+        // Integer overflow is an error, never a clamped number and never a
+        // silent NULL. `saturating_add` answered `.big + 1` with `i64::MAX`,
+        // which is a plausible-looking number that is not the sum; `Empty`
+        // answered it with a missing value, which an `update` then wrote into a
+        // required column. The aggregate accumulator refuses the same overflow
+        // outright (`plan_exec::aggregate::agg_overflow_error`), so all four
+        // operators now report through `arith_fault` and say the same thing
+        // `sum` says.
         BinOp::Add => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_add(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_add(*b)
+                .map_or_else(|| overflow("a sum"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             _ => Value::Empty,
         },
         BinOp::Sub => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_sub(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_sub(*b)
+                .map_or_else(|| overflow("a difference"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a - b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 - b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a - *b as f64),
             _ => Value::Empty,
         },
         BinOp::Mul => match (left, right) {
-            (Value::Int(a), Value::Int(b)) => a.checked_mul(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => a
+                .checked_mul(*b)
+                .map_or_else(|| overflow("a product"), Value::Int),
             (Value::Float(a), Value::Float(b)) => Value::Float(a * b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 * b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a * *b as f64),
@@ -1349,7 +1414,17 @@ pub(super) fn eval_binop_mode(left: &Value, op: BinOp, right: &Value, mode: CmpM
             // Returning `Empty` on either matches the sibling arithmetic arms.
             // A literal zero divisor is a typed error at validation; only a
             // divisor that is zero for some rows reaches this guard.
-            (Value::Int(a), Value::Int(b)) => a.checked_div(*b).map_or(Value::Empty, Value::Int),
+            (Value::Int(a), Value::Int(b)) => {
+                if *b == 0 {
+                    divide_by_zero()
+                } else {
+                    // Still `checked_div`: `i64::MIN / -1` overflows and panics
+                    // even in release builds, which under `panic = "abort"` is a
+                    // remotely craftable process crash.
+                    a.checked_div(*b)
+                        .map_or_else(|| overflow("a quotient"), Value::Int)
+                }
+            }
             (Value::Float(a), Value::Float(b)) => Value::Float(a / b),
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 / b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a / *b as f64),
