@@ -430,7 +430,12 @@ async fn sync_frames_respect_open_transaction_gate() {
         Message::SyncStatusResult { status } => {
             assert_eq!(status.last_applied_lsn, Some(0));
             assert_eq!(status.servable_lsn, Some(committed_lsn));
-            assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+            // This replica is at LSN 0 and the retained tail still holds the
+            // `type SyncT` that created the table. V1 embedded sync cannot
+            // apply a DDL unit, so no pull can ever succeed from here and the
+            // status says so. It used to report `Pull`, which is what let a
+            // wedged replica look healthy while every pull failed.
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
         }
         other => panic!("expected sync status after rollback, got {other:?}"),
     }
