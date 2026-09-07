@@ -112,10 +112,22 @@ one-time setup and the reusable standard.
     clients/sync/CHANGELOG.md to the dated version entry (both ship in their
     npm tarballs and both are gated by check-version-consistency.sh)
 [ ] Update both the Next release and Current release lines in RELEASES.md
+[ ] Update the AGENTS.md feature stamp: "Available in released PowDB (vX.Y.Z)".
+    It is the line agents read to decide which features exist, it drifted three
+    minors behind before anything noticed, and check-version-consistency.sh
+    gates it now.
 [ ] Update doc version strings: --version pins and CLI banner transcripts in
     README.md, docs/getting-started.md, docs/powdb-vs-sqlite.md
 [ ] Run bash scripts/check-version-consistency.sh
 [ ] Run bash scripts/smoke-package.sh (npm pack/import smoke + cargo package list)
+[ ] Check the nightly fuzz runs since the last release: none red, or every
+    failing input triaged and checked in under crates/query/fuzz/seeds/.
+    fuzz.yml is not part of ci-success, so a red nightly blocks nothing on its
+    own and will sit there unless someone looks.
+[ ] Run the perf gate on the release branch and record the run URL in the
+    release PR: `gh workflow run bench.yml --ref release/vX.Y.Z`, green.
+    bench.yml is manual-only and is not a merge gate, so this is the only
+    point in the process where a performance regression can be caught.
 
 Note on the three lockfiles: bindings/node and crates/query/fuzz are detached
 workspaces, so `cargo build --workspace` never regenerates them. All three are
@@ -147,7 +159,12 @@ under a released version number, so the crates cannot go first.
     published crates.io baselines and refuses to publish an API change bigger
     than the version bump allows (the point-release-over-a-break hazard). If
     it fires on a real release, the bump is wrong: raise the version, do not
-    bypass the check.
+    bypass the check. The separate advisory pass now also fails when
+    cargo-semver-checks does not run at all (exit above 1) or examines no
+    crate: on a 0.x minor bump it skips every lint by design, so "it ran and
+    found nothing" and "it never ran" used to look identical, and the advisory
+    pass is that release shape's whole verdict. Its findings still never
+    block.
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
@@ -161,7 +178,10 @@ under a released version number, so the crates cannot go first.
     lacked), cargo-installs the `powdb` facade crate, npm-installs
     @zvndev/powdb-client + @zvndev/powdb-embedded and @zvndev/powdb-sync, pulls
     and runs the ghcr image, and checks the GitHub Release assets and their
-    attestation
+    attestation. Smoke the NEWEST release of a channel: the ghcr leg now
+    asserts the floating channel pointer (`latest` for a final, `rc` for a
+    candidate) as well as the two pinned tags, so smoking an older version
+    fails that assertion by design.
 [ ] Verify each registry directly rather than trusting workflow exit codes:
     crates.io versions, `gh release view vX.Y.Z`, the ghcr tag list, and
     `npm view <pkg> version` for each npm package
