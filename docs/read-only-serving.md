@@ -113,6 +113,31 @@ Read-only handles take a **shared reader lock** (a PID file named
   recycled PID from ever colliding with a stale file a crashed predecessor left
   behind.
 
+### What holds the writer lock
+
+On unix, a data directory is held for writing by whoever holds the **advisory
+`flock`** on its `LOCK` file, not by whoever is named inside it. The lock is
+taken first and is what admits a writer; the PID is then written in place
+through the already-locked handle, so `LOCK` never names a process that does not
+hold the directory. A lock that is already held is a refusal.
+
+Three consequences worth knowing as an operator:
+
+- **A PID is meaningless across a namespace, and the `flock` is not.** A
+  container's init is PID 1 to itself and something unrelated on the host, so a
+  `LOCK` left behind in one namespace used to read as permanently held in the
+  other and the directory could never be opened again. The kernel releases an
+  `flock` on death in any namespace, which makes it the one liveness signal that
+  cannot go stale: a `LOCK` naming a live-looking PID whose lock can be taken is
+  reclaimed, with a warning naming the PID.
+- **Deleting `LOCK` by hand while a server is running no longer hands the
+  directory to a second writer.** An acquirer checks that the lock it holds is on
+  the inode the path still names, so a previous holder's cleanup cannot admit two
+  writers at once. It is still not something to do.
+- **On a filesystem with no advisory locking at all** (some network mounts) PowDB
+  logs a warning and falls back to the PID heuristic rather than refusing to
+  open.
+
 Never run a read-write process against a directory that read-only servers are
 using. Serve a **copy** (a restored snapshot), not the primary's live directory.
 

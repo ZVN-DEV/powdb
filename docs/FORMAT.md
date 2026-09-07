@@ -7,6 +7,15 @@ compatibility reader exists.
 
 ## Current format versions
 
+> **This table is machine-read.** `powdb-storage`'s
+> `the_documented_format_versions_are_the_ones_this_build_writes` test parses it
+> and requires every format constant the build writes to appear among the
+> numbers in the **Current writer** column of its own row, matched by the row's
+> first cell. It strips parenthesised asides before looking. So a format bump
+> with a stale table fails the build, which is the point, but restructuring the
+> table also fails it: renaming a row's first cell, or moving the numbers out of
+> the third column, breaks the parse. Change the shape and the test with it.
+
 | Structure | Magic | Current writer | Legacy accepted | Unknown behavior |
 | --- | --- | ---: | ---: | --- |
 | Catalog (`catalog.bin`) | `BCAT` | 5; 6 once the first expression index activates it (since v0.13.0); 7 once the first entity link is declared (since v0.19.0) | 1, 2, 3, 4 (and 5/6 where the newer format was never activated) | reject `unsupported catalog version` |
