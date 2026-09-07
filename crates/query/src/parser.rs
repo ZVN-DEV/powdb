@@ -149,6 +149,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
         message: e.message,
         position: e.position,
     })?;
+    let mut referenced = vec![false; params.len()];
     for tok in tokens.iter_mut() {
         if let Token::Param(name) = tok {
             let n: usize = name.parse().map_err(|_| ParseError::Syntax {
@@ -170,6 +171,7 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                 ),
                 position: None,
             })?;
+            referenced[n - 1] = true;
             *tok = match p {
                 ParamValue::Null => Token::Null,
                 ParamValue::Int(v) => Token::IntLit(*v),
@@ -178,6 +180,29 @@ pub fn parse_with_params(input: &str, params: &[ParamValue]) -> Result<Statement
                 ParamValue::Str(s) => Token::StringLit(s.clone()),
             };
         }
+    }
+    // A supplied value the query never mentions was dropped in silence, which
+    // is the same failure an off-by-one in any positional API produces and
+    // leaves nothing in the result to show it. Too FEW parameters has always
+    // been an error; too many is the same mistake counted the other way.
+    if let Some(unused) = referenced.iter().position(|used| !used) {
+        let supplied = params.len();
+        let plural = if supplied == 1 { "" } else { "s" };
+        let message = match referenced.iter().rposition(|used| *used) {
+            None => format!("{supplied} parameter{plural} supplied but the query references none"),
+            Some(highest) if unused > highest => format!(
+                "{supplied} parameter{plural} supplied but the query references only ${}",
+                highest + 1
+            ),
+            Some(_) => format!(
+                "{supplied} parameter{plural} supplied but the query never references ${}",
+                unused + 1
+            ),
+        };
+        return Err(ParseError::Syntax {
+            message,
+            position: None,
+        });
     }
     parse_tokens_with_spans(tokens, Some(spans))
 }
