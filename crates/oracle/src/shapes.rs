@@ -68,6 +68,14 @@ fn orderable() -> Vec<&'static Column> {
 
 const CMP_OPS: [&str; 6] = ["=", "!=", "<", "<=", ">", ">="];
 
+/// The two halves of [`CMP_OPS`]. A json path holds a value of whatever type
+/// the document put there, so an ordered comparison over one is a comparison
+/// across types on some rows, and PowDB and SQLite answer that differently by
+/// design (see the ledger). Keeping the two halves in separate shapes is what
+/// stops the entry for the ordered half from also excusing an equality bug.
+const EQ_OPS: [&str; 2] = ["=", "!="];
+const ORD_OPS: [&str; 4] = ["<", "<=", ">", ">="];
+
 /// SQLite's spelling of PowDB's engine-wide NULLS LAST ordering contract
 /// (`crates/query/src/executor/plan_exec/mod.rs`, `compare_order_values`).
 ///
@@ -227,6 +235,8 @@ const SHAPES: &[ShapeFn] = &[
     order_asc_limit,
     distinct_limit,
     cmp_against_null_literal,
+    filter_cmp_untyped_literal,
+    json_path_filter_ordered,
 ];
 
 fn select_star(b: &mut Builder, _rng: &mut Rng, _n: usize) {
@@ -300,6 +310,44 @@ fn filter_cmp(b: &mut Builder, rng: &mut Rng, n: usize) {
         };
         b.push(Case {
             shape: "filter_cmp",
+            powql: format!("{TABLE} filter .{} {op} {pq} {{ .id }}", col.name),
+            powdb_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} {ps}", col.name),
+            sqlite_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} ?1", col.name),
+            sqlite_params: vec![lit],
+            ordered: false,
+            kinds: vec![Kind::Col(ColType::Int)],
+            scalar: false,
+            sqlite_comparable: true,
+        });
+    }
+}
+
+/// `filter_cmp` again, with the literal written as a plain string instead of
+/// through its type constructor.
+///
+/// `uuid` and `bytes` are the two types whose PowQL literal has two spellings:
+/// `uuid("550e8400-...")` and the bare `"550e8400-..."`. Every other shape
+/// writes the constructor form, and the bare form is the one a user writes
+/// first. It used to be a silently false predicate: a `uuid` column compared
+/// against its own value as a string answered zero rows, `!=` answered every
+/// row, and update/delete by that key touched nothing, on all four frontends.
+/// SQLite is handed the value as a bound BLOB either way, so the only thing
+/// that differs between the two sides of the comparison is how PowDB was
+/// asked for it.
+fn filter_cmp_untyped_literal(b: &mut Builder, rng: &mut Rng, n: usize) {
+    let cols: Vec<&Column> = COLUMNS
+        .iter()
+        .filter(|c| matches!(c.ty, ColType::Uuid | ColType::Bytes))
+        .collect();
+    for _ in 0..n {
+        let col = *rng.pick(&cols);
+        let op = *rng.pick(&CMP_OPS);
+        let lit = predicate_literal(rng, col);
+        let (Some(pq), Some(ps)) = (lit.powql_untyped(), lit.powdb_sql_untyped()) else {
+            continue;
+        };
+        b.push(Case {
+            shape: "filter_cmp_untyped_literal",
             powql: format!("{TABLE} filter .{} {op} {pq} {{ .id }}", col.name),
             powdb_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} {ps}", col.name),
             sqlite_sql: format!("SELECT id FROM {TABLE} WHERE {} {op} ?1", col.name),
@@ -952,7 +1000,29 @@ fn json_path_project(b: &mut Builder, _rng: &mut Rng, _n: usize) {
     }
 }
 
+/// Equality over an extracted json scalar. Both engines agree on every row,
+/// whatever type the document put under the key, so this shape carries no
+/// ledger entry and is what keeps the entry on `json_path_filter_ordered`
+/// confined to ordering.
 fn json_path_filter(b: &mut Builder, rng: &mut Rng, n: usize) {
+    json_path_filter_ops(b, rng, n, "json_path_filter", &EQ_OPS);
+}
+
+/// Ordered comparison over an extracted json scalar. PowDB answers false when
+/// the two sides are of different types; SQLite ranks its storage classes. One
+/// ledger entry covers the difference, and it can only reach ordering because
+/// equality lives in its own shape above.
+fn json_path_filter_ordered(b: &mut Builder, rng: &mut Rng, n: usize) {
+    json_path_filter_ops(b, rng, n, "json_path_filter_ordered", &ORD_OPS);
+}
+
+fn json_path_filter_ops(
+    b: &mut Builder,
+    rng: &mut Rng,
+    n: usize,
+    shape: &'static str,
+    ops: &[&str],
+) {
     // No boolean probe: see `fixture::json_pool` for why booleans are kept out
     // of the extracted keys entirely.
     let probes: [Lit; 6] = [
@@ -966,12 +1036,12 @@ fn json_path_filter(b: &mut Builder, rng: &mut Rng, n: usize) {
     for _ in 0..n {
         let key = *rng.pick(&JSON_SCALAR_KEYS);
         let lit = rng.pick(&probes).clone();
-        let op = *rng.pick(&CMP_OPS);
+        let op = *rng.pick(ops);
         let (Some(pq), Some(ps)) = (lit.powql(), lit.powdb_sql()) else {
             continue;
         };
         b.push(Case {
-            shape: "json_path_filter",
+            shape,
             powql: format!("{TABLE} filter .j->{key} {op} {pq} {{ .id }}"),
             powdb_sql: format!("SELECT id FROM {TABLE} WHERE j->'{key}' {op} {ps}"),
             sqlite_sql: format!("SELECT id FROM {TABLE} WHERE json_extract(j, '$.{key}') {op} ?1"),
@@ -1200,11 +1270,17 @@ fn cmp_against_null_literal(b: &mut Builder, _rng: &mut Rng, _n: usize) {
 fn sql_backslash_literal(b: &mut Builder, _rng: &mut Rng, _n: usize) {
     b.push(Case {
         shape: "sql_backslash_literal",
-        // PowQL is given the *same naive spelling*, so the case measures the
-        // escape rule and not the oracle's own quoting helper.
-        powql: format!("{TABLE} filter .s = \"back\\slash\" {{ .id }}"),
-        powdb_sql: format!("SELECT id FROM {TABLE} WHERE s = 'back\\slash'"),
-        sqlite_sql: format!("SELECT id FROM {TABLE} WHERE s = 'back\\slash'"),
+        // All three engines are given the *same source text*, so the case
+        // measures the escape rule and not the oracle's own quoting helper.
+        // The text carries a doubled backslash: both PowDB frontends read it
+        // as one backslash and match the fixture's `back\slash` row, while
+        // SQLite has no backslash escapes and reads two. The single-backslash
+        // spelling this shape used to carry is now refused by both PowDB
+        // frontends, which made the shape prove nothing (PowQL errored on
+        // every case) instead of measuring the difference.
+        powql: format!("{TABLE} filter .s = \"back\\\\slash\" {{ .id }}"),
+        powdb_sql: format!("SELECT id FROM {TABLE} WHERE s = 'back\\\\slash'"),
+        sqlite_sql: format!("SELECT id FROM {TABLE} WHERE s = 'back\\\\slash'"),
         sqlite_params: Vec::new(),
         ordered: false,
         kinds: vec![Kind::Col(ColType::Int)],
