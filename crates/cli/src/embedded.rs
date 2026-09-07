@@ -12,7 +12,11 @@ use super::*;
 /// file; neither names the path the operator typed. A read-only open must also
 /// never CREATE the directory: handing back an empty database because the
 /// snapshot path was mistyped looks exactly like data loss.
-pub(crate) fn open_embedded_engine(data_dir: &str, readonly: bool) -> Result<Engine, i32> {
+pub(crate) fn open_embedded_engine(
+    data_dir: &str,
+    readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
+) -> Result<Engine, i32> {
     let path = Path::new(data_dir);
     match std::fs::metadata(path) {
         Ok(meta) if !meta.is_dir() => {
@@ -42,10 +46,16 @@ pub(crate) fn open_embedded_engine(data_dir: &str, readonly: bool) -> Result<Eng
     } else {
         Engine::new_with_wal_archive(path, archive_wal_records_if_sync_enabled)
     };
-    opened.map_err(|e| {
+    let mut engine = opened.map_err(|e| {
         eprintln!("Error: failed to initialize engine: {e}");
         1
-    })
+    })?;
+    // A read-only engine never appends to the log, so the threshold is moot
+    // there and setting it would only invite a write.
+    if let (Some(bytes), false) = (wal_checkpoint_bytes, readonly) {
+        engine.catalog_mut().set_wal_checkpoint_bytes(bytes);
+    }
+    Ok(engine)
 }
 
 pub(crate) fn exec_embedded(
@@ -53,8 +63,9 @@ pub(crate) fn exec_embedded(
     query: &str,
     session: SessionOpts,
     readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
 ) -> i32 {
-    let mut engine = match open_embedded_engine(data_dir, readonly) {
+    let mut engine = match open_embedded_engine(data_dir, readonly, wal_checkpoint_bytes) {
         Ok(e) => e,
         Err(code) => return code,
     };
@@ -187,7 +198,12 @@ pub(crate) fn missing_separator_hint(source: &str, statement_count: usize) -> Op
 
 // ─── Embedded mode ──────────────────────────────────────────────────────────
 
-pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts, readonly: bool) {
+pub(crate) fn run_embedded(
+    data_dir: &str,
+    session: SessionOpts,
+    readonly: bool,
+    wal_checkpoint_bytes: Option<u64>,
+) {
     eprintln!(
         "PowDB v{} — embedded mode{}",
         env!("CARGO_PKG_VERSION"),
@@ -204,7 +220,7 @@ pub(crate) fn run_embedded(data_dir: &str, session: SessionOpts, readonly: bool)
         }
     );
 
-    let mut engine = match open_embedded_engine(data_dir, readonly) {
+    let mut engine = match open_embedded_engine(data_dir, readonly, wal_checkpoint_bytes) {
         Ok(engine) => engine,
         Err(code) => std::process::exit(code),
     };

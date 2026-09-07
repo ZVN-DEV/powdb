@@ -298,3 +298,49 @@ fn the_sql_repl_banner_says_sql() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- The WAL checkpoint threshold on the embedded path ----
+
+/// Storage bounds WAL growth by checkpointing once the durable log passes a
+/// threshold. The embedded CLI writes through the same catalog, so an operator
+/// running a long `--exec` import needs the same knob the server has.
+#[test]
+fn the_embedded_path_can_set_the_wal_checkpoint_threshold() {
+    let help = stdout_of(&run(&["--help"]));
+    assert!(
+        help.contains("--wal-checkpoint-bytes"),
+        "--help must document the knob: {help}"
+    );
+    assert!(
+        help.contains("64 MiB") && help.contains("0 disables"),
+        "--help must give the default and what 0 means: {help}"
+    );
+
+    let bad = run(&["--wal-checkpoint-bytes", "64MiB", "-c", "schema"]);
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "a suffixed value must be refused: {}",
+        stderr_of(&bad)
+    );
+
+    let remote = run(&[
+        "--remote",
+        "127.0.0.1:1",
+        "--wal-checkpoint-bytes",
+        "0",
+        "-c",
+        "schema",
+    ]);
+    assert_eq!(
+        remote.status.code(),
+        Some(2),
+        "the threshold belongs to whoever owns the data dir, not to a remote session: {}",
+        stderr_of(&remote)
+    );
+
+    // That the threshold actually bounds the log is proved against the
+    // catalog in `open_embedded_engine_applies_the_wal_checkpoint_threshold`:
+    // a clean CLI exit checkpoints and truncates the log anyway, so the file
+    // left on disk afterwards would be 8 bytes either way.
+}

@@ -198,8 +198,14 @@ fn main() {
             &query,
             session,
             args.readonly,
+            args.wal_checkpoint_bytes,
         ));
     } else {
-        run_embedded(&args.data_dir, session, args.readonly);
+        run_embedded(
+            &args.data_dir,
+            session,
+            args.readonly,
+            args.wal_checkpoint_bytes,
+        );
     }
 }

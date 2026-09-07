@@ -60,6 +60,10 @@ pub(crate) struct CliArgs {
     /// statements are refused by the engine and nothing on disk is written,
     /// which is what makes a snapshot or a restored backup safe to inspect.
     pub(crate) readonly: bool,
+    /// WAL size in bytes at which a finished statement checkpoints on the
+    /// embedded path (`--wal-checkpoint-bytes`). `None` keeps the storage
+    /// default; `0` turns the automatic checkpoint off.
+    pub(crate) wal_checkpoint_bytes: Option<u64>,
 }
 
 /// TLS settings for remote mode.
@@ -299,6 +303,7 @@ pub(crate) fn parse_args() -> CliArgs {
     let mut password_flag_given = false;
     let mut password_stdin = false;
     let mut readonly = false;
+    let mut wal_checkpoint_bytes: Option<u64> = None;
     let mut output = OutputMode::Table;
     let mut action = Action::Default;
     // Accumulators for backup/restore modifier flags, which may appear after
@@ -359,6 +364,23 @@ pub(crate) fn parse_args() -> CliArgs {
             }
             "--readonly" => {
                 readonly = true;
+            }
+            "--wal-checkpoint-bytes" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("Error: --wal-checkpoint-bytes requires a value in bytes");
+                    std::process::exit(2);
+                }
+                match argv[i].trim().parse::<u64>() {
+                    Ok(bytes) => wal_checkpoint_bytes = Some(bytes),
+                    Err(_) => {
+                        eprintln!(
+                            "Error: --wal-checkpoint-bytes wants a plain whole number of bytes, \
+                             with no unit suffix (0 disables the automatic checkpoint)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
             }
             "--format" => {
                 i += 1;
@@ -481,6 +503,10 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("                               For snapshots and restored backups. Embedded only; a");
                 println!("                               remote server decides this with its own --readonly /");
                 println!("                               POWDB_READONLY");
+                println!("        --wal-checkpoint-bytes <BYTES>");
+                println!("                               WAL size at which a finished statement checkpoints on the");
+                println!("                               embedded path (default: 64 MiB; 0 disables, leaving the");
+                println!("                               log to grow until the CLI exits). Embedded only");
                 println!("        --format <FMT>         Result rendering: table (default), json, or csv.");
                 println!("                               json and csv make the CLI scriptable");
                 println!("    -r, --remote <HOST:PORT>   Connect to a remote server over TCP, or pass the path");
@@ -855,6 +881,17 @@ pub(crate) fn parse_args() -> CliArgs {
         std::process::exit(2);
     }
 
+    if wal_checkpoint_bytes.is_some() && remote.is_some() {
+        eprintln!(
+            "Error: --wal-checkpoint-bytes applies to an embedded data dir, not to a remote connection"
+        );
+        eprintln!(
+            "note: the server that owns the data dir sets it, with its own --wal-checkpoint-bytes \
+             or POWDB_WAL_CHECKPOINT_BYTES"
+        );
+        std::process::exit(2);
+    }
+
     if readonly && remote.is_some() {
         eprintln!("Error: --readonly applies to an embedded data dir, not to a remote connection");
         eprintln!(
@@ -908,5 +945,6 @@ pub(crate) fn parse_args() -> CliArgs {
             server_name: tls_server_name,
         },
         readonly,
+        wal_checkpoint_bytes,
     }
 }

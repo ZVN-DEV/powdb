@@ -70,6 +70,10 @@ struct Args {
     /// env-only. `None` keeps the storage default
     /// (`DEFAULT_DIRTY_PAGE_BUDGET`).
     dirty_page_budget: Option<usize>,
+    /// WAL size in bytes at which a finished autocommit statement checkpoints.
+    /// `None` keeps the storage default (`DEFAULT_WAL_CHECKPOINT_BYTES`); `0`
+    /// is the documented opt-out and leaves the log to grow until close.
+    wal_checkpoint_bytes: Option<u64>,
     require_tls: bool,
     /// `host:port` for the optional Prometheus metrics endpoint; `None` = off.
     metrics_addr: Option<String>,
@@ -222,6 +226,16 @@ fn parse_positive_count(unit: &'static str) -> impl Fn(&str) -> Result<usize, St
     }
 }
 
+/// A WAL checkpoint threshold in bytes. Unlike every other budget, `0` is a
+/// real setting here and not a typo: it turns the automatic checkpoint off and
+/// restores the pre-0.28 behaviour where the log grew until the catalog closed.
+fn parse_wal_checkpoint_bytes(raw: &str) -> Result<u64, String> {
+    raw.trim().parse::<u64>().map_err(|_| {
+        "a plain whole number of bytes, with no unit suffix (0 disables the automatic checkpoint)"
+            .to_string()
+    })
+}
+
 /// Parse `POWDB_SYNC_MODE` (`full` | `normal` | `off`). `normal` trades a
 /// bounded crash-loss window (OS-crash/power-loss only) for much faster
 /// writes; `off` disables durability entirely and is bench-only.
@@ -320,7 +334,11 @@ fn parse_args() -> Args {
         parse_positive_count("candidate pairs"),
     );
     // Dirty-page (unflushed heap page) budget; env-only (no CLI flag).
-    let dirty_page_budget = env_setting("POWDB_DIRTY_PAGE_BUDGET", parse_positive_count("pages"));
+    let dirty_page_budget = env_setting("POWDB_DIRTY_PAGE_BUDGET", parse_positive_count("bytes"));
+    // WAL checkpoint threshold. Has a flag as well as a variable because it is
+    // the one storage budget an operator may legitimately need to turn off.
+    let mut wal_checkpoint_bytes =
+        env_setting("POWDB_WAL_CHECKPOINT_BYTES", parse_wal_checkpoint_bytes);
     // When set, refuse to start with a password but no TLS. Default off.
     let require_tls = env_setting("POWDB_REQUIRE_TLS", parse_bool_setting).unwrap_or(false);
     // `POWDB_READONLY` reuses the same boolean grammar as `POWDB_REQUIRE_TLS`.
@@ -450,6 +468,18 @@ fn parse_args() -> Args {
                 shutdown_timeout_secs =
                     flag_setting("--shutdown-timeout", &argv[i], parse_timeout_secs);
             }
+            "--wal-checkpoint-bytes" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("--wal-checkpoint-bytes requires a value");
+                    std::process::exit(2);
+                }
+                wal_checkpoint_bytes = Some(flag_setting(
+                    "--wal-checkpoint-bytes",
+                    &argv[i],
+                    parse_wal_checkpoint_bytes,
+                ));
+            }
             "--readonly" => {
                 read_only = true;
             }
@@ -480,6 +510,7 @@ fn parse_args() -> Args {
                 println!("        --port-file <PATH>     Write the bound listener ports to PATH after startup (use with --port 0)");
                 println!("        --max-connections <N>  Ceiling on concurrent connections (default: 1024)");
                 println!("        --shutdown-timeout <SECS>  Seconds a graceful shutdown waits for connections to drain before exiting non-zero (default: 30)");
+                println!("        --wal-checkpoint-bytes <BYTES>  WAL size at which a finished statement checkpoints (default: 64 MiB; 0 disables, leaving the log to grow until shutdown)");
                 println!("        --readonly             Serve the data directory read-only (snapshot serving; mutations are refused)");
                 println!("    -V, --version              Print version and exit");
                 println!("    -h, --help                 Print this message");
@@ -500,6 +531,7 @@ fn parse_args() -> Args {
                 println!("    POWDB_QUERY_MEMORY_LIMIT   Per-query memory budget in bytes (default: 256 MiB)");
                 println!("    POWDB_MAX_NESTED_LOOP_PAIRS  Fallback nested-loop join candidate-pair cap (default: 6,400,000)");
                 println!("    POWDB_DIRTY_PAGE_BUDGET    Ceiling in bytes on unflushed heap pages inside an explicit transaction (default: 256 MiB)");
+                println!("    POWDB_WAL_CHECKPOINT_BYTES WAL size at which a finished statement checkpoints (default: 64 MiB; 0 disables)");
                 println!("    POWDB_METRICS_ADDR         host:port for the Prometheus /metrics endpoint (unauthenticated)");
                 println!("    POWDB_SOCKET               Path for an additional Unix-domain-socket listener (off by default)");
                 println!("    POWDB_PORT_FILE            Write the bound listener ports here after startup (use with --port 0)");
@@ -540,6 +572,7 @@ fn parse_args() -> Args {
         query_memory_limit,
         nested_loop_pair_limit,
         dirty_page_budget,
+        wal_checkpoint_bytes,
         require_tls,
         metrics_addr,
         port_file,
@@ -984,6 +1017,14 @@ async fn main() {
         info!(
             dirty_page_budget_bytes = limit,
             "unflushed heap-page budget (POWDB_DIRTY_PAGE_BUDGET)"
+        );
+    }
+    if let Some(bytes) = args.wal_checkpoint_bytes {
+        engine.catalog_mut().set_wal_checkpoint_bytes(bytes);
+        info!(
+            wal_checkpoint_bytes = bytes,
+            disabled = bytes == 0,
+            "WAL checkpoint threshold (--wal-checkpoint-bytes / POWDB_WAL_CHECKPOINT_BYTES)"
         );
     }
 
@@ -1615,7 +1656,7 @@ mod tests {
             "POWDB_MAX_NESTED_LOOP_PAIRS"
         );
         assert!(
-            parse_positive_count("pages")("nope").is_err(),
+            parse_positive_count("bytes")("nope").is_err(),
             "POWDB_DIRTY_PAGE_BUDGET"
         );
         assert!(
@@ -1815,12 +1856,68 @@ mod tests {
         assert_eq!(engine.query_memory_limit(), 2048);
     }
 
+    /// 0 is the documented opt-out for the WAL checkpoint threshold, so the
+    /// validator that refuses 0 everywhere else must accept it here, and a
+    /// suffixed value must still be refused rather than defaulted.
+    #[test]
+    fn wal_checkpoint_bytes_accepts_the_opt_out_and_refuses_a_suffix() {
+        assert_eq!(parse_wal_checkpoint_bytes("0"), Ok(0));
+        assert_eq!(parse_wal_checkpoint_bytes("  1048576 "), Ok(1_048_576));
+        let err = parse_wal_checkpoint_bytes("64MiB").expect_err("a suffix must be refused");
+        assert!(err.contains("bytes"), "unexpected message: {err}");
+        assert!(err.contains('0'), "the message must say what 0 does: {err}");
+    }
+
+    /// The parsed `POWDB_WAL_CHECKPOINT_BYTES` value reaches the engine's
+    /// catalog and bounds the log there. The control half of the assertion is
+    /// the point: without the wiring the catalog keeps
+    /// `DEFAULT_WAL_CHECKPOINT_BYTES` (64 MiB), which no test-sized workload
+    /// reaches, so a one-sided test would pass with the knob doing nothing.
+    #[test]
+    fn env_wal_checkpoint_bytes_is_applied_to_engine() {
+        fn write_notes(dir: &std::path::Path, threshold: Option<u64>) -> u64 {
+            let _ = std::fs::remove_dir_all(dir);
+            let mut engine = Engine::with_memory_limit(dir, DEFAULT_QUERY_MEMORY_LIMIT).unwrap();
+            if let Some(bytes) = threshold {
+                engine.catalog_mut().set_wal_checkpoint_bytes(bytes);
+            }
+            engine
+                .execute_powql("type Note { required body: string }")
+                .expect("create type");
+            for i in 0..400 {
+                engine
+                    .execute_powql(&format!(
+                        "insert Note {{ body := \"{}{i}\" }}",
+                        "x".repeat(64)
+                    ))
+                    .expect("insert");
+            }
+            std::fs::metadata(dir.join("wal.log")).expect("wal").len()
+        }
+
+        let base = std::env::temp_dir().join(format!("powdb_srv_walckpt_{}", std::process::id()));
+        let bounded = write_notes(
+            &base.join("bounded"),
+            Some(parse_wal_checkpoint_bytes("4096").expect("valid")),
+        );
+        let unbounded = write_notes(&base.join("default"), None);
+        assert!(
+            bounded < unbounded,
+            "the threshold did not bound the log: {bounded} bytes with it, {unbounded} without"
+        );
+        assert!(
+            unbounded > 4096,
+            "the workload is too small to prove anything: {unbounded} bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The parsed `POWDB_DIRTY_PAGE_BUDGET` value reaches the engine's catalog.
     /// Without the wiring the catalog keeps `DEFAULT_DIRTY_PAGE_BUDGET`, which
     /// is what made the 256 MiB ceiling unoverridable.
     #[test]
     fn env_dirty_page_budget_is_applied_to_engine() {
-        let budget = parse_positive_count("pages")("32768").expect("valid");
+        let budget = parse_positive_count("bytes")("32768").expect("valid");
         let dir =
             std::env::temp_dir().join(format!("powdb_srv_dirtybudget_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -141,6 +141,56 @@ fn a_refusal_names_the_unit_the_setting_is_actually_in() {
     );
 }
 
+/// Storage checkpoints the WAL once the durable log passes a threshold, so a
+/// long-running server no longer carries every record it ever wrote. The
+/// threshold was reachable only from Rust, so an operator whose workload the
+/// default suits badly could neither raise it nor turn it off.
+#[test]
+fn the_wal_checkpoint_threshold_is_operator_settable() {
+    let (code, stdout, _) = run_to_completion(&["--help"], &[]);
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("--wal-checkpoint-bytes") && stdout.contains("POWDB_WAL_CHECKPOINT_BYTES"),
+        "--help must document the knob: {stdout}"
+    );
+    assert!(
+        stdout.contains("64 MiB") && stdout.contains("0 disables"),
+        "--help must give the default and what 0 means: {stdout}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+    let base = ["--data-dir", data_dir, "--port", "0", "--bind", "127.0.0.1"];
+
+    let mut flag_args = base.to_vec();
+    flag_args.extend_from_slice(&["--wal-checkpoint-bytes", "lots"]);
+    let (code, _, stderr) = run_to_completion(&flag_args, &[]);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--wal-checkpoint-bytes") && stderr.contains("bytes"),
+        "the flag refusal must name the flag and its unit: {stderr}"
+    );
+
+    let (code, _, stderr) = run_to_completion(&base, &[("POWDB_WAL_CHECKPOINT_BYTES", "64MiB")]);
+    assert_eq!(
+        code,
+        Some(2),
+        "a suffixed value must refuse startup, not silently keep the default"
+    );
+    assert!(
+        stderr.contains("POWDB_WAL_CHECKPOINT_BYTES"),
+        "the refusal must name the variable: {stderr}"
+    );
+
+    // 0 is the documented opt-out, so the validator that refuses 0 for every
+    // other budget has to accept it here and the server has to start.
+    let started = stderr_of_a_short_run(dir.path(), &["--wal-checkpoint-bytes", "0"]);
+    assert!(
+        started.contains("wal_checkpoint_bytes=0"),
+        "0 must start the server and be reported: {started}"
+    );
+}
+
 /// A log that nobody is reading as a terminal must carry no ANSI escapes.
 #[test]
 fn no_ansi_escapes_when_stdout_is_not_a_tty() {

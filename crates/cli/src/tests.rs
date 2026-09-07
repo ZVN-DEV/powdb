@@ -541,3 +541,46 @@ fn a_rebootstrap_still_reports_its_error() {
         "a rebootstrap must still surface its error: {text}"
     );
 }
+
+/// The `--wal-checkpoint-bytes` value has to reach the catalog, or the flag is
+/// decoration. Measured while the engine is still open: a clean close
+/// checkpoints and truncates the log, so the file left behind by an exited CLI
+/// is the same size either way.
+#[test]
+fn open_embedded_engine_applies_the_wal_checkpoint_threshold() {
+    fn write_notes(dir: &std::path::Path, threshold: Option<u64>) -> u64 {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let mut engine = crate::embedded::open_embedded_engine(
+            dir.to_str().expect("utf-8 path"),
+            false,
+            threshold,
+        )
+        .expect("open");
+        engine
+            .execute_powql("type Note { required body: string }")
+            .expect("create type");
+        for i in 0..400 {
+            engine
+                .execute_powql(&format!(
+                    "insert Note {{ body := \"{}{i}\" }}",
+                    "x".repeat(64)
+                ))
+                .expect("insert");
+        }
+        std::fs::metadata(dir.join("wal.log")).expect("wal").len()
+    }
+
+    let base = std::env::temp_dir().join(format!("powdb_cli_walckpt_{}", std::process::id()));
+    let bounded = write_notes(&base.join("bounded"), Some(4096));
+    let unbounded = write_notes(&base.join("default"), None);
+    assert!(
+        bounded < unbounded,
+        "the threshold did not bound the log: {bounded} bytes with it, {unbounded} without"
+    );
+    assert!(
+        unbounded > 4096,
+        "the workload is too small to prove anything: {unbounded} bytes"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
