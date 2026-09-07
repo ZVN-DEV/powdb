@@ -230,6 +230,7 @@ fn variant_key(stmt: &powdb_query::ast::Statement) -> &'static str {
         S::DeleteQuery(_) => "DeleteQuery",
         S::CreateType(_) => "CreateType",
         S::CreateLink(_) => "CreateLink",
+        S::DropLink(_) => "DropLink",
         S::AlterTable(_) => "AlterTable",
         S::DropTable(_) => "DropTable",
         S::CreateView(_) => "CreateView",
@@ -291,6 +292,7 @@ fn the_full_role_by_statement_matrix() {
             true,
             false,
         ),
+        ("drop link User.orders", true, true, false),
         ("alter User add column status: str", true, true, false),
         ("drop User", true, true, false),
         ("materialized V as User", true, true, false),
@@ -334,6 +336,7 @@ fn the_full_role_by_statement_matrix() {
         "DeleteQuery",
         "CreateType",
         "CreateLink",
+        "DropLink",
         "AlterTable",
         "DropTable",
         "CreateView",
@@ -433,6 +436,85 @@ fn a_successful_login_clears_the_counters() {
     assert!(
         !is_rate_limited(&limiter, &peer, Some("alice")),
         "the pre-success failures must not still count toward the lockout"
+    );
+}
+
+/// A username longer than a key may hold is truncated, not retained whole.
+///
+/// The name arrives on a CONNECT frame from a peer that has not authenticated,
+/// so its length is the attacker's to choose. Truncation shares a bucket
+/// between names with the same prefix, which can only tighten the limiter.
+#[test]
+fn a_long_username_is_truncated_before_it_becomes_a_key() {
+    let limiter = new_rate_limiter();
+    let peer = ip(5);
+    let long = "u".repeat(4000);
+    record_auth_failure(&limiter, &peer, Some(&long));
+    let table = limiter.lock().unwrap();
+    assert!(
+        table.retained_user_bytes() <= MAX_AUTH_BUCKET_USER_BYTES,
+        "one failure retained {} bytes of username",
+        table.retained_user_bytes()
+    );
+}
+
+/// Truncation cuts on a character boundary, so a multi-byte name still makes
+/// a key rather than panicking on a slice through the middle of a codepoint.
+#[test]
+fn a_multibyte_username_is_cut_on_a_character_boundary() {
+    let limiter = new_rate_limiter();
+    let peer = ip(6);
+    // "€" is three bytes, so byte 64 lands inside a character.
+    record_auth_failure(&limiter, &peer, Some(&"€".repeat(200)));
+    let table = limiter.lock().unwrap();
+    assert!(table.retained_user_bytes() <= MAX_AUTH_BUCKET_USER_BYTES);
+    assert!(!table.is_empty());
+}
+
+/// The table is bounded in entries as well as in key size.
+///
+/// One peer is bounded by its own failure limit, but the number of peers is
+/// not: a single IPv6 /64 supplies more source addresses than any table could
+/// hold, and every entry outlives the connection that created it.
+#[test]
+fn the_failure_table_is_bounded_across_unbounded_peers() {
+    let limiter = new_rate_limiter();
+    for n in 0..(MAX_AUTH_BUCKETS as u128 * 2) {
+        let peer = AuthPeer::Ip(std::net::IpAddr::from(std::net::Ipv6Addr::from(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + n,
+        )));
+        record_auth_failure(&limiter, &peer, Some("alice"));
+    }
+    let table = limiter.lock().unwrap();
+    assert!(
+        table.len() <= MAX_AUTH_BUCKETS,
+        "the table grew to {} buckets against a {MAX_AUTH_BUCKETS} cap",
+        table.len()
+    );
+    assert!(!table.is_empty(), "eviction must not empty the table");
+}
+
+/// Eviction keeps the peers closest to their bound.
+///
+/// A spray of one-failure buckets from throwaway addresses must not be able
+/// to forget a peer that is one guess away from being locked out.
+#[test]
+fn eviction_drops_the_buckets_furthest_from_a_lockout() {
+    let limiter = new_rate_limiter();
+    let hot = ip(7);
+    for _ in 0..MAX_PEER_AUTH_FAILURES {
+        record_auth_failure(&limiter, &hot, Some("alice"));
+    }
+    assert!(is_rate_limited(&limiter, &hot, Some("alice")));
+    for n in 0..(MAX_AUTH_BUCKETS as u128 * 2) {
+        let peer = AuthPeer::Ip(std::net::IpAddr::from(std::net::Ipv6Addr::from(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000u128 + n,
+        )));
+        record_auth_failure(&limiter, &peer, Some("spray"));
+    }
+    assert!(
+        is_rate_limited(&limiter, &hot, Some("alice")),
+        "a spray of throwaway addresses must not clear a standing lockout"
     );
 }
 

@@ -23,8 +23,8 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 pub use self::auth::{
-    authenticate_connect, new_rate_limiter, AuthBucket, AuthOutcome, AuthPeer, AuthRateLimiter,
-    Principal, UserDirectory,
+    authenticate_connect, new_rate_limiter, AuthBucket, AuthFailureTable, AuthOutcome, AuthPeer,
+    AuthRateLimiter, Principal, UserDirectory, MAX_AUTH_BUCKETS, MAX_AUTH_BUCKET_USER_BYTES,
 };
 pub use self::transaction::{
     new_tx_gate, new_tx_gate_with_max_tx_lifetime, new_tx_gate_with_permits, TxGate,
@@ -245,9 +245,24 @@ async fn serve_connection<R, W>(
             password,
             username,
         } => {
+            // Which name the limiter counts a failure against.
+            //
+            // On the shared-password (and open) path `authenticate_connect`
+            // never looks at the username, so counting it there let a peer
+            // reset its own per-user counter by varying a field that changes
+            // nothing: 50 password guesses a minute from one address instead
+            // of 5. It also made an unauthenticated peer the author of the
+            // limiter's keys for the deployment shape that has no user store
+            // at all. With no user store the failure belongs to the peer.
+            let limiter_user = if users.is_empty() {
+                None
+            } else {
+                username.as_deref()
+            };
+
             // Check rate limiting before verifying credentials.
             if let Some(limiter) = rate_limiter {
-                if is_rate_limited(limiter, &auth_peer, username.as_deref()) {
+                if is_rate_limited(limiter, &auth_peer, limiter_user) {
                     warn!(peer = %peer, "rate limited: too many auth failures");
                     let err = error_response(
                         format!(
@@ -274,7 +289,7 @@ async fn serve_connection<R, W>(
                     metrics.inc_auth_failure();
                     // Record the failure for rate limiting.
                     if let Some(limiter) = rate_limiter {
-                        record_auth_failure(limiter, &auth_peer, username.as_deref());
+                        record_auth_failure(limiter, &auth_peer, limiter_user);
                     }
                     let err = error_response("authentication failed", ErrorClass::AuthFailed);
                     write_msg(writer, &err).await;
@@ -285,7 +300,7 @@ async fn serve_connection<R, W>(
                 } => {
                     // Auth succeeded — clear any prior failure count.
                     if let Some(limiter) = rate_limiter {
-                        clear_auth_failures(limiter, &auth_peer, username.as_deref());
+                        clear_auth_failures(limiter, &auth_peer, limiter_user);
                     }
                     match &auth_principal {
                         Some(p) => {

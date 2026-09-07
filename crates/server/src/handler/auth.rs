@@ -129,7 +129,7 @@ impl UserDirectory {
 /// guesses at ANY username locked the legitimate user out of that address for
 /// a minute, which is a denial of service a single bad script can cause; and a
 /// Unix-socket peer has no address at all, so it was never throttled.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum AuthBucket {
     /// One username as attempted from one peer.
     PeerUser {
@@ -142,7 +142,7 @@ pub enum AuthBucket {
 
 /// The peer half of a bucket key. A Unix-socket peer has no address, so every
 /// local connection shares one bucket rather than none.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum AuthPeer {
     Ip(IpAddr),
     /// Any connection over the Unix domain socket.
@@ -160,7 +160,7 @@ impl AuthPeer {
 }
 
 /// Tracks authentication failure counts per bucket.
-pub type AuthRateLimiter = Arc<Mutex<HashMap<AuthBucket, (u32, Instant)>>>;
+pub type AuthRateLimiter = Arc<Mutex<AuthFailureTable>>;
 
 /// Failures at ONE username from one peer before that pair is locked out.
 const MAX_AUTH_FAILURES: u32 = 5;
@@ -169,10 +169,42 @@ const MAX_AUTH_FAILURES: u32 = 5;
 /// out. Higher than the per-user threshold on purpose: it exists to bound a
 /// sweep across many usernames, not to let one wrong username lock out
 /// another.
-const MAX_PEER_AUTH_FAILURES: u32 = 50;
+pub(super) const MAX_PEER_AUTH_FAILURES: u32 = 50;
 
 /// Window during which auth failures are counted (60 seconds).
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The longest username retained inside a rate-limiter key.
+///
+/// The username on a CONNECT frame is chosen by a peer that has not
+/// authenticated yet, and nothing under the 4 KB pre-auth frame limit bounded
+/// it. Every failed handshake used to pin a fresh copy of the whole thing for
+/// the length of the window, outliving the connection that sent it. Keys are
+/// truncated instead: two names sharing a 64-byte prefix share one bucket,
+/// which can only make the limiter stricter, never more permissive. Real
+/// usernames are far shorter than this.
+pub const MAX_AUTH_BUCKET_USER_BYTES: usize = 64;
+
+/// The most failure buckets held at once, across every peer.
+///
+/// One peer is bounded by [`MAX_PEER_AUTH_FAILURES`], but the number of
+/// distinct peers is not: a single IPv6 /64 supplies more source addresses
+/// than this table could ever hold, and each of their entries outlives the
+/// connection that created it. At capacity the table evicts, so its memory is
+/// bounded by this constant whatever an unauthenticated peer does.
+pub const MAX_AUTH_BUCKETS: usize = 4096;
+
+/// How many buckets survive an eviction. The headroom means a full table sorts
+/// itself once per thousand inserts rather than on every one.
+const AUTH_BUCKETS_AFTER_EVICTION: usize = MAX_AUTH_BUCKETS * 3 / 4;
+
+/// How often the expiry sweep runs.
+///
+/// The sweep is an O(n) scan under the limiter's mutex. Running it on every
+/// CONNECT made each legitimate handshake pay for the size of a table an
+/// attacker had inflated; once per second bounds that cost without letting an
+/// expired entry linger meaningfully longer than it used to.
+const AUTH_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a locked-out peer or user must wait, for the client-facing
 /// message. The window is fixed, so this is the whole of it.
@@ -180,9 +212,147 @@ pub(super) fn auth_retry_after_secs() -> u64 {
     AUTH_FAILURE_WINDOW.as_secs()
 }
 
+/// One bucket's failure count and the window it is being counted in.
+#[derive(Clone, Copy, Debug)]
+struct FailureWindow {
+    count: u32,
+    started: Instant,
+}
+
+/// Authentication failure counts, bounded in both key size and entry count.
+///
+/// Every key here is derived from bytes an unauthenticated peer sent, so the
+/// table treats its own size as part of the attack surface: keys are
+/// truncated ([`MAX_AUTH_BUCKET_USER_BYTES`]), the entry count is capped
+/// ([`MAX_AUTH_BUCKETS`]), and eviction is deterministic.
+#[derive(Debug)]
+pub struct AuthFailureTable {
+    buckets: HashMap<AuthBucket, FailureWindow>,
+    last_sweep: Instant,
+}
+
+impl Default for AuthFailureTable {
+    fn default() -> Self {
+        AuthFailureTable {
+            buckets: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+}
+
+impl AuthFailureTable {
+    /// How many buckets are currently held.
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Whether no failure is currently being counted.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Bytes of peer-supplied username retained across every key.
+    ///
+    /// Exposed so the limiter's memory bound can be asserted by a test that
+    /// drives the real handshake, rather than argued from the source.
+    pub fn retained_user_bytes(&self) -> usize {
+        self.buckets
+            .keys()
+            .map(|bucket| match bucket {
+                AuthBucket::PeerUser {
+                    user: Some(user), ..
+                } => user.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Drop every bucket whose window has elapsed.
+    fn sweep(&mut self, now: Instant) {
+        self.buckets
+            .retain(|_, window| now.duration_since(window.started) < AUTH_FAILURE_WINDOW);
+        self.last_sweep = now;
+    }
+
+    fn sweep_if_due(&mut self, now: Instant) {
+        if now.duration_since(self.last_sweep) >= AUTH_SWEEP_INTERVAL {
+            self.sweep(now);
+        }
+    }
+
+    /// Failures counted against `key` inside the current window. An entry
+    /// whose window has elapsed reads as zero whether or not it has been
+    /// swept yet.
+    fn count(&self, key: &AuthBucket, now: Instant) -> u32 {
+        match self.buckets.get(key) {
+            Some(window) if now.duration_since(window.started) < AUTH_FAILURE_WINDOW => {
+                window.count
+            }
+            _ => 0,
+        }
+    }
+
+    /// Count one failure against `key`.
+    fn record(&mut self, key: AuthBucket, now: Instant) {
+        if let Some(window) = self.buckets.get_mut(&key) {
+            if now.duration_since(window.started) >= AUTH_FAILURE_WINDOW {
+                *window = FailureWindow {
+                    count: 1,
+                    started: now,
+                };
+            } else {
+                window.count = window.count.saturating_add(1);
+            }
+            return;
+        }
+        self.make_room(now);
+        self.buckets.insert(
+            key,
+            FailureWindow {
+                count: 1,
+                started: now,
+            },
+        );
+    }
+
+    fn forget(&mut self, key: &AuthBucket) {
+        self.buckets.remove(key);
+    }
+
+    /// Make room for one more bucket.
+    ///
+    /// Expired entries go first. If the table is still full, the buckets
+    /// furthest from locking anybody out are dropped: lowest failure count,
+    /// then oldest window, then key order. The ordering is total, so the same
+    /// table always evicts the same entries, and a spray of one-failure
+    /// buckets can never displace a peer that is close to its bound.
+    fn make_room(&mut self, now: Instant) {
+        if self.buckets.len() < MAX_AUTH_BUCKETS {
+            return;
+        }
+        self.sweep(now);
+        if self.buckets.len() < MAX_AUTH_BUCKETS {
+            return;
+        }
+        let mut ranked: Vec<(u32, Instant, AuthBucket)> = self
+            .buckets
+            .iter()
+            .map(|(key, window)| (window.count, window.started, key.clone()))
+            .collect();
+        ranked.sort_unstable();
+        let evict = self
+            .buckets
+            .len()
+            .saturating_sub(AUTH_BUCKETS_AFTER_EVICTION);
+        for (_, _, key) in ranked.into_iter().take(evict) {
+            self.buckets.remove(&key);
+        }
+    }
+}
+
 /// Create a new shared rate limiter.
 pub fn new_rate_limiter() -> AuthRateLimiter {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(AuthFailureTable::default()))
 }
 
 /// Whether this (peer, user) pair, or the peer as a whole, has failed too many
@@ -192,45 +362,47 @@ pub(super) fn is_rate_limited(
     peer: &AuthPeer,
     user: Option<&str>,
 ) -> bool {
-    let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
-    // Clean up stale entries while we have the lock.
+    let mut table = limiter.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    map.retain(|_, (_, ts)| now.duration_since(*ts) < AUTH_FAILURE_WINDOW);
+    table.sweep_if_due(now);
+    table.count(&pair_bucket(peer, user), now) >= MAX_AUTH_FAILURES
+        || table.count(&AuthBucket::Peer(peer.clone()), now) >= MAX_PEER_AUTH_FAILURES
+}
 
-    let over =
-        |key: &AuthBucket, limit: u32| map.get(key).is_some_and(|(count, _)| *count >= limit);
-    over(&pair_bucket(peer, user), MAX_AUTH_FAILURES)
-        || over(&AuthBucket::Peer(peer.clone()), MAX_PEER_AUTH_FAILURES)
+/// The username as it is stored inside a key: at most
+/// [`MAX_AUTH_BUCKET_USER_BYTES`], cut on a character boundary so the key
+/// stays a valid `String`.
+fn bucket_user_key(user: &str) -> String {
+    let mut end = MAX_AUTH_BUCKET_USER_BYTES.min(user.len());
+    while end > 0 && !user.is_char_boundary(end) {
+        end -= 1;
+    }
+    user[..end].to_string()
 }
 
 fn pair_bucket(peer: &AuthPeer, user: Option<&str>) -> AuthBucket {
     AuthBucket::PeerUser {
         peer: peer.clone(),
-        user: user.map(str::to_string),
+        user: user.map(bucket_user_key),
     }
 }
 
 /// Record an auth failure against both the pair and the peer bucket.
 pub(super) fn record_auth_failure(limiter: &AuthRateLimiter, peer: &AuthPeer, user: Option<&str>) {
-    let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
+    let mut table = limiter.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
+    table.sweep_if_due(now);
     for key in [pair_bucket(peer, user), AuthBucket::Peer(peer.clone())] {
-        let entry = map.entry(key).or_insert((0, now));
-        // Reset counter if the window has elapsed.
-        if now.duration_since(entry.1) >= AUTH_FAILURE_WINDOW {
-            *entry = (1, now);
-        } else {
-            entry.0 += 1;
-        }
+        table.record(key, now);
     }
 }
 
 /// Clear the failure counters a successful authentication settles: this pair,
 /// and the peer bound it contributed to.
 pub(super) fn clear_auth_failures(limiter: &AuthRateLimiter, peer: &AuthPeer, user: Option<&str>) {
-    let mut map = limiter.lock().unwrap_or_else(|e| e.into_inner());
-    map.remove(&pair_bucket(peer, user));
-    map.remove(&AuthBucket::Peer(peer.clone()));
+    let mut table = limiter.lock().unwrap_or_else(|e| e.into_inner());
+    table.forget(&pair_bucket(peer, user));
+    table.forget(&AuthBucket::Peer(peer.clone()));
 }
 
 /// Constant-time password comparison. Hashes both inputs to fixed-size
@@ -256,7 +428,7 @@ pub struct Principal {
 }
 
 /// Whether a parsed statement is data-definition (schema) work: creating,
-/// altering, or dropping a type or view. `explain <ddl>` is classified by its
+/// altering, or dropping a type, link or view. `explain <ddl>` is classified by its
 /// inner statement so `explain drop User` needs the same permission as
 /// `drop User`. Mutations that change *rows* (insert/update/delete/upsert/
 /// refresh) and transaction control are NOT DDL — they fall under `Write`.
@@ -270,6 +442,7 @@ fn is_ddl_statement(stmt: &powdb_query::ast::Statement) -> bool {
         inner,
         Statement::CreateType(_)
             | Statement::CreateLink(_)
+            | Statement::DropLink(_)
             | Statement::AlterTable(_)
             | Statement::DropTable(_)
             | Statement::CreateView(_)
