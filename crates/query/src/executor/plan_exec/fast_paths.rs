@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use crate::executor::row_body_base;
 use crate::executor::Engine;
 
-use super::aggregate::agg_overflow_error;
+use super::aggregate::{agg_overflow_error, CompensatedSum};
 use super::*;
 
 /// Bounded top-N heap for a descending sort, keyed by `(sort key, scan seq)`.
@@ -232,11 +232,9 @@ impl Engine {
             },
             TypeId::Float => match function {
                 AggFunc::Sum => {
-                    // Use a single f64 accumulator. Naive summation is
-                    // sufficient for MVP parity; if precision becomes an
-                    // issue on long scans we can upgrade to Kahan–Neumaier
-                    // compensated sum (~2x scalar cost, zero error growth).
-                    let mut sum: f64 = 0.0;
+                    // Same compensated accumulator as the generic path: a
+                    // float total must not depend on which path read the rows.
+                    let mut sum = CompensatedSum::default();
                     let mut count: i64 = 0;
                     agg_float_loop!(
                         self,
@@ -246,7 +244,7 @@ impl Engine {
                         bitmap_bit,
                         body_data_offset,
                         |v: f64| {
-                            sum += v;
+                            sum.add(v);
                             count += 1;
                         }
                     );
@@ -257,11 +255,11 @@ impl Engine {
                         // question.
                         QueryResult::Scalar(Value::Empty)
                     } else {
-                        QueryResult::Scalar(Value::Float(sum))
+                        QueryResult::Scalar(Value::Float(sum.total()))
                     }
                 }
                 AggFunc::Avg => {
-                    let mut sum: f64 = 0.0;
+                    let mut sum = CompensatedSum::default();
                     let mut count: i64 = 0;
                     agg_float_loop!(
                         self,
@@ -271,14 +269,14 @@ impl Engine {
                         bitmap_bit,
                         body_data_offset,
                         |v: f64| {
-                            sum += v;
+                            sum.add(v);
                             count += 1;
                         }
                     );
                     if count == 0 {
                         QueryResult::Scalar(Value::Empty)
                     } else {
-                        QueryResult::Scalar(Value::Float(sum / count as f64))
+                        QueryResult::Scalar(Value::Float(sum.total() / count as f64))
                     }
                 }
                 AggFunc::Min => {

@@ -553,6 +553,51 @@ fn resolve_direct_group_expr(expr: &Expr, columns: &[String]) -> Result<Option<u
     }
 }
 
+/// Neumaier compensated summation, the one float accumulator the aggregates
+/// share.
+///
+/// A plain `+=` chain makes a float total depend on the order the values
+/// arrive in, and the access path is what fixes that order: a sequential scan
+/// visits insertion order, a range scan visits index order. On a column that
+/// mixes values near 2^53 with small ones the same rows therefore summed to
+/// two different numbers, neither of them the exact total. Carrying the lost
+/// low-order bits in `compensation` and adding them back once at the end
+/// removes the dependence.
+///
+/// Neumaier rather than Kahan: Kahan's correction is only right while the
+/// running total dominates the addend, and here it repeatedly does not (a
+/// small value arriving while the total sits at 2^53, then a 2^53-sized value
+/// arriving while the total is small).
+#[derive(Clone, Copy, Default)]
+pub(super) struct CompensatedSum {
+    sum: f64,
+    compensation: f64,
+}
+
+impl CompensatedSum {
+    pub(super) fn add(&mut self, value: f64) {
+        let total = self.sum + value;
+        if total.is_finite() {
+            // Whichever operand is larger in magnitude keeps its bits; the
+            // other one's lost low bits are what the correction recovers.
+            self.compensation += if self.sum.abs() >= value.abs() {
+                (self.sum - total) + value
+            } else {
+                (value - total) + self.sum
+            };
+        } else {
+            // Infinity and NaN have no meaningful correction, and computing
+            // one would turn an honest infinite total into a NaN.
+            self.compensation = 0.0;
+        }
+        self.sum = total;
+    }
+
+    pub(super) fn total(&self) -> f64 {
+        self.sum + self.compensation
+    }
+}
+
 /// Running total shared by the generic scalar path, the grouped path, the
 /// symmetric (join) path and the window path, so which of those happened to
 /// fire cannot change the answer. Two rules it enforces that the per-path
@@ -574,7 +619,7 @@ fn resolve_direct_group_expr(expr: &Expr, columns: &[String]) -> Result<Option<u
 /// `generic_sum_over_only_nulls_is_int_zero` below.
 pub(super) struct NumericAgg {
     int_sum: i128,
-    float_sum: f64,
+    float_sum: CompensatedSum,
     saw_float: bool,
     count: u64,
 }
@@ -583,7 +628,7 @@ impl NumericAgg {
     pub(super) fn new() -> Self {
         Self {
             int_sum: 0,
-            float_sum: 0.0,
+            float_sum: CompensatedSum::default(),
             saw_float: false,
             count: 0,
         }
@@ -600,7 +645,7 @@ impl NumericAgg {
                     .ok_or_else(|| agg_overflow_error(label))?;
             }
             Value::Float(v) => {
-                self.float_sum += *v;
+                self.float_sum.add(*v);
                 self.saw_float = true;
             }
             Value::Empty => return Ok(()),
@@ -620,7 +665,7 @@ impl NumericAgg {
             return Ok(Value::Empty);
         }
         if self.saw_float {
-            return Ok(Value::Float(self.float_sum + self.int_sum as f64));
+            return Ok(Value::Float(self.float_sum.total() + self.int_sum as f64));
         }
         i64::try_from(self.int_sum)
             .map(Value::Int)
@@ -634,7 +679,7 @@ impl NumericAgg {
         if self.count == 0 {
             Value::Empty
         } else {
-            Value::Float((self.float_sum + self.int_sum as f64) / self.count as f64)
+            Value::Float((self.float_sum.total() + self.int_sum as f64) / self.count as f64)
         }
     }
 }
