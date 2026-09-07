@@ -525,6 +525,7 @@ fn collect_join_scope_columns(catalog: &Catalog, plan: &PlanNode, out: &mut Vec<
 }
 
 /// Resolution context for [`validate_column_references`].
+#[derive(Clone)]
 struct ColumnScope {
     /// Every name the plan can produce: scan columns, projection outputs, and
     /// synthetic group/aggregate/window output names.
@@ -659,6 +660,85 @@ fn comparable_column(expr: &Expr, ctx: &ColumnScope) -> Option<(String, TypeId)>
     }
     let type_id = resolve_scan_type(&name, &ctx.scope)?;
     Some((name, type_id))
+}
+
+/// Reject a `like` whose subject or pattern is known not to be text.
+///
+/// `like_match` only ever runs on a `(Str, Str)` pair; every other pair
+/// evaluates to false, so `.n like "abc"` on an int column and `.s like 5`
+/// both returned an empty result where `=` returns a typed error for the same
+/// mistake. Only operands whose type is fixed before execution are judged: a
+/// computed expression, a cast, a json path or a bound parameter is left to
+/// run.
+fn like_type_error(left: &Expr, right: &Expr, ctx: &ColumnScope) -> Option<String> {
+    like_operand_error(left, ctx, "subject").or_else(|| like_operand_error(right, ctx, "pattern"))
+}
+
+fn like_operand_error(expr: &Expr, ctx: &ColumnScope, role: &str) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(_)) => None,
+        Expr::Literal(literal) => Some(format!(
+            "type mismatch: the 'like' {role} must be str, got {}",
+            literal_type_name(literal)
+        )),
+        _ => match comparable_column(expr, ctx)? {
+            (_, TypeId::Str) => None,
+            (name, type_id) => Some(format!(
+                "type mismatch for column '{name}': 'like' matches str, not {}",
+                type_id_to_name(type_id)
+            )),
+        },
+    }
+}
+
+/// The type a grouped aggregate's output column carries, so `having` can be
+/// type-checked against it.
+fn aggregate_output_type(aggregate: &GroupAgg, input: &ColumnScope) -> Option<TypeId> {
+    match aggregate.function {
+        AggFunc::Count | AggFunc::CountDistinct => Some(TypeId::Int),
+        AggFunc::Avg => Some(TypeId::Float),
+        // A sum keeps the summed column's own type, and min/max return one of
+        // the values themselves.
+        AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+            comparable_column(&aggregate.argument, input).map(|(_, type_id)| type_id)
+        }
+    }
+}
+
+/// The scope a `having` predicate actually resolves against: the grouped row,
+/// whose columns are the group keys and the aggregate outputs.
+///
+/// Both are in `rebound` for every other clause, because after grouping the
+/// name no longer describes the scan column it came from. For `having` that is
+/// exactly backwards: it is the only clause that reads the grouped row, and the
+/// key and aggregate output types are known here. Without them
+/// `having count(.id) = "x"` and `having .s = 5` were the one place a mistyped
+/// comparison stayed silent.
+fn having_scope(ctx: &ColumnScope, keys: &[GroupKey], aggregates: &[GroupAgg]) -> ColumnScope {
+    // The key and aggregate ARGUMENTS read the pre-grouping row, where this
+    // node's own output names do not shadow anything.
+    let mut input = ctx.clone();
+    for name in keys
+        .iter()
+        .map(|key| &key.output_name)
+        .chain(aggregates.iter().map(|agg| &agg.output_name))
+    {
+        input.rebound.remove(name);
+    }
+    let mut grouped = ctx.clone();
+    for key in keys {
+        if let Some((_, type_id)) = comparable_column(&key.expr, &input) {
+            grouped.rebound.remove(&key.output_name);
+            grouped.scope.push((key.output_name.clone(), type_id));
+        }
+    }
+    for aggregate in aggregates {
+        if let Some(type_id) = aggregate_output_type(aggregate, &input) {
+            grouped.rebound.remove(&aggregate.output_name);
+            grouped.scope.push((aggregate.output_name.clone(), type_id));
+        }
+    }
+    grouped
 }
 
 /// Reject `column <cmp> literal` (either orientation) when the two sides
@@ -865,6 +945,11 @@ fn check_expr_columns(expr: &Expr, ctx: &ColumnScope) -> Result<(), QueryError> 
                     return Err(QueryError::Execution(message));
                 }
             }
+            if *op == BinOp::Like {
+                if let Some(message) = like_type_error(left, right, ctx) {
+                    return Err(QueryError::Execution(message));
+                }
+            }
             if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
                 if let Some(error) = arithmetic_type_error(left, *op, right, ctx) {
                     return Err(error);
@@ -955,7 +1040,7 @@ fn check_plan_columns(plan: &PlanNode, ctx: &ColumnScope) -> Result<(), QueryErr
                 check_expr_columns(&aggregate.argument, ctx)?;
             }
             if let Some(having) = having {
-                check_expr_columns(having, ctx)?;
+                check_expr_columns(having, &having_scope(ctx, keys, aggregates))?;
             }
             check_plan_columns(input, ctx)
         }
