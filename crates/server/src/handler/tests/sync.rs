@@ -908,6 +908,128 @@ fn a_pull_chunk_never_exceeds_the_units_every_released_decoder_accepts() {
     }
 }
 
+/// The unit count a decoder reads out of an encoded `SYNC_PULL_RESULT` frame.
+///
+/// The boundary below has to be pinned against the bytes, not against the
+/// `units` vector the handler happens to be holding: the contract is with the
+/// v0.27.0 decoder, which this repository no longer contains, and the only
+/// thing that decoder sees is this `u32`. `MSG_SYNC_PULL_RESULT` encodes as
+/// `[type(1)][flags(1)][len(4)]` then `status ++ count(4) ++ units ++
+/// has_more(1)`, so re-encoding the same status with an empty unit list
+/// recovers where the status block ends and the count begins.
+fn declared_unit_count(message: &Message) -> u32 {
+    const FRAME_HEADER_LEN: usize = 6;
+    let Message::SyncPullResult {
+        status, has_more, ..
+    } = message
+    else {
+        panic!("expected a SyncPullResult, got {message:?}");
+    };
+    let empty = Message::SyncPullResult {
+        status: status.clone(),
+        units: Vec::new(),
+        has_more: *has_more,
+    }
+    .encode();
+    // `empty` is header ++ status ++ count(4) ++ has_more(1).
+    let count_at = FRAME_HEADER_LEN + (empty.len() - FRAME_HEADER_LEN - 5);
+    let frame = message.encode();
+    u32::from_le_bytes(frame[count_at..count_at + 4].try_into().unwrap())
+}
+
+/// A transaction that closes on the last unit the ceiling allows is served
+/// whole: the cap is exactly [`V0_27_DECODER_UNIT_CEILING`], not one below it.
+///
+/// This is a WIRE constraint, not a resource one. It exists because of what
+/// the peer on the other end can decode, so it may not be widened *or*
+/// narrowed as a tuning decision; see [`MAX_SYNC_PULL_UNITS`]. This test is
+/// the "must still serve" half, and it is what stops the cap being quietly
+/// tightened; its sibling below is the "must never serve one more" half.
+#[test]
+fn a_transaction_filling_the_4096_unit_ceiling_exactly_is_still_served_whole() {
+    // begin + rows + commit, so the ceiling is reached on the commit itself.
+    let rows = u64::from(V0_27_DECODER_UNIT_CEILING) - 2;
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, through_lsn) = engine_with_one_transaction(&dir, rows);
+    assert_eq!(through_lsn, u64::from(V0_27_DECODER_UNIT_CEILING));
+    let principal = admin_principal();
+
+    let message = dispatch_sync_pull(
+        &engine,
+        pull_for(0, MAX_SYNC_PULL_UNITS, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    );
+    assert_eq!(
+        declared_unit_count(&message),
+        V0_27_DECODER_UNIT_CEILING,
+        "a transaction that ends exactly on the ceiling must be served, not \
+         answered with a rebootstrap the replica cannot avoid"
+    );
+    match message {
+        Message::SyncPullResult { status, units, .. } => {
+            assert_eq!(units.last().unwrap().lsn, through_lsn);
+            assert_eq!(status.repair_action, WireSyncRepairAction::Pull);
+        }
+        other => panic!("expected the whole transaction, got {other:?}"),
+    }
+}
+
+/// One unit past the ceiling is never put on the wire, whatever it costs.
+///
+/// This is a WIRE constraint, not a resource one: a 4097-unit frame is not
+/// merely large, it is undecodable by every peer released through v0.27.0
+/// (`count > MAX_SYNC_UNITS => "too many retained units"`), and on the
+/// TypeScript replica that refusal drops the socket with no typed error, so
+/// the replica retries the identical cut forever. Serving 4097 must therefore
+/// stay impossible even though the transaction closes there and the byte
+/// budget has room; the replica is told to rebootstrap instead.
+///
+/// Do not "optimise" the cap away by relaxing the comparison in
+/// `build_pull_chunk`: relaxing it by one is exactly the frame this pins.
+#[test]
+fn a_transaction_one_unit_past_the_4096_unit_ceiling_is_refused_not_served() {
+    // begin + rows + commit lands the commit one unit past the ceiling.
+    let rows = u64::from(V0_27_DECODER_UNIT_CEILING) - 1;
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, through_lsn) = engine_with_one_transaction(&dir, rows);
+    assert_eq!(through_lsn, u64::from(V0_27_DECODER_UNIT_CEILING) + 1);
+    let principal = admin_principal();
+
+    let message = dispatch_sync_pull(
+        &engine,
+        pull_for(0, MAX_SYNC_PULL_UNITS, MAX_SYNC_PULL_BYTES),
+        true,
+        Some(&principal),
+    );
+    let declared = declared_unit_count(&message);
+    assert!(
+        declared <= V0_27_DECODER_UNIT_CEILING,
+        "the primary declared {declared} units in one frame; a peer released \
+         through v0.27.0 refuses more than {V0_27_DECODER_UNIT_CEILING} and \
+         drops the connection without a typed error"
+    );
+    assert_eq!(
+        declared, 0,
+        "a transaction that cannot close inside the ceiling is unservable, so \
+         the frame carries no units at all"
+    );
+    match message {
+        Message::SyncPullResult { status, .. } => {
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+            assert!(status.stale);
+            let reason = status
+                .last_sync_error
+                .expect("an unservable replica must be told why");
+            assert!(
+                reason.contains("transaction"),
+                "reason must name the transaction, got: {reason}"
+            );
+        }
+        other => panic!("expected a rebootstrap status, got {other:?}"),
+    }
+}
+
 /// The one case that genuinely cannot be served: a transaction too large for
 /// the byte budget. The replica has to hear "rebootstrap" with a reason, not
 /// a bare error with `repairAction: "pull"` that it will retry forever.
