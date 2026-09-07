@@ -24,16 +24,32 @@ use super::auth::Principal;
 use super::classify::error_response;
 use super::transaction::TxGate;
 
-/// The largest `maxUnits` a replica may ask for. It is a *hint*: a chunk that
-/// would end inside a transaction runs on to the commit or rollback that
-/// closes it, because a chunk cut mid-transaction is not applyable and every
-/// later pull would make the identical cut. Only [`MAX_SYNC_PULL_BYTES`] and
-/// [`MAX_SYNC_PULL_UNITS_HARD`] actually bound a chunk.
+/// The largest `maxUnits` a replica may ask for, and the most units this
+/// server will put in one pull frame.
+///
+/// As a request bound it is a *hint*: a chunk that would end inside a
+/// transaction runs on to the commit or rollback that closes it, because a
+/// chunk cut mid-transaction is not applyable and every later pull would make
+/// the identical cut. So a replica that asks for 512 can be served more.
+///
+/// As a serving bound it is a hard cap, and it is a WIRE CONSTRAINT rather
+/// than a resource one. Every released decoder through v0.27.0 refuses a
+/// `SYNC_PULL_RESULT` declaring more than 4096 units
+/// (`git show e310560:crates/server/src/protocol.rs`, `MAX_SYNC_UNITS`), and
+/// on the TypeScript replica that refusal is a frame-level decode failure that
+/// drops the socket rather than a typed sync error, so every retry cuts the
+/// same chunk and tears the connection down again. A transaction this server
+/// cannot fit inside the cap is answered with the same rebootstrap status the
+/// byte budget produces: a frame every peer can decode, carrying a reason.
+///
+/// Serving more than this needs a negotiated feature, because neither peer can
+/// otherwise tell what the other decodes.
 pub(super) const MAX_SYNC_PULL_UNITS: u32 = 4096;
 
-/// Absolute ceiling on the units in one pull chunk, whatever the byte budget
-/// allows. Bounds a single request even when units are tiny, and bounds the
-/// ack range validated against a served chunk.
+/// Absolute ceiling on the ack range validated against a served chunk.
+///
+/// A served chunk is bounded by [`MAX_SYNC_PULL_UNITS`], so this only bounds
+/// the scan an acknowledgement can ask for.
 pub(super) const MAX_SYNC_PULL_UNITS_HARD: u32 = 262_144;
 
 /// Units read from the retained tail per round while a chunk is being built.
@@ -773,14 +789,18 @@ enum PullChunk {
 /// transaction boundary: stopping anywhere else produces a chunk the replica
 /// must refuse, and since every later pull would cut at the same place, the
 /// replica would be wedged for good. The chunk therefore runs on to the next
-/// commit or rollback, bounded by `max_bytes` and
-/// [`MAX_SYNC_PULL_UNITS_HARD`].
+/// commit or rollback, bounded by `max_bytes` and `max_units`.
+///
+/// `max_units` is the hard one, and it is a wire bound: see
+/// [`MAX_SYNC_PULL_UNITS`]. A transaction that does not close inside it is
+/// answered as a rebootstrap, exactly as one that does not fit `max_bytes`.
 fn build_pull_chunk(
     segment_dir: &Path,
     identity: SegmentIdentity,
     since_lsn: u64,
     through_lsn: u64,
     hint_units: usize,
+    max_units: usize,
     max_bytes: u64,
 ) -> PullChunk {
     let mut boundary = powdb_sync::V1ApplyBoundary::new();
@@ -815,7 +835,7 @@ fn build_pull_chunk(
                 }
             };
             if selected_bytes.saturating_add(unit_bytes) > max_bytes
-                || wire_units.len() >= MAX_SYNC_PULL_UNITS_HARD as usize
+                || wire_units.len() >= max_units
             {
                 budget_stopped = true;
                 break 'fill;
@@ -841,7 +861,8 @@ fn build_pull_chunk(
             .map(|tx_id| format!("transaction {tx_id}"))
             .unwrap_or_else(|| "the next transaction".to_string());
         return PullChunk::Rebootstrap(format!(
-            "sync pull cannot fit {open} within the {max_bytes}-byte budget (server cap {MAX_SYNC_PULL_BYTES}); rebootstrap the replica"
+            "sync pull cannot fit {open} within the {max_bytes}-byte budget (server cap {MAX_SYNC_PULL_BYTES}) \
+             and {max_units}-unit chunk cap; rebootstrap the replica"
         ));
     }
     wire_units.truncate(applyable_len);
@@ -1095,6 +1116,7 @@ pub(super) fn dispatch_sync_pull_decision(
         request.since_lsn,
         servable_through_lsn,
         hint_units,
+        MAX_SYNC_PULL_UNITS as usize,
         request.max_bytes,
     ) {
         PullChunk::Units(units) => units,

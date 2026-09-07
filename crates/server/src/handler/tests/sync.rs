@@ -828,11 +828,13 @@ fn engine_with_one_transaction(dir: &tempfile::TempDir, rows: u64) -> (Arc<RwLoc
 /// server refused it. Every subsequent pull made the identical cut, so the
 /// replica was wedged with `repairAction: "pull"` and no error to act on.
 /// `maxUnits` is a hint now: the chunk runs on to the commit that closes the
-/// transaction it is standing in.
+/// transaction it is standing in, up to what every peer's decoder accepts
+/// ([`MAX_SYNC_PULL_UNITS`]).
 #[test]
 fn sync_pull_extends_past_max_units_to_the_transaction_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let (engine, through_lsn) = engine_with_one_transaction(&dir, 4998);
+    let (engine, through_lsn) = engine_with_one_transaction(&dir, 3000);
+    assert!(through_lsn < u64::from(MAX_SYNC_PULL_UNITS));
     let principal = admin_principal();
 
     match dispatch_sync_pull(
@@ -849,10 +851,34 @@ fn sync_pull_extends_past_max_units_to_the_transaction_boundary() {
     }
 }
 
+/// The most retained units a `SYNC_PULL_RESULT` may declare before a v0.27.0
+/// peer refuses the frame outright.
+///
+/// `git show e310560:crates/server/src/protocol.rs` — `MAX_SYNC_UNITS: usize =
+/// 4096`, checked in the `MSG_SYNC_PULL_RESULT` decode arm as
+/// `count > MAX_SYNC_UNITS => "too many retained units"`. On the Rust peer
+/// that is a frame decode error; on the TypeScript replica it is not a
+/// `ResultTooLargeError`, so `onData` routes it to `onClose` and the socket is
+/// dropped with no diagnostic. Every retry cuts the identical chunk, so the
+/// replica loops on socket teardown: strictly worse than the typed answer the
+/// v0.27.0 primary gave for the same transaction.
+const V0_27_DECODER_UNIT_CEILING: u32 = 4096;
+
+/// A transaction too large for one frame is answered with a rebootstrap the
+/// replica can act on, never with a frame an older peer cannot decode.
+///
+/// Running a chunk on to the commit boundary is right, but it must not run
+/// past what the peer on the other end accepts, and nothing in the handshake
+/// says what that is. Until a feature is negotiated for it, the ceiling is the
+/// oldest decoder still in the field.
 #[test]
-fn sync_pull_serves_a_transaction_larger_than_the_unit_cap() {
+fn a_pull_chunk_never_exceeds_the_units_every_released_decoder_accepts() {
+    assert_eq!(
+        MAX_SYNC_PULL_UNITS, V0_27_DECODER_UNIT_CEILING,
+        "the served chunk cap is a wire constraint, not a resource one"
+    );
     let dir = tempfile::tempdir().unwrap();
-    let (engine, through_lsn) = engine_with_one_transaction(&dir, 50_000);
+    let (engine, _) = engine_with_one_transaction(&dir, 50_000);
     let principal = admin_principal();
 
     match dispatch_sync_pull(
@@ -861,27 +887,24 @@ fn sync_pull_serves_a_transaction_larger_than_the_unit_cap() {
         true,
         Some(&principal),
     ) {
-        Message::SyncPullResult {
-            units, has_more, ..
-        } => {
-            assert_eq!(units.len() as u64, through_lsn);
-            assert_eq!(units.last().unwrap().lsn, through_lsn);
-            assert!(!has_more);
+        Message::SyncPullResult { status, units, .. } => {
+            assert!(
+                units.len() as u32 <= V0_27_DECODER_UNIT_CEILING,
+                "the primary served {} units in one frame; a v0.27.0 peer refuses \
+                 more than {V0_27_DECODER_UNIT_CEILING} and drops the connection",
+                units.len()
+            );
+            assert!(units.is_empty());
+            assert_eq!(status.repair_action, WireSyncRepairAction::Rebootstrap);
+            let reason = status
+                .last_sync_error
+                .expect("an unservable replica must be told why");
+            assert!(
+                reason.contains("transaction"),
+                "reason must name the transaction, got: {reason}"
+            );
         }
-        other => panic!("expected a 50002-unit chunk, got {other:?}"),
-    }
-
-    // The replica now acks a range far longer than the old 4096-unit ceiling.
-    match dispatch_sync_ack(
-        &engine,
-        "replica-a".into(),
-        through_lsn,
-        through_lsn,
-        true,
-        Some(&principal),
-    ) {
-        Message::SyncAckResult { applied_lsn, .. } => assert_eq!(applied_lsn, through_lsn),
-        other => panic!("expected the ack to be accepted, got {other:?}"),
+        other => panic!("expected a rebootstrap status, got {other:?}"),
     }
 }
 

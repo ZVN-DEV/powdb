@@ -58,14 +58,15 @@ const MAX_PARAMS: usize = 4096;
 
 /// Maximum retained units accepted in one sync pull frame.
 ///
-/// A pull chunk is extended to the next commit boundary, so one frame has to
-/// be able to carry a whole transaction however large it is. At 4096 a
-/// committed transaction of ~5000 rows could never be pulled at all and the
-/// replica wedged on it permanently. This matches `MAX_SYNC_UNITS` in
+/// This is what this build will DECODE, not what it will send: a server serves
+/// at most `MAX_SYNC_PULL_UNITS` (4096) per frame, which is the ceiling every
+/// released decoder through v0.27.0 accepts. Widening what we accept is safe
+/// in a mixed fleet and widening what we send is not, so the two numbers are
+/// deliberately different. It matches `MAX_SYNC_UNITS` in
 /// `clients/ts/src/protocol.ts`: the two implementations of this protocol have
-/// to agree, or one peer refuses frames the other will send. The decoder still
-/// sizes its unit vector from the payload length, not from this count, so the
-/// higher ceiling is not an allocation amplifier.
+/// to agree on what they accept. The decoder sizes its unit vector from the
+/// payload length, not from this count, so the higher ceiling is not an
+/// allocation amplifier.
 const MAX_SYNC_UNITS: usize = 262_144;
 
 const STRING_LEN_PREFIX: usize = 4; // decode_string reads a 4-byte length prefix
@@ -2774,16 +2775,18 @@ mod tests {
         }
     }
 
-    /// A committed transaction can hold far more than 4096 retained units, and
-    /// the sync handler now extends a pull chunk to the next commit boundary
-    /// rather than cutting a transaction in half. The wire decoder has to be
-    /// able to carry that chunk, or the replica can never pull the transaction
-    /// and stays wedged on it forever.
+    /// What this build DECODES is wider than what it serves, on purpose.
+    ///
+    /// A committed transaction can hold far more than 4096 retained units, so
+    /// a future negotiated large chunk has to be decodable here. What a server
+    /// SENDS stays at `MAX_SYNC_PULL_UNITS` (4096) until such a feature is
+    /// negotiated, because every released decoder through v0.27.0 refuses more
+    /// than that: accepting more than the old peers is safe, sending more is
+    /// not.
     ///
     /// The ceiling is also a contract with the other implementation of this
     /// protocol: `clients/ts/src/protocol.ts` ships `MAX_SYNC_UNITS =
-    /// 262_144`, and a peer that refuses what the other peer will send is a
-    /// protocol disagreement, not a safety limit.
+    /// 262_144`, and the two have to agree on what they accept.
     #[test]
     fn a_pull_chunk_larger_than_the_old_ceiling_still_decodes() {
         assert_eq!(
