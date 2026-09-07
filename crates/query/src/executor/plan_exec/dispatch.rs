@@ -50,11 +50,10 @@ impl Engine {
         // FunctionCall the grouped-aggregate planner could not lower. Without
         // this, such an aggregate would reach eval_expr and silently evaluate
         // to Empty (a wrong answer). The outermost call validates the whole
-        // tree before any row is produced.
-        validate_no_stray_aggregates(plan)?;
-        validate_json_path_types(&self.catalog, plan)?;
-        validate_column_references(&self.catalog, plan)?;
-        validate_slice_counts(plan)?;
+        // tree before any row is produced; the same call also refuses unknown
+        // tables and columns, mistyped comparisons, mistyped JSON path bases
+        // and negative slice counts, against the catalog as it is right now.
+        validate_plan(&self.catalog, plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }

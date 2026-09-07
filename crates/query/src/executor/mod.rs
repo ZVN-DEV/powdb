@@ -263,8 +263,7 @@ use self::plan_exec::{
     cooperative_stable_sort_by, counts_every_row, exec_group_by, exec_group_by_with_provenance,
     execute_materialized_join, execute_window, for_each_row_raw_cancellable, format_plan_tree,
     literal_limit, predicate_column_indices_json, range_matches, synthesize_range_predicate,
-    union_rows, validate_column_references, validate_json_path_types, validate_no_stray_aggregates,
-    validate_slice_counts, LoweredPlan,
+    union_rows, validate_plan, LoweredPlan,
 };
 
 /// Mission infra-1: classify a parsed statement as read-only vs. mutating.
@@ -1591,12 +1590,11 @@ impl Engine {
         if plan_reads_dirty_view(plan, &self.view_registry) {
             return Err(QueryError::ReadonlyNeedsWrite);
         }
-        // Mirror the mutable path: reject a stray aggregate FunctionCall before
-        // evaluating any row (see execute_plan for the rationale).
-        validate_no_stray_aggregates(plan)?;
-        validate_json_path_types(&self.catalog, plan)?;
-        validate_column_references(&self.catalog, plan)?;
-        validate_slice_counts(plan)?;
+        // Mirror the mutable path: reject a stray aggregate FunctionCall, an
+        // unknown table or column, a mistyped comparison or JSON path base and
+        // a negative slice count before evaluating any row (see `dispatch_mut`
+        // for the rationale).
+        validate_plan(&self.catalog, plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }

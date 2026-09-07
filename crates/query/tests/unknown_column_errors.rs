@@ -246,3 +246,51 @@ fn zero_and_positive_limits_still_work() {
         other => panic!("expected rows, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The check runs against the catalog as it is at execution time
+// ---------------------------------------------------------------------------
+
+/// The plan cache outlives DDL and is keyed on query text, so the second
+/// execution of the same text is a cache hit. The unknown-column check must
+/// resolve against the catalog as it is NOW, not as it was when the plan was
+/// built: a column dropped between two executions has to be refused on the
+/// second one, on both the mutable and the read-only path.
+#[test]
+fn a_column_dropped_between_two_cached_executions_is_still_rejected() {
+    let (_dir, mut engine) = fixture();
+    let filter = "User filter .age > 25 { .name }";
+    let project = "User { .name, .age }";
+    // First executions plan and cache; both must succeed against the live
+    // schema (mutable path first, then the read-only path).
+    for query in [filter, project] {
+        engine
+            .execute_powql(query)
+            .unwrap_or_else(|err| panic!("`{query}` must be accepted before the drop: {err}"));
+        engine
+            .execute_powql_readonly(query)
+            .unwrap_or_else(|err| panic!("`{query}` must be accepted before the drop: {err}"));
+    }
+    engine.execute_powql("alter User drop column age").unwrap();
+    // Same text, so a plan-cache hit. The column is gone.
+    assert_column_not_found(&mut engine, filter, "age");
+    assert_column_not_found(&mut engine, project, "age");
+    for query in [filter, project] {
+        let err = match engine.execute_powql_readonly(query) {
+            Err(err) => err,
+            Ok(ok) => panic!("`{query}` must be rejected on the read-only path, got {ok:?}"),
+        };
+        assert!(
+            err.to_string().contains("column 'age' not found"),
+            "`{query}` (read-only): got {err}"
+        );
+    }
+    // The surviving column must still answer through the same cached plans.
+    match engine.execute_powql("User { .name }").unwrap() {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["name"]);
+            assert_eq!(rows.len(), 3);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

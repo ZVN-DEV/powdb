@@ -27,7 +27,7 @@ pub(crate) fn counts_every_row(argument: Option<&Expr>) -> bool {
 /// A fast path that carries its own bound must **decline** on `None` and let the
 /// generic `PlanNode::Limit` arm run: that arm is the single place that reports
 /// `limit must be integer literal`, and negative counts are already refused up
-/// front by [`validate_slice_counts`]. Substituting `usize::MAX` for a count the
+/// front by `validate_slice_counts` (`validate.rs`). Substituting `usize::MAX` for a count the
 /// fast path could not read is what made `F limit 1 + 1 { .id }` answer the whole
 /// table while the same query without the projection was rejected, and because
 /// the top-N heap takes its capacity from the same number, it also lifted the
@@ -354,7 +354,4 @@ pub(crate) use join::execute_materialized_join;
 pub(crate) use lowering::{
     format_plan_tree, range_matches, synthesize_range_predicate, LoweredPlan,
 };
-pub(crate) use validate::{
-    predicate_column_indices_json, validate_column_references, validate_json_path_types,
-    validate_no_stray_aggregates, validate_slice_counts,
-};
+pub(crate) use validate::{predicate_column_indices_json, validate_plan};

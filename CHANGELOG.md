@@ -1026,6 +1026,21 @@ refused.** These announce themselves, but they fail work that previously ran:
   regression dated from 0.19.1 and went unmeasured because the workload sat in
   the benchmark baseline but not in the comparator's gated list until now.
 
+- **A query no longer rebuilds its validation scaffolding on every execution.**
+  Since 0.20.0 every execution, plan-cache hits included, checks the plan
+  against the catalog as it is right now: unknown tables and columns, mistyped
+  comparisons, mistyped JSON path bases, negative slice counts and stray
+  aggregates. Those checks stay where they are, because a column dropped between
+  two executions of a cached plan must still be refused on the second one (a
+  test now holds that on both the mutable and the read-only path). What changes
+  is their cost. Each check used to gather the scan columns for itself, three
+  walks plus a fourth for the join ambiguity check, cloning every column name
+  into a fresh string and building hash sets of them per query. They now share
+  one walk and borrow every name they resolve, the projection names that can
+  shadow a JSON path base are collected only when the plan carries a `->` path,
+  and the join ambiguity walk is skipped for a single-table plan. On a point
+  lookup that scaffolding was a large share of the wall time.
+
 ### Security
 
 - **The auth rate limiter is bounded in key size and entry count.** A failed

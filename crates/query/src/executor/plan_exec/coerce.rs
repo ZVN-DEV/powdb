@@ -20,12 +20,14 @@
 //! and a literal that cannot be coerced is a typed error naming the column and
 //! the expected format instead of a silently empty result.
 
+use std::borrow::Cow;
+
 use super::*;
 use crate::executor::eval::coerce_value;
 use crate::result::QueryError;
 use powdb_storage::catalog::Catalog;
 
-use super::validate::{collect_rebound_names, collect_scan_columns, resolve_scan_type};
+use super::validate::{collect_rebound_names, collect_scan_columns, resolve_scan_type, ScanColumn};
 
 /// Rewrite every comparison literal that addresses a `datetime`/`uuid`/`bytes`
 /// column into that column's `Value`. Returns the rewritten plan, or the typed
@@ -34,10 +36,10 @@ pub(crate) fn coerce_typed_literals(
     catalog: &Catalog,
     plan: &PlanNode,
 ) -> Result<PlanNode, QueryError> {
-    let mut scope: Vec<(String, TypeId)> = Vec::new();
+    let mut scope = Vec::new();
     collect_scan_columns(catalog, plan, &mut scope);
-    let mut rebound = std::collections::HashSet::new();
-    let mut computed = std::collections::HashSet::new();
+    let mut rebound = Vec::new();
+    let mut computed = Vec::new();
     collect_rebound_names(plan, &mut rebound, &mut computed);
     let ctx = TypedScope {
         catalog,
@@ -55,23 +57,25 @@ fn is_string_spelled(type_id: TypeId) -> bool {
 }
 
 /// Resolution context: the scan columns in scope and the names a projection or
-/// aggregation rebinds (whose scan type no longer describes them).
+/// aggregation rebinds (whose scan type no longer describes them). Both borrow
+/// their names (from the catalog and the plan) for the duration of the pass;
+/// this runs on every execution, so it must not clone them.
 struct TypedScope<'a> {
     catalog: &'a Catalog,
-    scope: Vec<(String, TypeId)>,
-    rebound: std::collections::HashSet<String>,
+    scope: Vec<ScanColumn<'a>>,
+    rebound: Vec<&'a str>,
 }
 
 impl TypedScope<'_> {
     /// The declared type of `expr` when it is a bare column reference that
     /// resolves to exactly one string-spelled scan type.
-    fn typed_column(&self, expr: &Expr) -> Option<(String, TypeId)> {
-        let name = match expr {
-            Expr::Field(name) => name.clone(),
-            Expr::QualifiedField { qualifier, field } => format!("{qualifier}.{field}"),
+    fn typed_column<'e>(&self, expr: &'e Expr) -> Option<(Cow<'e, str>, TypeId)> {
+        let name: Cow<'e, str> = match expr {
+            Expr::Field(name) => Cow::Borrowed(name.as_str()),
+            Expr::QualifiedField { qualifier, field } => Cow::Owned(format!("{qualifier}.{field}")),
             _ => return None,
         };
-        if self.rebound.contains(&name) {
+        if self.rebound.iter().any(|rebound| *rebound == name) {
             return None;
         }
         let type_id = resolve_scan_type(&name, &self.scope)?;
