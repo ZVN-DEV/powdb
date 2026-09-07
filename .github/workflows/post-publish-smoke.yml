@@ -231,6 +231,13 @@ jobs:
       contents: read
       attestations: read
     steps:
+      # The floating channel tag is derived, not hardcoded: release.yml pushes
+      # `latest` for a final and `rc` for a candidate, and both come out of
+      # scripts/ci/release-channel.sh. Checking the repo out means this leg asks
+      # the same source of truth rather than keeping a second copy of the rule.
+      - name: Checkout (for scripts/ci/release-channel.sh)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Pull, inspect and run the published image
         env:
           SMOKE_VERSION: ${{ inputs.version }}
@@ -242,20 +249,37 @@ jobs:
           # is what a user gets and what a package accidentally flipped to
           # private would fail.
 
-          # All three tags a release pushes must resolve. The bare semver tag
-          # ("0.28.0", the spelling crates.io and npm use) was missing until the
-          # v0.28.0 release, so this leg fails for anything older, which is the
-          # honest verdict rather than a skip.
-          for tag in "v$SMOKE_VERSION" "$SMOKE_VERSION"; do
+          # All three tags a release pushes must resolve, and this loop used to
+          # pull two of them: the floating channel pointer was named in the
+          # comment and in release.yml's tag list and checked by nothing, so a
+          # release that moved `latest` to the wrong digest, or never moved it
+          # at all, passed this smoke. The bare semver tag ("0.28.0", the
+          # spelling crates.io and npm use) was missing until the v0.28.0
+          # release, so this leg fails for anything older, which is the honest
+          # verdict rather than a skip.
+          floating="$(bash scripts/ci/release-channel.sh "$SMOKE_VERSION" | sed -n 's/^docker_floating_tag=//p')"
+          if [ -z "$floating" ]; then
+            echo "::error::could not derive the floating channel tag for '$SMOKE_VERSION'"
+            exit 1
+          fi
+          echo "floating channel tag for $SMOKE_VERSION: $floating"
+
+          for tag in "v$SMOKE_VERSION" "$SMOKE_VERSION" "$floating"; do
             echo "--- $image:$tag"
             docker pull "$image:$tag"
           done
 
-          label="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image:v$SMOKE_VERSION")"
-          if [ "$label" != "$SMOKE_VERSION" ]; then
-            echo "::error::image label org.opencontainers.image.version is '$label', expected '$SMOKE_VERSION'"
-            exit 1
-          fi
+          # Every one of the three must be the release under test, the floating
+          # pointer included. Pulling it only proves the tag exists; the label
+          # is what proves it points here.
+          for tag in "v$SMOKE_VERSION" "$SMOKE_VERSION" "$floating"; do
+            label="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image:$tag")"
+            if [ "$label" != "$SMOKE_VERSION" ]; then
+              echo "::error::$image:$tag has org.opencontainers.image.version '$label', expected '$SMOKE_VERSION'."
+              echo "::error::For the floating tag this means the channel pointer was not moved to this release (or was moved past it: smoke the newest release of a channel)."
+              exit 1
+            fi
+          done
 
           # Both invocations must work: the explicit binary (every version) and
           # a bare flag through the entrypoint shim (from 0.28.0 on, where the
