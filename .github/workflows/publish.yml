@@ -121,25 +121,27 @@ jobs:
       # broke. Forcing --release-type minor produces that list for the
       # CHANGELOG and for the release notes.
       #
-      # It ends in an explicit `exit 0` rather than `continue-on-error: true`:
-      # this repo has been burned by gates that could not fail, so a step that
-      # deliberately does not gate says so in its own body, where a reader of
-      # the log sees it, instead of in a YAML key they have to go look up.
+      # The body lives in a script, not inline here, and the reason is a bug
+      # this step shipped with: an inline `run:` gets GitHub's default
+      # `bash -e {0}`, the block opened with `set -uo pipefail` (which does not
+      # clear the inherited `-e`), and `--release-type minor` forces the major
+      # lints on, so the first removed public item killed the shell on the
+      # cargo line. No log, no summary, the trailing `exit 0` unreachable, the
+      # `semver` job red and `publish` (needs: semver) never started. An
+      # "advisory" step took the crates.io channel down for exactly the release
+      # shape it exists to describe. In a script the behaviour is testable, and
+      # the selftest below drives it against a tool that exits 1.
+      #
+      # It still ends in an explicit `exit 0` rather than
+      # `continue-on-error: true`: this repo has been burned by gates that
+      # could not fail, so a step that deliberately does not gate says so in
+      # its own body, where a reader of the log sees it, instead of in a YAML
+      # key they have to go look up.
+      - name: Prove the advisory pass survives a failing checker
+        run: bash scripts/ci/semver-advisory.sh --selftest
+
       - name: List breaking changes for the CHANGELOG (advisory, never blocks)
-        run: |
-          set -uo pipefail
-          log="$(mktemp)"
-          cargo semver-checks check-release --workspace --release-type minor --color never > "$log" 2>&1
-          echo "EXIT: $?" >> "$log"
-          cat "$log"
-          {
-            echo "## Semver advisory for a 0.x minor bump (not a gate)"
-            echo
-            echo '```'
-            grep -E '^--- failure |^[[:space:]]*Summary ' "$log" || echo "no breaking changes reported"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
+        run: bash scripts/ci/semver-advisory.sh
 
   publish:
     name: publish crates
