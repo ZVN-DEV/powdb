@@ -63,6 +63,25 @@ fn positioned(position: Option<usize>, body: &str) -> String {
     }
 }
 
+/// A pipeline clause that carries a value may be written at most once. Before
+/// this check a second `filter` simply replaced the first, so half a predicate
+/// could go missing without a word; the same held for `order`, `limit`,
+/// `offset`, `group` and the projection block. One rule covers every such
+/// clause, in the read pipeline and in nested blocks alike. `having` is the
+/// deliberate exception: repeats there chain with `and`.
+fn refuse_repeated_clause<T>(slot: &Option<T>, what: &str) -> Result<(), ParseError> {
+    if slot.is_none() {
+        return Ok(());
+    }
+    Err(ParseError::Syntax {
+        message: format!(
+            "{what} appears more than once in one pipeline; each clause is written once, \
+             so combine them into one"
+        ),
+        position: None,
+    })
+}
+
 impl ParseError {
     /// Convenience: human-readable message for any variant.
     pub fn message(&self) -> String {
@@ -720,26 +739,32 @@ impl Parser {
                     distinct = true;
                 }
                 Token::Group => {
+                    refuse_repeated_clause(&group_by, "'group'")?;
                     self.advance();
                     group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
+                    refuse_repeated_clause(&filter, "'filter'")?;
                     self.advance();
                     filter = Some(self.parse_expr()?);
                 }
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
                 Token::LBrace => {
+                    refuse_repeated_clause(&projection, "a projection")?;
                     projection = Some(self.parse_projection()?);
                 }
                 Token::Having => {
@@ -849,26 +874,32 @@ impl Parser {
                     distinct = true;
                 }
                 Token::Group => {
+                    refuse_repeated_clause(&group_by, "'group'")?;
                     self.advance();
                     group_by = Some(self.parse_group_by()?);
                 }
                 Token::Filter => {
+                    refuse_repeated_clause(&filter, "'filter'")?;
                     self.advance();
                     filter = Some(self.parse_expr()?);
                 }
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
                 Token::LBrace => {
+                    refuse_repeated_clause(&projection, "a projection")?;
                     projection = Some(self.parse_projection()?);
                 }
                 Token::Having => {
@@ -1318,6 +1349,7 @@ impl Parser {
         loop {
             match self.peek() {
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     let mut clause = self.parse_order()?;
                     for key in &mut clause.keys {
@@ -1329,6 +1361,7 @@ impl Parser {
                     order = Some(clause);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     if offset.is_some() {
                         offset_before_limit = true;
@@ -1336,6 +1369,7 @@ impl Parser {
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
@@ -1419,10 +1453,12 @@ impl Parser {
         loop {
             match self.peek() {
                 Token::Order => {
+                    refuse_repeated_clause(&order, "'order'")?;
                     self.advance();
                     order = Some(self.parse_order()?);
                 }
                 Token::Limit => {
+                    refuse_repeated_clause(&limit, "'limit'")?;
                     self.advance();
                     if offset.is_some() {
                         offset_before_limit = true;
@@ -1430,6 +1466,7 @@ impl Parser {
                     limit = Some(self.parse_expr()?);
                 }
                 Token::Offset => {
+                    refuse_repeated_clause(&offset, "'offset'")?;
                     self.advance();
                     offset = Some(self.parse_expr()?);
                 }
