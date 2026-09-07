@@ -260,7 +260,7 @@ type WalArchiveCallback<'a> = &'a mut dyn FnMut(&Path, &[WalRecord]) -> io::Resu
 /// A hook that publishes WAL records somewhere durable before the log that
 /// holds them is truncated.
 ///
-/// Owned and shareable, unlike [`WalArchiveCallback`], which is borrowed for
+/// Owned and shareable, unlike `WalArchiveCallback`, which is borrowed for
 /// the duration of one call. The automatic checkpoint runs long after the open
 /// that installed the hook, so it needs one it can keep. See
 /// [`Catalog::install_auto_wal_archive`].
@@ -2271,6 +2271,11 @@ impl Catalog {
         Ok(new_rid)
     }
 
+    /// Read one row by [`RowId`].
+    ///
+    /// `Ok(None)` when no live row has that id, and also when `table` does not
+    /// exist: a caller that needs to tell the two apart resolves the table
+    /// first.
     pub fn get(&self, table: &str, rid: RowId) -> io::Result<Option<Row>> {
         match self.get_table(table) {
             Some(tbl) => tbl.get(rid),

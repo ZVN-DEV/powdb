@@ -133,7 +133,10 @@ impl UserDirectory {
 pub enum AuthBucket {
     /// One username as attempted from one peer.
     PeerUser {
+        /// Where the attempt came from.
         peer: AuthPeer,
+        /// The username the attempt named; `None` for the legacy
+        /// password-only CONNECT, which names no user.
         user: Option<String>,
     },
     /// Everything that peer attempts, whatever username it names.
@@ -144,6 +147,8 @@ pub enum AuthBucket {
 /// local connection shares one bucket rather than none.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum AuthPeer {
+    /// A TCP peer, keyed by address alone: every port it connects from is
+    /// the same client for throttling purposes.
     Ip(IpAddr),
     /// Any connection over the Unix domain socket.
     UnixSocket,
@@ -187,7 +192,7 @@ pub const MAX_AUTH_BUCKET_USER_BYTES: usize = 64;
 
 /// The most failure buckets held at once, across every peer.
 ///
-/// One peer is bounded by [`MAX_PEER_AUTH_FAILURES`], but the number of
+/// One peer is bounded by `MAX_PEER_AUTH_FAILURES`, but the number of
 /// distinct peers is not: a single IPv6 /64 supplies more source addresses
 /// than this table could ever hold, and each of their entries outlives the
 /// connection that created it. At capacity the table evicts, so its memory is

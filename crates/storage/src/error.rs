@@ -55,7 +55,10 @@ pub enum StorageError {
     /// `count(<table>)` over a raw scan, for one), and the two have to
     /// classify alike.
     #[error("table '{table}' not found")]
-    TableNotFound { table: String },
+    TableNotFound {
+        /// The name exactly as the statement spelled it.
+        table: String,
+    },
 
     /// A DDL statement was issued inside an explicit transaction. DDL is not
     /// transactional: it unlinks files and rewrites the catalog immediately,
@@ -113,6 +116,8 @@ pub enum StorageErrorKind {
     CatalogCorrupt,
     PageCorrupt,
     InvalidIdentifier,
+    /// [`StorageError::TableNotFound`]: the statement named a table the
+    /// catalog does not have. A client mistake, never an internal fault.
     TableNotFound,
     RowTooLarge,
     ValueTooLarge,

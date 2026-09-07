@@ -24,7 +24,7 @@ use super::wire::write_msg_with_budget;
 ///
 /// An explicit transaction that has not written yet is the one holder that
 /// lets reads through anyway, out of a second pool. See
-/// [`TxGateHold`] and [`upgrade_to_exclusive`].
+/// `TxGateHold` and `upgrade_to_exclusive`.
 ///
 /// The gate also carries the maximum time ONE connection may hold it inside an
 /// explicit transaction. That bound lives here, not in
@@ -227,7 +227,7 @@ pub(super) fn parsed_transaction_control(
 ///
 /// The whole pool, so no second transaction, no autocommit write and no sync
 /// operation runs beside it. Reads are admitted anyway until this
-/// transaction's first write; see [`upgrade_to_exclusive`].
+/// transaction's first write; see `upgrade_to_exclusive`.
 ///
 /// Overlapping explicit transactions queue behind the permit rather than being
 /// rejected, but a connection gives up with a clear, client-facing error once

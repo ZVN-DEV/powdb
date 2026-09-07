@@ -2263,6 +2263,11 @@ impl Table {
         })
     }
 
+    /// Point lookup through the index on `col_name`.
+    ///
+    /// `Ok(None)` when the column has no index or no row carries `key`. On a
+    /// non-unique index this is the first match; [`Self::index_lookup_all`]
+    /// returns every matching [`RowId`].
     pub fn index_lookup(&self, col_name: &str, key: &Value) -> io::Result<Option<(RowId, Row)>> {
         let Some(entry) = self.indexed_cols.iter().find(|c| c.col_name == col_name) else {
             return Ok(None);

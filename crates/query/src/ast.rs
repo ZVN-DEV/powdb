@@ -11,6 +11,8 @@ pub enum Statement {
     /// `link <Owner>.<name> -> <Target> on <local> = <target>`: declare a
     /// persistent entity link (catalog v7). Lowers to `Catalog::create_link`.
     CreateLink(CreateLinkExpr),
+    /// `drop link <Owner>.<name>`: remove a persistent entity link. Lowers to
+    /// `Catalog::drop_link`.
     DropLink(DropLinkExpr),
     AlterTable(AlterTableExpr),
     DropTable(DropTableExpr),
@@ -64,8 +66,11 @@ pub struct CreateLinkExpr {
 /// `alter <Owner> drop link <name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropLinkExpr {
+    /// The type that declared the link.
     pub owner: String,
+    /// The link's name on that type.
     pub name: String,
+    /// `if exists`: a link that is already gone is not an error.
     pub if_exists: bool,
 }
 
