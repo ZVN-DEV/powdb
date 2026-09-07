@@ -173,15 +173,16 @@ const WORKLOADS: &[&str] = &[
     "powql_filter_projection", // legacy 5b
     "powql_aggregation",       // MA#3 scan_filter_count
     // ── Mission A reads (workloads 2, 4-10) ──
-    "point_lookup_nonindexed",    // MA#2
-    "scan_filter_project_top100", // MA#4
-    "scan_filter_sort_limit10",   // MA#5
-    "agg_sum",                    // MA#6
-    "agg_avg",                    // MA#7
-    "agg_min",                    // MA#8
-    "agg_max",                    // MA#9
-    "multi_col_and_filter",       // MA#10
-    "conjunction_index_residual", // Lane A conjunction index selection
+    "point_lookup_nonindexed",       // MA#2
+    "scan_filter_project_top100",    // MA#4
+    "scan_filter_sort_limit10",      // MA#5
+    "agg_sum",                       // MA#6
+    "agg_avg",                       // MA#7
+    "agg_min",                       // MA#8
+    "agg_max",                       // MA#9
+    "multi_col_and_filter",          // MA#10
+    "conjunction_index_residual",    // Lane A conjunction index selection
+    "conjunction_s4_selective_path", // Lane A selective-path choice
     // ── Mission A writes (workloads 11-15) ──
     "insert_single",    // MA#11
     "insert_batch_1k",  // MA#12
@@ -189,6 +190,11 @@ const WORKLOADS: &[&str] = &[
     "update_by_filter", // MA#14
     "delete_by_filter", // MA#15
 ];
+
+/// The gated workload list as newline-separated text, for `--list-workloads`.
+fn workload_list() -> String {
+    WORKLOADS.join("\n")
+}
 
 /// Return the absolute-threshold that applies to a workload. Most workloads
 /// use the ±7% default; a handful of write-heavy or sort-heavy workloads
@@ -316,6 +322,12 @@ struct Args {
     /// that need to agree with the `arch` fingerprint (the gate self-test) can
     /// ask THIS binary instead of asking `rustc` and hoping the two agree.
     print_arch: bool,
+    /// `--list-workloads`: print the gated workload list, one per line, and
+    /// exit. `scripts/update-bench-baseline.sh` asks the binary rather than
+    /// keeping its own copy: a short copy there would drop workloads from
+    /// `main.json`, and a workload with no baseline entry passes the gate
+    /// unconditionally in CAPTURE mode.
+    list_workloads: bool,
 }
 
 /// Parse the argument list.
@@ -334,6 +346,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
                 parsed.control = Some(PathBuf::from(&other["--control=".len()..]));
             }
             "--print-arch" => parsed.print_arch = true,
+            "--list-workloads" => parsed.list_workloads = true,
             other => return Err(format!("unrecognised argument: {other}")),
         }
     }
@@ -366,12 +379,18 @@ fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!("usage: compare [--control <criterion-dir>] [--print-arch]");
+            eprintln!(
+                "usage: compare [--control <criterion-dir>] [--print-arch] [--list-workloads]"
+            );
             return ExitCode::from(2);
         }
     };
     if args.print_arch {
         println!("{}", compiled_arch());
+        return ExitCode::SUCCESS;
+    }
+    if args.list_workloads {
+        println!("{}", workload_list());
         return ExitCode::SUCCESS;
     }
     let control_dir = args.control;
@@ -823,6 +842,52 @@ mod tests {
     /// The arch this test binary was compiled for, i.e. what a baseline has to
     /// record for the measured check to pass here.
     const HOST_ARCH: &str = std::env::consts::ARCH;
+
+    /// A workload listed here but absent from `main.json` runs in CAPTURE
+    /// mode: the comparator prints what it measured and passes, so the gate
+    /// silently stops guarding it. `conjunction_s4_selective_path` had the
+    /// opposite drift (a Depot-measured baseline that nothing enforced) and
+    /// `scripts/update-bench-baseline.sh` would have produced the dangerous
+    /// direction, because its hand-copied list was two workloads short.
+    #[test]
+    fn every_gated_workload_has_a_baseline_and_every_baseline_is_gated() {
+        const BASELINE: &str = include_str!("../../baseline/main.json");
+        let parsed: Json = serde_json::from_str(BASELINE).expect("main.json parses");
+        let mut baselined: Vec<&str> = parsed
+            .get("workloads")
+            .and_then(Json::as_object)
+            .expect("main.json has a workloads object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        baselined.sort_unstable();
+
+        let mut gated: Vec<&str> = WORKLOADS.to_vec();
+        gated.sort_unstable();
+
+        let ungated: Vec<&&str> = baselined.iter().filter(|w| !gated.contains(w)).collect();
+        assert!(
+            ungated.is_empty(),
+            "baselined but not in WORKLOADS, so measured and never enforced: {ungated:?}"
+        );
+
+        let unbaselined: Vec<&&str> = gated.iter().filter(|w| !baselined.contains(w)).collect();
+        assert!(
+            unbaselined.is_empty(),
+            "in WORKLOADS but missing from main.json, so the gate runs in CAPTURE mode \
+             and passes whatever it measures: {unbaselined:?}"
+        );
+    }
+
+    /// `WORKLOADS` is the single source of truth, and the rebaseline script
+    /// asks the binary for it rather than keeping a copy. Prove the flag the
+    /// script depends on still answers.
+    #[test]
+    fn the_workload_list_flag_prints_one_workload_per_line() {
+        let printed = workload_list();
+        let lines: Vec<&str> = printed.lines().collect();
+        assert_eq!(lines, WORKLOADS.to_vec());
+    }
 
     #[test]
     fn missing_baseline_field_is_not_a_mismatch() {

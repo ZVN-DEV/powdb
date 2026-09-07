@@ -50,7 +50,8 @@ WORKLOADS=(
   insert_10k btree_lookup seq_scan_filter
   powql_point powql_filter_only powql_filter_projection powql_aggregation
   point_lookup_nonindexed scan_filter_project_top100 scan_filter_sort_limit10
-  agg_sum agg_avg agg_min agg_max multi_col_and_filter conjunction_index_residual
+  agg_sum agg_avg agg_min agg_max multi_col_and_filter
+  conjunction_index_residual conjunction_s4_selective_path
   insert_single insert_batch_1k update_by_pk update_by_filter delete_by_filter
 )
 

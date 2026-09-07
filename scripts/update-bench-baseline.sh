@@ -34,28 +34,14 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BASELINE_FILE="${REPO_ROOT}/crates/bench/baseline/main.json"
 CRITERION_DIR="${REPO_ROOT}/target/criterion"
 
-WORKLOADS=(
-  insert_10k
-  btree_lookup
-  seq_scan_filter
-  powql_point
-  powql_filter_only
-  powql_filter_projection
-  powql_aggregation
-  point_lookup_nonindexed
-  scan_filter_project_top100
-  scan_filter_sort_limit10
-  agg_sum
-  agg_avg
-  agg_min
-  agg_max
-  multi_col_and_filter
-  insert_single
-  insert_batch_1k
-  update_by_pk
-  update_by_filter
-  delete_by_filter
-)
+# The gated workload list comes from the comparator, which is the only thing
+# that actually enforces it. A hand-copied list here can only go wrong in one
+# direction: a short copy drops workloads from main.json, and the comparator
+# treats a workload with no baseline entry as a first-run CAPTURE, so it prints
+# a number and passes instead of gating. The list is populated below, after
+# the build, because asking the binary requires compiling it.
+WORKLOADS=()
+
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required but not installed." >&2
@@ -63,6 +49,17 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 cd "${REPO_ROOT}"
+
+echo "===> asking the comparator which workloads it gates"
+while IFS= read -r w; do
+  [[ -n "${w}" ]] && WORKLOADS+=("${w}")
+done < <(cargo run -q -p powdb-bench --bin compare -- --list-workloads)
+if [[ ${#WORKLOADS[@]} -eq 0 ]]; then
+  echo "error: the comparator reported no gated workloads; refusing to write an" >&2
+  echo "       empty baseline, which would disable the gate entirely." >&2
+  exit 1
+fi
+echo "     ${#WORKLOADS[@]} workloads"
 
 echo "===> running cargo bench -p powdb-bench (this takes ~60s)"
 cargo bench -p powdb-bench --quiet
