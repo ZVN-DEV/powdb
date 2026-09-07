@@ -358,20 +358,50 @@ pub fn lex_with_spans(input: &str) -> Result<(Vec<Token>, Vec<usize>), LexError>
             while pos < chars.len() && chars[pos].is_ascii_digit() {
                 pos += 1;
             }
+            let mut is_float = false;
             if pos < chars.len()
                 && chars[pos] == '.'
                 && pos + 1 < chars.len()
                 && chars[pos + 1].is_ascii_digit()
             {
+                is_float = true;
                 pos += 1;
                 while pos < chars.len() && chars[pos].is_ascii_digit() {
                     pos += 1;
                 }
+            }
+            // An exponent, but only when it really is one: `e`/`E`, an optional
+            // sign, and at least one digit. Without the lookahead `1e` would
+            // swallow a name that happens to start with `e`, so a malformed
+            // exponent stays an int followed by an identifier and the parser
+            // says so.
+            if pos < chars.len() && (chars[pos] == 'e' || chars[pos] == 'E') {
+                let mut look = pos + 1;
+                if look < chars.len() && (chars[look] == '+' || chars[look] == '-') {
+                    look += 1;
+                }
+                if look < chars.len() && chars[look].is_ascii_digit() {
+                    pos = look;
+                    while pos < chars.len() && chars[pos].is_ascii_digit() {
+                        pos += 1;
+                    }
+                    is_float = true;
+                }
+            }
+            if is_float {
                 let s: String = chars[start..pos].iter().collect();
-                let value = s.parse::<f64>().map_err(|_| LexError {
-                    message: format!("float literal out of range: {s}"),
-                    position: start,
-                })?;
+                // `str::parse::<f64>` answers `inf` for an exponent past the
+                // range rather than failing, and an infinite literal is not a
+                // value any column can hold.
+                let value = match s.parse::<f64>() {
+                    Ok(value) if value.is_finite() => value,
+                    _ => {
+                        return Err(LexError {
+                            message: format!("float literal out of range: {s}"),
+                            position: start,
+                        })
+                    }
+                };
                 tokens.push(Token::FloatLit(value));
                 spans.push(token_start);
             } else {

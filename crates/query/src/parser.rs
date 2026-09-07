@@ -5478,14 +5478,19 @@ mod token_text_roundtrip {
 
     /// A view whose source text cannot be stored faithfully is refused at
     /// creation instead of quietly becoming a different query.
+    ///
+    /// The lexer now refuses a literal with no finite value outright, so this
+    /// one never reaches the round-trip check; the check still guards the
+    /// token streams that are built rather than lexed, which
+    /// `unspellable_tokens_are_typed_errors` covers directly.
     #[test]
     fn unspellable_view_source_is_refused() {
         let huge = format!("1{}.0", "0".repeat(400)); // overflows f64 to inf
         let err = parse(&format!("materialize V as U filter .x = {huge}"))
             .expect_err("a view source that cannot round-trip must be refused");
         assert!(
-            matches!(err, ParseError::Unsupported { .. }),
-            "expected a typed Unsupported error, got {err:?}"
+            matches!(err, ParseError::Lex { ref message, .. } if message.contains("out of range")),
+            "expected the out-of-range refusal, got {err:?}"
         );
     }
 

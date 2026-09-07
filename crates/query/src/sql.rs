@@ -520,6 +520,21 @@ fn lex_sql_with_spans(input: &str) -> Result<(Vec<SqlTok>, Vec<usize>), ParseErr
                     i += 1;
                 }
             }
+            // An exponent, on the same terms as the PowQL lexer: `e`/`E`, an
+            // optional sign, at least one digit. The token text is handed
+            // straight to PowQL, which reads the same spelling.
+            if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                let mut look = i + 1;
+                if chars.get(look).is_some_and(|c| *c == '+' || *c == '-') {
+                    look += 1;
+                }
+                if chars.get(look).is_some_and(char::is_ascii_digit) {
+                    i = look;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
             out.push(SqlTok::Number(chars[start..i].iter().collect()));
             spans.push(tok_start);
             continue;
