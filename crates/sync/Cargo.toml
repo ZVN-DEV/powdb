@@ -15,7 +15,7 @@ documentation = "https://docs.rs/powdb-sync"
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
-powdb-storage = { version = "0.28.0-rc.1", path = "../storage" }
+powdb-storage = { version = "0.28.0", path = "../storage" }
 crc32fast.workspace = true
 getrandom = "0.4"
 serde.workspace = true

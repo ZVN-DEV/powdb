@@ -56,7 +56,13 @@ section="$(printf '%s\n' "${section}" | awk '
 # grep, not `${section//[[:space:]]/}`: bash 3.2 (macOS) implements that
 # replacement quadratically, and on the ~11 KB v0.27.0 section it pinned a
 # CPU for minutes. Found the hard way cutting v0.27.0; CI's bash 5 masked it.
-if ! printf '%s' "${section}" | grep -q '[^[:space:]]'; then
+#
+# A here-string, not `printf ... | grep -q`: under `pipefail`, `grep -q` exits
+# on its first match and closes the pipe, and once the section is larger than
+# the pipe buffer (the v0.28.0 section is ~80 KB) printf is still writing,
+# takes SIGPIPE, and the pipeline reports failure for a section full of
+# content. Found the hard way cutting v0.28.0.
+if ! grep -q '[^[:space:]]' <<< "${section}"; then
   die "CHANGELOG.md has no content under '## [${version}]'.
        The GitHub Release body is built from that section, and publishing an
        empty body is the exact failure this check exists to prevent. Add the

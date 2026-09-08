@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.28.0 - 2026-09-07
+
 ### Fixed
 
 - Every entry point reports a transport failure as `remote_unavailable`.
