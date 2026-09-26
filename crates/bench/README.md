@@ -120,5 +120,18 @@ cargo run --release -p powdb-bench --bin smoke-bench
 
 ## Related
 
+The product-review durable-write diagnostic keeps `WalSyncMode::Full` and
+compares 256 prepared autocommit inserts, one explicit transaction, and one
+multi-row statement. It reports actual WAL fsync counters and verifies count
+and ID sum after graceful reopen:
+
+```bash
+cargo run --release -p powdb-bench --example durable_write_review
+```
+
+This is a single-sample diagnostic, not a power-loss test or a replacement for
+the regression gate. Its timings include the durable write path; unlike
+`powdb-compare`, it does not disable WAL.
+
 `powdb-compare` is a different crate. It compares PowDB against SQLite, Postgres
 and MySQL over a 100K-row fixture. See `crates/compare/README.md`.

@@ -1,5 +1,17 @@
 use powdb_storage::types::Value;
 
+pub(crate) const OUTER_CORRELATION_QUALIFIER: &str = "\0powdb_outer_correlated_reference";
+
+pub(crate) fn outer_correlation_qualifier(visible: &str) -> String {
+    format!("{OUTER_CORRELATION_QUALIFIER}{visible}")
+}
+
+pub(crate) fn outer_correlation_alias(qualifier: &str) -> Option<&str> {
+    qualifier
+        .strip_prefix(OUTER_CORRELATION_QUALIFIER)
+        .filter(|alias| !alias.is_empty())
+}
+
 /// Top-level PowQL statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {

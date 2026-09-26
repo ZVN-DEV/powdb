@@ -21,7 +21,7 @@ exclude = ["src/executor/tests/**"]
 # query can be run twice — once physically optimized, once through the generic
 # evaluator — and the two answers compared. Never enable it in a shipped build:
 # it exists so tests can prove the two paths agree, not to change behavior.
-testing = []
+testing = ["powdb-storage/testing"]
 
 [dependencies]
 powdb-storage = { version = "0.28.0", path = "../storage" }

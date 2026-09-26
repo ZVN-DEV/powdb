@@ -33,8 +33,16 @@ impl Engine {
     /// Lowering is idempotent, so a caller that already has a lowered tree pays
     /// one pass and gets the same plan back.
     pub fn execute_plan(&mut self, plan: &PlanNode) -> Result<QueryResult, QueryError> {
-        let lowered = self.lower(plan)?;
-        self.execute_lowered(&lowered)
+        self.run_statement(|engine| {
+            engine.ensure_plan_allowed(plan)?;
+            let lowered = engine.lower(plan)?;
+            if engine.read_only {
+                return crate::executor::to_readonly_terminal(
+                    engine.execute_plan_readonly(&lowered),
+                );
+            }
+            engine.execute_lowered(&lowered)
+        })
     }
 
     /// The write-path dispatch itself. Takes a bare `&PlanNode` because it is
@@ -54,6 +62,8 @@ impl Engine {
         // tables and columns, mistyped comparisons, mistyped JSON path bases
         // and negative slice counts, against the catalog as it is right now.
         validate_plan(&self.catalog, plan)?;
+        self.ensure_plan_allowed(plan)?;
+        self.begin_plan_mutation(plan)?;
         match plan {
             PlanNode::ExprIndexScan { .. }
             | PlanNode::ExprRangeScan { .. }
@@ -98,7 +108,9 @@ impl Engine {
                 // Correlated subqueries are left in place for per-row eval.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
-                    materialized = self.materialize_subqueries(predicate)?;
+                    let outer_columns = self.plan_output_columns(input);
+                    materialized =
+                        self.materialize_subqueries(predicate, outer_columns.as_deref())?;
                     &materialized
                 } else {
                     predicate
@@ -2292,10 +2304,7 @@ impl Engine {
                         "no active transaction to commit".into(),
                     ));
                 }
-                self.catalog
-                    .commit_transaction()
-                    .map_err(QueryError::from_storage_io)?;
-                self.in_transaction = false;
+                self.commit_explicit_transaction()?;
                 Ok(QueryResult::Executed {
                     message: "transaction committed".to_string(),
                 })
@@ -2782,11 +2791,16 @@ impl Engine {
                 "materialized view '{name}' not found"
             )));
         }
-        self.view_registry
-            .unregister(name)
-            .map_err(QueryError::from_storage_io)?;
+        // Drop the backing table first. `Catalog::drop_table` can refuse before
+        // mutating (inside an explicit transaction, or when a link still names
+        // the backing table). If the registry were unregistered first, that
+        // safe refusal would become a durable split-brain: views.bin says the
+        // view is gone while the backing table remains.
         self.catalog
             .drop_table(name)
+            .map_err(QueryError::from_storage_io)?;
+        self.view_registry
+            .unregister(name)
             .map_err(QueryError::from_storage_io)?;
         Ok(())
     }

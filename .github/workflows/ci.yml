@@ -471,6 +471,7 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:sync-live
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:eager
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:exec-script
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:statement-atomicity
 
   node-addon:
     name: Node embedded addon (build + tests)

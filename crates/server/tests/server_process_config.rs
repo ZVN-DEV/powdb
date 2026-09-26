@@ -266,6 +266,9 @@ fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> Str
         .args(["--bind", "127.0.0.1", "--port", "0"])
         .args(["--port-file", port_file.to_str().unwrap()])
         .args(extra_args)
+        // These assertions inspect INFO startup fields regardless of the
+        // developer's log filter in the parent shell.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn powdb-server");

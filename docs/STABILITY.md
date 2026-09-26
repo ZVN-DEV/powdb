@@ -158,6 +158,15 @@ A query relying on any of the old behaviors returns a different result set, or
 an error, on the release that fixed it. Changes of that class are called out in
 `CHANGELOG.md`. Read it before upgrading if you depend on exact result sets.
 
+### Next release: failed statements abort explicit transactions
+
+The next release also changes statement-error handling: an explicit transaction
+becomes aborted after a statement fails, and only `rollback` can recover it.
+Applications that previously caught an error and continued or committed the
+same transaction must now roll it back and start a new one. A commit whose
+response or durability outcome is uncertain must be reconciled, not blindly
+retried. This changes error behavior without changing the stored row format.
+
 ### Breaking: DDL inside an explicit transaction is refused (v0.21.0)
 
 **DDL is not transactional in PowDB, and must be run outside `begin` /

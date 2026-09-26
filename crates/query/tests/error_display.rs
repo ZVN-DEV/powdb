@@ -111,6 +111,20 @@ fn query_error_display_is_byte_exact_for_every_variant() {
             "query cancelled by client disconnect".into(),
         ),
         (
+            QueryError::TransactionAborted,
+            "explicit transaction is aborted; roll back before running another statement".into(),
+        ),
+        (
+            QueryError::EnginePoisoned,
+            "database handle is unusable after a storage failure; close and reopen before continuing"
+                .into(),
+        ),
+        (
+            QueryError::CommitOutcomeUnknown,
+            "commit outcome is unknown after a storage failure; close and reopen, then reconcile before retrying"
+                .into(),
+        ),
+        (
             QueryError::Execution("unique constraint violation on User.email".into()),
             "unique constraint violation on User.email".into(),
         ),
@@ -148,6 +162,9 @@ fn every_query_error_variant_is_named_here() {
             QueryError::ReadonlyMode => "ReadonlyMode",
             QueryError::Timeout { .. } => "Timeout",
             QueryError::Cancelled => "Cancelled",
+            QueryError::TransactionAborted => "TransactionAborted",
+            QueryError::EnginePoisoned => "EnginePoisoned",
+            QueryError::CommitOutcomeUnknown => "CommitOutcomeUnknown",
             QueryError::Execution(_) => "Execution",
         }
     }

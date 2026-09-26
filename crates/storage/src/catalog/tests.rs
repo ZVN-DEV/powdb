@@ -186,6 +186,268 @@ fn open_read_only_expression_index_reads_work() {
     );
 }
 
+fn tx_schema() -> Schema {
+    Schema {
+        table_name: "T".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                type_id: TypeId::Int,
+                required: false,
+                position: 0,
+            },
+            ColumnDef {
+                name: "body".into(),
+                type_id: TypeId::Str,
+                required: false,
+                position: 1,
+            },
+        ],
+    }
+}
+
+fn rows_by_id(catalog: &Catalog) -> Vec<i64> {
+    let mut ids: Vec<i64> = catalog
+        .scan("T")
+        .unwrap()
+        .map(|row| match row.unwrap().1[0] {
+            Value::Int(id) => id,
+            ref other => panic!("expected int id, got {other:?}"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn insert_row(catalog: &mut Catalog, id: i64, body: &str) -> RowId {
+    catalog
+        .insert("T", &vec![Value::Int(id), Value::Str(body.into())])
+        .unwrap()
+}
+
+#[test]
+fn statement_rollback_restores_rows_in_every_wal_mode() {
+    for mode in [WalSyncMode::Full, WalSyncMode::Normal, WalSyncMode::Off] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog.set_wal_sync_mode(mode);
+        catalog.create_table(tx_schema()).unwrap();
+
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 1, "kept");
+        catalog.commit_transaction().unwrap();
+
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 2, "rolled back");
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), vec![1], "mode {mode:?}");
+
+        drop(catalog);
+        let mut reopened = Catalog::open(dir.path()).unwrap();
+        reopened.set_wal_sync_mode(mode);
+        assert_eq!(rows_by_id(&reopened), vec![1], "reopen mode {mode:?}");
+    }
+}
+
+#[test]
+fn wal_off_rollback_preserves_prior_dirty_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog.set_wal_sync_mode(WalSyncMode::Off);
+    catalog.create_table(tx_schema()).unwrap();
+
+    catalog.begin_statement_transaction().unwrap();
+    insert_row(&mut catalog, 1, "dirty but successful");
+    catalog.commit_transaction().unwrap();
+
+    catalog.begin_statement_transaction().unwrap();
+    insert_row(&mut catalog, 2, "failed later");
+    catalog.rollback_to_last_sync().unwrap();
+
+    assert_eq!(rows_by_id(&catalog), vec![1]);
+    drop(catalog);
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(rows_by_id(&reopened), vec![1]);
+}
+
+#[test]
+fn wal_off_rollback_rebuilds_indexes_from_restored_heap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog.set_wal_sync_mode(WalSyncMode::Off);
+    catalog.create_table(tx_schema()).unwrap();
+    catalog.create_index_unique("T", "id", true).unwrap();
+    let rid = insert_row(&mut catalog, 1, "indexed");
+
+    catalog.begin_statement_transaction().unwrap();
+    catalog
+        .update("T", rid, &vec![Value::Int(3), Value::Str("moved".into())])
+        .unwrap();
+    assert!(catalog
+        .index_lookup("T", "id", &Value::Int(3))
+        .unwrap()
+        .is_some());
+    catalog.rollback_to_last_sync().unwrap();
+
+    assert!(catalog
+        .index_lookup("T", "id", &Value::Int(3))
+        .unwrap()
+        .is_none());
+    let original = catalog
+        .index_lookup("T", "id", &Value::Int(1))
+        .unwrap()
+        .expect("original index entry must be rebuilt");
+    assert_eq!(original[1], Value::Str("indexed".into()));
+}
+
+#[test]
+fn wal_off_statement_rollback_restores_overflow_growth_and_auto_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog.set_wal_sync_mode(WalSyncMode::Off);
+    catalog
+        .create_table_full(tx_schema(), Vec::new(), vec![true, false])
+        .unwrap();
+    let slot = catalog.table_slot("T").unwrap();
+    let original_pages = catalog.table_by_slot(slot).heap.num_pages();
+
+    catalog.begin_statement_transaction().unwrap();
+    let mut first = vec![Value::Empty, Value::Str("small".into())];
+    catalog.assign_auto_columns("T", &mut first).unwrap();
+    catalog.insert("T", &first).unwrap();
+    catalog.commit_transaction().unwrap();
+    assert_eq!(first[0], Value::Int(1));
+
+    catalog.begin_statement_transaction().unwrap();
+    let big = "x".repeat(crate::row::MAX_VALUE_SIZE.min(16 * 1024));
+    let mut rolled_back = vec![Value::Empty, Value::Str(big)];
+    catalog.assign_auto_columns("T", &mut rolled_back).unwrap();
+    catalog.insert("T", &rolled_back).unwrap();
+    assert_eq!(rolled_back[0], Value::Int(2));
+    assert!(
+        catalog.table_by_slot(slot).heap.num_pages() > original_pages,
+        "overflow insert should grow the heap before rollback"
+    );
+    catalog.rollback_to_last_sync().unwrap();
+
+    let mut second = vec![Value::Empty, Value::Str("after rollback".into())];
+    catalog.begin_statement_transaction().unwrap();
+    catalog.assign_auto_columns("T", &mut second).unwrap();
+    catalog.insert("T", &second).unwrap();
+    catalog.commit_transaction().unwrap();
+    assert_eq!(second[0], Value::Int(2));
+    assert_eq!(rows_by_id(&catalog), vec![1, 2]);
+}
+
+#[test]
+fn abandon_untrusted_state_poison_skips_drop_checkpoint_but_keeps_wal_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog.create_table(tx_schema()).unwrap();
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 1, "from wal");
+        catalog.commit_transaction().unwrap();
+        assert_eq!(rows_by_id(&catalog), vec![1]);
+        catalog.abandon_untrusted_state();
+        assert!(catalog.is_sync_poisoned());
+    }
+
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(rows_by_id(&reopened), vec![1]);
+}
+
+#[test]
+fn wal_off_rollback_preserves_untouched_dirty_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog.set_wal_sync_mode(WalSyncMode::Off);
+    catalog.create_table(tx_schema()).unwrap();
+
+    for id in 1..=12 {
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, id, &"p".repeat(900));
+        catalog.commit_transaction().unwrap();
+    }
+
+    let first_rid = { catalog.scan("T").unwrap().next().unwrap().unwrap().0 };
+    catalog.begin_statement_transaction().unwrap();
+    catalog
+        .update(
+            "T",
+            first_rid,
+            &vec![Value::Int(100), Value::Str("failed".into())],
+        )
+        .unwrap();
+    catalog.rollback_to_last_sync().unwrap();
+
+    assert_eq!(rows_by_id(&catalog), (1..=12).collect::<Vec<_>>());
+    drop(catalog);
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(rows_by_id(&reopened), (1..=12).collect::<Vec<_>>());
+}
+
+#[test]
+fn wal_mode_switch_during_transaction_is_deferred_until_after_rollback() {
+    let full_to_off = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(full_to_off.path()).unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Full);
+        catalog.create_table(tx_schema()).unwrap();
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 1, "kept");
+        catalog.commit_transaction().unwrap();
+
+        catalog.begin_transaction().unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Off);
+        insert_row(&mut catalog, 2, "rolled back");
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), vec![1]);
+    }
+    assert_eq!(
+        rows_by_id(&Catalog::open(full_to_off.path()).unwrap()),
+        vec![1]
+    );
+
+    let off_to_full = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(off_to_full.path()).unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Off);
+        catalog.create_table(tx_schema()).unwrap();
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 1, "kept");
+        catalog.commit_transaction().unwrap();
+
+        catalog.begin_transaction().unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Full);
+        insert_row(&mut catalog, 2, "rolled back");
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), vec![1]);
+    }
+    assert_eq!(
+        rows_by_id(&Catalog::open(off_to_full.path()).unwrap()),
+        vec![1]
+    );
+}
+
+#[test]
+fn dropping_active_wal_off_transaction_rolls_back_only_active_work() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Off);
+        catalog.create_table(tx_schema()).unwrap();
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 1, "kept");
+        catalog.commit_transaction().unwrap();
+
+        catalog.begin_transaction().unwrap();
+        insert_row(&mut catalog, 2, "dropped transaction");
+    }
+    let reopened = Catalog::open(dir.path()).unwrap();
+    assert_eq!(rows_by_id(&reopened), vec![1]);
+}
+
 #[test]
 fn v5_reader_rejects_v6_catalog() {
     let dir = tempfile::tempdir().unwrap();

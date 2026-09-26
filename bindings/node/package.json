@@ -57,7 +57,8 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test"
+    "test": "node --test",
+    "test:statement-atomicity": "node --test __test__/statement-atomicity.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3"

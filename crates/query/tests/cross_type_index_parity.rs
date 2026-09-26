@@ -237,21 +237,33 @@ const OPERATORS: &[&str] = &["=", "!=", "<", "<=", ">", ">="];
 /// sensitive to the predicate it carries.
 const NESTED_SHAPES: &[(&str, &str)] = &[
     ("Top", "T filter {p} {{ .id }}"),
-    ("In", "T filter .id in (T filter {p} {{ .id }}) {{ .id }}"),
+    (
+        "In",
+        "T as ot filter ot.id in (T as it filter {p:it} {{ it.id }}) {{ ot.id }}",
+    ),
     (
         "NotIn",
-        "T filter .id not in (T filter {p} {{ .id }}) {{ .id }}",
+        "T as ot filter ot.id not in (T as it filter {p:it} {{ it.id }}) {{ ot.id }}",
     ),
-    ("Exists", "T filter exists (T filter {p}) {{ .id }}"),
-    ("NotExists", "T filter not exists (T filter {p}) {{ .id }}"),
-    ("Scalar", "count(T filter .id in (T filter {p} {{ .id }}))"),
+    (
+        "Exists",
+        "T as ot filter exists (T as it filter {p:it}) {{ ot.id }}",
+    ),
+    (
+        "NotExists",
+        "T as ot filter not exists (T as it filter {p:it}) {{ ot.id }}",
+    ),
+    (
+        "Scalar",
+        "count(T as ot filter ot.id in (T as it filter {p:it} {{ it.id }}))",
+    ),
     // The outer scan is `Probe` so the inner `.pid` reference resolves to no
     // column of `T` and the subquery is therefore correlated: it is re-planned
     // and re-executed per outer row, through the two per-row materialization
     // sites the uncorrelated shapes above never touch.
     (
         "Correlated",
-        "Probe filter exists (T filter {p} and .id = .pid) {{ id: .pid }}",
+        "Probe as p filter exists (T as t filter {p:t} and t.id = p.pid) {{ id: p.pid }}",
     ),
 ];
 
@@ -259,6 +271,8 @@ const NESTED_SHAPES: &[(&str, &str)] = &[
 fn nested_query(template: &str, predicate: &str) -> String {
     template
         .replace("{p}", predicate)
+        .replace("{p:it}", &predicate.replace(".v", "it.v"))
+        .replace("{p:t}", &predicate.replace(".v", "t.v"))
         .replace("{{", "{")
         .replace("}}", "}")
 }
@@ -903,7 +917,7 @@ fn the_only_public_plan_entry_point_lowers_what_it_is_given() {
         .1;
     let body = &body[..body.find("\n    }").unwrap_or(body.len())];
     assert!(
-        body.contains("self.lower("),
+        body.contains(".lower(plan)?") && body.contains(".execute_lowered(&lowered)"),
         "`Engine::execute_plan` stopped lowering its argument, so an embedder's \
          plan reaches execution raw again. Its body now reads:\n{body}"
     );
