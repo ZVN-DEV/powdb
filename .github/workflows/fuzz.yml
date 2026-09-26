@@ -50,6 +50,42 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  recovery-model:
+    name: deterministic recovery model (extended corpus)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      POWDB_RECOVERY_SEED: '24301'
+      POWDB_RECOVERY_SEEDS: '32'
+      POWDB_RECOVERY_STEPS: '96'
+      # This corpus checks logical state and graceful reopen, not power loss.
+      # Keep fsync-heavy model exploration off the shared runner's disk.
+      TMPDIR: /dev/shm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: recovery-model
+      - name: Exercise the extended mutation corpus
+        shell: bash
+        run: cargo test -p powdb-query --test recovery_model --locked -- --nocapture 2>&1 | tee recovery-model.log
+      - name: Retain replayable operation traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-model-traces
+          path: recovery-model.log
+          retention-days: 14
+
   fuzz-smoke:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-24.04

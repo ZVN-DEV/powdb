@@ -994,6 +994,11 @@ impl HeapFile {
         self.free_overflow_pages.extend_from_slice(pages);
     }
 
+    /// Replay must mirror allocation even when an LSN guard skips the write.
+    pub(crate) fn reserve_overflow_page(&mut self, page_id: u32) {
+        self.free_overflow_pages.retain(|&free| free != page_id);
+    }
+
     /// Snapshot of the current overflow free list (test/introspection).
     pub fn overflow_free_list_len(&self) -> usize {
         self.free_overflow_pages.len()

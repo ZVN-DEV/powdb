@@ -2,7 +2,8 @@ name: ci
 
 on:
   pull_request:
-    branches: [main]
+    # Stacked changes target another codex branch before that parent merges.
+    branches: [main, "codex/**"]
   push:
     branches: [main]
 
