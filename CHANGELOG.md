@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Rolling back a spilled-value write no longer lets the retired catalog
+  truncate the replacement catalog's WAL. Repeated rollback/write sequences
+  now preserve subsequent writes instead of corrupting the log.
+- WAL replay removes reused overflow pages from its free list even when their
+  physical writes are already durable, preventing later inserts from
+  overwriting a committed row's out-of-line payload.
 - Autocommit data mutations use a statement rollback boundary, including
   prepared execution, so a later constraint failure cannot leave a changed
   prefix that subsequent queries or a graceful close commit.

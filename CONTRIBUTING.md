@@ -39,6 +39,10 @@ cargo bench -p powdb-bench        # criterion benchmarks (24 benches, 22 gated w
 cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --features mysql for MySQL)
 ```
 
+For deterministic mixed-write/rollback traces and exact seed replay commands,
+see [Recovery testing](docs/recovery-testing.md). A short corpus runs in normal
+workspace CI; the existing nightly/manual fuzz workflow runs the extended corpus.
+
 ## Project Structure
 
 ```

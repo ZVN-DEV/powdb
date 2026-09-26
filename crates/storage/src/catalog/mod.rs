@@ -1133,6 +1133,11 @@ impl Catalog {
                                 replay_page_ceiling,
                             )?;
                             let tbl = &mut self.tables[slot];
+                            // An earlier OverflowFree may have released this
+                            // page during replay. This record consumes it even
+                            // if its bytes are already on disk; otherwise the
+                            // next allocation can overwrite a live chain.
+                            tbl.heap.reserve_overflow_page(page_id);
                             if rec.lsn > 0 && tbl.heap.overflow_page_lsn(page_id) >= rec.lsn {
                                 skipped += 1;
                                 continue;
@@ -2031,6 +2036,11 @@ impl Catalog {
             restored.structure_generation = self.structure_generation;
         }
         let dirty_budget_limit = self.dirty_budget.limit_bytes();
+        // The replacement may already have logged post-recovery overflow
+        // cleanup. Retire this handle without checkpointing: its Drop would
+        // truncate that shared WAL underneath the replacement's writer,
+        // leaving a stale file offset and corrupting the next append.
+        self.abandon_untrusted_state();
         *self = restored;
         self.wal.set_sync_mode(sync_mode);
         self.wal.set_defer_sync(defer_sync);
