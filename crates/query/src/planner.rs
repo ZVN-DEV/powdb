@@ -428,9 +428,11 @@ fn projected_tail(
 /// is genuinely missing (optional/JSON) still yields `Empty` downstream, so
 /// doc-store missing-value semantics are unchanged.
 ///
-/// Subquery bodies (`InSubquery` / `ExistsSubquery` / `NestedQuery`) introduce
-/// their own scope and are left untouched: correlated references there are
-/// bare fields, and each subquery is resolved against its own source.
+/// Subquery bodies (`InSubquery` / `ExistsSubquery`) introduce their own scope,
+/// but a reference qualified by this query's visible alias is an explicit
+/// outer reference. Mark it before the subquery is later planned in isolation
+/// so runtime correlation can substitute it without guessing that every
+/// unknown qualifier is outer.
 fn resolve_scan_qualifiers(expr: &mut Expr, visible: &str) -> Result<(), PlanError> {
     match expr {
         Expr::QualifiedField { qualifier, field } => {
@@ -495,13 +497,113 @@ fn resolve_scan_qualifiers(expr: &mut Expr, visible: &str) -> Result<(), PlanErr
             }
             Ok(())
         }
-        // Own-scope subqueries are resolved separately; nested projections and
-        // link paths take the dedicated `plan_nested_query` path and never
-        // reach here.
-        Expr::InSubquery { .. }
-        | Expr::ExistsSubquery { .. }
-        | Expr::NestedQuery(_)
-        | Expr::LinkPath { .. } => Ok(()),
+        Expr::InSubquery { expr, subquery, .. } => {
+            resolve_scan_qualifiers(expr, visible)?;
+            mark_outer_refs_in_query(subquery, visible);
+            Ok(())
+        }
+        Expr::ExistsSubquery { subquery, .. } => {
+            mark_outer_refs_in_query(subquery, visible);
+            Ok(())
+        }
+        // Nested projections and link paths take the dedicated
+        // `plan_nested_query` path and never reach here.
+        Expr::NestedQuery(_) | Expr::LinkPath { .. } => Ok(()),
+    }
+}
+
+fn mark_outer_refs_in_query(query: &mut QueryExpr, outer_visible: &str) {
+    let query_visible = query.alias.as_deref().unwrap_or(&query.source);
+    let outer_is_shadowed = query_visible == outer_visible;
+
+    if let Some(filter) = query.filter.as_mut() {
+        mark_outer_refs(filter, outer_visible, outer_is_shadowed);
+    }
+    if let Some(order) = query.order.as_mut() {
+        for key in order.keys.iter_mut() {
+            mark_outer_refs(&mut key.expr, outer_visible, outer_is_shadowed);
+        }
+    }
+    if let Some(projection) = query.projection.as_mut() {
+        for field in projection.iter_mut() {
+            mark_outer_refs(&mut field.expr, outer_visible, outer_is_shadowed);
+        }
+    }
+    if let Some(group) = query.group_by.as_mut() {
+        for key in group.keys.iter_mut() {
+            mark_outer_refs(&mut key.expr, outer_visible, outer_is_shadowed);
+        }
+        if let Some(having) = group.having.as_mut() {
+            mark_outer_refs(having, outer_visible, outer_is_shadowed);
+        }
+    }
+    if let Some(aggregation) = query.aggregation.as_mut() {
+        if let Some(argument) = aggregation.argument.as_mut() {
+            mark_outer_refs(argument, outer_visible, outer_is_shadowed);
+        }
+    }
+}
+
+fn mark_outer_refs(expr: &mut Expr, outer_visible: &str, outer_is_shadowed: bool) {
+    match expr {
+        Expr::QualifiedField { qualifier, .. }
+            if !outer_is_shadowed && qualifier == outer_visible =>
+        {
+            *qualifier = outer_correlation_qualifier(outer_visible);
+        }
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            mark_outer_refs(left, outer_visible, outer_is_shadowed);
+            mark_outer_refs(right, outer_visible, outer_is_shadowed);
+        }
+        Expr::UnaryOp(_, inner)
+        | Expr::Cast(inner, _)
+        | Expr::FunctionCall(_, inner, _)
+        | Expr::JsonPath { base: inner, .. } => {
+            mark_outer_refs(inner, outer_visible, outer_is_shadowed);
+        }
+        Expr::ScalarFunc(_, args) => {
+            for arg in args {
+                mark_outer_refs(arg, outer_visible, outer_is_shadowed);
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            mark_outer_refs(expr, outer_visible, outer_is_shadowed);
+            for item in list {
+                mark_outer_refs(item, outer_visible, outer_is_shadowed);
+            }
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, result) in whens {
+                mark_outer_refs(cond, outer_visible, outer_is_shadowed);
+                mark_outer_refs(result, outer_visible, outer_is_shadowed);
+            }
+            if let Some(else_expr) = else_expr {
+                mark_outer_refs(else_expr, outer_visible, outer_is_shadowed);
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for expr in args.iter_mut().chain(partition_by) {
+                mark_outer_refs(expr, outer_visible, outer_is_shadowed);
+            }
+            for key in order_by {
+                mark_outer_refs(&mut key.expr, outer_visible, outer_is_shadowed);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            mark_outer_refs(expr, outer_visible, outer_is_shadowed);
+            if !outer_is_shadowed {
+                mark_outer_refs_in_query(subquery, outer_visible);
+            }
+        }
+        Expr::ExistsSubquery { subquery, .. } if !outer_is_shadowed => {
+            mark_outer_refs_in_query(subquery, outer_visible);
+        }
+        _ => {}
     }
 }
 

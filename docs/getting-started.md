@@ -93,7 +93,7 @@ type User created
 
 That's it. No `CREATE TABLE`, no column types in parentheses. Fields have a name and a type, separated by a colon.
 
-Supported types: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`.
+Supported types: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`, `json`.
 
 ---
 

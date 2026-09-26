@@ -60,7 +60,7 @@ const WAL_POISONED_MSG: &str = "WAL poisoned by an earlier fsync failure; commit
 /// flusher thread can trip it too. [`Wal::drop`] removes its own entry, so a
 /// test that arms but never fsyncs cannot leak an arm onto whatever WAL the
 /// allocator later places at the same address.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 static WAL_FSYNC_FAILPOINTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 /// Run `sync_data` on `file`, recording its duration in the process-wide
@@ -251,7 +251,7 @@ struct WalSyncShared {
 
 impl WalSyncShared {
     /// True (once) when the fsync failpoint is armed for THIS shared state.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fn take_fsync_failpoint(&self) -> bool {
         let me = self as *const WalSyncShared as usize;
         let mut armed = WAL_FSYNC_FAILPOINTS.lock().unwrap();
@@ -267,7 +267,7 @@ impl WalSyncShared {
     /// The one fsync choke point for this WAL: [`timed_sync_data`] plus the
     /// test-only failure injection.
     fn fsync_file(&self, file: &File) -> io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.take_fsync_failpoint() {
             FSYNC_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Err(io::Error::other("injected WAL fsync failure"));
@@ -598,8 +598,8 @@ impl Wal {
     /// Arm the fsync failpoint for this WAL: its next fsync — from any
     /// thread, including the Normal-mode background flusher — fails with an
     /// injected error. Self-disarming.
-    #[cfg(test)]
-    fn arm_fsync_failpoint(&self) {
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn arm_fsync_failpoint(&self) {
         let me = Arc::as_ptr(&self.shared) as usize;
         let mut armed = WAL_FSYNC_FAILPOINTS.lock().unwrap();
         if !armed.contains(&me) {
@@ -608,7 +608,7 @@ impl Wal {
     }
 
     /// Remove this WAL's armed failpoint, if any (see the static's docs).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fn disarm_fsync_failpoint(&self) {
         let me = Arc::as_ptr(&self.shared) as usize;
         WAL_FSYNC_FAILPOINTS.lock().unwrap().retain(|&a| a != me);
@@ -650,6 +650,11 @@ impl Wal {
     /// `Normal` and `Off` modes are unaffected (they never fsync inline).
     pub fn set_defer_sync(&mut self, defer: bool) {
         self.defer_sync = defer;
+    }
+
+    /// Whether Full-mode commit fsyncs are currently deferred.
+    pub fn defer_sync(&self) -> bool {
+        self.defer_sync
     }
 
     /// Take the durability claim registered by deferred flushes since the
@@ -1277,7 +1282,7 @@ impl Drop for Wal {
             }
         }
         self.stop_flusher();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         self.disarm_fsync_failpoint();
     }
 }

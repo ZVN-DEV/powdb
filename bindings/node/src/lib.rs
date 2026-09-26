@@ -112,11 +112,15 @@ fn code_for_query_error(e: &QueryError) -> Code {
         | QueryError::TypeError(_)
         | QueryError::IndexError(_)
         | QueryError::ViewError(_)
+        | QueryError::TransactionAborted
         | QueryError::Execution(_) => code::QUERY_FAILED,
         QueryError::Storage { kind, .. } => code_for_storage_kind(*kind),
         // A retry sentinel the facade intercepts, and a storage failure with no
         // kind to classify on: neither is anything a caller can act on.
-        QueryError::ReadonlyNeedsWrite | QueryError::StorageError(_) => code::INTERNAL,
+        QueryError::ReadonlyNeedsWrite
+        | QueryError::EnginePoisoned
+        | QueryError::CommitOutcomeUnknown
+        | QueryError::StorageError(_) => code::INTERNAL,
     }
 }
 
@@ -899,5 +903,29 @@ impl Drop for Database {
         if self.inner.is_some() {
             unregister_open(&self.key);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_transaction_state_errors_match_wire_class_taxonomy() {
+        assert_eq!(
+            code_for_query_error(&QueryError::TransactionAborted),
+            code::QUERY_FAILED,
+            "TransactionAborted maps to wire execution/query_failed"
+        );
+        assert_eq!(
+            code_for_query_error(&QueryError::EnginePoisoned),
+            code::INTERNAL,
+            "EnginePoisoned maps to wire internal"
+        );
+        assert_eq!(
+            code_for_query_error(&QueryError::CommitOutcomeUnknown),
+            code::INTERNAL,
+            "CommitOutcomeUnknown maps to wire internal"
+        );
     }
 }

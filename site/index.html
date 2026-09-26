@@ -4,14 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PowDB: Pure-Rust embedded database with native nested results</title>
-  <meta name="description" content="PowDB is a from-scratch pure-Rust embedded database. PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Faster than SQLite on aggregates and filtered scans, roughly 16x slower on indexed point lookups.">
+  <meta name="description" content="PowDB is a pure-Rust embedded database for read-heavy applications. PowQL returns correlated children as native nested JSON, traverses declared entity links, and indexes JSON paths. See workload-specific benchmarks and limitations.">
   <link rel="canonical" href="https://zvn-dev.github.io/powdb/">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="PowDB">
   <meta property="og:title" content="PowDB: Pure-Rust embedded database with native nested results">
-  <meta property="og:description" content="PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Faster than SQLite on aggregates and filtered scans, roughly 16x slower on indexed point lookups.">
+  <meta property="og:description" content="PowQL returns correlated children as native nested JSON, traverses declared entity links, and indexes JSON paths. A pure-Rust embedded database with workload-specific benchmarks and explicit limitations.">
   <meta property="og:url" content="https://zvn-dev.github.io/powdb/">
   <meta property="og:image" content="https://zvn-dev.github.io/powdb/favicon.svg">
 
@@ -280,9 +280,9 @@ alter Post add index (.data->published_at)</code></pre>
         </tr>
         <tr>
           <td>update_by_pk</td>
-          <td>60ns</td>
-          <td>272ns</td>
-          <td class="speedup">4.5x</td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+          <td>Withdrawn: repeated key</td>
         </tr>
         <tr>
           <td>agg_avg</td>
@@ -298,9 +298,9 @@ alter Post add index (.data->published_at)</code></pre>
         </tr>
         <tr>
           <td>point_lookup_nonindexed</td>
-          <td>101&micro;s</td>
-          <td>319&micro;s</td>
-          <td class="speedup">3.2x</td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+          <td>Withdrawn: repeated key</td>
         </tr>
         <tr>
           <td>scan_filter_sort_limit</td>
@@ -316,9 +316,9 @@ alter Post add index (.data->published_at)</code></pre>
         </tr>
         <tr>
           <td>update_by_filter</td>
-          <td>2.36ms</td>
-          <td>4.54ms</td>
-          <td class="speedup">1.9x</td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+          <td>Withdrawn: repeated value</td>
         </tr>
         <tr>
           <td>insert_single</td>
@@ -346,12 +346,13 @@ alter Post add index (.data->published_at)</code></pre>
         </tr>
         <tr>
           <td><strong>point_lookup_indexed</strong></td>
-          <td><strong>3.17&micro;s</strong></td>
-          <td><strong>202ns</strong></td>
-          <td class="speedup"><strong>15.7x slower</strong></td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
+          <td>Withdrawn: repeated key</td>
         </tr>
       </tbody>
     </table>
+    <p class="section-subtitle"><strong>Benchmark correction (2026-09-19):</strong> the old runner reused one lookup key and repeated the same update values. The corrected runner varies keys and values; lookup/update timings are withdrawn pending controlled remeasurement. The remaining rows are historical results, not measurements of the unreleased transaction changes. WAL-off mode writes no WAL at all.</p>
   </div>
 </section>
 

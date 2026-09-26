@@ -66,6 +66,88 @@ fn cancellation_errors_surface_to_remote_clients() {
     );
 }
 
+#[test]
+fn transaction_state_errors_keep_safe_guidance_and_deliberate_classes() {
+    let aborted = QueryError::TransactionAborted;
+    assert_eq!(
+        client_facing_message(&aborted),
+        "explicit transaction is aborted; roll back before running another statement"
+    );
+    assert_eq!(classify_query_error(&aborted), ErrorClass::Execution);
+
+    for err in [QueryError::EnginePoisoned, QueryError::CommitOutcomeUnknown] {
+        assert_eq!(
+            client_facing_message(&err),
+            err.to_string(),
+            "fixed recovery guidance must cross the wire verbatim"
+        );
+        assert_eq!(
+            classify_query_error(&err),
+            ErrorClass::Internal,
+            "storage-failure recovery uncertainty remains an internal-class failure"
+        );
+    }
+
+    assert!(
+        QueryError::CommitOutcomeUnknown
+            .to_string()
+            .contains("reconcile before retrying"),
+        "unknown commit outcome must not invite automatic retry"
+    );
+}
+
+#[tokio::test]
+async fn poisoned_engine_lock_reaches_wire_as_internal_safe_guidance() {
+    let (_dir, engine) = one_row_engine();
+    let poisoned = Arc::clone(&engine);
+    std::thread::spawn(move || {
+        let _guard = poisoned.write().expect("lock before poison");
+        panic!("intentional RwLock poison for wire classification regression");
+    })
+    .join()
+    .expect_err("poisoning thread must panic");
+
+    let gate = new_tx_gate_with_permits(1);
+    let metrics = Arc::new(Metrics::new());
+    let (_client, server) = tokio::io::duplex(1024);
+    let mut reader = BufReader::new(server);
+    let mut wire_read_buffer = Vec::new();
+    let mut pending_messages = InFlightReadAhead::default();
+    let mut tx_permit = None;
+
+    let (message, _, _) = execute_wire_query(
+        QueryContext {
+            engine,
+            tx_gate: gate,
+            tx_permit: &mut tx_permit,
+            principal: None,
+            result_mode: WireResultMode::Native,
+            query_timeout: Duration::from_secs(2),
+            tx_wait_timeout: Duration::from_secs(2),
+            metrics: &metrics,
+            stream: FrameStream {
+                reader: &mut reader,
+                buffered: &mut wire_read_buffer,
+                pending: &mut pending_messages,
+            },
+        },
+        "count(User)".into(),
+    )
+    .await;
+
+    match message {
+        Message::ErrorWithClass { message, class } => {
+            assert_eq!(class, ErrorClass::Internal);
+            assert_eq!(message, QueryError::EnginePoisoned.to_string());
+            assert!(
+                !message.contains("lock poisoned"),
+                "poison details must not cross the wire: {message}"
+            );
+        }
+        other => panic!("expected internal typed error frame, got {other:?}"),
+    }
+}
+
 /// Every `StorageErrorKind` gets a class chosen deliberately, and no kind
 /// lands on `Internal` by accident.
 ///

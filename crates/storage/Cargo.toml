@@ -12,6 +12,12 @@ keywords = ["database", "powdb", "btree", "wal", "storage-engine"]
 categories = ["database", "database-implementations", "data-structures"]
 documentation = "https://docs.rs/powdb-storage"
 
+[features]
+# Test-only storage fault injection. Enables a scoped WAL fsync failpoint used
+# by higher-level engine tests to prove uncertain durability paths poison the
+# live handle instead of retrying. Never enable it in shipped artifacts.
+testing = []
+
 [dependencies]
 thiserror.workspace = true
 bytes.workspace = true

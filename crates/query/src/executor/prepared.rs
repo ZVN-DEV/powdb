@@ -391,6 +391,18 @@ impl Engine {
         prep: &PreparedQuery,
         literals: &[Literal],
     ) -> Result<QueryResult, QueryError> {
+        self.run_statement(|engine| engine.execute_prepared_inner(prep, literals))
+    }
+
+    fn execute_prepared_inner(
+        &mut self,
+        prep: &PreparedQuery,
+        literals: &[Literal],
+    ) -> Result<QueryResult, QueryError> {
+        self.ensure_plan_allowed(&prep.plan_template)?;
+        if !matches!(prep.plan_template, PlanNode::Rollback) {
+            crate::cancel::check()?;
+        }
         if literals.len() != prep.param_count {
             return Err(QueryError::Execution(format!(
                 "prepared query expects {} literal(s), got {}",
@@ -398,6 +410,7 @@ impl Engine {
                 literals.len(),
             )));
         }
+        self.begin_plan_mutation(&prep.plan_template)?;
 
         // Mission C Phase 14: update-by-pk fast path. Skip plan clone,
         // substitute walk, resolved_assignments, FastPatch, Vec<RowId>,
@@ -419,11 +432,6 @@ impl Engine {
                         .mark_dependents_dirty(table)
                         .map_err(QueryError::from_storage_io)?;
                 }
-                // Mission B (post-review): statement-boundary WAL group
-                // commit. The fast path appended an Update record but did
-                // not flush — flush it now so the executor's contract is
-                // "WAL is on disk before this returns".
-                self.commit_statement()?;
                 return Ok(result);
             }
         }
@@ -495,7 +503,7 @@ impl Engine {
             let res = self
                 .catalog
                 .insert_by_slot(fast.table_slot, &values)
-                .map_err(|e| e.to_string());
+                .map_err(QueryError::from_storage_io);
             // Retain ordinary row buffers, but do not pin an overflow-sized
             // client string in the engine forever after one prepared insert.
             for value in &mut values {
@@ -513,8 +521,6 @@ impl Engine {
             self.view_registry
                 .mark_dependents_dirty(&fast.table_name)
                 .map_err(QueryError::from_storage_io)?;
-            // Mission B (post-review): statement-boundary WAL group commit.
-            self.commit_statement()?;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -527,11 +533,10 @@ impl Engine {
         // template directly is what made a prepared `.price < $1` answer
         // differently from the same query executed as text.
         let plan = self.lower(&plan)?;
-        let result = self.execute_lowered(&plan);
-        // Mission B (post-review): statement-boundary WAL group commit.
-        // No-op when nothing was buffered (read-only plans).
-        self.commit_statement()?;
-        result
+        if self.read_only {
+            return super::to_readonly_terminal(self.execute_plan_readonly(&plan));
+        }
+        self.execute_lowered(&plan)
     }
 
     /// Mission C Phase 14: point-update fast path for prepared
@@ -649,6 +654,38 @@ impl Engine {
         prep: &PreparedQuery,
         literals: &mut [Literal],
     ) -> Result<QueryResult, QueryError> {
+        let mut moved_insert = false;
+        let result = self.run_statement(|engine| {
+            engine.execute_prepared_take_inner(prep, literals, &mut moved_insert)
+        });
+        if moved_insert {
+            if result.is_err() {
+                // A commit failure occurs after the insert path has returned.
+                // Keep input ownership intact until the outer boundary succeeds.
+                let fast = prep.insert_fast.as_ref().expect("moving insert fast path");
+                restore_taken_strings(fast, literals, &mut self.insert_values_scratch);
+            }
+            self.insert_values_scratch.clear();
+        } else if result.is_ok() && matches!(prep.plan_template, PlanNode::Insert { .. }) {
+            for literal in literals {
+                if let Literal::String(value) = literal {
+                    value.clear();
+                }
+            }
+        }
+        result
+    }
+
+    fn execute_prepared_take_inner(
+        &mut self,
+        prep: &PreparedQuery,
+        literals: &mut [Literal],
+        moved_insert: &mut bool,
+    ) -> Result<QueryResult, QueryError> {
+        self.ensure_plan_allowed(&prep.plan_template)?;
+        if !matches!(prep.plan_template, PlanNode::Rollback) {
+            crate::cancel::check()?;
+        }
         if literals.len() != prep.param_count {
             return Err(QueryError::Execution(format!(
                 "prepared query expects {} literal(s), got {}",
@@ -656,12 +693,12 @@ impl Engine {
                 literals.len(),
             )));
         }
+        self.begin_plan_mutation(&prep.plan_template)?;
 
-        if let Some(fast) = prep
-            .insert_fast
-            .as_ref()
-            .filter(|fast| cached_table_matches(&self.catalog, fast.structure_generation))
-        {
+        if let Some(fast) = prep.insert_fast.as_ref().filter(|fast| {
+            !self.generic_path_forced("prepared-insert-take")
+                && cached_table_matches(&self.catalog, fast.structure_generation)
+        }) {
             // Moving strings is only safe when coercion cannot fail or replace
             // the string with another representation. Complex/coercing shapes
             // use the borrowed path; on success we still honor this method's
@@ -671,15 +708,7 @@ impl Engine {
                 .zip(&fast.assigned_columns)
                 .all(|(literal, column)| literal_can_take_without_error(literal, column))
             {
-                let result = self.execute_prepared(prep, literals);
-                if result.is_ok() {
-                    for literal in literals {
-                        if let Literal::String(value) = literal {
-                            value.clear();
-                        }
-                    }
-                }
-                return result;
+                return self.execute_prepared(prep, literals);
             }
             let mut values = std::mem::take(&mut self.insert_values_scratch);
             values.clear();
@@ -725,15 +754,9 @@ impl Engine {
                 self.insert_values_scratch = values;
                 return Err(QueryError::from_storage_io(error));
             }
-            // Mission B (post-review): statement-boundary WAL group commit.
-            if let Err(error) = self.commit_statement() {
-                restore_taken_strings(fast, literals, &mut values);
-                values.clear();
-                self.insert_values_scratch = values;
-                return Err(error);
-            }
-            values.clear();
+            // Keep moved strings available until the outer commit succeeds.
             self.insert_values_scratch = values;
+            *moved_insert = true;
             return Ok(QueryResult::Modified(1));
         }
 
@@ -741,15 +764,7 @@ impl Engine {
         // can't usefully move the literals because `substitute_plan`
         // still expects an immutable slice, and the non-insert hot
         // paths are dominated by plan walks anyway.
-        let result = self.execute_prepared(prep, literals);
-        if result.is_ok() && matches!(prep.plan_template, PlanNode::Insert { .. }) {
-            for literal in literals {
-                if let Literal::String(value) = literal {
-                    value.clear();
-                }
-            }
-        }
-        result
+        self.execute_prepared(prep, literals)
     }
 
     /// Walk an expression tree and replace every `InSubquery` node with
@@ -757,22 +772,27 @@ impl Engine {
     /// column as literal values. This must be called before entering
     /// the row-by-row scan loop because the scan closure can't call back
     /// into the engine.
-    pub(super) fn materialize_subqueries(&mut self, expr: &Expr) -> Result<Expr, QueryError> {
+    pub(super) fn materialize_subqueries(
+        &mut self,
+        expr: &Expr,
+        outer_columns: Option<&[String]>,
+    ) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
                 subquery,
                 negated,
             } => {
-                if is_correlated_subquery(subquery, &self.catalog) {
-                    let inner = self.materialize_subqueries(inner)?;
+                validate_subquery_scope(subquery, &self.catalog, outer_columns)?;
+                if is_correlated_subquery(subquery, &self.catalog, outer_columns) {
+                    let inner = self.materialize_subqueries(inner, outer_columns)?;
                     return Ok(Expr::InSubquery {
                         expr: Box::new(inner),
                         subquery: subquery.clone(),
                         negated: *negated,
                     });
                 }
-                let inner = self.materialize_subqueries(inner)?;
+                let inner = self.materialize_subqueries(inner, outer_columns)?;
                 // Plan and execute the subquery.
                 let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
                 let result = self.execute_lowered(&sub_plan)?;
@@ -799,7 +819,8 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
-                if is_correlated_subquery(subquery, &self.catalog) {
+                validate_subquery_scope(subquery, &self.catalog, outer_columns)?;
+                if is_correlated_subquery(subquery, &self.catalog, outer_columns) {
                     return Ok(expr.clone());
                 }
                 // Uncorrelated EXISTS: run the subquery once and collapse
@@ -814,25 +835,25 @@ impl Engine {
                 Ok(Expr::Literal(Literal::Bool(truth)))
             }
             Expr::BinaryOp(l, op, r) => {
-                let l = self.materialize_subqueries(l)?;
-                let r = self.materialize_subqueries(r)?;
+                let l = self.materialize_subqueries(l, outer_columns)?;
+                let r = self.materialize_subqueries(r, outer_columns)?;
                 Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
             }
             Expr::UnaryOp(op, inner) => {
-                let inner = self.materialize_subqueries(inner)?;
+                let inner = self.materialize_subqueries(inner, outer_columns)?;
                 Ok(Expr::UnaryOp(*op, Box::new(inner)))
             }
             Expr::Case { whens, else_expr } => {
                 let whens = whens
                     .iter()
                     .map(|(c, r)| {
-                        let c = self.materialize_subqueries(c)?;
-                        let r = self.materialize_subqueries(r)?;
+                        let c = self.materialize_subqueries(c, outer_columns)?;
+                        let r = self.materialize_subqueries(r, outer_columns)?;
                         Ok((Box::new(c), Box::new(r)))
                     })
                     .collect::<Result<Vec<_>, QueryError>>()?;
                 let else_expr = match else_expr {
-                    Some(e) => Some(Box::new(self.materialize_subqueries(e)?)),
+                    Some(e) => Some(Box::new(self.materialize_subqueries(e, outer_columns)?)),
                     None => None,
                 };
                 Ok(Expr::Case { whens, else_expr })
@@ -860,11 +881,11 @@ impl Engine {
                 if let Some(ref filter) = sub.filter {
                     sub.filter = Some(substitute_outer_refs(
                         filter,
-                        &sub.source,
+                        &sub,
                         &self.catalog,
                         outer_row,
                         outer_columns,
-                    ));
+                    )?);
                 }
                 let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_lowered(&sub_plan)?;
@@ -893,11 +914,11 @@ impl Engine {
                 if let Some(ref filter) = sub.filter {
                     sub.filter = Some(substitute_outer_refs(
                         filter,
-                        &sub.source,
+                        &sub,
                         &self.catalog,
                         outer_row,
                         outer_columns,
-                    ));
+                    )?);
                 }
                 let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_lowered(&sub_plan)?;

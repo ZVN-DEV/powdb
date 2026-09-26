@@ -6,7 +6,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.93-blue)](https://github.com/ZVN-DEV/powdb/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/ZVN-DEV/powdb/blob/main/LICENSE)
 
-**PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its compiled execution engine measures 3-7x SQLite on aggregates and 1-3.7x on filtered scans, and roughly 16x slower than SQLite on indexed point lookups.**
+**PowDB is a pure-Rust embedded database whose query language returns shaped results: one row per parent with its children nested inside, no join fan-out and no JSON text round-trip. Its published benchmarks favor aggregate and filtered-scan workloads, while indexed point operations are a weaker fit. See the workload-specific results and benchmark corrections below.**
 
 - **Performance** -- compiled byte-level predicates, zero-copy mmap scans, and a plan cache with literal substitution. Filter and aggregate paths skip full row decoding.
 - **Platform** -- pure-Rust engine (`powdb`, `powdb-storage`, `powdb-query` pull no C at all), embeddable and server modes, installed with a single `cargo install` on Linux and macOS. A built binary needs nothing installed beside it, but building `powdb-server` or `powdb-cli` from source does need a C toolchain and `cmake` for their TLS stack; see [Install](#install). **Windows is not supported** (the storage engine's mmap scan path is Unix-only); see [Platform support](#platform-support).
@@ -39,7 +39,7 @@ For the concurrency numbers behind the boundary above (single-request cost versu
 
 ## How it works
 
-**Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. On aggregate workloads this is where the 3-7x SQLite wins come from; on scan-shaped workloads the same machinery buys 1-3.7x. It does nothing for point lookups, where PowDB is roughly 16x slower than SQLite.
+**Compiled predicate engine.** Filter expressions on integer columns are compiled into branch-free, byte-level operations that run directly against the encoded row bytes. The executor pattern-matches on `Filter(SeqScan)` plan shapes and dispatches to fast paths that never decode columns they don't need. This explains the aggregate and scan advantages in the historical measurements below. It does not provide the same advantage for indexed point lookups.
 
 **Plan cache + tight planner-executor contract.** The planner is pure (no catalog access) and produces a canonical `PlanNode` tree; the cache hashes the canonical shape with FNV-1a and substitutes literals at lookup time, so repeat queries skip lex/parse/plan entirely. Range scans without a matching index are lowered to `Filter(SeqScan)` at execution time, keeping the planner stateless and the executor's fast paths fireable.
 
@@ -158,24 +158,36 @@ These are **single-request latencies**: one query at a time, measuring per-query
 | Aggregate MIN | 221 us | 1.70 ms | **7.7x faster** |
 | Aggregate MAX | 217 us | 1.47 ms | **6.8x faster** |
 | Aggregate SUM | 234 us | 1.45 ms | **6.2x faster** |
-| Update by primary key | 60 ns | 272 ns | **4.5x faster** |
+| Update by primary key | — | — | Withdrawn: repeated-key workload |
 | Aggregate AVG | 455 us | 1.70 ms | **3.7x faster** |
 | Scan + filter + count | 380 us | 1.40 ms | **3.7x faster** |
-| Non-indexed point lookup | 101 us | 319 us | **3.2x faster** |
+| Non-indexed point lookup | — | — | Withdrawn: repeated-key workload |
 | Scan + filter + sort + limit 10 | 2.46 ms | 6.41 ms | **2.6x faster** |
 | Multi-column AND filter | 1.58 ms | 3.21 ms | **2.0x faster** |
-| Update by filter (10K rows) | 2.36 ms | 4.54 ms | **1.9x faster** |
+| Update by filter (10K rows) | — | — | Withdrawn: repeated-value workload |
 | Insert single row | 380 ns | 638 ns | roughly tied |
 | Scan + filter + project top 100 | 8.1 us | 8.9 us | roughly tied |
 | Delete by filter (10K rows) | 1.57 ms | 1.75 ms | roughly tied |
 | Insert batch (1K rows) | 242 ns | 214 ns | roughly tied |
-| **Indexed point lookup** | **3.17 us** | **202 ns** | **15.7x SLOWER** |
+| **Indexed point lookup** | — | — | Withdrawn: repeated-key workload |
 
-Reproduce with `cargo run --release -p powdb-compare`.
+Run the corrected workloads with `cargo run --release -p powdb-compare`.
+
+**Benchmark correction (2026-09-19):** the historical table above used a
+constant seed inside each point-lookup loop, so it repeatedly queried one key.
+Its primary-key update also repeatedly assigned `42` to one row. The comparison
+runner now varies lookup keys, visits different update keys, and changes the
+assigned value on every pass. The historical lookup and update rows therefore
+do **not** describe the corrected workloads and should not be used as current
+claims. Regression tests now check workload diversity and resulting data in both
+engines. Filter updates now alternate values too, and the preceding point-update
+workload changes their input fixture. Those rows are withdrawn above pending a
+controlled remeasurement. The remaining numbers are historical, not a benchmark
+of the unreleased transaction changes.
 
 The compiled predicate engine avoids full row decoding during scans and aggregates. That is worth 3.7-7.7x on the four aggregates, but only 1.0-3.7x on the four scan-shaped workloads, so read the rows rather than a single headline multiplier. These wins come from compiled predicates and mmap scans, not from PowQL's syntax: the same query written in SQL lowers to the same plan and gets the same numbers.
 
-**PowDB loses the indexed point lookup, badly, and by more than we used to publish.** Once the index is probed the remaining work is trivial, so nearly the whole 3.17 us is PowDB's own front end (lex, parse, canonicalize, plan-cache lookup) while SQLite amortizes that away with a prepared statement. The previous table put this at 7.9x against an older engine. Nine independent re-measurements of the current engine, across two machines, ranged from 10x to 20x, most of them above 15x. This row got worse and we had been understating it by roughly 2x. If your hot path is "fetch one row by id", SQLite is the better engine and scan throughput will not compensate.
+**Indexed point latency remains a reason to evaluate SQLite first.** Front-end and row-fetch costs matter when little scanning is needed. The old repeated-key ratios are withdrawn, not replaced by an unverified claim that the corrected workload wins. Measure the varied-key workload on your hardware; scan throughput does not compensate for a slower point-lookup hot path.
 
 Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from durability cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `e3dfa71`, 2026-08-15. Re-measured the same way on 2026-09-07 after a large correctness round: every row landed within 11% of the number above and eleven of the fifteen within 3%, so the table is unchanged. The heap allocator rewrite in that round is not visible here because it removes a cost that grows with heap size, and this fixture is too small to pay it; the measurement that does show it is in the changelog. **These are laptop numbers, not CI numbers.** One caveat specific to the write rows: PowDB writes to a real temp directory while SQLite is `:memory:`, so `insert_single`, `insert_batch_1k`, and `delete_by_filter` are sensitive to whatever else is touching the disk. Measured under a heavy concurrent build on the same laptop, those rows moved by 30-100x while every other row moved by less than 2x, and two of them changed sign. The table above is from the quietest run we could get, but this machine was not fully idle, so treat the three write rows as the least reliable and re-measure them yourself before relying on them. Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
 
@@ -228,7 +240,8 @@ type User {
 # Insert (single row)
 insert User { name := "Alice", email := "alice@example.com", age := 30 }
 
-# Insert many rows in one statement (one fsync, one round trip, all-or-nothing).
+# Insert many rows in one statement (one round trip, all-or-nothing).
+# Large batches also fsync at each 64-record WAL buffer flush.
 # Keep the whole statement on one line in the CLI REPL, which buffers input
 # across lines only while braces/parens stay open.
 insert User { name := "Bob", email := "bob@example.com", age := 22 }, { name := "Carol", email := "carol@example.com", age := 41 }
@@ -388,7 +401,7 @@ Before exposing `powdb-server` beyond `127.0.0.1`:
 - [ ] Mount `POWDB_DATA` on a persistent, durable volume. WAL replay assumes the directory is not wiped between restarts.
 - [ ] **Run under a process supervisor with auto-restart.** PowDB is crash-only by design: the release profile sets `panic = "abort"`, so on an unrecoverable error the server exits immediately rather than limping along on possibly-corrupt shared state. WAL replay rolls the data directory forward to the last consistent state on the next start, but only if something restarts the process. Use systemd `Restart=always`, Docker `restart: unless-stopped`, a Kubernetes Deployment, Fly `auto_start_machines`, Railway `restartPolicyType = "ON_FAILURE"`, or an ECS service with `desired_count`. Every template in [`examples/deploy/`](https://github.com/ZVN-DEV/powdb/blob/main/examples/deploy/README.md) ships with auto-restart already wired in.
 - [ ] Pin the version (`cargo install powdb-server --version 0.28.0 --locked` or the matching ghcr tag). Pin to a release that is still supported: [SECURITY.md](https://github.com/ZVN-DEV/powdb/blob/main/SECURITY.md) ships security fixes only for the latest minor series. PowDB is pre-1.0; minor bumps may add on-disk format versions. An older directory always opens on a newer release, but not the reverse. See [docs/STABILITY.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/STABILITY.md).
-- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`): one fsync per batch instead of per row, ~50x write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#ddl-is-not-transactional).
+- [ ] Wrap bulk loads and write bursts in a transaction (`begin` … `commit`): far fewer fsyncs than one per row (at each 64-record WAL buffer flush and at commit), ~50x measured write throughput with identical durability. See [Write throughput & durability](#write-throughput--durability). Run schema changes (`type`, `alter`, `drop`, `link`, `materialize`) **outside** the transaction: DDL is not transactional and is refused inside `begin`/`commit`. See [docs/POWQL.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#ddl-is-not-transactional).
 - [ ] Size `POWDB_QUERY_MEMORY_LIMIT` for your host's RAM: it bounds a **single** query's materialization, not aggregate concurrent usage, so the 256 MiB default times many simultaneous connections can still exceed the process ceiling and get OOM-killed on memory-capped hosts (Railway/Fly/small AWS). Lower it accordingly.
 - [ ] Size `POWDB_DIRTY_PAGE_BUDGET` the same way. It bounds the unflushed pages one explicit transaction holds in memory, so a bulk load bigger than the budget is refused (`cannot buffer more of this transaction`) rather than OOM-killing the server. Split the load into several transactions, or raise the budget if the host has the RAM. Like the query budget it is per-transaction, not aggregate.
 

@@ -15,6 +15,9 @@
 
 mod engines;
 
+#[cfg(test)]
+mod product_review_tests;
+
 use engines::postgres::PostgresEngine;
 use engines::powdb::PowdbEngine;
 use engines::sqlite::SqliteEngine;
@@ -64,10 +67,10 @@ const WRITE_OPS: usize = 1_000;
 /// `delete_by_filter` workload.
 const DELETE_ITERS: usize = 3;
 
-fn time_iter<F: FnMut()>(n: usize, mut f: F) -> f64 {
+fn time_iter<T, F: FnMut(usize) -> T>(n: usize, mut f: F) -> f64 {
     let start = Instant::now();
-    for _ in 0..n {
-        f();
+    for iteration in 0..n {
+        std::hint::black_box(f(iteration));
     }
     start.elapsed().as_nanos() as f64 / n as f64
 }
@@ -151,39 +154,29 @@ fn bench_engine(
         }
         println!("  [{name}] running {workload}...");
         let ns = match *workload {
-            "point_lookup_indexed" => time_iter(READ_OPS, || {
-                let id = ((fastrand_xor(idx as u64) as usize) % n_rows) as i64;
-                let _ = engine.point_lookup_indexed(id);
+            "point_lookup_indexed" => time_iter(READ_OPS, |iteration| {
+                let id = lookup_id(iteration, n_rows, idx);
+                engine.point_lookup_indexed(id)
             }),
-            "point_lookup_nonindexed" => time_iter(READ_OPS, || {
-                let id = (fastrand_xor(idx as u64) as usize) % n_rows;
-                let target = 1_700_000_000 + id as i64;
-                let _ = engine.point_lookup_nonindexed(target);
+            "point_lookup_nonindexed" => time_iter(READ_OPS, |iteration| {
+                let id = lookup_id(iteration, n_rows, idx);
+                let target = 1_700_000_000 + id;
+                engine.point_lookup_nonindexed(target)
             }),
-            "scan_filter_count" => time_iter(READ_OPS, || {
-                let _ = engine.scan_filter_count(30);
-            }),
-            "scan_filter_project_top100" => time_iter(READ_OPS, || {
-                let _ = engine.scan_filter_project_top100(30);
-            }),
-            "scan_filter_sort_limit10" => time_iter(READ_OPS, || {
-                let _ = engine.scan_filter_sort_limit10(30);
-            }),
-            "agg_sum" => time_iter(READ_OPS, || {
-                let _ = engine.agg_sum();
-            }),
-            "agg_avg" => time_iter(READ_OPS, || {
-                let _ = engine.agg_avg(30);
-            }),
-            "agg_min" => time_iter(READ_OPS, || {
-                let _ = engine.agg_min();
-            }),
-            "agg_max" => time_iter(READ_OPS, || {
-                let _ = engine.agg_max();
-            }),
-            "multi_col_and_filter" => time_iter(READ_OPS, || {
-                let _ = engine.multi_col_and_filter(30, "active");
-            }),
+            "scan_filter_count" => time_iter(READ_OPS, |_| engine.scan_filter_count(30)),
+            "scan_filter_project_top100" => {
+                time_iter(READ_OPS, |_| engine.scan_filter_project_top100(30))
+            }
+            "scan_filter_sort_limit10" => {
+                time_iter(READ_OPS, |_| engine.scan_filter_sort_limit10(30))
+            }
+            "agg_sum" => time_iter(READ_OPS, |_| engine.agg_sum()),
+            "agg_avg" => time_iter(READ_OPS, |_| engine.agg_avg(30)),
+            "agg_min" => time_iter(READ_OPS, |_| engine.agg_min()),
+            "agg_max" => time_iter(READ_OPS, |_| engine.agg_max()),
+            "multi_col_and_filter" => {
+                time_iter(READ_OPS, |_| engine.multi_col_and_filter(30, "active"))
+            }
             "insert_single" => {
                 // Each iteration inserts a brand-new row with a fresh id
                 // outside the existing populated range. We assign ids
@@ -228,14 +221,16 @@ fn bench_engine(
                 // number is comparable to `insert_single`.
                 total_ns / (iters * batch_size) as f64
             }
-            "update_by_pk" => time_iter(WRITE_OPS, || {
-                // Pick an id inside the original populated range.
-                let id = (fastrand_xor(idx as u64) as usize % n_rows) as i64;
-                let _ = engine.update_by_pk(id, 42);
+            "update_by_pk" => time_iter(WRITE_OPS, |iteration| {
+                // Spread writes across the fixture, not just its first pages.
+                // A fresh value outside the fixture age range makes even a
+                // repeated key a real content change.
+                let id = lookup_id(iteration, n_rows, idx);
+                let age = 100 + iteration as i64;
+                engine.update_by_pk(id, age)
             }),
             "update_by_filter" => {
-                // `update_by_filter` is idempotent (setting status to the
-                // same value is a no-op for content), so we can loop.
+                // Alternate the value so every iteration changes content.
                 // Note: reduced from 20 iters → 3 because PowDB's current
                 // Update(Filter(SeqScan)) path does a per-row catalog.update
                 // that dominates the timing. Expected to drop once the
@@ -243,8 +238,13 @@ fn bench_engine(
                 // Mission A followup).
                 let iters: usize = 3;
                 let start = Instant::now();
-                for _ in 0..iters {
-                    let _ = engine.update_by_filter(50, "senior");
+                for iteration in 0..iters {
+                    let status = if iteration % 2 == 0 {
+                        "senior"
+                    } else {
+                        "junior"
+                    };
+                    std::hint::black_box(engine.update_by_filter(50, status));
                 }
                 start.elapsed().as_nanos() as f64 / iters as f64
             }
@@ -311,6 +311,10 @@ fn warmup(engine: &mut dyn BenchEngine, n_rows: usize, selected: &[&'static str]
 
 /// Tiny deterministic PRNG so point-lookup iterations stride around the
 /// fixture without clustering. Not cryptographically meaningful.
+fn lookup_id(iteration: usize, n_rows: usize, workload: usize) -> i64 {
+    (fastrand_xor((iteration as u64).wrapping_add(workload as u64)) % n_rows as u64) as i64
+}
+
 fn fastrand_xor(seed: u64) -> u64 {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
     x ^= x >> 30;
@@ -432,6 +436,7 @@ fn write_csv(results: &[EngineResults], selected: &[&'static str]) -> std::io::R
 
 fn main() {
     let n_rows = parse_n_rows();
+    assert!(n_rows > 0, "BENCH_N_ROWS must be positive");
     let filter = parse_workload_filter();
     let selected = selected_workloads(&filter);
 

@@ -786,7 +786,12 @@ no Error frame.
 
 For local development, `npm test` and `npm run test:pool` start a disposable
 PowDB server automatically when `POWDB_PORT` is not set. Set `POWDB_HOST` and
-`POWDB_PORT` to run those tests against an existing server.
+`POWDB_PORT` to run those tests against an existing server. The disposable
+test server binds `--port 0` and publishes the actual OS-assigned port through
+the server's `--port-file`, so parallel test runs do not race over a probed
+"free" port. Set `POWDB_SERVER_BIN=/absolute/path/to/powdb-server` to make the
+harness run an already-built server binary instead of invoking
+`cargo run --release -p powdb-server`.
 
 ## License
 

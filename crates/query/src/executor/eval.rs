@@ -1,6 +1,7 @@
 //! Expression evaluation functions for the PowDB executor.
 
 use crate::ast::*;
+use crate::result::QueryError;
 use powdb_storage::catalog::Catalog;
 use powdb_storage::types::*;
 
@@ -115,96 +116,508 @@ pub(super) fn collect_field_refs(expr: &Expr, out: &mut Vec<String>) {
 /// Detect whether a subquery is correlated: any `Expr::Field` reference in
 /// the subquery's filter that doesn't match a column in the subquery's
 /// source table indicates a reference to an outer scope.
+///
 /// Replace outer-scope field references in a correlated subquery's filter
-/// with literal values from the current outer row. Fields that belong to
-/// the subquery's own source table are left unchanged.
+/// with literal values from the current outer row. Inner fields are left
+/// unchanged. A bare field name that both scopes expose is refused directly:
+/// the old "inner wins" rule silently answered the wrong query for
+/// `Order.id = User.id`-style schemas.
 pub(super) fn substitute_outer_refs(
     expr: &Expr,
-    subquery_source: &str,
+    subquery: &QueryExpr,
     catalog: &Catalog,
     outer_row: &[Value],
     outer_columns: &[String],
-) -> Expr {
+) -> Result<Expr, QueryError> {
     let sub_cols: Vec<String> = catalog
-        .schema(subquery_source)
+        .schema(&subquery.source)
         .map(|s| s.columns.iter().map(|c| c.name.clone()).collect())
         .unwrap_or_default();
-    substitute_outer_refs_inner(expr, &sub_cols, outer_row, outer_columns)
+    let local_qualifiers = local_qualifiers(subquery);
+    substitute_outer_refs_inner(expr, &sub_cols, &local_qualifiers, outer_row, outer_columns)
+}
+
+fn outer_column_indices(field: &str, outer_columns: &[String]) -> Vec<usize> {
+    outer_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            (column == field
+                || matches!(
+                    column.rsplit_once('.'),
+                    Some((_, outer_field)) if outer_field == field
+                ))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn unique_outer_column_index(
+    field: &str,
+    outer_columns: &[String],
+) -> Result<Option<usize>, QueryError> {
+    match outer_column_indices(field, outer_columns).as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err(ambiguous_correlated_field(field)),
+    }
+}
+
+fn exact_outer_column_index(alias: &str, field: &str, outer_columns: &[String]) -> Option<usize> {
+    let qualified = format!("{alias}.{field}");
+    outer_columns
+        .iter()
+        .position(|column| column == &qualified)
+        .or_else(|| {
+            let bare_matches: Vec<usize> = outer_columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, column)| {
+                    (!column.contains('.') && column == field).then_some(index)
+                })
+                .collect();
+            match bare_matches.as_slice() {
+                [index] => Some(*index),
+                _ => None,
+            }
+        })
+}
+
+fn has_outer_column(field: &str, outer_columns: &[String]) -> bool {
+    outer_columns.iter().any(|column| {
+        column == field
+            || matches!(
+                column.rsplit_once('.'),
+                Some((_, outer_field)) if outer_field == field
+            )
+    })
+}
+
+fn local_qualifiers(subquery: &QueryExpr) -> Vec<String> {
+    let mut qualifiers = vec![subquery.source.clone()];
+    if let Some(alias) = &subquery.alias {
+        qualifiers.push(alias.clone());
+    }
+    qualifiers.sort();
+    qualifiers.dedup();
+    qualifiers
+}
+
+fn ambiguous_correlated_field(name: &str) -> QueryError {
+    QueryError::Execution(format!(
+        "ambiguous bare correlated field `{name}`; qualify the inner field \
+         with its inner alias or the outer field with its outer alias"
+    ))
+}
+
+fn unknown_correlated_qualifier(qualifier: &str, field: &str) -> QueryError {
+    let reference = if outer_correlation_alias(qualifier).is_some() {
+        format!("outer field `{field}`")
+    } else {
+        format!("correlated field `{qualifier}.{field}`")
+    };
+    QueryError::Execution(format!(
+        "unknown {reference}; qualify inner fields with the subquery alias and \
+         outer fields with a visible outer alias"
+    ))
 }
 
 fn substitute_outer_refs_inner(
     expr: &Expr,
     sub_cols: &[String],
+    local_qualifiers: &[String],
     outer_row: &[Value],
     outer_columns: &[String],
-) -> Expr {
+) -> Result<Expr, QueryError> {
     match expr {
         Expr::Field(name) => {
-            if sub_cols.iter().any(|c| c == name) {
-                expr.clone()
-            } else if let Some(i) = outer_columns.iter().position(|c| c == name) {
-                value_to_expr(outer_row[i].clone())
+            let inner_has = sub_cols.iter().any(|c| c == name);
+            let outer_index = unique_outer_column_index(name, outer_columns)?;
+            match (inner_has, outer_index) {
+                (true, Some(_)) => Err(ambiguous_correlated_field(name)),
+                (true, None) => Ok(expr.clone()),
+                (false, Some(i)) => Ok(value_to_expr(outer_row[i].clone())),
+                (false, None) => Ok(expr.clone()),
+            }
+        }
+        Expr::QualifiedField { qualifier, field } => {
+            if local_qualifiers.iter().any(|local| local == qualifier) {
+                Ok(expr.clone())
+            } else if let Some(alias) = outer_correlation_alias(qualifier) {
+                if let Some(i) = exact_outer_column_index(alias, field, outer_columns) {
+                    Ok(value_to_expr(outer_row[i].clone()))
+                } else {
+                    Err(unknown_correlated_qualifier(qualifier, field))
+                }
+            } else if let Some(i) = outer_columns
+                .iter()
+                .position(|column| column == &format!("{qualifier}.{field}"))
+            {
+                Ok(value_to_expr(outer_row[i].clone()))
             } else {
-                expr.clone()
+                Ok(expr.clone())
             }
         }
         Expr::BinaryOp(l, op, r) => {
-            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
-            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
-            Expr::BinaryOp(Box::new(l), *op, Box::new(r))
+            let l = substitute_outer_refs_inner(
+                l,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            let r = substitute_outer_refs_inner(
+                r,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
         }
         Expr::UnaryOp(op, inner) => {
-            let inner = substitute_outer_refs_inner(inner, sub_cols, outer_row, outer_columns);
-            Expr::UnaryOp(*op, Box::new(inner))
+            let inner = substitute_outer_refs_inner(
+                inner,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::UnaryOp(*op, Box::new(inner)))
+        }
+        Expr::FunctionCall(func, inner, mode) => {
+            let inner = substitute_outer_refs_inner(
+                inner,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::FunctionCall(*func, Box::new(inner), *mode))
         }
         Expr::InList {
             expr: e,
             list,
             negated,
         } => {
-            let e = substitute_outer_refs_inner(e, sub_cols, outer_row, outer_columns);
+            let e = substitute_outer_refs_inner(
+                e,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
             let list = list
                 .iter()
-                .map(|item| substitute_outer_refs_inner(item, sub_cols, outer_row, outer_columns))
-                .collect();
-            Expr::InList {
+                .map(|item| {
+                    substitute_outer_refs_inner(
+                        item,
+                        sub_cols,
+                        local_qualifiers,
+                        outer_row,
+                        outer_columns,
+                    )
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            Ok(Expr::InList {
                 expr: Box::new(e),
                 list,
                 negated: *negated,
-            }
+            })
         }
         Expr::Coalesce(l, r) => {
-            let l = substitute_outer_refs_inner(l, sub_cols, outer_row, outer_columns);
-            let r = substitute_outer_refs_inner(r, sub_cols, outer_row, outer_columns);
-            Expr::Coalesce(Box::new(l), Box::new(r))
+            let l = substitute_outer_refs_inner(
+                l,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            let r = substitute_outer_refs_inner(
+                r,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::Coalesce(Box::new(l), Box::new(r)))
         }
-        other => other.clone(),
+        Expr::ScalarFunc(func, args) => Ok(Expr::ScalarFunc(
+            *func,
+            args.iter()
+                .map(|arg| {
+                    substitute_outer_refs_inner(
+                        arg,
+                        sub_cols,
+                        local_qualifiers,
+                        outer_row,
+                        outer_columns,
+                    )
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?,
+        )),
+        Expr::Cast(inner, cast_type) => {
+            let inner = substitute_outer_refs_inner(
+                inner,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::Cast(Box::new(inner), *cast_type))
+        }
+        Expr::Case { whens, else_expr } => {
+            let whens = whens
+                .iter()
+                .map(|(cond, result)| -> Result<_, QueryError> {
+                    Ok((
+                        Box::new(substitute_outer_refs_inner(
+                            cond,
+                            sub_cols,
+                            local_qualifiers,
+                            outer_row,
+                            outer_columns,
+                        )?),
+                        Box::new(substitute_outer_refs_inner(
+                            result,
+                            sub_cols,
+                            local_qualifiers,
+                            outer_row,
+                            outer_columns,
+                        )?),
+                    ))
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
+            let else_expr = else_expr
+                .as_ref()
+                .map(|else_expr| {
+                    substitute_outer_refs_inner(
+                        else_expr,
+                        sub_cols,
+                        local_qualifiers,
+                        outer_row,
+                        outer_columns,
+                    )
+                    .map(Box::new)
+                })
+                .transpose()?;
+            Ok(Expr::Case { whens, else_expr })
+        }
+        Expr::JsonPath { base, segments } => {
+            let base = substitute_outer_refs_inner(
+                base,
+                sub_cols,
+                local_qualifiers,
+                outer_row,
+                outer_columns,
+            )?;
+            Ok(Expr::JsonPath {
+                base: Box::new(base),
+                segments: segments.clone(),
+            })
+        }
+        other => Ok(other.clone()),
     }
 }
 
-pub(super) fn is_correlated_subquery(subquery: &QueryExpr, catalog: &Catalog) -> bool {
+pub(super) fn validate_subquery_scope(
+    subquery: &QueryExpr,
+    catalog: &Catalog,
+    outer_columns: Option<&[String]>,
+) -> Result<(), QueryError> {
+    let Some(filter) = &subquery.filter else {
+        return Ok(());
+    };
+    let Some(schema) = catalog.schema(&subquery.source) else {
+        return Ok(());
+    };
+    let table_cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let local_qualifiers = local_qualifiers(subquery);
+    validate_scope_expr(
+        filter,
+        &subquery.source,
+        &table_cols,
+        &local_qualifiers,
+        outer_columns,
+    )
+}
+
+fn validate_scope_expr(
+    expr: &Expr,
+    subquery_source: &str,
+    sub_cols: &[String],
+    local_qualifiers: &[String],
+    outer_columns: Option<&[String]>,
+) -> Result<(), QueryError> {
+    match expr {
+        Expr::Field(name) => {
+            let inner_has = sub_cols.iter().any(|c| c == name);
+            let outer_count =
+                outer_columns.map_or(0, |columns| outer_column_indices(name, columns).len());
+            match (inner_has, outer_count) {
+                (true, count) if count > 0 => Err(ambiguous_correlated_field(name)),
+                (false, 0) => Err(QueryError::ColumnNotFound {
+                    table: subquery_source.to_string(),
+                    column: name.clone(),
+                }),
+                (false, 1) => Ok(()),
+                (false, _) => Err(ambiguous_correlated_field(name)),
+                _ => Ok(()),
+            }
+        }
+        Expr::QualifiedField { qualifier, field } => {
+            if local_qualifiers.iter().any(|local| local == qualifier) {
+                if sub_cols.iter().any(|column| column == field) {
+                    Ok(())
+                } else {
+                    Err(QueryError::ColumnNotFound {
+                        table: subquery_source.to_string(),
+                        column: field.clone(),
+                    })
+                }
+            } else if let Some(alias) = outer_correlation_alias(qualifier) {
+                if outer_columns.is_some_and(|columns| {
+                    exact_outer_column_index(alias, field, columns).is_some()
+                }) {
+                    Ok(())
+                } else {
+                    Err(unknown_correlated_qualifier(qualifier, field))
+                }
+            } else if outer_columns.is_some_and(|columns| {
+                columns
+                    .iter()
+                    .any(|column| column == &format!("{qualifier}.{field}"))
+            }) {
+                Ok(())
+            } else {
+                Err(unknown_correlated_qualifier(qualifier, field))
+            }
+        }
+        Expr::BinaryOp(left, _, right) | Expr::Coalesce(left, right) => {
+            validate_scope_expr(
+                left,
+                subquery_source,
+                sub_cols,
+                local_qualifiers,
+                outer_columns,
+            )?;
+            validate_scope_expr(
+                right,
+                subquery_source,
+                sub_cols,
+                local_qualifiers,
+                outer_columns,
+            )
+        }
+        Expr::UnaryOp(_, inner)
+        | Expr::Cast(inner, _)
+        | Expr::FunctionCall(_, inner, _)
+        | Expr::JsonPath { base: inner, .. } => validate_scope_expr(
+            inner,
+            subquery_source,
+            sub_cols,
+            local_qualifiers,
+            outer_columns,
+        ),
+        Expr::ScalarFunc(_, args) => args.iter().try_for_each(|arg| {
+            validate_scope_expr(
+                arg,
+                subquery_source,
+                sub_cols,
+                local_qualifiers,
+                outer_columns,
+            )
+        }),
+        Expr::InList { expr, list, .. } => {
+            validate_scope_expr(
+                expr,
+                subquery_source,
+                sub_cols,
+                local_qualifiers,
+                outer_columns,
+            )?;
+            list.iter().try_for_each(|item| {
+                validate_scope_expr(
+                    item,
+                    subquery_source,
+                    sub_cols,
+                    local_qualifiers,
+                    outer_columns,
+                )
+            })
+        }
+        Expr::Case { whens, else_expr } => {
+            for (cond, result) in whens {
+                validate_scope_expr(
+                    cond,
+                    subquery_source,
+                    sub_cols,
+                    local_qualifiers,
+                    outer_columns,
+                )?;
+                validate_scope_expr(
+                    result,
+                    subquery_source,
+                    sub_cols,
+                    local_qualifiers,
+                    outer_columns,
+                )?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_scope_expr(
+                    else_expr,
+                    subquery_source,
+                    sub_cols,
+                    local_qualifiers,
+                    outer_columns,
+                )?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            validate_scope_expr(
+                expr,
+                subquery_source,
+                sub_cols,
+                local_qualifiers,
+                outer_columns,
+            )?;
+            let _ = subquery;
+            Ok(())
+        }
+        Expr::ExistsSubquery { .. } => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+pub(super) fn is_correlated_subquery(
+    subquery: &QueryExpr,
+    catalog: &Catalog,
+    outer_columns: Option<&[String]>,
+) -> bool {
     let filter = match &subquery.filter {
         Some(f) => f,
         None => return false,
     };
-    let schema = match catalog.schema(&subquery.source) {
-        Some(s) => s,
-        None => return false, // table not found — not correlation, just an error
-    };
-    let table_cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    if catalog.schema(&subquery.source).is_none() {
+        return false; // table not found — not correlation, just an error
+    }
     let mut refs = Vec::new();
     collect_field_refs(filter, &mut refs);
-    // If any referenced field doesn't exist in the subquery's source table,
-    // it's (probably) a reference to an outer scope — i.e., correlated.
+    let local_qualifiers = local_qualifiers(subquery);
     refs.iter().any(|r| {
-        // Skip qualified references (alias.field) — they unambiguously
-        // target a specific source and will only match the subquery's own
-        // source if they share the alias.
-        if r.contains('.') {
-            let alias = subquery.alias.as_deref().unwrap_or(&subquery.source);
-            !r.starts_with(alias)
+        if let Some((qualifier, field)) = r.split_once('.') {
+            if local_qualifiers.iter().any(|local| local == qualifier) {
+                false
+            } else if let Some(alias) = outer_correlation_alias(qualifier) {
+                outer_columns.is_some_and(|columns| {
+                    exact_outer_column_index(alias, field, columns).is_some()
+                })
+            } else {
+                outer_columns.is_some_and(|columns| columns.iter().any(|column| column == r))
+            }
         } else {
-            !table_cols.iter().any(|c| c == r)
+            outer_columns.is_some_and(|columns| has_outer_column(r, columns))
         }
     })
 }

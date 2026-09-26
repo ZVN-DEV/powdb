@@ -312,9 +312,12 @@ fn cancelled_update_before_write_leaves_all_rows_unchanged() {
 }
 
 #[test]
-fn cancelled_mutation_does_not_abort_explicit_transaction() {
+fn cancelled_mutation_aborts_explicit_transaction_until_rollback() {
     let mut engine = item_engine(1);
     engine.execute_powql("begin").unwrap();
+    engine
+        .execute_powql("Item filter .id = 0 update { v := 5 }")
+        .unwrap();
 
     let cancel = CancelArc::new(ExecCancel::new());
     cancel.cancel(CancelReason::Disconnect);
@@ -322,10 +325,17 @@ fn cancelled_mutation_does_not_abort_explicit_transaction() {
         engine.execute_powql_with_cancel("Item filter .id = 0 update { v := .v + 1 }", cancel);
     assert!(matches!(result, Err(QueryError::Cancelled)));
 
+    assert_eq!(
+        engine.execute_powql("sum(Item { .v })").unwrap_err(),
+        QueryError::TransactionAborted
+    );
+    assert_eq!(
+        engine.execute_powql("commit").unwrap_err(),
+        QueryError::TransactionAborted
+    );
+    engine.execute_powql("rollback").unwrap();
     let unchanged = engine.execute_powql("sum(Item { .v })").unwrap();
     assert!(matches!(unchanged, QueryResult::Scalar(Value::Int(0))));
-    let committed = engine.execute_powql("commit").unwrap();
-    assert!(matches!(committed, QueryResult::Executed { .. }));
 }
 
 #[test]

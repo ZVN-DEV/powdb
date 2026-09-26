@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (transaction error handling):** a failed statement now aborts an
+  explicit transaction. Further work and COMMIT are refused until ROLLBACK;
+  applications must not catch an error and continue the same transaction.
+- **BREAKING (Rust error matching):** `QueryError` adds `TransactionAborted`,
+  `EnginePoisoned`, and `CommitOutcomeUnknown`. Exhaustive downstream matches
+  must handle the new variants. Numeric wire error classes remain unchanged.
+- Correlated PowQL subqueries accept explicit outer aliases. Ambiguous bare
+  fields shared by inner and outer scopes are refused with alias guidance
+  instead of silently selecting the inner column.
+- Statement rollback protection adds write overhead, especially with WAL
+  disabled. Local diagnostic runs show materially slower WAL-Off writes;
+  this is a correctness/security update, not a throughput improvement. Full
+  remains the default durability mode, and no benchmark baseline is reset.
+
+### Fixed
+
+- Autocommit data mutations use a statement rollback boundary, including
+  prepared execution, so a later constraint failure cannot leave a changed
+  prefix that subsequent queries or a graceful close commit.
+- Rejected materialized-view drops preserve view registration. Registry
+  persistence failures distinguish unpublished and published state, and a
+  registered view missing its backing table is refused on reopen.
+- Transaction rollback preserves earlier successful in-memory writes with WAL
+  disabled. Changing WAL mode during a transaction is deferred to its end.
+- Database handles with uncertain commit/recovery state refuse further work;
+  commit uncertainty is reported without implying it is safe to retry.
+- TypeScript live tests obtain the port selected by the server, eliminating the
+  separate free-port probe race.
+- The database comparison benchmark varies lookup/update keys and checks real
+  mutation outcomes rather than repeatedly timing a same-value hot-key update.
+
+### Security
+
+- Updated rustls to 0.23.45 in the workspace and fuzz lockfiles to address
+  RUSTSEC-2026-0285 without changing the TLS wire protocol.
+
 ## [0.28.0] - 2026-09-07
 
 ### Breaking

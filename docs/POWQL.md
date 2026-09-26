@@ -1499,6 +1499,33 @@ User filter not exists (Order filter .status = "pending")
 
 `exists` evaluates to true if the inner query matches at least one row. `not exists` is the negation.
 
+Correlated `exists` / `not exists` queries should alias the outer table and
+qualify outer fields with that alias, matching nested projection syntax:
+
+```
+User as u filter exists (Order as o filter o.user_id = u.id) { u.id }
+User as u filter not exists (Order as o filter o.user_id = u.id) { u.id }
+```
+
+The older bare outer-field spelling still works only when the name is
+unambiguous in the inner table:
+
+```
+User filter exists (Order filter .user_uid = .uid)
+```
+
+If the inner and outer scopes both expose the same bare name, PowQL now refuses
+the query instead of guessing. Write the inner side with its inner alias and the
+outer side with its outer alias:
+
+```
+# Ambiguous: both tables have `id`
+User as u filter exists (Order as o filter o.user_id = .id)
+
+# Supported
+User as u filter exists (Order as o filter o.user_id = u.id)
+```
+
 ---
 
 ## Functions
@@ -2036,6 +2063,22 @@ User filter .age < 18 delete returning
 ## Transactions
 
 PowDB supports explicit transactions with `begin`, `commit`, and `rollback`. Statements executed between `begin` and `commit` are applied atomically -- either all succeed or none do. Use `rollback` to discard uncommitted changes.
+
+**Failure handling (next release):** a failed statement in an explicit
+transaction aborts that transaction. Further queries and `commit` are refused
+until `rollback`; fix the cause and begin a new transaction. This includes
+parse/binding and read-query errors, not only writes. An aborted transaction
+cannot commit the successful statements that preceded the error.
+
+An autocommit data mutation has its own rollback boundary. A constraint or
+execution failure does not leave an earlier matching row changed, and a later
+query cannot commit that failed prefix. This live-process guarantee also applies
+to WAL `off`; it does **not** add crash durability to that mode.
+
+An I/O failure during commit is different: its outcome can be unknown. Close
+and reopen/recover the database, inspect the durable state, and reconcile before
+retrying. A dropped connection while waiting for a commit response is likewise
+not proof that the commit failed. See [error recovery](errors.md#explicit-transaction-and-commit-recovery-errors).
 
 ### Syntax
 

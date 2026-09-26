@@ -209,6 +209,16 @@ impl DiskManager {
         self.num_pages
     }
 
+    /// Truncate the data file to exactly `pages` pages.
+    pub fn truncate_pages(&mut self, pages: u32) -> io::Result<()> {
+        if self.read_only {
+            return Err(Self::read_only_write_error());
+        }
+        self.file.set_len(pages as u64 * PAGE_SIZE as u64)?;
+        self.num_pages = pages;
+        Ok(())
+    }
+
     /// Borrow the underlying file (for mmap-based scans).
     pub fn file_ref(&self) -> &File {
         &self.file

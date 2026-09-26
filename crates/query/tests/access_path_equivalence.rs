@@ -1601,6 +1601,10 @@ const UNCOVERED_SITES: &[(&str, &str)] = &[
     // Prepared statements have their own entry point; this runner drives
     // `execute_powql` only.
     ("prepared-insert", "prepared-statement entry point"),
+    (
+        "prepared-insert-take",
+        "prepared-statement entry point; covered by statement_atomicity's generic/take parity",
+    ),
     ("prepared-update-pk", "prepared-statement entry point"),
 ];
 

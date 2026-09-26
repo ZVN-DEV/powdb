@@ -22,9 +22,9 @@ These numeric values are **stable wire contract**: they are never renumbered or 
 
 | Code | Name | Meaning | Typical causes | TS client `PowDBError.code` |
 |------|------|---------|----------------|------------------------------|
-| 0 | `internal` | Unclassified or internal server error | Lock poisoning, internal task failure, WAL durability sync failure, an unreadable or checksum-failing page (`PageCorrupt`), protocol misuse, server shutdown notice | `query_failed` |
+| 0 | `internal` | Unclassified or internal server error | Lock poisoning, internal task failure, WAL durability sync failure, unknown commit outcome, poisoned database handle, an unreadable or checksum-failing page (`PageCorrupt`), protocol misuse, server shutdown notice | `query_failed` |
 | 1 | `parse` | The query text failed to lex or parse | Syntax errors, unterminated strings, unsupported constructs, excessive nesting | `query_failed` |
-| 2 | `execution` | Planning or execution failed | Unknown table or column, type mismatch, view/index errors, `cannot begin` while a transaction is active | `query_failed` |
+| 2 | `execution` | Planning or execution failed | Unknown table or column, type mismatch, view/index errors, `cannot begin` while a transaction is active, an explicit transaction that must be rolled back after a failed statement | `query_failed` |
 | 3 | `timeout` | A time budget elapsed | Per-query timeout, transaction-gate wait timeout, idle-connection timeout, **explicit-transaction maximum lifetime** (see below) | `timeout` |
 | 4 | `limit_exceeded` | A memory or size limit was exceeded | Sort/join row caps, per-query memory budget, query text too large, result too large | `size_exceeded` |
 | 5 | `readonly_refused` | The server serves a read-only snapshot and the statement requires a writer | Any mutation (or a read that needs a writer, e.g. a stale materialized view) against `powdb-server --readonly` | `query_failed` |
@@ -55,7 +55,24 @@ The last one is a default-on behavior added in v0.22: an explicit transaction ho
 
 A driver that lumps all of class `3` into one retry path will silently retry a *statement* against a transaction that no longer exists, so branch on the message prefix (or simply treat any class-3 error as fatal to an open transaction).
 
-One fallback rule completes that: when the lifetime budget expires while the server is writing a reply that cannot finish, the server closes the connection without sending the error frame, because anything written after a partly-sent frame would be read as that frame's payload. The client sees only the close. **Treat an unexpected connection close during an open transaction exactly as you would a class-3 timeout:** the transaction is gone, so reconnect and replay it instead of assuming its writes survived.
+When the lifetime budget expires while the server is writing a reply that cannot finish, it closes the connection without sending another error frame: bytes written after a partly-sent frame would be read as its payload. A confirmed transaction-lifetime reap rolls back uncommitted work. A generic connection close does not prove that this happened: **if COMMIT was in flight, its outcome may be unknown.** Reconnect only after the database is usable, inspect durable state, and reconcile before retrying a non-idempotent transaction. Do not infer rollback from a missing commit acknowledgement.
+
+### Explicit transaction and commit recovery errors
+
+Some class `2` and class `0` messages are intentionally forwarded even though they describe transaction safety state instead of a typo in the query:
+
+| Message | Class | What the client must do |
+|---|---|---|
+| `explicit transaction is aborted; roll back before running another statement` | `execution` | Issue `rollback`. Do not keep running statements, and do not try to `commit` the aborted transaction. |
+| `database handle is unusable after a storage failure; close and reopen before continuing` | `internal` | Close this handle and reopen the database before issuing more work. |
+| `commit outcome is unknown after a storage failure; close and reopen, then reconcile before retrying` | `internal` | Do **not** blindly retry the commit or the whole transaction. Reopen first, inspect durable state, and only then decide what application-level retry or compensation is safe. |
+
+The last case is intentionally conservative: once commit has entered its durability path, retrying without reconciliation can duplicate effects if the original commit actually made it to disk.
+
+For an embedded database, close and reopen the database handle. For a remote
+server, reconnecting a socket does not repair its shared poisoned engine:
+the operator must recover/reopen the server's database first. The wire classes
+remain unchanged; the new Rust error variants expose the distinction directly.
 
 ## Client-side mapping (TypeScript)
 
@@ -65,7 +82,7 @@ Errors from servers that predate the class byte keep the historical behavior: `e
 
 ## Message sanitization policy
 
-The class byte is orthogonal to the message *text*. The server decides whether to forward a message verbatim from the **type** of the failure, not from its wording: an exhaustive match over `QueryError` in `crates/server/src/handler/classify.rs`, with no wildcard arm, so a new variant does not compile until someone decides whether its text may cross the wire. Everything the engine phrases from the client's own statement, or from a budget the operator configured, crosses unchanged. Only what can carry internal state is replaced with the generic string `query execution error`: a plain I/O failure, corruption detail (`PageCorrupt`, `CorruptCrc`, `WalReplay`, `CatalogCorrupt`, `OverflowCorrupt`), and the read-only retry sentinel below. A storage refusal that kept its `StorageErrorKind` is decided by the kind; the few that still reach the query layer as a bare `io::Error` string keep a narrowed prefix fallback (`UNTYPED_STORAGE_SAFE_PREFIXES`) until their producers are typed.
+The class byte is orthogonal to the message *text*. The server decides whether to forward a message verbatim from the **type** of the failure, not from its wording: an exhaustive match over `QueryError` in `crates/server/src/handler/classify.rs`, with no wildcard arm, so a new variant does not compile until someone decides whether its text may cross the wire. Everything the engine phrases from the client's own statement, from fixed recovery guidance (`TransactionAborted`, `EnginePoisoned`, `CommitOutcomeUnknown`), or from a budget the operator configured, crosses unchanged. Only what can carry internal state is replaced with the generic string `query execution error`: a plain I/O failure, corruption detail (`PageCorrupt`, `CorruptCrc`, `WalReplay`, `CatalogCorrupt`, `OverflowCorrupt`), and the read-only retry sentinel below. A storage refusal that kept its `StorageErrorKind` is decided by the kind; the few that still reach the query layer as a bare `io::Error` string keep a narrowed prefix fallback (`UNTYPED_STORAGE_SAFE_PREFIXES`) until their producers are typed.
 
 Before this, the decision ran on a prefix allowlist over the message text, so any diagnostic whose wording did not start with one of about 35 recognized phrases arrived as `query execution error`. A mistyped column, `commit` outside a transaction, a malformed `uuid` or `bytes` literal, a missing required column, an unknown insert field, a negative limit, an upsert on a non-unique key, a non-scalar path-index key and a refresh of an unknown view were all diagnosable embedded and undiagnosable over the wire. `crates/server/tests/wire_error_text_parity.rs` now holds the two surfaces equal by executing each refusal both ways and comparing the text.
 
