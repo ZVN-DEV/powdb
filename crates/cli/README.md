@@ -214,8 +214,8 @@ provisioning a user can be the very first thing you do on a fresh install.
 
 `verify` exits 0 only when the data directory is clean and internally
 consistent. It refuses live writers and pending WAL, validates catalog/link/view
-metadata, heap CRCs plus strict slot/row/overflow decoding, and checks index
-entry sets against reconstructed rows. `--format json` returns a stable
+metadata, heap checksums where present plus strict slot/row/overflow decoding,
+and checks index entry sets against reconstructed rows. `--format json` returns a stable
 `VerifyReport` object with `schema_version`, `target`, `ok`, `checks`,
 `warnings`, and `errors`; text output prints the same check rows for humans.
 

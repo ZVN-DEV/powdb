@@ -226,7 +226,7 @@ pub(crate) fn subcommand_help(name: &str) -> &'static [&'static str] {
         "verify" => &[
             "    verify [--data-dir <DIR>]",
             "        Verify a quiescent data directory read-only: clean WAL, heap",
-            "        CRCs, strict row/overflow decode, index agreement, links,",
+            "        checksums where present, strict row/overflow decode, index agreement, links,",
             "        and materialized-view metadata. Writes no repairs.",
         ],
         "verify-backup" => &[

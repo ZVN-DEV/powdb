@@ -71,7 +71,7 @@ The verifier then opens the catalog with `Catalog::open_read_only`, which refuse
 
 For every table, `verify`:
 
-- checks every heap page CRC and strict data-page slot layout with `heap.verify_integrity`;
+- validates heap page checksums where present and strict data-page slot layout with `heap.verify_integrity`;
 - enumerates row IDs from the heap after slot layout validation;
 - validates raw row format;
 - decodes each row through strict `Table::get(RowId)`, so corrupt v2 overflow chains fail closed instead of being hidden by scan fallback behavior;

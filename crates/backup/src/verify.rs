@@ -12,7 +12,7 @@ use crate::restore::{
 use crate::RestoreSyncMode;
 use powdb_storage::btree::BTree;
 use powdb_storage::catalog::{expression_index_file_name, Catalog, IndexKeySource};
-use powdb_storage::data_dir::{CATALOG_FILE, READERS_DIR};
+use powdb_storage::data_dir::{CATALOG_FILE, READERS_DIR, WRITER_LOCK_FILE};
 use powdb_storage::dir_lock::DirLock;
 use powdb_storage::pj1::{pj1_get, pj1_scalar, PathSeg, Pj1Scalar};
 use powdb_storage::row::validate_row_format;
@@ -38,38 +38,53 @@ pub struct VerifyOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifyStatus {
+    /// The check completed successfully.
     Ok,
+    /// The check detected a problem or could not complete safely.
     Failed,
 }
 
 /// One completed check, suitable for both human and machine output.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyCheck {
+    /// Stable-ish check name, such as `catalog_open_read_only` or `table:T:rows`.
     pub name: String,
+    /// Whether this check succeeded or failed.
     pub status: VerifyStatus,
+    /// Human-readable evidence for the check result.
     pub detail: String,
 }
 
 /// One verifier finding.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyFinding {
+    /// Stable short machine-readable category.
     pub code: String,
+    /// Human-readable finding summary.
     pub message: String,
+    /// Operator-oriented next step; verification never repairs in place.
     pub remedy: String,
 }
 
 /// Stable machine-readable verification report.
 #[derive(Debug, Clone, Serialize)]
 pub struct VerifyReport {
+    /// Version of this report schema. Increment only for incompatible JSON changes.
     pub schema_version: u16,
+    /// The verified target, prefixed by report type.
     pub target: String,
+    /// True only when every required check succeeded. Warnings do not clear this flag.
     pub ok: bool,
+    /// Ordered check coverage and status rows.
     pub checks: Vec<VerifyCheck>,
+    /// Fatal findings that made `ok` false.
     pub errors: Vec<VerifyFinding>,
+    /// Non-fatal findings operators may still need to address.
     pub warnings: Vec<VerifyFinding>,
 }
 
 impl VerifyReport {
+    /// Current stable JSON report schema version.
     pub const SCHEMA_VERSION: u16 = 1;
 
     fn new(target: impl Into<String>) -> Self {
@@ -176,6 +191,27 @@ pub fn verify_database(data_dir: &Path) -> VerifyReport {
 
 fn verify_database_inner(data_dir: &Path, cleanup_created_reader_dir: bool) -> VerifyReport {
     let mut report = VerifyReport::new(format!("database:{}", data_dir.display()));
+    if let Err(error) = powdb_storage::validate_data_dir_read_only(data_dir) {
+        report.check_failed("directory", error.to_string());
+        report.error(
+            "directory_unavailable",
+            format!(
+                "cannot verify {} as an existing data directory: {error}",
+                data_dir.display()
+            ),
+            "point verify at an existing PowDB data directory; the verifier will not create missing paths",
+        );
+        return report;
+    }
+    if let Err(error) = refuse_current_process_writer_lock(data_dir) {
+        report.check_failed("writer_lock", error.to_string());
+        report.error(
+            "live_writer",
+            format!("cannot verify while this process owns {}: {error}", data_dir.display()),
+            "drop the write engine or run verification from a separate quiescent process after the writer exits",
+        );
+        return report;
+    }
     let readers_dir = data_dir.join(READERS_DIR);
     let readers_dir_existed = readers_dir.exists();
     let reader =
@@ -234,6 +270,21 @@ fn verify_database_inner(data_dir: &Path, cleanup_created_reader_dir: bool) -> V
         &mut report,
     );
     report
+}
+
+fn refuse_current_process_writer_lock(data_dir: &Path) -> io::Result<()> {
+    let lock_path = data_dir.join(WRITER_LOCK_FILE);
+    match fs::read_to_string(&lock_path) {
+        Ok(contents) if contents.trim().parse::<u32>().ok() == Some(std::process::id()) => {
+            Err(io::Error::other(format!(
+                "{} names the current process as writer",
+                lock_path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn cleanup_reader_dir_if_created(
@@ -335,14 +386,16 @@ fn verify_catalog_contents(data_dir: &Path, catalog: &Catalog, report: &mut Veri
             report.check_failed(format!("table:{table_name}:heap_crc"), error.to_string());
             report.error(
                 "heap_crc_failed",
-                format!("heap CRC verification failed for table '{table_name}': {error}"),
+                format!(
+                    "heap checksum/layout verification failed for table '{table_name}': {error}"
+                ),
                 "restore this table heap from backup; do not run repair against the source",
             );
             continue;
         }
         report.check_ok(
             format!("table:{table_name}:heap_crc"),
-            "all heap page CRCs verified",
+            "heap checksums verified where present; strict page and slot layout verified",
         );
 
         let rows = match strict_table_rows(table_name, table) {

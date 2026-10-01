@@ -2,6 +2,7 @@ use powdb_query::executor::Engine;
 use powdb_storage::btree::BTree;
 use powdb_storage::catalog::Catalog;
 use powdb_storage::data_dir::{READERS_DIR, VIEW_REGISTRY_FILE};
+use powdb_storage::dir_lock::DirLock;
 use powdb_storage::page::{slot_entry_offset_checked, Page, PAGE_SIZE};
 use powdb_storage::pj1::parse_json_text;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
@@ -194,6 +195,7 @@ fn verify_database_refuses_pending_wal() {
     exec(&mut engine, "type T { id: int }");
     exec(&mut engine, "insert T { id := 1 }");
     std::mem::forget(engine);
+    std::fs::remove_file(dir.join("LOCK")).unwrap();
 
     let report = powdb_backup::verify_database(&dir);
     assert!(!report.ok);
@@ -205,6 +207,39 @@ fn verify_database_refuses_pending_wal() {
         "expected pending WAL refusal, got:\n{}",
         report.to_text()
     );
+}
+
+#[test]
+fn verify_database_missing_directory_does_not_create_path() {
+    let dir = tmp("missing_dir");
+    assert!(!dir.exists());
+
+    let report = powdb_backup::verify_database(&dir);
+
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "directory_unavailable"));
+    assert!(
+        !dir.exists(),
+        "verify_database must not create missing data directories"
+    );
+}
+
+#[test]
+fn verify_database_refuses_same_process_writer_lock_even_when_wal_clean() {
+    let dir = make_indexed_db("same_pid_writer");
+    drop(Catalog::open_read_only(&dir).unwrap());
+    let _writer = DirLock::acquire(&dir).unwrap();
+
+    let report = powdb_backup::verify_database(&dir);
+
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "live_writer" && e.message.contains("current process")));
 }
 
 #[test]
