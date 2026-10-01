@@ -39,6 +39,56 @@ uses `:memory:`, and each cell is an arithmetic mean from one timed loop. It
 does not report confidence intervals. Repeat on a quiet host and report the
 spread; never use these results to promise durable-write throughput.
 
+## Paired value-profile harness
+
+`powdb-compare-paired` is the machine-readable paired harness used for
+publishable PowDB-vs-SQLite evidence. It is separate from `compare-engines` so
+the old diagnostic runner remains available.
+
+The publishable mode is `--mode full`: PowDB uses a file-backed temporary
+database with `WalSyncMode::Full`, while SQLite uses a file-backed temporary
+database with `journal_mode=WAL` and `synchronous=FULL`. The `--mode off` profile
+is deliberately labeled diagnostic: PowDB uses WAL-off and SQLite uses
+`:memory:`. Do not mix Full and Off numbers in one claim.
+
+Each driver invocation emits a single JSON document on stdout:
+
+```bash
+cargo run --release -p powdb-compare --bin powdb-compare-paired -- \
+  --engine powdb \
+  --mode full \
+  --engine-ref candidate \
+  --engine-hash "$(shasum -a 256 target/release/powdb-compare-paired | awk '{print $1}')"
+```
+
+The JSON includes provenance (`engine_ref`, binary hash, mode/storage labels),
+fixture/settings, raw per-run arithmetic means in `mean_ns_per_op`, and untimed
+correctness checks. The timed operations use varied keys, changed-value
+primary-key updates, prepared single-row inserts, bounded prepared insert
+batches, and protected scan/aggregate workloads. Correctness checks run outside
+the timed loops and include fixture parity, mutation readback, row-count/sum
+agreement, and reopen parity for file-backed modes.
+
+Use the pairing script for baseline/candidate evidence:
+
+```bash
+scripts/paired-bench.sh \
+  --baseline-bin /path/to/baseline/powdb-compare-paired \
+  --candidate-bin /path/to/candidate/powdb-compare-paired \
+  --baseline-ref baseline \
+  --candidate-ref candidate \
+  --mode full \
+  --runs 5 \
+  --output paired-full.json
+```
+
+The script alternates baseline/candidate order and PowDB/SQLite engine order
+across five runs, then reports raw run means plus medians/min/max/spread. A Full
+run is publishable only when all correctness checks pass, the candidate improves
+either a write median by at least 25% or point-read median by at least 30%, and
+protected scan/aggregate medians do not regress by more than 10%. Off-mode
+results are always diagnostic, even when they pass the same checks.
+
 ## With Postgres
 
 A pinned local Postgres is provided via Docker Compose. The credentials and
