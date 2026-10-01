@@ -71,8 +71,8 @@ The verifier then opens the catalog with `Catalog::open_read_only`, which refuse
 
 For every table, `verify`:
 
-- checks every heap page CRC with `heap.verify_integrity`;
-- enumerates row IDs from the heap;
+- checks every heap page CRC and strict data-page slot layout with `heap.verify_integrity`;
+- enumerates row IDs from the heap after slot layout validation;
 - validates raw row format;
 - decodes each row through strict `Table::get(RowId)`, so corrupt v2 overflow chains fail closed instead of being hidden by scan fallback behavior;
 - reconstructs column-index contents from rows and compares indexed row IDs and entry counts;
@@ -94,14 +94,16 @@ Links do not enforce row-level referential integrity in PowDB, so `verify` does 
 - unsupported manifest version;
 - invalid file name, path traversal, or nested path;
 - duplicate file entry;
-- missing `catalog.bin`;
+- missing `catalog.bin` or any catalog-referenced heap/index file omitted from the manifest;
 - missing referenced file;
 - symlink or non-regular file;
 - file length mismatch;
-- blake3 hash mismatch.
+- streaming blake3 hash mismatch.
 
-With `--restore-drill-dir`, it restores the full backup through the existing restore path into a fresh directory, verifies that restored directory, and optionally compares logical rows plus index metadata with `--compare-source`.
+After the manifest/file checks pass, `verify-backup` opens the backup snapshot itself through the same strict database verifier. With `--restore-drill-dir`, it restores the full backup through the existing restore path into a fresh, empty, non-symlink directory, verifies that restored directory, and optionally compares logical rows plus index metadata with `--compare-source`.
 
 ## Limits
 
 Verification is offline. It is not an online backup protocol, does not replay WAL, does not rebuild indexes, and does not salvage corrupt pages. If a required check cannot complete, the report fails closed rather than silently returning partial coverage.
+
+The source table/catalog files are not repaired or rewritten. Acquiring the shared reader lock can create ordinary administrative `readers/` metadata for the lifetime of the verifier; backup verification removes an empty reader directory it created for the backup snapshot.

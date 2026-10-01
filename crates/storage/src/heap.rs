@@ -1,7 +1,8 @@
 use crate::disk::DiskManager;
 use crate::error::StorageError;
 use crate::page::{
-    iter_page_slots, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE, PAGE_SIZE, SLOT_ENTRY_SIZE,
+    iter_page_slots, verify_page_layout_bytes, Page, PageType, UpdateFit, MAX_ROW_DATA_SIZE,
+    PAGE_SIZE, SLOT_ENTRY_SIZE,
 };
 use crate::row::{row_is_v2, validate_row_format};
 use crate::types::RowId;
@@ -2558,7 +2559,12 @@ impl HeapFile {
             let buf = self.disk.read_page(page_id)?;
             // Returns PageCorrupt on a CRC mismatch for stamped pages;
             // legacy unstamped pages (flag clear) pass without verification.
-            Page::from_bytes_verified(&buf)?;
+            verify_page_layout_bytes(&buf)?;
+            if buf[4] == PageType::Data as u8 {
+                for (_, row) in iter_page_slots(&buf) {
+                    validate_row_format(row)?;
+                }
+            }
         }
         Ok(())
     }

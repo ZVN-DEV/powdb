@@ -5,12 +5,14 @@
 //! normal lifetime of that open, and reports operator remedies rather than
 //! modifying bytes in place.
 
-use crate::manifest::BackupManifest;
-use crate::restore::{ensure_empty_dir, restore_with_sync_mode, validate_backup_file_name};
+use crate::manifest::{active_durable_file_names, durable_file_is_optional, BackupManifest};
+use crate::restore::{
+    ensure_empty_dir, restore_with_sync_mode, validate_backup_file_entry, validate_backup_file_name,
+};
 use crate::RestoreSyncMode;
 use powdb_storage::btree::BTree;
 use powdb_storage::catalog::{expression_index_file_name, Catalog, IndexKeySource};
-use powdb_storage::data_dir::CATALOG_FILE;
+use powdb_storage::data_dir::{CATALOG_FILE, READERS_DIR};
 use powdb_storage::dir_lock::DirLock;
 use powdb_storage::pj1::{pj1_get, pj1_scalar, PathSeg, Pj1Scalar};
 use powdb_storage::row::validate_row_format;
@@ -169,8 +171,14 @@ impl VerifyReport {
 /// Verify an offline data directory without replaying WAL or writing repair
 /// bytes.
 pub fn verify_database(data_dir: &Path) -> VerifyReport {
+    verify_database_inner(data_dir, false)
+}
+
+fn verify_database_inner(data_dir: &Path, cleanup_created_reader_dir: bool) -> VerifyReport {
     let mut report = VerifyReport::new(format!("database:{}", data_dir.display()));
-    let _reader =
+    let readers_dir = data_dir.join(READERS_DIR);
+    let readers_dir_existed = readers_dir.exists();
+    let reader =
         match DirLock::acquire_reader(data_dir) {
             Ok(lock) => {
                 report.check_ok(
@@ -205,12 +213,57 @@ pub fn verify_database(data_dir: &Path) -> VerifyReport {
                 format!("read-only catalog open failed: {error}"),
                 "open the directory with a read-write engine to recover pending WAL, or restore from a known-good backup",
             );
+            drop(reader);
+            cleanup_reader_dir_if_created(
+                data_dir,
+                cleanup_created_reader_dir,
+                readers_dir_existed,
+                &mut report,
+            );
             return report;
         }
     };
 
     verify_catalog_contents(data_dir, &catalog, &mut report);
+    drop(catalog);
+    drop(reader);
+    cleanup_reader_dir_if_created(
+        data_dir,
+        cleanup_created_reader_dir,
+        readers_dir_existed,
+        &mut report,
+    );
     report
+}
+
+fn cleanup_reader_dir_if_created(
+    data_dir: &Path,
+    cleanup_created_reader_dir: bool,
+    readers_dir_existed: bool,
+    report: &mut VerifyReport,
+) {
+    if !cleanup_created_reader_dir {
+        return;
+    }
+    let readers_dir = data_dir.join(READERS_DIR);
+    if readers_dir_existed || !readers_dir.exists() {
+        return;
+    }
+    match fs::remove_dir(&readers_dir) {
+        Ok(()) => report.check_ok(
+            "reader_lock_cleanup",
+            "removed empty verifier-created administrative readers directory",
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => report.warning(
+            "reader_lock_metadata_left",
+            format!(
+                "verifier-created administrative readers directory remains at {}: {error}",
+                readers_dir.display()
+            ),
+            "this is reader-lock metadata, not table/catalog data; remove it only after all readers exit",
+        ),
+    }
 }
 
 fn verify_catalog_contents(data_dir: &Path, catalog: &Catalog, report: &mut VerifyReport) {
@@ -670,6 +723,12 @@ pub fn verify_backup(backup_dir: &Path, options: &VerifyOptions) -> VerifyReport
         ),
     );
 
+    if verify_backup_manifest_completeness(backup_dir, &manifest, &mut report).is_err() {
+        return report;
+    }
+    let content = verify_database_inner(backup_dir, true);
+    merge_child_report(&mut report, "backup_database", content);
+
     if let Some(dest) = &options.restore_drill_dir {
         let drill = verify_restore_drill(backup_dir, dest, options.compare_source_dir.as_deref());
         merge_child_report(&mut report, "restore_drill", drill);
@@ -739,64 +798,26 @@ fn verify_backup_manifest_and_files(
             );
             return Err(());
         }
-        let path = backup_dir.join(&entry.name);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                report.check_failed("backup_file_exists", error.to_string());
-                report.error(
-                    "backup_file_missing",
-                    format!("manifest file '{}' is missing: {error}", entry.name),
-                    "restore from another backup or regenerate the snapshot",
-                );
-                return Err(());
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            report.check_failed("backup_file_type", entry.name.clone());
+        if let Err(error) =
+            validate_backup_file_entry(backup_dir, &entry.name, entry.len, &entry.blake3_hex)
+        {
+            report.check_failed("backup_file_validate", format!("{}: {error}", entry.name));
+            let message = error.to_string();
+            let code = if message.contains("No such file") || message.contains("not found") {
+                "backup_file_missing"
+            } else if message.contains("not a regular file") {
+                "backup_file_type_invalid"
+            } else if message.contains("length") {
+                "backup_file_length_mismatch"
+            } else if message.contains("blake3 mismatch") {
+                "backup_file_hash_mismatch"
+            } else {
+                "backup_file_unreadable"
+            };
             report.error(
-                "backup_file_type_invalid",
-                format!("backup entry '{}' is not a regular file", entry.name),
-                "reject this backup; symlinks and non-file entries are not safe restore inputs",
-            );
-            return Err(());
-        }
-        if metadata.len() != entry.len {
-            report.check_failed(
-                "backup_file_length",
-                format!(
-                    "{} len {} != manifest {}",
-                    entry.name,
-                    metadata.len(),
-                    entry.len
-                ),
-            );
-            report.error(
-                "backup_file_length_mismatch",
-                format!("backup entry '{}' length differs from manifest", entry.name),
-                "copy the backup again from its source or use a different backup",
-            );
-            return Err(());
-        }
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                report.check_failed("backup_file_read", error.to_string());
-                report.error(
-                    "backup_file_unreadable",
-                    format!("could not read backup entry '{}': {error}", entry.name),
-                    "fix filesystem permissions or use a readable backup copy",
-                );
-                return Err(());
-            }
-        };
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if hash != entry.blake3_hex {
-            report.check_failed("backup_file_hash", format!("{} hash mismatch", entry.name));
-            report.error(
-                "backup_file_hash_mismatch",
-                format!("backup entry '{}' hash differs from manifest", entry.name),
-                "discard this backup; bytes changed after the manifest was written",
+                code,
+                format!("backup entry '{}' failed validation: {error}", entry.name),
+                "discard this backup or copy it again from its trusted source",
             );
             return Err(());
         }
@@ -823,6 +844,62 @@ fn verify_backup_manifest_and_files(
     Ok(manifest)
 }
 
+fn verify_backup_manifest_completeness(
+    backup_dir: &Path,
+    manifest: &BackupManifest,
+    report: &mut VerifyReport,
+) -> Result<(), ()> {
+    let catalog = match Catalog::open_read_only(backup_dir) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            report.check_failed("manifest_required_files", error.to_string());
+            report.error(
+                "backup_catalog_open_failed",
+                format!("backup catalog cannot be opened read-only: {error}"),
+                "discard this backup; a full backup must contain every catalog-referenced durable file",
+            );
+            return Err(());
+        }
+    };
+    let listed: BTreeSet<&str> = manifest
+        .files
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let mut missing = Vec::new();
+    for expected in active_durable_file_names(&catalog) {
+        if durable_file_is_optional(&expected) && !backup_dir.join(&expected).exists() {
+            continue;
+        }
+        if !listed.contains(expected.as_str()) {
+            missing.push(expected);
+        }
+    }
+    if !missing.is_empty() {
+        report.check_failed(
+            "manifest_required_files",
+            format!(
+                "manifest omits required durable file(s): {}",
+                missing.join(", ")
+            ),
+        );
+        report.error(
+            "manifest_missing_required_file",
+            format!(
+                "backup manifest omits catalog-referenced durable file(s): {}",
+                missing.join(", ")
+            ),
+            "discard this backup; restore requires all heap/index/catalog-referenced files to be present and hashed",
+        );
+        return Err(());
+    }
+    report.check_ok(
+        "manifest_required_files",
+        "manifest includes every catalog-referenced durable file",
+    );
+    Ok(())
+}
+
 /// Restore a full backup into a fresh directory, verify the restored copy, and
 /// optionally compare it to a source data directory.
 pub fn verify_restore_drill(
@@ -831,19 +908,44 @@ pub fn verify_restore_drill(
     compare_source: Option<&Path>,
 ) -> VerifyReport {
     let mut report = VerifyReport::new(format!("restore-drill:{}", dest.display()));
-    if dest.exists()
-        && dest
-            .read_dir()
-            .map(|mut it| it.next().is_some())
-            .unwrap_or(true)
-    {
-        report.check_failed("restore_destination", "destination is not empty");
-        report.error(
-            "restore_destination_not_empty",
-            format!("restore drill destination {} is not empty", dest.display()),
-            "choose a fresh empty directory; verifier never overwrites existing data",
-        );
-        return report;
+    match fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() => {
+            report.check_failed("restore_destination", "destination is not a real directory");
+            report.error(
+                "restore_destination_invalid",
+                format!(
+                    "restore drill destination {} is not a real directory",
+                    dest.display()
+                ),
+                "choose a writable fresh real directory; verifier never follows destination symlinks",
+            );
+            return report;
+        }
+        Ok(_)
+            if dest
+                .read_dir()
+                .map(|mut it| it.next().is_some())
+                .unwrap_or(true) =>
+        {
+            report.check_failed("restore_destination", "destination is not empty");
+            report.error(
+                "restore_destination_not_empty",
+                format!("restore drill destination {} is not empty", dest.display()),
+                "choose a fresh empty directory; verifier never overwrites existing data",
+            );
+            return report;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            report.check_failed("restore_destination", error.to_string());
+            report.error(
+                "restore_destination_invalid",
+                format!("restore drill destination could not be inspected: {error}"),
+                "choose a writable fresh directory",
+            );
+            return report;
+        }
     }
     if let Err(error) = ensure_empty_dir(dest) {
         report.check_failed("restore_destination", error.to_string());
@@ -992,19 +1094,47 @@ fn open_verified_catalog(
 
 fn logical_table_digest(table: &powdb_storage::table::Table) -> io::Result<Vec<String>> {
     let mut rows = Vec::new();
-    for (rid, row) in strict_table_rows(table.schema().table_name.as_str(), table)? {
-        rows.push(format!(
-            "{}:{}:{}",
-            rid.page_id,
-            rid.slot_index,
-            row.iter()
-                .map(Value::to_wire_string)
-                .collect::<Vec<_>>()
-                .join("\u{1f}")
-        ));
+    for (_, row) in strict_table_rows(table.schema().table_name.as_str(), table)? {
+        rows.push(logical_row_hash(&row));
     }
     rows.sort();
     Ok(rows)
+}
+
+fn logical_row_hash(row: &Row) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(row.len() as u64).to_le_bytes());
+    for value in row {
+        hash_value(&mut hasher, value);
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn hash_value(hasher: &mut blake3::Hasher, value: &Value) {
+    hasher.update(&[value.type_id() as u8]);
+    match value {
+        Value::Int(value) | Value::DateTime(value) => {
+            hasher.update(&value.to_le_bytes());
+        }
+        Value::Float(value) => {
+            hasher.update(&value.to_bits().to_le_bytes());
+        }
+        Value::Bool(value) => {
+            hasher.update(&[*value as u8]);
+        }
+        Value::Str(value) => hash_len_bytes(hasher, value.as_bytes()),
+        Value::Uuid(value) => {
+            hasher.update(value);
+        }
+        Value::Bytes(value) => hash_len_bytes(hasher, value),
+        Value::Json(value) => hash_len_bytes(hasher, value),
+        Value::Empty => {}
+    };
+}
+
+fn hash_len_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn merge_child_report(parent: &mut VerifyReport, prefix: &str, child: VerifyReport) {

@@ -26,7 +26,7 @@ pub(crate) fn create_dir_secure(dir: &Path) -> io::Result<()> {
 
 /// Open `path` for writing, creating it with owner-only permissions and
 /// tightening it if it already exists.
-fn open_file_secure(path: &Path, truncate: bool) -> io::Result<File> {
+pub(crate) fn open_file_secure(path: &Path, truncate: bool) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true);
     if truncate {

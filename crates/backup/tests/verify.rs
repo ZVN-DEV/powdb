@@ -1,9 +1,12 @@
 use powdb_query::executor::Engine;
 use powdb_storage::btree::BTree;
 use powdb_storage::catalog::Catalog;
+use powdb_storage::data_dir::{READERS_DIR, VIEW_REGISTRY_FILE};
+use powdb_storage::page::{slot_entry_offset_checked, Page, PAGE_SIZE};
 use powdb_storage::pj1::parse_json_text;
 use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1};
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
+use std::io::{Seek, SeekFrom, Write};
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -295,4 +298,194 @@ fn restore_drill_requires_fresh_dest_and_can_compare_source() {
         .checks
         .iter()
         .any(|c| c.name.contains("source_compare:compare:User:rows")));
+}
+
+#[test]
+fn verify_database_rejects_live_slot_outside_page_even_with_valid_crc() {
+    let dir = make_indexed_db("bad_slot");
+    let heap = dir.join("User.heap");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&heap)
+        .unwrap();
+    let mut raw = [0u8; PAGE_SIZE];
+    file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+    std::io::Read::read_exact(&mut file, &mut raw).unwrap();
+    let entry = slot_entry_offset_checked(0).unwrap();
+    raw[entry..entry + 2].copy_from_slice(&(PAGE_SIZE as u16 - 1).to_le_bytes());
+    raw[entry + 2..entry + 4].copy_from_slice(&10u16.to_le_bytes());
+    let mut page = Page::from_bytes(&raw).unwrap();
+    page.stamp_checksum();
+    file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+    file.write_all(page.as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let report = powdb_backup::verify_database(&dir);
+    assert!(!report.ok);
+    assert!(
+        report.errors.iter().any(|e| e.code == "heap_crc_failed"),
+        "expected strict heap layout failure, got:\n{}",
+        report.to_text()
+    );
+}
+
+#[test]
+fn verify_backup_rejects_manifest_omitting_catalog_referenced_index() {
+    let src = make_indexed_db("manifest_missing_src");
+    let backup = full_backup(&src);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    let files = manifest
+        .get_mut("files")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
+    files.retain(|entry| {
+        entry
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|name| name != "User.heap" && name != "User_name.idx")
+            .unwrap_or(true)
+    });
+    std::fs::write(
+        backup.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let report = powdb_backup::verify_backup(&backup, &powdb_backup::VerifyOptions::default());
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "manifest_missing_required_file"));
+}
+
+#[test]
+fn verify_backup_rejects_traversal_manifest_name() {
+    let src = make_indexed_db("manifest_traversal_src");
+    let backup = full_backup(&src);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    let files = manifest
+        .get_mut("files")
+        .and_then(|v| v.as_array_mut())
+        .unwrap();
+    files[0]["name"] = serde_json::Value::String("../catalog.bin".into());
+    std::fs::write(
+        backup.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let report = powdb_backup::verify_backup(&backup, &powdb_backup::VerifyOptions::default());
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "manifest_name_invalid"));
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_backup_rejects_symlink_manifest_file() {
+    let src = make_indexed_db("manifest_symlink_src");
+    let backup = full_backup(&src);
+    let real = backup.join("User_name.idx.real");
+    std::fs::rename(backup.join("User_name.idx"), &real).unwrap();
+    std::os::unix::fs::symlink(&real, backup.join("User_name.idx")).unwrap();
+
+    let report = powdb_backup::verify_backup(&backup, &powdb_backup::VerifyOptions::default());
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "backup_file_type_invalid"));
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_drill_rejects_symlink_destination_without_writing() {
+    let src = make_indexed_db("symlink_dest_src");
+    let backup = full_backup(&src);
+    let real = tmp("symlink_dest_real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = tmp("symlink_dest_link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let report = powdb_backup::verify_restore_drill(&backup, &link, Some(&src));
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "restore_destination_invalid"));
+    assert!(std::fs::read_dir(&real).unwrap().next().is_none());
+}
+
+#[test]
+fn verify_backup_cleans_transient_reader_dir_it_created() {
+    let src = make_indexed_db("backup_readers_src");
+    let backup = full_backup(&src);
+    assert!(!backup.join(READERS_DIR).exists());
+
+    let report = powdb_backup::verify_backup(&backup, &powdb_backup::VerifyOptions::default());
+    assert!(report.ok, "report was not ok:\n{}", report.to_text());
+    assert!(
+        !backup.join(READERS_DIR).exists(),
+        "backup verification should clean its transient readers directory"
+    );
+}
+
+#[test]
+fn compare_database_dirs_hashes_bytes_by_content_not_display_placeholder() {
+    let left = tmp("bytes_left");
+    let right = tmp("bytes_right");
+    for (dir, value) in [(&left, vec![1u8, 2, 3]), (&right, vec![9u8, 8, 7])] {
+        let mut catalog = Catalog::create(dir).unwrap();
+        catalog
+            .create_table(Schema {
+                table_name: "Blob".into(),
+                columns: vec![ColumnDef {
+                    name: "payload".into(),
+                    type_id: TypeId::Bytes,
+                    required: false,
+                    position: 0,
+                }],
+            })
+            .unwrap();
+        catalog.insert("Blob", &vec![Value::Bytes(value)]).unwrap();
+    }
+
+    let report = powdb_backup::compare_database_dirs(&left, &right);
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "compare_rows_mismatch"));
+}
+
+#[test]
+fn verify_database_rejects_dangling_view_dependency_metadata() {
+    let dir = tmp("dangling_view");
+    {
+        let mut engine = Engine::new(&dir).unwrap();
+        exec(&mut engine, "type E { required id: int }");
+        exec(&mut engine, "insert E { id := 1 }");
+        exec(&mut engine, "materialize V as E { .id }");
+    }
+    let path = dir.join(VIEW_REGISTRY_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    for byte in &mut bytes {
+        if *byte == b'E' {
+            *byte = b'Z';
+        }
+    }
+    std::fs::write(&path, bytes).unwrap();
+
+    let report = powdb_backup::verify_database(&dir);
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == "view_metadata_invalid"));
 }

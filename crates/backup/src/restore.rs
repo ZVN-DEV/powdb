@@ -1,6 +1,8 @@
 use crate::manifest::{BackupManifest, SyncSnapshotMetadata, UNREFERENCED_DURABLE_FILES};
 use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
+use std::fs;
 use std::io;
+use std::io::{Read, Write};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -25,11 +27,29 @@ pub enum RestoreSyncMode {
 /// onto the restored data on `Catalog::open` and corrupt it. Restore requires
 /// a fresh or empty directory. A nonexistent or empty dest is fine.
 pub(crate) fn ensure_empty_dir(dest_data_dir: &Path) -> io::Result<()> {
-    if dest_data_dir.exists() && dest_data_dir.read_dir()?.next().is_some() {
-        return Err(io::Error::other(format!(
-            "restore destination {} is not empty; restore requires a fresh or empty directory",
-            dest_data_dir.display()
-        )));
+    match fs::symlink_metadata(dest_data_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is a symlink; restore requires a real fresh or empty directory",
+                    dest_data_dir.display()
+                )));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is not a directory",
+                    dest_data_dir.display()
+                )));
+            }
+            if dest_data_dir.read_dir()?.next().is_some() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is not empty; restore requires a fresh or empty directory",
+                    dest_data_dir.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     crate::secure::create_dir_secure(dest_data_dir)?;
     Ok(())
@@ -78,6 +98,63 @@ pub(crate) fn validate_delta_file_name(delta_file: &str, data_file: &str) -> io:
     Ok(())
 }
 
+pub(crate) fn validate_backup_file_entry(
+    backup_dir: &Path,
+    name: &str,
+    len: u64,
+    expected_blake3_hex: &str,
+) -> io::Result<()> {
+    validate_backup_file_name(name)?;
+    let path = backup_dir.join(name);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(io::Error::other(format!(
+            "backup entry '{name}' is not a regular file"
+        )));
+    }
+    if metadata.len() != len {
+        return Err(io::Error::other(format!(
+            "backup entry '{name}' length {} differs from manifest {len}",
+            metadata.len()
+        )));
+    }
+    let mut file = fs::File::open(&path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut read_len = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        read_len += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    if read_len != len {
+        return Err(io::Error::other(format!(
+            "backup entry '{name}' read length {read_len} differs from manifest {len}"
+        )));
+    }
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual != expected_blake3_hex {
+        return Err(io::Error::other(format!(
+            "integrity check failed for {name}: blake3 mismatch (backup is corrupt)"
+        )));
+    }
+    Ok(())
+}
+
+fn copy_backup_file_secure_streaming(
+    backup_dir: &Path,
+    dest_data_dir: &Path,
+    name: &str,
+) -> io::Result<()> {
+    let mut input = fs::File::open(backup_dir.join(name))?;
+    let mut output = crate::secure::open_file_secure(&dest_data_dir.join(name), true)?;
+    io::copy(&mut input, &mut output)?;
+    output.flush()
+}
+
 /// Verify every file in a full backup's manifest against its blake3, then copy
 /// it into `dest`. Does NOT open the catalog or write sync identity metadata —
 /// callers decide when to validate. Assumes `dest` already exists.
@@ -87,17 +164,11 @@ pub(crate) fn verify_and_copy_full(
     dest_data_dir: &Path,
 ) -> io::Result<()> {
     for f in &manifest.files {
-        validate_backup_file_name(&f.name)?;
-        let bytes = std::fs::read(backup_dir.join(&f.name))?;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if hash != f.blake3_hex {
-            warn!(file = %f.name, "blake3 mismatch while restoring; backup is corrupt");
-            return Err(io::Error::other(format!(
-                "integrity check failed for {}: blake3 mismatch (backup is corrupt)",
-                f.name
-            )));
+        if let Err(error) = validate_backup_file_entry(backup_dir, &f.name, f.len, &f.blake3_hex) {
+            warn!(file = %f.name, %error, "backup file validation failed while restoring");
+            return Err(error);
         }
-        crate::secure::write_file_secure(&dest_data_dir.join(&f.name), &bytes)?;
+        copy_backup_file_secure_streaming(backup_dir, dest_data_dir, &f.name)?;
     }
     Ok(())
 }

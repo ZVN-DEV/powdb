@@ -506,7 +506,7 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("USAGE:");
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
                 println!("    powdb-cli --data-dir <DIR> backup <DEST_DIR> [--base <FULL_DIR>]");
-                println!("    powdb-cli verify --data-dir <DIR>");
+                println!("    powdb-cli verify [--data-dir <DIR>]");
                 println!("    powdb-cli verify-backup <BACKUP_DIR> [--restore-drill-dir <DEST>] [--compare-source <DIR>]");
                 println!(
                     "    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR> [--apply <INC_DIR>]... [--sync-strip|--sync-preserve|--sync-fork]"

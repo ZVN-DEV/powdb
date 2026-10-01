@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
 
@@ -136,6 +136,48 @@ fn cli_verify_backup_restore_drill_requires_fresh_destination() {
         String::from_utf8_lossy(&ok.stderr)
     );
     assert!(String::from_utf8_lossy(&ok.stdout).contains("\"ok\": true"));
+}
+
+#[test]
+fn cli_verify_refuses_live_writer() {
+    let data = tmp("livewriter");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+
+    let mut child = Command::new(bin())
+        .args(["--data-dir", data_s])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn powdb-cli repl");
+    for _ in 0..50 {
+        if data.join("LOCK").exists() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "writer process exited before taking lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(data.join("LOCK").exists(), "writer lock was not created");
+
+    let out = run(&["verify", "--data-dir", data_s]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("live_writer") || stdout.contains("reader_lock"),
+        "expected live writer refusal, got stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
