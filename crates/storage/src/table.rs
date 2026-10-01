@@ -777,6 +777,26 @@ impl Table {
         Ok(heap_changed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_page_count(&self) -> Option<usize> {
+        self.heap.statement_snapshot_page_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.heap.statement_snapshot_metadata_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.heap.cached_statement_snapshot_metadata_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_before_page_capacity(&self) -> usize {
+        self.heap.cached_statement_snapshot_before_page_capacity()
+    }
+
     /// Whether this table has any `auto` column.
     pub(crate) fn has_auto(&self) -> bool {
         self.auto_cols.iter().any(|&a| a)

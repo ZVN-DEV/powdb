@@ -99,13 +99,35 @@ fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let args = parse_args();
+    if matches!(&args.action, Action::Verify | Action::VerifyBackup { .. })
+        && !matches!(args.output, OutputMode::Table | OutputMode::Json)
+    {
+        eprintln!("Error: verification --format requires table or json");
+        std::process::exit(2);
+    }
 
     match &args.action {
         Action::Backup { dest, base } => {
             std::process::exit(run_backup(&args.data_dir, dest, base.as_deref()));
+        }
+        Action::Verify => {
+            std::process::exit(run_verify(&args.data_dir, args.output));
+        }
+        Action::VerifyBackup {
+            backup_dir,
+            restore_drill_dir,
+            compare_source_dir,
+        } => {
+            std::process::exit(run_verify_backup(
+                backup_dir,
+                restore_drill_dir.as_deref(),
+                compare_source_dir.as_deref(),
+                args.output,
+            ));
         }
         Action::Restore {
             backup_dir,

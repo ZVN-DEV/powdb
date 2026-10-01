@@ -1,7 +1,10 @@
 use crate::manifest::{BackupManifest, SyncSnapshotMetadata, UNREFERENCED_DURABLE_FILES};
 use powdb_storage::catalog::{Catalog, CATALOG_LSN_FILE};
+use std::fs;
 use std::io;
+use std::io::{Read, Seek, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Controls how restore writes sync identity metadata.
@@ -25,11 +28,29 @@ pub enum RestoreSyncMode {
 /// onto the restored data on `Catalog::open` and corrupt it. Restore requires
 /// a fresh or empty directory. A nonexistent or empty dest is fine.
 pub(crate) fn ensure_empty_dir(dest_data_dir: &Path) -> io::Result<()> {
-    if dest_data_dir.exists() && dest_data_dir.read_dir()?.next().is_some() {
-        return Err(io::Error::other(format!(
-            "restore destination {} is not empty; restore requires a fresh or empty directory",
-            dest_data_dir.display()
-        )));
+    match fs::symlink_metadata(dest_data_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is a symlink; restore requires a real fresh or empty directory",
+                    dest_data_dir.display()
+                )));
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is not a directory",
+                    dest_data_dir.display()
+                )));
+            }
+            if dest_data_dir.read_dir()?.next().is_some() {
+                return Err(io::Error::other(format!(
+                    "restore destination {} is not empty; restore requires a fresh or empty directory",
+                    dest_data_dir.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     crate::secure::create_dir_secure(dest_data_dir)?;
     Ok(())
@@ -78,6 +99,153 @@ pub(crate) fn validate_delta_file_name(delta_file: &str, data_file: &str) -> io:
     Ok(())
 }
 
+pub(crate) fn validate_backup_file_entry(
+    backup_dir: &Path,
+    name: &str,
+    len: u64,
+    expected_blake3_hex: &str,
+) -> io::Result<()> {
+    let mut file = open_manifest_entry(backup_dir, name, len)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut read_len = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        read_len += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    if read_len != len {
+        return Err(io::Error::other(format!(
+            "integrity check failed for {name}: read length {read_len} differs from manifest {len}"
+        )));
+    }
+    let actual = hasher.finalize().to_hex().to_string();
+    if actual != expected_blake3_hex {
+        return Err(io::Error::other(format!(
+            "integrity check failed for {name}: blake3 mismatch (backup is corrupt)"
+        )));
+    }
+    Ok(())
+}
+
+fn open_manifest_entry(backup_dir: &Path, name: &str, len: u64) -> io::Result<fs::File> {
+    validate_backup_file_name(name)?;
+    let path = backup_dir.join(name);
+    let mut file = fs::File::open(&path)?;
+    let handle_metadata = file.metadata()?;
+    let path_metadata = fs::symlink_metadata(&path)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.file_type().is_file()
+        || !handle_metadata.file_type().is_file()
+    {
+        return Err(io::Error::other(format!(
+            "backup entry '{name}' is not a regular file"
+        )));
+    }
+    verify_opened_file_identity(name, &handle_metadata, &path_metadata)?;
+    if handle_metadata.len() != len {
+        return Err(io::Error::other(format!(
+            "integrity check failed for {name}: length {} differs from manifest {len}",
+            handle_metadata.len()
+        )));
+    }
+    file.rewind()?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn verify_opened_file_identity(
+    name: &str,
+    opened: &fs::Metadata,
+    path: &fs::Metadata,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if opened.dev() != path.dev() || opened.ino() != path.ino() {
+        return Err(io::Error::other(format!(
+            "backup entry '{name}' changed while opening"
+        )));
+    }
+    Ok(())
+}
+
+// The race-hardening identity check is implemented for Unix platforms (Linux
+// and macOS), where backup/restore currently enforces owner-only modes. On
+// non-Unix targets we still require a regular file and stream from one opened
+// handle, but std exposes no stable dev/inode equivalent to compare.
+#[cfg(not(unix))]
+fn verify_opened_file_identity(
+    _name: &str,
+    _opened: &fs::Metadata,
+    _path: &fs::Metadata,
+) -> io::Result<()> {
+    Ok(())
+}
+
+fn copy_backup_file_verified(
+    backup_dir: &Path,
+    dest_data_dir: &Path,
+    name: &str,
+    len: u64,
+    expected_blake3_hex: &str,
+) -> io::Result<()> {
+    let mut input = open_manifest_entry(backup_dir, name, len)?;
+    let final_path = dest_data_dir.join(name);
+    if final_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "restore destination file {} already exists",
+                final_path.display()
+            ),
+        ));
+    }
+    let tmp_path = dest_data_dir.join(format!(
+        ".{name}.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| {
+        let mut output = crate::secure::create_new_file_secure(&tmp_path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut copied_len = 0u64;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = input.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            copied_len += n as u64;
+            hasher.update(&buf[..n]);
+            output.write_all(&buf[..n])?;
+        }
+        output.flush()?;
+        drop(output);
+        if copied_len != len {
+            return Err(io::Error::other(format!(
+                "integrity check failed for {name}: read length {copied_len} differs from manifest {len}"
+            )));
+        }
+        let actual = hasher.finalize().to_hex().to_string();
+        if actual != expected_blake3_hex {
+            return Err(io::Error::other(format!(
+                "integrity check failed for {name}: blake3 mismatch (backup is corrupt)"
+            )));
+        }
+        fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 /// Verify every file in a full backup's manifest against its blake3, then copy
 /// it into `dest`. Does NOT open the catalog or write sync identity metadata —
 /// callers decide when to validate. Assumes `dest` already exists.
@@ -87,17 +255,12 @@ pub(crate) fn verify_and_copy_full(
     dest_data_dir: &Path,
 ) -> io::Result<()> {
     for f in &manifest.files {
-        validate_backup_file_name(&f.name)?;
-        let bytes = std::fs::read(backup_dir.join(&f.name))?;
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if hash != f.blake3_hex {
-            warn!(file = %f.name, "blake3 mismatch while restoring; backup is corrupt");
-            return Err(io::Error::other(format!(
-                "integrity check failed for {}: blake3 mismatch (backup is corrupt)",
-                f.name
-            )));
+        if let Err(error) =
+            copy_backup_file_verified(backup_dir, dest_data_dir, &f.name, f.len, &f.blake3_hex)
+        {
+            warn!(file = %f.name, %error, "backup file validation failed while restoring");
+            return Err(error);
         }
-        crate::secure::write_file_secure(&dest_data_dir.join(&f.name), &bytes)?;
     }
     Ok(())
 }

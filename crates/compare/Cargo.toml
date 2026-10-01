@@ -27,5 +27,10 @@ name = "compare-engines"
 path = "src/main.rs"
 test = true
 
+[[bin]]
+name = "powdb-compare-paired"
+path = "src/paired.rs"
+test = true
+
 [lints]
 workspace = true

@@ -803,6 +803,9 @@ jobs:
       - name: Prove every comparator verdict is reachable
         run: bash scripts/ci/bench-gate-selftest.sh
 
+      - name: Prove paired evidence rejects unsafe conclusions
+        run: bash scripts/paired-bench.sh --selftest
+
   # A job that is not in ci-success's `needs:` blocks nothing. The comment on
   # that job asks contributors to keep the list current; this makes forgetting
   # it a build failure instead of a silently unguarded job. Pure text parsing,

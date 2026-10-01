@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Offline `powdb-cli verify` and `verify-backup` commands with text/JSON reports,
+  strict heap/row/index checks, manifest validation, and optional restore drills
+  into a fresh directory. Verification never repairs or replays the source.
+- A paired performance driver with explicit control/candidate binaries,
+  equivalent Full-mode configuration, raw samples, result checks, and guards
+  for noisy or mismatched measurements.
+
 ### Changed
+
+- Full/Normal transactions no longer capture unused in-memory rollback
+  before-images; WAL recovery still owns their rollback. WAL-Off commits reuse
+  metadata buffers while releasing page-image storage and its budget charges.
 
 - **BREAKING (transaction error handling):** a failed statement now aborts an
   explicit transaction. Further work and COMMIT are refused until ROLLBACK;

@@ -1,4 +1,4 @@
-//! Offline administration subcommands: backup, restore, sync, users, sweep.
+//! Offline administration subcommands: backup, restore, verify, sync, users, sweep.
 
 use super::*;
 
@@ -132,6 +132,44 @@ pub(crate) fn run_restore(
             eprintln!("Error: chain restore failed: {e}");
             1
         }
+    }
+}
+
+pub(crate) fn print_verify_report(report: &powdb_backup::VerifyReport, output: OutputMode) {
+    match output {
+        OutputMode::Json => println!("{}", report.to_json_pretty()),
+        OutputMode::Table | OutputMode::Csv => print!("{}", report.to_text()),
+    }
+}
+
+pub(crate) fn run_verify(data_dir: &str, output: OutputMode) -> i32 {
+    let report = powdb_backup::verify_database(Path::new(data_dir));
+    let ok = report.ok;
+    print_verify_report(&report, output);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+pub(crate) fn run_verify_backup(
+    backup_dir: &str,
+    restore_drill_dir: Option<&str>,
+    compare_source_dir: Option<&str>,
+    output: OutputMode,
+) -> i32 {
+    let options = powdb_backup::VerifyOptions {
+        restore_drill_dir: restore_drill_dir.map(PathBuf::from),
+        compare_source_dir: compare_source_dir.map(PathBuf::from),
+    };
+    let report = powdb_backup::verify_backup(Path::new(backup_dir), &options);
+    let ok = report.ok;
+    print_verify_report(&report, output);
+    if ok {
+        0
+    } else {
+        1
     }
 }
 

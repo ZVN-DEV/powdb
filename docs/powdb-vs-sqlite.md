@@ -10,6 +10,19 @@ between the two.
 
 ## When to choose PowDB
 
+- **You want shaped, typed results directly from the engine.** PowQL can return
+  one row per parent with correlated children nested as a native value, so the
+  application does not have to undo join fan-out or parse JSON text back into
+  objects. The Rust API, TypeScript client, and Node addon all expose native
+  typed result paths for exact integers, booleans, bytes, datetimes, UUIDs, and
+  PJ1 JSON.
+- **You want named relationship traversal in the query language.** Declare
+  `link Order.user -> User on user_id = id` once, then read `o.user.name` or
+  `orders: u.orders { ... }` in PowQL. A scalar hop through a non-unique key is
+  refused as an error rather than silently multiplying rows.
+- **You store documents but still need scalar path indexes.** JSON is a binary
+  PJ1 value, and scalar paths can be filtered, grouped, ordered, aggregated, and
+  indexed with `alter Post add index (.data->slug)`.
 - **Your stack is pure Rust and you want to keep it that way.** PowDB's
   storage and query engines are 100% Rust with no `libsqlite3-sys`, no
   `bindgen`, and no C toolchain in the build path. The two *binaries* are the
@@ -103,12 +116,12 @@ visible in `crates/storage/src/wal.rs`, `crates/storage/src/heap.rs`, and
 
 ## Benchmarks
 
-Numbers below are from `cargo run --release -p powdb-compare` against the
-same dataset (100K rows), with PowDB in `WalSyncMode::Off` and SQLite in
-`:memory:` -- neither engine fsyncs. This is the methodology
-disclosed in the project README. It favors both engines' in-memory paths
-equally; on-disk durable comparisons will move the numbers and are tracked
-separately.
+Numbers below are a historical snapshot from `cargo run --release -p
+powdb-compare` against the same dataset (100K rows), with PowDB in
+`WalSyncMode::Off` and SQLite in `:memory:` -- neither engine fsyncs. This
+isolates query-engine cost from durability cost; on-disk durable comparisons
+will move the numbers and are tracked separately. It is not a broad "fastest
+vs SQLite" claim.
 
 Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0),
 commit `e3dfa71`, measured 2026-08-15. **Laptop numbers, not CI numbers.**
@@ -133,11 +146,14 @@ Full methodology and per-run spread:
 | Insert batch (1K rows)              | 242 ns   | 214 ns   | roughly tied            |
 | **Indexed point lookup**            | —        | —        | Withdrawn: repeated-key workload |
 
-**Correction (2026-09-19):** the old runner repeatedly used one lookup key and
-assigned the same update values. The corrected runner varies keys and changes
-values. These lookup/update rows are withdrawn until controlled remeasurement;
-the other rows remain a historical snapshot, not timings for the unreleased
-transaction changes. PowDB's WAL-off mode writes no WAL, not merely no fsync.
+**Correction (2026-09-19):** lookup and update rows from the older runner are
+withdrawn because they reused keys or values in ways that did not represent the
+corrected workloads. Details remain public in
+[the correction record](benchmarks/2026-09-19-benchmark-corrections.md). The
+next publishable comparison should come from the paired harness work: explicit
+baseline/candidate binaries, alternating run order, correctness checks outside
+timing, and raw samples. Until then, no new point-lookup or update ratios are
+claimed. PowDB's WAL-off mode writes no WAL, not merely no fsync.
 
 The wins are where the compiled-predicate engine is designed to win:
 aggregates, at 3.7-7.7x. The scan-shaped workloads are a weaker story than
@@ -151,9 +167,9 @@ pretend otherwise.
 
 **Indexed point latency remains a reason to evaluate SQLite first.** Front-end
 and row-fetch costs matter when little scanning is needed. The old repeated-key
-ratios are withdrawn, not replaced by an unverified claim that the corrected
-workload wins. Measure the varied-key workload on your hardware; scan
-throughput does not compensate for a slower point-lookup hot path.
+ratios are withdrawn, not replaced by a new claim. Measure the varied-key
+workload on your hardware; scan throughput does not prove a point-lookup hot
+path.
 
 One caveat on the two insert rows. PowDB writes into a real temporary
 directory while SQLite runs in `:memory:`, so PowDB's insert numbers are
@@ -163,11 +179,9 @@ while every other row moved by under 2x, and SQLite's inserts did not move at
 all. The figures above are from an otherwise-idle machine; treat them as an
 upper bound on what a loaded host will give you.
 
-Two of these workloads used to be measured through a code path a user could
-not reach (the aggregates hand-built a plan node; the indexed point lookup
-called the B-tree directly), which is why previously published figures were
-40-60% higher and why the point lookup was previously, wrongly, reported as a
-3.0x win. That is fixed; see the snapshot doc for the before-and-after.
+Earlier benchmark history also includes a code-path correction: two workloads
+used to be measured through paths a user could not reach. That is fixed; see
+the snapshot doc and the 2026-09-19 correction record for the before-and-after.
 
 ### A note on durable writes
 
@@ -209,6 +223,11 @@ Results land in `crates/compare/results.csv`.
   Embed it in a service that already speaks Rust, where the win on scans
   and aggregates compounds across the request path, and where the
   pure-Rust build chain matters. That is the workload PowDB is built for.
+- **No MVCC, live backup, Windows support, or full SQL.** PowDB has parallel
+  reads and a single write-admission gate, offline full/incremental backup with
+  coarse PITR, Linux/macOS support, and a supported SQL subset. SQLite has
+  snapshot isolation in WAL mode, online backup APIs, Windows support, and the
+  broader SQL/tooling ecosystem.
 
 If your evaluation lands somewhere in between, the honest answer is: ship
 SQLite, measure your bottleneck, and reach for PowDB if and when an

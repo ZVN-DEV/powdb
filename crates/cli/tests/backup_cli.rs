@@ -1,9 +1,43 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use powdb_storage::types::{ColumnDef, Schema, TypeId, Value};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_powdb-cli")
+}
+
+#[test]
+fn verifier_accepts_json_format_after_subcommand_and_rejects_csv() {
+    let data = tmp("verify_format");
+    let backup = tmp("verify_format_backup");
+    let data_s = data.to_str().unwrap();
+    let backup_s = backup.to_str().unwrap();
+    assert!(run(&["--data-dir", data_s, "--exec", "type T { id: int }"])
+        .status
+        .success());
+    let verified = run(&["verify", "--data-dir", data_s, "--format", "json"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("\"ok\": true"));
+    assert!(run(&["--data-dir", data_s, "backup", backup_s])
+        .status
+        .success());
+    let verified = run(&["verify-backup", backup_s, "--format", "json"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("\"ok\": true"));
+    for args in [
+        vec!["verify", "--data-dir", data_s, "--format", "csv"],
+        vec!["--format", "csv", "verify", "--data-dir", data_s],
+    ] {
+        assert_eq!(run(&args).status.code(), Some(2));
+    }
 }
 
 fn tmp(tag: &str) -> std::path::PathBuf {
@@ -39,6 +73,144 @@ fn assert_cli_count(data_dir: &std::path::Path, table: &str, expected: usize) {
         stdout.trim(),
         expected.to_string(),
         "expected count {expected} in restored DB, got stdout: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_verify_database_text_and_json() {
+    let data = tmp("verifydata");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["verify", "--data-dir", data_s]).status.code() == Some(1),
+        "missing database should fail verification"
+    );
+
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+    assert!(run(&["--data-dir", data_s, "-c", "insert T { id := 1 }"])
+        .status
+        .success());
+
+    let text = run(&["verify", "--data-dir", data_s]);
+    assert!(
+        text.status.success(),
+        "verify failed: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("verify database:"));
+    assert!(stdout.contains("[ok] catalog_open_read_only"));
+
+    let json = run(&["--format", "json", "verify", "--data-dir", data_s]);
+    assert!(
+        json.status.success(),
+        "json verify failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    assert!(stdout.contains("\"schema_version\""));
+    assert!(stdout.contains("\"ok\": true"));
+    assert!(stdout.contains("\"checks\""));
+}
+
+#[test]
+fn cli_verify_backup_restore_drill_requires_fresh_destination() {
+    let data = tmp("verifybkpdata");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+    assert!(run(&["--data-dir", data_s, "-c", "insert T { id := 7 }"])
+        .status
+        .success());
+    let backup = tmp("verifybkp");
+    let backup_out = run(&["--data-dir", data_s, "backup", backup.to_str().unwrap()]);
+    assert!(
+        backup_out.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup_out.stderr)
+    );
+
+    let nonempty = tmp("verifybkpnonempty");
+    std::fs::create_dir_all(&nonempty).unwrap();
+    std::fs::write(nonempty.join("sentinel"), b"keep").unwrap();
+    let refused = run(&[
+        "verify-backup",
+        backup.to_str().unwrap(),
+        "--restore-drill-dir",
+        nonempty.to_str().unwrap(),
+        "--compare-source",
+        data_s,
+    ]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert!(stdout.contains("restore_destination_not_empty"));
+    assert_eq!(std::fs::read(nonempty.join("sentinel")).unwrap(), b"keep");
+
+    let fresh = tmp("verifybkpfresh");
+    let ok = run(&[
+        "--format",
+        "json",
+        "verify-backup",
+        backup.to_str().unwrap(),
+        "--restore-drill-dir",
+        fresh.to_str().unwrap(),
+        "--compare-source",
+        data_s,
+    ]);
+    assert!(
+        ok.status.success(),
+        "verify-backup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("\"ok\": true"));
+}
+
+#[test]
+fn cli_verify_refuses_live_writer() {
+    let data = tmp("livewriter");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+
+    let mut child = Command::new(bin())
+        .args(["--data-dir", data_s])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn powdb-cli repl");
+    for _ in 0..50 {
+        if data.join("LOCK").exists() {
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "writer process exited before taking lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(data.join("LOCK").exists(), "writer lock was not created");
+
+    let out = run(&["verify", "--data-dir", data_s]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("live_writer") || stdout.contains("reader_lock"),
+        "expected live writer refusal, got stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
