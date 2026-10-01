@@ -11,6 +11,7 @@ use powdb_storage::types::Value;
 use powdb_storage::wal::WalSyncMode;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::TryFrom;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -142,7 +143,12 @@ trait ValueEngine {
     fn scan_filter_count(&mut self) -> Result<usize, String>;
     fn aggregate_sum(&mut self) -> Result<i64, String>;
     fn row_count(&mut self) -> Result<usize, String>;
-    fn reopen_check(&mut self, expected_count: usize, expected_sum: i64) -> Result<String, String>;
+    fn reopen_check(
+        &mut self,
+        expected_count: usize,
+        expected_sum: i64,
+        expected_points: &[(i64, i64)],
+    ) -> Result<String, String>;
 }
 
 struct PowdbValueEngine {
@@ -345,12 +351,19 @@ impl ValueEngine for PowdbValueEngine {
         }
     }
 
-    fn reopen_check(&mut self, expected_count: usize, expected_sum: i64) -> Result<String, String> {
+    fn reopen_check(
+        &mut self,
+        expected_count: usize,
+        expected_sum: i64,
+        expected_points: &[(i64, i64)],
+    ) -> Result<String, String> {
         let path = self.path().to_path_buf();
-        drop(std::mem::replace(
-            &mut self.engine,
-            Engine::new(&path).map_err(|e| e.to_string())?,
-        ));
+        let scratch = TempDir::new().map_err(|e| e.to_string())?;
+        let placeholder = Engine::new(scratch.path()).map_err(|e| e.to_string())?;
+        let old_engine = std::mem::replace(&mut self.engine, placeholder);
+        drop(old_engine);
+        drop(scratch);
+        self.engine = Engine::new(&path).map_err(|e| e.to_string())?;
         self.engine
             .catalog_mut()
             .set_wal_sync_mode(match self.mode {
@@ -362,13 +375,16 @@ impl ValueEngine for PowdbValueEngine {
         self.insert_one = None;
         let count = self.row_count()?;
         let sum = self.aggregate_sum()?;
-        if count == expected_count && sum == expected_sum {
-            Ok(format!("count={count},sum={sum}"))
-        } else {
-            Err(format!(
+        if count != expected_count || sum != expected_sum {
+            return Err(format!(
                 "after reopen expected count={expected_count},sum={expected_sum}; got count={count},sum={sum}"
-            ))
+            ));
         }
+        validate_reopened_points(self, expected_points)?;
+        Ok(format!(
+            "count={count},sum={sum},points={}",
+            expected_points.len()
+        ))
     }
 }
 
@@ -551,22 +567,34 @@ impl ValueEngine for SqliteValueEngine {
             .map_err(|e| e.to_string())
     }
 
-    fn reopen_check(&mut self, expected_count: usize, expected_sum: i64) -> Result<String, String> {
+    fn reopen_check(
+        &mut self,
+        expected_count: usize,
+        expected_sum: i64,
+        expected_points: &[(i64, i64)],
+    ) -> Result<String, String> {
         let Some(path) = self.path.clone() else {
             return Ok("skipped:sqlite-memory-diagnostic".to_string());
         };
+        let placeholder = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let old_conn = std::mem::replace(&mut self.conn, placeholder);
+        drop(old_conn);
         let replacement = Connection::open(&path).map_err(|e| e.to_string())?;
         configure_sqlite_full(&replacement)?;
-        drop(std::mem::replace(&mut self.conn, replacement));
+        let placeholder = std::mem::replace(&mut self.conn, replacement);
+        drop(placeholder);
         let count = self.row_count()?;
         let sum = self.aggregate_sum()?;
-        if count == expected_count && sum == expected_sum {
-            Ok(format!("count={count},sum={sum}"))
-        } else {
-            Err(format!(
+        if count != expected_count || sum != expected_sum {
+            return Err(format!(
                 "after reopen expected count={expected_count},sum={expected_sum}; got count={count},sum={sum}"
-            ))
+            ));
         }
+        validate_reopened_points(self, expected_points)?;
+        Ok(format!(
+            "count={count},sum={sum},points={}",
+            expected_points.len()
+        ))
     }
 }
 
@@ -575,6 +603,22 @@ fn configure_sqlite_full(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "synchronous", "FULL")
         .map_err(|e| e.to_string())?;
+    let journal_mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let synchronous: i64 = conn
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(format!(
+            "SQLite journal_mode claim mismatch: expected WAL, got {journal_mode}"
+        ));
+    }
+    if synchronous != 2 {
+        return Err(format!(
+            "SQLite synchronous claim mismatch: expected FULL(2), got {synchronous}"
+        ));
+    }
     Ok(())
 }
 
@@ -585,12 +629,7 @@ fn run(config: Config) -> Result<RunReport, String> {
             config.profile
         ));
     }
-    if config.fixture_rows == 0 {
-        return Err("--fixture-rows must be positive".to_string());
-    }
-    if config.batch_size == 0 {
-        return Err("--batch-size must be positive".to_string());
-    }
+    validate_config_bounds(&config)?;
 
     let mut engine: Box<dyn ValueEngine> = match config.engine {
         EngineKind::Powdb => Box::new(PowdbValueEngine::new(config.mode)?),
@@ -710,18 +749,30 @@ fn run(config: Config) -> Result<RunReport, String> {
     check_mutations(&mut *engine, &expected_ages, &update_keys, &mut checks);
     let expected_count = expected_ages.len();
     let expected_sum = expected_ages.values().sum::<i64>();
-    checks.push(match engine.reopen_check(expected_count, expected_sum) {
-        Ok(detail) => CheckResult {
-            name: "reopen_parity",
-            passed: true,
-            detail,
+    let reopen_points = reopen_sample_points(
+        &expected_ages,
+        &update_keys,
+        insert_start,
+        config.write_ops,
+        batch_start,
+        batch_ops
+            .checked_mul(config.batch_size)
+            .expect("validated batch rows"),
+    );
+    checks.push(
+        match engine.reopen_check(expected_count, expected_sum, &reopen_points) {
+            Ok(detail) => CheckResult {
+                name: "reopen_parity",
+                passed: true,
+                detail,
+            },
+            Err(detail) => CheckResult {
+                name: "reopen_parity",
+                passed: false,
+                detail,
+            },
         },
-        Err(detail) => CheckResult {
-            name: "reopen_parity",
-            passed: false,
-            detail,
-        },
-    });
+    );
 
     let all_checks_passed = checks.iter().all(|c| c.passed);
     Ok(RunReport {
@@ -731,6 +782,94 @@ fn run(config: Config) -> Result<RunReport, String> {
         workloads,
         checks,
     })
+}
+
+fn validate_config_bounds(config: &Config) -> Result<(), String> {
+    if config.fixture_rows == 0 {
+        return Err("--fixture-rows must be positive".to_string());
+    }
+    if config.point_read_ops == 0 {
+        return Err("--point-read-ops must be positive".to_string());
+    }
+    if config.write_ops == 0 {
+        return Err("--write-ops must be positive".to_string());
+    }
+    if config.scan_ops == 0 {
+        return Err("--scan-ops must be positive".to_string());
+    }
+    if config.batch_size == 0 {
+        return Err("--batch-size must be positive".to_string());
+    }
+
+    let fixture_rows = i64::try_from(config.fixture_rows)
+        .map_err(|_| "--fixture-rows must fit in i64".to_string())?;
+    let write_ops =
+        i64::try_from(config.write_ops).map_err(|_| "--write-ops must fit in i64".to_string())?;
+    let batch_ops = config.write_ops.div_ceil(config.batch_size);
+    let batch_rows = batch_ops
+        .checked_mul(config.batch_size)
+        .ok_or_else(|| "--write-ops/--batch-size overflow batch row count".to_string())?;
+    let batch_rows =
+        i64::try_from(batch_rows).map_err(|_| "batch row count must fit in i64".to_string())?;
+    let max_id_exclusive = fixture_rows
+        .checked_add(write_ops)
+        .and_then(|n| n.checked_add(batch_rows))
+        .ok_or_else(|| "fixture/write/batch row ids overflow i64".to_string())?;
+    max_id_exclusive
+        .checked_add(1_700_000_000)
+        .ok_or_else(|| "created_at values would overflow i64".to_string())?;
+    Ok(())
+}
+
+fn reopen_sample_points(
+    expected_ages: &BTreeMap<i64, i64>,
+    update_keys: &[i64],
+    insert_start: i64,
+    insert_rows: usize,
+    batch_start: i64,
+    batch_rows: usize,
+) -> Vec<(i64, i64)> {
+    let mut sample_ids: BTreeSet<i64> = update_keys.iter().copied().take(8).collect();
+    sample_ids.insert(0);
+    if insert_rows > 0 {
+        sample_ids.insert(insert_start);
+        sample_ids.insert(insert_start + insert_rows as i64 - 1);
+    }
+    if batch_rows > 0 {
+        sample_ids.insert(batch_start);
+        sample_ids.insert(batch_start + batch_rows as i64 - 1);
+    }
+    expected_ages
+        .len()
+        .checked_sub(1)
+        .and_then(|id| i64::try_from(id).ok())
+        .map(|id| sample_ids.insert(id));
+    sample_ids
+        .into_iter()
+        .filter_map(|id| expected_ages.get(&id).map(|age| (id, *age)))
+        .collect()
+}
+
+fn validate_reopened_points(
+    engine: &mut dyn ValueEngine,
+    expected_points: &[(i64, i64)],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for (id, age) in expected_points {
+        match engine.point_read(*id) {
+            Ok(row) if row.name == format!("user_{id}") && row.age == *age => {}
+            Ok(row) => failures.push(format!("id {id} expected age {age}, got {row:?}")),
+            Err(e) => failures.push(format!("id {id} read failed: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "after reopen point/index parity failed: {}",
+            failures.join("; ")
+        ))
+    }
 }
 
 fn warmup(engine: &mut dyn ValueEngine, rows: usize) -> Result<(), String> {
@@ -1105,6 +1244,62 @@ mod tests {
         );
         assert!(report.checks.iter().any(|c| c.name == "reopen_parity"));
         assert!(report.publishable);
+    }
+
+    #[test]
+    fn small_sqlite_full_run_verifies_pragmas_mutations_and_reopen() {
+        let config = Config {
+            engine: EngineKind::Sqlite,
+            mode: Mode::Full,
+            fixture_rows: 12,
+            point_read_ops: 4,
+            write_ops: 4,
+            scan_ops: 1,
+            batch_size: 2,
+            ..Config::default()
+        };
+        let report = run(config).expect("small sqlite full run");
+        assert!(
+            report.checks.iter().all(|c| c.passed),
+            "{:?}",
+            report.checks
+        );
+        assert_eq!(report.sqlite_storage, "file-backed-wal-full");
+        let reopen = report
+            .checks
+            .iter()
+            .find(|c| c.name == "reopen_parity")
+            .expect("reopen check");
+        assert!(reopen.detail.contains("points="), "{reopen:?}");
+    }
+
+    #[test]
+    fn config_bounds_reject_zero_ops_and_overflow() {
+        let zero_point_ops = Config {
+            point_read_ops: 0,
+            ..Config::default()
+        };
+        assert!(run(zero_point_ops)
+            .unwrap_err()
+            .contains("--point-read-ops must be positive"));
+
+        let zero_scan_ops = Config {
+            scan_ops: 0,
+            ..Config::default()
+        };
+        assert!(run(zero_scan_ops)
+            .unwrap_err()
+            .contains("--scan-ops must be positive"));
+
+        let overflowing = Config {
+            fixture_rows: 1,
+            point_read_ops: 1,
+            write_ops: usize::MAX,
+            scan_ops: 1,
+            batch_size: 2,
+            ..Config::default()
+        };
+        assert!(validate_config_bounds(&overflowing).is_err());
     }
 
     #[test]
