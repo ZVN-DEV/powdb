@@ -402,6 +402,84 @@ fn rollback_memento_follows_transaction_start_mode_not_deferred_mode_switch() {
 }
 
 #[test]
+fn wal_off_successful_statements_reuse_snapshot_metadata_without_retaining_before_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Catalog::create(dir.path()).unwrap();
+    catalog.set_wal_sync_mode(WalSyncMode::Off);
+    catalog.create_table(tx_schema()).unwrap();
+    let slot = catalog.table_slot("T").unwrap();
+
+    for id in 1..=40 {
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, id, &"payload".repeat(120));
+        catalog.commit_transaction().unwrap();
+    }
+
+    let first_rid = catalog.scan("T").unwrap().next().unwrap().unwrap().0;
+    catalog.begin_statement_transaction().unwrap();
+    catalog
+        .update(
+            "T",
+            first_rid,
+            &vec![Value::Int(1), Value::Str("updated once".into())],
+        )
+        .unwrap();
+    let active_capacity = catalog
+        .table_by_slot(slot)
+        .statement_snapshot_metadata_capacity()
+        .expect("Off statement must snapshot free-space metadata");
+    assert!(
+        active_capacity > 0,
+        "fixture must make metadata reuse observable"
+    );
+    assert_eq!(
+        catalog.table_by_slot(slot).statement_snapshot_page_count(),
+        Some(1),
+        "update should capture one before-page while active"
+    );
+    catalog.commit_transaction().unwrap();
+
+    assert_eq!(
+        catalog.table_by_slot(slot).statement_snapshot_page_count(),
+        None,
+        "commit must drop the active before-page snapshot"
+    );
+    assert_eq!(
+        catalog
+            .table_by_slot(slot)
+            .cached_statement_snapshot_before_page_capacity(),
+        0,
+        "cleared 4KB before-page maps must not retain uncharged capacity"
+    );
+    let cached_capacity = catalog
+        .table_by_slot(slot)
+        .cached_statement_snapshot_metadata_capacity()
+        .expect("successful Off commit should retain reusable metadata buffers");
+    assert!(
+        cached_capacity >= active_capacity,
+        "metadata cache should preserve reusable Vec capacity"
+    );
+
+    catalog.begin_statement_transaction().unwrap();
+    catalog
+        .update(
+            "T",
+            first_rid,
+            &vec![Value::Int(1), Value::Str("updated twice".into())],
+        )
+        .unwrap();
+    assert!(
+        catalog
+            .table_by_slot(slot)
+            .statement_snapshot_metadata_capacity()
+            .expect("second Off statement should reuse cached metadata")
+            >= cached_capacity,
+        "second Off statement should start from cached metadata capacity"
+    );
+    catalog.rollback_to_last_sync().unwrap();
+}
+
+#[test]
 fn wal_off_statement_rollback_restores_overflow_growth_and_auto_counter() {
     let dir = tempfile::tempdir().unwrap();
     let mut catalog = Catalog::create(dir.path()).unwrap();

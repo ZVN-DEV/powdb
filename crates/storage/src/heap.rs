@@ -245,11 +245,53 @@ struct HotPage {
 pub(crate) struct HeapStatementSnapshot {
     original_num_pages: u32,
     before_pages: FxHashMap<u32, Page>,
+    metadata: HeapStatementMetadataSnapshot,
+}
+
+#[derive(Clone)]
+struct HeapStatementMetadataSnapshot {
     free_bytes: Vec<u16>,
     free_buckets: Vec<Vec<u32>>,
     bucket_of_page: Vec<u8>,
     free_overflow_pages: Vec<u32>,
     heap_version: u16,
+}
+
+impl HeapStatementMetadataSnapshot {
+    fn empty() -> Self {
+        HeapStatementMetadataSnapshot {
+            free_bytes: Vec::new(),
+            free_buckets: empty_free_buckets(),
+            bucket_of_page: Vec::new(),
+            free_overflow_pages: Vec::new(),
+            heap_version: HEAP_FORMAT_VERSION,
+        }
+    }
+
+    fn clone_from_heap(&mut self, heap: &HeapFile) {
+        self.free_bytes.clone_from(&heap.free_bytes);
+        self.free_buckets.clone_from(&heap.free_buckets);
+        self.bucket_of_page.clone_from(&heap.bucket_of_page);
+        self.free_overflow_pages
+            .clone_from(&heap.free_overflow_pages);
+        self.heap_version = heap.heap_version;
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.free_bytes.capacity()
+            + self.bucket_of_page.capacity()
+            + self.free_overflow_pages.capacity()
+            + self.free_buckets.capacity()
+            + self.free_buckets.iter().map(Vec::capacity).sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+impl HeapStatementSnapshot {
+    fn metadata_capacity(&self) -> usize {
+        self.metadata.capacity()
+    }
 }
 
 /// Width of one free-space bucket. Narrow enough that the bucket the insert
@@ -337,6 +379,7 @@ pub struct HeapFile {
     free_overflow_pages: Vec<u32>,
     heap_version: u16,
     statement_snapshot: Option<HeapStatementSnapshot>,
+    statement_snapshot_cache: Option<HeapStatementMetadataSnapshot>,
 }
 
 impl HeapFile {
@@ -362,6 +405,7 @@ impl HeapFile {
             free_overflow_pages: Vec::new(),
             heap_version: HEAP_FORMAT_VERSION,
             statement_snapshot: None,
+            statement_snapshot_cache: None,
         })
     }
 
@@ -472,6 +516,7 @@ impl HeapFile {
             free_overflow_pages: Vec::new(),
             heap_version,
             statement_snapshot: None,
+            statement_snapshot_cache: None,
         };
         for (page_id, free) in free_space_by_page {
             heap.note_free_bytes(page_id, free);
@@ -498,6 +543,25 @@ impl HeapFile {
         self.statement_snapshot
             .as_ref()
             .map(|snapshot| snapshot.before_pages.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.statement_snapshot
+            .as_ref()
+            .map(HeapStatementSnapshot::metadata_capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.statement_snapshot_cache
+            .as_ref()
+            .map(HeapStatementMetadataSnapshot::capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_before_page_capacity(&self) -> usize {
+        0
     }
 
     pub fn format_version(&self) -> u16 {
@@ -1026,20 +1090,22 @@ impl HeapFile {
         if self.statement_snapshot.is_some() {
             return;
         }
+        let mut metadata = self
+            .statement_snapshot_cache
+            .take()
+            .unwrap_or_else(HeapStatementMetadataSnapshot::empty);
+        metadata.clone_from_heap(self);
         self.statement_snapshot = Some(HeapStatementSnapshot {
             original_num_pages: self.disk.num_pages(),
             before_pages: FxHashMap::default(),
-            free_bytes: self.free_bytes.clone(),
-            free_buckets: self.free_buckets.clone(),
-            bucket_of_page: self.bucket_of_page.clone(),
-            free_overflow_pages: self.free_overflow_pages.clone(),
-            heap_version: self.heap_version,
+            metadata,
         });
     }
 
     pub(crate) fn commit_statement_snapshot(&mut self) {
         if let Some(snapshot) = self.statement_snapshot.take() {
             self.dirty_budget.release(snapshot.before_pages.len());
+            self.statement_snapshot_cache = Some(snapshot.metadata);
         }
     }
 
@@ -1072,11 +1138,11 @@ impl HeapFile {
                 self.disk.write_page(*page_id, page.as_bytes())?;
             }
         }
-        self.free_bytes = snapshot.free_bytes;
-        self.free_buckets = snapshot.free_buckets;
-        self.bucket_of_page = snapshot.bucket_of_page;
-        self.free_overflow_pages = snapshot.free_overflow_pages;
-        self.heap_version = snapshot.heap_version;
+        self.free_bytes = snapshot.metadata.free_bytes;
+        self.free_buckets = snapshot.metadata.free_buckets;
+        self.bucket_of_page = snapshot.metadata.bucket_of_page;
+        self.free_overflow_pages = snapshot.metadata.free_overflow_pages;
+        self.heap_version = snapshot.metadata.heap_version;
         self.dirty_budget.release(snapshot.before_pages.len());
         Ok(true)
     }
