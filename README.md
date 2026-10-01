@@ -208,39 +208,29 @@ As of **v0.10.0**, the published `ghcr.io/zvn-dev/powdb` image is multi-arch (`l
 cargo install powdb-server
 ```
 
-## Benchmark snapshot: PowDB vs SQLite (100K rows, Apple M5 Max laptop)
+## Benchmark methodology: what to measure now
 
-PowDB's compiled predicate engine is strongest on read-heavy aggregates, and gives a smaller and more variable win on filtered scans. The table below is a dated historical snapshot, not a broad "fastest vs SQLite" claim. Lookup and update rows affected by the 2026-09-19 correction are withdrawn here rather than replaced with unverified ratios. For durable write throughput, batch writes in a transaction, see [Write throughput & durability](#write-throughput--durability).
+PowDB's current comparison story is a measurement path, not a new headline ratio. The old PowDB-vs-SQLite table is preserved in the historical docs, but it no longer leads the README because several lookup/update rows were withdrawn and durable-write comparisons need the paired harness.
 
-These are **single-request latencies**: one query at a time, measuring per-query cost, not throughput under many simultaneous clients. On a shared read-write database at concurrency, reads amplify through the write-admission gate (PowDB has no MVCC); that behavior is decomposed in [docs/benchmarks/concurrency-decomposition.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/concurrency-decomposition.md). See also [What PowDB is for](#what-powdb-is-for).
+Use two profiles depending on the question:
 
-| Workload | PowDB | SQLite | Result |
-|---|---|---|---|
-| Aggregate MIN | 221 us | 1.70 ms | **7.7x faster** |
-| Aggregate MAX | 217 us | 1.47 ms | **6.8x faster** |
-| Aggregate SUM | 234 us | 1.45 ms | **6.2x faster** |
-| Update by primary key | — | — | Withdrawn: repeated-key workload |
-| Aggregate AVG | 455 us | 1.70 ms | **3.7x faster** |
-| Scan + filter + count | 380 us | 1.40 ms | **3.7x faster** |
-| Non-indexed point lookup | — | — | Withdrawn: repeated-key workload |
-| Scan + filter + sort + limit 10 | 2.46 ms | 6.41 ms | **2.6x faster** |
-| Multi-column AND filter | 1.58 ms | 3.21 ms | **2.0x faster** |
-| Update by filter (10K rows) | — | — | Withdrawn: repeated-value workload |
-| Insert single row | 380 ns | 638 ns | roughly tied |
-| Scan + filter + project top 100 | 8.1 us | 8.9 us | roughly tied |
-| Delete by filter (10K rows) | 1.57 ms | 1.75 ms | roughly tied |
-| Insert batch (1K rows) | 242 ns | 214 ns | roughly tied |
-| **Indexed point lookup** | — | — | Withdrawn: repeated-key workload |
+| Profile | What it compares | When to use it |
+|---|---|---|
+| Full / file-backed SQLite WAL+FULL | PowDB durable writes against file-backed SQLite with WAL and `synchronous=FULL` | Publishable evidence for write and point-read value claims |
+| Off / `:memory:` diagnostic | PowDB WAL-off against SQLite `:memory:` | Engineering diagnostics only; not a durability claim |
 
-Run the corrected workloads with `cargo run --release -p powdb-compare`.
+The paired harness alternates baseline/candidate order, runs correctness checks outside timed regions, records raw samples and provenance, and refuses to invent percentiles from five means. Run it with explicit binaries, for example:
 
-**Benchmark correction (2026-09-19):** lookup and update rows from the older runner are withdrawn because they reused keys or values in ways that did not represent the corrected workloads. The correction remains public and detailed in [docs/benchmarks/2026-09-19-benchmark-corrections.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-09-19-benchmark-corrections.md). The next publishable comparison will come from the paired harness work, using alternating baseline/candidate runs and raw samples; until then, no new point-lookup or update ratios are claimed.
+```bash
+scripts/paired-bench.sh \
+  --baseline-bin /path/to/baseline/powdb-compare-paired \
+  --candidate-bin /path/to/candidate/powdb-compare-paired \
+  --mode full \
+  --runs 5 \
+  --output paired-full.json
+```
 
-The compiled predicate engine avoids full row decoding during scans and aggregates. That is worth 3.7-7.7x on the four aggregates, but only 1.0-3.7x on the four scan-shaped workloads, so read the rows rather than a single headline multiplier. These wins come from compiled predicates and mmap scans, not from PowQL's syntax: the same query written in SQL lowers to the same plan and gets the same numbers.
-
-**Indexed point latency remains a reason to evaluate SQLite first.** Front-end and row-fetch costs matter when little scanning is needed. The old repeated-key ratios are withdrawn, not replaced by a new claim. Measure the varied-key workload on your hardware; scan throughput does not prove a point-lookup hot path.
-
-Neither engine fsyncs (PowDB: `WalSyncMode::Off`, SQLite: `:memory:`), which isolates query-engine cost from durability cost and is not a durability comparison; for that see [Write throughput & durability](#write-throughput--durability). Median of 5 runs on an Apple M5 Max (macOS 26.5.1, rustc 1.97.0), commit `e3dfa71`, 2026-08-15. Re-measured the same way on 2026-09-07 after a large correctness round: every row landed within 11% of the number above and eleven of the fifteen within 3%, so the table is unchanged. The heap allocator rewrite in that round is not visible here because it removes a cost that grows with heap size, and this fixture is too small to pay it; the measurement that does show it is in the changelog. **These are laptop numbers, not CI numbers.** One caveat specific to the write rows: PowDB writes to a real temp directory while SQLite is `:memory:`, so `insert_single`, `insert_batch_1k`, and `delete_by_filter` are sensitive to whatever else is touching the disk. Measured under a heavy concurrent build on the same laptop, those rows moved by 30-100x while every other row moved by less than 2x, and two of them changed sign. The table above is from the quietest run we could get, but this machine was not fully idle, so treat the three write rows as the least reliable and re-measure them yourself before relying on them. Full methodology, per-run spread, and what changed in the harness: [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md).
+Read the full reproduction contract in [docs/benchmarks/paired-value-harness.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/paired-value-harness.md). The historical July 2026 results remain available in [docs/benchmarks/2026-07-24-wide-bench-snapshot.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md), and the withdrawn lookup/update rows are documented in [docs/benchmarks/2026-09-19-benchmark-corrections.md](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-09-19-benchmark-corrections.md). Until fresh paired evidence is integrated, this README does not publish replacement point-lookup or update ratios.
 
 ### Write throughput & durability
 
@@ -547,10 +537,16 @@ cargo run --release -p powdb-bench --bin compare   # regression gate
 
 The gate also runs on-demand in CI via `workflow_dispatch` (`.github/workflows/bench.yml`). It is **not** a required PR gate, because shared-runner noise makes it unreliable as a blocking check. The required PR gates live in `ci.yml`.
 
-Run the PowDB vs SQLite comparison bench:
+For PowDB-vs-SQLite value evidence, use the paired harness rather than the old
+single-binary table output:
 
 ```bash
-cargo run --release -p powdb-compare    # prints table + writes results.csv
+scripts/paired-bench.sh \
+  --baseline-bin /path/to/baseline/powdb-compare-paired \
+  --candidate-bin /path/to/candidate/powdb-compare-paired \
+  --mode full \
+  --runs 5 \
+  --output paired-full.json
 ```
 
 ## Tests

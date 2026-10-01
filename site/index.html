@@ -55,11 +55,9 @@
   <div class="container">
     <h1>The embedded database for<br><span class="highlight">shaped typed results</span></h1>
     <p class="subtitle">
-      From-scratch pure-Rust database with PowQL -- a pipeline query language that reads left to right --
-      plus a SQL frontend on the same engine. Ask for a parent and its children and get one row per
-      parent with children as native nested values. Traverse named links, index scalar JSON paths,
-      and embed the engine in Rust or Node without a server. Built for single-writer embedded state
-      and read-only snapshot serving, not for many clients sharing one read-write database.
+      Query relational data in the shape your application needs. PowQL returns parents with
+      native typed children, traverses named relationships, and indexes JSON paths. Embed the
+      pure-Rust engine in Rust or Node, or connect over TCP/TLS.
     </p>
     <div class="hero-actions">
       <a href="getting-started.html" class="btn btn-primary">Get Started</a>
@@ -247,114 +245,26 @@ alter Post add index (.data->published_at)</code></pre>
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows, neither engine fsyncs. This is a dated workload snapshot, not a broad "fastest vs SQLite" claim. Lookup and update rows affected by the 2026-09-19 correction are withdrawn instead of replaced with unverified ratios. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#integrations">Embed or connect</a> below.</p>
-    <div class="install-block" style="margin-bottom: 24px;">
-      <span class="prompt">$</span> cargo run --release -p powdb-compare
+    <p class="section-subtitle">PowDB's benchmark story is now a reproducible measurement path. Historical July 2026 results remain linked for context, but new public ratios wait for paired Full-mode evidence.</p>
+
+    <div class="compare-grid" style="margin-top: 24px;">
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header powql">Publishable profile</div>
+        <h3>Full / file-backed SQLite WAL+FULL</h3>
+        <p>PowDB durable writes are compared against file-backed SQLite with WAL and <code>synchronous=FULL</code>. Use this profile for any new write or point-read value claim.</p>
+      </div>
+      <div class="compare-card" style="padding: 24px;">
+        <div class="compare-card-header sql">Diagnostic profile</div>
+        <h3>Off / SQLite <code>:memory:</code></h3>
+        <p>PowDB WAL-off against SQLite <code>:memory:</code> is useful for engineering diagnostics. It is explicitly not a durability comparison and should not become a headline ratio.</p>
+      </div>
     </div>
-    <p class="section-subtitle">Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0), commit <code>e3dfa71</code>, measured 2026-08-15. <strong>Laptop numbers, not CI numbers.</strong> PowDB writes to a real temp directory while SQLite is <code>:memory:</code>, so the three write rows (<code>insert_single</code>, <code>insert_batch_1k</code>, <code>delete_by_filter</code>) are sensitive to competing disk I/O and change sign depending on machine load. Treat them as ties and re-measure them yourself. Full methodology and per-run spread: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md" target="_blank" rel="noopener">the 2026-07-24 snapshot</a>.</p>
-    <table>
-      <thead>
-        <tr>
-          <th>Workload</th>
-          <th>PowDB</th>
-          <th>SQLite</th>
-          <th>Speedup</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>agg_min</td>
-          <td>221&micro;s</td>
-          <td>1.70ms</td>
-          <td class="speedup">7.7x</td>
-        </tr>
-        <tr>
-          <td>agg_max</td>
-          <td>217&micro;s</td>
-          <td>1.47ms</td>
-          <td class="speedup">6.8x</td>
-        </tr>
-        <tr>
-          <td>agg_sum</td>
-          <td>234&micro;s</td>
-          <td>1.45ms</td>
-          <td class="speedup">6.2x</td>
-        </tr>
-        <tr>
-          <td>update_by_pk</td>
-          <td>&mdash;</td>
-          <td>&mdash;</td>
-          <td>Withdrawn: repeated key</td>
-        </tr>
-        <tr>
-          <td>agg_avg</td>
-          <td>455&micro;s</td>
-          <td>1.70ms</td>
-          <td class="speedup">3.7x</td>
-        </tr>
-        <tr>
-          <td>scan_filter_count</td>
-          <td>380&micro;s</td>
-          <td>1.40ms</td>
-          <td class="speedup">3.7x</td>
-        </tr>
-        <tr>
-          <td>point_lookup_nonindexed</td>
-          <td>&mdash;</td>
-          <td>&mdash;</td>
-          <td>Withdrawn: repeated key</td>
-        </tr>
-        <tr>
-          <td>scan_filter_sort_limit</td>
-          <td>2.46ms</td>
-          <td>6.41ms</td>
-          <td class="speedup">2.6x</td>
-        </tr>
-        <tr>
-          <td>multi_col_and_filter</td>
-          <td>1.58ms</td>
-          <td>3.21ms</td>
-          <td class="speedup">2.0x</td>
-        </tr>
-        <tr>
-          <td>update_by_filter</td>
-          <td>&mdash;</td>
-          <td>&mdash;</td>
-          <td>Withdrawn: repeated value</td>
-        </tr>
-        <tr>
-          <td>insert_single</td>
-          <td>380ns</td>
-          <td>638ns</td>
-          <td class="speedup">tied</td>
-        </tr>
-        <tr>
-          <td>scan_filter_project_top100</td>
-          <td>8.1&micro;s</td>
-          <td>8.9&micro;s</td>
-          <td class="speedup">tied</td>
-        </tr>
-        <tr>
-          <td>delete_by_filter</td>
-          <td>1.57ms</td>
-          <td>1.75ms</td>
-          <td class="speedup">tied</td>
-        </tr>
-        <tr>
-          <td>insert_batch_1k</td>
-          <td>242ns</td>
-          <td>214ns</td>
-          <td class="speedup">tied</td>
-        </tr>
-        <tr>
-          <td><strong>point_lookup_indexed</strong></td>
-          <td>&mdash;</td>
-          <td>&mdash;</td>
-          <td>Withdrawn: repeated key</td>
-        </tr>
-      </tbody>
-    </table>
-    <p class="section-subtitle"><strong>Benchmark correction (2026-09-19):</strong> lookup and update timings are withdrawn pending controlled remeasurement with the paired harness. Details stay public in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-09-19-benchmark-corrections.md" target="_blank" rel="noopener">the correction record</a>. The next comparison will use alternating baseline/candidate runs and raw samples; no new point-lookup or update ratios are claimed here.</p>
+
+    <p class="section-subtitle" style="margin-top: 24px;">The paired harness alternates baseline/candidate order, checks correctness outside timing, records raw samples and provenance, and reports medians plus spread without inventing percentiles from five means.</p>
+    <div class="install-block" style="margin-bottom: 24px;">
+      <span class="prompt">$</span> scripts/paired-bench.sh --baseline-bin ./baseline/powdb-compare-paired --candidate-bin ./candidate/powdb-compare-paired --mode full --runs 5 --output paired-full.json
+    </div>
+    <p class="section-subtitle">Reproduction guide: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/paired-value-harness.md" target="_blank" rel="noopener">paired value harness</a>. Historical context: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md" target="_blank" rel="noopener">July 2026 snapshot</a> and <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-09-19-benchmark-corrections.md" target="_blank" rel="noopener">September correction record</a>. No replacement point-lookup or update ratios are claimed here until fresh paired evidence is integrated.</p>
   </div>
 </section>
 
