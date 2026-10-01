@@ -119,7 +119,7 @@ pub(crate) fn validate_backup_file_entry(
     }
     if read_len != len {
         return Err(io::Error::other(format!(
-            "backup entry '{name}' read length {read_len} differs from manifest {len}"
+            "integrity check failed for {name}: read length {read_len} differs from manifest {len}"
         )));
     }
     let actual = hasher.finalize().to_hex().to_string();
@@ -148,7 +148,7 @@ fn open_manifest_entry(backup_dir: &Path, name: &str, len: u64) -> io::Result<fs
     verify_opened_file_identity(name, &handle_metadata, &path_metadata)?;
     if handle_metadata.len() != len {
         return Err(io::Error::other(format!(
-            "backup entry '{name}' length {} differs from manifest {len}",
+            "integrity check failed for {name}: length {} differs from manifest {len}",
             handle_metadata.len()
         )));
     }
@@ -228,7 +228,7 @@ fn copy_backup_file_verified(
         drop(output);
         if copied_len != len {
             return Err(io::Error::other(format!(
-                "backup entry '{name}' read length {copied_len} differs from manifest {len}"
+                "integrity check failed for {name}: read length {copied_len} differs from manifest {len}"
             )));
         }
         let actual = hasher.finalize().to_hex().to_string();

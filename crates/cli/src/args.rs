@@ -127,6 +127,16 @@ pub(crate) const SUBCOMMANDS: &[&str] = &[
     "sweep",
 ];
 
+fn verifier_output_format(value: Option<&str>) -> OutputMode {
+    match value.and_then(parse_output_mode) {
+        Some(mode @ (OutputMode::Table | OutputMode::Json)) => mode,
+        _ => {
+            eprintln!("Error: verification --format requires table or json");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Levenshtein edit distance, for "did you mean" on a mistyped subcommand.
 /// Two rolling rows: the inputs here are single command words.
 pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
@@ -620,6 +630,10 @@ pub(crate) fn parse_args() -> CliArgs {
                 i += 1;
                 while i < argv.len() {
                     match argv[i].as_str() {
+                        "--format" => {
+                            i += 1;
+                            output = verifier_output_format(argv.get(i).map(String::as_str));
+                        }
                         "--data-dir" | "-d" => {
                             i += 1;
                             if i >= argv.len() {
@@ -651,6 +665,10 @@ pub(crate) fn parse_args() -> CliArgs {
                 let mut compare_source_dir: Option<String> = None;
                 while i < argv.len() {
                     match argv[i].as_str() {
+                        "--format" => {
+                            i += 1;
+                            output = verifier_output_format(argv.get(i).map(String::as_str));
+                        }
                         "--restore-drill-dir" => {
                             i += 1;
                             if i >= argv.len() {

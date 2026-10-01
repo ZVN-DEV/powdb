@@ -137,10 +137,13 @@ fn sql_is_reachable_from_the_repl() {
     let stdout = stdout_of(&out);
     assert!(stdout.contains("ada"), "one-off .sql did not run: {stdout}");
     assert!(stdout.contains("bob"), ".sql mode did not run: {stdout}");
-    assert!(
-        stdout.trim_end().ends_with('2'),
-        ".powql did not restore PowQL: {stdout}"
-    );
+    // With piped stdin, some rustyline/platform combinations print the next
+    // prompt before observing EOF. Check the exact result, not that prompt.
+    let trimmed = stdout.trim_end();
+    let without_eof_prompt = trimmed.strip_suffix("powql>").unwrap_or(trimmed).trim_end();
+    let last_line = without_eof_prompt.lines().last().unwrap_or("").trim();
+    let result = last_line.strip_prefix("powql> ").unwrap_or(last_line);
+    assert_eq!(result, "2", ".powql did not restore PowQL: {stdout}");
 }
 
 /// SQL is reachable from one-shot mode with `--sql`.

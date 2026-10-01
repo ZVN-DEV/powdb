@@ -9,6 +9,71 @@ use powdb_storage::stored_json_path::{StoredJsonPathSegmentV1, StoredJsonPathV1}
 use powdb_storage::types::{ColumnDef, RowId, Schema, TypeId, Value};
 use std::io::{Seek, SeekFrom, Write};
 
+#[test]
+fn source_comparison_refuses_missing_paths_and_live_owned_writers() {
+    let valid = make_indexed_db("compare_guard");
+    let missing = tmp("compare_missing");
+    assert!(!powdb_backup::compare_database_dirs(&missing, &valid).ok);
+    assert!(
+        !missing.exists(),
+        "comparison must not create a missing source"
+    );
+    let _writer = DirLock::acquire(&valid).unwrap();
+    assert!(!powdb_backup::compare_database_dirs(&valid, &valid).ok);
+}
+
+#[test]
+fn source_comparison_detects_defaults_even_when_rows_match() {
+    let left = tmp("defaults_left");
+    let right = tmp("defaults_right");
+    for (dir, default) in [(&left, 1), (&right, 2)] {
+        let mut catalog = Catalog::create(dir).unwrap();
+        catalog
+            .create_table_full(
+                Schema {
+                    table_name: "T".into(),
+                    columns: vec![ColumnDef {
+                        name: "value".into(),
+                        type_id: TypeId::Int,
+                        required: false,
+                        position: 0,
+                    }],
+                },
+                vec![Some(Value::Int(default))],
+                vec![false],
+            )
+            .unwrap();
+        catalog.insert("T", &vec![Value::Int(7)]).unwrap();
+    }
+    let report = powdb_backup::compare_database_dirs(&left, &right);
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|error| error.code == "compare_column_behavior_mismatch"));
+}
+
+#[test]
+fn source_comparison_detects_view_definition_changes_with_same_rows() {
+    let left = tmp("views_left");
+    let right = tmp("views_right");
+    for (dir, filter) in [(&left, ".id > 0"), (&right, ".id >= 1")] {
+        let mut engine = Engine::new(dir).unwrap();
+        exec(&mut engine, "type T { required id: int }");
+        exec(&mut engine, "insert T { id := 1 }");
+        exec(
+            &mut engine,
+            &format!("materialize V as T filter {filter} {{ .id }}"),
+        );
+    }
+    let report = powdb_backup::compare_database_dirs(&left, &right);
+    assert!(!report.ok);
+    assert!(report
+        .errors
+        .iter()
+        .any(|error| error.code == "compare_views_mismatch"));
+}
+
 fn tmp(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CTR: AtomicU64 = AtomicU64::new(0);

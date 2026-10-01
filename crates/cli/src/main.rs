@@ -99,9 +99,16 @@ fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let args = parse_args();
+    if matches!(&args.action, Action::Verify | Action::VerifyBackup { .. })
+        && !matches!(args.output, OutputMode::Table | OutputMode::Json)
+    {
+        eprintln!("Error: verification --format requires table or json");
+        std::process::exit(2);
+    }
 
     match &args.action {
         Action::Backup { dest, base } => {

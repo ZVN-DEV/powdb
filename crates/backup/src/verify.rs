@@ -1030,8 +1030,8 @@ pub fn verify_restore_drill(
     report
 }
 
-/// Compare logical rows and index metadata between two verified offline data
-/// directories.
+/// Verify and compare logical rows and persisted schema/relationship behavior
+/// between two offline data directories.
 pub fn compare_database_dirs(source: &Path, other: &Path) -> VerifyReport {
     let mut report = VerifyReport::new(format!("compare:{}:{}", source.display(), other.display()));
     let left = match open_verified_catalog(source, &mut report, "source") {
@@ -1063,7 +1063,61 @@ pub fn compare_database_dirs(source: &Path, other: &Path) -> VerifyReport {
         );
         return report;
     }
+    let link_definitions = |catalog: &Catalog| {
+        let mut definitions: Vec<_> = catalog
+            .links()
+            .map(|link| {
+                (
+                    link.owner_type.clone(),
+                    link.name.clone(),
+                    link.target_type.clone(),
+                    link.local_key.clone(),
+                    link.target_key.clone(),
+                )
+            })
+            .collect();
+        definitions.sort();
+        definitions
+    };
+    if link_definitions(&left.catalog) != link_definitions(&right.catalog) {
+        report.error(
+            "compare_links_mismatch",
+            "relationship definitions differ",
+            "restore from the intended source backup before cutover",
+        );
+    }
+    let view_definitions = |path: &Path| -> io::Result<Vec<_>> {
+        let registry = ViewRegistry::open(path)?;
+        let mut definitions = Vec::new();
+        for name in registry.list_views() {
+            if let Some(view) = registry.get(name) {
+                let mut dependencies = view.depends_on.clone();
+                dependencies.sort();
+                definitions.push((view.name.clone(), view.query.clone(), dependencies));
+            }
+        }
+        definitions.sort();
+        Ok(definitions)
+    };
+    match (view_definitions(source), view_definitions(other)) {
+        (Ok(left), Ok(right)) if left == right => {}
+        _ => report.error(
+            "compare_views_mismatch",
+            "view definitions differ or could not be read",
+            "verify both view registries and restore from the intended source backup",
+        ),
+    }
     for table_name in left_tables {
+        if default_values_digest(&left.catalog, &table_name)
+            != default_values_digest(&right.catalog, &table_name)
+            || left.catalog.auto_columns(&table_name) != right.catalog.auto_columns(&table_name)
+        {
+            report.error(
+                "compare_column_behavior_mismatch",
+                format!("defaults or auto columns differ for table '{table_name}'"),
+                "restore matching catalog metadata before cutover",
+            );
+        }
         let left_rows = logical_table_digest(left.catalog.get_table(&table_name).unwrap());
         let right_rows = logical_table_digest(right.catalog.get_table(&table_name).unwrap());
         match (left_rows, right_rows) {
@@ -1118,6 +1172,16 @@ fn open_verified_catalog(
     report: &mut VerifyReport,
     label: &str,
 ) -> Option<OpenVerified> {
+    if let Err(error) = powdb_storage::validate_data_dir_read_only(path)
+        .and_then(|_| refuse_current_process_writer_lock(path))
+    {
+        report.error(
+            "compare_open_failed",
+            format!("{label}: {error}"),
+            "use an existing quiescent data directory; comparison never creates missing paths",
+        );
+        return None;
+    }
     let reader = match DirLock::acquire_reader(path) {
         Ok(reader) => reader,
         Err(error) => {
@@ -1142,7 +1206,28 @@ fn open_verified_catalog(
             return None;
         }
     };
+    let mut verification = VerifyReport::new(format!("{label}:{}", path.display()));
+    verify_catalog_contents(path, &catalog, &mut verification);
+    let ok = verification.ok;
+    merge_child_report(report, label, verification);
+    if !ok {
+        return None;
+    }
     Some(OpenVerified { catalog, reader })
+}
+
+fn default_values_digest(catalog: &Catalog, table: &str) -> Option<blake3::Hash> {
+    catalog.column_defaults(table).map(|defaults| {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&(defaults.len() as u64).to_le_bytes());
+        for value in defaults {
+            hasher.update(&[u8::from(value.is_some())]);
+            if let Some(value) = value {
+                hash_value(&mut hasher, value);
+            }
+        }
+        hasher.finalize()
+    })
 }
 
 fn logical_table_digest(table: &powdb_storage::table::Table) -> io::Result<Vec<String>> {

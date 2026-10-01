@@ -238,6 +238,23 @@ Planned (design doc only, don't use): `let` bindings, UDFs, per-row permissions,
 
 ## For contributors
 
+### Offline verification (source / unreleased update)
+
+```bash
+powdb-cli verify --data-dir ./powdb_data --format json
+powdb-cli verify-backup ./backups/full --format json
+powdb-cli verify-backup ./backups/full --restore-drill-dir ./fresh-drill --compare-source ./powdb_data
+```
+
+These commands inspect quiescent data/full backups, refuse live writers and
+pending WAL, and report findings without repair or writable recovery of the
+source. Exit 0 means required checks completed without errors; exit 1 means
+findings/incomplete verification; exit 2 means bad usage. Reader-lock metadata
+may be published during the check; table/catalog files are not rewritten.
+Restore drills require a fresh empty destination. See `docs/offline-verification.md`.
+
+### Contributor checks
+
 Build: `cargo build --workspace`. Test: `cargo test --workspace`. Lint: `cargo clippy --workspace --all-targets -- -D warnings`. Format: `cargo fmt --all`.
 
 CI gates on `main` all live in `.github/workflows/ci.yml`: clippy/fmt/test on a 2-OS matrix, plus miri, ASan, cargo audit, cargo-deny, MSRV, version consistency, cross-version on-disk compatibility, fuzz-corpus replay, examples / TS-client / Node-addon / embedded-sync smokes, and a gitleaks secret scan. Every one of them is wired into a single `ci-success` aggregator job (`needs:` every job, fails if any fails), and that aggregator is the one required status check on `main`. A job that is not in its `needs:` list fails the `ci-success needs completeness` check, so new jobs cannot silently stop gating. `.github/workflows/bench.yml` (criterion + regression gate) is **manual-only** (`workflow_dispatch`) and NOT a merge gate; run the gate locally instead (see above).

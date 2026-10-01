@@ -1,0 +1,2705 @@
+{
+  "baseline_ref": "4e6a8e4-fixed-engine",
+  "candidate_ref": "3998891-optimized-engine",
+  "evaluation": {
+    "contaminated": false,
+    "contamination_note": "",
+    "criteria": {
+      "candidate_point_read_improvement_required": 0.3,
+      "candidate_write_improvement_required": 0.25,
+      "min_runs": 5,
+      "protected_regression_limit": 0.1,
+      "relative_spread_limit": 0.2
+    },
+    "durable_publishable": false,
+    "engineering_contract_pass": false,
+    "note": "Off mode can satisfy the engineering improvement contract but is never a durable performance claim.",
+    "point_read_improvement": 0.05272552805988647,
+    "point_read_pass": false,
+    "protected_regressions": [],
+    "status": "not_publishable",
+    "too_noisy": [
+      {
+        "engine_ref": "3998891-optimized-engine",
+        "limit": 0.2,
+        "relative_spread": 0.3982276051907196,
+        "workload": "point_read_indexed"
+      },
+      {
+        "engine_ref": "3998891-optimized-engine",
+        "limit": 0.2,
+        "relative_spread": 0.33570747081221886,
+        "workload": "protected_aggregate_sum"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.39341832355886147,
+        "workload": "point_read_indexed"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.7242206375017859,
+        "workload": "point_update_changed_value"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.7328268568588857,
+        "workload": "prepared_insert_bounded_batch"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.7453349529154831,
+        "workload": "prepared_insert_single"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.543386030832273,
+        "workload": "protected_aggregate_sum"
+      },
+      {
+        "engine_ref": "4e6a8e4-fixed-engine",
+        "limit": 0.2,
+        "relative_spread": 0.3326762133536129,
+        "workload": "protected_scan_filter_count"
+      }
+    ],
+    "write_improvements": [
+      {
+        "baseline_median_ns_per_op": 3817585.792,
+        "candidate_median_ns_per_op": 3862181.917,
+        "improvement": -0.011681761047375566,
+        "workload": "point_update_changed_value"
+      },
+      {
+        "baseline_median_ns_per_op": 3674489.333,
+        "candidate_median_ns_per_op": 3788895.0,
+        "improvement": -0.031135120184603866,
+        "workload": "prepared_insert_single"
+      },
+      {
+        "baseline_median_ns_per_op": 116053.959,
+        "candidate_median_ns_per_op": 114110.625,
+        "improvement": 0.01674509010071774,
+        "workload": "prepared_insert_bounded_batch"
+      }
+    ],
+    "write_pass": false
+  },
+  "host": {
+    "arch": "arm64",
+    "os": "Darwin"
+  },
+  "invalid_reasons": [],
+  "mode": "full",
+  "not_publishable_reasons": [
+    "relative spread exceeded policy"
+  ],
+  "profile": "value-v1",
+  "provenance": {
+    "3998891-optimized-engine": {
+      "engine_hashes": [
+        "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf"
+      ],
+      "storage_by_engine": {
+        "powdb": "file-backed-wal-full",
+        "sqlite": "file-backed-wal-full"
+      }
+    },
+    "4e6a8e4-fixed-engine": {
+      "engine_hashes": [
+        "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7"
+      ],
+      "storage_by_engine": {
+        "powdb": "file-backed-wal-full",
+        "sqlite": "file-backed-wal-full"
+      }
+    }
+  },
+  "quality_blockers": [
+    "relative spread exceeded policy"
+  ],
+  "raw_records": [
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 0,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 0,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1390.267,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3592126.0,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3616961.583,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 113118.708,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 119604.5,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 61486.375,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 1,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 0,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 854.319,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 35457.833,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 25471.584,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 653.375,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 300872.792,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 316441.333,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 2,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 0,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1478.71,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3696244.167,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3775918.417,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 114110.625,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 121587.875,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 63784.667,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 3,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 0,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 880.047,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 68160.625,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 26076.292,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 659.875,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 309233.834,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 337417.375,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 0,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 1,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 883.099,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 37983.791,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 23986.75,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 674.208,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 308396.0,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 322902.959,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 1,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 1,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1589.375,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3898334.167,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3734887.5,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 114004.459,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 107723.542,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 64345.333,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 2,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 1,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 981.477,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 38858.541,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 25557.792,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 736.375,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 311219.833,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 324872.25,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 3,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 1,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1495.366,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 5728843.292,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 5133622.167,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 195158.708,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 103385.75,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 62806.333,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 0,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 2,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 2050.36,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 6356900.416,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 6355686.917,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 198166.166,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 141257.0,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 95614.459,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 1,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 2,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1364.062,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 179524.625,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 170044.208,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 1546.958,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 495724.125,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 500727.166,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 2,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 2,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1586.969,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3862181.917,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 4111590.666,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 117791.125,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 105542.166,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 61943.458,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 3,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 2,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 936.296,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 35073.0,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 25663.292,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 676.75,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 325062.458,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 351532.166,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 0,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 3,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1125.164,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 36591.833,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 40671.958,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 682.666,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 318190.0,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 344332.208,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 1,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 3,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 2111.643,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3686347.292,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3946055.667,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 113683.042,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 112210.542,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 66872.667,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 2,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 3,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 938.912,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 39646.625,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 26092.166,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 749.666,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 340998.459,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 376123.541,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 3,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 3,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1716.705,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3626881.125,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3674489.333,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 116053.959,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 113838.166,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 67277.583,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 0,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 4,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1677.84,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3817585.792,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3620841.792,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 115973.583,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 108365.166,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 62068.125,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "569a3a914ce03bd93ffa8cb6fd1ded26748956f882bcc5f824c853c29db4f6a7",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 1,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 4,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1193.005,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 51560.917,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 29865.708,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 816.042,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 333071.375,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 365224.0,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "powdb",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 2,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 4,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1728.442,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 4093841.375,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 3788895.0,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 116622.583,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 126734.0,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 83544.667,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    },
+    {
+      "checks": [
+        {
+          "detail": "sample point reads matched fixture",
+          "name": "fixture_point_parity",
+          "passed": true
+        },
+        {
+          "detail": "expected 15658",
+          "name": "fixture_scan_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 949600",
+          "name": "fixture_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "updated and inserted sample rows read back",
+          "name": "mutation_readback",
+          "passed": true
+        },
+        {
+          "detail": "expected 22000",
+          "name": "post_mutation_row_count",
+          "passed": true
+        },
+        {
+          "detail": "expected 11178873",
+          "name": "post_mutation_aggregate_sum",
+          "passed": true
+        },
+        {
+          "detail": "count=22000,sum=11178873,points=13",
+          "name": "reopen_parity",
+          "passed": true
+        }
+      ],
+      "engine": "sqlite",
+      "engine_hash": "88bece50f0499e3e202e9d1becb8883adfee69c7713c0a9a2620473125c92acf",
+      "engine_ref": "3998891-optimized-engine",
+      "fixture": {
+        "correctness_outside_timing": true,
+        "key_strategy": "deterministic-varied-mix64",
+        "rows": 20000
+      },
+      "mode": "full",
+      "order_index": 3,
+      "profile": "value-v1",
+      "publishable": true,
+      "round": 4,
+      "schema": "powdb.compare.paired.v1",
+      "settings": {
+        "batch_size": 100,
+        "candidate_point_read_improvement_required": 0.3,
+        "candidate_write_improvement_required": 0.25,
+        "point_read_ops": 100000,
+        "protected_regression_limit": 0.1,
+        "scan_ops": 1000,
+        "write_ops": 1000
+      },
+      "storage": "file-backed-wal-full",
+      "workloads": [
+        {
+          "mean_ns_per_op": 1111.585,
+          "name": "point_read_indexed",
+          "operations": 100000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 41983.542,
+          "name": "point_update_changed_value",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 41498.958,
+          "name": "prepared_insert_single",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 734.75,
+          "name": "prepared_insert_bounded_batch",
+          "operations": 1000,
+          "protected": false,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 350849.209,
+          "name": "protected_scan_filter_count",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        },
+        {
+          "mean_ns_per_op": 354290.041,
+          "name": "protected_aggregate_sum",
+          "operations": 1000,
+          "protected": true,
+          "timed": true
+        }
+      ]
+    }
+  ],
+  "runs": 5,
+  "schema": "powdb.compare.paired.aggregate.v2",
+  "summary": [
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 2111.643,
+      "median_ns_per_op": 1589.375,
+      "min_ns_per_op": 1478.71,
+      "raw_mean_ns_per_op": [
+        1478.71,
+        1586.969,
+        1589.375,
+        1728.442,
+        2111.643
+      ],
+      "relative_spread": 0.3982276051907196,
+      "runs": 5,
+      "spread_ns_per_op": 632.933,
+      "workload": "point_read_indexed"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 4093841.375,
+      "median_ns_per_op": 3862181.917,
+      "min_ns_per_op": 3686347.292,
+      "raw_mean_ns_per_op": [
+        3686347.292,
+        3696244.167,
+        3862181.917,
+        3898334.167,
+        4093841.375
+      ],
+      "relative_spread": 0.10550877502852751,
+      "runs": 5,
+      "spread_ns_per_op": 407494.0830000001,
+      "workload": "point_update_changed_value"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 117791.125,
+      "median_ns_per_op": 114110.625,
+      "min_ns_per_op": 113683.042,
+      "raw_mean_ns_per_op": [
+        113683.042,
+        114004.459,
+        114110.625,
+        116622.583,
+        117791.125
+      ],
+      "relative_spread": 0.036000880724297135,
+      "runs": 5,
+      "spread_ns_per_op": 4108.082999999999,
+      "workload": "prepared_insert_bounded_batch"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 4111590.666,
+      "median_ns_per_op": 3788895.0,
+      "min_ns_per_op": 3734887.5,
+      "raw_mean_ns_per_op": [
+        3734887.5,
+        3775918.417,
+        3788895.0,
+        3946055.667,
+        4111590.666
+      ],
+      "relative_spread": 0.09942296263158525,
+      "runs": 5,
+      "spread_ns_per_op": 376703.1660000002,
+      "workload": "prepared_insert_single"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 83544.667,
+      "median_ns_per_op": 64345.333,
+      "min_ns_per_op": 61943.458,
+      "raw_mean_ns_per_op": [
+        61943.458,
+        63784.667,
+        64345.333,
+        66872.667,
+        83544.667
+      ],
+      "relative_spread": 0.33570747081221886,
+      "runs": 5,
+      "spread_ns_per_op": 21601.209000000003,
+      "workload": "protected_aggregate_sum"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 126734.0,
+      "median_ns_per_op": 112210.542,
+      "min_ns_per_op": 105542.166,
+      "raw_mean_ns_per_op": [
+        105542.166,
+        107723.542,
+        112210.542,
+        121587.875,
+        126734.0
+      ],
+      "relative_spread": 0.1888577812947379,
+      "runs": 5,
+      "spread_ns_per_op": 21191.834000000003,
+      "workload": "protected_scan_filter_count"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 1125.164,
+      "median_ns_per_op": 936.296,
+      "min_ns_per_op": 880.047,
+      "raw_mean_ns_per_op": [
+        880.047,
+        883.099,
+        936.296,
+        1111.585,
+        1125.164
+      ],
+      "relative_spread": 0.26179434708681865,
+      "runs": 5,
+      "spread_ns_per_op": 245.11699999999996,
+      "workload": "point_read_indexed"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 68160.625,
+      "median_ns_per_op": 37983.791,
+      "min_ns_per_op": 35073.0,
+      "raw_mean_ns_per_op": [
+        35073.0,
+        36591.833,
+        37983.791,
+        41983.542,
+        68160.625
+      ],
+      "relative_spread": 0.8710985430601175,
+      "runs": 5,
+      "spread_ns_per_op": 33087.625,
+      "workload": "point_update_changed_value"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 734.75,
+      "median_ns_per_op": 676.75,
+      "min_ns_per_op": 659.875,
+      "raw_mean_ns_per_op": [
+        659.875,
+        674.208,
+        676.75,
+        682.666,
+        734.75
+      ],
+      "relative_spread": 0.1106390838566679,
+      "runs": 5,
+      "spread_ns_per_op": 74.875,
+      "workload": "prepared_insert_bounded_batch"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 41498.958,
+      "median_ns_per_op": 26076.292,
+      "min_ns_per_op": 23986.75,
+      "raw_mean_ns_per_op": [
+        23986.75,
+        25663.292,
+        26076.292,
+        40671.958,
+        41498.958
+      ],
+      "relative_spread": 0.6715758513518716,
+      "runs": 5,
+      "spread_ns_per_op": 17512.208,
+      "workload": "prepared_insert_single"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 354290.041,
+      "median_ns_per_op": 344332.208,
+      "min_ns_per_op": 322902.959,
+      "raw_mean_ns_per_op": [
+        322902.959,
+        337417.375,
+        344332.208,
+        351532.166,
+        354290.041
+      ],
+      "relative_spread": 0.09115348861004618,
+      "runs": 5,
+      "spread_ns_per_op": 31387.082000000053,
+      "workload": "protected_aggregate_sum"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "3998891-optimized-engine",
+      "max_ns_per_op": 350849.209,
+      "median_ns_per_op": 318190.0,
+      "min_ns_per_op": 308396.0,
+      "raw_mean_ns_per_op": [
+        308396.0,
+        309233.834,
+        318190.0,
+        325062.458,
+        350849.209
+      ],
+      "relative_spread": 0.13342094031867743,
+      "runs": 5,
+      "spread_ns_per_op": 42453.20899999997,
+      "workload": "protected_scan_filter_count"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 2050.36,
+      "median_ns_per_op": 1677.84,
+      "min_ns_per_op": 1390.267,
+      "raw_mean_ns_per_op": [
+        1390.267,
+        1495.366,
+        1677.84,
+        1716.705,
+        2050.36
+      ],
+      "relative_spread": 0.39341832355886147,
+      "runs": 5,
+      "spread_ns_per_op": 660.0930000000001,
+      "workload": "point_read_indexed"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 6356900.416,
+      "median_ns_per_op": 3817585.792,
+      "min_ns_per_op": 3592126.0,
+      "raw_mean_ns_per_op": [
+        3592126.0,
+        3626881.125,
+        3817585.792,
+        5728843.292,
+        6356900.416
+      ],
+      "relative_spread": 0.7242206375017859,
+      "runs": 5,
+      "spread_ns_per_op": 2764774.416,
+      "workload": "point_update_changed_value"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 198166.166,
+      "median_ns_per_op": 116053.959,
+      "min_ns_per_op": 113118.708,
+      "raw_mean_ns_per_op": [
+        113118.708,
+        115973.583,
+        116053.959,
+        195158.708,
+        198166.166
+      ],
+      "relative_spread": 0.7328268568588857,
+      "runs": 5,
+      "spread_ns_per_op": 85047.458,
+      "workload": "prepared_insert_bounded_batch"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 6355686.917,
+      "median_ns_per_op": 3674489.333,
+      "min_ns_per_op": 3616961.583,
+      "raw_mean_ns_per_op": [
+        3616961.583,
+        3620841.792,
+        3674489.333,
+        5133622.167,
+        6355686.917
+      ],
+      "relative_spread": 0.7453349529154831,
+      "runs": 5,
+      "spread_ns_per_op": 2738725.3340000003,
+      "workload": "prepared_insert_single"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 95614.459,
+      "median_ns_per_op": 62806.333,
+      "min_ns_per_op": 61486.375,
+      "raw_mean_ns_per_op": [
+        61486.375,
+        62068.125,
+        62806.333,
+        67277.583,
+        95614.459
+      ],
+      "relative_spread": 0.543386030832273,
+      "runs": 5,
+      "spread_ns_per_op": 34128.084,
+      "workload": "protected_aggregate_sum"
+    },
+    {
+      "engine": "powdb",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 141257.0,
+      "median_ns_per_op": 113838.166,
+      "min_ns_per_op": 103385.75,
+      "raw_mean_ns_per_op": [
+        103385.75,
+        108365.166,
+        113838.166,
+        119604.5,
+        141257.0
+      ],
+      "relative_spread": 0.3326762133536129,
+      "runs": 5,
+      "spread_ns_per_op": 37871.25,
+      "workload": "protected_scan_filter_count"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 1364.062,
+      "median_ns_per_op": 981.477,
+      "min_ns_per_op": 854.319,
+      "raw_mean_ns_per_op": [
+        854.319,
+        938.912,
+        981.477,
+        1193.005,
+        1364.062
+      ],
+      "relative_spread": 0.519363163884635,
+      "runs": 5,
+      "spread_ns_per_op": 509.74299999999994,
+      "workload": "point_read_indexed"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 179524.625,
+      "median_ns_per_op": 39646.625,
+      "min_ns_per_op": 35457.833,
+      "raw_mean_ns_per_op": [
+        35457.833,
+        38858.541,
+        39646.625,
+        51560.917,
+        179524.625
+      ],
+      "relative_spread": 3.633771903661409,
+      "runs": 5,
+      "spread_ns_per_op": 144066.79200000002,
+      "workload": "point_update_changed_value"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 1546.958,
+      "median_ns_per_op": 749.666,
+      "min_ns_per_op": 653.375,
+      "raw_mean_ns_per_op": [
+        653.375,
+        736.375,
+        749.666,
+        816.042,
+        1546.958
+      ],
+      "relative_spread": 1.1919748261225667,
+      "runs": 5,
+      "spread_ns_per_op": 893.5830000000001,
+      "workload": "prepared_insert_bounded_batch"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 170044.208,
+      "median_ns_per_op": 26092.166,
+      "min_ns_per_op": 25471.584,
+      "raw_mean_ns_per_op": [
+        25471.584,
+        25557.792,
+        26092.166,
+        29865.708,
+        170044.208
+      ],
+      "relative_spread": 5.5408440985696625,
+      "runs": 5,
+      "spread_ns_per_op": 144572.624,
+      "workload": "prepared_insert_single"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 500727.166,
+      "median_ns_per_op": 365224.0,
+      "min_ns_per_op": 316441.333,
+      "raw_mean_ns_per_op": [
+        316441.333,
+        324872.25,
+        365224.0,
+        376123.541,
+        500727.166
+      ],
+      "relative_spread": 0.5045830312356254,
+      "runs": 5,
+      "spread_ns_per_op": 184285.83300000004,
+      "workload": "protected_aggregate_sum"
+    },
+    {
+      "engine": "sqlite",
+      "engine_ref": "4e6a8e4-fixed-engine",
+      "max_ns_per_op": 495724.125,
+      "median_ns_per_op": 333071.375,
+      "min_ns_per_op": 300872.792,
+      "raw_mean_ns_per_op": [
+        300872.792,
+        311219.833,
+        333071.375,
+        340998.459,
+        495724.125
+      ],
+      "relative_spread": 0.5850137466781706,
+      "runs": 5,
+      "spread_ns_per_op": 194851.33299999998,
+      "workload": "protected_scan_filter_count"
+    }
+  ],
+  "valid": true
+}

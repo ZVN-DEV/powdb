@@ -6,6 +6,40 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_powdb-cli")
 }
 
+#[test]
+fn verifier_accepts_json_format_after_subcommand_and_rejects_csv() {
+    let data = tmp("verify_format");
+    let backup = tmp("verify_format_backup");
+    let data_s = data.to_str().unwrap();
+    let backup_s = backup.to_str().unwrap();
+    assert!(run(&["--data-dir", data_s, "--exec", "type T { id: int }"])
+        .status
+        .success());
+    let verified = run(&["verify", "--data-dir", data_s, "--format", "json"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("\"ok\": true"));
+    assert!(run(&["--data-dir", data_s, "backup", backup_s])
+        .status
+        .success());
+    let verified = run(&["verify-backup", backup_s, "--format", "json"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("\"ok\": true"));
+    for args in [
+        vec!["verify", "--data-dir", data_s, "--format", "csv"],
+        vec!["--format", "csv", "verify", "--data-dir", data_s],
+    ] {
+        assert_eq!(run(&args).status.code(), Some(2));
+    }
+}
+
 fn tmp(tag: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
         "powdb_clibk_{tag}_{}_{}",

@@ -210,6 +210,10 @@ cargo install powdb-server
 
 ## Benchmark methodology: what to measure now
 
+For measured implementation changes and raw paired results, see the
+[2026-10-01 write-bookkeeping profile](https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-10-01-write-bookkeeping-profile.md).
+It separates WAL-Off engineering savings from Full-mode durability measurements.
+
 PowDB's current comparison story is a measurement path, not a new headline ratio. The old PowDB-vs-SQLite table is preserved in the historical docs, but it no longer leads the README because several lookup/update rows were withdrawn and durable-write comparisons need the paired harness.
 
 Use two profiles depending on the question:

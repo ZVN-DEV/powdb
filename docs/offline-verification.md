@@ -30,6 +30,10 @@ powdb-cli verify-backup ./backups/full \
 
 `--compare-source` is optional, but it requires `--restore-drill-dir` because there must be a restored copy to compare. The drill destination must be empty; the verifier refuses to overwrite existing files.
 
+Source comparison verifies both directories under reader locks and compares
+typed row values, schema/index metadata, defaults, auto columns, named links,
+and stored view query/dependency definitions. It never creates a missing source.
+
 ## Exit codes
 
 - `0`: every required check completed and no errors were reported.
