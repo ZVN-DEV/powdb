@@ -59,6 +59,26 @@ pub(crate) fn write_file_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.flush()
 }
 
+/// Create a brand-new owner-only file, failing if anything already exists at
+/// `path`. Used for restore temp files so a failed restore never truncates an
+/// existing file or follows a pre-existing temp-path symlink.
+pub(crate) fn create_new_file_secure(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(FILE_MODE);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(FILE_MODE))?;
+    }
+    Ok(file)
+}
+
 /// Open a page-addressed file for random-access writes (the incremental
 /// restore delta path) with owner-only permissions, preserving existing
 /// content.

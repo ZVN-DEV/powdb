@@ -336,6 +336,52 @@ fn restore_drill_requires_fresh_dest_and_can_compare_source() {
 }
 
 #[test]
+fn restore_does_not_publish_bad_file_when_manifest_hash_fails() {
+    let src = make_indexed_db("restore_bad_hash_src");
+    let backup = full_backup(&src);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    let first_name = manifest
+        .get_mut("files")
+        .and_then(|v| v.as_array_mut())
+        .and_then(|files| files.first())
+        .and_then(|entry| entry.get("name"))
+        .and_then(|name| name.as_str())
+        .unwrap()
+        .to_owned();
+    let target = backup.join(&first_name);
+    let mut bytes = std::fs::read(&target).unwrap();
+    bytes[0] ^= 0x5a;
+    std::fs::write(&target, bytes).unwrap();
+    let backup_after_tamper = dir_fingerprints(&backup);
+
+    let dest = tmp("restore_bad_hash_dest");
+    let error = powdb_backup::restore(&backup, &dest).unwrap_err();
+
+    assert!(
+        error.to_string().contains("blake3 mismatch"),
+        "expected hash failure, got {error}"
+    );
+    assert_eq!(
+        backup_after_tamper,
+        dir_fingerprints(&backup),
+        "restore must not mutate backup source files"
+    );
+    assert!(
+        !dest.join(&first_name).exists(),
+        "failed restore must not publish the corrupt final destination file"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&dest)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.iter().all(|name| !name.contains(".tmp.")),
+        "failed restore must clean temporary destination files, found {leftovers:?}"
+    );
+}
+
+#[test]
 fn verify_database_rejects_live_slot_outside_page_even_with_valid_crc() {
     let dir = make_indexed_db("bad_slot");
     let heap = dir.join("User.heap");
