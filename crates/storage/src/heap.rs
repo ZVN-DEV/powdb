@@ -493,6 +493,13 @@ impl HeapFile {
         self.dirty_buffer.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_page_count(&self) -> Option<usize> {
+        self.statement_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.before_pages.len())
+    }
+
     pub fn format_version(&self) -> u16 {
         if self.first_data_page == 0 {
             1

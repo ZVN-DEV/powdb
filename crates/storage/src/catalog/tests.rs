@@ -301,6 +301,107 @@ fn wal_off_rollback_rebuilds_indexes_from_restored_heap() {
 }
 
 #[test]
+fn rollback_memento_is_armed_only_for_wal_off_transactions() {
+    for mode in [WalSyncMode::Full, WalSyncMode::Normal, WalSyncMode::Off] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::create(dir.path()).unwrap();
+        catalog.set_wal_sync_mode(mode);
+        catalog.create_table(tx_schema()).unwrap();
+        let slot = catalog.table_slot("T").unwrap();
+
+        catalog.begin_statement_transaction().unwrap();
+        let rid = insert_row(&mut catalog, 1, "seed");
+        catalog.commit_transaction().unwrap();
+
+        catalog.begin_statement_transaction().unwrap();
+        catalog
+            .update("T", rid, &vec![Value::Int(1), Value::Str("updated".into())])
+            .unwrap();
+        let snapshot_pages = catalog.table_by_slot(slot).statement_snapshot_page_count();
+        match mode {
+            WalSyncMode::Off => {
+                assert_eq!(snapshot_pages, Some(1), "Off keeps live rollback memento");
+                assert_eq!(
+                    catalog.dirty_pages_buffered(),
+                    1,
+                    "Off charges the captured before-page against the dirty-page budget"
+                );
+            }
+            WalSyncMode::Full | WalSyncMode::Normal => {
+                assert_eq!(
+                    snapshot_pages, None,
+                    "{mode:?} must rely on WAL/reopen rollback, not heap mementos"
+                );
+                assert_eq!(
+                    catalog.dirty_pages_buffered(),
+                    0,
+                    "{mode:?} must not charge unused before-pages to the dirty-page budget"
+                );
+            }
+        }
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), vec![1], "mode {mode:?}");
+    }
+}
+
+#[test]
+fn rollback_memento_follows_transaction_start_mode_not_deferred_mode_switch() {
+    let full_to_off = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(full_to_off.path()).unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Full);
+        catalog.create_table(tx_schema()).unwrap();
+        let slot = catalog.table_slot("T").unwrap();
+
+        catalog.begin_transaction().unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Off);
+        insert_row(&mut catalog, 1, "full-start");
+        assert_eq!(
+            catalog.table_by_slot(slot).statement_snapshot_page_count(),
+            None,
+            "a Full-start transaction still rolls back through WAL/reopen"
+        );
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), Vec::<i64>::new());
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 2, "now-off");
+        assert_eq!(
+            catalog.table_by_slot(slot).statement_snapshot_page_count(),
+            Some(1),
+            "the deferred switch applies after rollback, so the next Off statement is armed"
+        );
+        catalog.rollback_to_last_sync().unwrap();
+    }
+
+    let off_to_full = tempfile::tempdir().unwrap();
+    {
+        let mut catalog = Catalog::create(off_to_full.path()).unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Off);
+        catalog.create_table(tx_schema()).unwrap();
+        let slot = catalog.table_slot("T").unwrap();
+
+        catalog.begin_transaction().unwrap();
+        catalog.set_wal_sync_mode(WalSyncMode::Full);
+        insert_row(&mut catalog, 1, "off-start");
+        assert_eq!(
+            catalog.table_by_slot(slot).statement_snapshot_page_count(),
+            Some(0),
+            "an Off-start transaction must keep its live rollback memento"
+        );
+        catalog.rollback_to_last_sync().unwrap();
+        assert_eq!(rows_by_id(&catalog), Vec::<i64>::new());
+        catalog.begin_statement_transaction().unwrap();
+        insert_row(&mut catalog, 2, "now-full");
+        assert_eq!(
+            catalog.table_by_slot(slot).statement_snapshot_page_count(),
+            None,
+            "the deferred switch applies after rollback, so the next Full statement is unarmed"
+        );
+        catalog.rollback_to_last_sync().unwrap();
+    }
+}
+
+#[test]
 fn wal_off_statement_rollback_restores_overflow_growth_and_auto_counter() {
     let dir = tempfile::tempdir().unwrap();
     let mut catalog = Catalog::create(dir.path()).unwrap();

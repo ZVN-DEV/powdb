@@ -1578,8 +1578,8 @@ impl Catalog {
         id
     }
 
-    fn begin_rollback_memento(&mut self) {
-        self.statement_snapshot_active = true;
+    fn begin_rollback_memento_if_wal_off(&mut self) {
+        self.statement_snapshot_active = self.wal.is_off();
     }
 
     fn ensure_table_rollback_memento(&mut self, slot: usize) {
@@ -1627,7 +1627,7 @@ impl Catalog {
         self.dirty_budget.set_rollback_pinned(true);
         self.tx_start_len = Some(start_len);
         self.pending_autocommit_tx_ids.clear();
-        self.begin_rollback_memento();
+        self.begin_rollback_memento_if_wal_off();
         // Recovery accepts boundary-free logs for legacy compatibility. Even
         // the first statement after a checkpoint must therefore carry BEGIN,
         // or a crash before COMMIT could replay its uncommitted row records.
@@ -1657,7 +1657,7 @@ impl Catalog {
         self.dirty_budget.set_rollback_pinned(true);
         self.tx_start_len = Some(start_len);
         self.pending_autocommit_tx_ids.clear();
-        self.begin_rollback_memento();
+        self.begin_rollback_memento_if_wal_off();
         if !self.wal.is_off() {
             if let Err(error) = self
                 .wal

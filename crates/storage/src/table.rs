@@ -777,6 +777,11 @@ impl Table {
         Ok(heap_changed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_page_count(&self) -> Option<usize> {
+        self.heap.statement_snapshot_page_count()
+    }
+
     /// Whether this table has any `auto` column.
     pub(crate) fn has_auto(&self) -> bool {
         self.auto_cols.iter().any(|&a| a)
