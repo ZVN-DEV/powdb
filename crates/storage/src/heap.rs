@@ -218,11 +218,18 @@ impl DirtyPageBudget {
         if pages == 0 {
             return;
         }
-        let _ = self
-            .pages
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
-                Some(charged.saturating_sub(pages))
-            });
+        let mut charged = self.pages.load(Ordering::Relaxed);
+        loop {
+            match self.pages.compare_exchange_weak(
+                charged,
+                charged.saturating_sub(pages),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => charged = actual,
+            }
+        }
     }
 }
 
@@ -3419,6 +3426,39 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn dirty_budget_release_saturates_and_can_be_reused() {
+        let budget = DirtyPageBudget::new(8 * PAGE_SIZE);
+        budget.force_charge(3);
+        budget.release(0);
+        assert_eq!(budget.charged_pages(), 3);
+        budget.release(2);
+        assert_eq!(budget.charged_pages(), 1);
+        budget.release(usize::MAX);
+        assert_eq!(budget.charged_pages(), 0);
+        assert!(budget.try_charge_page());
+        budget.release(1);
+        assert_eq!(budget.charged_pages(), 0);
+    }
+
+    #[test]
+    fn dirty_budget_release_preserves_concurrent_charges() {
+        let budget = DirtyPageBudget::new(8 * PAGE_SIZE);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let budget = &budget;
+                scope.spawn(move || {
+                    for _ in 0..10_000 {
+                        assert!(budget.try_charge_page());
+                        std::thread::yield_now();
+                        budget.release(1);
+                    }
+                });
+            }
+        });
+        assert_eq!(budget.charged_pages(), 0);
     }
 
     #[test]
