@@ -77,8 +77,9 @@
   <div class="container">
     <h2>What PowQL does differently from SQL</h2>
     <p class="section-subtitle">
-      Speed is not the interesting part of PowDB, and the benchmarks below are honest about where it loses.
-      One of these four changes the answer you get. The other three change how much you have to write to get it.
+      PowDB is most interesting when the result shape matters: native nested values, named links,
+      JSON-path indexes, and aggregate semantics that avoid join fan-out mistakes. The benchmarks
+      below stay workload-specific and do not replace that product fit.
     </p>
 
     <!-- Symmetric aggregates -->
@@ -162,9 +163,10 @@ JOIN User u ON o.user_id = u.id;</code></pre>
         <div class="compare-card">
           <div class="compare-card-header powql">PowQL</div>
           <pre><code>link Order.user -> User on user_id = id
+link User.orders -> Order on id = user_id
 
 Order as o { o.total, o.user.name }
-User  as u { u.name, u.orders { .total } }</code></pre>
+User  as u { u.name, orders: u.orders { total } }</code></pre>
         </div>
       </div>
       <p class="section-subtitle" style="margin-top: 16px;">
@@ -196,14 +198,12 @@ alter Post add index (.data->published_at)</code></pre>
     </div>
 
     <p class="section-subtitle" style="margin-top: 32px;">
-      <strong>What is spelling and what is not.</strong> The nested shape itself is not exclusive: stock
-      SQLite produces the same output, empty array for a childless parent included, with a correlated
-      subquery and <code>json_group_array(json_object(...))</code>, and DuckDB, SurrealDB and several ORMs
-      have their own spellings. What differs here is that PowDB owns the storage engine, the executor and
-      the wire protocol, so the nested value crosses the wire as PJ1 binary and the client decodes that
-      rather than parsing JSON text. It is a binary decode instead of a text parse, not the absence of a
-      decode, and we have not published a benchmark of the difference. The aggregate above is the one item
-      on this page that changes the answer rather than the typing.
+      <strong>Native shape, without claiming false uniqueness.</strong> SQLite can reproduce the same
+      nested output, empty array for a childless parent included, with a correlated subquery and
+      <code>json_group_array(json_object(...))</code>. PowDB's advantage is that PowQL expresses the
+      shape directly, links can be declared once and traversed by name, and native typed clients receive
+      the nested value as PJ1 binary rather than JSON text to parse back into objects. The aggregate
+      example above is the place this section changes the answer, not just the ergonomics.
     </p>
     <p class="section-subtitle" style="margin-top: 12px;">
       Full detail: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/POWQL.md#grouped-aggregates-over-joins-symmetric-and-raw-semantics" target="_blank" rel="noopener">Symmetric aggregates</a>,
@@ -521,7 +521,7 @@ await client.close();</code></pre>
     <div class="features-grid">
       <div class="feature-card">
         <h3>Compiled Predicates</h3>
-        <p>Filter expressions compile into byte-level operations that skip full row decoding. Historical aggregate and scan measurements show where this path helps; point-lookup and update ratios are withdrawn until corrected paired measurements are published.</p>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. Historical aggregate and scan measurements show where this path helps; point-lookup and update ratios are withdrawn until corrected paired measurements are published with the <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/paired-value-harness.md" target="_blank" rel="noopener">paired value harness</a>.</p>
       </div>
       <div class="feature-card">
         <h3>Nested Projections</h3>
@@ -550,6 +550,10 @@ await client.close();</code></pre>
       <div class="feature-card">
         <h3>WAL + Crash Recovery</h3>
         <p>Write-ahead log with statement-boundary group commit. Full crash recovery via WAL replay, page-zero recovery, and automatic index rebuild.</p>
+      </div>
+      <div class="feature-card">
+        <h3>Offline Verification</h3>
+        <p>Source/unreleased operations add JSON reports for quiescent directory verification and backup restore drills: <code>powdb-cli verify --data-dir DIR --format json</code> and <code>powdb-cli verify-backup BACKUP --restore-drill-dir FRESH_DEST --compare-source SOURCE --format json</code>. Verification fails closed and does not repair data.</p>
       </div>
       <div class="feature-card">
         <h3>Plan Cache</h3>
