@@ -107,6 +107,21 @@ fn main() {
         Action::Backup { dest, base } => {
             std::process::exit(run_backup(&args.data_dir, dest, base.as_deref()));
         }
+        Action::Verify => {
+            std::process::exit(run_verify(&args.data_dir, args.output));
+        }
+        Action::VerifyBackup {
+            backup_dir,
+            restore_drill_dir,
+            compare_source_dir,
+        } => {
+            std::process::exit(run_verify_backup(
+                backup_dir,
+                restore_drill_dir.as_deref(),
+                compare_source_dir.as_deref(),
+                args.output,
+            ));
+        }
         Action::Restore {
             backup_dir,
             dest,

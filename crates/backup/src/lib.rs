@@ -14,6 +14,7 @@ pub mod incremental;
 pub mod manifest;
 pub mod restore;
 mod secure;
+pub mod verify;
 pub use bootstrap::{bootstrap_replica_from_full_backup, ReplicaBootstrapSummary};
 pub use full::full_backup;
 pub use incremental::{incremental_backup, restore_chain, restore_chain_with_sync_mode};
@@ -21,3 +22,7 @@ pub use manifest::{
     BackupManifest, ChangedFile, FileEntry, IncrementManifest, SyncSnapshotMetadata,
 };
 pub use restore::{restore, restore_with_sync_mode, RestoreSyncMode};
+pub use verify::{
+    compare_database_dirs, verify_backup, verify_database, verify_restore_drill, VerifyOptions,
+    VerifyReport, VerifyStatus,
+};

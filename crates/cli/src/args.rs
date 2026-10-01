@@ -9,6 +9,14 @@ pub(crate) enum Action {
     /// When `base` is set, write an incremental (differential) backup
     /// diffed against the full backup at that directory.
     Backup { dest: String, base: Option<String> },
+    /// Verify an offline data directory without writing repairs.
+    Verify,
+    /// Verify a full backup manifest/files, with optional restore drill.
+    VerifyBackup {
+        backup_dir: String,
+        restore_drill_dir: Option<String>,
+        compare_source_dir: Option<String>,
+    },
     /// Rebuild a data dir from a backup. When `apply` is non-empty, treat
     /// `backup_dir` as a full base and apply the ordered increments on top.
     Restore {
@@ -106,6 +114,8 @@ pub(crate) fn set_restore_sync_mode(
 /// A word close to one of these is a mistake, not a data directory.
 pub(crate) const SUBCOMMANDS: &[&str] = &[
     "backup",
+    "verify",
+    "verify-backup",
     "restore",
     "sync-enable",
     "sync-bootstrap",
@@ -212,6 +222,19 @@ pub(crate) fn subcommand_help(name: &str) -> &'static [&'static str] {
             "          --sync-strip     Default. Restore data without sync identity.",
             "          --sync-preserve  Disaster recovery: keep source sync identity.",
             "          --sync-fork      Clone/fork: mint a fresh sync identity.",
+        ],
+        "verify" => &[
+            "    verify [--data-dir <DIR>]",
+            "        Verify a quiescent data directory read-only: clean WAL, heap",
+            "        CRCs, strict row/overflow decode, index agreement, links,",
+            "        and materialized-view metadata. Writes no repairs.",
+        ],
+        "verify-backup" => &[
+            "    verify-backup <BACKUP_DIR> [--restore-drill-dir <DEST>] [--compare-source <DIR>]",
+            "        Verify a full backup manifest and every referenced file",
+            "        without writing. With --restore-drill-dir, restore into a",
+            "        fresh empty destination, verify that copy, and optionally",
+            "        compare logical rows/index metadata with --compare-source.",
         ],
         "sync-enable" => &[
             "    sync-enable",
@@ -483,6 +506,8 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("USAGE:");
                 println!("    powdb-cli [OPTIONS] [DATA_DIR]");
                 println!("    powdb-cli --data-dir <DIR> backup <DEST_DIR> [--base <FULL_DIR>]");
+                println!("    powdb-cli verify --data-dir <DIR>");
+                println!("    powdb-cli verify-backup <BACKUP_DIR> [--restore-drill-dir <DEST>] [--compare-source <DIR>]");
                 println!(
                     "    powdb-cli restore <BACKUP_DIR> <DEST_DATA_DIR> [--apply <INC_DIR>]... [--sync-strip|--sync-preserve|--sync-fork]"
                 );
@@ -560,6 +585,8 @@ pub(crate) fn parse_args() -> CliArgs {
                 println!("SUBCOMMANDS:");
                 for name in [
                     "backup",
+                    "verify",
+                    "verify-backup",
                     "restore",
                     "sync-enable",
                     "sync-bootstrap",
@@ -587,6 +614,89 @@ pub(crate) fn parse_args() -> CliArgs {
                 action = Action::Backup {
                     dest: argv[i].clone(),
                     base: None,
+                };
+            }
+            "verify" => {
+                i += 1;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "--data-dir" | "-d" => {
+                            i += 1;
+                            if i >= argv.len() {
+                                eprintln!("Error: --data-dir requires a path");
+                                std::process::exit(2);
+                            }
+                            data_dir = argv[i].clone();
+                            data_dir_explicit = true;
+                        }
+                        arg if arg.starts_with('-') => {
+                            eprintln!("Error: unknown verify argument: {arg}");
+                            eprintln!("try --help");
+                            std::process::exit(2);
+                        }
+                        other => {
+                            eprintln!("Error: unexpected verify argument: {other}");
+                            eprintln!("try --help");
+                            std::process::exit(2);
+                        }
+                    }
+                    i += 1;
+                }
+                action = Action::Verify;
+            }
+            "verify-backup" => {
+                i += 1;
+                let mut backup_dir: Option<String> = None;
+                let mut restore_drill_dir: Option<String> = None;
+                let mut compare_source_dir: Option<String> = None;
+                while i < argv.len() {
+                    match argv[i].as_str() {
+                        "--restore-drill-dir" => {
+                            i += 1;
+                            if i >= argv.len() {
+                                eprintln!("Error: --restore-drill-dir requires a path");
+                                std::process::exit(2);
+                            }
+                            restore_drill_dir = Some(argv[i].clone());
+                        }
+                        "--compare-source" => {
+                            i += 1;
+                            if i >= argv.len() {
+                                eprintln!("Error: --compare-source requires a data dir");
+                                std::process::exit(2);
+                            }
+                            compare_source_dir = Some(argv[i].clone());
+                        }
+                        arg if arg.starts_with('-') => {
+                            eprintln!("Error: unknown verify-backup argument: {arg}");
+                            eprintln!("try --help");
+                            std::process::exit(2);
+                        }
+                        other if backup_dir.is_none() => {
+                            backup_dir = Some(other.to_string());
+                        }
+                        other => {
+                            eprintln!("Error: unexpected verify-backup argument: {other}");
+                            eprintln!("try --help");
+                            std::process::exit(2);
+                        }
+                    }
+                    i += 1;
+                }
+                let Some(backup_dir) = backup_dir else {
+                    eprintln!("Error: verify-backup requires a backup dir");
+                    std::process::exit(2);
+                };
+                if compare_source_dir.is_some() && restore_drill_dir.is_none() {
+                    eprintln!(
+                        "Error: --compare-source requires --restore-drill-dir so there is a restored copy to compare"
+                    );
+                    std::process::exit(2);
+                }
+                action = Action::VerifyBackup {
+                    backup_dir,
+                    restore_drill_dir,
+                    compare_source_dir,
                 };
             }
             "--base" => {
@@ -830,6 +940,20 @@ pub(crate) fn parse_args() -> CliArgs {
             }
             *apply = restore_apply;
             *sync_mode = restore_sync_mode;
+        }
+        Action::Verify | Action::VerifyBackup { .. } => {
+            if backup_base.is_some() {
+                eprintln!("Error: --base is only valid with the `backup` subcommand");
+                std::process::exit(2);
+            }
+            if !restore_apply.is_empty() {
+                eprintln!("Error: --apply is only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
+            if restore_sync_mode_was_set {
+                eprintln!("Error: --sync-strip, --sync-preserve, and --sync-fork are only valid with the `restore` subcommand");
+                std::process::exit(2);
+            }
         }
         _ => {
             if backup_base.is_some() {

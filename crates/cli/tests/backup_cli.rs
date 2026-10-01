@@ -43,6 +43,102 @@ fn assert_cli_count(data_dir: &std::path::Path, table: &str, expected: usize) {
 }
 
 #[test]
+fn cli_verify_database_text_and_json() {
+    let data = tmp("verifydata");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["verify", "--data-dir", data_s]).status.code() == Some(1),
+        "missing database should fail verification"
+    );
+
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+    assert!(run(&["--data-dir", data_s, "-c", "insert T { id := 1 }"])
+        .status
+        .success());
+
+    let text = run(&["verify", "--data-dir", data_s]);
+    assert!(
+        text.status.success(),
+        "verify failed: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(stdout.contains("verify database:"));
+    assert!(stdout.contains("[ok] catalog_open_read_only"));
+
+    let json = run(&["--format", "json", "verify", "--data-dir", data_s]);
+    assert!(
+        json.status.success(),
+        "json verify failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    assert!(stdout.contains("\"schema_version\""));
+    assert!(stdout.contains("\"ok\": true"));
+    assert!(stdout.contains("\"checks\""));
+}
+
+#[test]
+fn cli_verify_backup_restore_drill_requires_fresh_destination() {
+    let data = tmp("verifybkpdata");
+    let data_s = data.to_str().unwrap();
+    assert!(
+        run(&["--data-dir", data_s, "-c", "type T { required id: int }"])
+            .status
+            .success()
+    );
+    assert!(run(&["--data-dir", data_s, "-c", "insert T { id := 7 }"])
+        .status
+        .success());
+    let backup = tmp("verifybkp");
+    let backup_out = run(&["--data-dir", data_s, "backup", backup.to_str().unwrap()]);
+    assert!(
+        backup_out.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup_out.stderr)
+    );
+
+    let nonempty = tmp("verifybkpnonempty");
+    std::fs::create_dir_all(&nonempty).unwrap();
+    std::fs::write(nonempty.join("sentinel"), b"keep").unwrap();
+    let refused = run(&[
+        "verify-backup",
+        backup.to_str().unwrap(),
+        "--restore-drill-dir",
+        nonempty.to_str().unwrap(),
+        "--compare-source",
+        data_s,
+    ]);
+    assert_eq!(refused.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&refused.stdout);
+    assert!(stdout.contains("restore_destination_not_empty"));
+    assert_eq!(std::fs::read(nonempty.join("sentinel")).unwrap(), b"keep");
+
+    let fresh = tmp("verifybkpfresh");
+    let ok = run(&[
+        "--format",
+        "json",
+        "verify-backup",
+        backup.to_str().unwrap(),
+        "--restore-drill-dir",
+        fresh.to_str().unwrap(),
+        "--compare-source",
+        data_s,
+    ]);
+    assert!(
+        ok.status.success(),
+        "verify-backup failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("\"ok\": true"));
+}
+
+#[test]
 fn cli_backup_then_restore_roundtrip() {
     let data = tmp("data");
     let data_s = data.to_str().unwrap();
