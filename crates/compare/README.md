@@ -82,12 +82,27 @@ scripts/paired-bench.sh \
   --output paired-full.json
 ```
 
+The script requires `python3` for JSON aggregation and synthetic selftests:
+
+```bash
+scripts/paired-bench.sh --selftest
+```
+
 The script alternates baseline/candidate order and PowDB/SQLite engine order
-across five runs, then reports raw run means plus medians/min/max/spread. A Full
-run is publishable only when all correctness checks pass, the candidate improves
-either a write median by at least 25% or point-read median by at least 30%, and
-protected scan/aggregate medians do not regress by more than 10%. Off-mode
-results are always diagnostic, even when they pass the same checks.
+across at least five runs, then reports raw run means plus medians/min/max,
+absolute spread, and relative spread. A Full run is durable-publishable only
+when all correctness checks pass, baseline/candidate labels and binary hashes
+are distinct and singular, profile/settings/fixture/platform metadata matches,
+the run is not marked contaminated, no PowDB workload exceeds the fixed 20%
+relative-spread policy, the candidate improves either a write median by at least
+25% or point-read median by at least 30%, and point-read plus protected
+scan/aggregate medians do not regress by more than 10%.
+
+Use `--require-improvement` when the command should exit nonzero unless the
+fixed 25% write / 30% point-read / 10% protected-regression engineering
+thresholds pass. Use `--contaminated --contamination-note <why>` to keep a run
+valid but explicitly non-publishable. Off-mode results can pass the engineering
+improvement contract, but they remain diagnostic and are never durable claims.
 
 ## With Postgres
 

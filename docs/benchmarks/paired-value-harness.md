@@ -41,17 +41,33 @@ scripts/paired-bench.sh \
   --output paired-full.json
 ```
 
-The script alternates both revision order and engine order. It reports raw
-arithmetic means for every run, then medians, min/max, and spread. It does not
-invent percentiles from five means.
+The script uses `python3` from the developer environment for aggregation. Run
+`scripts/paired-bench.sh --selftest` after edits; it feeds synthetic JSON into
+the same evaluator and checks win, protected regression, noisy spread, under-5,
+settings mismatch, and contamination cases without executing benchmark binaries.
 
-A Full-mode candidate is publishable only if:
+The script alternates both revision order and engine order. It reports raw
+arithmetic means for every run, then medians, min/max, absolute spread, and
+relative spread. It does not invent percentiles from five means.
+
+A Full-mode candidate is durable-publishable only if:
 
 1. all driver correctness checks pass;
-2. at least one write workload median improves by 25% or the point-read median
+2. at least five paired runs were collected;
+3. baseline/candidate labels are distinct and binary hash provenance is present,
+   singular per ref, and distinct between refs;
+4. profile, mode, fixture, settings, and platform metadata match across records;
+5. the run is not marked contaminated with `--contaminated`;
+6. no PowDB workload exceeds the fixed 20% relative-spread policy;
+7. at least one write workload median improves by 25% or the point-read median
    improves by 30%; and
-3. protected scan/aggregate medians do not show a repeatable regression above
+8. point-read plus protected scan/aggregate medians do not regress by more than
    10%.
+
+`--require-improvement` makes the script exit nonzero when the fixed engineering
+thresholds fail. This is separate from durable publishability: Off-mode output
+can report `diagnostic_pass` for the same improvement contract, but it is never a
+durable-write claim.
 
 The script leaves baseline files and benchmark baselines untouched. It uses only
 temporary databases created by the driver and has no external database URL path.
