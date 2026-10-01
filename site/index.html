@@ -3,22 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PowDB: Pure-Rust embedded database with native nested results</title>
-  <meta name="description" content="PowDB is a pure-Rust embedded database for read-heavy applications. PowQL returns correlated children as native nested JSON, traverses declared entity links, and indexes JSON paths. See workload-specific benchmarks and limitations.">
+  <title>PowDB: Pure-Rust embedded database for shaped typed results</title>
+  <meta name="description" content="PowDB is a pure-Rust embedded database for shaped typed results: native nested children, named links, JSON-path indexes, and Rust/Node embedding. See workload-specific benchmarks and limitations.">
   <link rel="canonical" href="https://zvn-dev.github.io/powdb/">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="PowDB">
-  <meta property="og:title" content="PowDB: Pure-Rust embedded database with native nested results">
-  <meta property="og:description" content="PowQL returns correlated children as native nested JSON, traverses declared entity links, and indexes JSON paths. A pure-Rust embedded database with workload-specific benchmarks and explicit limitations.">
+  <meta property="og:title" content="PowDB: Pure-Rust embedded database for shaped typed results">
+  <meta property="og:description" content="PowQL returns correlated children as native nested values, traverses declared entity links, and indexes JSON paths. Rust/Node embedding with workload-specific benchmarks and explicit limitations.">
   <meta property="og:url" content="https://zvn-dev.github.io/powdb/">
   <meta property="og:image" content="https://zvn-dev.github.io/powdb/favicon.svg">
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="PowDB: Pure-Rust embedded database with native nested results">
-  <meta name="twitter:description" content="PowQL returns correlated children as native nested JSON in one row per parent, traverses declared entity links by name, and indexes JSON paths. Honest benchmarks, including where PowDB loses.">
+  <meta name="twitter:title" content="PowDB: Pure-Rust embedded database for shaped typed results">
+  <meta name="twitter:description" content="PowQL returns correlated children as native nested values, traverses declared entity links by name, and indexes JSON paths. Rust/Node embedding with honest workload-specific benchmarks.">
   <meta name="twitter:image" content="https://zvn-dev.github.io/powdb/favicon.svg">
 
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -38,6 +38,7 @@
       <a href="getting-started.html">Getting Started</a>
       <a href="powql.html">PowQL Reference</a>
       <a href="#shaped-results">Shaped Results</a>
+      <a href="#integrations">Integrations</a>
       <a href="#benchmarks">Benchmarks</a>
       <a href="https://github.com/ZVN-DEV/powdb/releases" target="_blank" rel="noopener">Releases</a>
       <a href="https://github.com/ZVN-DEV/powdb/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a>
@@ -52,12 +53,13 @@
 <!-- Hero -->
 <section class="hero">
   <div class="container">
-    <h1>The embedded database that returns<br><span class="highlight">shaped results</span>, not flat rows</h1>
+    <h1>The embedded database for<br><span class="highlight">shaped typed results</span></h1>
     <p class="subtitle">
       From-scratch pure-Rust database with PowQL -- a pipeline query language that reads left to right --
-      plus a SQL frontend on the same engine. Ask for a parent and its children and get exactly that:
-      one row per parent, children as a native nested value, no join fan-out to undo and no JSON text to re-parse.
-      Built for single-writer embedded state and read-only snapshot serving, not for many clients sharing one read-write database.
+      plus a SQL frontend on the same engine. Ask for a parent and its children and get one row per
+      parent with children as native nested values. Traverse named links, index scalar JSON paths,
+      and embed the engine in Rust or Node without a server. Built for single-writer embedded state
+      and read-only snapshot serving, not for many clients sharing one read-write database.
     </p>
     <div class="hero-actions">
       <a href="getting-started.html" class="btn btn-primary">Get Started</a>
@@ -245,11 +247,11 @@ alter Post add index (.data->published_at)</code></pre>
 <section class="bench-section" id="benchmarks">
   <div class="container">
     <h2>Benchmarks</h2>
-    <p class="section-subtitle">PowDB vs SQLite on 100K rows, neither engine fsyncs. All 15 workloads are listed, including the four where PowDB ties or loses. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#embedded">Embedded in Node</a> below.</p>
+    <p class="section-subtitle">PowDB vs SQLite on 100K rows, neither engine fsyncs. This is a dated workload snapshot, not a broad "fastest vs SQLite" claim. Lookup and update rows affected by the 2026-09-19 correction are withdrawn instead of replaced with unverified ratios. These are single-request latencies (one query at a time), not throughput under many simultaneous clients. Single-row durable inserts are fsync-bound; that write story is covered in <a href="#integrations">Embed or connect</a> below.</p>
     <div class="install-block" style="margin-bottom: 24px;">
       <span class="prompt">$</span> cargo run --release -p powdb-compare
     </div>
-    <p class="section-subtitle">Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0), commit <code>e3dfa71</code>, measured 2026-08-15. <strong>Laptop numbers, not CI numbers.</strong> PowDB writes to a real temp directory while SQLite is <code>:memory:</code>, so the three write rows (<code>insert_single</code>, <code>insert_batch_1k</code>, <code>delete_by_filter</code>) are sensitive to competing disk I/O and change sign depending on machine load. Treat them as ties and re-measure them yourself. Full methodology, per-run spread, and what changed in the harness: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md" target="_blank" rel="noopener">the 2026-07-24 snapshot</a>.</p>
+    <p class="section-subtitle">Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0), commit <code>e3dfa71</code>, measured 2026-08-15. <strong>Laptop numbers, not CI numbers.</strong> PowDB writes to a real temp directory while SQLite is <code>:memory:</code>, so the three write rows (<code>insert_single</code>, <code>insert_batch_1k</code>, <code>delete_by_filter</code>) are sensitive to competing disk I/O and change sign depending on machine load. Treat them as ties and re-measure them yourself. Full methodology and per-run spread: <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-07-24-wide-bench-snapshot.md" target="_blank" rel="noopener">the 2026-07-24 snapshot</a>.</p>
     <table>
       <thead>
         <tr>
@@ -352,7 +354,7 @@ alter Post add index (.data->published_at)</code></pre>
         </tr>
       </tbody>
     </table>
-    <p class="section-subtitle"><strong>Benchmark correction (2026-09-19):</strong> the old runner reused one lookup key and repeated the same update values. The corrected runner varies keys and values; lookup/update timings are withdrawn pending controlled remeasurement. The remaining rows are historical results, not measurements of the unreleased transaction changes. WAL-off mode writes no WAL at all.</p>
+    <p class="section-subtitle"><strong>Benchmark correction (2026-09-19):</strong> lookup and update timings are withdrawn pending controlled remeasurement with the paired harness. Details stay public in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/benchmarks/2026-09-19-benchmark-corrections.md" target="_blank" rel="noopener">the correction record</a>. The next comparison will use alternating baseline/candidate runs and raw samples; no new point-lookup or update ratios are claimed here.</p>
   </div>
 </section>
 
@@ -442,35 +444,68 @@ VALUES ('Alice', 'alice@example.com', 30);</code></pre>
   </div>
 </section>
 
-<!-- Embedded in Node -->
-<section class="compare-section" id="embedded">
+<!-- Embed or connect -->
+<section class="compare-section" id="integrations">
   <div class="container">
-    <h2>Embedded in Node — no server</h2>
-    <p class="section-subtitle">The same engine, in-process. <code>@zvndev/powdb-embedded</code> is a native Node addon: open a database, run PowQL or SQL, no TCP, no daemon. Durability is a mode you pick, so batched writes can be made fast without giving up crash safety.</p>
+    <h2>Embed or connect</h2>
+    <p class="section-subtitle">Use the same engine three ways: embedded Rust, embedded Node, or a remote TypeScript client. PowQL parameters are token-level bindings, so an injection-shaped string stays data and cannot change the query shape.</p>
 
     <div class="install-block" style="margin-bottom: 24px;">
-      <span class="prompt">$</span> npm install @zvndev/powdb-embedded
+      <span class="prompt">$</span> cargo add powdb&nbsp;&nbsp;/&nbsp;&nbsp;npm install @zvndev/powdb-embedded @zvndev/powdb-client
     </div>
 
     <div class="compare-example">
-      <div class="compare-card">
-        <div class="compare-card-header powql">index.mjs</div>
-        <pre><code class="language-typescript">import { Database } from "@zvndev/powdb-embedded";
+      <div class="compare-grid">
+        <div class="compare-card">
+          <div class="compare-card-header powql">Rust embedded</div>
+          <pre><code class="language-rust">use powdb::{Database, QueryResult, Value};
+
+let mut db = Database::open("./data")?;
+db.query("type User { required name: str, age: int }")?;
+db.query(r#"insert User { name := "Ada", age := 36 }"#)?;
+
+match db.query("count(User)")? {
+    QueryResult::Scalar(Value::Int(n)) => assert_eq!(n, 1),
+    other => panic!("unexpected: {other:?}"),
+}</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">Node embedded</div>
+          <pre><code class="language-typescript">import { Database } from "@zvndev/powdb-embedded";
 
 const db = Database.open("./data");
 
-// "normal" = off-lock background fsync: much faster writes,
-// a bounded crash-loss window. This closes the write gap vs SQLite.
 db.setSyncMode("normal");
 
 db.query('type User { required name: str, required email: str, age: int }');
 db.query('insert User { name := "Alice", email := "alice@example.com", age := 30 }');
 
-// PowQL
-db.query('User filter .age > 25 { .name, .age }');
+const rows = db.queryWithParams(
+  "User filter .age >= $1 { .name, .age }",
+  [21],
+);
+db.close();</code></pre>
+        </div>
+        <div class="compare-card">
+          <div class="compare-card-header powql">Remote TypeScript</div>
+          <pre><code class="language-typescript">import { Client } from "@zvndev/powdb-client";
 
-// ...or SQL, on the same handle — lowered to PowQL by the SQL frontend
-db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</code></pre>
+const client = await Client.connect({
+  host: "localhost",
+  port: 5433,
+});
+
+await client.query(
+  "insert User { name := $1, email := $2, age := $3 }",
+  [name, email, age],
+);
+
+const r = await client.queryNative(
+  "User filter .email = $1 { .name, .age }",
+  [email],
+);
+await client.close();</code></pre>
+        </div>
       </div>
     </div>
     <p class="section-subtitle" style="margin-top: 20px;">Durability is a knob, not a fork: <code>"full"</code> fsyncs every commit (safest, the default), <code>"normal"</code> moves the fsync off the write lock for a bounded crash-loss window, and batching writes in a <code>begin</code>/<code>commit</code> transaction drops the cost from one fsync per row to roughly one per 64. That is how single-row insert throughput stops being fsync-bound.</p>
@@ -480,13 +515,13 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
 <!-- Features -->
 <section class="features-section">
   <div class="container">
-    <h2>Built for Performance</h2>
-    <p class="section-subtitle">Every layer of PowDB is written in Rust, from the storage engine to the query executor.</p>
+    <h2>Built for shaped local data</h2>
+    <p class="section-subtitle">Every layer of PowDB is written in Rust, from the storage engine to the query executor. The differentiator is not only speed; it is the result shape and typed values the engine can hand your app directly.</p>
 
     <div class="features-grid">
       <div class="feature-card">
         <h3>Compiled Predicates</h3>
-        <p>Filter expressions compile into byte-level operations that skip full row decoding. This is why the aggregates measure 3.7-7.7x SQLite and filtered scans 1-3.7x, while point lookups measure about 15x slower.</p>
+        <p>Filter expressions compile into byte-level operations that skip full row decoding. Historical aggregate and scan measurements show where this path helps; point-lookup and update ratios are withdrawn until corrected paired measurements are published.</p>
       </div>
       <div class="feature-card">
         <h3>Nested Projections</h3>
@@ -530,7 +565,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
       </div>
       <div class="feature-card">
         <h3>TypeScript Client</h3>
-        <p>First-class TypeScript client (<code>@zvndev/powdb-client</code>) with a clean async API. Connect to PowDB server over TCP with full type safety.</p>
+        <p>First-class TypeScript client (<code>@zvndev/powdb-client</code>) with a clean async API, token-level <code>$1..$N</code> PowQL parameters, and native typed results over TCP/TLS.</p>
       </div>
       <div class="feature-card">
         <h3>TLS + Authentication</h3>
@@ -558,6 +593,7 @@ db.querySql("SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC");</cod
       <li><strong>No wire-protocol compatibility</strong> -- PowDB speaks a SQL subset (<a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/SQL.md" target="_blank" rel="noopener">docs/SQL.md</a>) through its own binary protocol and embedded API, not the Postgres or MySQL wire format. Off-the-shelf ORMs, BI dashboards, JDBC drivers, and DB browsers won't connect over the wire.</li>
       <li><strong>Effectively single-node</strong> -- no sharding, no consensus, and no live replica tailing. Freshness across processes comes from snapshot refresh (restore a newer snapshot and swap, in seconds), not streaming replication. If you need live replication or sync across nodes, use <a href="https://turso.tech" target="_blank" rel="noopener">Turso</a>.</li>
       <li><strong>No MVCC, no online backup</strong> -- a single writer takes the whole write-admission gate while parallel readers run; many concurrent clients sharing one read-write database is Postgres's territory. Backups (full, incremental, PITR) are offline-only today.</li>
+      <li><strong>No full SQL compatibility</strong> -- the SQL frontend is a supported subset lowered to the same engine, not a drop-in replacement for SQLite/Postgres SQL.</li>
     </ul>
     <p class="section-subtitle" style="margin-top: 24px;">If any of those are dealbreakers, use SQLite -- and we say so plainly in <a href="https://github.com/ZVN-DEV/powdb/blob/main/docs/powdb-vs-sqlite.md" target="_blank" rel="noopener">PowDB vs SQLite: when to use which</a>.</p>
   </div>
