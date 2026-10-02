@@ -6,9 +6,12 @@ title = "PowDB gitleaks configuration"
 useDefault = true
 
 [allowlist]
-description = "Exact documented placeholders that are intentionally non-secret."
+description = "Exact documented placeholders and public identifiers that are intentionally non-secret."
 regexes = [
   '''ci-smoke-not-a-real-secret''',
   '''example-(password|token|secret)''',
   '''(changeme|not-a-real-secret)''',
+  # Public Little Friend site key in site/little-friend.js. It only names the
+  # analytics project and ships in every page, so it is not a secret.
+  '''lf_G0lPMMRv20gPCelURBHgtV02''',
 ]
