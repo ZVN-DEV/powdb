@@ -182,8 +182,10 @@ under a released version number, so the crates cannot go first.
       gh workflow run publish.yml --ref vX.Y.Z -f version=X.Y.Z -f dry_run=false
 
     `dry_run` defaults to TRUE on purpose, so it must be spelled out or nothing
-    publishes. A dry run is NOT a useful rehearsal here: it fails by design for
-    every crate that depends on a workspace version not yet on crates.io.
+    publishes. Before tagging, dispatch with `dry_run=true` on the candidate
+    branch: Cargo validates all eight unpublished, interdependent crates
+    together without uploading them. Real publication still runs the existing
+    per-crate order and waits for each version to appear in the registry.
     Either way the workflow first runs cargo-semver-checks against the
     published crates.io baselines and refuses to publish an API change bigger
     than the version bump allows (the point-release-over-a-break hazard). If
@@ -197,8 +199,10 @@ under a released version number, so the crates cannot go first.
 [ ] Publish the embedded Node addon: run publish-node-addon.yml with
     dry_run=true to validate the full platform matrix, then re-run with
     dry_run=false to publish @zvndev/powdb-embedded (token-less, provenance).
-    Unlike publish.yml, this dry run IS meaningful: it packs every platform and
-    needs no OIDC setup. Do this BEFORE the smoke, which installs the addon.
+    The credential-free dry-run job tests and packs all three platform binaries
+    without entering the protected publishing environment. Real publishing still
+    requires the environment's approval and tag checks. Do this BEFORE the live
+    registry smoke, which installs the addon.
 [ ] Smoke-test the LIVE registries: run post-publish-smoke.yml with the
     released version (`gh workflow run post-publish-smoke.yml -f version=X.Y.Z`).
     It covers all six published channels in parallel jobs: cargo-installs
