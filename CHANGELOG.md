@@ -49,6 +49,10 @@ notes below before upgrading.
 
 ### Fixed
 
+- Small autocommit writes can continue when earlier committed pages fill the
+  dirty buffer. Pressure relief settles WAL durability before flushing those
+  pages, retains WAL history, and preserves the limit on individual statements
+  and explicit transactions.
 - Rolling back a spilled-value write no longer lets the retired catalog
   truncate the replacement catalog's WAL. Repeated rollback/write sequences
   now preserve subsequent writes instead of corrupting the log.
