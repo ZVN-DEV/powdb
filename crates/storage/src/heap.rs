@@ -217,11 +217,18 @@ impl DirtyPageBudget {
         if pages == 0 {
             return;
         }
-        let _ = self
-            .pages
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
-                Some(charged.saturating_sub(pages))
-            });
+        let mut charged = self.pages.load(Ordering::Relaxed);
+        loop {
+            match self.pages.compare_exchange_weak(
+                charged,
+                charged.saturating_sub(pages),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => charged = actual,
+            }
+        }
     }
 }
 
