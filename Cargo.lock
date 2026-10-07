@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "powdb"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-auth"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "argon2",
  "serde",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-backup"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "blake3",
  "powdb-query",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-bench"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "criterion",
  "libc",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-cli"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "powdb-auth",
  "powdb-backup",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-compare"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "mysql",
  "postgres",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-oracle"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-query"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "powdb-query",
  "powdb-storage",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-server"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bytes",
  "powdb-auth",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-storage"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1938,7 +1938,7 @@ dependencies = [
 
 [[package]]
 name = "powdb-sync"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "crc32fast",
  "getrandom 0.4.3",

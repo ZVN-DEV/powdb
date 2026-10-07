@@ -19,7 +19,7 @@ When cutting a release, follow the checklist at the bottom.
 > the release-candidate implementation work: a paired benchmark driver now makes
 > future claims reproducible, and WAL-Off diagnostic runs show the bookkeeping
 > costs recovered after the transaction-safety work, but no durable/default-mode
-> throughput claim is published and no benchmark baseline is reset yet.
+> throughput claim is published and no benchmark baseline is reset.
 
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See

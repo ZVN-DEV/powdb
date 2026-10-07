@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.29.0 - Unreleased
+
 No sync package API changes are planned for 0.29.0. The package version and peer
 pins move in lockstep with the engine, the wire client, and the embedded addon.
 

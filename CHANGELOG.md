@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - Unreleased
+
+This is an untagged release candidate, not a published release. The update
+protects failed writes, adds offline integrity checks and restore drills, and
+makes performance comparisons reproducible. Review the breaking migration
+notes below before upgrading.
+
 ### Added
 
 - Offline `powdb-cli verify` and `verify-backup` commands with text/JSON reports,
@@ -68,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated rustls to 0.23.45 in the workspace and fuzz lockfiles to address
   RUSTSEC-2026-0285 without changing the TLS wire protocol.
+- Updated the Node development dependency `js-yaml` and workspace `rand`
+  dependencies to patched compatible versions. The optional, unpublished MySQL
+  comparison tool's `lru` advisories remain visible; see the
+  [dependency disposition](docs/dependency-security.md).
 
 ## [0.28.0] - 2026-09-07
 

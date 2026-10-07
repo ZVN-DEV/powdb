@@ -9,6 +9,8 @@ the engine, so `@zvndev/powdb-embedded` 0.29.0 is PowDB 0.29.0.
 
 ## Unreleased
 
+## 0.29.0 - Unreleased
+
 ### Changed
 
 - The embedded addon version moves in lockstep with the 0.29.0 engine candidate.
