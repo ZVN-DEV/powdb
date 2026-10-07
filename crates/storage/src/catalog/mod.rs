@@ -334,12 +334,13 @@ fn write_durable_lsn(data_dir: &Path, lsn: u64) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
+/// Miri cannot open a directory, so under miri there is no directory fsync.
+#[cfg(any(not(unix), miri))]
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     let _ = path;
     Ok(())
