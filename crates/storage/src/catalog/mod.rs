@@ -1621,6 +1621,15 @@ impl Catalog {
                 "transaction is already active",
             ));
         }
+        // Only earlier committed statements own these pages. Relieve their
+        // pressure before pinning the new statement, leaving room for Off-mode
+        // before-images. Never truncate WAL here: sync readers may still need
+        // its history, and explicit transactions must retain their size bound.
+        let pressure_pages = (self.dirty_budget.limit_bytes() / crate::page::PAGE_SIZE / 2).max(1);
+        if self.dirty_budget.charged_pages() >= pressure_pages {
+            self.wal.sync_before_heap_flush()?;
+            self.flush_checkpoint_state()?;
+        }
         let start_len = self.wal.synced_len()?;
         let id = self.next_tx_id;
         self.next_tx_id = self.next_tx_id.wrapping_add(1);
