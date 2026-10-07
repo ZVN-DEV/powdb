@@ -794,6 +794,17 @@ impl Wal {
         Ok(())
     }
 
+    /// Settle all written WAL generations before committed heap pages can be
+    /// persisted, including claims already handed to deferred commit callers.
+    pub(crate) fn sync_before_heap_flush(&mut self) -> io::Result<()> {
+        self.flush_to_os()?;
+        if !matches!(self.sync_mode, WalSyncMode::Off) {
+            self.shared
+                .sync_until(self.shared.dirty_gen.load(Ordering::Acquire))?;
+        }
+        Ok(())
+    }
+
     /// Push buffered records through to the OS file (no fsync) and register
     /// the resulting dirty generation. Returns `Ok(None)` when there was
     /// nothing pending or the WAL is `Off`.
