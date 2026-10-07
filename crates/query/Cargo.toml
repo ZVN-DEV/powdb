@@ -24,7 +24,7 @@ exclude = ["src/executor/tests/**"]
 testing = ["powdb-storage/testing"]
 
 [dependencies]
-powdb-storage = { version = "0.28.0", path = "../storage" }
+powdb-storage = { version = "0.29.0", path = "../storage" }
 thiserror.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true

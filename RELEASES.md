@@ -5,6 +5,22 @@ When cutting a release, follow the checklist at the bottom.
 
 > **Current release: v0.28.0.** The full-review round: everything a 124-item audit of v0.27.0 (gold-standard, product review, stranger smoke, end-to-end torture and ops) surfaced, then everything an adversarial bug hunt found in those fixes, then everything a rigor review found in the hunt's, shipped as one branch and cut through the rc channel (`v0.28.0-rc.1` preceded it on every lane). Correctness: a comparison against a `datetime`, `uuid` or `bytes` column coerces its literal, so an `update` or `delete` keyed on such a column writes rows instead of silently doing nothing; a repeated query no longer answers a different question on its second execution; `union` de-duplicates both branches; `length()` counts characters; `not` over a missing value is the plain complement; an unqualified column in a join resolves instead of returning NULLs. Durability and operations: a crash after an ordinary insert can no longer leave the data directory unopenable, two processes cannot open one data directory for writing, backups carry `views.bin` and `auth.json`, the WAL checkpoints automatically in both binaries (`--wal-checkpoint-bytes`), `insert` cost no longer grows with the size of the heap and deleted space is allocatable again, a committed transaction larger than the sync pull window can be pulled, `SIGHUP` reloads the user store, and a TLS certificate's expiry is reported at startup. Performance: the index chooser's 22x regression on selective conjunctions (since 0.19.1) and the +70% per-execution validation cost on point lookups (since 0.20.0) are recovered, and the bench baseline was re-measured on Depot for the first time since v0.13.0. New: `drop link`, `powdb-cli --readonly`, `--remote` over a Unix-domain socket, `--password-stdin`, per-subcommand `--help`; `@zvndev/powdb-client` no longer desynchronizes its connection on a parameter the wire cannot carry. Breaking: 35 entries, twelve of them answer-changing with no error raised, indexed at the top of `CHANGELOG.md`; `cargo-semver-checks` runs no lints on a 0.x minor bump, so that index is the record.
 
+> **Next release: v0.29.0 (unreleased).** This is a development version only;
+> package registries, Docker tags, website install pins, and published-format
+> promises still point at v0.28.0 until a release tag is cut. The planned value
+> is safer failure handling and easier pre-release validation: failed statements
+> inside an explicit transaction abort that transaction until `ROLLBACK`, commit
+> uncertainty poisons the live handle instead of inviting a blind retry, and new
+> offline verification commands can check a quiescent data directory or full
+> backup without repairing or replaying the source. The verifier is intentionally
+> strict: restore drills require a fresh empty destination, source comparison is
+> read-only, live writers and pending WAL are refused, and findings are reported
+> rather than fixed in place. The performance story is deliberately narrower than
+> the release-candidate implementation work: a paired benchmark driver now makes
+> future claims reproducible, and WAL-Off diagnostic runs show the bookkeeping
+> costs recovered after the transaction-safety work, but no durable/default-mode
+> throughput claim is published and no benchmark baseline is reset yet.
+
 > **v0.4.1, v0.4.2, and v0.4.3 are yanked** for crash-recovery data-loss bugs;
 > 0.4.4 fixed them and added a standing durability regression suite. See
 > `CHANGELOG.md`.

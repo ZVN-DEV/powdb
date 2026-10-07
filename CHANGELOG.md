@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Offline `powdb-cli verify` and `verify-backup` commands with text/JSON reports,
   strict heap/row/index checks, manifest validation, and optional restore drills
-  into a fresh directory. Verification never repairs or replays the source.
+  into a fresh empty directory. Verification never repairs or replays the source,
+  refuses live writers and pending WAL, and compares an original source
+  read-only when `--compare-source` is used.
 - A paired performance driver with explicit control/candidate binaries,
   equivalent Full-mode configuration, raw samples, result checks, and guards
   for noisy or mismatched measurements.
@@ -31,10 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Correlated PowQL subqueries accept explicit outer aliases. Ambiguous bare
   fields shared by inner and outer scopes are refused with alias guidance
   instead of silently selecting the inner column.
-- Statement rollback protection adds write overhead, especially with WAL
-  disabled. Local diagnostic runs show materially slower WAL-Off writes;
-  this is a correctness/security update, not a throughput improvement. Full
-  remains the default durability mode, and no benchmark baseline is reset.
+- Statement rollback protection adds write bookkeeping, especially with WAL
+  disabled. The new paired driver makes that cost measurable, and local WAL-Off
+  diagnostic runs show the selected bookkeeping costs recovered after the
+  transaction-safety work. This is not a durable/default-mode throughput claim:
+  Full remains the default durability mode, the Full-mode paired runs were too
+  noisy to publish as a speedup, and no benchmark baseline is reset.
 
 ### Fixed
 
@@ -53,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transaction rollback preserves earlier successful in-memory writes with WAL
   disabled. Changing WAL mode during a transaction is deferred to its end.
 - Database handles with uncertain commit/recovery state refuse further work;
-  commit uncertainty is reported without implying it is safe to retry.
+  commit uncertainty is reported without implying it is safe to blindly retry
+  the same write.
 - TypeScript live tests obtain the port selected by the server, eliminating the
   separate free-port probe race.
 - The database comparison benchmark varies lookup/update keys and checks real
