@@ -252,46 +252,94 @@ struct HotPage {
 #[derive(Clone)]
 pub(crate) struct HeapStatementSnapshot {
     original_num_pages: u32,
-    before_pages: FxHashMap<u32, Page>,
+    before_pages: FxHashMap<u32, Box<Page>>,
     metadata: HeapStatementMetadataSnapshot,
+    last_before_page: Option<u32>,
+    last_metadata_page: Option<u32>,
 }
 
 #[derive(Clone)]
 struct HeapStatementMetadataSnapshot {
-    free_bytes: Vec<u16>,
-    free_buckets: Vec<Vec<u32>>,
-    bucket_of_page: Vec<u8>,
-    free_overflow_pages: Vec<u32>,
+    original_free_bytes_len: usize,
+    original_bucket_of_page_len: usize,
+    bucket_low_watermarks: [usize; FREE_BUCKETS],
+    page_originals: FxHashMap<u32, (u16, u8)>,
+    popped_bucket_originals: Vec<(u8, u32)>,
+    original_overflow_len: usize,
+    overflow_low_watermark: usize,
+    popped_overflow_originals: Vec<u32>,
+    overflow_full_original: Option<Vec<u32>>,
     heap_version: u16,
 }
 
 impl HeapStatementMetadataSnapshot {
-    fn empty() -> Self {
+    fn from_heap(heap: &HeapFile) -> Self {
+        let mut bucket_low_watermarks = [0; FREE_BUCKETS];
+        for (idx, bucket) in heap.free_buckets.iter().enumerate() {
+            bucket_low_watermarks[idx] = bucket.len();
+        }
+        let overflow_len = heap.free_overflow_pages.len();
         HeapStatementMetadataSnapshot {
-            free_bytes: Vec::new(),
-            free_buckets: empty_free_buckets(),
-            bucket_of_page: Vec::new(),
-            free_overflow_pages: Vec::new(),
+            original_free_bytes_len: heap.free_bytes.len(),
+            original_bucket_of_page_len: heap.bucket_of_page.len(),
+            bucket_low_watermarks,
+            page_originals: FxHashMap::default(),
+            popped_bucket_originals: Vec::new(),
+            original_overflow_len: overflow_len,
+            overflow_low_watermark: overflow_len,
+            popped_overflow_originals: Vec::new(),
+            overflow_full_original: None,
             heap_version: HEAP_FORMAT_VERSION,
+        }
+        .with_heap_version(heap.heap_version)
+    }
+
+    fn with_heap_version(mut self, heap_version: u16) -> Self {
+        self.heap_version = heap_version;
+        self
+    }
+
+    fn record_page_original(&mut self, page_id: u32, free: u16, bucket: u8) {
+        if (page_id as usize) < self.original_free_bytes_len {
+            self.page_originals.entry(page_id).or_insert((free, bucket));
         }
     }
 
-    fn clone_from_heap(&mut self, heap: &HeapFile) {
-        self.free_bytes.clone_from(&heap.free_bytes);
-        self.free_buckets.clone_from(&heap.free_buckets);
-        self.bucket_of_page.clone_from(&heap.bucket_of_page);
-        self.free_overflow_pages
-            .clone_from(&heap.free_overflow_pages);
-        self.heap_version = heap.heap_version;
+    fn record_bucket_pop(&mut self, bucket: usize, new_len: usize, page_id: u32) {
+        if new_len < self.bucket_low_watermarks[bucket] {
+            self.bucket_low_watermarks[bucket] = new_len;
+            self.popped_bucket_originals.push((bucket as u8, page_id));
+        }
+    }
+
+    fn record_overflow_pop(&mut self, new_len: usize, page_id: u32) {
+        if new_len < self.overflow_low_watermark {
+            self.overflow_low_watermark = new_len;
+            self.popped_overflow_originals.push(page_id);
+        }
+    }
+
+    fn ensure_overflow_full_original(&mut self, current: &[u32]) {
+        if self.overflow_full_original.is_some() {
+            return;
+        }
+        let prefix_len = self.overflow_low_watermark.min(current.len());
+        let mut original = Vec::with_capacity(self.original_overflow_len);
+        original.extend_from_slice(&current[..prefix_len]);
+        original.extend(self.popped_overflow_originals.iter().rev().copied());
+        original.truncate(self.original_overflow_len);
+        self.overflow_full_original = Some(original);
     }
 
     #[cfg(test)]
     fn capacity(&self) -> usize {
-        self.free_bytes.capacity()
-            + self.bucket_of_page.capacity()
-            + self.free_overflow_pages.capacity()
-            + self.free_buckets.capacity()
-            + self.free_buckets.iter().map(Vec::capacity).sum::<usize>()
+        self.page_originals.capacity()
+            + self.popped_bucket_originals.capacity()
+            + self.popped_overflow_originals.capacity()
+            + self
+                .overflow_full_original
+                .as_ref()
+                .map_or(0, Vec::capacity)
     }
 }
 
@@ -387,7 +435,6 @@ pub struct HeapFile {
     free_overflow_pages: Vec<u32>,
     heap_version: u16,
     statement_snapshot: Option<HeapStatementSnapshot>,
-    statement_snapshot_cache: Option<HeapStatementMetadataSnapshot>,
 }
 
 impl HeapFile {
@@ -413,7 +460,6 @@ impl HeapFile {
             free_overflow_pages: Vec::new(),
             heap_version: HEAP_FORMAT_VERSION,
             statement_snapshot: None,
-            statement_snapshot_cache: None,
         })
     }
 
@@ -524,7 +570,6 @@ impl HeapFile {
             free_overflow_pages: Vec::new(),
             heap_version,
             statement_snapshot: None,
-            statement_snapshot_cache: None,
         };
         for (page_id, free) in free_space_by_page {
             heap.note_free_bytes(page_id, free);
@@ -562,9 +607,7 @@ impl HeapFile {
 
     #[cfg(test)]
     pub(crate) fn cached_statement_snapshot_metadata_capacity(&self) -> Option<usize> {
-        self.statement_snapshot_cache
-            .as_ref()
-            .map(HeapStatementMetadataSnapshot::capacity)
+        None
     }
 
     #[cfg(test)]
@@ -594,6 +637,7 @@ impl HeapFile {
     /// compaction, and file it under the matching bucket. O(1): any earlier
     /// entry for the page is left where it is and skipped when it surfaces.
     fn note_free_bytes(&mut self, page_id: u32, free: usize) {
+        self.remember_free_metadata_before_change(page_id);
         let idx = page_id as usize;
         if idx >= self.free_bytes.len() {
             self.free_bytes.resize(idx + 1, 0);
@@ -629,6 +673,24 @@ impl HeapFile {
         self.note_free_bytes(page_id, updated as usize);
     }
 
+    fn remember_free_metadata_before_change(&mut self, page_id: u32) {
+        let Some(snapshot) = self.statement_snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.last_metadata_page == Some(page_id) {
+            return;
+        }
+        let idx = page_id as usize;
+        if idx < snapshot.metadata.original_free_bytes_len {
+            let free = self.free_bytes.get(idx).copied().unwrap_or_default();
+            let bucket = self.bucket_of_page.get(idx).copied().unwrap_or(NO_BUCKET);
+            snapshot
+                .metadata
+                .record_page_original(page_id, free, bucket);
+        }
+        snapshot.last_metadata_page = Some(page_id);
+    }
+
     /// Take a page the summary says is guaranteed to hold `need` bytes once
     /// compacted, removing it from the free list. Costs at most one look per
     /// bucket, so allocation does not get slower as the heap grows.
@@ -637,10 +699,18 @@ impl HeapFile {
         // bucket that certainly fits `need` is the one above it.
         for bucket in Self::free_bucket(need) + 1..FREE_BUCKETS {
             while let Some(page_id) = self.free_buckets[bucket].pop() {
+                if let Some(snapshot) = self.statement_snapshot.as_mut() {
+                    snapshot.metadata.record_bucket_pop(
+                        bucket,
+                        self.free_buckets[bucket].len(),
+                        page_id,
+                    );
+                }
                 let idx = page_id as usize;
                 if self.bucket_of_page.get(idx).copied() != Some(bucket as u8) {
                     continue;
                 }
+                self.remember_free_metadata_before_change(page_id);
                 self.bucket_of_page[idx] = NO_BUCKET;
                 return Some(page_id);
             }
@@ -943,6 +1013,11 @@ impl HeapFile {
     /// is torn down first — exactly as on the data-page allocation path.
     pub fn allocate_overflow_page(&mut self) -> io::Result<u32> {
         if let Some(pid) = self.free_overflow_pages.pop() {
+            if let Some(snapshot) = self.statement_snapshot.as_mut() {
+                snapshot
+                    .metadata
+                    .record_overflow_pop(self.free_overflow_pages.len(), pid);
+            }
             return Ok(pid);
         }
         self.disable_mmap();
@@ -1075,6 +1150,11 @@ impl HeapFile {
 
     /// Replay must mirror allocation even when an LSN guard skips the write.
     pub(crate) fn reserve_overflow_page(&mut self, page_id: u32) {
+        if let Some(snapshot) = self.statement_snapshot.as_mut() {
+            snapshot
+                .metadata
+                .ensure_overflow_full_original(&self.free_overflow_pages);
+        }
         self.free_overflow_pages.retain(|&free| free != page_id);
     }
 
@@ -1098,22 +1178,20 @@ impl HeapFile {
         if self.statement_snapshot.is_some() {
             return;
         }
-        let mut metadata = self
-            .statement_snapshot_cache
-            .take()
-            .unwrap_or_else(HeapStatementMetadataSnapshot::empty);
-        metadata.clone_from_heap(self);
         self.statement_snapshot = Some(HeapStatementSnapshot {
             original_num_pages: self.disk.num_pages(),
             before_pages: FxHashMap::default(),
-            metadata,
+            metadata: HeapStatementMetadataSnapshot::from_heap(self),
+            last_before_page: None,
+            last_metadata_page: None,
         });
     }
 
     pub(crate) fn commit_statement_snapshot(&mut self) {
         if let Some(snapshot) = self.statement_snapshot.take() {
-            self.dirty_budget.release(snapshot.before_pages.len());
-            self.statement_snapshot_cache = Some(snapshot.metadata);
+            let charged_before_pages = snapshot.before_pages.len();
+            drop(snapshot);
+            self.dirty_budget.release(charged_before_pages);
         }
     }
 
@@ -1121,18 +1199,27 @@ impl HeapFile {
         let Some(snapshot) = self.statement_snapshot.take() else {
             return Ok(false);
         };
-        let touched_pages: std::collections::HashSet<u32> =
-            snapshot.before_pages.keys().copied().collect();
+        let charged_before_pages = snapshot.before_pages.len();
+        let result = self.rollback_statement_snapshot_inner(snapshot);
+        self.dirty_budget.release(charged_before_pages);
+        result
+    }
+
+    fn rollback_statement_snapshot_inner(
+        &mut self,
+        snapshot: HeapStatementSnapshot,
+    ) -> io::Result<bool> {
         let original_num_pages = snapshot.original_num_pages;
         let drop_hot = self.hot_page.as_ref().is_some_and(|hot| {
-            hot.page_id >= original_num_pages || touched_pages.contains(&hot.page_id)
+            hot.page_id >= original_num_pages || snapshot.before_pages.contains_key(&hot.page_id)
         });
         if drop_hot {
             self.hot_page = None;
         }
         let before_buffered = self.dirty_buffer.len();
-        self.dirty_buffer
-            .retain(|page_id, _| *page_id < original_num_pages && !touched_pages.contains(page_id));
+        self.dirty_buffer.retain(|page_id, _| {
+            *page_id < original_num_pages && !snapshot.before_pages.contains_key(page_id)
+        });
         self.dirty_budget
             .release(before_buffered.saturating_sub(self.dirty_buffer.len()));
         self.disable_mmap();
@@ -1141,25 +1228,54 @@ impl HeapFile {
         }
         for (page_id, page) in &snapshot.before_pages {
             if *page_id < original_num_pages {
-                let mut page = page.clone();
+                let mut page = (**page).clone();
                 page.stamp_checksum();
-                self.disk.write_page(*page_id, page.as_bytes())?;
+                write_page_flushing(&mut self.disk, *page_id, page.as_bytes())?;
             }
         }
-        self.free_bytes = snapshot.metadata.free_bytes;
-        self.free_buckets = snapshot.metadata.free_buckets;
-        self.bucket_of_page = snapshot.metadata.bucket_of_page;
-        self.free_overflow_pages = snapshot.metadata.free_overflow_pages;
-        self.heap_version = snapshot.metadata.heap_version;
-        self.dirty_budget.release(snapshot.before_pages.len());
+        self.restore_statement_metadata(&snapshot.metadata);
         Ok(true)
+    }
+
+    fn restore_statement_metadata(&mut self, metadata: &HeapStatementMetadataSnapshot) {
+        self.free_bytes.truncate(metadata.original_free_bytes_len);
+        self.bucket_of_page
+            .truncate(metadata.original_bucket_of_page_len);
+        for (&page_id, &(free, bucket)) in &metadata.page_originals {
+            let idx = page_id as usize;
+            if idx < self.free_bytes.len() {
+                self.free_bytes[idx] = free;
+            }
+            if idx < self.bucket_of_page.len() {
+                self.bucket_of_page[idx] = bucket;
+            }
+        }
+        for bucket in 0..FREE_BUCKETS {
+            self.free_buckets[bucket].truncate(metadata.bucket_low_watermarks[bucket]);
+        }
+        for &(bucket, page_id) in metadata.popped_bucket_originals.iter().rev() {
+            self.free_buckets[bucket as usize].push(page_id);
+        }
+        if let Some(original) = &metadata.overflow_full_original {
+            self.free_overflow_pages.clone_from(original);
+        } else {
+            self.free_overflow_pages
+                .truncate(metadata.overflow_low_watermark);
+            self.free_overflow_pages
+                .extend(metadata.popped_overflow_originals.iter().rev().copied());
+        }
+        self.heap_version = metadata.heap_version;
     }
 
     fn remember_page_before_statement_write(&mut self, page_id: u32) -> io::Result<()> {
         let Some(snapshot) = self.statement_snapshot.as_mut() else {
             return Ok(());
         };
+        if snapshot.last_before_page == Some(page_id) {
+            return Ok(());
+        }
         if page_id >= snapshot.original_num_pages || snapshot.before_pages.contains_key(&page_id) {
+            snapshot.last_before_page = Some(page_id);
             return Ok(());
         }
         if !self.dirty_budget.try_charge_page() {
@@ -1184,9 +1300,16 @@ impl HeapFile {
                     return Err(error);
                 }
             };
-            Page::from_bytes_verified(&buf).map_err(io::Error::from)
+            match Page::from_bytes_verified(&buf) {
+                Ok(page) => Ok(page),
+                Err(error) => {
+                    self.dirty_budget.release(1);
+                    Err(io::Error::from(error))
+                }
+            }
         }?;
-        snapshot.before_pages.insert(page_id, before);
+        snapshot.before_pages.insert(page_id, Box::new(before));
+        snapshot.last_before_page = Some(page_id);
         Ok(())
     }
 
@@ -1718,43 +1841,51 @@ impl HeapFile {
         let mut count = 0u64;
         for page_id in 0..num_pages {
             self.ensure_hot(page_id)?;
-            self.remember_page_before_statement_write(page_id)?;
-            let mut released = 0usize;
+            if self
+                .hot_page
+                .as_ref()
+                .expect("ensure_hot guarantees Some")
+                .page
+                .is_overflow()
             {
-                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
-                // Overflow-chain pages carry value payload, not a slot
-                // directory — never walk them as rows.
-                if hot.page.is_overflow() {
-                    continue;
-                }
-                let slot_count = hot.page.slot_count();
-                for slot in 0..slot_count {
-                    // Scoped immutable borrow for the pred/hook invocation,
-                    // then a separate mutable call to `delete`. The borrow
-                    // checker is happy because each borrow ends inside the
-                    // same iteration.
-                    let matched_len = match hot.page.get(slot) {
-                        Some(bytes) if pred(bytes) => {
-                            hook(
-                                RowId {
-                                    page_id,
-                                    slot_index: slot,
-                                },
-                                bytes,
-                            );
-                            Some(bytes.len())
-                        }
+                continue;
+            }
+            let mut released = 0usize;
+            let slot_count = self
+                .hot_page
+                .as_ref()
+                .expect("ensure_hot guarantees Some")
+                .page
+                .slot_count();
+            for slot in 0..slot_count {
+                let matched_len = {
+                    let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
+                    match hot.page.get(slot) {
+                        Some(bytes) if pred(bytes) => Some(bytes.len()),
                         _ => None,
-                    };
-                    if let Some(len) = matched_len {
-                        hot.page.delete(slot);
-                        released += len;
-                        count += 1;
                     }
+                };
+                if let Some(len) = matched_len {
+                    self.remember_page_before_statement_write(page_id)?;
+                    let rid = RowId {
+                        page_id,
+                        slot_index: slot,
+                    };
+                    {
+                        let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
+                        if let Some(bytes) = hot.page.get(slot) {
+                            hook(rid, bytes);
+                        }
+                    }
+                    let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+                    hot.page.delete(slot);
+                    released += len;
+                    count += 1;
                 }
-                if released > 0 {
-                    hot.dirty = true;
-                }
+            }
+            if released > 0 {
+                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
+                hot.dirty = true;
             }
             if released > 0 {
                 self.adjust_free_bytes(page_id, released as i32);
@@ -1800,18 +1931,30 @@ impl HeapFile {
         let mut fallback: Vec<RowId> = Vec::new();
         for page_id in 0..num_pages {
             self.ensure_hot(page_id)?;
-            self.remember_page_before_statement_write(page_id)?;
-            let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
             // Skip overflow-chain pages (no slot directory to patch).
-            if hot.page.is_overflow() {
+            if self
+                .hot_page
+                .as_ref()
+                .expect("ensure_hot guarantees Some")
+                .page
+                .is_overflow()
+            {
                 continue;
             }
-            let slot_count = hot.page.slot_count();
+            let slot_count = self
+                .hot_page
+                .as_ref()
+                .expect("ensure_hot guarantees Some")
+                .page
+                .slot_count();
             let mut any_mutated = false;
             for slot in 0..slot_count {
-                let matches = match hot.page.get(slot) {
-                    Some(bytes) => pred(bytes),
-                    None => false,
+                let matches = {
+                    let hot = self.hot_page.as_ref().expect("ensure_hot guarantees Some");
+                    match hot.page.get(slot) {
+                        Some(bytes) => pred(bytes),
+                        None => false,
+                    }
                 };
                 if matches {
                     let rid = RowId {
@@ -1823,10 +1966,20 @@ impl HeapFile {
                     // spilled row (and Path-1 fixed patches write unconditionally).
                     // Route it to the fallback list so the caller re-applies the
                     // mutation through the reassembling update path.
-                    if hot.page.get(slot).map(row_is_v2).unwrap_or(false) {
+                    if self
+                        .hot_page
+                        .as_ref()
+                        .expect("ensure_hot guarantees Some")
+                        .page
+                        .get(slot)
+                        .map(row_is_v2)
+                        .unwrap_or(false)
+                    {
                         fallback.push(rid);
                         continue;
                     }
+                    self.remember_page_before_statement_write(page_id)?;
+                    let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
                     if let Some(bytes) = hot.page.slot_bytes_mut(slot) {
                         let old_len = bytes.len() as u16;
                         if let Some(new_len) = try_mutate(bytes) {
@@ -1846,6 +1999,7 @@ impl HeapFile {
                 }
             }
             if any_mutated {
+                let hot = self.hot_page.as_mut().expect("ensure_hot guarantees Some");
                 hot.dirty = true;
             }
         }
@@ -2693,6 +2847,362 @@ mod tests {
         let path = std::env::temp_dir().join(format!("powdb_heap_{name}_{}", std::process::id()));
         let heap = HeapFile::create(&path).unwrap();
         (heap, path)
+    }
+
+    #[test]
+    fn statement_snapshot_metadata_work_is_bounded_by_touched_pages() {
+        fn snapshot_capacity_after_first_write(rows: usize, name: &str) -> usize {
+            let (mut heap, path) = temp_heap(name);
+            let schema = user_schema();
+            let payload = "x".repeat(240);
+            for i in 0..rows {
+                let row = vec![
+                    Value::Str(format!("{payload}_{i:06}")),
+                    Value::Int(i as i64),
+                ];
+                heap.insert(&encode_row(&schema, &row)).unwrap();
+            }
+            heap.flush_all_dirty().unwrap();
+
+            heap.begin_statement_snapshot();
+            let row = vec![Value::Str("one changed row".into()), Value::Int(1)];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+            let capacity = heap
+                .statement_snapshot_metadata_capacity()
+                .expect("active snapshot records metadata work");
+            heap.rollback_statement_snapshot().unwrap();
+            drop(heap);
+            std::fs::remove_file(&path).ok();
+            capacity
+        }
+
+        let small = snapshot_capacity_after_first_write(32, "snapshot_small");
+        let large = snapshot_capacity_after_first_write(8_000, "snapshot_large");
+        assert!(
+            large <= small + 128,
+            "one-row snapshot metadata should stay bounded; small={small}, large={large}"
+        );
+    }
+
+    #[test]
+    fn zero_match_scan_patch_does_not_capture_pages() {
+        let (mut heap, path) = temp_heap("zero_match_scan_patch_snapshot");
+        let schema = user_schema();
+        for i in 0..1_000 {
+            let row = vec![Value::Str(format!("user_{i:06}")), Value::Int(i as i64)];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        heap.flush_all_dirty().unwrap();
+
+        heap.begin_statement_snapshot();
+        let (patched, fallback) = heap
+            .scan_patch_matching(
+                |_| false,
+                |bytes| Some(bytes.len() as u16),
+                |_rid, _bytes| {},
+            )
+            .unwrap();
+        assert_eq!(patched, 0);
+        assert!(fallback.is_empty());
+        assert_eq!(
+            heap.statement_snapshot_page_count(),
+            Some(0),
+            "a filtered update with no matches must not copy or charge table pages"
+        );
+        heap.rollback_statement_snapshot().unwrap();
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sparse_snapshot_restores_popped_bucket_state_exactly() {
+        let (mut heap, path) = temp_heap("bucket_snapshot_restore");
+        let bucket = HeapFile::free_bucket(512);
+        heap.free_bytes.resize(4, 0);
+        heap.bucket_of_page.resize(4, NO_BUCKET);
+        heap.free_bytes[1] = 512;
+        heap.bucket_of_page[1] = bucket as u8;
+        heap.free_bytes[2] = 512;
+        heap.bucket_of_page[2] = bucket as u8;
+        heap.free_buckets[bucket].push(1);
+        heap.free_buckets[bucket].push(2);
+
+        let original_buckets = heap.free_buckets.clone();
+        let original_free = heap.free_bytes.clone();
+        let original_bucket_of_page = heap.bucket_of_page.clone();
+
+        heap.begin_statement_snapshot();
+        assert_eq!(heap.take_free_page(256), Some(2));
+        heap.note_free_bytes(2, 0);
+        heap.note_free_bytes(3, 512);
+        assert_ne!(heap.free_buckets, original_buckets);
+
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(heap.free_buckets, original_buckets);
+        assert_eq!(heap.free_bytes, original_free);
+        assert_eq!(heap.bucket_of_page, original_bucket_of_page);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sparse_snapshot_bucket_undo_stays_bounded_under_mixed_churn() {
+        let (mut heap, path) = temp_heap("bucket_snapshot_mixed_churn");
+        let low_bucket = HeapFile::free_bucket(512);
+        let high_bucket = HeapFile::free_bucket(2_048);
+        heap.free_bytes.resize(16, 0);
+        heap.bucket_of_page.resize(16, NO_BUCKET);
+        // Page 4 is deliberately stale: it is present in `free_buckets`, but
+        // `bucket_of_page` says it is not currently filed there. Rollback must
+        // restore stale original entries too, because the stack is part of the
+        // allocator state.
+        for (page_id, bucket, free, filed) in [
+            (1, low_bucket, 512, true),
+            (2, low_bucket, 512, true),
+            (3, high_bucket, 2_048, true),
+            (4, low_bucket, 512, false),
+        ] {
+            heap.free_bytes[page_id] = free;
+            heap.bucket_of_page[page_id] = if filed { bucket as u8 } else { NO_BUCKET };
+            heap.free_buckets[bucket].push(page_id as u32);
+        }
+        let original_buckets = heap.free_buckets.clone();
+        let original_free = heap.free_bytes.clone();
+        let original_bucket_of_page = heap.bucket_of_page.clone();
+
+        heap.begin_statement_snapshot();
+        for i in 0..100 {
+            let new_page = 32 + (i % 4);
+            heap.note_free_bytes(new_page as u32, 2_048);
+            assert_eq!(heap.take_free_page(1_024), Some(new_page as u32));
+            heap.note_free_bytes(new_page as u32, 0);
+        }
+        assert_eq!(heap.take_free_page(256), Some(2));
+        assert_eq!(heap.take_free_page(256), Some(1));
+        assert_eq!(heap.take_free_page(1_024), Some(3));
+        {
+            let snapshot = heap.statement_snapshot.as_ref().unwrap();
+            assert!(
+                snapshot.metadata.page_originals.len() <= 3,
+                "metadata originals must dedupe touched original pages, got {:?}",
+                snapshot.metadata.page_originals
+            );
+            assert_eq!(
+                snapshot.metadata.popped_bucket_originals.len(),
+                4,
+                "only original popped entries, including stale originals, belong in the undo log"
+            );
+        }
+
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(heap.free_buckets, original_buckets);
+        assert_eq!(heap.free_bytes, original_free);
+        assert_eq!(heap.bucket_of_page, original_bucket_of_page);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn overflow_reserve_during_snapshot_restores_original_freelist() {
+        let (mut heap, path) = temp_heap("overflow_reserve_snapshot");
+        heap.free_overflow_pages = vec![2, 3, 4];
+        heap.begin_statement_snapshot();
+        assert_eq!(heap.allocate_overflow_page().unwrap(), 4);
+        heap.release_overflow_pages(&[9]);
+        heap.reserve_overflow_page(3);
+        assert_eq!(heap.free_overflow_pages, vec![2, 9]);
+
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(heap.free_overflow_pages, vec![2, 3, 4]);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn overflow_undo_stays_bounded_under_alloc_release_reserve_churn() {
+        let (mut heap, path) = temp_heap("overflow_snapshot_mixed_churn");
+        heap.free_overflow_pages = vec![10, 11, 12, 13];
+        let original = heap.free_overflow_pages.clone();
+
+        heap.begin_statement_snapshot();
+        for i in 0..100 {
+            heap.release_overflow_pages(&[100 + i]);
+            assert_eq!(heap.allocate_overflow_page().unwrap(), 100 + i);
+        }
+        assert_eq!(heap.allocate_overflow_page().unwrap(), 13);
+        assert_eq!(heap.allocate_overflow_page().unwrap(), 12);
+        heap.release_overflow_pages(&[200, 201]);
+        heap.reserve_overflow_page(11);
+        {
+            let snapshot = heap.statement_snapshot.as_ref().unwrap();
+            assert_eq!(
+                snapshot.metadata.popped_overflow_originals.len(),
+                2,
+                "transaction-only alloc/release churn must not grow the original-pop log"
+            );
+            assert!(
+                snapshot.metadata.overflow_full_original.is_some(),
+                "reserve during an active snapshot should take the bounded fallback"
+            );
+        }
+
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(heap.free_overflow_pages, original);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn failed_rollback_write_releases_before_page_charge() {
+        let (mut heap, path) = temp_heap("rollback_write_failure_releases");
+        let budget = Arc::new(DirtyPageBudget::default());
+        heap.set_dirty_budget(Arc::clone(&budget));
+        let schema = user_schema();
+        let rid = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("before".into()), Value::Int(1)],
+            ))
+            .unwrap();
+        heap.flush_all_dirty().unwrap();
+        assert_eq!(budget.charged_pages(), 0);
+
+        heap.begin_statement_snapshot();
+        heap.update(
+            rid,
+            &encode_row(&schema, &[Value::Str("after".into()), Value::Int(2)]),
+        )
+        .unwrap();
+        assert_eq!(heap.statement_snapshot_page_count(), Some(1));
+        assert!(budget.charged_pages() >= 1);
+
+        HEAP_WRITE_FAILPOINT.with(|failpoint| failpoint.set(Some(rid.page_id)));
+        let err = heap
+            .rollback_statement_snapshot()
+            .expect_err("injected rollback write failure must surface");
+        assert!(err.to_string().contains("injected write failure"));
+        assert_eq!(
+            budget.charged_pages(),
+            heap.dirty_page_count(),
+            "failed rollback must release before-image charges exactly once"
+        );
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn failed_before_page_crc_capture_releases_charge_without_entry() {
+        let (mut heap, path) = temp_heap("before_capture_crc_failure");
+        let budget = Arc::new(DirtyPageBudget::default());
+        heap.set_dirty_budget(Arc::clone(&budget));
+        let schema = user_schema();
+        let rid = heap
+            .insert(&encode_row(
+                &schema,
+                &[Value::Str("before".into()), Value::Int(1)],
+            ))
+            .unwrap();
+        heap.flush_all_dirty().unwrap();
+        let mut bytes = heap.disk.read_page(rid.page_id).unwrap();
+        bytes[crate::page::PAGE_HEADER_SIZE + 8] ^= 0x80;
+        heap.disk.write_page(rid.page_id, &bytes).unwrap();
+        heap.hot_page = None;
+
+        heap.begin_statement_snapshot();
+        let err = heap
+            .remember_page_before_statement_write(rid.page_id)
+            .expect_err("stale CRC must refuse the before-image capture");
+        assert!(
+            err.to_string().contains("CRC32 mismatch") || err.to_string().contains("corrupt"),
+            "expected a page-corruption error, got {err}"
+        );
+        assert_eq!(budget.charged_pages(), 0);
+        assert_eq!(heap.statement_snapshot_page_count(), Some(0));
+        heap.commit_statement_snapshot();
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn selective_scan_patch_and_delete_capture_only_touched_pages_under_small_budget() {
+        let (mut heap, path) = temp_heap("selective_scan_snapshot_budget");
+        let schema = user_schema();
+        for i in 0..1_000 {
+            let row = vec![Value::Str(format!("user_{i:06}")), Value::Int(i as i64)];
+            heap.insert(&encode_row(&schema, &row)).unwrap();
+        }
+        let overflow_page = heap.allocate_overflow_page().unwrap();
+        heap.write_overflow_page(
+            overflow_page,
+            crate::page::OVERFLOW_CHAIN_END,
+            b"skip-me",
+            0,
+        )
+        .unwrap();
+        heap.flush_all_dirty().unwrap();
+        let budget = Arc::new(DirtyPageBudget::new(2 * PAGE_SIZE));
+        budget.set_rollback_pinned(true);
+        heap.set_dirty_budget(Arc::clone(&budget));
+
+        heap.begin_statement_snapshot();
+        let (patched, fallback) = heap
+            .scan_patch_matching(
+                |bytes| decode_row(&schema, bytes)[1] == Value::Int(0),
+                |bytes| Some(bytes.len() as u16),
+                |_rid, _bytes| {},
+            )
+            .unwrap();
+        assert_eq!(patched, 1);
+        assert!(fallback.is_empty());
+        assert_eq!(
+            heap.statement_snapshot_page_count(),
+            Some(1),
+            "one-page filtered patch must not capture the whole heap"
+        );
+        assert!(
+            budget.charged_pages() <= 2,
+            "one before image plus one dirty page should fit under the small budget"
+        );
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(budget.charged_pages(), 0);
+
+        heap.begin_statement_snapshot();
+        let deleted = heap
+            .scan_delete_matching(
+                |bytes| decode_row(&schema, bytes)[1] == Value::Int(1),
+                |_rid, _bytes| {},
+            )
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            heap.statement_snapshot_page_count(),
+            Some(1),
+            "one-page filtered delete must not capture metadata or overflow pages"
+        );
+        heap.rollback_statement_snapshot().unwrap();
+        assert_eq!(budget.charged_pages(), 0);
+
+        heap.begin_statement_snapshot();
+        let deleted = heap
+            .scan_delete_matching(|_| false, |_rid, _bytes| {})
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            heap.statement_snapshot_page_count(),
+            Some(0),
+            "zero-match delete must not capture data, meta, or overflow pages"
+        );
+        heap.rollback_statement_snapshot().unwrap();
+        budget.set_rollback_pinned(false);
+
+        drop(heap);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

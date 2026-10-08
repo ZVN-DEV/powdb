@@ -451,13 +451,12 @@ fn wal_off_successful_statements_reuse_snapshot_metadata_without_retaining_befor
         0,
         "cleared 4KB before-page maps must not retain uncharged capacity"
     );
-    let cached_capacity = catalog
-        .table_by_slot(slot)
-        .cached_statement_snapshot_metadata_capacity()
-        .expect("successful Off commit should retain reusable metadata buffers");
-    assert!(
-        cached_capacity >= active_capacity,
-        "metadata cache should preserve reusable Vec capacity"
+    assert_eq!(
+        catalog
+            .table_by_slot(slot)
+            .cached_statement_snapshot_metadata_capacity(),
+        None,
+        "successful Off commit must not retain a whole-table metadata clone"
     );
 
     catalog.begin_statement_transaction().unwrap();
@@ -472,9 +471,9 @@ fn wal_off_successful_statements_reuse_snapshot_metadata_without_retaining_befor
         catalog
             .table_by_slot(slot)
             .statement_snapshot_metadata_capacity()
-            .expect("second Off statement should reuse cached metadata")
-            >= cached_capacity,
-        "second Off statement should start from cached metadata capacity"
+            .expect("second Off statement should track sparse metadata")
+            <= active_capacity + 8,
+        "second Off statement should keep sparse metadata work bounded"
     );
     catalog.rollback_to_last_sync().unwrap();
 }
