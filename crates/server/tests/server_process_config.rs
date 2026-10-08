@@ -18,16 +18,16 @@ use common::{
 use powdb_auth::UserStore;
 use powdb_server::protocol::Message;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
-/// Sequence number for unique TLS-startup-warning port files.
-static TLS_WARNING_PORT_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn next_tls_warning_port_file() -> std::path::PathBuf {
-    let seq = TLS_WARNING_PORT_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("powdb_tlswarn_{}_{}", std::process::id(), seq))
+fn new_tls_warning_port_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("powdb_tlswarn_")
+        .tempdir()
+        .expect("create tls warning tempdir");
+    let port_file = dir.path().join("port");
+    (dir, port_file)
 }
 
 /// Run the server binary to completion with `env` set, returning
@@ -260,18 +260,22 @@ fn write_certificate(dir: &std::path::Path, not_after: (i32, u8, u8)) -> (String
 }
 
 #[test]
-fn tls_warning_port_files_do_not_depend_on_clock_entropy() {
+fn tls_warning_port_files_live_in_owned_tempdirs() {
     let mut seen = std::collections::HashSet::new();
     for _ in 0..256 {
-        let path = next_tls_warning_port_file();
+        let (_dir, path) = new_tls_warning_port_file();
         assert!(seen.insert(path.clone()), "duplicate port file: {path:?}");
+        assert!(
+            !path.exists(),
+            "a readiness path must start absent so stale files cannot signal startup: {path:?}"
+        );
     }
 }
 
 /// Start the server, wait until it has bound, then stop it and return
 /// everything it wrote to stderr.
 fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> String {
-    let port_file = next_tls_warning_port_file();
+    let (_port_dir, port_file) = new_tls_warning_port_file();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_powdb-server"));
     cmd.args(["--data-dir", data_dir.to_str().unwrap()])
         .args(["--bind", "127.0.0.1", "--port", "0"])
