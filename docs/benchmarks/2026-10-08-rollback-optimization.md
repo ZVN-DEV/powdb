@@ -1,6 +1,6 @@
 # Statement rollback optimization — 2026-10-08
 
-**Status: local diagnostic improvement, not release performance clearance.**
+**Verdict: fixed optimization targets passed; full release gate still failed.**
 The existing failed-statement guarantees, dirty-page limits and benchmark
 thresholds are unchanged. This work targets avoidable WAL-Off rollback costs;
 it does not claim faster durable Full/Normal writes or competitive rankings.
@@ -87,9 +87,15 @@ Engine churn cases, the allocator regression, strict workspace Clippy,
 formatting, version consistency, testing-feature isolation, CI-needs
 completeness and the missing-docs ratchet pass. Independent review approved
 the final source with no findings. A frozen final-source, nonroot Linux
-Rust 1.95 workspace build and full test run passed: 2,742 tests, zero failures,
-five ignored across 208 test/doc-test targets. Fresh hosted CI and the native
-query testing-feature suite are still running.
+workspace build and full test run passed: 2,742 tests, zero failures,
+five ignored across 208 test/doc-test targets. The native query testing-feature
+suite also passed: 1,485 tests, zero failures, three ignored across 100 targets.
+[Hosted CI 37798779012](https://github.com/ZVN-DEV/powdb/actions/runs/37798779012)
+passed on `26e8280`, which contains the final production code. Required
+`ci-success` includes both OS test/lint jobs, MSRV, Miri shards, ASan,
+cross-version compatibility, release-profile corruption suites, package
+smokes and the remaining repository guards. Later changes in this tranche
+are benchmark evidence only and receive their own fresh CI run.
 
 ## Real tradeoffs
 
@@ -105,9 +111,71 @@ query testing-feature suite are still running.
 ## Unchanged Depot gate
 
 [Run 37798233522](https://github.com/ZVN-DEV/powdb/actions/runs/37798233522)
-compares the candidate with the safe engine above on the same instance. It
-also runs the unchanged absolute baseline check. Its verdict is pending;
+completed both suites and the comparator. Every same-instance workload passed
+its existing regression limit. The fixed >=50% growing-insert and >=25%
+filtered-update targets also passed, with no protected workload over +10%.
+The combined gate nevertheless **failed the unchanged absolute baseline**;
 this document grants no gate exception, baseline reset or release clearance.
+
+Runner `depot-ubuntu-24.04-4`, x86_64, Rust 1.99.0 (`b940084d7`, 2026-09-28),
+`RUSTFLAGS=-C target-cpu=x86-64-v2`. Both revisions use the same environment.
+These are Criterion medians, not the per-run arithmetic means above.
+
+| Hosted workload | Safe control | Optimized candidate | Lower cost |
+|---|---:|---:|---:|
+| Growing-table insert | 2,765 ns | 434 ns | 84.29% |
+| Filtered update | 2.628 ms | 1.659 ms | 36.88% |
+| Indexed update | 2,321 ns | 1,910 ns | 17.70% |
+| 1,000-row batch | 266.40 us | 224.21 us | 15.84% |
+| Filtered delete | 163.39 us | 136.14 us | 16.68% |
+
+The largest protected read increase is full-row filter +9.93%, just below its
+10% limit; it is not an improvement and needs attention in subsequent work.
+All four thesis-ratio checks pass, which does not override the absolute
+workload failures. Those failures are storage insert-10K +10.80%, full-row
+filter +12.86%, top-100 projection +12.96%, growing insert +82.19%, filtered
+update +55.34% and filtered delete +34.13% against the recorded baseline.
+That historical baseline has a different compiler; do not treat it as an
+identical same-instance causal comparison.
+
+[Raw hosted estimates and deltas](2026-10-08-rollback-depot-safe.json) preserve
+all 23 workloads, confidence intervals and other statistics. The growing
+insert fixture is nonstationary and inserts more rows for the faster engine;
+do not advertise its 434 ns median as fixed-table-size insert latency.
+
+A second unchanged run,
+[37798935336](https://github.com/ZVN-DEV/powdb/actions/runs/37798935336), compares
+the same production code (evidence-only head `26e8280`) with pinned original
+release control `9294a9a9bb0c8cda281e9de71655aceb3861aba7`. Both suites completed;
+the combined gate failed. Only three same-instance workload limits fail:
+
+| Remaining same-instance failure | Original release control | Candidate | Change | Limit |
+|---|---:|---:|---:|---:|
+| Growing-table insert | 276 ns | 417 ns | +50.91% | 10% |
+| Filtered update | 1.224 ms | 1.446 ms | +18.17% | 10% |
+| Filtered delete | 115.58 us | 129.49 us | +12.03% | 10% |
+
+Indexed update is +9.03% (1,824 -> 1,989 ns), within the 10% limit, and batches
+are -14.36%. Every read and storage workload passes the same-instance limit.
+The separate absolute check still fails top-100 projection, growing insert,
+indexed update, filtered update and filtered delete; all four thesis ratios
+pass. No check was disabled or threshold changed.
+[Raw original-release comparison](2026-10-08-rollback-depot-release.json)
+preserves all 23 workloads and estimates.
+
+The two candidate runs differ in timing (for example filtered updates 1.659
+versus 1.446 ms); compare each candidate only with its own same-instance
+control, not across jobs. Same-instance control reduces cross-machine noise
+but does not eliminate run-order, thermal or within-run variability.
+
+The original control does not have the same failed-statement contract. Before
+images, budget accounting and undo tracking buy that protection; this tranche
+removes demonstrated unnecessary copying. It does **not** prove the residual
+cost is unavoidable or assign an exact fraction to each safety mechanism.
+Next bounded work should profile the residual single-row snapshot/capture
+allocations (about 141 ns/iteration gap in this nonstationary run), then
+filtered mutation page-copy work. No correctness rollback or gate waiver is
+justified by this record.
 
 ```bash
 gh workflow run bench.yml --ref codex/powdb-rollback-performance \
