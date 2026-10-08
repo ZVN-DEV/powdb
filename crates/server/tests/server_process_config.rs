@@ -18,8 +18,17 @@ use common::{
 use powdb_auth::UserStore;
 use powdb_server::protocol::Message;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+
+/// Sequence number for unique TLS-startup-warning port files.
+static TLS_WARNING_PORT_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_tls_warning_port_file() -> std::path::PathBuf {
+    let seq = TLS_WARNING_PORT_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("powdb_tlswarn_{}_{}", std::process::id(), seq))
+}
 
 /// Run the server binary to completion with `env` set, returning
 /// `(exit code, stdout, stderr)`. Used for the paths that must refuse to
@@ -250,17 +259,19 @@ fn write_certificate(dir: &std::path::Path, not_after: (i32, u8, u8)) -> (String
     )
 }
 
+#[test]
+fn tls_warning_port_files_do_not_depend_on_clock_entropy() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        let path = next_tls_warning_port_file();
+        assert!(seen.insert(path.clone()), "duplicate port file: {path:?}");
+    }
+}
+
 /// Start the server, wait until it has bound, then stop it and return
 /// everything it wrote to stderr.
 fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> String {
-    let port_file = std::env::temp_dir().join(format!(
-        "powdb_tlswarn_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let port_file = next_tls_warning_port_file();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_powdb-server"));
     cmd.args(["--data-dir", data_dir.to_str().unwrap()])
         .args(["--bind", "127.0.0.1", "--port", "0"])
@@ -274,13 +285,25 @@ fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> Str
     let mut child = cmd.spawn().expect("spawn powdb-server");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !port_file.exists() {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
+        if let Ok(Some(status)) = child.try_wait() {
+            let out = child.wait_with_output().expect("wait powdb-server");
+            let _ = std::fs::remove_file(&port_file);
+            panic!(
+                "powdb-server exited before binding ({status}):\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("powdb-server never bound");
+            let out = child.wait_with_output().expect("wait powdb-server");
+            let _ = std::fs::remove_file(&port_file);
+            panic!(
+                "powdb-server never bound; port file was {}:\n{}{}",
+                port_file.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
