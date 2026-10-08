@@ -9,12 +9,14 @@ When cutting a release, follow the checklist at the bottom.
 > reconciled rather than blindly retried. Review the breaking migration notes in
 > `CHANGELOG.md`. Verification refuses live writers and pending WAL and never
 > repairs the source. The maintainer authorized this release with known WAL-Off
-> performance regressions: growing inserts +50.9%, filtered updates +18.2%, and
-> filtered deletes +12.0% versus the original same-instance control. These do not
+> performance regressions in final preflight: growing inserts +69.2%, indexed
+> updates +11.8%, filtered updates +25.3%, and filtered deletes +19.4% versus
+> the original same-instance control. These do not
 > pass the unchanged benchmark gate. The optimization itself reduced growing
 > insert cost by 84% and filtered updates by 37% against the already-safe engine;
 > it is not a durable/default-mode speed claim. See
-> [the complete measurements](docs/benchmarks/2026-10-08-rollback-optimization.md).
+> [final release measurements](docs/benchmarks/2026-10-08-final-release-gate.md)
+> and [optimization evidence](docs/benchmarks/2026-10-08-rollback-optimization.md).
 > Registry availability is confirmed by the release publishing and live-smoke
 > workflow runs; the release commit alone is not proof that every channel is live.
 

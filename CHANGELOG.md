@@ -46,10 +46,12 @@ the breaking migration notes below before upgrading.
   cost by 84% and filtered-update cost by 37% against the already-safe engine.
   This is not a durable/default-mode throughput claim: Full remains the default.
   The release retains known performance regressions against the original
-  control: growing inserts +50.9%, filtered updates +18.2%, filtered deletes
-  +12.0%. The benchmark gate remains failed; the maintainer authorized release
+  control in final preflight: growing inserts +69.2%, indexed updates +11.8%,
+  filtered updates +25.3%, filtered deletes +19.4%.
+  The benchmark gate remains failed; the maintainer authorized release
   with these disclosed limits. No benchmark baseline or threshold is reset.
-  See [full evidence and caveats](docs/benchmarks/2026-10-08-rollback-optimization.md).
+  See [final preflight evidence](docs/benchmarks/2026-10-08-final-release-gate.md)
+  and [optimization evidence](docs/benchmarks/2026-10-08-rollback-optimization.md).
 
 ### Fixed
 

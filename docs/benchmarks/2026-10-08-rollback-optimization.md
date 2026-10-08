@@ -185,6 +185,10 @@ WAL-Off regressions above documented in its changelog. This is a release
 decision, not performance clearance: the failed benchmark verdicts remain
 unchanged, residual cost is not proved unavoidable, and correctness CI,
 package validation and protected publishing approvals remain mandatory.
+The subsequent [final release preflight](2026-10-08-final-release-gate.md)
+records the integrated v0.29.0 build: four same-instance write failures remain
+and the release warning is updated to that run, without rewriting these earlier
+measurements.
 
 ```bash
 gh workflow run bench.yml --ref codex/powdb-rollback-performance \
