@@ -2064,7 +2064,7 @@ User filter .age < 18 delete returning
 
 PowDB supports explicit transactions with `begin`, `commit`, and `rollback`. Statements executed between `begin` and `commit` are applied atomically -- either all succeed or none do. Use `rollback` to discard uncommitted changes.
 
-**Failure handling (next release):** a failed statement in an explicit
+**Failure handling (since v0.29.0):** a failed statement in an explicit
 transaction aborts that transaction. Further queries and `commit` are refused
 until `rollback`; fix the cause and begin a new transaction. This includes
 parse/binding and read-query errors, not only writes. An aborted transaction

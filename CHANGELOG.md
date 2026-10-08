@@ -7,12 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.29.0] - Unreleased
+## [0.29.0] - 2026-10-08
 
-This is an untagged release candidate, not a published release. The update
-protects failed writes, adds offline integrity checks and restore drills, and
-makes performance comparisons reproducible. Review the breaking migration
-notes below before upgrading.
+This update protects failed writes, adds offline integrity checks and restore
+drills, and reduces the write overhead of the new rollback protection. Review
+the breaking migration notes below before upgrading.
 
 ### Added
 
@@ -22,14 +21,16 @@ notes below before upgrading.
   refuses live writers and pending WAL, and compares an original source
   read-only when `--compare-source` is used.
 - A paired performance driver with explicit control/candidate binaries,
-  equivalent Full-mode configuration, raw samples, result checks, and guards
+  explicit Full/WAL-Off profiles, raw samples, result checks, and guards
   for noisy or mismatched measurements.
 
 ### Changed
 
 - Full/Normal transactions no longer capture unused in-memory rollback
-  before-images; WAL recovery still owns their rollback. WAL-Off commits reuse
-  metadata buffers while releasing page-image storage and its budget charges.
+  before-images; WAL recovery still owns their rollback. WAL-Off statements
+  record only changed allocator state rather than copying table-wide metadata,
+  and filtered writes capture page images only before mutation. Page-image
+  storage and budget charges are released at transaction end and on errors.
 
 - **BREAKING (transaction error handling):** a failed statement now aborts an
   explicit transaction. Further work and COMMIT are refused until ROLLBACK;
@@ -41,11 +42,14 @@ notes below before upgrading.
   fields shared by inner and outer scopes are refused with alias guidance
   instead of silently selecting the inner column.
 - Statement rollback protection adds write bookkeeping, especially with WAL
-  disabled. The new paired driver makes that cost measurable, and local WAL-Off
-  diagnostic runs show the selected bookkeeping costs recovered after the
-  transaction-safety work. This is not a durable/default-mode throughput claim:
-  Full remains the default durability mode, the Full-mode paired runs were too
-  noisy to publish as a speedup, and no benchmark baseline is reset.
+  disabled. Same-instance hosted WAL-Off measurements reduce growing-insert
+  cost by 84% and filtered-update cost by 37% against the already-safe engine.
+  This is not a durable/default-mode throughput claim: Full remains the default.
+  The release retains known performance regressions against the original
+  control: growing inserts +50.9%, filtered updates +18.2%, filtered deletes
+  +12.0%. The benchmark gate remains failed; the maintainer authorized release
+  with these disclosed limits. No benchmark baseline or threshold is reset.
+  See [full evidence and caveats](docs/benchmarks/2026-10-08-rollback-optimization.md).
 
 ### Fixed
 
@@ -4023,7 +4027,9 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/ZVN-DEV/powdb/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/ZVN-DEV/powdb/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/ZVN-DEV/powdb/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...v0.25.0

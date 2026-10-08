@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-## 0.29.0 - Unreleased
+## 0.29.0 - 2026-10-08
 
-No sync package API changes are planned for 0.29.0. The package version and peer
+There are no sync package API changes in 0.29.0. The package version and peer
 pins move in lockstep with the engine, the wire client, and the embedded addon.
 
 Engine-side migration note: a failed statement inside an explicit transaction

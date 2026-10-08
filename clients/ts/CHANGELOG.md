@@ -2,11 +2,11 @@
 
 ## Unreleased
 
-## 0.29.0 - Unreleased
+## 0.29.0 - 2026-10-08
 
 ### Changed
 
-- No TypeScript client API changes are planned for this engine bump. Servers at
+- There are no TypeScript client API changes in this engine bump. Servers at
   0.29.0 can reject `COMMIT` after any failed statement in an explicit
   transaction; callers must `ROLLBACK` and start a new transaction instead of
   catching the statement error and continuing on the same handle.

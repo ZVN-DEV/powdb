@@ -1,7 +1,7 @@
 # Dependency security disposition — 2026-10-07
 
-This record applies to the source candidate for the next release, not to the
-already published v0.28.0 packages. Do not read a passing audit as a claim that
+This record covers dependencies in v0.29.0, not the older v0.28.0 packages.
+Do not read a passing audit as a claim that
 every upstream informational advisory has disappeared.
 
 ## Compatible fixes

@@ -175,7 +175,16 @@ cost is unavoidable or assign an exact fraction to each safety mechanism.
 Next bounded work should profile the residual single-row snapshot/capture
 allocations (about 141 ns/iteration gap in this nonstationary run), then
 filtered mutation page-copy work. No correctness rollback or gate waiver is
-justified by this record.
+justified by this record alone.
+
+### Maintainer release disposition — 2026-10-08
+
+After these results were disclosed, the maintainer explicitly requested merging
+and releasing the outstanding work. v0.29.0 therefore ships with the known
+WAL-Off regressions above documented in its changelog. This is a release
+decision, not performance clearance: the failed benchmark verdicts remain
+unchanged, residual cost is not proved unavoidable, and correctness CI,
+package validation and protected publishing approvals remain mandatory.
 
 ```bash
 gh workflow run bench.yml --ref codex/powdb-rollback-performance \
