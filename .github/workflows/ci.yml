@@ -2,7 +2,8 @@ name: ci
 
 on:
   pull_request:
-    branches: [main]
+    # Stacked changes target another codex branch before that parent merges.
+    branches: [main, "codex/**"]
   push:
     branches: [main]
 
@@ -471,6 +472,7 @@ jobs:
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:sync-live
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:eager
           npm exec --yes --package=pnpm@10.29.3 -- pnpm test:exec-script
+          npm exec --yes --package=pnpm@10.29.3 -- pnpm test:statement-atomicity
 
   node-addon:
     name: Node embedded addon (build + tests)
@@ -800,6 +802,9 @@ jobs:
 
       - name: Prove every comparator verdict is reachable
         run: bash scripts/ci/bench-gate-selftest.sh
+
+      - name: Prove paired evidence rejects unsafe conclusions
+        run: bash scripts/paired-bench.sh --selftest
 
   # A job that is not in ci-success's `needs:` blocks nothing. The comment on
   # that job asks contributors to keep the list current; this makes forgetting

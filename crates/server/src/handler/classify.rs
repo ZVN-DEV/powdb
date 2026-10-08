@@ -102,7 +102,10 @@ fn is_client_derived(e: &QueryError) -> bool {
         | QueryError::MemoryLimitExceeded { .. }
         | QueryError::ReadonlyMode
         | QueryError::Timeout { .. }
-        | QueryError::Cancelled => true,
+        | QueryError::Cancelled
+        | QueryError::TransactionAborted
+        | QueryError::EnginePoisoned
+        | QueryError::CommitOutcomeUnknown => true,
         // A storage refusal that kept its kind: the kind says whether the
         // message describes the caller's request or the server's disk.
         QueryError::Storage { kind, .. } => storage_message_is_client_derived(*kind),
@@ -153,7 +156,10 @@ pub(super) fn classify_query_error(e: &QueryError) -> ErrorClass {
         QueryError::Timeout { .. } => ErrorClass::Timeout,
         QueryError::Cancelled => ErrorClass::Cancelled,
         QueryError::ReadonlyMode => ErrorClass::ReadonlyRefused,
-        QueryError::ReadonlyNeedsWrite => ErrorClass::Internal,
+        QueryError::ReadonlyNeedsWrite
+        | QueryError::EnginePoisoned
+        | QueryError::CommitOutcomeUnknown => ErrorClass::Internal,
+        QueryError::TransactionAborted => ErrorClass::Execution,
         QueryError::JoinLimitExceeded
         | QueryError::NestedLoopPairLimitExceeded { .. }
         | QueryError::SortLimitExceeded

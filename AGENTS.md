@@ -12,7 +12,7 @@ PowDB is an embeddable database engine written from scratch in Rust. Its native 
 
 > Most of what a SQL engine does is *translate your query* into something executable. We remove that tier. PowQL is designed so the parser's AST **is already a plan tree**: no rewriting, no cost-based planning, no bytecode VM.
 
-The measurable result: 3-7x faster than SQLite on aggregate and scan workloads, and slower on indexed point lookups, where the front-end cost dominates the actual probe (measured 3.17us against SQLite's 202ns, roughly 16x; an earlier table published 1.65us/7.9x and the README documents the retraction). The current numbers, the methodology, and the workloads PowDB loses are in `docs/benchmarks/2026-07-24-wide-bench-snapshot.md`.
+The measurable result: published benchmarks favor aggregate and scan workloads, while indexed point operations are a weaker fit. The README and `docs/powdb-vs-sqlite.md` document the withdrawn repeated-key lookup/update ratios, current methodology, and the workloads PowDB loses.
 
 ### When PowDB is the right choice
 
@@ -88,7 +88,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | Traverse a to-many link | `User as u { u.name, posts: u.posts { title } }` | *(no SQL-frontend equivalent: one row per parent, children as a JSON array)* |
 | Nested projection | `User as u { u.name, posts: Post as p filter p.user_id = u.id { p.title } }` | *(no SQL-frontend equivalent)* |
 | IN subquery | `User filter .id in (Order filter .total > 100 { .user_id })` | `SELECT * FROM User WHERE id IN (SELECT user_id FROM Order WHERE total > 100)` |
-| EXISTS | `User filter exists (Order filter .user_id = .id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
+| EXISTS | `User as u filter exists (Order as o filter o.user_id = u.id)` | `SELECT * FROM User WHERE EXISTS (SELECT 1 FROM Order o WHERE o.user_id = User.id)` |
 | UNION | `A filter ... union B filter ...` | `SELECT ... UNION SELECT ...` |
 | NULL check | `User filter .age = null` / `.age != null` | `WHERE age IS NULL` / `IS NOT NULL` |
 | Update | `User filter .id = 1 update { age := 31 }` | `UPDATE User SET age = 31 WHERE id = 1` |
@@ -115,7 +115,7 @@ Compare SQL: `SELECT name, age FROM User WHERE age > 25 ORDER BY age DESC LIMIT 
 | `AND`, `OR`, `NOT` | `and`, `or`, `not` (lowercase) |
 | `User.posts` (bare link navigation) | alias the table and label the block: `User as u { posts: u.posts { title } }`; a to-one link reads inline: `Post as p { p.user.name }` |
 | `let x := ...` | not yet implemented |
-| `exists (Order filter .user_id = User.id)` (qualified outer reference) | `exists (Order filter .user_id = .id)`: inside `exists`, a bare `.col` reaches the outer row. `User.id` and the aliased `u.id` are both rejected |
+| `exists (Order filter .user_id = .id)` when both scopes have `id` | Use explicit aliases: `User as u filter exists (Order as o filter o.user_id = u.id)`. Ambiguous bare fields are rejected; a bare field absent from the inner schema may still refer to the outer row |
 | `(A filter ...) union (B filter ...)` (parenthesized branches) | `A filter ... union B filter ...`: a statement cannot start with `(` |
 | `count: count(.name)` (aggregate keyword as alias) | fails with `expected '(', got ':'`; `sum:` fails the same way; use `n:`, `cnt:`, `total:` |
 
@@ -230,13 +230,30 @@ The legacy `query()` and `querySql()` result shapes above remain unchanged.
 
 ## What's available vs. what's planned
 
-Available in released PowDB (v0.28.0): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), nested projections (PowQL-only shaped results: one row per parent with correlated children as a native JSON array, with per-parent `filter` / `order` / `limit` / `offset`), entity links (PowQL-only relationship traversal: `link Post.user -> User on user_id = id`, then `p.user.name` for a to-one hop or a labeled block `posts: u.posts { title }` for a to-many, with `schema links` / `describe <Type>` introspection and `drop link <Owner>.<name>` to remove one), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL, see `docs/SQL.md`).
+Available in released PowDB (v0.29.0): joins (inner/left/right/cross, compound-predicate hash joins + bounded nested loops), GROUP BY + HAVING, symmetric PowQL aggregates with `raw` opt-out, expression-valued aggregate/group/order keys, DISTINCT, UNION / UNION ALL, subqueries (IN, EXISTS, correlated), nested projections (PowQL-only shaped results: one row per parent with correlated children as a native JSON array, with per-parent `filter` / `order` / `limit` / `offset`), entity links (PowQL-only relationship traversal: `link Post.user -> User on user_id = id`, then `p.user.name` for a to-one hop or a labeled block `posts: u.posts { title }` for a to-many, with `schema links` / `describe <Type>` introspection and `drop link <Owner>.<name>` to remove one), CASE, LIKE, BETWEEN, IN-list, JSON paths and persistent path indexes, SQL `->` / `->>` JSON operators, window functions (ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/COUNT/MIN/MAX over partition), arithmetic, string/math/datetime scalars, CAST, COALESCE (`??`), materialized views with auto-refresh, upsert, multi-row INSERT, prepared queries with literal substitution, explicit transactions (`begin` / `commit` / `rollback`), concurrent autocommit reads, cooperative query cancellation, additive native typed wire results, password auth + multi-user auth (named users, admin/readwrite/readonly roles), TLS (`POWDB_TLS_CERT` / `POWDB_TLS_KEY`), WAL + crash recovery, persistent indexes, backup/restore (full/incremental/PITR, offline), SQL frontend (supported subset lowered to PowQL, see `docs/SQL.md`).
 
 Planned (design doc only, don't use): `let` bindings, UDFs, per-row permissions, replication.
 
 ---
 
 ## For contributors
+
+### Offline verification
+
+```bash
+powdb-cli verify --data-dir ./powdb_data --format json
+powdb-cli verify-backup ./backups/full --format json
+powdb-cli verify-backup ./backups/full --restore-drill-dir ./fresh-drill --compare-source ./powdb_data
+```
+
+These commands inspect quiescent data/full backups, refuse live writers and
+pending WAL, and report findings without repair or writable recovery of the
+source. Exit 0 means required checks completed without errors; exit 1 means
+findings/incomplete verification; exit 2 means bad usage. Reader-lock metadata
+may be published during the check; table/catalog files are not rewritten.
+Restore drills require a fresh empty destination. See `docs/offline-verification.md`.
+
+### Contributor checks
 
 Build: `cargo build --workspace`. Test: `cargo test --workspace`. Lint: `cargo clippy --workspace --all-targets -- -D warnings`. Format: `cargo fmt --all`.
 

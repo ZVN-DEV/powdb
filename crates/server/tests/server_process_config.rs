@@ -21,6 +21,15 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+fn new_tls_warning_port_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("powdb_tlswarn_")
+        .tempdir()
+        .expect("create tls warning tempdir");
+    let port_file = dir.path().join("port");
+    (dir, port_file)
+}
+
 /// Run the server binary to completion with `env` set, returning
 /// `(exit code, stdout, stderr)`. Used for the paths that must refuse to
 /// start, which return promptly on their own.
@@ -250,34 +259,55 @@ fn write_certificate(dir: &std::path::Path, not_after: (i32, u8, u8)) -> (String
     )
 }
 
+#[test]
+fn tls_warning_port_files_live_in_owned_tempdirs() {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        let (_dir, path) = new_tls_warning_port_file();
+        assert!(seen.insert(path.clone()), "duplicate port file: {path:?}");
+        assert!(
+            !path.exists(),
+            "a readiness path must start absent so stale files cannot signal startup: {path:?}"
+        );
+    }
+}
+
 /// Start the server, wait until it has bound, then stop it and return
 /// everything it wrote to stderr.
 fn stderr_of_a_short_run(data_dir: &std::path::Path, extra_args: &[&str]) -> String {
-    let port_file = std::env::temp_dir().join(format!(
-        "powdb_tlswarn_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let (_port_dir, port_file) = new_tls_warning_port_file();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_powdb-server"));
     cmd.args(["--data-dir", data_dir.to_str().unwrap()])
         .args(["--bind", "127.0.0.1", "--port", "0"])
         .args(["--port-file", port_file.to_str().unwrap()])
         .args(extra_args)
+        // These assertions inspect INFO startup fields regardless of the
+        // developer's log filter in the parent shell.
+        .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn powdb-server");
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !port_file.exists() {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
+        if let Ok(Some(status)) = child.try_wait() {
+            let out = child.wait_with_output().expect("wait powdb-server");
+            let _ = std::fs::remove_file(&port_file);
+            panic!(
+                "powdb-server exited before binding ({status}):\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("powdb-server never bound");
+            let out = child.wait_with_output().expect("wait powdb-server");
+            let _ = std::fs::remove_file(&port_file);
+            panic!(
+                "powdb-server never bound; port file was {}:\n{}{}",
+                port_file.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }

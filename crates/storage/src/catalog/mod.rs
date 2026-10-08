@@ -485,6 +485,16 @@ pub struct Catalog {
     /// explicit transaction that exceeds it is refused rather than allowed to
     /// grow the per-table dirty buffers until the process is OOM-killed.
     dirty_budget: Arc<DirtyPageBudget>,
+    /// True while a statement/transaction rollback memento is active inside
+    /// every table heap.
+    statement_snapshot_active: bool,
+    /// Set after commit/rollback uncertainty. The owning engine must refuse
+    /// later use; Drop must not checkpoint dirty state over the WAL.
+    sync_poisoned: bool,
+    /// Infallible legacy mode switches requested during an active transaction
+    /// are applied only after commit/rollback, so rollback semantics stay tied
+    /// to the mode that was active at BEGIN.
+    pending_wal_sync_mode: Option<WalSyncMode>,
 }
 
 impl Catalog {
@@ -533,6 +543,9 @@ impl Catalog {
             structure_generation: next_structure_generation(),
             read_only: false,
             dirty_budget: Arc::new(DirtyPageBudget::default()),
+            statement_snapshot_active: false,
+            sync_poisoned: false,
+            pending_wal_sync_mode: None,
         };
         cat.persist()?;
         Ok(cat)
@@ -674,6 +687,9 @@ impl Catalog {
             structure_generation: next_structure_generation(),
             read_only: false,
             dirty_budget,
+            statement_snapshot_active: false,
+            sync_poisoned: false,
+            pending_wal_sync_mode: None,
         };
         debug!(
             directory_catalog_version = active_catalog_version,
@@ -806,6 +822,9 @@ impl Catalog {
             structure_generation: next_structure_generation(),
             read_only: true,
             dirty_budget,
+            statement_snapshot_active: false,
+            sync_poisoned: false,
+            pending_wal_sync_mode: None,
         })
     }
 
@@ -1115,6 +1134,11 @@ impl Catalog {
                                 replay_page_ceiling,
                             )?;
                             let tbl = &mut self.tables[slot];
+                            // An earlier OverflowFree may have released this
+                            // page during replay. This record consumes it even
+                            // if its bytes are already on disk; otherwise the
+                            // next allocation can overwrite a live chain.
+                            tbl.heap.reserve_overflow_page(page_id);
                             if rec.lsn > 0 && tbl.heap.overflow_page_lsn(page_id) >= rec.lsn {
                                 skipped += 1;
                                 continue;
@@ -1555,6 +1579,76 @@ impl Catalog {
         id
     }
 
+    fn begin_rollback_memento_if_wal_off(&mut self) {
+        self.statement_snapshot_active = self.wal.is_off();
+    }
+
+    fn ensure_table_rollback_memento(&mut self, slot: usize) {
+        if self.statement_snapshot_active {
+            self.tables[slot].begin_statement_snapshot();
+        }
+    }
+
+    fn commit_rollback_memento(&mut self) {
+        if !self.statement_snapshot_active {
+            return;
+        }
+        for tbl in &mut self.tables {
+            tbl.commit_statement_snapshot();
+        }
+        self.statement_snapshot_active = false;
+    }
+
+    fn rollback_rollback_memento(&mut self) -> io::Result<()> {
+        if !self.statement_snapshot_active {
+            return Ok(());
+        }
+        for tbl in &mut self.tables {
+            tbl.rollback_statement_snapshot()?;
+        }
+        self.statement_snapshot_active = false;
+        Ok(())
+    }
+
+    /// Begin an implicit statement transaction without separately syncing its
+    /// BEGIN marker. The executor uses this after validation and
+    /// before the first data mutation so a failed statement has a storage
+    /// rollback boundary in every WAL mode, including `Off`.
+    pub fn begin_statement_transaction(&mut self) -> io::Result<()> {
+        if self.active_tx_id.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction is already active",
+            ));
+        }
+        // Only earlier committed statements own these pages. Relieve their
+        // pressure before pinning the new statement, leaving room for Off-mode
+        // before-images. Never truncate WAL here: sync readers may still need
+        // its history, and explicit transactions must retain their size bound.
+        let pressure_pages = (self.dirty_budget.limit_bytes() / crate::page::PAGE_SIZE / 2).max(1);
+        if self.dirty_budget.charged_pages() >= pressure_pages {
+            self.wal.sync_before_heap_flush()?;
+            self.flush_checkpoint_state()?;
+        }
+        let start_len = self.wal.synced_len()?;
+        let id = self.next_tx_id;
+        self.next_tx_id = self.next_tx_id.wrapping_add(1);
+        self.active_tx_id = Some(id);
+        self.dirty_budget.set_rollback_pinned(true);
+        self.tx_start_len = Some(start_len);
+        self.pending_autocommit_tx_ids.clear();
+        self.begin_rollback_memento_if_wal_off();
+        // Recovery accepts boundary-free logs for legacy compatibility. Even
+        // the first statement after a checkpoint must therefore carry BEGIN,
+        // or a crash before COMMIT could replay its uncommitted row records.
+        // Buffer it with the statement; unlike explicit BEGIN, do not fsync.
+        if let Err(error) = self.wal.append(id, WalRecordType::Begin, &[]) {
+            self.abandon_untrusted_state();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Begin a connection/session-scoped explicit transaction.
     pub fn begin_transaction(&mut self) -> io::Result<()> {
         if self.active_tx_id.is_some() {
@@ -1573,9 +1667,16 @@ impl Catalog {
         self.dirty_budget.set_rollback_pinned(true);
         self.tx_start_len = Some(start_len);
         self.pending_autocommit_tx_ids.clear();
+        self.begin_rollback_memento_if_wal_off();
         if !self.wal.is_off() {
-            self.wal.append(id, WalRecordType::Begin, &[])?;
-            self.wal.flush()?;
+            if let Err(error) = self
+                .wal
+                .append(id, WalRecordType::Begin, &[])
+                .and_then(|_| self.wal.flush())
+            {
+                self.abandon_untrusted_state();
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1597,6 +1698,8 @@ impl Catalog {
         for (slot, pages) in std::mem::take(&mut self.pending_free_overflow) {
             self.tables[slot].release_overflow_pages(&pages);
         }
+        self.commit_rollback_memento();
+        self.apply_pending_wal_sync_mode()?;
         Ok(())
     }
 
@@ -1746,7 +1849,22 @@ impl Catalog {
     /// **Never** call this with `Off` in production — a machine crash
     /// can lose any record written since the last `sync_wal` returned.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
+        if self.active_tx_id.is_some() {
+            self.pending_wal_sync_mode = Some(mode);
+            return;
+        }
         self.wal.set_sync_mode(mode);
+    }
+
+    fn apply_pending_wal_sync_mode(&mut self) -> io::Result<()> {
+        let Some(mode) = self.pending_wal_sync_mode.take() else {
+            return Ok(());
+        };
+        if let Some(ticket) = self.wal.take_durability_ticket() {
+            ticket.wait()?;
+        }
+        self.wal.set_sync_mode(mode);
+        Ok(())
     }
 
     /// Ceiling on unflushed heap pages held across every table, in bytes.
@@ -1788,6 +1906,16 @@ impl Catalog {
         self.wal.fsync_count()
     }
 
+    /// Testing-only: make this catalog's next WAL fsync fail.
+    ///
+    /// The hook is scoped to this WAL and self-disarms when it fires. It exists
+    /// only behind `powdb-storage/testing` (or this crate's unit tests), so
+    /// shipped builds have no fault-injection surface.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn inject_next_fsync_failure_for_testing(&self) {
+        self.wal.arm_fsync_failpoint();
+    }
+
     /// Discard in-memory mutations made since the last `sync_wal()` and
     /// restore the catalog to its on-disk state. Used by ROLLBACK to
     /// undo an in-progress transaction's changes.
@@ -1822,6 +1950,26 @@ impl Catalog {
         &mut self,
         mut archive: Option<WalArchiveCallback<'_>>,
     ) -> io::Result<()> {
+        if self.wal.is_off() {
+            if let Err(error) = self.rollback_rollback_memento() {
+                self.abandon_untrusted_state();
+                return Err(error);
+            }
+            self.dirty_budget.set_rollback_pinned(false);
+            self.pending_autocommit_tx_ids.clear();
+            self.pending_free_overflow.clear();
+            self.tx_start_len = None;
+            self.active_tx_id = None;
+            if let Err(error) = self
+                .wal
+                .discard_pending()
+                .and_then(|_| self.apply_pending_wal_sync_mode())
+            {
+                self.abandon_untrusted_state();
+                return Err(error);
+            }
+            return Ok(());
+        }
         let start_len = self.tx_start_len.unwrap_or(0);
         let prearchived = if let Some(archive) = archive.as_mut() {
             let records = self.wal.read_through_len(start_len)?;
@@ -1839,7 +1987,10 @@ impl Catalog {
                 let _ = self.wal.append(id, WalRecordType::Rollback, &[]);
             }
         }
-        self.wal.discard_and_truncate_to(start_len)?;
+        if let Err(error) = self.wal.discard_and_truncate_to(start_len) {
+            self.abandon_untrusted_state();
+            return Err(error);
+        }
 
         // Step 1: throw away every uncommitted in-memory write so the
         // upcoming Drop of `*self` has nothing dirty to flush. This covers
@@ -1859,18 +2010,32 @@ impl Catalog {
         // become file-visible before `sync_wal()`; truncating to the last
         // synced boundary prevents `open()` below from replaying rolled-back
         // transaction records.
-        self.wal.discard_pending()?;
+        if let Err(error) = self.wal.discard_pending() {
+            self.abandon_untrusted_state();
+            return Err(error);
+        }
         // Step 3: re-open the catalog from disk. The heap files on disk
         // still reflect the last checkpoint (pre-transaction state)
         // because we never flushed the transaction's dirty pages.
         let data_dir = self.data_dir.clone();
         let sync_mode = self.wal.sync_mode();
-        let mut restored = if prearchived {
+        let defer_sync = self.wal.defer_sync();
+        let wal_checkpoint_bytes = self.wal_checkpoint_bytes;
+        let wal_archive_hook_installed = self.wal_archive_hook_installed;
+        let auto_wal_archive = self.auto_wal_archive.clone();
+        let pending_wal_sync_mode = self.pending_wal_sync_mode;
+        let mut restored = match if prearchived {
             let mut already_archived = |_dir: &Path, _records: &[WalRecord]| Ok(());
             let archive: WalArchiveCallback<'_> = &mut already_archived;
-            Self::open_inner(&data_dir, Some(archive))?
+            Self::open_inner(&data_dir, Some(archive))
         } else {
-            Self::open_inner(&data_dir, archive)?
+            Self::open_inner(&data_dir, archive)
+        } {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.abandon_untrusted_state();
+                return Err(error);
+            }
         };
         // Row-only rollback reopens the catalog to discard dirty heap/index
         // state, but it does not change prepared-query metadata. Preserve the
@@ -1881,19 +2046,45 @@ impl Catalog {
             restored.structure_generation = self.structure_generation;
         }
         let dirty_budget_limit = self.dirty_budget.limit_bytes();
+        // The replacement may already have logged post-recovery overflow
+        // cleanup. Retire this handle without checkpointing: its Drop would
+        // truncate that shared WAL underneath the replacement's writer,
+        // leaving a stale file offset and corrupting the next append.
+        self.abandon_untrusted_state();
         *self = restored;
         self.wal.set_sync_mode(sync_mode);
+        self.wal.set_defer_sync(defer_sync);
+        self.wal_checkpoint_bytes = wal_checkpoint_bytes;
+        self.wal_archive_hook_installed = wal_archive_hook_installed;
+        self.auto_wal_archive = auto_wal_archive;
+        self.pending_wal_sync_mode = pending_wal_sync_mode;
         // The replacement catalog brought a fresh (unpinned, empty) budget;
         // carry the configured ceiling across, like the sync mode above.
         self.dirty_budget.set_limit_bytes(dirty_budget_limit);
+        if let Err(error) = self.apply_pending_wal_sync_mode() {
+            self.abandon_untrusted_state();
+            return Err(error);
+        }
         Ok(())
     }
 
     fn abandon_active_transaction_for_drop(&mut self) -> io::Result<()> {
+        if self.wal.is_off() {
+            self.rollback_rollback_memento()?;
+            self.dirty_budget.set_rollback_pinned(false);
+            self.pending_autocommit_tx_ids.clear();
+            self.pending_free_overflow.clear();
+            self.tx_start_len = None;
+            self.active_tx_id = None;
+            self.wal.discard_pending()?;
+            self.apply_pending_wal_sync_mode()?;
+            return Ok(());
+        }
         self.dirty_budget.set_rollback_pinned(false);
         for tbl in &mut self.tables {
             tbl.heap.discard_dirty();
         }
+        self.commit_rollback_memento();
         self.pending_autocommit_tx_ids.clear();
         let truncate_result = match self.tx_start_len.take() {
             Some(start_len) => self.wal.discard_and_truncate_to(start_len),
@@ -1901,6 +2092,31 @@ impl Catalog {
         };
         self.active_tx_id = None;
         truncate_result
+    }
+
+    /// Permanently poison this catalog handle after an uncertain durability or
+    /// rollback outcome. Dirty heap/index state is discarded and future Drop
+    /// skips checkpointing, but the WAL is left intact for reopen/recovery.
+    pub fn abandon_untrusted_state(&mut self) {
+        self.sync_poisoned = true;
+        self.dirty_budget.set_rollback_pinned(false);
+        for tbl in &mut self.tables {
+            tbl.heap.discard_dirty();
+            tbl.discard_dirty_indexes();
+            tbl.commit_statement_snapshot();
+        }
+        self.statement_snapshot_active = false;
+        self.pending_autocommit_tx_ids.clear();
+        self.pending_free_overflow.clear();
+        self.active_tx_id = None;
+        self.tx_start_len = None;
+        self.pending_wal_sync_mode = None;
+    }
+
+    /// Whether this handle has been poisoned after an uncertain sync/rollback
+    /// boundary and must no longer be used.
+    pub fn is_sync_poisoned(&self) -> bool {
+        self.sync_poisoned || self.wal.is_sync_poisoned()
     }
 
     /// Returns a reference to the data directory.
@@ -2001,6 +2217,7 @@ impl Catalog {
     /// colliding auto ids).
     pub fn assign_auto_columns(&mut self, table: &str, values: &mut [Value]) -> io::Result<()> {
         if let Some(&slot) = self.name_to_slot.get(table) {
+            self.ensure_table_rollback_memento(slot);
             self.tables[slot].assign_auto(values)?;
         }
         Ok(())
@@ -2213,9 +2430,12 @@ impl Catalog {
         // entire WAL pipeline is a no-op, so skip the per-row
         // `encode_row_into` allocation and `wal_log` call entirely.
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.insert(values);
+            let slot = self.slot_of(table)?;
+            self.ensure_table_rollback_memento(slot);
+            return self.tables[slot].insert(values);
         }
         let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
         let _ = self.tables[slot].preflight_insert(values)?;
         // Allocate the tx id up front: any overflow chains for a spilled row
         // must be logged under the SAME tx (and before the Insert record) so
@@ -2246,6 +2466,7 @@ impl Catalog {
     /// `Table::insert` and bypassed the WAL entirely, silently losing every
     /// prepared insert on a crash.
     pub fn insert_by_slot(&mut self, slot: usize, values: &Row) -> io::Result<RowId> {
+        self.ensure_table_rollback_memento(slot);
         if self.wal.is_off() {
             return self.tables[slot].insert(values);
         }
@@ -2295,6 +2516,7 @@ impl Catalog {
 
     pub fn delete(&mut self, table: &str, rid: RowId) -> io::Result<()> {
         let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
         // Capture the deleted row's overflow chain BEFORE the heap slot is
         // cleared, so it can be freed once safe (design 3.6). Empty for
         // inline-only tables (cheap `has_overflow_rows` check).
@@ -2334,6 +2556,7 @@ impl Catalog {
         // entire per-row payload loop — `wal.append` would no-op every
         // call but the `encode_wal_payload` Vec alloc would still run.
         let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
         // Gather every deleted row's overflow chain up front (empty and cheap
         // for inline-only tables) so the pages can be freed once safe.
         let old_pages = self.collect_overflow_pages(slot, rids)?;
@@ -2381,7 +2604,9 @@ impl Catalog {
     where
         P: FnMut(&[u8]) -> bool,
     {
-        self.by_name_mut(table)?.scan_delete_matching(pred)
+        let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
+        self.tables[slot].scan_delete_matching(pred)
     }
 
     /// WAL-logged variant of [`Self::scan_delete_matching`].
@@ -2404,7 +2629,9 @@ impl Catalog {
         // the no-WAL primitive — same single-pass scan, zero per-row
         // payload work.
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.scan_delete_matching(pred);
+            let slot = self.slot_of(table)?;
+            self.ensure_table_rollback_memento(slot);
+            return self.tables[slot].scan_delete_matching(pred);
         }
         // Resolve slot up front so we can split the borrow — the user
         // hook closes over `&mut self.wal`, which can't coexist with a
@@ -2413,6 +2640,7 @@ impl Catalog {
             .name_to_slot
             .get(table)
             .ok_or_else(|| table_not_found(table))?;
+        self.ensure_table_rollback_memento(slot);
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         // Split-borrow the catalog fields so the hook can write into
@@ -2467,16 +2695,15 @@ impl Catalog {
         M: FnMut(&mut [u8]) -> Option<u16>,
     {
         if self.wal.is_off() {
-            return self.by_name_mut(table)?.scan_patch_matching_with_hook(
-                pred,
-                try_mutate,
-                |_, _| {},
-            );
+            let slot = self.slot_of(table)?;
+            self.ensure_table_rollback_memento(slot);
+            return self.tables[slot].scan_patch_matching_with_hook(pred, try_mutate, |_, _| {});
         }
         let slot = *self
             .name_to_slot
             .get(table)
             .ok_or_else(|| table_not_found(table))?;
+        self.ensure_table_rollback_memento(slot);
         let tx_id = self.next_tx();
         let autocommit = self.active_tx_id.is_none();
         let Catalog { tables, wal, .. } = self;
@@ -2504,12 +2731,14 @@ impl Catalog {
         // construction.
         if self.wal.is_off() {
             let slot = self.slot_of(table)?;
+            self.ensure_table_rollback_memento(slot);
             let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
             let new_rid = self.tables[slot].update(rid, values)?;
             self.free_overflow_chain(slot, old_pages);
             return Ok(new_rid);
         }
         let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
         self.update_logged(slot, table, rid, values, None)
     }
 
@@ -2612,12 +2841,14 @@ impl Catalog {
         // path tens of thousands of times per iteration.
         if self.wal.is_off() {
             let slot = self.slot_of(table)?;
+            self.ensure_table_rollback_memento(slot);
             let old_pages = self.tables[slot].overflow_chain_pages_at(rid)?;
             let new_rid = self.tables[slot].update_hinted(rid, values, changed_col_indices)?;
             self.free_overflow_chain(slot, old_pages);
             return Ok(new_rid);
         }
         let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
         self.update_logged(slot, table, rid, values, changed_col_indices)
     }
 
@@ -2637,7 +2868,9 @@ impl Catalog {
     where
         F: FnOnce(&mut [u8]),
     {
-        self.by_name_mut(table)?.with_row_bytes_mut(rid, f)
+        let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
+        self.tables[slot].with_row_bytes_mut(rid, f)
     }
 
     /// WAL-logged variant of [`Self::with_row_bytes_mut`].
@@ -2662,6 +2895,7 @@ impl Catalog {
             .name_to_slot
             .get(table)
             .ok_or_else(|| table_not_found(table))?;
+        self.ensure_table_rollback_memento(slot);
         self.update_row_bytes_logged_by_slot(slot, rid, f)
     }
 
@@ -2679,6 +2913,7 @@ impl Catalog {
     where
         F: FnOnce(&mut [u8]),
     {
+        self.ensure_table_rollback_memento(slot);
         // Step 1: apply the mutation on the hot page. Failure here
         // (slot gone) short-circuits with Ok(false) — no WAL record.
         let tbl = &mut self.tables[slot];
@@ -2726,8 +2961,9 @@ impl Catalog {
         col_idx: usize,
         new_value: Option<&[u8]>,
     ) -> io::Result<bool> {
-        self.by_name_mut(table)?
-            .patch_var_col_in_place(rid, col_idx, new_value)
+        let slot = self.slot_of(table)?;
+        self.ensure_table_rollback_memento(slot);
+        self.tables[slot].patch_var_col_in_place(rid, col_idx, new_value)
     }
 
     /// WAL-logged variant of [`Self::patch_var_col_in_place`].
@@ -2746,6 +2982,7 @@ impl Catalog {
             .name_to_slot
             .get(table)
             .ok_or_else(|| table_not_found(table))?;
+        self.ensure_table_rollback_memento(slot);
         let tbl = &mut self.tables[slot];
         let ok = tbl.patch_var_col_in_place(rid, col_idx, new_value)?;
         if !ok {
@@ -3665,11 +3902,18 @@ impl Drop for Catalog {
         if self.read_only {
             return;
         }
+        if self.sync_poisoned {
+            return;
+        }
         if self.active_tx_id.is_some() {
+            let was_off = self.wal.is_off();
             if let Err(e) = self.abandon_active_transaction_for_drop() {
                 warn!(error = %e, "catalog drop active transaction cleanup failed");
+                return;
             }
-            return;
+            if !was_off {
+                return;
+            }
         }
         // Mission 2: best-effort clean shutdown. `checkpoint` flushes
         // every heap and truncates the WAL, which is what

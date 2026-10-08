@@ -194,6 +194,8 @@ These operate directly on `--data-dir` with no server running. See
 | Subcommand | Purpose |
 | --- | --- |
 | `backup <DEST> [--base <FULL>]` | Full or incremental (differential) snapshot |
+| `verify [--data-dir <DIR>]` | Offline verifier for a quiescent data directory |
+| `verify-backup <BKP> [--restore-drill-dir <DEST>] [--compare-source <DIR>]` | Validate a full backup manifest/files, optionally restore-drill and compare |
 | `restore <BKP> <DEST> [--apply <INC>]... [--sync-strip\|--sync-preserve\|--sync-fork]` | Rebuild a data dir, optionally chaining increments |
 | `sync-enable` | Create the sync identity so backups can bootstrap replicas |
 | `sync-bootstrap <BKP> <REPLICA_DIR> <REPLICA_ID>` | Restore a replica and publish its cursor |
@@ -208,10 +210,25 @@ The user-admin subcommands work before the first server start: `useradd`
 creates the data directory (owner-only, `0700`) if it does not exist yet, so
 provisioning a user can be the very first thing you do on a fresh install.
 
+### Verification reports
+
+`verify` exits 0 only when the data directory is clean and internally
+consistent. It refuses live writers and pending WAL, validates catalog/link/view
+metadata, heap checksums where present plus strict slot/row/overflow decoding,
+and checks index entry sets against reconstructed rows. `--format json` returns a stable
+`VerifyReport` object with `schema_version`, `target`, `ok`, `checks`,
+`warnings`, and `errors`; text output prints the same check rows for humans.
+
+`verify-backup` first validates `manifest.json` names, duplicates, required
+files, regular-file types, byte lengths, and streaming blake3 hashes before any
+restore-drill writes. It then opens the backup snapshot itself through the same
+database verifier. Restore drills require a fresh, empty, non-symlink
+destination.
+
 ## Exit codes
 
 | Code | Meaning |
 | --- | --- |
 | 0 | Success |
-| 1 | Runtime failure (query error, connection failure, backup failure) |
+| 1 | Runtime failure (query error, connection failure, backup/verification failure) |
 | 2 | Usage error (bad flag, missing argument) |

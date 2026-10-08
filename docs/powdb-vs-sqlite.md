@@ -3,13 +3,26 @@
 SQLite is the default embedded database for very good reasons: 25+ years of
 battle-testing, billions of deployments, and a SQL surface every tool on the
 planet understands. PowDB is a newer, pure-Rust embedded database built around
-a compiled query execution engine that delivers 3-7x speedups on aggregates
-and 1-3.7x on filtered scans, and loses to SQLite by roughly 16x on indexed
-point lookups. This guide is written so an evaluator can decide honestly
+a compiled query execution engine whose published measurements favor aggregate
+and filtered-scan workloads. Indexed point operations are a weaker fit; the old
+repeated-key ratios are withdrawn below. This guide helps an evaluator decide
 between the two.
 
 ## When to choose PowDB
 
+- **You want shaped, typed results directly from the engine.** PowQL can return
+  one row per parent with correlated children nested as a native value, so the
+  application does not have to undo join fan-out or parse JSON text back into
+  objects. The Rust API, TypeScript client, and Node addon all expose native
+  typed result paths for exact integers, booleans, bytes, datetimes, UUIDs, and
+  PJ1 JSON.
+- **You want named relationship traversal in the query language.** Declare
+  `link Order.user -> User on user_id = id` once, then read `o.user.name` or
+  `orders: u.orders { ... }` in PowQL. A scalar hop through a non-unique key is
+  refused as an error rather than silently multiplying rows.
+- **You store documents but still need scalar path indexes.** JSON is a binary
+  PJ1 value, and scalar paths can be filtered, grouped, ordered, aggregated, and
+  indexed with `alter Post add index (.data->slug)`.
 - **Your stack is pure Rust and you want to keep it that way.** PowDB's
   storage and query engines are 100% Rust with no `libsqlite3-sys`, no
   `bindgen`, and no C toolchain in the build path. The two *binaries* are the
@@ -26,8 +39,8 @@ between the two.
   the aggregates (`MIN`, `MAX`, `SUM`, `AVG`) and 3.7x on
   `scan + filter + count`. Other scan-shaped queries gain less: 2.6x on
   sort+limit, 2.0x on a multi-column AND filter, and nothing at all on a
-  small top-100 projection. It does not help point lookups, where SQLite
-  wins by roughly 16x.
+  small top-100 projection. These are historical measurements, not a universal
+  speed claim, and they do not establish an advantage for indexed point lookups.
 - **You are already on tokio.** `powdb-server` is async-native and wraps the
   engine in `Arc<RwLock<Engine>>` so parallel readers don't block each other.
   Note the boundary: there is no MVCC, so a writer (and especially a
@@ -35,9 +48,9 @@ between the two.
   readers for its lifetime. PowDB fits a single writer with many reads, not
   many concurrent clients sharing one read-write database; for that, use
   Postgres.
-- **You want to embed without a C toolchain.** Useful on Wasm-adjacent
-  targets, on minimal container images, and in environments where pulling
-  `cmake` into the build is friction.
+- **You want to embed without a C toolchain.** The Rust engine can be built
+  without C or `cmake` on supported Linux and macOS targets. This does not
+  imply Wasm support; the mmap storage path requires Unix facilities.
 - **You like the pipeline syntax.** PowQL reads left to right -- source,
   then operations, then projection. If that matches how you think about
   data, it cuts cognitive load. (Linked: [POWQL.md](POWQL.md).)
@@ -62,11 +75,13 @@ between the two.
 - **You're already shipping the C toolchain.** If your build already
   compiles `aws-lc`, `openssl`, or any other C dep, the
   `libsqlite3-sys` cost is zero.
-- **You want full MVCC, online backups, or any of the decade-of-features
-  SQLite has.** PowDB 0.4.5 shipped role-based users (admin / readwrite /
-  readonly) and offline full/incremental backup with coarse point-in-time
-  recovery, but there is still no MVCC and no *online* backup -- backups
-  require stopping the server.
+- **You need readers to coexist with a writer, or online backups.** SQLite
+  WAL mode provides snapshot isolation: readers keep seeing their snapshot
+  while a writer commits, though only one writer can run at a time.
+  PowDB's write-admission gate blocks readers during a write transaction.
+  PowDB 0.4.5 shipped role-based users (admin / readwrite / readonly) and
+  offline full/incremental backup with coarse point-in-time recovery, but
+  there is still no *online* backup -- backups require stopping the server.
 
 ## Side-by-side feature table
 
@@ -80,8 +95,8 @@ between the two.
 | Memory-mapped reads       | Yes (zero-syscall scan path)                         | Optional (`PRAGMA mmap_size`)                         |
 | Write-ahead log           | Yes (statement-boundary group commit)                | Yes (WAL mode)                                        |
 | Compiled predicates       | Yes (byte-level filters, plan cache w/ literal sub)  | Bytecode VM (VDBE)                                    |
-| MVCC                      | No (single-writer, parallel readers via RwLock)      | No (single-writer, WAL-mode readers don't block)      |
-| Joins                     | Nested-loop + hash (equi-join)                       | Nested-loop + merge + hash                            |
+| Read/write concurrency    | Parallel readers; exclusive writer gate, no MVCC    | One writer; WAL snapshot isolation lets readers coexist with the writer |
+| Joins                     | Nested-loop + hash (equi-join)                       | Nested-loop scans, accelerated by indexes             |
 | Window functions          | ROW_NUMBER, RANK, DENSE_RANK, SUM/AVG/MIN/MAX OVER   | Full set                                              |
 | Server mode               | Yes (binary wire protocol, TLS, auth)                | Not in core (extensions exist)                        |
 | Fuzz testing              | 9 cargo-fuzz targets (lexer, parser, roundtrip, SQL, PJ1, wire, WAL replay, execute, catalog open) | OSS-Fuzz, decades of corpora |
@@ -90,19 +105,23 @@ between the two.
 | On-disk format stability  | Pre-1.0, may shift                                   | Stable for decades                                    |
 | Production deployments    | Pre-1.0                                              | Billions                                              |
 
-The MVCC, fuzz testing, mmap, and WAL claims for SQLite are drawn from the
-SQLite docs (sqlite.org/wal.html, sqlite.org/testing.html). PowDB's are
+SQLite's behavior is documented in its official references for
+[isolation](https://www.sqlite.org/isolation.html),
+[join execution](https://www.sqlite.org/eqp.html),
+[WAL](https://www.sqlite.org/wal.html),
+[mmap](https://www.sqlite.org/mmap.html), and
+[testing](https://www.sqlite.org/testing.html). PowDB's implementations are
 visible in `crates/storage/src/wal.rs`, `crates/storage/src/heap.rs`, and
 `crates/query/fuzz/`.
 
 ## Benchmarks
 
-Numbers below are from `cargo run --release -p powdb-compare` against the
-same dataset (100K rows), with PowDB in `WalSyncMode::Off` and SQLite in
-`:memory:` -- neither engine fsyncs. This is the methodology
-disclosed in the project README. It favors both engines' in-memory paths
-equally; on-disk durable comparisons will move the numbers and are tracked
-separately.
+Numbers below are a historical snapshot from `cargo run --release -p
+powdb-compare` against the same dataset (100K rows), with PowDB in
+`WalSyncMode::Off` and SQLite in `:memory:` -- neither engine fsyncs. This
+isolates query-engine cost from durability cost; on-disk durable comparisons
+will move the numbers and are tracked separately. It is not a broad "fastest
+vs SQLite" claim.
 
 Median of 5 runs on an Apple M5 Max laptop (macOS 26.5.1, rustc 1.97.0),
 commit `e3dfa71`, measured 2026-08-15. **Laptop numbers, not CI numbers.**
@@ -114,18 +133,27 @@ Full methodology and per-run spread:
 | Aggregate MIN                       | 221 us   | 1.70 ms  | PowDB 7.7x faster      |
 | Aggregate MAX                       | 217 us   | 1.47 ms  | PowDB 6.8x faster      |
 | Aggregate SUM                       | 234 us   | 1.45 ms  | PowDB 6.2x faster      |
-| Update by primary key               | 60 ns    | 272 ns   | PowDB 4.5x faster      |
+| Update by primary key               | —        | —        | Withdrawn: repeated-key workload |
 | Aggregate AVG                       | 455 us   | 1.70 ms  | PowDB 3.7x faster      |
 | Scan + filter + count               | 380 us   | 1.40 ms  | PowDB 3.7x faster      |
-| Non-indexed point lookup            | 101 us   | 319 us   | PowDB 3.2x faster      |
+| Non-indexed point lookup            | —        | —        | Withdrawn: repeated-key workload |
 | Scan + filter + sort + limit 10     | 2.46 ms  | 6.41 ms  | PowDB 2.6x faster      |
 | Multi-column AND filter             | 1.58 ms  | 3.21 ms  | PowDB 2.0x faster      |
-| Update by filter (10K rows)         | 2.36 ms  | 4.54 ms  | PowDB 1.9x faster      |
+| Update by filter (10K rows)         | —        | —        | Withdrawn: repeated-value workload |
 | Insert single row                   | 380 ns   | 638 ns   | roughly tied           |
 | Scan + filter + project top 100     | 8.1 us  | 8.9 us  | roughly tied           |
 | Delete by filter (10K rows)         | 1.57 ms  | 1.75 ms  | roughly tied            |
 | Insert batch (1K rows)              | 242 ns   | 214 ns   | roughly tied            |
-| **Indexed point lookup**            | **3.17 us** | **202 ns** | **SQLite 15.7x faster** |
+| **Indexed point lookup**            | —        | —        | Withdrawn: repeated-key workload |
+
+**Correction (2026-09-19):** lookup and update rows from the older runner are
+withdrawn because they reused keys or values in ways that did not represent the
+corrected workloads. Details remain public in
+[the correction record](benchmarks/2026-09-19-benchmark-corrections.md). The
+next publishable comparison should come from the paired harness work: explicit
+baseline/candidate binaries, alternating run order, correctness checks outside
+timing, and raw samples. Until then, no new point-lookup or update ratios are
+claimed. PowDB's WAL-off mode writes no WAL, not merely no fsync.
 
 The wins are where the compiled-predicate engine is designed to win:
 aggregates, at 3.7-7.7x. The scan-shaped workloads are a weaker story than
@@ -137,16 +165,11 @@ change sign depending on what else the machine is doing, so read them as ties
 rather than as wins in either direction. An honest comparison should not
 pretend otherwise.
 
-**Read the point-lookup row before you decide.** PowDB is roughly 15x *slower*
-than SQLite at fetching one row by indexed id. Almost all of that 3.17 us is
-PowDB's own front end (lex, parse, canonicalize, plan-cache lookup); the
-B-tree probe underneath is tens of nanoseconds. SQLite pays roughly 202 ns
-end to end because a prepared statement amortizes its parser away. This gap
-has widened: it was published as 7.9x against an older engine, and five
-independent re-measurements of the current one, across two machines, landed
-from 10x to 20x, most of them above 15x. If your hot path is single-row fetches,
-that is the number that should decide this evaluation, and it points at
-SQLite.
+**Indexed point latency remains a reason to evaluate SQLite first.** Front-end
+and row-fetch costs matter when little scanning is needed. The old repeated-key
+ratios are withdrawn, not replaced by a new claim. Measure the varied-key
+workload on your hardware; scan throughput does not prove a point-lookup hot
+path.
 
 One caveat on the two insert rows. PowDB writes into a real temporary
 directory while SQLite runs in `:memory:`, so PowDB's insert numbers are
@@ -156,11 +179,9 @@ while every other row moved by under 2x, and SQLite's inserts did not move at
 all. The figures above are from an otherwise-idle machine; treat them as an
 upper bound on what a loaded host will give you.
 
-Two of these workloads used to be measured through a code path a user could
-not reach (the aggregates hand-built a plan node; the indexed point lookup
-called the B-tree directly), which is why previously published figures were
-40-60% higher and why the point lookup was previously, wrongly, reported as a
-3.0x win. That is fixed; see the snapshot doc for the before-and-after.
+Earlier benchmark history also includes a code-path correction: two workloads
+used to be measured through paths a user could not reach. That is fixed; see
+the snapshot doc and the 2026-09-19 correction record for the before-and-after.
 
 ### A note on durable writes
 
@@ -171,9 +192,12 @@ statement fsyncs the write-ahead log, so a single-row insert is
 fsync-bound -- on a real SSD that's roughly a few hundred autocommit
 inserts per second, comparable to SQLite in its default durable mode.
 The fix is the same on both engines: batch writes in a transaction.
-Wrapping inserts in `begin` / `commit` shares one fsync across the whole
-batch and runs ~50x faster on PowDB while staying fully durable. Bulk
-loads should always use a transaction -- see
+Wrapping inserts in `begin` / `commit` avoids a durability wait after every
+statement, but does not reduce the whole batch to one fsync: PowDB flushes
+and fsyncs every 64 WAL records and at commit. Each row is a record, so a
+5,000-row batch costs roughly 78 fsyncs instead of 5,000. This runs ~50x
+faster on the documented workload while staying fully durable. Bulk loads
+should always use a transaction -- see
 [Transactions](POWQL.md#transactions).
 
 Run it yourself:
@@ -188,7 +212,7 @@ Results land in `crates/compare/results.csv`.
 
 - **PowDB is pre-1.0.** New on-disk format versions appear across minor
   versions, though every release still reads everything earlier releases
-  wrote. Pin a version (`cargo install powdb-cli --version 0.28.0 --locked`)
+  wrote. Pin a version (`cargo install powdb-cli --version 0.29.0 --locked`)
   and expect to re-bench on upgrades until 1.0. What a minor version may and
   may not break is spelled out in [STABILITY.md](STABILITY.md); the
   version/magic mechanics are in [FORMAT.md](FORMAT.md).
@@ -199,6 +223,11 @@ Results land in `crates/compare/results.csv`.
   Embed it in a service that already speaks Rust, where the win on scans
   and aggregates compounds across the request path, and where the
   pure-Rust build chain matters. That is the workload PowDB is built for.
+- **No MVCC, live backup, Windows support, or full SQL.** PowDB has parallel
+  reads and a single write-admission gate, offline full/incremental backup with
+  coarse PITR, Linux/macOS support, and a supported SQL subset. SQLite has
+  snapshot isolation in WAL mode, online backup APIs, Windows support, and the
+  broader SQL/tooling ecosystem.
 
 If your evaluation lands somewhere in between, the honest answer is: ship
 SQLite, measure your bottleneck, and reach for PowDB if and when an

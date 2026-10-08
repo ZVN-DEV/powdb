@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-10-08
+
+This update protects failed writes, adds offline integrity checks and restore
+drills, and reduces the write overhead of the new rollback protection. Review
+the breaking migration notes below before upgrading.
+
+### Added
+
+- Offline `powdb-cli verify` and `verify-backup` commands with text/JSON reports,
+  strict heap/row/index checks, manifest validation, and optional restore drills
+  into a fresh empty directory. Verification never repairs or replays the source,
+  refuses live writers and pending WAL, and compares an original source
+  read-only when `--compare-source` is used.
+- A paired performance driver with explicit control/candidate binaries,
+  explicit Full/WAL-Off profiles, raw samples, result checks, and guards
+  for noisy or mismatched measurements.
+
+### Changed
+
+- Full/Normal transactions no longer capture unused in-memory rollback
+  before-images; WAL recovery still owns their rollback. WAL-Off statements
+  record only changed allocator state rather than copying table-wide metadata,
+  and filtered writes capture page images only before mutation. Page-image
+  storage and budget charges are released at transaction end and on errors.
+
+- **BREAKING (transaction error handling):** a failed statement now aborts an
+  explicit transaction. Further work and COMMIT are refused until ROLLBACK;
+  applications must not catch an error and continue the same transaction.
+- **BREAKING (Rust error matching):** `QueryError` adds `TransactionAborted`,
+  `EnginePoisoned`, and `CommitOutcomeUnknown`. Exhaustive downstream matches
+  must handle the new variants. Numeric wire error classes remain unchanged.
+- Correlated PowQL subqueries accept explicit outer aliases. Ambiguous bare
+  fields shared by inner and outer scopes are refused with alias guidance
+  instead of silently selecting the inner column.
+- Statement rollback protection adds write bookkeeping, especially with WAL
+  disabled. Same-instance hosted WAL-Off measurements reduce growing-insert
+  cost by 84% and filtered-update cost by 37% against the already-safe engine.
+  This is not a durable/default-mode throughput claim: Full remains the default.
+  The release retains known performance regressions against the original
+  control in final preflight: growing inserts +69.2%, indexed updates +11.8%,
+  filtered updates +25.3%, filtered deletes +19.4%.
+  The benchmark gate remains failed; the maintainer authorized release
+  with these disclosed limits. No benchmark baseline or threshold is reset.
+  See [final preflight evidence](docs/benchmarks/2026-10-08-final-release-gate.md)
+  and [optimization evidence](docs/benchmarks/2026-10-08-rollback-optimization.md).
+
+### Fixed
+
+- Small autocommit writes can continue when earlier committed pages fill the
+  dirty buffer. Pressure relief settles WAL durability before flushing those
+  pages, retains WAL history, and preserves the limit on individual statements
+  and explicit transactions.
+- Rolling back a spilled-value write no longer lets the retired catalog
+  truncate the replacement catalog's WAL. Repeated rollback/write sequences
+  now preserve subsequent writes instead of corrupting the log.
+- WAL replay removes reused overflow pages from its free list even when their
+  physical writes are already durable, preventing later inserts from
+  overwriting a committed row's out-of-line payload.
+- Autocommit data mutations use a statement rollback boundary, including
+  prepared execution, so a later constraint failure cannot leave a changed
+  prefix that subsequent queries or a graceful close commit.
+- Rejected materialized-view drops preserve view registration. Registry
+  persistence failures distinguish unpublished and published state, and a
+  registered view missing its backing table is refused on reopen.
+- Transaction rollback preserves earlier successful in-memory writes with WAL
+  disabled. Changing WAL mode during a transaction is deferred to its end.
+- Database handles with uncertain commit/recovery state refuse further work;
+  commit uncertainty is reported without implying it is safe to blindly retry
+  the same write.
+- TypeScript live tests obtain the port selected by the server, eliminating the
+  separate free-port probe race.
+- The database comparison benchmark varies lookup/update keys and checks real
+  mutation outcomes rather than repeatedly timing a same-value hot-key update.
+
+### Security
+
+- Updated rustls to 0.23.45 in the workspace and fuzz lockfiles to address
+  RUSTSEC-2026-0285 without changing the TLS wire protocol.
+- Updated the Node development dependency `js-yaml` and workspace `rand`
+  dependencies to patched compatible versions. The optional, unpublished MySQL
+  comparison tool's `lru` advisories remain visible; see the
+  [dependency disposition](docs/dependency-security.md).
+
 ## [0.28.0] - 2026-09-07
 
 ### Breaking
@@ -3946,7 +4029,9 @@ Initial release of PowDB — a from-scratch database engine with PowQL query lan
      `TS client x.y.z` headings are npm releases with no git tag, so they
      have no compare link. -->
 
-[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/ZVN-DEV/powdb/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/ZVN-DEV/powdb/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/ZVN-DEV/powdb/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/ZVN-DEV/powdb/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/ZVN-DEV/powdb/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/ZVN-DEV/powdb/compare/v0.24.0...v0.25.0

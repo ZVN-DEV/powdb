@@ -46,7 +46,7 @@ cargo run --release -p powdb-cli
 You should see:
 
 ```
-PowDB v0.28.0 — embedded mode
+PowDB v0.29.0 — embedded mode
 Data directory: ./powdb_data
 Type PowQL queries. Use Ctrl-D to exit. Type .help for commands.
 
@@ -93,7 +93,7 @@ type User created
 
 That's it. No `CREATE TABLE`, no column types in parentheses. Fields have a name and a type, separated by a colon.
 
-Supported types: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`.
+Supported types: `str`, `int`, `float`, `bool`, `datetime`, `uuid`, `bytes`, `json`.
 
 ---
 
@@ -477,9 +477,9 @@ cargo run --release -p powdb-cli -- --remote localhost:5433
 Output:
 
 ```
-PowDB v0.28.0 — remote mode
+PowDB v0.29.0 — remote mode
 Connecting to localhost:5433 ...
-Connected to db `default` (server v0.28.0, wire protocol v2)
+Connected to db `default` (server v0.29.0, wire protocol v2)
 Type PowQL queries. Use Ctrl-D to exit.
 
 powql>

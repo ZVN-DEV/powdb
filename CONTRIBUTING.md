@@ -39,6 +39,10 @@ cargo bench -p powdb-bench        # criterion benchmarks (24 benches, 22 gated w
 cargo run --release -p powdb-compare  # wide bench vs SQLite + Postgres (add --features mysql for MySQL)
 ```
 
+For deterministic mixed-write/rollback traces and exact seed replay commands,
+see [Recovery testing](docs/recovery-testing.md). A short corpus runs in normal
+workspace CI; the existing nightly/manual fuzz workflow runs the extended corpus.
+
 ## Project Structure
 
 ```
@@ -131,7 +135,7 @@ by `scripts/ci/check-ci-success-needs.sh`, so it cannot fall behind the workflow
 - **`fuzz-corpus-replay`**: deterministic single-pass replay of the checked-in fuzz corpus, so a reintroduced crash fails on the first PR rather than on some future night
 - **`release-profile-suites`**: the corruption and wire-corpus suites under the shipped `panic = "abort"` profile
 - **`bench-gate-selftest`**: proves the benchmark regression gate can still fail
-- **`testing-feature-guard`**: resolves every shipped artifact's normal and build feature graph and refuses `powdb-query/testing` (test-only executor instrumentation); `scripts/ci/testing-feature-guard.sh --selftest` proves the detector fires
+- **`testing-feature-guard`**: resolves every shipped artifact's normal and build feature graph and refuses `powdb-query/testing` (test-only executor instrumentation) and `powdb-storage/testing` (test-only WAL fault injection); `scripts/ci/testing-feature-guard.sh --selftest` proves both detectors fire
 - **`missing-docs-ratchet`**: each published library crate's count of undocumented public items must equal `scripts/ci/missing-docs-baseline.txt`, so public-API docs only ever tighten; `scripts/ci/missing-docs-ratchet.sh --selftest` proves the counter can see gaps
 - **`rustdoc`**: `cargo doc --workspace --no-deps --locked` with `RUSTDOCFLAGS=-D warnings`, default features only, so a broken or private intra-doc link in the public API docs fails the build instead of rendering as plain text on docs.rs
 - **`ci-needs-completeness`**: every job defined in `ci.yml` is required by `ci-success`, and every `needs:` entry names a job that exists
@@ -194,4 +198,3 @@ scripts/quality          # default fmt/check/clippy/test gate
 For release prep, also run `bash scripts/check-version-consistency.sh` so the
 Rust workspace version, publishable inter-crate dependency pins, TypeScript
 client metadata, changelog, and release notes stay in lockstep.
-

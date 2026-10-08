@@ -323,28 +323,43 @@ jobs:
       # by crates.io before the next dependent crate can be published. The
       # sleep gives the index time to propagate.
 
+      # Package unpublished interdependent crates together: separate dry runs
+      # cannot resolve the next-version dependency that was never uploaded.
+      - name: Validate all unpublished crates together (dry run)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          cargo publish --dry-run --locked \
+            -p powdb-storage -p powdb-auth -p powdb-query -p powdb-sync \
+            -p powdb-backup -p powdb-server -p powdb -p powdb-cli
+
       - name: Publish powdb-storage
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-storage "$VERSION" "$DRY_RUN"
 
       # powdb-auth is a leaf (argon2 etc., no powdb deps) but powdb-server
       # depends on it, so publish it before query/server to match RELEASES.md.
       - name: Publish powdb-auth
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-auth "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-query
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-query "$VERSION" "$DRY_RUN"
 
       # powdb-sync (experimental sync substrate) depends only on powdb-storage,
       # but backup/server/powdb/cli all depend on it, so it must precede them.
       - name: Publish powdb-sync
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-sync "$VERSION" "$DRY_RUN"
 
       # powdb-backup depends on storage+query+sync (all already published above)
       # and powdb-cli depends on backup, so it must precede the cli.
       - name: Publish powdb-backup
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-backup "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-server
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-server "$VERSION" "$DRY_RUN"
 
       # powdb (embedded facade) depends on powdb-query + powdb-storage (both
@@ -352,9 +367,11 @@ jobs:
       # (docs.rs/powdb) — the SQLite-shaped in-process front door — so it must be
       # released alongside the rest.
       - name: Publish powdb (embedded facade)
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb "$VERSION" "$DRY_RUN"
 
       - name: Publish powdb-cli
+        if: ${{ inputs.dry_run == false }}
         run: bash scripts/publish-crate.sh powdb-cli "$VERSION" "$DRY_RUN"
 
       - name: Summary

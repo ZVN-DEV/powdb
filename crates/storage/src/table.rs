@@ -136,6 +136,13 @@ pub struct Table {
     /// `auto_next_ready`.
     auto_next: Vec<i64>,
     auto_next_ready: bool,
+    statement_snapshot: Option<TableStatementSnapshot>,
+}
+
+#[derive(Clone)]
+struct TableStatementSnapshot {
+    auto_next: Vec<i64>,
+    auto_next_ready: bool,
 }
 
 /// The refusal for a duplicate key in a unique column index.
@@ -225,6 +232,7 @@ impl Table {
             auto_cols: Vec::new(),
             auto_next: Vec::new(),
             auto_next_ready: false,
+            statement_snapshot: None,
         })
     }
 
@@ -311,6 +319,7 @@ impl Table {
             auto_cols: Vec::new(),
             auto_next: Vec::new(),
             auto_next_ready: false,
+            statement_snapshot: None,
         };
 
         for meta in indexed_col_metas {
@@ -739,6 +748,53 @@ impl Table {
         self.auto_cols = auto_cols;
         // Force the counters to be recomputed from the current rows on next use.
         self.auto_next_ready = false;
+    }
+
+    pub(crate) fn begin_statement_snapshot(&mut self) {
+        if self.statement_snapshot.is_none() {
+            self.statement_snapshot = Some(TableStatementSnapshot {
+                auto_next: self.auto_next.clone(),
+                auto_next_ready: self.auto_next_ready,
+            });
+        }
+        self.heap.begin_statement_snapshot();
+    }
+
+    pub(crate) fn commit_statement_snapshot(&mut self) {
+        self.statement_snapshot = None;
+        self.heap.commit_statement_snapshot();
+    }
+
+    pub(crate) fn rollback_statement_snapshot(&mut self) -> io::Result<bool> {
+        if let Some(snapshot) = self.statement_snapshot.take() {
+            self.auto_next = snapshot.auto_next;
+            self.auto_next_ready = snapshot.auto_next_ready;
+        }
+        let heap_changed = self.heap.rollback_statement_snapshot()?;
+        if heap_changed {
+            self.rebuild_indexes_from_heap()?;
+        }
+        Ok(heap_changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_page_count(&self) -> Option<usize> {
+        self.heap.statement_snapshot_page_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.heap.statement_snapshot_metadata_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_metadata_capacity(&self) -> Option<usize> {
+        self.heap.cached_statement_snapshot_metadata_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_statement_snapshot_before_page_capacity(&self) -> usize {
+        self.heap.cached_statement_snapshot_before_page_capacity()
     }
 
     /// Whether this table has any `auto` column.

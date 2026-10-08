@@ -8,7 +8,7 @@ The baseline is a **full snapshot**: the whole database, all tables, in one oper
 
 ## Commands
 
-Two CLI subcommands handle both directions.
+Four CLI subcommands handle capture, restore, and verification.
 
 ### Back up
 
@@ -41,6 +41,38 @@ restored backup ./backups/2026-06-06 -> ./restored_data
 ```
 
 The destination must be a fresh or empty directory. Restore does not merge into a live database — see [Limitations](#limitations).
+
+### Verify a data directory
+
+`verify` opens a quiescent data directory read-only and checks that the on-disk image is safe to serve:
+
+```bash
+powdb-cli verify --data-dir ./powdb_data
+powdb-cli --format json verify --data-dir ./powdb_data
+```
+
+It refuses a live writer or pending committed WAL, validates heap page checksums where present plus strict page/slot layout, enumerates heap row IDs, decodes each row through strict `get(RowId)` overflow handling, checks column and expression index contents against reconstructed rows, validates link metadata references, and reports materialized views that are dirty as warnings (needs refresh, not corruption). It never repairs data.
+
+See [Offline verification](offline-verification.md) for report fields, exit codes, and restore-drill details.
+
+### Verify a backup
+
+`verify-backup` checks a full backup manifest, every referenced file, every catalog-referenced required heap/index file, and then the backup snapshot's database contents without writing a destination:
+
+```bash
+powdb-cli verify-backup ./backups/2026-06-06
+powdb-cli --format json verify-backup ./backups/2026-06-06
+```
+
+It rejects path traversal, duplicate manifest entries, omitted required heap/index files, symlinks, missing files, file length mismatches, and streaming blake3 hash mismatches before any restore writes happen. To rehearse recovery, add a fresh restore-drill destination:
+
+```bash
+powdb-cli verify-backup ./backups/2026-06-06 \
+  --restore-drill-dir ./restore-drill \
+  --compare-source ./powdb_data
+```
+
+The drill restores into the fresh directory, verifies the restored copy, and, when `--compare-source` is supplied, compares logical rows and index metadata against the source directory. The destination must be an empty real directory, not a symlink; PowDB will not overwrite an existing drill directory.
 
 ---
 
@@ -141,7 +173,7 @@ A backup deliberately leaves three things behind:
 - The writer lock (`LOCK`) and the `readers/` directory. They describe the process that took the backup and mean nothing in a restored copy.
 - The `.powdb-sync/` directory: replica cursors and retained replication segments. A restored directory therefore has no retained history of its own. That is deliberate for the replica-bootstrap flow, where the replica restores the snapshot and then catches up from the **primary's** retained history, which stays on the primary.
 
-The `manifest.json` records, for each copied file, its name, raw byte length, and blake3 hash. Nothing is compressed, so the length is the file's size on disk. Restore verifies the hash; the length is recorded for inspection, not as a second check. It also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable, the same number printed by `backup` (`at lsn 128` above).
+The `manifest.json` records, for each copied file, its name, raw byte length, and blake3 hash. Nothing is compressed, so the length is the file's size on disk. Restore and `verify-backup` verify both the length and the hash before trusting a file. The manifest also records a `source_lsn`: the page-LSN high-water mark the snapshot is consistent at. This is the log sequence number through which the backup's data is guaranteed durable, the same number printed by `backup` (`at lsn 128` above).
 
 ---
 
@@ -149,7 +181,7 @@ The `manifest.json` records, for each copied file, its name, raw byte length, an
 
 **Crash-consistent.** Backup calls the engine's `checkpoint()`, which flushes every dirty heap page and index to disk and truncates the WAL. The result is a clean-shutdown on-disk image — there is no partial or in-flight write to replay. Backup then copies those durable files. The checkpoint holds an exclusive borrow on the catalog, so writes are briefly quiesced while it runs.
 
-**Integrity-verified.** Every copied file is hashed with blake3 at backup time, and the hash and size are stored in `manifest.json`. On restore, PowDB re-hashes each file and compares it against the manifest **before writing it to the destination**. A tampered or corrupted backup fails with an integrity error and writes nothing usable:
+**Integrity-verified.** Every copied file is hashed with blake3 at backup time, and the hash and size are stored in `manifest.json`. On restore, PowDB checks each manifest name, refuses symlinks and traversal, verifies the file length, re-hashes each file, and compares it against the manifest **before writing it to the destination**. A tampered or corrupted backup fails with an integrity error and writes nothing usable:
 
 ```
 Error: restore failed: integrity check failed for users.heap: blake3 mismatch (backup is corrupt)
@@ -190,9 +222,10 @@ Full snapshots, incremental (differential) backups, and coarse point-in-time res
 
 - **Offline / single-writer only.** The target directory must not be open in a live `powdb-server` or another CLI while you back it up. Since v0.18.1 this is enforced, not merely advised: `backup` takes the writer lock first and refuses a directory another process holds (see [Back up](#back-up)). Online (serve-while-backing-up) snapshots are a future phase.
 - **Whole-database only.** Backup snapshots every table. There is no per-table backup.
-- **Restore is offline and needs a fresh destination.** Restore writes into a fresh or empty directory; it does not merge into a running database. If a restore fails partway, the destination may be left partial — discard it and restore again into a clean directory.
+- **Restore is offline and needs a fresh destination.** Restore writes into a fresh or empty real directory, never a symlink; it does not merge into a running database. If a restore fails partway, the destination may be left partial — discard it and restore again into a clean directory.
 - **Restore forward, not backward.** A backup is restorable by the release that wrote it and by any **later** release: a backup holds the same durable files a data directory holds, and every release reads every on-disk version an earlier release could write (the commitment and its deprecation mechanism are in [FORMAT.md](FORMAT.md#format-version-support-policy), and the promise a minor version makes is in [STABILITY.md](STABILITY.md)). What is *not* supported is restoring a **newer** backup with an **older** binary: an unrecognized catalog, heap, row, or WAL version fails loudly rather than being misread. The `manifest.json` carries its own `format_version` (currently 1) and refuses an unrecognized one outright.
-- **A corrupt page makes the database refuse to open, and restoring is the only recovery.** Opening a table verifies each page's checksum and fails closed, so a single corrupted page (bit rot, a torn write, a truncated file) fails the whole open with a `PageCorrupt` error rather than serving the remaining pages. There is no skip-corrupt-pages flag and no salvage tool: the recovery path is to restore the most recent good backup. This is deliberate, because the alternative under PowDB's crash-only design is a process abort that a supervisor restarts into forever, but it does mean a backup is your only recourse for a single bad page. Take backups accordingly, and rehearse a restore into a scratch directory rather than assuming a backup is good. Restore itself re-hashes every file against the manifest before writing, so a test restore is a real integrity check.
+- **A corrupt page makes the database refuse to open, and restoring is the only recovery.** Opening a table verifies each checksummed page and fails closed, so a single corrupted checksummed page (bit rot, a torn write, a truncated file) fails the whole open with a `PageCorrupt` error rather than serving the remaining pages. Legacy pages written before checksums shipped are still accepted without a checksum check; offline verification still validates their structural page/slot layout and row decoding. There is no skip-corrupt-pages flag and no salvage tool: the recovery path is to restore the most recent good backup. This is deliberate, because the alternative under PowDB's crash-only design is a process abort that a supervisor restarts into forever, but it does mean a backup is your only recourse for a single bad page. Take backups accordingly, and rehearse a restore into a scratch directory rather than assuming a backup is good. Restore itself re-hashes every file against the manifest before writing, so a test restore is a real integrity check.
+- **Verification is offline.** `verify` and `verify-backup --restore-drill-dir` are read-only with respect to the source table/catalog files, but they are not online consistency protocols. Taking the shared reader lock can create normal `readers/` administrative metadata; `verify-backup` removes an empty reader directory it created for the backup snapshot. `verify` refuses live writers and pending WAL rather than replaying or repairing them; run recovery with a normal read-write engine first, then verify the clean image.
 - **Coarse PITR only.** Point-in-time restore lands you at the state captured by an increment, so its granularity is your increment cadence. **Fine-grained (sub-increment) PITR** — replaying to an arbitrary instant via WAL archiving — and **cloud sync** are not in this release.
 
 The design for the upcoming incremental / PITR / cloud-sync phases lives in [`docs/design/2026-06-05-backup-pitr-sync-migrations-plan.md`](design/2026-06-05-backup-pitr-sync-migrations-plan.md).

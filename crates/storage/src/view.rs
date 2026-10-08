@@ -7,6 +7,57 @@ const VIEW_FILE: &str = crate::data_dir::VIEW_REGISTRY_FILE;
 const VIEW_MAGIC: &[u8; 4] = b"BVIW";
 const VIEW_VERSION: u16 = 1;
 
+#[cfg(test)]
+thread_local! {
+    static VIEW_PERSIST_FAIL_BEFORE_RENAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static VIEW_PERSIST_FAIL_AFTER_RENAME: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn take_view_persist_fail_before_rename() -> bool {
+    VIEW_PERSIST_FAIL_BEFORE_RENAME.with(|failpoint| {
+        let fail = failpoint.get();
+        failpoint.set(false);
+        fail
+    })
+}
+
+#[cfg(test)]
+fn take_view_persist_fail_after_rename() -> bool {
+    VIEW_PERSIST_FAIL_AFTER_RENAME.with(|failpoint| {
+        let fail = failpoint.get();
+        failpoint.set(false);
+        fail
+    })
+}
+
+struct ViewPersistError {
+    source: io::Error,
+    published: bool,
+}
+
+impl ViewPersistError {
+    fn before_publication(source: io::Error) -> Self {
+        Self {
+            source,
+            published: false,
+        }
+    }
+
+    fn after_publication(source: io::Error) -> Self {
+        Self {
+            source,
+            published: true,
+        }
+    }
+
+    fn into_io(self) -> io::Error {
+        self.source
+    }
+}
+
 /// Definition of a materialized view.
 #[derive(Debug, Clone)]
 pub struct ViewDef {
@@ -65,24 +116,29 @@ impl ViewRegistry {
                 format!("view '{}' already exists", def.name),
             ));
         }
+        let name = def.name.clone();
         self.insert_def(def);
-        self.persist()
+        if let Err(e) = self.persist_for_lifecycle() {
+            if !e.published {
+                self.remove_def(&name);
+            }
+            return Err(e.into_io());
+        }
+        Ok(())
     }
 
     /// Remove a view from the registry. Does NOT drop the backing table.
     pub fn unregister(&mut self, name: &str) -> io::Result<()> {
-        let def = self.views.remove(name).ok_or_else(|| {
+        let def = self.remove_def(name).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("view '{name}' not found"))
         })?;
-        for table in &def.depends_on {
-            if let Some(list) = self.deps.get_mut(table) {
-                list.retain(|v| v != name);
-                if list.is_empty() {
-                    self.deps.remove(table);
-                }
+        if let Err(e) = self.persist_for_lifecycle() {
+            if !e.published {
+                self.insert_def(def);
             }
+            return Err(e.into_io());
         }
-        self.persist()
+        Ok(())
     }
 
     /// Look up a view by name.
@@ -273,6 +329,43 @@ impl ViewRegistry {
         self.views.keys().map(|k| k.as_str()).collect()
     }
 
+    /// Validate that every registered materialized view still has its backing
+    /// table in the catalog.
+    ///
+    /// This is deliberately narrower than a full view-health check. A dirty
+    /// view, a view whose source table was dropped, or a normal table whose
+    /// name is absent from the registry can all be legitimate states handled
+    /// elsewhere. The split-brain state this catches is more fundamental:
+    /// `views.bin` says a name is a materialized view, but the catalog no
+    /// longer has the backing table that stores its rows. Opening such a
+    /// database as if it were healthy would turn a failed lifecycle operation
+    /// into a delayed, confusing query-time error.
+    pub fn validate_backing_tables(&self, catalog: &crate::catalog::Catalog) -> io::Result<()> {
+        let mut missing: Vec<&str> = self
+            .views
+            .keys()
+            .map(|name| name.as_str())
+            .filter(|name| catalog.schema(name).is_none())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} registers materialized view{} {} but the catalog has no backing table{}; \
+                 restore the missing table file/catalog entry from backup, or repair by \
+                 removing/recreating the view after taking an operator-approved copy of the \
+                 data directory",
+                self.data_dir.join(VIEW_FILE).display(),
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", "),
+                if missing.len() == 1 { "" } else { "s" }
+            ),
+        ))
+    }
+
     // ─── Internal ────────────────────────────────────────────────
 
     fn insert_def(&mut self, def: ViewDef) {
@@ -286,6 +379,19 @@ impl ViewRegistry {
         self.views.insert(name, def);
     }
 
+    fn remove_def(&mut self, name: &str) -> Option<ViewDef> {
+        let def = self.views.remove(name)?;
+        for table in &def.depends_on {
+            if let Some(list) = self.deps.get_mut(table) {
+                list.retain(|v| v != name);
+                if list.is_empty() {
+                    self.deps.remove(table);
+                }
+            }
+        }
+        Some(def)
+    }
+
     /// Durable write-temp-then-rename, matching `catalog.rs`.
     ///
     /// The directory fsync after the rename is load-bearing, not ceremony: the
@@ -295,12 +401,30 @@ impl ViewRegistry {
     /// written, acknowledged, and then not be there on the next open, which is
     /// exactly the stale-view bug this file exists to prevent.
     fn persist(&self) -> io::Result<()> {
+        self.persist_for_lifecycle()
+            .map_err(ViewPersistError::into_io)
+    }
+
+    fn persist_for_lifecycle(&self) -> Result<(), ViewPersistError> {
         let path = self.data_dir.join(VIEW_FILE);
         let tmp = self.data_dir.join(format!("{VIEW_FILE}.tmp"));
         let defs: Vec<&ViewDef> = self.views.values().collect();
-        write_view_file(&tmp, &defs)?;
-        fs::rename(&tmp, &path)?;
-        crate::catalog::sync_directory(&self.data_dir)?;
+        write_view_file(&tmp, &defs).map_err(ViewPersistError::before_publication)?;
+        #[cfg(test)]
+        if take_view_persist_fail_before_rename() {
+            return Err(ViewPersistError::before_publication(io::Error::other(
+                "injected view registry failure before rename",
+            )));
+        }
+        fs::rename(&tmp, &path).map_err(ViewPersistError::before_publication)?;
+        #[cfg(test)]
+        if take_view_persist_fail_after_rename() {
+            return Err(ViewPersistError::after_publication(io::Error::other(
+                "injected view registry failure after rename",
+            )));
+        }
+        crate::catalog::sync_directory(&self.data_dir)
+            .map_err(ViewPersistError::after_publication)?;
         Ok(())
     }
 }
@@ -465,11 +589,33 @@ fn read_str(buf: &[u8], pos: &mut usize) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
+    use crate::types::{ColumnDef, Schema, TypeId};
+
+    fn fail_next_view_persist_before_rename() {
+        VIEW_PERSIST_FAIL_BEFORE_RENAME.with(|failpoint| failpoint.set(true));
+    }
+
+    fn fail_next_view_persist_after_rename() {
+        VIEW_PERSIST_FAIL_AFTER_RENAME.with(|failpoint| failpoint.set(true));
+    }
 
     fn temp_registry(name: &str) -> ViewRegistry {
         let dir = std::env::temp_dir().join(format!("powdb_view_{name}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         ViewRegistry::new(&dir)
+    }
+
+    fn one_int_schema(name: &str) -> Schema {
+        Schema {
+            table_name: name.into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                type_id: TypeId::Int,
+                required: true,
+                position: 0,
+            }],
+        }
     }
 
     #[test]
@@ -649,6 +795,188 @@ mod tests {
         assert!(!reg.is_view("V1"));
         // Dependency map is cleaned up — marking T1 dirty doesn't panic
         reg.mark_dependents_dirty("T1").unwrap();
+    }
+
+    #[test]
+    fn register_rolls_back_memory_when_registry_persist_fails_before_rename() {
+        let mut reg = temp_registry("register_fail");
+        fail_next_view_persist_before_rename();
+        let error = reg
+            .register(ViewDef {
+                name: "V1".into(),
+                query: "T1".into(),
+                depends_on: vec!["T1".into()],
+                dirty: false,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected view registry failure before rename"),
+            "expected injected registry failure, got: {error}"
+        );
+        assert!(
+            !reg.is_view("V1"),
+            "a failed register must not leave an in-memory ghost view"
+        );
+        assert!(
+            !reg.data_dir.join(VIEW_FILE).exists(),
+            "a failed register before rename must not create views.bin"
+        );
+    }
+
+    #[test]
+    fn unregister_rolls_back_memory_when_registry_persist_fails_before_rename() {
+        let mut reg = temp_registry("unregister_fail");
+        reg.register(ViewDef {
+            name: "V1".into(),
+            query: "T1".into(),
+            depends_on: vec!["T1".into()],
+            dirty: false,
+        })
+        .unwrap();
+
+        fail_next_view_persist_before_rename();
+        let error = reg.unregister("V1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected view registry failure before rename"),
+            "expected injected registry failure, got: {error}"
+        );
+        assert!(
+            reg.is_view("V1"),
+            "a failed unregister must keep the in-memory registry aligned with disk"
+        );
+        reg.mark_dependents_dirty("T1").unwrap();
+        assert!(
+            reg.is_dirty("V1"),
+            "rollback must also restore dependency edges"
+        );
+
+        let reopened = ViewRegistry::open(&reg.data_dir).unwrap();
+        assert!(
+            reopened.is_view("V1"),
+            "the view must still be registered after reopening"
+        );
+    }
+
+    #[test]
+    fn register_keeps_published_memory_when_registry_sync_fails_after_rename() {
+        let mut reg = temp_registry("register_after_rename_fail");
+        fail_next_view_persist_after_rename();
+        let error = reg
+            .register(ViewDef {
+                name: "V1".into(),
+                query: "T1".into(),
+                depends_on: vec!["T1".into()],
+                dirty: false,
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected view registry failure after rename"),
+            "expected injected post-rename registry failure, got: {error}"
+        );
+        assert!(
+            reg.is_view("V1"),
+            "after rename, memory must keep the potentially published register state"
+        );
+        let reopened = ViewRegistry::open(&reg.data_dir).unwrap();
+        assert!(
+            reopened.is_view("V1"),
+            "the post-rename failure fixture publishes views.bin before returning the error"
+        );
+    }
+
+    #[test]
+    fn unregister_keeps_published_memory_when_registry_sync_fails_after_rename() {
+        let mut reg = temp_registry("unregister_after_rename_fail");
+        reg.register(ViewDef {
+            name: "V1".into(),
+            query: "T1".into(),
+            depends_on: vec!["T1".into()],
+            dirty: false,
+        })
+        .unwrap();
+
+        fail_next_view_persist_after_rename();
+        let error = reg.unregister("V1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected view registry failure after rename"),
+            "expected injected post-rename registry failure, got: {error}"
+        );
+        assert!(
+            !reg.is_view("V1"),
+            "after rename, memory must keep the potentially published unregister state"
+        );
+        let reopened = ViewRegistry::open(&reg.data_dir).unwrap();
+        assert!(
+            !reopened.is_view("V1"),
+            "the post-rename failure fixture publishes views.bin before returning the error"
+        );
+    }
+
+    #[test]
+    fn validate_backing_tables_accepts_dirty_views_and_normal_tables() {
+        let dir =
+            std::env::temp_dir().join(format!("powdb_view_validate_ok_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut catalog = Catalog::create(&dir).unwrap();
+        catalog.create_table(one_int_schema("Base")).unwrap();
+        catalog.create_table(one_int_schema("V")).unwrap();
+        catalog.create_table(one_int_schema("Ordinary")).unwrap();
+
+        let mut reg = ViewRegistry::new(&dir);
+        reg.register(ViewDef {
+            name: "V".into(),
+            query: "MissingSource { .id }".into(),
+            depends_on: vec!["MissingSource".into()],
+            dirty: true,
+        })
+        .unwrap();
+
+        reg.validate_backing_tables(&catalog)
+            .expect("dirty views and ordinary non-view tables are not backing-table damage");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_backing_tables_rejects_registered_view_without_backing_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "powdb_view_validate_missing_{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut catalog = Catalog::create(&dir).unwrap();
+        catalog.create_table(one_int_schema("Base")).unwrap();
+
+        let mut reg = ViewRegistry::new(&dir);
+        reg.register(ViewDef {
+            name: "V".into(),
+            query: "Base { .id }".into(),
+            depends_on: vec!["Base".into()],
+            dirty: false,
+        })
+        .unwrap();
+
+        let error = reg.validate_backing_tables(&catalog).unwrap_err();
+        let message = error.to_string();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            message.contains("views.bin")
+                && message.contains("materialized view V")
+                && message.contains("no backing table")
+                && message.contains("restore")
+                && message.contains("recreating the view"),
+            "missing backing table error must be actionable, got: {message}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

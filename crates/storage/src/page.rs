@@ -794,6 +794,89 @@ pub fn slot_count_from_page(page_bytes: &[u8]) -> u16 {
     raw.min(MAX_SLOT_COUNT)
 }
 
+/// Verify the structural invariants of a raw page image that are deliberately
+/// skipped by the hot scan helpers. In particular, a corrupt data page can
+/// keep a valid CRC while pointing a live slot outside the row region; the
+/// scan iterator skips that slot for safety, but offline verification must
+/// fail closed instead of treating the skipped row as absence.
+pub fn verify_page_layout_bytes(page_bytes: &[u8]) -> crate::error::Result<()> {
+    Page::verify_bytes(page_bytes)?;
+    let page_type = PageType::from_u8(page_bytes[4]).ok_or_else(|| {
+        crate::error::StorageError::PageCorrupt(format!("invalid page type byte {}", page_bytes[4]))
+    })?;
+    if page_type != PageType::Data {
+        return Ok(());
+    }
+
+    let header_lower = if page_bytes[5] & FLAG_HAS_CHECKSUM != 0 {
+        PAGE_HEADER_SIZE
+    } else {
+        LEGACY_HEADER_SIZE
+    };
+    let free_start = u16::from_le_bytes(
+        page_bytes[6..8]
+            .try_into()
+            .expect("free_start: 2-byte slice"),
+    ) as usize;
+    if !(header_lower..=PAGE_SIZE - SLOT_COUNT_SIZE).contains(&free_start) {
+        return Err(crate::error::StorageError::PageCorrupt(format!(
+            "data page free_start {free_start} outside valid range {header_lower}..={}",
+            PAGE_SIZE - SLOT_COUNT_SIZE
+        )));
+    }
+
+    let raw_slot_count = u16::from_le_bytes(
+        page_bytes[PAGE_SIZE - 2..PAGE_SIZE]
+            .try_into()
+            .expect("slot_count: 2-byte slice"),
+    );
+    if raw_slot_count > MAX_SLOT_COUNT {
+        return Err(crate::error::StorageError::PageCorrupt(format!(
+            "data page slot_count {raw_slot_count} exceeds maximum {MAX_SLOT_COUNT}"
+        )));
+    }
+    let dir_start = PAGE_SIZE - SLOT_COUNT_SIZE - (raw_slot_count as usize * SLOT_ENTRY_SIZE);
+    if dir_start < header_lower || free_start > dir_start {
+        return Err(crate::error::StorageError::PageCorrupt(format!(
+            "data page row region/free space overlaps slot directory: free_start {free_start}, dir_start {dir_start}"
+        )));
+    }
+
+    let mut live_ranges: Vec<(usize, usize, u16)> = Vec::new();
+    for slot in 0..raw_slot_count {
+        let (offset, length) = read_slot_entry_from_bytes(page_bytes, slot).ok_or_else(|| {
+            crate::error::StorageError::PageCorrupt(format!(
+                "slot {slot} directory entry lies outside page"
+            ))
+        })?;
+        if length == DELETED_MARKER {
+            continue;
+        }
+        let (start, end) = slot_data_range(offset, length).ok_or_else(|| {
+            crate::error::StorageError::PageCorrupt(format!(
+                "slot {slot} points outside page: offset {offset}, length {length}"
+            ))
+        })?;
+        if start < header_lower || end > free_start {
+            return Err(crate::error::StorageError::PageCorrupt(format!(
+                "slot {slot} points outside live row region: {start}..{end}, valid {header_lower}..{free_start}"
+            )));
+        }
+        live_ranges.push((start, end, slot));
+    }
+    live_ranges.sort_by_key(|(start, _, _)| *start);
+    for pair in live_ranges.windows(2) {
+        let (_, prev_end, prev_slot) = pair[0];
+        let (next_start, _, next_slot) = pair[1];
+        if prev_end > next_start {
+            return Err(crate::error::StorageError::PageCorrupt(format!(
+                "live slots {prev_slot} and {next_slot} overlap in data page"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn page_lsn(page_bytes: &[u8]) -> u64 {
     u64::from_le_bytes(

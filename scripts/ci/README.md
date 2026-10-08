@@ -23,13 +23,20 @@ exist and passed for months.
 | `semver-advisory.sh` | that a 0.x minor bump still gets a semver verdict: findings never block, but cargo-semver-checks failing to RUN does, because `semver-gate.sh` lints nothing on that bump shape by design | point `SEMVER_CHECKS` at a stub that exits 101 (`printf '#!/bin/sh\nexit 101\n' > /tmp/s.sh; chmod +x /tmp/s.sh; SEMVER_CHECKS=/tmp/s.sh bash scripts/ci/semver-advisory.sh`). For the selftest, swap the script's `set +e` for `set -e`: case 1 then fails because the step exited 1 with an empty summary |
 | `check-dependabot-coverage.sh` | every tracked dependency manifest is watched by `.github/dependabot.yml`, and no entry watches a directory with no manifest | delete an entry from `dependabot.yml`, or add one for a directory that has none |
 | `strip-empty-unreleased.sh` | the published npm CHANGELOGs lose an EMPTY `## Unreleased` heading and keep a non-empty one | break the `nonblank` branch so a real section is dropped; `--selftest` catches it |
-| `testing-feature-guard.sh` | no shipped artifact resolves `powdb-query/testing` | resolve the feature from a published crate's manifest |
+| `testing-feature-guard.sh` | no shipped artifact resolves `powdb-query/testing` or `powdb-storage/testing` | resolve either feature from a published crate's manifest; `--selftest` proves both detectors fire on the dev-unified query tree |
 | `missing-docs-ratchet.sh` | the `missing_docs` count never grows (`--color never` is load-bearing: this greps cargo's own output) | add an undocumented public item |
 | `release-channel.sh` | a release tag classifies into exactly one channel, or the release fails | `release-channel.sh 0.27` or any non-SemVer shape, leading zeros included |
 | `check-tool-pins.sh` | every `cargo install` in a workflow carries `--version` and `--locked`, and a tool installed by two workflows is pinned to the same version in both | drop `--version` from any install line, or set `CARGO_FUZZ_VERSION` to a different value in ci.yml than in fuzz.yml; `--selftest` does both on fixtures |
 | `internal-content-guard.sh` | no tracked file lives under an internal-only path, and no public doc or source matches the private publication denylist; refuses a run in which either half did not actually inspect anything | `PUBLICATION_DENYLIST_REGEX='(' bash scripts/ci/internal-content-guard.sh` (a regex git cannot compile: it used to print "denylist checked"), or run it from a directory that is not a git repo |
 
 ## Running them locally
+
+`testing-feature-guard.sh` is deliberately stricter than a source grep: the
+query `testing` feature exposes executor instrumentation and propagates to the
+storage `testing` feature, which exposes WAL fsync fault injection. Both are
+valid in test graphs and forbidden in normal/build dependency graphs, so the
+guard resolves every shipped artifact the same way Cargo would build it for
+release.
 
 All of them work from a normal checkout, with no CI-only environment:
 

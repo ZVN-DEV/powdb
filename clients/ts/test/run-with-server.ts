@@ -3,7 +3,8 @@
  *
  * If POWDB_PORT is already set, this script assumes the caller supplied a
  * server and just runs the target test. Otherwise it starts powdb-server from
- * the repo, waits until TCP accepts connections, and tears it down afterward.
+ * the repo with `--port 0 --port-file`, waits until the server publishes the
+ * actual OS-assigned port, and tears it down afterward.
  */
 
 import * as fs from "node:fs/promises";
@@ -18,21 +19,13 @@ const clientRoot = path.resolve(here, "..");
 const repoRoot = path.resolve(clientRoot, "..", "..");
 const host = process.env.POWDB_HOST ?? "127.0.0.1";
 
-async function getFreePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, host, () => {
-      const addr = server.address();
-      if (!addr || typeof addr === "string") {
-        server.close();
-        reject(new Error("failed to allocate TCP port"));
-        return;
-      }
-      const port = addr.port;
-      server.close(() => resolve(port));
-    });
-  });
+function serverCommand(): { cmd: string; prefix: string[] } {
+  const serverBin = process.env.POWDB_SERVER_BIN;
+  if (serverBin && serverBin.length > 0) return { cmd: serverBin, prefix: [] };
+  return {
+    cmd: "cargo",
+    prefix: ["run", "--release", "-p", "powdb-server", "--"],
+  };
 }
 
 function canConnect(port: number): Promise<boolean> {
@@ -53,6 +46,37 @@ function canConnect(port: number): Promise<boolean> {
   });
 }
 
+function parsePublishedPort(text: string): number | undefined {
+  for (const line of text.split(/\r?\n/)) {
+    const value = line.match(/^port=(\d+)$/)?.[1];
+    if (value === undefined) continue;
+    const port = Number(value);
+    if (Number.isInteger(port) && port > 0 && port <= 65_535) return port;
+  }
+  return undefined;
+}
+
+async function waitForPublishedPort(
+  portFile: string,
+  child: ChildProcessWithoutNullStreams,
+): Promise<number> {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`powdb-server exited early with code ${child.exitCode}`);
+    }
+    try {
+      const text = await fs.readFile(portFile, "utf8");
+      const port = parsePublishedPort(text);
+      if (port !== undefined) return port;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`timed out waiting for powdb-server to publish ${portFile}`);
+}
+
 async function waitForServer(port: number, child: ChildProcessWithoutNullStreams) {
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
@@ -60,7 +84,7 @@ async function waitForServer(port: number, child: ChildProcessWithoutNullStreams
       throw new Error(`powdb-server exited early with code ${child.exitCode}`);
     }
     if (await canConnect(port)) return;
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(`timed out waiting for powdb-server on ${host}:${port}`);
 }
@@ -107,24 +131,23 @@ async function main() {
     process.exit(code);
   }
 
-  const port = await getFreePort();
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "powdb-ts-test-"));
+  const portFile = path.join(dataDir, "ports");
   // Also expose a Unix domain socket so the client's `{ path }` connection
   // mode is exercised end-to-end alongside TCP.
   const socketPath = path.join(dataDir, "powdb.sock");
   const serverLog: string[] = [];
+  const { cmd, prefix } = serverCommand();
   const server = spawn(
-    "cargo",
+    cmd,
     [
-      "run",
-      "--release",
-      "-p",
-      "powdb-server",
-      "--",
+      ...prefix,
       "--bind",
       host,
       "--port",
-      String(port),
+      "0",
+      "--port-file",
+      portFile,
       "--socket",
       socketPath,
       "--data-dir",
@@ -148,8 +171,9 @@ async function main() {
   server.stderr.on("data", capture);
 
   try {
+    const port = await waitForPublishedPort(portFile, server);
     await waitForServer(port, server);
-    console.log(`Started disposable PowDB server on ${host}:${port}`);
+    console.log(`Started disposable PowDB server on ${host}:${port} (from ${portFile})`);
     const code = await runCommand("tsx", [target, ...targetArgs], {
       ...process.env,
       POWDB_HOST: host,

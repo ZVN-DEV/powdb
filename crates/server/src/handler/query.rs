@@ -89,12 +89,7 @@ fn execute_write_deferred(
 ) -> DispatchOutcome {
     let mut eng = match engine.write() {
         Ok(eng) => eng,
-        Err(e) => {
-            return (
-                Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                None,
-            )
-        }
+        Err(_) => return (Err(QueryError::EnginePoisoned), None),
     };
     eng.run_with_deferred_durability(f)
 }
@@ -136,12 +131,7 @@ fn dispatch_query_parsed(
         let res = {
             let eng = match engine.read() {
                 Ok(eng) => eng,
-                Err(e) => {
-                    return (
-                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                        None,
-                    )
-                }
+                Err(_) => return (Err(QueryError::EnginePoisoned), None),
             };
             eng.execute_powql_readonly(query)
         };
@@ -164,12 +154,7 @@ fn dispatch_query_parsed(
     ) {
         let mut eng = match engine.write() {
             Ok(eng) => eng,
-            Err(e) => {
-                return (
-                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                    None,
-                )
-            }
+            Err(_) => return (Err(QueryError::EnginePoisoned), None),
         };
         return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
@@ -211,12 +196,7 @@ fn dispatch_sql_query_parsed(
         let res = {
             let eng = match engine.read() {
                 Ok(eng) => eng,
-                Err(e) => {
-                    return (
-                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                        None,
-                    )
-                }
+                Err(_) => return (Err(QueryError::EnginePoisoned), None),
             };
             eng.execute_sql_readonly(query)
         };
@@ -237,12 +217,7 @@ fn dispatch_sql_query_parsed(
     ) {
         let mut eng = match engine.write() {
             Ok(eng) => eng,
-            Err(e) => {
-                return (
-                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                    None,
-                )
-            }
+            Err(_) => return (Err(QueryError::EnginePoisoned), None),
         };
         return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
@@ -344,12 +319,7 @@ fn dispatch_query_with_bound_params_parsed(
         let res = {
             let eng = match engine.read() {
                 Ok(eng) => eng,
-                Err(e) => {
-                    return (
-                        Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                        None,
-                    )
-                }
+                Err(_) => return (Err(QueryError::EnginePoisoned), None),
             };
             eng.execute_powql_readonly_with_params(query, bound)
         };
@@ -370,12 +340,7 @@ fn dispatch_query_with_bound_params_parsed(
     ) {
         let mut eng = match engine.write() {
             Ok(eng) => eng,
-            Err(e) => {
-                return (
-                    Err(QueryError::Execution(format!("lock poisoned: {e}"))),
-                    None,
-                )
-            }
+            Err(_) => return (Err(QueryError::EnginePoisoned), None),
         };
         return (execute_rollback_preserving_sync_if_needed(&mut eng), None);
     }
@@ -430,6 +395,33 @@ fn permission_denied_response(
 ) {
     metrics.record_query(start.elapsed(), QueryOutcome::Error);
     (query_error_response(denied), None, None)
+}
+
+fn mark_owned_transaction_aborted<R>(
+    ctx: &QueryContext<'_, R>,
+) -> Option<(
+    Message,
+    Option<PendingDurability>,
+    Option<ConnectionTermination>,
+)>
+where
+    R: AsyncRead + Unpin,
+{
+    if ctx.tx_permit.is_none() {
+        return None;
+    }
+    let eng = match ctx.engine.read() {
+        Ok(eng) => eng,
+        Err(_) => {
+            return Some((
+                query_error_response(&QueryError::EnginePoisoned),
+                None,
+                None,
+            ));
+        }
+    };
+    eng.mark_transaction_aborted();
+    None
 }
 
 /// Everything one wire query frame is executed against: the connection's
@@ -810,7 +802,12 @@ where
     // three separate routing helpers before reaching it.
     let stmt_result = parser::parse(&query).map_err(|e| e.to_string());
     match &stmt_result {
-        Err(message) => return parse_failure_response(message, ctx.metrics, start),
+        Err(message) => {
+            if let Some(response) = mark_owned_transaction_aborted(&ctx) {
+                return response;
+            }
+            return parse_failure_response(message, ctx.metrics, start);
+        }
         Ok(stmt) => {
             if let Err(denied) = check_statement_permitted(ctx.principal.as_ref(), stmt) {
                 return permission_denied_response(&denied, ctx.metrics, start);
@@ -863,7 +860,12 @@ where
     let query_deadline = start + ctx.query_timeout;
     let stmt_result = sql::parse_sql(&query).map_err(|e| e.to_string());
     match &stmt_result {
-        Err(message) => return parse_failure_response(message, ctx.metrics, start),
+        Err(message) => {
+            if let Some(response) = mark_owned_transaction_aborted(&ctx) {
+                return response;
+            }
+            return parse_failure_response(message, ctx.metrics, start);
+        }
         Ok(stmt) => {
             if let Err(denied) = check_statement_permitted(ctx.principal.as_ref(), stmt) {
                 return permission_denied_response(&denied, ctx.metrics, start);
@@ -918,7 +920,12 @@ where
     let bound: Vec<powdb_query::ast::ParamValue> = params.iter().map(wire_param_to_value).collect();
     let stmt_result = parser::parse_with_params(&query, &bound).map_err(|e| e.to_string());
     match &stmt_result {
-        Err(message) => return parse_failure_response(message, ctx.metrics, start),
+        Err(message) => {
+            if let Some(response) = mark_owned_transaction_aborted(&ctx) {
+                return response;
+            }
+            return parse_failure_response(message, ctx.metrics, start);
+        }
         Ok(stmt) => {
             if let Err(denied) = check_statement_permitted(ctx.principal.as_ref(), stmt) {
                 return permission_denied_response(&denied, ctx.metrics, start);
@@ -1168,11 +1175,14 @@ where
 ///
 /// Returns `None` when the covering fsync succeeded, or `Some(client-facing
 /// error message)` when it failed — in which case no statement the ticket
-/// covers may be acknowledged as durable (it executed in memory only).
+/// covers may be acknowledged as durable. The failure happens after the engine
+/// has already returned and may have made in-memory/catalog changes visible, so
+/// report the same uncertain-commit guidance the engine uses for synchronous
+/// commit failures instead of leaking a retryable-looking fsync detail.
 pub(super) async fn settle_durability_ticket(ticket: WalDurabilityTicket) -> Option<String> {
     match tokio::task::spawn_blocking(move || ticket.wait()).await {
         Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(format!("WAL durability sync failed: {e}")),
+        Ok(Err(_)) => Some(QueryError::CommitOutcomeUnknown.to_string()),
         Err(e) => Some(format!("internal error: {e}")),
     }
 }

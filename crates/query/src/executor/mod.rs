@@ -4,6 +4,9 @@
 mod compiled;
 mod eval;
 pub mod mem_budget;
+mod statement;
+#[cfg(feature = "testing")]
+pub use statement::StatementCommitPhase;
 
 use crate::ast::*;
 use crate::canonicalize::canonicalize_with_form;
@@ -19,6 +22,7 @@ pub use powdb_storage::wal::{WalDurabilityTicket, WalSyncMode};
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{error, info, warn, Level};
@@ -464,10 +468,10 @@ fn collect_dirty_scanned_views(plan: &PlanNode, views: &ViewRegistry, out: &mut 
         | PlanNode::RangeScan { table, .. }
         | PlanNode::ExprIndexScan { table, .. }
         | PlanNode::ExprRangeScan { table, .. }
-        | PlanNode::OrderedExprIndexScan { table, .. } => {
-            if views.is_dirty(table) && !out.iter().any(|name| name == table) {
-                out.push(table.clone());
-            }
+        | PlanNode::OrderedExprIndexScan { table, .. }
+            if views.is_dirty(table) && !out.iter().any(|name| name == table) =>
+        {
+            out.push(table.clone());
         }
 
         PlanNode::Filter { input, .. }
@@ -490,6 +494,20 @@ fn collect_dirty_scanned_views(plan: &PlanNode, views: &ViewRegistry, out: &mut 
         // statements own their own view bookkeeping.
         _ => {}
     }
+}
+
+fn nested_project_output_columns(fields: &[crate::plan::NestedProjectField]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| match field {
+            crate::plan::NestedProjectField::Plain(field) => field
+                .alias
+                .clone()
+                .unwrap_or_else(|| projection_output_name(&field.expr)),
+            crate::plan::NestedProjectField::Nested(nested) => nested.name.clone(),
+            crate::plan::NestedProjectField::Link(link) => link.name.clone(),
+        })
+        .collect()
 }
 
 /// True when any registered materialized view is currently dirty. Conservative
@@ -528,6 +546,12 @@ pub struct Engine {
     /// registry adds the lifecycle metadata.
     view_registry: ViewRegistry,
     in_transaction: bool,
+    transaction_aborted: AtomicBool,
+    implicit_transaction: bool,
+    statement_depth: usize,
+    poisoned: bool,
+    #[cfg(feature = "testing")]
+    statement_commit_hook: Option<fn(StatementCommitPhase)>,
     /// WS2 — per-query memory budget ceiling (bytes). The running total lives
     /// in a thread-local (see [`mem_budget`]) and is reset at every top-level
     /// query entry, so sort/join/GROUP BY/IN-list materialization can be capped
@@ -638,6 +662,7 @@ impl Engine {
             catalog.install_auto_wal_archive(Arc::clone(hook));
         }
         let view_registry = open_view_registry(data_dir)?;
+        view_registry.validate_backing_tables(&catalog)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -645,6 +670,12 @@ impl Engine {
             insert_values_scratch: Vec::new(),
             view_registry,
             in_transaction: false,
+            transaction_aborted: AtomicBool::new(false),
+            implicit_transaction: false,
+            statement_depth: 0,
+            poisoned: false,
+            #[cfg(feature = "testing")]
+            statement_commit_hook: None,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
             nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             wal_archive_hook,
@@ -681,6 +712,7 @@ impl Engine {
         let catalog = Catalog::open_read_only(data_dir)?;
         info!(data_dir = %data_dir.display(), "engine opened read-only for snapshot serving");
         let view_registry = open_view_registry(data_dir)?;
+        view_registry.validate_backing_tables(&catalog)?;
         Ok(Engine {
             catalog,
             _dir_lock: dir_lock,
@@ -688,6 +720,12 @@ impl Engine {
             insert_values_scratch: Vec::new(),
             view_registry,
             in_transaction: false,
+            transaction_aborted: AtomicBool::new(false),
+            implicit_transaction: false,
+            statement_depth: 0,
+            poisoned: false,
+            #[cfg(feature = "testing")]
+            statement_commit_hook: None,
             query_memory_limit: mem_budget::DEFAULT_QUERY_MEMORY_LIMIT,
             nested_loop_pair_limit: MAX_NESTED_LOOP_PAIRS,
             // No WAL-archive hook: a read-only engine never writes, so its Drop
@@ -799,6 +837,7 @@ impl Engine {
     /// executor goes through here so that what it runs is a plan the type
     /// system says was lowered.
     fn execute_lowered(&mut self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
+        self.ensure_plan_allowed(plan.node())?;
         self.refresh_dirty_views_read_by(plan.node())?;
         let result = self.dispatch_mut(plan.node());
         Self::raise_arith_fault(result)
@@ -989,6 +1028,9 @@ impl Engine {
     /// fsyncs every commit; `Normal` moves the fsync to a background flusher
     /// with a bounded crash-loss window; `Off` is bench-only (no durability).
     /// Wired from the server's `POWDB_SYNC_MODE` / `--sync-mode` config.
+    /// Changes requested during a transaction take effect only after that
+    /// transaction commits or rolls back, so recovery always uses its original
+    /// mode and earlier durability obligations are not dropped.
     pub fn set_wal_sync_mode(&mut self, mode: WalSyncMode) {
         self.catalog.set_wal_sync_mode(mode);
     }
@@ -1012,16 +1054,35 @@ impl Engine {
         &mut self,
         f: impl FnOnce(&mut Engine) -> T,
     ) -> (T, Option<WalDurabilityTicket>) {
+        struct DeferredGuard<'a>(&'a mut Engine);
+        impl Drop for DeferredGuard<'_> {
+            fn drop(&mut self) {
+                self.0.catalog.set_wal_sync_deferred(false);
+                if std::thread::panicking() {
+                    self.0.poison_live_state();
+                }
+            }
+        }
         self.catalog.set_wal_sync_deferred(true);
-        let out = f(self);
-        self.catalog.set_wal_sync_deferred(false);
-        let ticket = self.catalog.take_wal_durability_ticket();
+        let guard = DeferredGuard(self);
+        let out = f(guard.0);
+        let ticket = guard.0.catalog.take_wal_durability_ticket();
+        drop(guard);
         (out, ticket)
     }
 
     /// Number of fsyncs issued against the WAL (test/metrics hook).
     pub fn wal_fsync_count(&self) -> u64 {
         self.catalog.wal_fsync_count()
+    }
+
+    /// Testing-only: make the next WAL fsync fail for this engine's catalog.
+    ///
+    /// Available only with `powdb-query/testing`, which propagates to
+    /// `powdb-storage/testing`. Shipping builds have no fault-injection API.
+    #[cfg(feature = "testing")]
+    pub fn inject_next_fsync_failure_for_testing(&self) {
+        self.catalog.inject_next_fsync_failure_for_testing();
     }
 
     /// Roll back the active explicit transaction while archiving any committed
@@ -1036,41 +1097,66 @@ impl Engine {
     where
         F: FnMut(&Path, &[powdb_storage::wal::WalRecord]) -> io::Result<()>,
     {
+        self.ensure_usable()?;
         if !self.in_transaction {
             return Err(QueryError::Execution(
                 "no active transaction to roll back".into(),
             ));
         }
-        self.catalog
-            .rollback_to_last_sync_with_wal_archive(archive)
-            .map_err(QueryError::from_storage_io)?;
+        if let Err(error) = self.catalog.rollback_to_last_sync_with_wal_archive(archive) {
+            error!(%error, "transaction rollback failed");
+            if self.catalog.is_sync_poisoned() {
+                self.poison_live_state();
+                return Err(QueryError::EnginePoisoned);
+            }
+            self.mark_transaction_aborted();
+            return Err(QueryError::from_storage_io(error));
+        }
         self.finish_rollback_after_catalog_restore()
     }
 
     pub fn rollback_transaction_preserving_wal_archive(
         &mut self,
     ) -> Result<QueryResult, QueryError> {
+        self.ensure_usable()?;
         let Some(hook) = self.wal_archive_hook.clone() else {
             if !self.in_transaction {
                 return Err(QueryError::Execution(
                     "no active transaction to roll back".into(),
                 ));
             }
-            self.catalog
-                .rollback_to_last_sync()
-                .map_err(QueryError::from_storage_io)?;
+            if let Err(error) = self.catalog.rollback_to_last_sync() {
+                error!(%error, "transaction rollback failed");
+                if self.catalog.is_sync_poisoned() {
+                    self.poison_live_state();
+                    return Err(QueryError::EnginePoisoned);
+                }
+                self.mark_transaction_aborted();
+                return Err(QueryError::from_storage_io(error));
+            }
             return self.finish_rollback_after_catalog_restore();
         };
         self.rollback_transaction_with_wal_archive(move |dir, records| hook(dir, records))
     }
 
     fn finish_rollback_after_catalog_restore(&mut self) -> Result<QueryResult, QueryError> {
+        let views = match open_view_registry(self.catalog.data_dir()).and_then(|views| {
+            views.validate_backing_tables(&self.catalog)?;
+            Ok(views)
+        }) {
+            Ok(views) => views,
+            Err(error) => {
+                error!(%error, "view state could not be restored after rollback");
+                self.poison_live_state();
+                return Err(QueryError::EnginePoisoned);
+            }
+        };
         self.in_transaction = false;
+        self.transaction_aborted.store(false, Ordering::Relaxed);
         if let Ok(mut cache) = self.plan_cache.lock() {
             cache.clear();
         }
-        self.view_registry =
-            open_view_registry(self.catalog.data_dir()).map_err(QueryError::from_storage_io)?;
+        self.view_registry = views;
         Ok(QueryResult::Executed {
             message: "transaction rolled back".to_string(),
         })
@@ -1195,6 +1281,10 @@ impl Engine {
     /// around 3μs per call on bench workloads. On a miss we plan as before
     /// and insert the plan under its canonical hash.
     pub fn execute_powql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        self.run_statement(|engine| engine.execute_powql_inner(input))
+    }
+
+    fn execute_powql_inner(&mut self, input: &str) -> Result<QueryResult, QueryError> {
         if self.read_only {
             // Snapshot-serving mode: run reads through the read-only executor and
             // turn the "this statement writes" sentinel into the terminal
@@ -1224,12 +1314,6 @@ impl Engine {
                 if let Some(plan) = cached {
                     let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
-                    // Mission B (post-review): statement-boundary WAL
-                    // group commit. Catalog::wal_log now only appends;
-                    // the fsync happens here exactly once per statement.
-                    // `sync_wal` is a no-op when nothing was buffered
-                    // (pure reads pay zero fsync).
-                    self.commit_statement()?;
                     return result;
                 }
                 // Miss — plan, insert, execute.
@@ -1239,14 +1323,12 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                self.commit_statement()?;
                 return result;
             }
             // Lex error — fall through to the planner so the caller gets a
             // consistent error shape.
             let (_, plan) = self.plan_text_and_lower(input)?;
             let result = self.execute_lowered(&plan);
-            self.commit_statement()?;
             return result;
         }
 
@@ -1264,7 +1346,6 @@ impl Engine {
 
         let exec_start = Instant::now();
         let result = self.execute_lowered(&plan);
-        self.commit_statement()?;
         let exec_us = exec_start.elapsed().as_micros();
 
         let total_us = total_start.elapsed().as_micros();
@@ -1298,6 +1379,10 @@ impl Engine {
     /// The canonical PowQL text is used as the plan-cache key, so equivalent
     /// SQL and PowQL spellings share cached plans.
     pub fn execute_sql(&mut self, input: &str) -> Result<QueryResult, QueryError> {
+        self.run_statement(|engine| engine.execute_sql_inner(input))
+    }
+
+    fn execute_sql_inner(&mut self, input: &str) -> Result<QueryResult, QueryError> {
         if self.read_only {
             return to_readonly_terminal(self.execute_sql_readonly(input));
         }
@@ -1322,7 +1407,6 @@ impl Engine {
                 if let Some(plan) = cached {
                     let plan = self.lower(&plan)?;
                     let result = self.execute_lowered(&plan);
-                    self.commit_statement()?;
                     return result;
                 }
 
@@ -1332,19 +1416,21 @@ impl Engine {
                     .map_err(|e| QueryError::Execution(format!("plan cache lock poisoned: {e}")))?
                     .insert(hash, canonical, raw, literals.len());
                 let result = self.execute_lowered(&plan);
-                self.commit_statement()?;
                 return result;
             }
         }
 
         let plan = self.plan_and_lower(parsed.statement)?;
-        let result = self.execute_lowered(&plan);
-        self.commit_statement()?;
-        result
+        self.execute_lowered(&plan)
     }
 
     /// Read-only variant of [`Engine::execute_sql`].
     pub fn execute_sql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
+        self.run_read_statement(|engine| engine.execute_sql_readonly_inner(input))
+    }
+
+    fn execute_sql_readonly_inner(&self, input: &str) -> Result<QueryResult, QueryError> {
+        self.ensure_read_allowed()?;
         let _budget = self.enter_memory_budget();
         crate::cancel::check()?;
         let parsed = crate::sql::parse_sql_with_canonical(input)
@@ -1392,6 +1478,14 @@ impl Engine {
         input: &str,
         params: &[crate::ast::ParamValue],
     ) -> Result<QueryResult, QueryError> {
+        self.run_statement(|engine| engine.execute_powql_with_params_inner(input, params))
+    }
+
+    fn execute_powql_with_params_inner(
+        &mut self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+    ) -> Result<QueryResult, QueryError> {
         if self.read_only {
             return to_readonly_terminal(self.execute_powql_readonly_with_params(input, params));
         }
@@ -1400,9 +1494,7 @@ impl Engine {
         let stmt = crate::parser::parse_with_params(input, params)
             .map_err(|e| QueryError::Parse(e.to_string()))?;
         let plan = self.plan_and_lower(stmt)?;
-        let result = self.execute_lowered(&plan);
-        self.commit_statement()?;
-        result
+        self.execute_lowered(&plan)
     }
 
     /// Read-only variant of [`Engine::execute_powql_with_params`].
@@ -1417,6 +1509,17 @@ impl Engine {
         input: &str,
         params: &[crate::ast::ParamValue],
     ) -> Result<QueryResult, QueryError> {
+        self.run_read_statement(|engine| {
+            engine.execute_powql_readonly_with_params_inner(input, params)
+        })
+    }
+
+    fn execute_powql_readonly_with_params_inner(
+        &self,
+        input: &str,
+        params: &[crate::ast::ParamValue],
+    ) -> Result<QueryResult, QueryError> {
+        self.ensure_read_allowed()?;
         let _budget = self.enter_memory_budget();
         crate::cancel::check()?;
         let stmt = crate::parser::parse_with_params(input, params)
@@ -1519,6 +1622,11 @@ impl Engine {
     /// `Arc<RwLock<Engine>>`: multiple threads can call it simultaneously
     /// under a shared `.read()` lock and each will scan independently.
     pub fn execute_powql_readonly(&self, input: &str) -> Result<QueryResult, QueryError> {
+        self.run_read_statement(|engine| engine.execute_powql_readonly_inner(input))
+    }
+
+    fn execute_powql_readonly_inner(&self, input: &str) -> Result<QueryResult, QueryError> {
+        self.ensure_read_allowed()?;
         // WS2: each *outermost* statement starts with the full memory
         // allowance. The guard holds the reentrancy depth so a nested
         // `execute_powql*` does not reset the outer frame's accounting.
@@ -1571,6 +1679,7 @@ impl Engine {
     /// in [`Engine::execute_powql_readonly`]; in-flight subquery
     /// materialisation uses [`Engine::materialize_subqueries_readonly`]).
     fn execute_plan_readonly(&self, plan: &LoweredPlan) -> Result<QueryResult, QueryError> {
+        self.ensure_read_allowed()?;
         Self::raise_arith_fault(self.dispatch_readonly(plan.node()))
     }
 
@@ -1887,7 +1996,9 @@ impl Engine {
                 // for per-row materialisation below.
                 let materialized;
                 let predicate = if contains_subquery(predicate) {
-                    materialized = self.materialize_subqueries_readonly(predicate)?;
+                    let outer_columns = self.plan_output_columns(input);
+                    materialized =
+                        self.materialize_subqueries_readonly(predicate, outer_columns.as_deref())?;
                     &materialized
                 } else {
                     predicate
@@ -2649,24 +2760,91 @@ impl Engine {
     /// lock. Inner queries that would themselves need a write (e.g. dirty
     /// view) escalate via [`READONLY_NEEDS_WRITE`] just like the top-level
     /// read path does.
-    fn materialize_subqueries_readonly(&self, expr: &Expr) -> Result<Expr, QueryError> {
+    pub(super) fn plan_output_columns(&self, plan: &PlanNode) -> Option<Vec<String>> {
+        match plan {
+            PlanNode::SeqScan { table }
+            | PlanNode::IndexScan { table, .. }
+            | PlanNode::RangeScan { table, .. }
+            | PlanNode::ExprIndexScan { table, .. }
+            | PlanNode::ExprRangeScan { table, .. }
+            | PlanNode::OrderedExprIndexScan { table, .. } => self
+                .catalog
+                .schema(table)
+                .map(|s| s.columns.iter().map(|column| column.name.clone()).collect()),
+            PlanNode::AliasScan { table, alias } => self.catalog.schema(table).map(|s| {
+                s.columns
+                    .iter()
+                    .map(|column| format!("{alias}.{}", column.name))
+                    .collect()
+            }),
+            PlanNode::Filter { input, .. }
+            | PlanNode::Sort { input, .. }
+            | PlanNode::Limit { input, .. }
+            | PlanNode::Offset { input, .. }
+            | PlanNode::Distinct { input }
+            | PlanNode::Explain { input } => self.plan_output_columns(input),
+            PlanNode::Project { fields, .. } => Some(
+                fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| projection_output_name(&field.expr))
+                    })
+                    .collect(),
+            ),
+            PlanNode::NestedProject { fields, .. } => Some(nested_project_output_columns(fields)),
+            PlanNode::NestedLoopJoin { left, right, .. } => {
+                let mut columns = self.plan_output_columns(left)?;
+                columns.extend(self.plan_output_columns(right)?);
+                Some(columns)
+            }
+            PlanNode::Union { left, .. } => self.plan_output_columns(left),
+            PlanNode::GroupBy {
+                keys, aggregates, ..
+            } => {
+                let mut columns: Vec<String> = keys.iter().map(|key| key.output_name()).collect();
+                columns.extend(
+                    aggregates
+                        .iter()
+                        .map(|aggregate| aggregate.output_name.clone()),
+                );
+                Some(columns)
+            }
+            PlanNode::Window { input, windows } => {
+                let mut columns = self.plan_output_columns(input)?;
+                columns.extend(windows.iter().map(|window| window.output_name.clone()));
+                Some(columns)
+            }
+            PlanNode::Aggregate { function, .. } => Some(vec![format!("{function:?}")]),
+            _ => None,
+        }
+    }
+
+    fn materialize_subqueries_readonly(
+        &self,
+        expr: &Expr,
+        outer_columns: Option<&[String]>,
+    ) -> Result<Expr, QueryError> {
         match expr {
             Expr::InSubquery {
                 expr: inner,
                 subquery,
                 negated,
             } => {
-                if is_correlated_subquery(subquery, &self.catalog) {
+                validate_subquery_scope(subquery, &self.catalog, outer_columns)?;
+                if is_correlated_subquery(subquery, &self.catalog, outer_columns) {
                     // Pass through — will be materialized per-row in the
                     // Filter handler's correlated subquery path.
-                    let inner = self.materialize_subqueries_readonly(inner)?;
+                    let inner = self.materialize_subqueries_readonly(inner, outer_columns)?;
                     return Ok(Expr::InSubquery {
                         expr: Box::new(inner),
                         subquery: subquery.clone(),
                         negated: *negated,
                     });
                 }
-                let inner = self.materialize_subqueries_readonly(inner)?;
+                let inner = self.materialize_subqueries_readonly(inner, outer_columns)?;
                 let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
                 let values = match result {
@@ -2692,7 +2870,8 @@ impl Engine {
                 })
             }
             Expr::ExistsSubquery { subquery, negated } => {
-                if is_correlated_subquery(subquery, &self.catalog) {
+                validate_subquery_scope(subquery, &self.catalog, outer_columns)?;
+                if is_correlated_subquery(subquery, &self.catalog, outer_columns) {
                     return Ok(expr.clone());
                 }
                 let sub_plan = self.plan_and_lower(Statement::Query(*subquery.clone()))?;
@@ -2705,25 +2884,27 @@ impl Engine {
                 Ok(Expr::Literal(Literal::Bool(truth)))
             }
             Expr::BinaryOp(l, op, r) => {
-                let l = self.materialize_subqueries_readonly(l)?;
-                let r = self.materialize_subqueries_readonly(r)?;
+                let l = self.materialize_subqueries_readonly(l, outer_columns)?;
+                let r = self.materialize_subqueries_readonly(r, outer_columns)?;
                 Ok(Expr::BinaryOp(Box::new(l), *op, Box::new(r)))
             }
             Expr::UnaryOp(op, inner) => {
-                let inner = self.materialize_subqueries_readonly(inner)?;
+                let inner = self.materialize_subqueries_readonly(inner, outer_columns)?;
                 Ok(Expr::UnaryOp(*op, Box::new(inner)))
             }
             Expr::Case { whens, else_expr } => {
                 let whens = whens
                     .iter()
                     .map(|(c, r)| {
-                        let c = self.materialize_subqueries_readonly(c)?;
-                        let r = self.materialize_subqueries_readonly(r)?;
+                        let c = self.materialize_subqueries_readonly(c, outer_columns)?;
+                        let r = self.materialize_subqueries_readonly(r, outer_columns)?;
                         Ok((Box::new(c), Box::new(r)))
                     })
                     .collect::<Result<Vec<_>, QueryError>>()?;
                 let else_expr = match else_expr {
-                    Some(e) => Some(Box::new(self.materialize_subqueries_readonly(e)?)),
+                    Some(e) => Some(Box::new(
+                        self.materialize_subqueries_readonly(e, outer_columns)?,
+                    )),
                     None => None,
                 };
                 Ok(Expr::Case { whens, else_expr })
@@ -2754,11 +2935,11 @@ impl Engine {
                 if let Some(ref filter) = sub.filter {
                     sub.filter = Some(substitute_outer_refs(
                         filter,
-                        &sub.source,
+                        &sub,
                         &self.catalog,
                         outer_row,
                         outer_columns,
-                    ));
+                    )?);
                 }
                 let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
@@ -2789,11 +2970,11 @@ impl Engine {
                 if let Some(ref filter) = sub.filter {
                     sub.filter = Some(substitute_outer_refs(
                         filter,
-                        &sub.source,
+                        &sub,
                         &self.catalog,
                         outer_row,
                         outer_columns,
-                    ));
+                    )?);
                 }
                 let sub_plan = self.plan_and_lower(Statement::Query(sub))?;
                 let result = self.execute_plan_readonly(&sub_plan)?;
@@ -2831,6 +3012,10 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        if self.poisoned || self.catalog.is_sync_poisoned() {
+            self.catalog.abandon_untrusted_state();
+            return;
+        }
         let Some(hook) = self.wal_archive_hook.clone() else {
             return;
         };

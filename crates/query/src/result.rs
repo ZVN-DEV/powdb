@@ -131,6 +131,19 @@ pub enum QueryError {
     /// disconnected). Like [`QueryError::Timeout`], a clean early-return.
     #[error("query cancelled by client disconnect")]
     Cancelled,
+    /// A statement failed inside an explicit transaction. Only ROLLBACK may
+    /// proceed; a later COMMIT must not publish a partially executed statement.
+    #[error("explicit transaction is aborted; roll back before running another statement")]
+    TransactionAborted,
+    /// Recovery of a failed mutation could not establish a usable live state.
+    #[error(
+        "database handle is unusable after a storage failure; close and reopen before continuing"
+    )]
+    EnginePoisoned,
+    /// A commit encountered an I/O failure after entering its durability path.
+    /// The caller must reconcile after reopening instead of blindly retrying.
+    #[error("commit outcome is unknown after a storage failure; close and reopen, then reconcile before retrying")]
+    CommitOutcomeUnknown,
     /// Generic execution error (catch-all for migration).
     #[error("{0}")]
     Execution(String),
