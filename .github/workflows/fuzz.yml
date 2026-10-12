@@ -80,7 +80,7 @@ jobs:
         run: cargo test -p powdb-query --test recovery_model --locked -- --nocapture 2>&1 | tee recovery-model.log
       - name: Retain replayable operation traces
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: recovery-model-traces
           path: recovery-model.log
@@ -226,7 +226,7 @@ jobs:
 
       - name: Upload crash artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-crashes-${{ matrix.target }}
           path: crates/query/fuzz/artifacts/
