@@ -34,12 +34,15 @@ catches. Run it deliberately:
 gh workflow run bench.yml
 ```
 
-The workflow runs on a Depot single-tenant runner (`depot-ubuntu-24.04-4`) with
-temp databases on tmpfs, so numbers are comparable run to run.
+The workflow runs on GitHub's standard hosted runner (`ubuntu-latest`, free for
+this public repository) with temp databases on tmpfs. Until 2026-10-24 it ran on
+a Depot runner (`depot-ubuntu-24.04-4`). Hosted VMs vary in CPU model from run to
+run, so the same-instance control gate is the one to trust; the absolute gate
+against `main.json` is noisier.
 
-## The baseline is Depot-only
+## The baseline comes from bench.yml only
 
-`baseline/main.json` may only be rebaselined from a Depot run of `bench.yml`.
+`baseline/main.json` may only be rebaselined from a CI run of `bench.yml`.
 Never from a laptop. An arm64 laptop is roughly twice as fast as the x86 runner,
 so a laptop rebaseline silently doubles every tolerance and the gate stops
 catching anything.
@@ -63,8 +66,8 @@ run's artifact and job log; nothing is measured on the machine running the
 script, and the document records the run in `source_run`. The script prints the
 old and new value of every gated workload so the commit message can say which
 change moved which one. `./scripts/update-bench-baseline.sh` is the same
-extraction run on the Depot runner itself; on a laptop it would record the
-laptop's arch and the comparator would refuse the result on Depot, which is the
+extraction run on the CI runner itself; on a laptop it would record the
+laptop's arch and the comparator would refuse the result in CI, which is the
 gate working.
 
 Both scripts stage the new file but do not commit, and neither touches
