@@ -697,10 +697,10 @@ jobs:
           # the corpus that fuzz.yml produced, so a different compiler here
           # would replay those inputs against different code.
           # `nightly-pin-freshness` in fuzz.yml fails once the pin goes stale,
-          # so it cannot rot silently. Moved 2026-09-06 with fuzz.yml; the
-          # reason for the old nightly-2026-07-22 pin (a tokio ICE in
-          # nightly-2026-07-23) no longer applies.
-          toolchain: nightly-2026-09-01
+          # so it cannot rot silently. Refreshed 2026-11-04 with fuzz.yml:
+          # the September pin exceeded its 45-day freshness allowance.
+          # Keep the replay and exploratory campaigns on one dated compiler.
+          toolchain: nightly-2026-11-01
 
       - name: Cargo cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -728,7 +728,7 @@ jobs:
 
       - name: Replay the checked-in corpus
         env:
-          FUZZ_TOOLCHAIN: nightly-2026-09-01
+          FUZZ_TOOLCHAIN: nightly-2026-11-01
         run: bash scripts/ci/fuzz-corpus-replay.sh
 
       - name: Upload crash artifacts on failure
