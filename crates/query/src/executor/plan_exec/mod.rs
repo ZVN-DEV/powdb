@@ -218,6 +218,11 @@ pub(super) fn for_each_row_raw_cancellable(
     table: &str,
     mut f: impl FnMut(RowId, &[u8]),
 ) -> Result<(), QueryError> {
+    let mut f = |rid, data: &[u8]| {
+        #[cfg(feature = "testing")]
+        crate::executor::work_stats::record_seq_row();
+        f(rid, data);
+    };
     // Embedded/direct execution normally has no cancellation token. Preserve
     // the original zero-poll raw-scan hot path in that case instead of paying
     // a counter increment and mask branch for every row. The active-install

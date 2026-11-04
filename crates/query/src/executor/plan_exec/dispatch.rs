@@ -96,6 +96,8 @@ impl Engine {
                     .map_err(QueryError::from_storage_io)?
                 {
                     let (_, row) = item.map_err(QueryError::from_storage_io)?;
+                    #[cfg(feature = "testing")]
+                    crate::executor::work_stats::record_seq_row();
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -1791,6 +1793,11 @@ impl Engine {
                 aggregates,
                 having,
             } => {
+                if let Some(result) =
+                    self.try_stream_constant_group(input, keys, aggregates, having)?
+                {
+                    return Ok(result);
+                }
                 if aggregates
                     .iter()
                     .any(|aggregate| aggregate.provenance_alias.is_some())
@@ -2336,11 +2343,15 @@ impl Engine {
                 // Uses index_lookup_all to return ALL matching rows for
                 // both unique and non-unique indexes.
                 if tbl.has_index(column) {
+                    #[cfg(feature = "testing")]
+                    crate::executor::work_stats::record_index_probe();
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                     let mut cancel = CancelCheck::new();
                     for rid in rids {
                         cancel.tick()?;
+                        #[cfg(feature = "testing")]
+                        crate::executor::work_stats::record_heap_fetch();
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns; the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value.

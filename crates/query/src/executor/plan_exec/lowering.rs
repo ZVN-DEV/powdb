@@ -724,6 +724,116 @@ struct ConjunctionCandidate {
     tier: u8,
 }
 
+/// Probe a bounded, selective literal membership list through an existing index.
+/// Mutations exclude this row-producing union until RID collection supports it.
+fn lower_indexed_membership(
+    catalog: &Catalog,
+    table: &str,
+    predicate: &Expr,
+    memory_limit: usize,
+) -> Option<PlanNode> {
+    let tbl = catalog.get_table(table)?;
+    if tbl.has_overflow_rows() {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    if conjuncts.iter().any(|conjunct| {
+        try_extract_eq_index_key(table, conjunct)
+            .and_then(|scan| coerce_candidate_keys(catalog, scan))
+            .is_some_and(|scan| eq_candidate_tier(catalog, &scan) == Some(0))
+    }) {
+        return None;
+    }
+    for conjunct in conjuncts {
+        let Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } = conjunct
+        else {
+            continue;
+        };
+        let Expr::Field(column) = expr.as_ref() else {
+            continue;
+        };
+        if list.is_empty() || list.len() > 128 || !catalog.get_table(table)?.has_index(column) {
+            continue;
+        }
+        let col_type = column_type(catalog, table, column)?;
+        let mut keys = Vec::new();
+        let mut faithful = true;
+        for key in list {
+            if matches!(key, Expr::Null) {
+                continue;
+            }
+            let Some(key) = coerce_column_index_key(col_type, key, ProbeKind::Equality) else {
+                faithful = false;
+                break;
+            };
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        if !faithful || keys.is_empty() {
+            continue;
+        }
+        // Bound estimation itself, and leave broad membership on the scan
+        // path rather than multiplying intermediate row buffers in a union.
+        let stats = catalog.index_stats(table, column)?;
+        let unique = catalog.is_index_unique(table, column) == Some(true);
+        let mut estimated_rows = 0u64;
+        for key in &keys {
+            let estimate = column_eq_est(catalog, table, column, key, unique, 256);
+            if estimate.rows >= 256 || estimate.rows == UNKNOWN_EST {
+                faithful = false;
+                break;
+            }
+            estimated_rows = estimated_rows.saturating_add(estimate.rows);
+        }
+        if !faithful || estimated_rows > (stats.total_entries / 4).max(1) {
+            continue;
+        }
+        let row_bound = powdb_storage::page::PAGE_SIZE
+            .saturating_add(
+                tbl.schema()
+                    .columns
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(std::mem::size_of::<Vec<Value>>());
+        let depth = (usize::BITS - (keys.len() - 1).leading_zeros()) as usize;
+        let materialization_bound = (estimated_rows as usize)
+            .saturating_mul(row_bound)
+            .saturating_mul(depth + 4);
+        if materialization_bound > memory_limit / 4 {
+            continue;
+        }
+        fn probes(table: &str, column: &str, keys: &[Expr]) -> PlanNode {
+            if keys.len() == 1 {
+                return PlanNode::IndexScan {
+                    table: table.into(),
+                    column: column.into(),
+                    key: keys[0].clone(),
+                };
+            }
+            let mid = keys.len() / 2;
+            PlanNode::Union {
+                left: Box::new(probes(table, column, &keys[..mid])),
+                right: Box::new(probes(table, column, &keys[mid..])),
+                all: true,
+            }
+        }
+        // Distinct coerced keys address disjoint row sets. Keep the original
+        // predicate as the final authority for residual and membership semantics.
+        return Some(PlanNode::Filter {
+            input: Box::new(probes(table, column, &keys)),
+            predicate: predicate.clone(),
+        });
+    }
+    None
+}
+
 /// Lane A: rewrite a `Filter(SeqScan)` whose predicate is a top-level `and`
 /// chain into `Filter(residual)(index scan)` driven by the most selective
 /// indexed conjunct. Returns `None` when the predicate is not a conjunction or
@@ -907,9 +1017,17 @@ impl LoweredPlan {
     /// `tests/cross_type_index_parity.rs` holds that. Idempotence is what lets
     /// the boundary be enforced by construction instead of by auditing which
     /// paths have already lowered.
-    pub(crate) fn of(catalog: &Catalog, plan: &PlanNode) -> Result<Self, QueryError> {
+    pub(crate) fn of(
+        catalog: &Catalog,
+        plan: &PlanNode,
+        query_memory_limit: usize,
+    ) -> Result<Self, QueryError> {
         let coerced = super::coerce::coerce_typed_literals(catalog, plan)?;
-        Ok(LoweredPlan(lower_unindexed_scans(catalog, &coerced)))
+        Ok(LoweredPlan(lower_unindexed_scans(
+            catalog,
+            &coerced,
+            mem_budget::remaining(query_memory_limit),
+        )))
     }
 
     /// The lowered tree, for dispatch.
@@ -919,7 +1037,19 @@ impl LoweredPlan {
 }
 
 /// This pass runs once per query, before execution.
-fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
+fn lower_unindexed_scans(
+    catalog: &Catalog,
+    plan: &PlanNode,
+    query_memory_limit: usize,
+) -> PlanNode {
+    lower_unindexed_scans_impl(catalog, plan, Some(query_memory_limit))
+}
+
+fn lower_unindexed_scans_impl(
+    catalog: &Catalog,
+    plan: &PlanNode,
+    membership_budget: Option<usize>,
+) -> PlanNode {
     match plan {
         PlanNode::ExprIndexScan { table, path, .. }
         | PlanNode::ExprRangeScan { table, path, .. }
@@ -975,29 +1105,56 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             // as a residual. The planner emits this shape because it is pure;
             // lowering makes the choice with real catalog knowledge.
             if let PlanNode::SeqScan { table } = input.as_ref() {
+                if let Some(memory_limit) = membership_budget {
+                    if let Some(lowered) =
+                        lower_indexed_membership(catalog, table, predicate, memory_limit)
+                    {
+                        return lowered;
+                    }
+                }
                 if let Some(lowered) = lower_conjunction_scan(catalog, table, predicate) {
                     return lowered;
                 }
             }
             PlanNode::Filter {
-                input: Box::new(lower_unindexed_scans(catalog, input)),
+                input: Box::new(lower_unindexed_scans_impl(
+                    catalog,
+                    input,
+                    membership_budget,
+                )),
                 predicate: predicate.clone(),
             }
         }
         PlanNode::Project { input, fields } => PlanNode::Project {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             fields: fields.clone(),
         },
         PlanNode::Sort { input, keys } => PlanNode::Sort {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             keys: keys.clone(),
         },
         PlanNode::Limit { input, count } => PlanNode::Limit {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             count: count.clone(),
         },
         PlanNode::Offset { input, count } => PlanNode::Offset {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             count: count.clone(),
         },
         PlanNode::Aggregate {
@@ -1007,14 +1164,22 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             mode,
             provenance_alias,
         } => PlanNode::Aggregate {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             function: *function,
             argument: argument.clone(),
             mode: *mode,
             provenance_alias: provenance_alias.clone(),
         },
         PlanNode::Distinct { input } => PlanNode::Distinct {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
         },
         PlanNode::GroupBy {
             input,
@@ -1022,7 +1187,11 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             aggregates,
             having,
         } => PlanNode::GroupBy {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             keys: keys.clone(),
             aggregates: aggregates.clone(),
             having: having.clone(),
@@ -1033,7 +1202,7 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             assignments,
             returning,
         } => PlanNode::Update {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(catalog, input, None)),
             table: table.clone(),
             assignments: assignments.clone(),
             returning: *returning,
@@ -1043,21 +1212,31 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             table,
             returning,
         } => PlanNode::Delete {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(catalog, input, None)),
             table: table.clone(),
             returning: *returning,
         },
         PlanNode::Window { input, windows } => PlanNode::Window {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
             windows: windows.clone(),
         },
         PlanNode::Union { left, right, all } => PlanNode::Union {
-            left: Box::new(lower_unindexed_scans(catalog, left)),
-            right: Box::new(lower_unindexed_scans(catalog, right)),
+            // Independently retained branches must not each spend the same
+            // membership-materialization allowance.
+            left: Box::new(lower_unindexed_scans_impl(catalog, left, None)),
+            right: Box::new(lower_unindexed_scans_impl(catalog, right, None)),
             all: *all,
         },
         PlanNode::Explain { input } => PlanNode::Explain {
-            input: Box::new(lower_unindexed_scans(catalog, input)),
+            input: Box::new(lower_unindexed_scans_impl(
+                catalog,
+                input,
+                membership_budget,
+            )),
         },
         PlanNode::NestedLoopJoin {
             left,
@@ -1065,8 +1244,8 @@ fn lower_unindexed_scans(catalog: &Catalog, plan: &PlanNode) -> PlanNode {
             on,
             kind,
         } => PlanNode::NestedLoopJoin {
-            left: Box::new(lower_unindexed_scans(catalog, left)),
-            right: Box::new(lower_unindexed_scans(catalog, right)),
+            left: Box::new(lower_unindexed_scans_impl(catalog, left, None)),
+            right: Box::new(lower_unindexed_scans_impl(catalog, right, None)),
             on: on.clone(),
             kind: *kind,
         },
@@ -1855,6 +2034,62 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn membership_mutations_do_not_use_generic_rid_matching() {
+        for body_len in [128, 12_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut engine = crate::executor::Engine::new(dir.path()).unwrap();
+            engine
+                .execute_powql(
+                    "type MembershipMutation { required unique id: int, key: str, body: str }",
+                )
+                .unwrap();
+            for id in 0..100 {
+                engine
+                    .catalog_mut()
+                    .get_table_mut("MembershipMutation")
+                    .unwrap()
+                    .insert(&vec![
+                        Value::Int(id),
+                        Value::Str(format!("k{}", id % 20)),
+                        Value::Str("x".repeat(body_len)),
+                    ])
+                    .unwrap();
+            }
+            engine
+                .execute_powql("alter MembershipMutation add index .key")
+                .unwrap();
+            if body_len == 128 {
+                let read_plan = engine
+                    .execute_powql(
+                        r#"explain MembershipMutation filter .key in ("k1", "k3", "k1") { .id }"#,
+                    )
+                    .unwrap();
+                let text = format!("{read_plan:?}");
+                assert!(text.contains("IndexScan"));
+                assert!(!text.contains("SeqScan"));
+            }
+            super::super::reset_generic_rid_match_calls();
+            engine.execute_powql(r#"MembershipMutation filter .key in ("k1", "k3", "k1") update { body := "changed" }"#).unwrap();
+            assert_eq!(super::super::generic_rid_match_calls(), 0);
+            assert!(matches!(
+                engine
+                    .execute_powql(r#"count(MembershipMutation filter .body = "changed")"#)
+                    .unwrap(),
+                crate::result::QueryResult::Scalar(Value::Int(10))
+            ));
+            super::super::reset_generic_rid_match_calls();
+            engine
+                .execute_powql(r#"MembershipMutation filter .key in ("k2", "k4", "k2") delete"#)
+                .unwrap();
+            assert_eq!(super::super::generic_rid_match_calls(), 0);
+            assert!(matches!(
+                engine.execute_powql("count(MembershipMutation)").unwrap(),
+                crate::result::QueryResult::Scalar(Value::Int(90))
+            ));
+        }
+    }
+
     use super::*;
 
     /// One fake index for one equality candidate: the literal's true count and

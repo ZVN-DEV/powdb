@@ -6,7 +6,11 @@ mod eval;
 pub mod mem_budget;
 mod statement;
 #[cfg(feature = "testing")]
+mod work_stats;
+#[cfg(feature = "testing")]
 pub use statement::StatementCommitPhase;
+#[cfg(feature = "testing")]
+pub use work_stats::{capture_query_work, QueryWork};
 
 use crate::ast::*;
 use crate::canonicalize::canonicalize_with_form;
@@ -808,7 +812,7 @@ impl Engine {
     /// Lowering is idempotent, so calling it on a plan that has been through it
     /// already is a no-op.
     fn lower(&self, plan: &PlanNode) -> Result<LoweredPlan, QueryError> {
-        LoweredPlan::of(&self.catalog, plan)
+        LoweredPlan::of(&self.catalog, plan, self.query_memory_limit())
     }
 
     /// Test-only: the EXPLAIN text of `query`'s plan after `passes` rounds of
@@ -1732,6 +1736,8 @@ impl Engine {
                 let mut rows: Vec<Vec<Value>> = Vec::new();
                 for item in self.catalog.scan(table).map_err(|e| e.to_string())? {
                     let (_, row) = item.map_err(crate::result::QueryError::from_storage_io)?;
+                    #[cfg(feature = "testing")]
+                    work_stats::record_seq_row();
                     cancel.tick()?;
                     rows.push(row);
                 }
@@ -1799,11 +1805,15 @@ impl Engine {
                 if tbl.has_index(column) {
                     // Use index_lookup_all to handle both unique and
                     // non-unique indexes — returns all matching RowIds.
+                    #[cfg(feature = "testing")]
+                    work_stats::record_index_probe();
                     let rids = tbl.index_lookup_all(column, &key_value);
                     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                     let mut cancel = crate::cancel::CancelCheck::new();
                     for rid in rids {
                         cancel.tick()?;
+                        #[cfg(feature = "testing")]
+                        work_stats::record_heap_fetch();
                         // Overflow safety (P0-3/P0-4): `tbl.get` reassembles
                         // spilled columns (the old `heap.get` + `decode_row`
                         // returned Empty / wrapped a >= 64KB value).
@@ -2635,6 +2645,11 @@ impl Engine {
                 aggregates,
                 having,
             } => {
+                if let Some(result) =
+                    self.try_stream_constant_group(input, keys, aggregates, having)?
+                {
+                    return Ok(result);
+                }
                 if aggregates
                     .iter()
                     .any(|aggregate| aggregate.provenance_alias.is_some())

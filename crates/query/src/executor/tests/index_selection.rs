@@ -43,7 +43,7 @@ fn engine_only() -> Engine {
 
 fn lower(engine: &Engine, query: &str) -> PlanNode {
     let plan = crate::planner::plan(query).unwrap();
-    super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
+    super::plan_exec::LoweredPlan::of(&engine.catalog, &plan, engine.query_memory_limit())
         .unwrap()
         .node()
         .clone()
@@ -80,10 +80,11 @@ fn conjunction_without_any_index_is_left_byte_identical() {
     let engine = doc_no_index_engine();
     let plan = crate::planner::plan("Doc filter .data->score = 20 and .id = 1").unwrap();
     let before = format!("{plan:?}");
-    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
-        .unwrap()
-        .node()
-        .clone();
+    let lowered =
+        super::plan_exec::LoweredPlan::of(&engine.catalog, &plan, engine.query_memory_limit())
+            .unwrap()
+            .node()
+            .clone();
     assert_eq!(
         before,
         format!("{lowered:?}"),
@@ -333,10 +334,11 @@ fn same_column_between_pair_merges_and_empties_the_residual() {
         }),
         predicate: between,
     };
-    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &plan)
-        .unwrap()
-        .node()
-        .clone();
+    let lowered =
+        super::plan_exec::LoweredPlan::of(&engine.catalog, &plan, engine.query_memory_limit())
+            .unwrap()
+            .node()
+            .clone();
     match &lowered {
         PlanNode::RangeScan {
             column, start, end, ..
@@ -473,10 +475,11 @@ fn residual_fast_path_agrees_with_general_path() {
     let general = engine.dispatch_mut(&raw_plan).unwrap();
 
     // Fast path: the lowered plan must be driven by the expression index.
-    let lowered = super::plan_exec::LoweredPlan::of(&engine.catalog, &raw_plan)
-        .unwrap()
-        .node()
-        .clone();
+    let lowered =
+        super::plan_exec::LoweredPlan::of(&engine.catalog, &raw_plan, engine.query_memory_limit())
+            .unwrap()
+            .node()
+            .clone();
     match &lowered {
         PlanNode::Filter { input, .. } => {
             assert!(
