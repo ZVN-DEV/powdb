@@ -2154,36 +2154,14 @@ impl Engine {
                         return Ok(result);
                     }
                 }
-                // Fast path: Project over IndexScan. Avoids full-row decode
-                // by calling decode_column only for projected fields.
+                // Fast path: Project over IndexScan — project matching rows
+                // without constructing generic expression-evaluation state.
                 if let PlanNode::IndexScan { table, column, key } = input.as_ref() {
                     let key_value = literal_to_value(key)?;
                     let tbl = self
                         .catalog
                         .get_table(table)
                         .ok_or_else(|| QueryError::TableNotFound(table.clone()))?;
-                    let schema = tbl.schema();
-
-                    let proj_columns: Vec<String> = fields
-                        .iter()
-                        .map(|f| {
-                            f.alias
-                                .clone()
-                                .unwrap_or_else(|| projection_output_name(&f.expr))
-                        })
-                        .collect();
-
-                    let proj_indices: Vec<usize> = fields
-                        .iter()
-                        .filter_map(|f| {
-                            if let Expr::Field(name) = &f.expr {
-                                schema.column_index(name)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
                     // Plain-field projections only; a computed projection
                     // (e.g. `length(.v)`) falls through to the generic
                     // expression-evaluating path (its column is otherwise
@@ -2193,6 +2171,21 @@ impl Engine {
                         && all_plain_fields
                         && !self.generic_path_forced("readonly:project-over-index-scan")
                     {
+                        let proj_columns: Vec<String> = fields
+                            .iter()
+                            .map(|f| {
+                                f.alias
+                                    .clone()
+                                    .unwrap_or_else(|| projection_output_name(&f.expr))
+                            })
+                            .collect();
+                        let proj_indices: Vec<usize> = fields
+                            .iter()
+                            .filter_map(|f| match &f.expr {
+                                Expr::Field(name) => tbl.schema().column_index(name),
+                                _ => None,
+                            })
+                            .collect();
                         let rids = tbl.index_lookup_all(column, &key_value);
                         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rids.len());
                         let mut cancel = crate::cancel::CancelCheck::new();
