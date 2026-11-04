@@ -1,0 +1,390 @@
+{
+  "diagnostic_only": true,
+  "durable_write_claim": false,
+  "pass": true,
+  "samples": [
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1004068967,
+      "correctness": true,
+      "in_ns": 782942712,
+      "matches": 140,
+      "open_ns": "453724160",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_0\\\")), Literal(String(\\\"note_1\\\")), Literal(String(\\\"note_2\\\")), Literal(String(\\\"note_3\\\")), Literal(String(\\\"note_4\\\")), Literal(String(\\\"note_5\\\")), Literal(String(\\\"note_6\\\")), Literal(String(\\\"note_7\\\")), Literal(String(\\\"note_8\\\")), Literal(String(\\\"note_9\\\")), Literal(String(\\\"note_10\\\")), Literal(String(\\\"note_11\\\")), Literal(String(\\\"note_12\\\")), Literal(String(\\\"note_13\\\")), Literal(String(\\\"note_14\\\")), Literal(String(\\\"note_15\\\")), Literal(String(\\\"note_16\\\")), Literal(String(\\\"note_17\\\")), Literal(String(\\\"note_18\\\")), Literal(String(\\\"note_19\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "baseline",
+      "round": 0,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 80915196,
+      "correctness": true,
+      "in_ns": 852106,
+      "matches": 140,
+      "open_ns": "450145449",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_0\\\")), Literal(String(\\\"note_1\\\")), Literal(String(\\\"note_2\\\")), Literal(String(\\\"note_3\\\")), Literal(String(\\\"note_4\\\")), Literal(String(\\\"note_5\\\")), Literal(String(\\\"note_6\\\")), Literal(String(\\\"note_7\\\")), Literal(String(\\\"note_8\\\")), Literal(String(\\\"note_9\\\")), Literal(String(\\\"note_10\\\")), Literal(String(\\\"note_11\\\")), Literal(String(\\\"note_12\\\")), Literal(String(\\\"note_13\\\")), Literal(String(\\\"note_14\\\")), Literal(String(\\\"note_15\\\")), Literal(String(\\\"note_16\\\")), Literal(String(\\\"note_17\\\")), Literal(String(\\\"note_18\\\")), Literal(String(\\\"note_19\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_0\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_1\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_2\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_3\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_4\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_5\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_6\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_7\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_8\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_9\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_10\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_11\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_12\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_13\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_14\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_15\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_16\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_17\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_18\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_19\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "candidate",
+      "round": 0,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1004358430,
+      "correctness": true,
+      "in_ns": 780613803,
+      "matches": 140,
+      "open_ns": "321525086",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_0\\\")), Literal(String(\\\"note_1\\\")), Literal(String(\\\"note_2\\\")), Literal(String(\\\"note_3\\\")), Literal(String(\\\"note_4\\\")), Literal(String(\\\"note_5\\\")), Literal(String(\\\"note_6\\\")), Literal(String(\\\"note_7\\\")), Literal(String(\\\"note_8\\\")), Literal(String(\\\"note_9\\\")), Literal(String(\\\"note_10\\\")), Literal(String(\\\"note_11\\\")), Literal(String(\\\"note_12\\\")), Literal(String(\\\"note_13\\\")), Literal(String(\\\"note_14\\\")), Literal(String(\\\"note_15\\\")), Literal(String(\\\"note_16\\\")), Literal(String(\\\"note_17\\\")), Literal(String(\\\"note_18\\\")), Literal(String(\\\"note_19\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "baseline",
+      "round": 0,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81611711,
+      "correctness": true,
+      "in_ns": 921586,
+      "matches": 140,
+      "open_ns": "389901703",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_0\\\")), Literal(String(\\\"note_1\\\")), Literal(String(\\\"note_2\\\")), Literal(String(\\\"note_3\\\")), Literal(String(\\\"note_4\\\")), Literal(String(\\\"note_5\\\")), Literal(String(\\\"note_6\\\")), Literal(String(\\\"note_7\\\")), Literal(String(\\\"note_8\\\")), Literal(String(\\\"note_9\\\")), Literal(String(\\\"note_10\\\")), Literal(String(\\\"note_11\\\")), Literal(String(\\\"note_12\\\")), Literal(String(\\\"note_13\\\")), Literal(String(\\\"note_14\\\")), Literal(String(\\\"note_15\\\")), Literal(String(\\\"note_16\\\")), Literal(String(\\\"note_17\\\")), Literal(String(\\\"note_18\\\")), Literal(String(\\\"note_19\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_0\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_1\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_2\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_3\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_4\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_5\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_6\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_7\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_8\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_9\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_10\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_11\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_12\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_13\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_14\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_15\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_16\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_17\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_18\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_19\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "candidate",
+      "round": 0,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 82975805,
+      "correctness": true,
+      "in_ns": 894966,
+      "matches": 140,
+      "open_ns": "448058430",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_37\\\")), Literal(String(\\\"note_38\\\")), Literal(String(\\\"note_39\\\")), Literal(String(\\\"note_40\\\")), Literal(String(\\\"note_41\\\")), Literal(String(\\\"note_42\\\")), Literal(String(\\\"note_43\\\")), Literal(String(\\\"note_44\\\")), Literal(String(\\\"note_45\\\")), Literal(String(\\\"note_46\\\")), Literal(String(\\\"note_47\\\")), Literal(String(\\\"note_48\\\")), Literal(String(\\\"note_49\\\")), Literal(String(\\\"note_50\\\")), Literal(String(\\\"note_51\\\")), Literal(String(\\\"note_52\\\")), Literal(String(\\\"note_53\\\")), Literal(String(\\\"note_54\\\")), Literal(String(\\\"note_55\\\")), Literal(String(\\\"note_56\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_37\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_38\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_39\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_40\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_41\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_42\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_43\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_44\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_45\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_46\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_47\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_48\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_49\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_50\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_51\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_52\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_53\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_54\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_55\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_56\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "candidate",
+      "round": 1,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1003756252,
+      "correctness": true,
+      "in_ns": 785965274,
+      "matches": 140,
+      "open_ns": "449744007",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_37\\\")), Literal(String(\\\"note_38\\\")), Literal(String(\\\"note_39\\\")), Literal(String(\\\"note_40\\\")), Literal(String(\\\"note_41\\\")), Literal(String(\\\"note_42\\\")), Literal(String(\\\"note_43\\\")), Literal(String(\\\"note_44\\\")), Literal(String(\\\"note_45\\\")), Literal(String(\\\"note_46\\\")), Literal(String(\\\"note_47\\\")), Literal(String(\\\"note_48\\\")), Literal(String(\\\"note_49\\\")), Literal(String(\\\"note_50\\\")), Literal(String(\\\"note_51\\\")), Literal(String(\\\"note_52\\\")), Literal(String(\\\"note_53\\\")), Literal(String(\\\"note_54\\\")), Literal(String(\\\"note_55\\\")), Literal(String(\\\"note_56\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "baseline",
+      "round": 1,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81302442,
+      "correctness": true,
+      "in_ns": 868417,
+      "matches": 140,
+      "open_ns": "328407454",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_37\\\")), Literal(String(\\\"note_38\\\")), Literal(String(\\\"note_39\\\")), Literal(String(\\\"note_40\\\")), Literal(String(\\\"note_41\\\")), Literal(String(\\\"note_42\\\")), Literal(String(\\\"note_43\\\")), Literal(String(\\\"note_44\\\")), Literal(String(\\\"note_45\\\")), Literal(String(\\\"note_46\\\")), Literal(String(\\\"note_47\\\")), Literal(String(\\\"note_48\\\")), Literal(String(\\\"note_49\\\")), Literal(String(\\\"note_50\\\")), Literal(String(\\\"note_51\\\")), Literal(String(\\\"note_52\\\")), Literal(String(\\\"note_53\\\")), Literal(String(\\\"note_54\\\")), Literal(String(\\\"note_55\\\")), Literal(String(\\\"note_56\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_37\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_38\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_39\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_40\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_41\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_42\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_43\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_44\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_45\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_46\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_47\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_48\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_49\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_50\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_51\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_52\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_53\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_54\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_55\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_56\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "candidate",
+      "round": 1,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1014044598,
+      "correctness": true,
+      "in_ns": 782019224,
+      "matches": 140,
+      "open_ns": "320786814",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_37\\\")), Literal(String(\\\"note_38\\\")), Literal(String(\\\"note_39\\\")), Literal(String(\\\"note_40\\\")), Literal(String(\\\"note_41\\\")), Literal(String(\\\"note_42\\\")), Literal(String(\\\"note_43\\\")), Literal(String(\\\"note_44\\\")), Literal(String(\\\"note_45\\\")), Literal(String(\\\"note_46\\\")), Literal(String(\\\"note_47\\\")), Literal(String(\\\"note_48\\\")), Literal(String(\\\"note_49\\\")), Literal(String(\\\"note_50\\\")), Literal(String(\\\"note_51\\\")), Literal(String(\\\"note_52\\\")), Literal(String(\\\"note_53\\\")), Literal(String(\\\"note_54\\\")), Literal(String(\\\"note_55\\\")), Literal(String(\\\"note_56\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "baseline",
+      "round": 1,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1003939911,
+      "correctness": true,
+      "in_ns": 783047362,
+      "matches": 140,
+      "open_ns": "449948487",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_74\\\")), Literal(String(\\\"note_75\\\")), Literal(String(\\\"note_76\\\")), Literal(String(\\\"note_77\\\")), Literal(String(\\\"note_78\\\")), Literal(String(\\\"note_79\\\")), Literal(String(\\\"note_80\\\")), Literal(String(\\\"note_81\\\")), Literal(String(\\\"note_82\\\")), Literal(String(\\\"note_83\\\")), Literal(String(\\\"note_84\\\")), Literal(String(\\\"note_85\\\")), Literal(String(\\\"note_86\\\")), Literal(String(\\\"note_87\\\")), Literal(String(\\\"note_88\\\")), Literal(String(\\\"note_89\\\")), Literal(String(\\\"note_90\\\")), Literal(String(\\\"note_91\\\")), Literal(String(\\\"note_92\\\")), Literal(String(\\\"note_93\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "baseline",
+      "round": 2,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81741472,
+      "correctness": true,
+      "in_ns": 882866,
+      "matches": 140,
+      "open_ns": "454034418",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_74\\\")), Literal(String(\\\"note_75\\\")), Literal(String(\\\"note_76\\\")), Literal(String(\\\"note_77\\\")), Literal(String(\\\"note_78\\\")), Literal(String(\\\"note_79\\\")), Literal(String(\\\"note_80\\\")), Literal(String(\\\"note_81\\\")), Literal(String(\\\"note_82\\\")), Literal(String(\\\"note_83\\\")), Literal(String(\\\"note_84\\\")), Literal(String(\\\"note_85\\\")), Literal(String(\\\"note_86\\\")), Literal(String(\\\"note_87\\\")), Literal(String(\\\"note_88\\\")), Literal(String(\\\"note_89\\\")), Literal(String(\\\"note_90\\\")), Literal(String(\\\"note_91\\\")), Literal(String(\\\"note_92\\\")), Literal(String(\\\"note_93\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_74\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_75\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_76\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_77\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_78\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_79\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_80\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_81\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_82\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_83\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_84\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_85\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_86\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_87\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_88\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_89\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_90\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_91\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_92\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_93\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "candidate",
+      "round": 2,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1014693365,
+      "correctness": true,
+      "in_ns": 787871667,
+      "matches": 140,
+      "open_ns": "322360900",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_74\\\")), Literal(String(\\\"note_75\\\")), Literal(String(\\\"note_76\\\")), Literal(String(\\\"note_77\\\")), Literal(String(\\\"note_78\\\")), Literal(String(\\\"note_79\\\")), Literal(String(\\\"note_80\\\")), Literal(String(\\\"note_81\\\")), Literal(String(\\\"note_82\\\")), Literal(String(\\\"note_83\\\")), Literal(String(\\\"note_84\\\")), Literal(String(\\\"note_85\\\")), Literal(String(\\\"note_86\\\")), Literal(String(\\\"note_87\\\")), Literal(String(\\\"note_88\\\")), Literal(String(\\\"note_89\\\")), Literal(String(\\\"note_90\\\")), Literal(String(\\\"note_91\\\")), Literal(String(\\\"note_92\\\")), Literal(String(\\\"note_93\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "baseline",
+      "round": 2,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 82086047,
+      "correctness": true,
+      "in_ns": 870472,
+      "matches": 140,
+      "open_ns": "324878271",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_74\\\")), Literal(String(\\\"note_75\\\")), Literal(String(\\\"note_76\\\")), Literal(String(\\\"note_77\\\")), Literal(String(\\\"note_78\\\")), Literal(String(\\\"note_79\\\")), Literal(String(\\\"note_80\\\")), Literal(String(\\\"note_81\\\")), Literal(String(\\\"note_82\\\")), Literal(String(\\\"note_83\\\")), Literal(String(\\\"note_84\\\")), Literal(String(\\\"note_85\\\")), Literal(String(\\\"note_86\\\")), Literal(String(\\\"note_87\\\")), Literal(String(\\\"note_88\\\")), Literal(String(\\\"note_89\\\")), Literal(String(\\\"note_90\\\")), Literal(String(\\\"note_91\\\")), Literal(String(\\\"note_92\\\")), Literal(String(\\\"note_93\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_74\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_75\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_76\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_77\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_78\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_79\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_80\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_81\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_82\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_83\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_84\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_85\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_86\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_87\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_88\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_89\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_90\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_91\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_92\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_93\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "candidate",
+      "round": 2,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81847803,
+      "correctness": true,
+      "in_ns": 889606,
+      "matches": 140,
+      "open_ns": "454196426",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_111\\\")), Literal(String(\\\"note_112\\\")), Literal(String(\\\"note_113\\\")), Literal(String(\\\"note_114\\\")), Literal(String(\\\"note_115\\\")), Literal(String(\\\"note_116\\\")), Literal(String(\\\"note_117\\\")), Literal(String(\\\"note_118\\\")), Literal(String(\\\"note_119\\\")), Literal(String(\\\"note_120\\\")), Literal(String(\\\"note_121\\\")), Literal(String(\\\"note_122\\\")), Literal(String(\\\"note_123\\\")), Literal(String(\\\"note_124\\\")), Literal(String(\\\"note_125\\\")), Literal(String(\\\"note_126\\\")), Literal(String(\\\"note_127\\\")), Literal(String(\\\"note_128\\\")), Literal(String(\\\"note_129\\\")), Literal(String(\\\"note_130\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_111\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_112\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_113\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_114\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_115\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_116\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_117\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_118\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_119\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_120\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_121\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_122\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_123\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_124\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_125\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_126\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_127\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_128\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_129\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_130\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "candidate",
+      "round": 3,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1015722778,
+      "correctness": true,
+      "in_ns": 773020297,
+      "matches": 140,
+      "open_ns": "451074441",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_111\\\")), Literal(String(\\\"note_112\\\")), Literal(String(\\\"note_113\\\")), Literal(String(\\\"note_114\\\")), Literal(String(\\\"note_115\\\")), Literal(String(\\\"note_116\\\")), Literal(String(\\\"note_117\\\")), Literal(String(\\\"note_118\\\")), Literal(String(\\\"note_119\\\")), Literal(String(\\\"note_120\\\")), Literal(String(\\\"note_121\\\")), Literal(String(\\\"note_122\\\")), Literal(String(\\\"note_123\\\")), Literal(String(\\\"note_124\\\")), Literal(String(\\\"note_125\\\")), Literal(String(\\\"note_126\\\")), Literal(String(\\\"note_127\\\")), Literal(String(\\\"note_128\\\")), Literal(String(\\\"note_129\\\")), Literal(String(\\\"note_130\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "baseline",
+      "round": 3,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 80033171,
+      "correctness": true,
+      "in_ns": 857516,
+      "matches": 140,
+      "open_ns": "322454244",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_111\\\")), Literal(String(\\\"note_112\\\")), Literal(String(\\\"note_113\\\")), Literal(String(\\\"note_114\\\")), Literal(String(\\\"note_115\\\")), Literal(String(\\\"note_116\\\")), Literal(String(\\\"note_117\\\")), Literal(String(\\\"note_118\\\")), Literal(String(\\\"note_119\\\")), Literal(String(\\\"note_120\\\")), Literal(String(\\\"note_121\\\")), Literal(String(\\\"note_122\\\")), Literal(String(\\\"note_123\\\")), Literal(String(\\\"note_124\\\")), Literal(String(\\\"note_125\\\")), Literal(String(\\\"note_126\\\")), Literal(String(\\\"note_127\\\")), Literal(String(\\\"note_128\\\")), Literal(String(\\\"note_129\\\")), Literal(String(\\\"note_130\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_111\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_112\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_113\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_114\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_115\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_116\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_117\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_118\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_119\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_120\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_121\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_122\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_123\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_124\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_125\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_126\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_127\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_128\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_129\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_130\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "candidate",
+      "round": 3,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1051527590,
+      "correctness": true,
+      "in_ns": 771248791,
+      "matches": 140,
+      "open_ns": "322610476",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_111\\\")), Literal(String(\\\"note_112\\\")), Literal(String(\\\"note_113\\\")), Literal(String(\\\"note_114\\\")), Literal(String(\\\"note_115\\\")), Literal(String(\\\"note_116\\\")), Literal(String(\\\"note_117\\\")), Literal(String(\\\"note_118\\\")), Literal(String(\\\"note_119\\\")), Literal(String(\\\"note_120\\\")), Literal(String(\\\"note_121\\\")), Literal(String(\\\"note_122\\\")), Literal(String(\\\"note_123\\\")), Literal(String(\\\"note_124\\\")), Literal(String(\\\"note_125\\\")), Literal(String(\\\"note_126\\\")), Literal(String(\\\"note_127\\\")), Literal(String(\\\"note_128\\\")), Literal(String(\\\"note_129\\\")), Literal(String(\\\"note_130\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "baseline",
+      "round": 3,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1029629260,
+      "correctness": true,
+      "in_ns": 777751609,
+      "matches": 140,
+      "open_ns": "450108437",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_148\\\")), Literal(String(\\\"note_149\\\")), Literal(String(\\\"note_150\\\")), Literal(String(\\\"note_151\\\")), Literal(String(\\\"note_152\\\")), Literal(String(\\\"note_153\\\")), Literal(String(\\\"note_154\\\")), Literal(String(\\\"note_155\\\")), Literal(String(\\\"note_156\\\")), Literal(String(\\\"note_157\\\")), Literal(String(\\\"note_158\\\")), Literal(String(\\\"note_159\\\")), Literal(String(\\\"note_160\\\")), Literal(String(\\\"note_161\\\")), Literal(String(\\\"note_162\\\")), Literal(String(\\\"note_163\\\")), Literal(String(\\\"note_164\\\")), Literal(String(\\\"note_165\\\")), Literal(String(\\\"note_166\\\")), Literal(String(\\\"note_167\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "baseline",
+      "round": 4,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81696627,
+      "correctness": true,
+      "in_ns": 902400,
+      "matches": 140,
+      "open_ns": "455922816",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_148\\\")), Literal(String(\\\"note_149\\\")), Literal(String(\\\"note_150\\\")), Literal(String(\\\"note_151\\\")), Literal(String(\\\"note_152\\\")), Literal(String(\\\"note_153\\\")), Literal(String(\\\"note_154\\\")), Literal(String(\\\"note_155\\\")), Literal(String(\\\"note_156\\\")), Literal(String(\\\"note_157\\\")), Literal(String(\\\"note_158\\\")), Literal(String(\\\"note_159\\\")), Literal(String(\\\"note_160\\\")), Literal(String(\\\"note_161\\\")), Literal(String(\\\"note_162\\\")), Literal(String(\\\"note_163\\\")), Literal(String(\\\"note_164\\\")), Literal(String(\\\"note_165\\\")), Literal(String(\\\"note_166\\\")), Literal(String(\\\"note_167\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_148\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_149\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_150\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_151\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_152\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_153\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_154\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_155\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_156\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_157\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_158\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_159\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_160\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_161\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_162\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_163\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_164\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_165\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_166\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_167\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": false,
+      "role": "candidate",
+      "round": 4,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "error": "query exceeded memory budget: requested 395666730 bytes, limit 268435456 bytes",
+        "ok": false
+      },
+      "aggregate_ns": 1027724872,
+      "correctness": true,
+      "in_ns": 770548088,
+      "matches": 140,
+      "open_ns": "323968139",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_148\\\")), Literal(String(\\\"note_149\\\")), Literal(String(\\\"note_150\\\")), Literal(String(\\\"note_151\\\")), Literal(String(\\\"note_152\\\")), Literal(String(\\\"note_153\\\")), Literal(String(\\\"note_154\\\")), Literal(String(\\\"note_155\\\")), Literal(String(\\\"note_156\\\")), Literal(String(\\\"note_157\\\")), Literal(String(\\\"note_158\\\")), Literal(String(\\\"note_159\\\")), Literal(String(\\\"note_160\\\")), Literal(String(\\\"note_161\\\")), Literal(String(\\\"note_162\\\")), Literal(String(\\\"note_163\\\")), Literal(String(\\\"note_164\\\")), Literal(String(\\\"note_165\\\")), Literal(String(\\\"note_166\\\")), Literal(String(\\\"note_167\\\"))], negated: false }\")], [Str(\"    SeqScan table=Comment\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "baseline",
+      "round": 4,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    },
+    {
+      "aggregate": {
+        "ok": true
+      },
+      "aggregate_ns": 81427265,
+      "correctness": true,
+      "in_ns": 896078,
+      "matches": 140,
+      "open_ns": "330221231",
+      "plan": "Rows { columns: [\"plan\"], rows: [[Str(\"Project fields=[Field(\\\"id\\\")]\")], [Str(\"  Filter predicate=InList { expr: Field(\\\"note_id\\\"), list: [Literal(String(\\\"note_148\\\")), Literal(String(\\\"note_149\\\")), Literal(String(\\\"note_150\\\")), Literal(String(\\\"note_151\\\")), Literal(String(\\\"note_152\\\")), Literal(String(\\\"note_153\\\")), Literal(String(\\\"note_154\\\")), Literal(String(\\\"note_155\\\")), Literal(String(\\\"note_156\\\")), Literal(String(\\\"note_157\\\")), Literal(String(\\\"note_158\\\")), Literal(String(\\\"note_159\\\")), Literal(String(\\\"note_160\\\")), Literal(String(\\\"note_161\\\")), Literal(String(\\\"note_162\\\")), Literal(String(\\\"note_163\\\")), Literal(String(\\\"note_164\\\")), Literal(String(\\\"note_165\\\")), Literal(String(\\\"note_166\\\")), Literal(String(\\\"note_167\\\"))], negated: false }\")], [Str(\"    UNION ALL\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_148\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_149\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_150\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_151\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_152\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_153\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_154\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_155\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_156\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_157\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"      UNION ALL\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_158\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_159\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_160\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_161\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_162\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"        UNION ALL\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_163\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_164\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"          UNION ALL\")], [Str(\"            IndexScan table=Comment column=note_id key=Literal(String(\\\"note_165\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"            UNION ALL\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_166\\\")) est_rows=7 entries=1000000 distinct=150000\")], [Str(\"              IndexScan table=Comment column=note_id key=Literal(String(\\\"note_167\\\")) est_rows=7 entries=1000000 distinct=150000\")]] }",
+      "query_memory_limit": 268435456,
+      "readonly": true,
+      "role": "candidate",
+      "round": 4,
+      "rows": 1000000,
+      "wal_mode": "Full"
+    }
+  ],
+  "schema": 1,
+  "summaries": [
+    {
+      "access_pass": true,
+      "aggregate_pass": true,
+      "baseline_in_ns": 782942712,
+      "candidate_in_ns": 889606,
+      "readonly": false,
+      "speedup": 880.1005298975052
+    },
+    {
+      "access_pass": true,
+      "aggregate_pass": true,
+      "baseline_in_ns": 780613803,
+      "candidate_in_ns": 870472,
+      "readonly": true,
+      "speedup": 896.7707209422015
+    }
+  ],
+  "provenance": {
+    "run": "https://github.com/ZVN-DEV/powdb/actions/runs/41782234843",
+    "candidate_merge": "bf8d4d9c4d734e38bee7edef67391bea1b9096ba",
+    "candidate_head": "980b954bd364bc171584dcdae3b47f36285b2755",
+    "control": "7cc4b548ac94d9379aa362c3121314b8c2479039",
+    "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+    "runner": "ubuntu-24.04 GitHub-hosted",
+    "arch": "x86_64",
+    "rustflags": "-C target-cpu=x86-64-v2",
+    "evaluator_sha256": "f57ae2c60f5dc160a0e34d4d836069a8258c75078d27e479cf5da1d1de69e333",
+    "control_binary_sha256": "44d304ebdf6ab7baefb62912388d4e0cb0770cc426f2022ca530c517eac9d8ab",
+    "candidate_binary_sha256": "5f2973b5925c8be9d40051483cc333f58080889786bd7669eca29f89726389c9",
+    "resource_capture": "Both sides sequentially on same VM; first run did not record CPU model/RAM; workflow now records them."
+  }
+}

@@ -4,6 +4,37 @@ This evaluator covers two engine-local read workloads against released PowDB
 0.29.0 (`7cc4b548ac94d9379aa362c3121314b8c2479039`). It is not a database
 leaderboard, a write-throughput test, or serverless/ORM qualification.
 
+## November 4, 2026 result
+
+The [five-pair hosted run](https://github.com/ZVN-DEV/powdb/actions/runs/41782234843)
+passed on both execution surfaces. Medians below include parsing, lowering and
+execution, but not opening the engine or checking the returned values.
+
+| Query | Released 0.29 | Candidate | Outcome |
+| --- | --- | --- | --- |
+| Indexed IN, mutable | 782.94 ms | 0.890 ms | 880x lower latency |
+| Indexed IN, read-only | 780.61 ms | 0.870 ms | 897x lower latency |
+| Four aggregates, mutable | Memory-limit error in every round | 81.74 ms | Exact result in every round |
+| Four aggregates, read-only | Memory-limit error in every round | 81.43 ms | Exact result in every round |
+
+Every lookup returned the expected 140 IDs. Every aggregate control reported
+395,666,730 requested bytes against 268,435,456 allowed bytes; those failures
+are retained, not converted into a successful-query speed ratio.
+[Raw samples, plans and provenance](2026-11-04-query-recovery.json) identify the
+exact control, candidate PR merge, evaluator and binary hashes.
+
+Both engines were compiled with Rust 1.99.1 and `-C target-cpu=x86-64-v2`, then
+run sequentially on the same free GitHub-hosted Ubuntu 24.04 VM. That first run
+did not record the CPU model or RAM; the workflow now captures both. Do not
+compare its absolute times directly with differently configured local runs.
+The measured candidate includes main's TLS security patches. A subsequent
+lockfile-only compression security patch affects the optional MySQL comparator,
+not the measured engine dependency graph. It does not alter this frozen control.
+
+The improvement comes from less execution work, not a reduced durability or
+memory setting. This does not establish a PostgreSQL/SQLite/DuckDB ranking or
+imply equivalent improvements for unsupported query shapes.
+
 ## Workloads and acceptance
 
 A deterministic million-row `Comment` table contains integer IDs, non-unique

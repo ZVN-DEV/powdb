@@ -74,6 +74,9 @@ jobs:
             git -C control rev-parse HEAD
             uname -m
             printenv RUSTFLAGS
+            lscpu
+            free -b
+            df -h "$GITHUB_WORKSPACE"
             sha256sum candidate/crates/bench/src/bin/query_recovery_gate.rs \
               control/target/release/examples/query_recovery_gate \
               candidate/target/release/examples/query_recovery_gate
