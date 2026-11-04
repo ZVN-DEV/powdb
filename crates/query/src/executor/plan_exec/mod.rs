@@ -218,8 +218,8 @@ pub(super) fn for_each_row_raw_cancellable(
     table: &str,
     mut f: impl FnMut(RowId, &[u8]),
 ) -> Result<(), QueryError> {
+    #[cfg(feature = "testing")]
     let mut f = |rid, data: &[u8]| {
-        #[cfg(feature = "testing")]
         crate::executor::work_stats::record_seq_row();
         f(rid, data);
     };

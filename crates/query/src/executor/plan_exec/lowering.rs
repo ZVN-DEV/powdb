@@ -724,6 +724,22 @@ struct ConjunctionCandidate {
     tier: u8,
 }
 
+/// Only positive bare-column membership conjuncts can use the probe rewrite.
+/// Check the shape before catalog lookups or allocating a conjunct vector.
+fn has_indexed_membership_shape(predicate: &Expr) -> bool {
+    match predicate {
+        Expr::BinaryOp(left, BinOp::And, right) => {
+            has_indexed_membership_shape(left) || has_indexed_membership_shape(right)
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => matches!(expr.as_ref(), Expr::Field(_)) && !list.is_empty() && list.len() <= 128,
+        _ => false,
+    }
+}
+
 /// Probe a bounded, selective literal membership list through an existing index.
 /// Mutations exclude this row-producing union until RID collection supports it.
 fn lower_indexed_membership(
@@ -732,6 +748,10 @@ fn lower_indexed_membership(
     predicate: &Expr,
     memory_limit: usize,
 ) -> Option<PlanNode> {
+    if !has_indexed_membership_shape(predicate) {
+        return None;
+    }
+    let memory_limit = mem_budget::remaining(memory_limit);
     let tbl = catalog.get_table(table)?;
     if tbl.has_overflow_rows() {
         return None;
@@ -1026,7 +1046,7 @@ impl LoweredPlan {
         Ok(LoweredPlan(lower_unindexed_scans(
             catalog,
             &coerced,
-            mem_budget::remaining(query_memory_limit),
+            query_memory_limit,
         )))
     }
 
@@ -2034,6 +2054,65 @@ pub(crate) fn format_plan_tree(catalog: &Catalog, plan: &PlanNode, depth: usize)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn membership_shape_gate_only_accepts_eligible_and_conjuncts() {
+        let equality = Expr::BinaryOp(
+            Box::new(Expr::Field("id".into())),
+            BinOp::Eq,
+            Box::new(Expr::Literal(Literal::Int(1))),
+        );
+        let membership = Expr::InList {
+            expr: Box::new(Expr::Field("key".into())),
+            list: vec![Expr::Literal(Literal::Int(1))],
+            negated: false,
+        };
+        assert!(!has_indexed_membership_shape(&equality));
+        assert!(!has_indexed_membership_shape(&Expr::BinaryOp(
+            Box::new(equality.clone()),
+            BinOp::And,
+            Box::new(equality.clone()),
+        )));
+        assert!(has_indexed_membership_shape(&membership));
+        for (left, right) in [
+            (membership.clone(), equality.clone()),
+            (equality.clone(), membership.clone()),
+        ] {
+            assert!(has_indexed_membership_shape(&Expr::BinaryOp(
+                Box::new(equality.clone()),
+                BinOp::And,
+                Box::new(Expr::BinaryOp(Box::new(left), BinOp::And, Box::new(right))),
+            )));
+        }
+        assert!(!has_indexed_membership_shape(&Expr::BinaryOp(
+            Box::new(equality),
+            BinOp::Or,
+            Box::new(membership.clone()),
+        )));
+        assert!(!has_indexed_membership_shape(&Expr::UnaryOp(
+            UnaryOp::Not,
+            Box::new(membership),
+        )));
+        for (expr, length, negated) in [
+            (Expr::Field("key".into()), 0, false),
+            (Expr::Field("key".into()), 129, false),
+            (Expr::Field("key".into()), 1, true),
+            (
+                Expr::QualifiedField {
+                    qualifier: "t".into(),
+                    field: "key".into(),
+                },
+                1,
+                false,
+            ),
+        ] {
+            assert!(!has_indexed_membership_shape(&Expr::InList {
+                expr: Box::new(expr),
+                list: vec![Expr::Literal(Literal::Int(1)); length],
+                negated,
+            }));
+        }
+    }
+
     #[test]
     fn membership_mutations_do_not_use_generic_rid_matching() {
         for body_len in [128, 12_000] {
