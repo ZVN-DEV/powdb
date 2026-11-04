@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # update-bench-baseline-from-depot.sh: refresh crates/bench/baseline/main.json
-# from the criterion estimates a Depot run of bench.yml uploaded.
+# from the criterion estimates a CI run of bench.yml uploaded. (The name is
+# historical: bench.yml ran on Depot until 2026-10-24 and now runs on GitHub's
+# hosted ubuntu-latest. Both are accepted below.)
 #
 # This is the rebaseline path the policy allows (CLAUDE.md, and the header of
 # update-bench-baseline.sh): every number, the runner label, the RUSTFLAGS and
@@ -11,7 +13,7 @@
 #
 #   scripts/update-bench-baseline-from-depot.sh <bench.yml run id> [output path]
 #
-# The run must be a completed bench.yml run on a Depot runner. Its head
+# The run must be a completed bench.yml run on a CI runner. Its head
 # checkout's estimates are used (bench.yml also uploads the control run's, for
 # the same-instance comparison; those are not a baseline). The document records
 # the run in `source_run` so a later reader can audit where every number came
@@ -49,8 +51,8 @@ RUN_URL="$(jq -r .url <<< "${RUN_JSON}")"
 JOBS_JSON="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs")"
 RUNNER="$(jq -r '[.jobs[].labels[]] | unique | join(",")' <<< "${JOBS_JSON}")"
 case "${RUNNER}" in
-  depot-*) ;;
-  *) die "run ${RUN_ID} did not execute on a Depot runner (labels: ${RUNNER}); refusing to rebaseline." ;;
+  depot-*|ubuntu-*) ;;
+  *) die "run ${RUN_ID} did not execute on a bench.yml CI runner (labels: ${RUNNER}); refusing to rebaseline." ;;
 esac
 case "${RUNNER}" in
   *arm*) ARCH="aarch64" ;;
@@ -126,7 +128,7 @@ jq -n \
   --arg rustc "${RUSTC_VERSION}" \
   --arg updated "${RUN_DATE}" \
   --arg sha "${HEAD_SHA:0:7}" \
-  --arg source "bench.yml run ${RUN_ID} (Depot, ${RUN_URL})" \
+  --arg source "bench.yml run ${RUN_ID} (${RUNNER}, ${RUN_URL})" \
   --argjson workloads "${workloads_json}" \
   '{schema: 3, runner: $runner, rustflags: $rustflags, arch: $arch, rustc: $rustc, updated: $updated,
     commit: $sha, git_sha: $sha, source_run: $source, workloads: $workloads}' > "${OUT}"

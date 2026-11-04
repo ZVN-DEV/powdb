@@ -14,12 +14,12 @@
 # This script does NOT touch thesis-ratios.json. That file is hand-edited.
 # Raising a ratio ceiling is a separate, deliberate commit.
 #
-# POLICY: baseline/main.json may only be rebaselined from a Depot run of
+# POLICY: baseline/main.json may only be rebaselined from a CI run of
 # bench.yml (see CLAUDE.md). update-bench-baseline-from-depot.sh <run id> is
 # the script that does that, from the run's uploaded criterion estimates; this
-# one exists for the Depot runner itself. This script records the fingerprint of the host
+# one exists for the CI runner itself. This script records the fingerprint of the host
 # it actually runs on (runner from POWDB_BENCH_RUNNER, RUSTFLAGS as set, arch
-# measured from the compare binary). It never fabricates the Depot values, so
+# measured from the compare binary). It never fabricates the CI values, so
 # a baseline produced on a laptop will be refused by the comparator. That is
 # the gate working, not a bug in this script.
 #
@@ -127,9 +127,9 @@ done
 if [[ -z "${POWDB_BENCH_RUNNER:-}" ]]; then
   echo "error: POWDB_BENCH_RUNNER is not set." >&2
   echo "       The baseline records the runner it was produced on. The" >&2
-  echo "       authoritative rebaseline path is the Depot bench.yml run," >&2
+  echo "       authoritative rebaseline path is the CI bench.yml run," >&2
   echo "       which sets this. Set it explicitly to proceed locally," >&2
-  echo "       knowing the comparator will refuse a non-Depot baseline." >&2
+  echo "       knowing the comparator will refuse it on the CI runner." >&2
   exit 1
 fi
 

@@ -9,7 +9,7 @@ name: bench
 # nobody owes anyone. A gate that has to tolerate 20% is not measuring code.
 #
 # What runs now: the job checks out head AND a control ref (default `main`),
-# builds and benchmarks BOTH on the same Depot instance in the same job, and
+# builds and benchmarks BOTH on the same runner instance in the same job, and
 # gates head against the control. Both numbers come from one machine minutes
 # apart, so the cross-machine noise is gone and the control comparison is
 # gated at 10% instead of 20%. The absolute gate against
@@ -31,12 +31,20 @@ name: bench
 # workflow is dispatch-only and gates nothing.
 #
 # Before flipping it, know the cost: this job benchmarks TWO checkouts, so it
-# roughly doubles the old runtime, and it needs a Depot instance per PR.
+# roughly doubles the old runtime, and it needs a runner per PR.
+#
+# THE RUNNER. GitHub's standard hosted `ubuntu-latest` (4 vCPU, 16 GB for a
+# public repository, and free). Until 2026-10-24 this ran on Depot
+# (`depot-ubuntu-24.04-4`), which bills per minute; public repositories here
+# use free hosted runners only, never Depot or ZVN's self-hosted pool. Hosted
+# VMs vary in CPU model from run to run, so the same-instance control gate is
+# the trustworthy one; the absolute gate against main.json is the noisier of
+# the two.
 #
 # Run it: Actions tab -> "bench" -> Run workflow, or `gh workflow run bench.yml`.
 #
-# Do NOT rebaseline main.json from anywhere but a Depot run of this workflow.
-# Those are x86 Depot numbers; an arm64 laptop reports a uniform ~2x
+# Do NOT rebaseline main.json from anywhere but a run of this workflow.
+# Those are x86 hosted-runner numbers; an arm64 laptop reports a uniform ~2x
 # "improvement", and the comparator's environment fingerprint refuses that
 # comparison BY DEFAULT rather than printing it as a win. "By default" because
 # POWDB_BENCH_ALLOW_ENV_MISMATCH=1 still downgrades the refusal to a warning,
@@ -62,7 +70,7 @@ permissions:
 jobs:
   bench:
     name: criterion + control-run regression gate (manual)
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
@@ -78,7 +86,7 @@ jobs:
       # GitHub does not expose the `runs-on` label to the job, so the
       # comparator's environment fingerprint reads it from here. It must match
       # baseline/main.json's `runner` field.
-      POWDB_BENCH_RUNNER: depot-ubuntu-24.04-4
+      POWDB_BENCH_RUNNER: ubuntu-latest
       CONTROL_REF: ${{ inputs.control_ref || 'main' }}
 
     steps:

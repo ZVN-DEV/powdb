@@ -1,101 +1,101 @@
 {
   "schema": 3,
-  "runner": "depot-ubuntu-24.04-4",
+  "runner": "ubuntu-latest",
   "rustflags": "-C target-cpu=x86-64-v2",
   "arch": "x86_64",
-  "rustc": "1.98.1",
-  "updated": "2026-09-07",
-  "commit": "f37c437",
-  "git_sha": "f37c437",
-  "source_run": "bench.yml run 34167015205 (Depot, https://github.com/ZVN-DEV/powdb/actions/runs/34167015205)",
+  "rustc": "1.99.1",
+  "updated": "2026-10-25",
+  "commit": "f5f0af3",
+  "git_sha": "f5f0af3",
+  "source_run": "bench.yml run 40153923091 (ubuntu-latest, https://github.com/ZVN-DEV/powdb/actions/runs/40153923091)",
   "workloads": {
     "insert_10k": {
-      "ns_per_iter": 880511.526272578,
-      "ops_per_sec": 1136
+      "ns_per_iter": 2211990.1052631577,
+      "ops_per_sec": 452
     },
     "btree_lookup": {
-      "ns_per_iter": 169.19222939571335,
-      "ops_per_sec": 5910437
+      "ns_per_iter": 302.94528333281875,
+      "ops_per_sec": 3300926
     },
     "seq_scan_filter": {
-      "ns_per_iter": 4231009.0,
-      "ops_per_sec": 236
+      "ns_per_iter": 8334582.214285715,
+      "ops_per_sec": 120
     },
     "powql_point": {
-      "ns_per_iter": 1438.920547140452,
-      "ops_per_sec": 694965
+      "ns_per_iter": 2835.2864640563575,
+      "ops_per_sec": 352698
     },
     "powql_filter_only": {
-      "ns_per_iter": 11912132.9,
-      "ops_per_sec": 84
+      "ns_per_iter": 22703593.0,
+      "ops_per_sec": 44
     },
     "powql_filter_projection": {
-      "ns_per_iter": 6023585.166666666,
-      "ops_per_sec": 166
+      "ns_per_iter": 11247669.1,
+      "ops_per_sec": 89
     },
     "powql_aggregation": {
-      "ns_per_iter": 531740.6047252747,
-      "ops_per_sec": 1881
+      "ns_per_iter": 997410.103575529,
+      "ops_per_sec": 1003
     },
     "point_lookup_nonindexed": {
-      "ns_per_iter": 568600.5006720431,
-      "ops_per_sec": 1759
+      "ns_per_iter": 1191987.1601505587,
+      "ops_per_sec": 839
     },
     "scan_filter_project_top100": {
-      "ns_per_iter": 16583.135995989305,
-      "ops_per_sec": 60302
+      "ns_per_iter": 38745.74230769231,
+      "ops_per_sec": 25809
     },
     "scan_filter_sort_limit10": {
-      "ns_per_iter": 2259564.238095238,
-      "ops_per_sec": 443
+      "ns_per_iter": 4387659.875,
+      "ops_per_sec": 228
     },
     "agg_sum": {
-      "ns_per_iter": 365944.8072100313,
-      "ops_per_sec": 2733
+      "ns_per_iter": 605837.7612125163,
+      "ops_per_sec": 1651
     },
     "agg_avg": {
-      "ns_per_iter": 617079.5304252199,
-      "ops_per_sec": 1621
+      "ns_per_iter": 1136704.318287037,
+      "ops_per_sec": 880
     },
     "agg_min": {
-      "ns_per_iter": 394014.86161616165,
-      "ops_per_sec": 2538
+      "ns_per_iter": 603478.3482142857,
+      "ops_per_sec": 1657
     },
     "agg_max": {
-      "ns_per_iter": 365141.40213675215,
-      "ops_per_sec": 2739
+      "ns_per_iter": 597796.9973255814,
+      "ops_per_sec": 1673
     },
     "multi_col_and_filter": {
-      "ns_per_iter": 2090395.1,
-      "ops_per_sec": 478
+      "ns_per_iter": 4114895.153846154,
+      "ops_per_sec": 243
     },
     "conjunction_index_residual": {
-      "ns_per_iter": 242954.95097920694,
-      "ops_per_sec": 4116
+      "ns_per_iter": 455761.57705073495,
+      "ops_per_sec": 2194
     },
     "conjunction_s4_selective_path": {
-      "ns_per_iter": 4807.740599539307,
-      "ops_per_sec": 207998
+      "ns_per_iter": 9802.493114948531,
+      "ops_per_sec": 102015
     },
     "insert_single": {
-      "ns_per_iter": 238.3653436351321,
-      "ops_per_sec": 4195241
+      "ns_per_iter": 822.3973193642696,
+      "ops_per_sec": 1215957
     },
     "insert_batch_1k": {
-      "ns_per_iter": 222514.38586956522,
-      "ops_per_sec": 4494
+      "ns_per_iter": 453692.5916666667,
+      "ops_per_sec": 2204
     },
     "update_by_pk": {
-      "ns_per_iter": 1615.7376813770875,
-      "ops_per_sec": 618912
+      "ns_per_iter": 3826.770710462699,
+      "ops_per_sec": 261317
     },
     "update_by_filter": {
-      "ns_per_iter": 1067642.2969726562,
-      "ops_per_sec": 937
+      "ns_per_iter": 3142872.825042017,
+      "ops_per_sec": 318
     },
     "delete_by_filter": {
-      "ns_per_iter": 101498.19711538462,
-      "ops_per_sec": 9852
+      "ns_per_iter": 291916.7567460317,
+      "ops_per_sec": 3426
     }
   }
 }
